@@ -76,7 +76,7 @@ result = repo.materialize()
 print(repo.load_node("summary"))  # "100 users, 5000 events"
 ```
 
-See the [Getting Started guide](https://ion-elgreco.github.io/rivers/getting-started/) for partitioning, jobs, IO handlers, and the K8s executor.
+See the [Getting Started guide](https://ion-elgreco.github.io/rivers/latest/getting-started/) for partitioning, jobs, IO handlers, and the K8s executor.
 
 ## Contributing
 
