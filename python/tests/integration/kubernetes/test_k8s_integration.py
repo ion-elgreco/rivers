@@ -18,6 +18,7 @@ never accidentally hit whatever cluster the user's kubeconfig happens
 to point at.
 """
 
+import base64
 import os
 import time
 
@@ -25,7 +26,7 @@ import grpc
 import httpx
 import pytest
 from kr8s import NotFoundError
-from kr8s.objects import APIObject, Deployment, Pod, Service
+from kr8s.objects import APIObject, Deployment, Pod, Secret, Service
 
 from .conftest import KUBECTL_CONTEXT, kube_api
 
@@ -222,8 +223,23 @@ def _query_run_events(run_id: str) -> list[dict]:
     if not pods:
         return []
     pod = pods[0]
+    secret = Secret.get(
+        name="rivers-surrealdb-auth", namespace=NAMESPACE, api=kube_api()
+    )
+    user = base64.b64decode(secret.raw["data"]["username"]).decode()
+    pwd = base64.b64decode(secret.raw["data"]["password"]).decode()
     query = f"SELECT event_type, asset_key FROM events WHERE run_id = '{run_id}';"
     with pod.portforward(remote_port=8000, local_port="auto") as local_port:
+        # SurrealDB v3 root-user basic auth doesn't apply to DB-scoped queries;
+        # we have to sign in to (ns=rivers, db=main) first and use the JWT.
+        si = httpx.post(
+            f"http://127.0.0.1:{local_port}/signin",
+            json={"ns": "rivers", "db": "main", "user": user, "pass": pwd},
+            timeout=10,
+        )
+        if si.status_code != 200:
+            return []
+        token = si.json().get("token", "")
         r = httpx.post(
             f"http://127.0.0.1:{local_port}/sql",
             content=query,
@@ -231,6 +247,7 @@ def _query_run_events(run_id: str) -> list[dict]:
                 "Surreal-NS": "rivers",
                 "Surreal-DB": "main",
                 "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
             },
             timeout=10,
         )
