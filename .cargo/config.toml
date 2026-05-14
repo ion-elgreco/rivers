@@ -3,3 +3,9 @@
 # maxLength assertion with the legacy mangling scheme.
 [build]
 rustflags = ["-C", "symbol-mangling-version=v0"]
+
+# Leptos `#[server]` hashes CARGO_MANIFEST_DIR into each /api/<fn> URL.
+# CI builds WASM and the wheel on different runners (different absolute
+# paths) → client/server hashes mismatch → 404. Pin a stable key.
+[env]
+SERVER_FN_OVERRIDE_KEY = "rivers"
