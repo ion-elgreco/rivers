@@ -98,4 +98,6 @@ runs:
       run: |
         set -euo pipefail
         pipx install ziglang
-        cargo zigbuild --version
+        # ziglang ≥0.14 renamed its console script to `python-zig`;
+        # cargo-zigbuild discovers the linker as `zig` on PATH.
+        ln -sf "$(command -v python-zig)" "$HOME/.local/bin/zig"
