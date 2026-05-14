@@ -1,0 +1,55 @@
+name: "Set release version"
+description: |
+  Rewrite placeholder versions across the repo to the release version.
+  Single source of truth for which files carry a version pin. The tree
+  is mutated in place on the ephemeral build checkout — release
+  workflows build artifacts from the rewritten state and never commit
+  it back. The Helm release workflow is excluded: `helm package
+  --version` already overrides Chart.yaml at package time.
+
+inputs:
+  version:
+    description: 'Release version without leading "v" (e.g. "0.1.1")'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    # TOML output in yq's encoder is only reliable from v4.50+
+    # (https://mikefarah.gitbook.io/yq/usage/toml). Runner-image yq can
+    # lag, so pin here for determinism.
+    - name: Install yq (pinned)
+      shell: bash
+      env:
+        YQ_VERSION: v4.53.2
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS" in
+          Linux)   asset=yq_linux_amd64 ;;
+          macOS)
+            case "$(uname -m)" in
+              arm64)  asset=yq_darwin_arm64 ;;
+              x86_64) asset=yq_darwin_amd64 ;;
+            esac ;;
+          Windows) asset=yq_windows_amd64.exe ;;
+          *) echo "unsupported RUNNER_OS=$RUNNER_OS" >&2; exit 1 ;;
+        esac
+        mkdir -p "$RUNNER_TEMP/yq-bin"
+        target="$RUNNER_TEMP/yq-bin/yq"
+        [ "$RUNNER_OS" = "Windows" ] && target="${target}.exe"
+        curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${asset}" -o "$target"
+        chmod +x "$target"
+        echo "$RUNNER_TEMP/yq-bin" >> "$GITHUB_PATH"
+
+    - name: Rewrite version pins
+      shell: bash
+      env:
+        TAG: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        # Cargo workspace
+        yq -i -p toml -o toml '.workspace.package.version = strenv(TAG)' Cargo.toml
+        # Python wheel version
+        yq -i -p toml -o toml '.project.version = strenv(TAG)' python/pyproject.toml
+        sed -i.bak "s/--version 0.0.0-dev/--version ${TAG}/g" docs/installation/kubernetes.md
+        rm -f docs/installation/kubernetes.md.bak

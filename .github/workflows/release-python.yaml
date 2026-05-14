@@ -57,6 +57,17 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Resolve release version from tag
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set release version
+        uses: ./.github/actions/set-release-version
+        with:
+          version: ${{ steps.version.outputs.version }}
+
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
@@ -102,6 +113,17 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Resolve release version from tag
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set release version
+        uses: ./.github/actions/set-release-version
+        with:
+          version: ${{ steps.version.outputs.version }}
+
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
@@ -142,6 +164,17 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Resolve release version from tag
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set release version
+        uses: ./.github/actions/set-release-version
+        with:
+          version: ${{ steps.version.outputs.version }}
+
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
@@ -174,6 +207,17 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Resolve release version from tag
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set release version
+        uses: ./.github/actions/set-release-version
+        with:
+          version: ${{ steps.version.outputs.version }}
 
       - name: Build sdist
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1

@@ -5553,7 +5553,7 @@ dependencies = [
 
 [[package]]
 name = "rivers"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "arrow-ipc",
@@ -5594,7 +5594,7 @@ dependencies = [
 
 [[package]]
 name = "rivers-api"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "prost",
  "tonic",
@@ -5604,7 +5604,7 @@ dependencies = [
 
 [[package]]
 name = "rivers-core"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5622,7 +5622,7 @@ dependencies = [
 
 [[package]]
 name = "rivers-k8s"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "k8s-openapi",
@@ -5640,7 +5640,7 @@ dependencies = [
 
 [[package]]
 name = "rivers-operator"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "axum",
@@ -5681,7 +5681,7 @@ dependencies = [
 
 [[package]]
 name = "rivers-ui"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "ansi-to-html",
  "anyhow",

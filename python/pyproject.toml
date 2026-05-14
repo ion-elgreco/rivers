@@ -1,6 +1,6 @@
 [project]
 name = "rivers"
-version = "0.1.0"
+version = "0.0.0.dev0"
 description = "Orchestration platform for tasks and assets, fully backed by Rust."
 readme = "README.md"
 license = "LICENSE"

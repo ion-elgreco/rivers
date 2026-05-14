@@ -6,19 +6,19 @@ release:
   name: rivers
   namespace: rivers
 chart:
-  appVersion: "0.1.0"
+  appVersion: "0.0.0-dev"
 tests:
   - it: empty image falls back to ghcr.io ref at Chart.AppVersion
     asserts:
       - template: templates/operator-deployment.yaml
         equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/ion-elgreco/rivers-operator:0.1.0
+          value: ghcr.io/ion-elgreco/rivers-operator:0.0.0-dev
       - template: templates/ui-deployment.yaml
         documentIndex: 0
         equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/ion-elgreco/rivers-ui:0.1.0
+          value: ghcr.io/ion-elgreco/rivers-ui:0.0.0-dev
 
   - it: explicit image overrides the ghcr default
     set:

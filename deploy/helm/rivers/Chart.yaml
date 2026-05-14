@@ -2,8 +2,8 @@ apiVersion: v2
 name: rivers
 description: rivers orchestration platform — operator, UI, SurrealDB, and code location
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.0.0-dev
+appVersion: "0.0.0-dev"
 dependencies:
   - name: surrealdb
     version: "0.4.0"

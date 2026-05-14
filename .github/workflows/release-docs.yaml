@@ -68,6 +68,11 @@ jobs:
           version="${REF_NAME#v}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
+      - name: Set release version
+        uses: ./.github/actions/set-release-version
+        with:
+          version: ${{ steps.ver.outputs.version }}
+
       # The mike pin + invocation lives in `justfile` so local users and CI
       # both run the exact same command. `--push` is the default for both
       # `docs-deploy` and `docs-set-default`.

@@ -18,12 +18,12 @@ the main `rivers` chart per namespace.
 ```sh
 helm install rivers-crds \
   oci://ghcr.io/ion-elgreco/charts/rivers-crds \
-  --version 0.1.0 \
+  --version 0.0.0-dev \
   --namespace kube-system
 
 helm install rivers \
   oci://ghcr.io/ion-elgreco/charts/rivers \
-  --version 0.1.0 \
+  --version 0.0.0-dev \
   --namespace rivers \
   --create-namespace
 ```

@@ -4,11 +4,12 @@ exclude = []
 resolver = "2"
 
 [workspace.package]
+version = "0.0.0-dev"
 edition = "2024"
 authors = ["Ion Koutsouris <ion@orchestration.rs>"]
 license-file = "LICENSE"
 repository = "https://github.com/ion-elgreco/rivers"
-description = "Orchestration platform for tasks and assets fully backed by Rust (front and back)"
+description = "Orchestration platform for tasks and assets fully backed by Rust"
 keywords = ["rivers", "orchestrator", "pipelines", "assets", "tasks"]
 rust-version = "1.91.0"
 
