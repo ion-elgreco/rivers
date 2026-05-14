@@ -17,8 +17,11 @@ runs:
   steps:
     # TOML output in yq's encoder is only reliable from v4.50+
     # (https://mikefarah.gitbook.io/yq/usage/toml). Runner-image yq can
-    # lag, so pin here for determinism.
+    # lag, so pin here for determinism. The binary is installed to
+    # $RUNNER_TEMP and passed to the next step via a step output —
+    # writing to $GITHUB_PATH would trip zizmor's github-env audit.
     - name: Install yq (pinned)
+      id: yq
       shell: bash
       env:
         YQ_VERSION: v4.53.2
@@ -39,17 +42,18 @@ runs:
         [ "$RUNNER_OS" = "Windows" ] && target="${target}.exe"
         curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${asset}" -o "$target"
         chmod +x "$target"
-        echo "$RUNNER_TEMP/yq-bin" >> "$GITHUB_PATH"
+        echo "bin=$target" >> "$GITHUB_OUTPUT"
 
     - name: Rewrite version pins
       shell: bash
       env:
         TAG: ${{ inputs.version }}
+        YQ: ${{ steps.yq.outputs.bin }}
       run: |
         set -euo pipefail
         # Cargo workspace
-        yq -i -p toml -o toml '.workspace.package.version = strenv(TAG)' Cargo.toml
+        "$YQ" -i -p toml -o toml '.workspace.package.version = strenv(TAG)' Cargo.toml
         # Python wheel version
-        yq -i -p toml -o toml '.project.version = strenv(TAG)' python/pyproject.toml
+        "$YQ" -i -p toml -o toml '.project.version = strenv(TAG)' python/pyproject.toml
         sed -i.bak "s/--version 0.0.0-dev/--version ${TAG}/g" docs/installation/kubernetes.md
         rm -f docs/installation/kubernetes.md.bak
