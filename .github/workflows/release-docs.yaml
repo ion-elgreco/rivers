@@ -65,7 +65,10 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
         run: |
+          # Strip leading v and any -<suffix> (retry tags like v0.1.1-2
+          # ship as the underlying 0.1.1).
           version="${REF_NAME#v}"
+          version="${version%-*}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
       - name: Set release version
