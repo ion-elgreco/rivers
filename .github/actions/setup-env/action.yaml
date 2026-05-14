@@ -18,7 +18,7 @@ inputs:
     default: "true"
 
   cross_compile:
-    description: "Install the cross-compile toolchain (cargo-zigbuild + zig as the cross linker). Release workflows that produce linux/amd64 + linux/arm64 artifacts from a single runner set this to 'true'. binaryen for wasm-opt is installed unconditionally — it's needed by `just wasm` whenever the SSR rivers-ui binary is built, and the apt install is cheap."
+    description: "Install the cross-compile toolchain (cargo-zigbuild + zig as the cross linker). Release workflows that produce linux/amd64 + linux/arm64 artifacts from a single runner set this to 'true'."
     required: false
     default: "false"
 
@@ -66,16 +66,12 @@ runs:
         # Save partial compilation
         cache-on-failure: "true"
 
-    - name: Install protoc + binaryen
+    - name: Install protoc
       shell: bash
       run: |
         set -euo pipefail
         sudo apt-get update -qq
-        # binaryen ships `wasm-opt`, used by `just wasm` to optimize the
-        # rivers-ui hydration WASM. Cheap (~5s) so we install it on every
-        # run rather than gating on a flag — gating proved fragile.
-        sudo apt-get install -y -qq protobuf-compiler binaryen
-        wasm-opt --version
+        sudo apt-get install -y -qq protobuf-compiler
 
     # wasm-bindgen-cli is used by `just wasm` / `just wasm-dev` (driven directly
     # so we can pass a custom cargo profile — wasm-pack can't)

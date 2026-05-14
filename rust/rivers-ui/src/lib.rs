@@ -251,10 +251,11 @@ mod server {
             )
             .fallback(|| async { (StatusCode::NOT_FOUND, "Not found") })
             .with_state(leptos_options)
-            // application/wasm is already heavily compressed by wasm-opt and
-            // is large; brotli on every fetch pins the runtime worker for
-            // multiple seconds (~2s for the 5 MB optimized blob, even worse
-            // for dev builds). The browser-side gain is minimal — skip it.
+            // application/wasm is large; brotli on every fetch pins the runtime
+            // worker for multiple seconds (~2s for the 5 MB blob, even worse for
+            // dev builds). Release builds precompress to .wasm.br in build.rs and
+            // serve_wasm_bg returns that directly — runtime compression here would
+            // re-do that work for nothing.
             .layer(CompressionLayer::new().br(true).gzip(true).compress_when(
                 DefaultPredicate::new().and(NotForContentType::const_new("application/wasm")),
             ));

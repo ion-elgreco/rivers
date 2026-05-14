@@ -14,7 +14,7 @@ For larger changes, please open an [issue](https://github.com/ion-elgreco/rivers
 
 Optional, only for specific recipes:
 
-- `wasm-pack`, `wasm-bindgen`, `binaryen` (`wasm-opt`) — for `just develop` (release WASM)
+- `wasm-pack`, `wasm-bindgen` — for `just develop` (release WASM)
 - `helm` + the [`helm-unittest`](https://github.com/helm-unittest/helm-unittest) plugin — for `just test-helm`
 - `cargo-zigbuild` — for cross-compiling K8s images on macOS
 
@@ -28,7 +28,7 @@ cd rivers
 just develop-fast
 ```
 
-`just develop-fast` is the default for day-to-day work — it skips `wasm-opt` and embeds an unoptimized WASM blob (~187 MB). It is **not** suitable for shipping or for K8s images. For UI release builds or anything you'd publish, use `just develop` instead (requires `binaryen`).
+`just develop-fast` is the default for day-to-day work — it builds the WASM with the dev cargo profile (preserves panic symbols, larger blob, much faster rebuilds). It is **not** suitable for shipping or for K8s images. For UI release builds or anything you'd publish, use `just develop` instead.
 
 After the first build, the editable wheel is installed into `.venv`. Re-run `just develop-fast` whenever you change Rust code; pure-Python edits don't need a rebuild.
 

@@ -113,8 +113,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Build and install rivers
-        # Python tests don't need the optimized UI bundle; develop-fast
-        # skips wasm-opt to save a few seconds in CI.
+        # Python tests don't need the release UI bundle; develop-fast
+        # builds the WASM dev-profile to save a few seconds in CI.
         run: just develop-fast
 
       - name: Run tests

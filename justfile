@@ -18,14 +18,12 @@ _default:
 venv:
     uv sync --no-install-workspace --all-extras
 
-# Build the UI's hydration WASM (release) and shrink it in-place with wasm-opt -Oz (requires binaryen)
+# Build the UI's hydration WASM (release).
 wasm:
     cargo build -p rivers-ui --target wasm32-unknown-unknown --release --no-default-features --features hydrate
     wasm-bindgen target/wasm32-unknown-unknown/release/rivers_ui.wasm --out-dir rust/rivers-ui/pkg --target web --no-typescript
-    # --all-features: rustc emits bulk-memory / sign-ext / nontrapping-float-to-int ops that wasm-opt rejects by default
-    wasm-opt -Oz --all-features -o rust/rivers-ui/pkg/rivers_ui_bg.wasm rust/rivers-ui/pkg/rivers_ui_bg.wasm
 
-# Build WASM in dev mode — preserves panic messages/symbols for debugging (no wasm-opt).
+# Build WASM in dev mode — preserves panic messages/symbols for debugging.
 # Honors $PROFILE so host build-deps (proc-macros, build.rs deps) land in the same
 # `target/<profile>/` dir as the follow-up `maturin develop --profile $PROFILE`,
 # letting the two steps share artifacts. wasm-pack hardcodes `dev`/`release` and
@@ -35,11 +33,11 @@ wasm-dev:
     cargo build -p rivers-ui --target wasm32-unknown-unknown --profile {{ profile }} --no-default-features --features hydrate
     wasm-bindgen target/wasm32-unknown-unknown/{{ profile_dir }}/rivers_ui.wasm --out-dir rust/rivers-ui/pkg --target web --no-typescript
 
-# Build and install rivers as editable (release WASM, shrunk via wasm-opt — use for UI work or shipping)
+# Build and install rivers as editable (release WASM — use for UI work or shipping)
 develop: venv wasm
     cd python && VIRTUAL_ENV={{ justfile_directory() }}/.venv uvx --from 'maturin[zig]' maturin develop --profile {{ profile }}
 
-# Faster develop for non-UI work — skips wasm-opt; embeds ~187 MB unoptimized blob (don't use for k8s/release)
+# Faster develop for non-UI work — dev-profile WASM build (preserves panic symbols, larger blob; don't use for k8s/release)
 develop-fast: venv wasm-dev
     cd python && VIRTUAL_ENV={{ justfile_directory() }}/.venv uvx --from 'maturin[zig]' maturin develop --profile {{ profile }}
 
@@ -53,7 +51,7 @@ test:
 
 # Run all Rust workspace tests.
 # - `wasm-dev` is a prerequisite so rivers-ui's `include_bytes!("../pkg/...")`
-#   can resolve when the crate is built with `ssr` (no wasm-opt = faster).
+#   can resolve when the crate is built with `ssr`.
 # - `rivers` (PyO3 cdylib) is excluded; its Rust unit tests need a libpython
 #   link step bare `cargo test` doesn't provide and are exercised indirectly
 #   by the Python test suite.
