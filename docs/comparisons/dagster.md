@@ -15,7 +15,7 @@ Dagster's daemon, schedulers, sensors, partition logic, and execution planning r
 | Execution planner | Python | Compiled Rust |
 | Daemon (schedules, sensors, automation conditions, run queue, backfills) | Python | Compiled Rust |
 | Web UI server | Python + JavaScript bundle (Dagit / Webserver) | Rust (Axum + Leptos SSR + WASM hydration) |
-| Kubernetes integration | Python operator + `dagster-k8s` launcher | Native Rust operator (`kube-rs`) with CRDs |
+| Kubernetes integration | `dagster-k8s` launcher | Native Rust operator (`kube-rs`) with CRDs |
 | Storage backend | Python ORM over PostgreSQL/MySQL/SQLite | SurrealDB v3 (embedded RocksDB locally; SurrealDB server + TiKV for HA) |
 | Python interpreter on the control plane | Yes (everywhere) | **No** — Python only runs inside user code |
 
