@@ -19,7 +19,7 @@ def nightly(context: rs.ScheduleEvaluationContext):
 | `cron_schedule` | `str` | required | Cron expression. 5 fields (`min hour dom mon dow`, e.g. `"0 0 * * *"`) or 6 fields (`sec min hour dom mon dow`, e.g. `"*/30 0 0 * * *"`) — seconds are optional. |
 | `job_name` | `str` | required | Name of the job to trigger. |
 | `name` | `str \| None` | `None` | Schedule name. Defaults to the function name. |
-| `default_status` | `ScheduleStatus` | `Running` | Whether the schedule starts running or stopped. |
+| `default_status` | `ScheduleStatus` | `Stopped` | Whether the schedule starts running or stopped. |
 | `timezone` | `str \| None` | `None` | Timezone for cron evaluation (e.g. `"US/Eastern"`). |
 | `tags` | `dict[str, str] \| None` | `None` | Tags for categorization. |
 | `description` | `str \| None` | `None` | Human-readable description. |
@@ -59,7 +59,7 @@ sched = rs.Schedule(
 | `job_name` | `str` | required | Job to trigger. Cannot be empty. |
 | `name` | `str \| None` | `None` | Schedule name. Defaults to `{job_name}_schedule`. |
 | `evaluation_fn` | `Callable \| None` | `None` | Function called on each tick. |
-| `default_status` | `ScheduleStatus` | `Running` | Initial status. |
+| `default_status` | `ScheduleStatus` | `Stopped` | Initial status. |
 | `timezone` | `str \| None` | `None` | Timezone for cron evaluation. |
 | `tags` | `dict[str, str] \| None` | `None` | Tags for categorization. |
 | `description` | `str \| None` | `None` | Human-readable description. |

@@ -354,6 +354,7 @@ class TestScheduleSensorQueueRegression:
                 cron_schedule="* * * * * *",  # every second
                 job_name="auto_job",
                 name="fast_schedule",
+                default_status=rs.ScheduleStatus.Running,
             )
             def fast_schedule(context: rs.ScheduleEvaluationContext):
                 return rs.RunRequest()
@@ -365,6 +366,7 @@ class TestScheduleSensorQueueRegression:
                 job_name="auto_job",
                 name="fast_sensor",
                 minimum_interval="1s",
+                default_status=rs.SensorStatus.Running,
             )
             def fast_sensor(context: rs.SensorEvaluationContext):
                 return rs.RunRequest()

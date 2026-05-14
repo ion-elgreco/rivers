@@ -64,11 +64,20 @@ def full_grpc_channel(grpc_stubs):
 
     job = rs.Job(name="my_job", assets=[source, sink])
 
-    @rs.Schedule(cron_schedule="0 0 * * *", job_name="my_job", name="daily_sched")
+    @rs.Schedule(
+        cron_schedule="0 0 * * *",
+        job_name="my_job",
+        name="daily_sched",
+        default_status=rs.ScheduleStatus.Running,
+    )
     def daily_sched(context: rs.ScheduleEvaluationContext):
         return rs.RunRequest()
 
-    @rs.Sensor(job_name="my_job", name="my_sensor")
+    @rs.Sensor(
+        job_name="my_job",
+        name="my_sensor",
+        default_status=rs.SensorStatus.Running,
+    )
     def my_sensor(context: rs.SensorEvaluationContext):
         return rs.RunRequest(tags={"tick": "1"})
 

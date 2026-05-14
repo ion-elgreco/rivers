@@ -44,6 +44,7 @@ from rivers import (
     SelfDependency,
     SensorEvaluationContext,
     SensorResult,
+    SensorStatus,
     SkipReason,
     TagConcurrencyLimit,
     Task,
@@ -1240,6 +1241,7 @@ def slow_pipeline_schedule(context: ScheduleEvaluationContext):
     cron_schedule="0 * * * *",
     job_name="ingestion",
     name="hourly_skip_example",
+    default_status=ScheduleStatus.Running,
     description="Demonstrates conditional Schedule skipping",
 )
 def hourly_skip_example(context: ScheduleEvaluationContext):
@@ -1258,6 +1260,7 @@ def hourly_skip_example(context: ScheduleEvaluationContext):
     job_name="analytics",
     name="new_data_sensor",
     minimum_interval="60s",
+    default_status=SensorStatus.Running,
     description="Triggers analytics when new data arrives",
     tags={"team": "data-eng"},
     asset_selection=["enriched_orders", "user_order_summary", "product_revenue"],
@@ -1284,6 +1287,7 @@ def new_data_sensor(context: SensorEvaluationContext) -> SensorResult:
 @Sensor(
     name="file_watcher_sensor",
     minimum_interval="30s",
+    default_status=SensorStatus.Running,
     description="Demonstrates a Sensor with no job (asset-targeted only)",
     asset_selection=["raw_users", "raw_orders"],
 )
@@ -1439,6 +1443,7 @@ def regional_daily_metrics(context: AssetExecutionContext) -> dict:
     name="data_quality_sensor",
     asset_selection=["validated_pipeline"],
     minimum_interval="60s",
+    default_status=SensorStatus.Running,
 )
 def data_quality_sensor(context: SensorEvaluationContext):
     """Detects data quality issues and triggers targeted backfills.

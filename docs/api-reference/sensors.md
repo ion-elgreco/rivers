@@ -25,7 +25,7 @@ def file_sensor(context: rs.SensorEvaluationContext):
 | `job_name` | `str \| None` | `None` | Name of the job to trigger. |
 | `name` | `str \| None` | `None` | Sensor name. Defaults to the function name. |
 | `minimum_interval` | `str \| None` | `None` | Minimum interval between evaluations as a human-readable duration (e.g. `"30s"`, `"1m"`). |
-| `default_status` | `SensorStatus` | `Running` | Whether the sensor starts running or stopped. |
+| `default_status` | `SensorStatus` | `Stopped` | Whether the sensor starts running or stopped. |
 | `description` | `str \| None` | `None` | Human-readable description. |
 | `tags` | `dict[str, str] \| None` | `None` | Tags for categorization. |
 | `asset_selection` | `list[str] \| None` | `None` | Assets this sensor monitors. |
@@ -60,7 +60,7 @@ sensor = rs.Sensor(
 | `job_name` | `str \| None` | `None` | Job to trigger. |
 | `evaluation_fn` | `Callable \| None` | `None` | Function called on each tick. |
 | `minimum_interval` | `str \| None` | `None` | Minimum interval between ticks (e.g. `"30s"`). |
-| `default_status` | `SensorStatus` | `Running` | Initial status. |
+| `default_status` | `SensorStatus` | `Stopped` | Initial status. |
 | `description` | `str \| None` | `None` | Description. |
 | `tags` | `dict[str, str] \| None` | `None` | Tags. |
 | `asset_selection` | `list[str] \| None` | `None` | Assets this sensor monitors. |

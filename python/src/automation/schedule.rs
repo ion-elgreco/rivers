@@ -291,9 +291,9 @@ impl PySkipReason {
 #[derive(Clone, Default, PartialEq)]
 pub enum PyScheduleStatus {
     /// Schedule is active and will be evaluated by the daemon.
-    #[default]
     Running,
     /// Schedule is paused and will not be evaluated.
+    #[default]
     Stopped,
 }
 

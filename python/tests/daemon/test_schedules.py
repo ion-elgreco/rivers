@@ -106,9 +106,9 @@ class TestSchedule:
         )
         assert repr(sched) == "Schedule(name='nightly', cron='0 0 * * *', job='my_job')"
 
-    def test_default_status_is_running(self):
+    def test_default_status_is_stopped(self):
         sched = rs.Schedule(cron_schedule="0 0 * * *", job_name="my_job")
-        assert sched.default_status == rs.ScheduleStatus.Running
+        assert sched.default_status == rs.ScheduleStatus.Stopped
 
 
 # ---------------------------------------------------------------------------

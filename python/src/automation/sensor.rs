@@ -24,9 +24,9 @@ use crate::errors::{
 #[derive(Clone, Default, PartialEq)]
 pub enum PySensorStatus {
     /// Sensor is active and will be evaluated by the daemon.
-    #[default]
     Running,
     /// Sensor is paused and will not be evaluated.
+    #[default]
     Stopped,
 }
 

@@ -210,6 +210,7 @@ def execute(
 ) -> None:
     """Execute a run against a remote SurrealDB. Designed for K8s executor pods."""
     os.environ["RIVERS_DEPLOYMENT"] = "cloud"
+    os.environ["RIVERS_RUN_ID"] = run_id
     storage = Storage.connect(surreal_endpoint)
 
     sys.path.insert(0, ".")
@@ -284,6 +285,7 @@ def execute_step(
 ) -> None:
     """Execute a single step within a run. Designed for K8s step pods."""
     os.environ["RIVERS_DEPLOYMENT"] = "cloud"
+    os.environ["RIVERS_RUN_ID"] = run_id
     surreal_endpoint = os.environ.get("RIVERS_SURREAL_ENDPOINT")
     if not surreal_endpoint:
         typer.echo("Error: RIVERS_SURREAL_ENDPOINT env var is required", err=True)

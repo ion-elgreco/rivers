@@ -26,7 +26,7 @@ class TestSensorDefinition:
         assert sensor.name == "my_sensor"
         assert sensor.job_name is None
         assert sensor.minimum_interval is None
-        assert sensor.default_status == rs.SensorStatus.Running
+        assert sensor.default_status == rs.SensorStatus.Stopped
 
     def test_with_all_options(self):
         sensor = rs.Sensor(
@@ -54,9 +54,9 @@ class TestSensorDefinition:
         sensor = rs.Sensor(name="my_sensor", job_name="my_job")
         assert repr(sensor) == "Sensor(name='my_sensor', job_name=Some(\"my_job\"))"
 
-    def test_default_status_is_running(self):
+    def test_default_status_is_stopped(self):
         sensor = rs.Sensor(name="my_sensor")
-        assert sensor.default_status == rs.SensorStatus.Running
+        assert sensor.default_status == rs.SensorStatus.Stopped
 
 
 # ---------------------------------------------------------------------------

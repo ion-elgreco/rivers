@@ -2344,7 +2344,11 @@ impl PyCodeRepository {
             .graph
             .as_ref()
             .expect("graph resolved by build_and_validate");
-        self.persist_topology(py, &node_map, resolved_graph, &storage_handle)?;
+        // Daemon pod will never set this env var
+        let register_catalog = std::env::var("RIVERS_RUN_ID").is_err();
+        if register_catalog {
+            self.persist_topology(py, &node_map, resolved_graph, &storage_handle)?;
+        }
 
         self.validate_and_build_job_plans(
             py,
@@ -2374,8 +2378,15 @@ impl PyCodeRepository {
             }
         }
 
-        register_assets_from_nodes(&storage_handle, &node_map, py);
-        self.register_pools(py, &node_map, &storage_handle);
+        if register_catalog {
+            register_assets_from_nodes(&storage_handle, &node_map, py);
+            self.register_pools(py, &node_map, &storage_handle);
+        } else {
+            tracing::debug!(
+                target: "rivers::repo",
+                "skipping catalog registration (non-daemon pod)"
+            );
+        }
 
         let run_backend = self.init_run_backend(py, &code_location_id)?;
 
