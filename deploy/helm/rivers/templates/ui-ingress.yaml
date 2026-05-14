@@ -1,0 +1,40 @@
+{{- if and .Values.ui.enabled .Values.ui.ingress.enabled }}
+{{- $host := required "ui.ingress.host is required when ui.ingress.enabled=true — set it to the DNS name the UI is reached at." .Values.ui.ingress.host }}
+{{- $tls := .Values.ui.ingress.tls }}
+{{- if and $tls.enabled (not $tls.secretName) }}
+{{ fail "ui.ingress.tls.secretName is required when ui.ingress.tls.enabled=true — point it at an existing TLS Secret (or one cert-manager will create from your issuer annotation)." }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rivers-ui
+  namespace: {{ include "rivers.namespace" . }}
+  labels:
+    app.kubernetes.io/name: rivers-ui
+    {{- include "rivers.labels" . | nindent 4 }}
+  {{- with .Values.ui.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ui.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- if $tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $host | quote }}
+      secretName: {{ $tls.secretName | quote }}
+  {{- end }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: {{ .Values.ui.ingress.path | quote }}
+            pathType: {{ .Values.ui.ingress.pathType | quote }}
+            backend:
+              service:
+                name: rivers-ui
+                port:
+                  number: {{ .Values.ui.port }}
+{{- end }}

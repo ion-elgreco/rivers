@@ -34,7 +34,7 @@ spec:
       {{- end }}
       containers:
         - name: ui
-          image: {{ .Values.ui.image }}
+          image: {{ .Values.ui.image | default (include "rivers.uiImage" .) }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

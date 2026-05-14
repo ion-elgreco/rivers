@@ -33,7 +33,12 @@ releases:
       - rivers/rivers-crds
     values:
       - operator:
+          # Use the locally-built image (k3d image import), not the ghcr
+          # default the chart points to for releases.
+          image: rivers-operator:latest
           allowInsecureRegistry: true
+        ui:
+          image: rivers-ui:latest
 
   # Dev-cluster scaffolding: MinIO + example CodeLocation CRs.
   - name: rivers-dev

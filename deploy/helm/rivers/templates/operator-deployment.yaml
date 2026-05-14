@@ -41,7 +41,7 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
-          image: {{ .Values.operator.image }}
+          image: {{ .Values.operator.image | default (include "rivers.operatorImage" .) }}
           imagePullPolicy: {{ .Values.operator.imagePullPolicy }}
           ports:
             - containerPort: 9090

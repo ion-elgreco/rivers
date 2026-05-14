@@ -107,7 +107,8 @@ surrealdb:
       memory: 1Gi
 
 operator:
-  image: rivers-operator:latest
+  # Empty defaults to ghcr.io/ion-elgreco/rivers-operator:{{ .Chart.AppVersion }}.
+  image: ""
   imagePullPolicy: IfNotPresent
   # PodDisruptionBudget(minAvailable: 1) is emitted automatically when > 1.
   replicas: 2
@@ -161,7 +162,8 @@ operator:
 
 ui:
   enabled: true
-  image: rivers-ui:latest
+  # Empty defaults to ghcr.io/ion-elgreco/rivers-ui:{{ .Chart.AppVersion }}.
+  image: ""
   imagePullPolicy: IfNotPresent
   port: 3000
   serviceType: ClusterIP
@@ -172,6 +174,18 @@ ui:
     limits:
       cpu: 500m
       memory: 256Mi
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    # Required when enabled=true.
+    host: ""
+    path: /
+    pathType: Prefix
+    tls:
+      enabled: false
+      # Required when tls.enabled=true.
+      secretName: ""
 
 executor:
   serviceAccountName: rivers-executor

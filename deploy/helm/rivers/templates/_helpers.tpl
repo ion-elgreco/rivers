@@ -2,6 +2,20 @@
 {{ .Values.global.namespace | default "rivers" }}
 {{- end -}}
 
+{{/*
+Default image refs. `.Chart.AppVersion` is overridden by the release-helm
+workflow's `helm package --app-version`, so a chart packaged at v0.2.0
+resolves these to `:0.2.0` without touching values.yaml. Override at
+install time via `operator.image` / `ui.image`.
+*/}}
+{{- define "rivers.operatorImage" -}}
+ghcr.io/ion-elgreco/rivers-operator:{{ .Chart.AppVersion }}
+{{- end -}}
+
+{{- define "rivers.uiImage" -}}
+ghcr.io/ion-elgreco/rivers-ui:{{ .Chart.AppVersion }}
+{{- end -}}
+
 {{- define "rivers.surrealEndpoint" -}}
 {{- if .Values.surrealdb.enabled -}}
 ws://surrealdb.{{ include "rivers.namespace" . }}.svc:{{ .Values.surrealdb.service.port }}

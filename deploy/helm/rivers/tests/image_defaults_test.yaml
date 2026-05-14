@@ -1,0 +1,36 @@
+suite: image defaults
+templates:
+  - templates/operator-deployment.yaml
+  - templates/ui-deployment.yaml
+release:
+  name: rivers
+  namespace: rivers
+chart:
+  appVersion: "0.1.0"
+tests:
+  - it: empty image falls back to ghcr.io ref at Chart.AppVersion
+    asserts:
+      - template: templates/operator-deployment.yaml
+        equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/ion-elgreco/rivers-operator:0.1.0
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/ion-elgreco/rivers-ui:0.1.0
+
+  - it: explicit image overrides the ghcr default
+    set:
+      operator.image: rivers-operator:dev
+      ui.image: rivers-ui:dev
+    asserts:
+      - template: templates/operator-deployment.yaml
+        equal:
+          path: spec.template.spec.containers[0].image
+          value: rivers-operator:dev
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        equal:
+          path: spec.template.spec.containers[0].image
+          value: rivers-ui:dev

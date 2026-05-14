@@ -1,0 +1,104 @@
+suite: UI ingress
+templates:
+  - templates/ui-ingress.yaml
+release:
+  name: rivers
+  namespace: rivers
+tests:
+  - it: omits the Ingress by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: omits the Ingress when ui.enabled is false even if ingress.enabled is true
+    set:
+      ui.enabled: false
+      ui.ingress.enabled: true
+      ui.ingress.host: rivers.example.com
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: emits a single-host Ingress pointing at the UI Service when enabled
+    set:
+      ui.ingress.enabled: true
+      ui.ingress.host: rivers.example.com
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: kind
+          value: Ingress
+      - equal:
+          path: apiVersion
+          value: networking.k8s.io/v1
+      - equal:
+          path: metadata.name
+          value: rivers-ui
+      - equal:
+          path: metadata.namespace
+          value: rivers
+      - equal:
+          path: spec.rules[0].host
+          value: rivers.example.com
+      - equal:
+          path: spec.rules[0].http.paths[0].path
+          value: /
+      - equal:
+          path: spec.rules[0].http.paths[0].pathType
+          value: Prefix
+      - equal:
+          path: spec.rules[0].http.paths[0].backend.service.name
+          value: rivers-ui
+      - equal:
+          path: spec.rules[0].http.paths[0].backend.service.port.number
+          value: 3000
+      - isNull:
+          path: spec.ingressClassName
+      - isNull:
+          path: spec.tls
+
+  - it: sets ingressClassName and merges annotations when provided
+    set:
+      ui.ingress.enabled: true
+      ui.ingress.host: rivers.example.com
+      ui.ingress.className: nginx
+      ui.ingress.annotations:
+        cert-manager.io/cluster-issuer: letsencrypt-prod
+    asserts:
+      - equal:
+          path: spec.ingressClassName
+          value: nginx
+      - equal:
+          path: metadata.annotations["cert-manager.io/cluster-issuer"]
+          value: letsencrypt-prod
+
+  - it: adds the TLS block when tls is enabled
+    set:
+      ui.ingress.enabled: true
+      ui.ingress.host: rivers.example.com
+      ui.ingress.tls.enabled: true
+      ui.ingress.tls.secretName: rivers-ui-tls
+    asserts:
+      - equal:
+          path: spec.tls[0].hosts[0]
+          value: rivers.example.com
+      - equal:
+          path: spec.tls[0].secretName
+          value: rivers-ui-tls
+
+  - it: fails install when ingress is enabled without a host
+    set:
+      ui.ingress.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "ui.ingress.host is required"
+
+  - it: fails install when tls is enabled without a secretName
+    set:
+      ui.ingress.enabled: true
+      ui.ingress.host: rivers.example.com
+      ui.ingress.tls.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "ui.ingress.tls.secretName is required"
