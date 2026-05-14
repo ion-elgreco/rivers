@@ -178,10 +178,18 @@ jobs:
       fail-fast: true
       matrix:
         include:
+          # maturin-action defaults MACOSX_DEPLOYMENT_TARGET to 10.12
+          # for x86_64, but rocksdb's C++ uses std::variant which the
+          # libc++ headers gate to 10.13+. Bump explicitly.
           - target: x86_64-apple-darwin
             arch: x86_64
+            deployment-target: "10.13"
           - target: aarch64-apple-darwin
             arch: arm64
+            deployment-target: "11.0"
+
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment-target }}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
