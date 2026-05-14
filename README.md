@@ -1,4 +1,7 @@
-# rivers
+<h1>
+  <img src="https://raw.githubusercontent.com/ion-elgreco/rivers/main/assets/logo.svg" alt="" width="40" height="40" align="left" />
+  rivers
+</h1>
 
 **Orchestration platform for tasks and assets, fully backed by Rust.**
 
