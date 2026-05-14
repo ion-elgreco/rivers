@@ -10,7 +10,7 @@ For larger changes, please open an [issue](https://github.com/ion-elgreco/rivers
 - **Python** ≥ 3.10
 - **[uv](https://docs.astral.sh/uv/)** — package manager for the Python side
 - **[just](https://github.com/casey/just)** — task runner; all dev commands go through the `justfile` at the repo root
-- **Docker** + **[k3d](https://k3d.io/)** — only needed for the Kubernetes integration tests
+- **Docker** + **[k3d](https://k3d.io/)** + **[helmfile](https://helmfile.readthedocs.io/)** — only needed for local Kubernetes development and integration tests
 
 Optional, only for specific recipes:
 
