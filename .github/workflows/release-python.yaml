@@ -125,16 +125,32 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           args: --release --out dist
           sccache: false
-          # surrealdb-librocksdb-sys's build script runs bindgen against
-          # rocksdb's C++ headers, which needs libclang.so at build time.
-          # The stock manylinux2014 (CentOS 7) and musllinux_1_2 (Alpine)
-          # images don't ship it, so install it per container.
+          # rivers-api needs protoc at build time (prost-build);
+          # surrealdb-librocksdb-sys needs libclang.so (bindgen).
+          # Host-side installs aren't visible to the container.
+          # protoc is downloaded as a binary so package-name drift
+          # between manylinux_2_28 (AlmaLinux) and musllinux_1_2
+          # (Alpine) doesn't bite us.
           before-script-linux: |
-            if command -v yum >/dev/null; then
+            set -euo pipefail
+            if command -v dnf >/dev/null; then
+              dnf install -y clang
+            elif command -v yum >/dev/null; then
               yum install -y clang
             elif command -v apk >/dev/null; then
-              apk add --no-cache clang-dev
+              apk add --no-cache clang-dev curl unzip
             fi
+            PROTOC_VERSION=28.3
+            case "$(uname -m)" in
+              x86_64)  PROTOC_ARCH=linux-x86_64 ;;
+              aarch64) PROTOC_ARCH=linux-aarch_64 ;;
+              *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+            esac
+            curl -fsSL -o /tmp/protoc.zip \
+              "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
+            unzip -o /tmp/protoc.zip -d /usr/local
+            rm /tmp/protoc.zip
+            protoc --version
 
       - name: Attest wheel provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
@@ -192,6 +208,10 @@ jobs:
         with:
           name: rivers-ui-pkg
           path: rust/rivers-ui/pkg/
+
+      # rivers-api's prost-build invokes protoc at build time.
+      - name: Install protoc
+        run: brew install protobuf
 
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
@@ -263,6 +283,10 @@ jobs:
       - name: Expose preinstalled libclang to bindgen
         shell: bash
         run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
+
+      # rivers-api's prost-build invokes protoc at build time.
+      - name: Install protoc
+        run: choco install protoc -y --no-progress
 
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
