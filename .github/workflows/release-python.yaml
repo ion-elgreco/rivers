@@ -167,7 +167,8 @@ jobs:
   build-macos:
     name: Build wheel (macos ${{ matrix.arch }})
     needs: build-wasm
-    runs-on: ${{ matrix.runner }}
+
+    runs-on: macos-14
     permissions:
       contents: read       # checkout sources
       id-token: write      # OIDC for Sigstore signing via attest-build-provenance
@@ -179,10 +180,8 @@ jobs:
         include:
           - target: x86_64-apple-darwin
             arch: x86_64
-            runner: macos-13       # last GHA macOS runner with native Intel hw
           - target: aarch64-apple-darwin
             arch: arm64
-            runner: macos-14       # native Apple Silicon
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
