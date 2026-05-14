@@ -4,6 +4,8 @@
 //! Used by both in-process and async executors to convert Python coroutines
 //! into Rust futures via `pyo3-async-runtimes`.
 
+use std::sync::Mutex;
+
 use pyo3::prelude::*;
 use pyo3_async_runtimes::TaskLocals;
 
@@ -12,6 +14,12 @@ use crate::runtime::rt;
 pub(crate) struct AsyncBridge {
     pub(crate) task_locals: TaskLocals,
     loop_obj: Py<PyAny>,
+    // The event-loop thread holds a python guard for the
+    // entirety of `loop.run_forever()`. If we let it outlive the bridge, the
+    // attached tstate can survive into `Py_Finalize` and trip
+    // `PyGILState_Release: thread state must be current when releasing`
+    // (SIGABRT). `shutdown` joins it the thread first; `Drop` is the safety net.
+    loop_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl AsyncBridge {
@@ -21,7 +29,7 @@ impl AsyncBridge {
         let task_locals = TaskLocals::new(loop_obj.clone());
 
         let loop_ref = loop_obj.clone().unbind();
-        std::thread::spawn(move || {
+        let loop_thread = std::thread::spawn(move || {
             Python::try_attach(|py| {
                 let _ = loop_ref.call_method0(py, "run_forever");
             });
@@ -30,6 +38,7 @@ impl AsyncBridge {
         Ok(Self {
             task_locals,
             loop_obj: loop_obj.unbind(),
+            loop_thread: Mutex::new(Some(loop_thread)),
         })
     }
 
@@ -46,16 +55,42 @@ impl AsyncBridge {
                 .loop_obj
                 .call_method1(py, "call_soon_threadsafe", (stop,));
         }
+        let handle = self.loop_thread.lock().unwrap().take();
+        if let Some(h) = handle {
+            py.detach(|| {
+                let _ = h.join();
+            });
+        }
     }
 }
 
 impl Drop for AsyncBridge {
     fn drop(&mut self) {
-        // Best-effort shutdown: try to stop the event loop if Python is available.
-        // If Python is shutting down, try_attach returns None and the thread
-        // will exit when the event loop is garbage collected.
+        let Some(handle) = self.loop_thread.lock().unwrap().take() else {
+            return;
+        };
+        // Try to schedule loop.stop while the interpreter is still alive.
+        let scheduled = Python::try_attach(|py| {
+            let Ok(stop) = self.loop_obj.getattr(py, "stop") else {
+                return false;
+            };
+            self.loop_obj
+                .call_method1(py, "call_soon_threadsafe", (stop,))
+                .is_ok()
+        });
+        if scheduled != Some(true) {
+            // Python is finalizing or unreachable: the loop thread is wedged
+            // inside `run_forever` and joining would deadlock. Leave it to
+            // process teardown.
+            return;
+        }
+        // Join with the GIL released so the loop thread can grab it to run
+        // the scheduled stop callback. `try_attach` returns the current
+        // attach when one is already held (e.g. unwinding past `Python::attach`).
         Python::try_attach(|py| {
-            self.shutdown(py);
+            py.detach(|| {
+                let _ = handle.join();
+            });
         });
     }
 }
