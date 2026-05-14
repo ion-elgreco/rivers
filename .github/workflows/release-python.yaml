@@ -218,6 +218,9 @@ jobs:
         id: version
         env:
           REF_NAME: ${{ github.ref_name }}
+        # windows-latest defaults to pwsh; the bash parameter expansions
+        # below need an explicit shell pin.
+        shell: bash
         run: |
           version="${REF_NAME#v}"
           version="${version%-*}"
