@@ -116,6 +116,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Resolve release version from tag
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       - name: Download all per-arch binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -126,10 +132,10 @@ jobs:
 
       - name: Package tarballs + checksums
         env:
-          REF_NAME: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          version="${REF_NAME#v}"
+          version="${VERSION}"
           mkdir -p dist
           for arch_dir in bins/bins-*; do
             arch="${arch_dir#bins/bins-}"

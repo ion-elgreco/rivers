@@ -53,7 +53,10 @@ jobs:
   build-linux:
     name: Build wheel (linux ${{ matrix.libc }} ${{ matrix.arch }})
     needs: build-wasm
-    runs-on: ubuntu-latest
+    # aarch64 builds run on native arm runners — cross-compiling aws-lc-sys
+    # (pulled in by rustls via surrealdb + kube) through manylinux's
+    # bundled cross-gcc reliably fails on bcm.c.
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read       # checkout sources
       id-token: write      # OIDC for Sigstore signing via attest-build-provenance
@@ -63,24 +66,31 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          # glibc — covers most distros (Debian/Ubuntu/RHEL/...).
+          # glibc — covers most distros from 2019+ (Debian 10+, Ubuntu
+          # 18.10+, RHEL 8+). manylinux2014 (glibc 2.17) is shelved
+          # because its CentOS 7 base only ships clang 3.4, which is too
+          # old for surrealdb-librocksdb-sys's bindgen build.
           - target: x86_64-unknown-linux-gnu
             arch: x86_64
             libc: gnu
-            manylinux: "2014"
+            manylinux: "2_28"
+            runner: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             arch: aarch64
             libc: gnu
-            manylinux: "2014"
+            manylinux: "2_28"
+            runner: ubuntu-24.04-arm
           # musl — covers Alpine and other distroless/musl-based images.
           - target: x86_64-unknown-linux-musl
             arch: x86_64
             libc: musl
             manylinux: musllinux_1_2
+            runner: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             arch: aarch64
             libc: musl
             manylinux: musllinux_1_2
+            runner: ubuntu-24.04-arm
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -112,6 +122,32 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           args: --release --out dist
           sccache: false
+          # rivers-api needs protoc at build time (prost-build);
+          # surrealdb-librocksdb-sys needs libclang.so (bindgen).
+          # Host-side installs aren't visible to the container.
+          # protoc is downloaded as a binary so package-name drift
+          # between manylinux_2_28 (AlmaLinux) and musllinux_1_2
+          # (Alpine) doesn't bite us.
+          before-script-linux: |
+            set -euo pipefail
+            if command -v dnf >/dev/null; then
+              dnf install -y clang
+            elif command -v yum >/dev/null; then
+              yum install -y clang
+            elif command -v apk >/dev/null; then
+              apk add --no-cache clang-dev curl unzip
+            fi
+            PROTOC_VERSION=28.3
+            case "$(uname -m)" in
+              x86_64)  PROTOC_ARCH=linux-x86_64 ;;
+              aarch64) PROTOC_ARCH=linux-aarch_64 ;;
+              *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+            esac
+            curl -fsSL -o /tmp/protoc.zip \
+              "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
+            unzip -o /tmp/protoc.zip -d /usr/local
+            rm /tmp/protoc.zip
+            protoc --version
 
       - name: Attest wheel provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
@@ -128,7 +164,8 @@ jobs:
   build-macos:
     name: Build wheel (macos ${{ matrix.arch }})
     needs: build-wasm
-    runs-on: ${{ matrix.runner }}
+
+    runs-on: macos-14
     permissions:
       contents: read       # checkout sources
       id-token: write      # OIDC for Sigstore signing via attest-build-provenance
@@ -138,12 +175,18 @@ jobs:
       fail-fast: true
       matrix:
         include:
+          # maturin-action defaults MACOSX_DEPLOYMENT_TARGET to 10.12
+          # for x86_64, but rocksdb's C++ uses std::variant which the
+          # libc++ headers gate to 10.13+. Bump explicitly.
           - target: x86_64-apple-darwin
             arch: x86_64
-            runner: macos-13       # last GHA macOS runner with native Intel hw
+            deployment-target: "10.13"
           - target: aarch64-apple-darwin
             arch: arm64
-            runner: macos-14       # native Apple Silicon
+            deployment-target: "11.0"
+
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment-target }}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -166,6 +209,10 @@ jobs:
         with:
           name: rivers-ui-pkg
           path: rust/rivers-ui/pkg/
+
+      # rivers-api's prost-build invokes protoc at build time.
+      - name: Install protoc
+        run: brew install protobuf
 
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
@@ -212,6 +259,9 @@ jobs:
         id: version
         env:
           REF_NAME: ${{ github.ref_name }}
+        # windows-latest defaults to pwsh; the bash parameter expansion
+        # for ${REF_NAME#v} needs an explicit shell pin.
+        shell: bash
         run: echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Set release version
@@ -224,6 +274,17 @@ jobs:
         with:
           name: rivers-ui-pkg
           path: rust/rivers-ui/pkg/
+
+      # surrealdb-librocksdb-sys's bindgen build script needs libclang.dll.
+      # windows-latest ships LLVM preinstalled, but bindgen can't find it
+      # unless LIBCLANG_PATH is set explicitly.
+      - name: Expose preinstalled libclang to bindgen
+        shell: bash
+        run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
+
+      # rivers-api's prost-build invokes protoc at build time.
+      - name: Install protoc
+        run: choco install protoc -y --no-progress
 
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
@@ -263,8 +324,12 @@ jobs:
       - name: List dist
         run: ls -la dist
 
+      # Trusted publishing is handled by PyO3/maturin-action itself:
+      # given `id-token: write` it exchanges the OIDC token for a PyPI
+      # publish token and sets MATURIN_PYPI_TOKEN. No CLI flag needed —
+      # `maturin upload` (1.13) does not accept --trusted-publishing.
       - name: Publish to PyPI
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: upload
-          args: --non-interactive --skip-existing --trusted-publishing automatic dist/*
+          args: --non-interactive --skip-existing dist/*

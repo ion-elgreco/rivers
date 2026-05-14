@@ -27,15 +27,13 @@ runs:
         YQ_VERSION: v4.53.2
       run: |
         set -euo pipefail
-        case "$RUNNER_OS" in
-          Linux)   asset=yq_linux_amd64 ;;
-          macOS)
-            case "$(uname -m)" in
-              arm64)  asset=yq_darwin_arm64 ;;
-              x86_64) asset=yq_darwin_amd64 ;;
-            esac ;;
-          Windows) asset=yq_windows_amd64.exe ;;
-          *) echo "unsupported RUNNER_OS=$RUNNER_OS" >&2; exit 1 ;;
+        case "${RUNNER_OS}/${RUNNER_ARCH}" in
+          Linux/X64)     asset=yq_linux_amd64 ;;
+          Linux/ARM64)   asset=yq_linux_arm64 ;;
+          macOS/X64)     asset=yq_darwin_amd64 ;;
+          macOS/ARM64)   asset=yq_darwin_arm64 ;;
+          Windows/X64)   asset=yq_windows_amd64.exe ;;
+          *) echo "unsupported runner ${RUNNER_OS}/${RUNNER_ARCH}" >&2; exit 1 ;;
         esac
         mkdir -p "$RUNNER_TEMP/yq-bin"
         target="$RUNNER_TEMP/yq-bin/yq"
