@@ -53,7 +53,10 @@ jobs:
   build-linux:
     name: Build wheel (linux ${{ matrix.libc }} ${{ matrix.arch }})
     needs: build-wasm
-    runs-on: ubuntu-latest
+    # aarch64 builds run on native arm runners — cross-compiling aws-lc-sys
+    # (pulled in by rustls via surrealdb + kube) through manylinux's
+    # bundled cross-gcc reliably fails on bcm.c.
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read       # checkout sources
       id-token: write      # OIDC for Sigstore signing via attest-build-provenance
@@ -68,19 +71,23 @@ jobs:
             arch: x86_64
             libc: gnu
             manylinux: "2014"
+            runner: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             arch: aarch64
             libc: gnu
             manylinux: "2014"
+            runner: ubuntu-24.04-arm
           # musl — covers Alpine and other distroless/musl-based images.
           - target: x86_64-unknown-linux-musl
             arch: x86_64
             libc: musl
             manylinux: musllinux_1_2
+            runner: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             arch: aarch64
             libc: musl
             manylinux: musllinux_1_2
+            runner: ubuntu-24.04-arm
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
