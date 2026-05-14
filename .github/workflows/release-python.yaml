@@ -122,6 +122,16 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           args: --release --out dist
           sccache: false
+          # surrealdb-librocksdb-sys's build script runs bindgen against
+          # rocksdb's C++ headers, which needs libclang.so at build time.
+          # The stock manylinux2014 (CentOS 7) and musllinux_1_2 (Alpine)
+          # images don't ship it, so install it per container.
+          before-script-linux: |
+            if command -v yum >/dev/null; then
+              yum install -y clang
+            elif command -v apk >/dev/null; then
+              apk add --no-cache clang-dev
+            fi
 
       - name: Attest wheel provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
