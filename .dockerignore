@@ -1,0 +1,15 @@
+target/
+dist/
+.venv/
+.git/
+.rivers/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+docs/
+benchmarks/
+thoughts/
+rfc/
+*.md
+!python/README.md

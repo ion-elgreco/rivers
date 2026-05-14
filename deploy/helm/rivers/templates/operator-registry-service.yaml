@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rivers-operator-registry
+  namespace: {{ include "rivers.namespace" . }}
+  labels:
+    app.kubernetes.io/name: rivers-operator-registry
+    {{- include "rivers.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: grpc
+      port: {{ .Values.operator.registry.port }}
+      targetPort: registry
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: rivers-operator

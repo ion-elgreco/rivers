@@ -1,0 +1,27 @@
+{{- range .Values.codeLocations }}
+---
+apiVersion: rivers.io/v1alpha1
+kind: CodeLocation
+metadata:
+  name: {{ .name }}
+  namespace: {{ $.Values.namespace }}
+spec:
+  image: {{ .image }}
+  tag: {{ .tag | default "latest" }}
+  {{- with .digest }}
+  digest: {{ . }}
+  {{- end }}
+  module: {{ .module }}
+  replicas: {{ .replicas | default 1 }}
+  env:
+    - name: RIVERS_S3_ENDPOINT
+      value: {{ $.Values.s3.endpoint | quote }}
+    - name: RIVERS_S3_BUCKET
+      value: {{ $.Values.s3.bucket | quote }}
+    - name: AWS_ACCESS_KEY_ID
+      value: {{ $.Values.s3.accessKey | quote }}
+    - name: AWS_SECRET_ACCESS_KEY
+      value: {{ $.Values.s3.secretKey | quote }}
+    - name: AWS_REGION
+      value: {{ $.Values.s3.region | quote }}
+{{- end }}

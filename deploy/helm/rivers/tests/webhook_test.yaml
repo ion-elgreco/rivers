@@ -1,0 +1,113 @@
+suite: webhook cert + MutatingWebhookConfiguration
+templates:
+  - templates/operator-webhook.yaml
+release:
+  name: rivers
+  namespace: rivers
+tests:
+  - it: defaults to selfSigned and emits a TLS Secret + Service + MWC
+    # No values overrides — exercises the chart default (certProvider: selfSigned).
+    asserts:
+      - hasDocuments:
+          count: 3
+      - documentIndex: 0
+        equal:
+          path: kind
+          value: Secret
+      - documentIndex: 0
+        equal:
+          path: type
+          value: kubernetes.io/tls
+      - documentIndex: 0
+        isNotEmpty:
+          path: data["tls.crt"]
+      - documentIndex: 0
+        isNotEmpty:
+          path: data["tls.key"]
+      - documentIndex: 0
+        isNotEmpty:
+          path: data["ca.crt"]
+      - documentIndex: 1
+        equal:
+          path: kind
+          value: Service
+      - documentIndex: 1
+        equal:
+          path: metadata.name
+          value: rivers-operator-webhook
+      - documentIndex: 2
+        equal:
+          path: kind
+          value: MutatingWebhookConfiguration
+      - documentIndex: 2
+        isNotEmpty:
+          path: webhooks[0].clientConfig.caBundle
+      - documentIndex: 2
+        isNotEmpty:
+          path: webhooks[1].clientConfig.caBundle
+      - documentIndex: 2
+        isNull:
+          path: metadata.annotations
+
+  - it: certManager mode emits a cert-manager Certificate, no Secret, MWC has the inject annotation
+    set:
+      operator.webhook.certProvider: certManager
+      operator.webhook.certManager.issuerRef.name: my-issuer
+    asserts:
+      - hasDocuments:
+          count: 3
+      - documentIndex: 0
+        equal:
+          path: kind
+          value: Certificate
+      - documentIndex: 0
+        equal:
+          path: apiVersion
+          value: cert-manager.io/v1
+      - documentIndex: 0
+        equal:
+          path: spec.issuerRef.name
+          value: my-issuer
+      - documentIndex: 0
+        equal:
+          path: spec.issuerRef.kind
+          value: ClusterIssuer
+      - documentIndex: 0
+        equal:
+          path: spec.secretName
+          value: rivers-operator-webhook-cert
+      - documentIndex: 1
+        equal:
+          path: kind
+          value: Service
+      - documentIndex: 2
+        equal:
+          path: kind
+          value: MutatingWebhookConfiguration
+      - documentIndex: 2
+        equal:
+          path: metadata.annotations["cert-manager.io/inject-ca-from"]
+          value: rivers/rivers-operator-webhook-cert
+      - documentIndex: 2
+        equal:
+          path: webhooks[0].clientConfig.caBundle
+          value: ""
+      - documentIndex: 2
+        equal:
+          path: webhooks[1].clientConfig.caBundle
+          value: ""
+
+  - it: certManager mode requires issuerRef.name
+    set:
+      operator.webhook.certProvider: certManager
+      # issuerRef.name intentionally left unset
+    asserts:
+      - failedTemplate:
+          errorPattern: "operator.webhook.certManager.issuerRef.name is required"
+
+  - it: rejects unknown certProvider values
+    set:
+      operator.webhook.certProvider: bogus
+    asserts:
+      - failedTemplate:
+          errorPattern: "certProvider must be 'selfSigned' or 'certManager'"

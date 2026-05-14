@@ -1,0 +1,1294 @@
+"""Integration tests for automation condition evaluation cross-interactions.
+
+Tests verify that when schedules, sensors, or observations trigger upstream
+materializations, downstream assets with eager() automation conditions are
+properly detected and materialized by the real daemon condition eval loop.
+
+All tests use actual AutomationDaemon instances with a fast condition eval
+interval (1s) to avoid waiting 30s per tick.
+"""
+
+import time
+
+import rivers as rs
+from rivers._core import AutomationDaemon
+
+from _polling import wait_for_asset_materialized as _wait_for_asset_materialized
+
+
+def _stale(storage, key):
+    """Live staleness for one asset. ``stale_status`` is no longer persisted —
+    callers go through ``Storage.compute_staleness()``."""
+    return storage.compute_staleness().get(key, ("Missing", []))
+
+
+def _wait_for_asset_up_to_date(storage, key, timeout=15.0, prev_version=None):
+    """Poll until asset record shows UpToDate and has been materialized, or timeout.
+
+    If *prev_version* is given, the record's last_data_version must also differ
+    from it — this detects a genuine re-materialization rather than a stale
+    pre-existing state.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        record = storage.get_asset_record(key)
+        if (
+            record
+            and _stale(storage, key)[0] == "UpToDate"
+            and record.last_data_version is not None
+            and (prev_version is None or record.last_data_version != prev_version)
+        ):
+            return record
+        time.sleep(0.2)
+    return storage.get_asset_record(key)
+
+
+# ---------------------------------------------------------------------------
+# Test: Schedule materializes upstream → downstream eager() fires via daemon
+# ---------------------------------------------------------------------------
+
+
+class TestScheduleTriggersEagerCondition:
+    def test_schedule_materializes_upstream_daemon_materializes_downstream(
+        self, storage
+    ):
+        """A per-second schedule re-materializes 'source' (via a scoped job).
+        Both assets start pre-materialized and UpToDate. The schedule gives
+        source new data, making processed stale. The daemon condition eval
+        loop detects the upstream change and triggers materialization of
+        'processed'.
+
+        Graph: source (schedule → ingest_job) → processed (eager)
+        """
+
+        @rs.Asset(name="source", io_handler=rs.InMemoryIOHandler())
+        def source() -> int:
+            return 42
+
+        @rs.Asset(
+            name="processed",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def processed(source: int) -> int:
+            return source * 2
+
+        # Job that only materializes 'source'
+        ingest_job = rs.Job(name="ingest_job", assets=[source])
+
+        repo = rs.CodeRepository(
+            assets=[source, processed],
+            jobs=[ingest_job],
+            schedules=[],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo.resolve(storage=storage)
+
+        # Pre-materialize both assets so they're UpToDate
+        repo.materialize()
+        assert _stale(storage, "source")[0] == "UpToDate"
+        assert _stale(storage, "processed")[0] == "UpToDate"
+
+        # Now add a schedule that re-materializes source
+        call_count = 0
+
+        @rs.Schedule(
+            cron_schedule="*/5 * * * * *",  # every 5 seconds
+            job_name="ingest_job",
+            default_status=rs.ScheduleStatus.Running,
+        )
+        def every_second(context: rs.ScheduleEvaluationContext):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 1:
+                return rs.RunRequest()
+            return rs.SkipReason("already triggered")
+
+        repo2 = rs.CodeRepository(
+            assets=[source, processed],
+            jobs=[ingest_job],
+            schedules=[every_second],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo2.resolve(storage=storage)
+
+        daemon = AutomationDaemon(
+            repo=repo2,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            # Wait for downstream to be re-materialized by condition eval
+            # (schedule re-materializes source → processed becomes stale → eager fires)
+            record = _wait_for_asset_up_to_date(storage, "processed", timeout=20)
+            assert record is not None
+            status, causes = _stale(storage, "processed")
+            assert status == "UpToDate", (
+                "'processed' should have been materialized by the daemon condition eval"
+            )
+            assert causes == []
+
+            # Verify provenance: processed consumed source's latest data
+            source_rec = storage.get_asset_record("source")
+            assert len(record.last_input_data_versions) == 1
+            assert record.last_input_data_versions[0][0] == "source"
+            assert record.last_input_data_versions[0][1] == source_rec.last_data_version
+        finally:
+            daemon.stop()
+
+    def test_schedule_chain_three_layers(self, storage):
+        """Schedule materializes A → B (eager) gets materialized by daemon →
+        C (eager) gets materialized by daemon, all in a single run.
+
+        Flow:
+        1. Daemon starts, baseline tick captures current dep state
+        2. Schedule fires (5s cron), creates run for A
+        3. Condition eval sees A in-progress → eager for B,C blocked (AnyDepsInProgress)
+        4. A's run completes → condition eval detects completion, re-fetches records
+        5. AnyDepsUpdated fires for B (A's timestamp changed) → B and C fire together
+        6. Single materialize(selection=["b","c"]) executes in topological order
+
+        Graph: A (schedule → source_job) → B (eager) → C (eager)
+        """
+
+        @rs.Asset(name="a", io_handler=rs.InMemoryIOHandler())
+        def a() -> int:
+            return 1
+
+        @rs.Asset(
+            name="b",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def b(a: int) -> int:
+            return a + 10
+
+        @rs.Asset(
+            name="c",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def c(b: int) -> int:
+            return b * 100
+
+        source_job = rs.Job(name="source_job", assets=[a])
+
+        # resolve WITHOUT schedule, materialize everything → UpToDate
+        repo1 = rs.CodeRepository(
+            assets=[a, b, c],
+            jobs=[source_job],
+            schedules=[],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo1.resolve(storage=storage)
+        repo1.materialize()
+
+        assert _stale(storage, "a")[0] == "UpToDate"
+        assert _stale(storage, "b")[0] == "UpToDate"
+        assert _stale(storage, "c")[0] == "UpToDate"
+        prev_b_version = storage.get_asset_record("b").last_data_version
+        prev_c_version = storage.get_asset_record("c").last_data_version
+
+        # new repo WITH schedule targeting only 'a' (5s cron so baseline
+        # captures clean state before schedule fires)
+        call_count = 0
+
+        @rs.Schedule(
+            cron_schedule="*/5 * * * * *",
+            job_name="source_job",
+            default_status=rs.ScheduleStatus.Running,
+        )
+        def trigger_a(context: rs.ScheduleEvaluationContext):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 1:
+                return rs.RunRequest()
+            return rs.SkipReason("done")
+
+        repo2 = rs.CodeRepository(
+            assets=[a, b, c],
+            jobs=[source_job],
+            schedules=[trigger_a],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo2.resolve(storage=storage)
+
+        daemon = AutomationDaemon(
+            repo=repo2,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            # Wait for end of chain to be re-materialized
+            record_c = _wait_for_asset_up_to_date(
+                storage, "c", timeout=30, prev_version=prev_c_version
+            )
+            assert record_c is not None
+            assert _stale(storage, "c")[0] == "UpToDate", (
+                "'c' should have been materialized via chain: schedule→a, eager→b, eager→c"
+            )
+
+            # Verify intermediate was also re-materialized
+            record_b = storage.get_asset_record("b")
+            assert record_b.last_data_version is not None
+            assert record_b.last_data_version != prev_b_version
+            assert _stale(storage, "b")[0] == "UpToDate"
+        finally:
+            daemon.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test: Sensor materializes upstream → downstream eager() fires via daemon
+# ---------------------------------------------------------------------------
+
+
+class TestSensorTriggersEagerCondition:
+    def test_sensor_materializes_upstream_daemon_materializes_downstream(self, storage):
+        """A sensor triggers materialization of 'ingested' (via a scoped job).
+        Downstream 'report' has eager(). The daemon condition eval loop
+        materializes 'report'.
+
+        Graph: ingested (sensor → ingest_job) → report (eager)
+
+        Pre-materialization pattern: resolve without sensor, materialize all,
+        then add sensor and start daemon.
+        """
+
+        @rs.Asset(name="ingested", io_handler=rs.InMemoryIOHandler())
+        def ingested() -> int:
+            return 100
+
+        @rs.Asset(
+            name="report",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def report(ingested: int) -> int:
+            return ingested * 2
+
+        ingest_job = rs.Job(name="ingest_job", assets=[ingested])
+
+        # resolve WITHOUT sensor, materialize everything → UpToDate
+        repo1 = rs.CodeRepository(
+            assets=[ingested, report],
+            jobs=[ingest_job],
+            sensors=[],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo1.resolve(storage=storage)
+        repo1.materialize()
+
+        assert _stale(storage, "ingested")[0] == "UpToDate"
+        assert _stale(storage, "report")[0] == "UpToDate"
+        prev_report_version = storage.get_asset_record("report").last_data_version
+
+        # new repo WITH sensor targeting only 'ingested'
+        call_count = 0
+
+        @rs.Sensor(
+            job_name="ingest_job",
+            minimum_interval="5s",
+            default_status=rs.SensorStatus.Running,
+        )
+        def data_sensor(context: rs.SensorEvaluationContext):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 1:
+                return rs.RunRequest()
+            return rs.SkipReason("already ingested")
+
+        repo2 = rs.CodeRepository(
+            assets=[ingested, report],
+            jobs=[ingest_job],
+            sensors=[data_sensor],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo2.resolve(storage=storage)
+
+        daemon = AutomationDaemon(
+            repo=repo2,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            record = _wait_for_asset_up_to_date(
+                storage, "report", timeout=20, prev_version=prev_report_version
+            )
+            assert record is not None
+            status, causes = _stale(storage, "report")
+            assert status == "UpToDate", (
+                "'report' should have been materialized by daemon after sensor triggered 'ingested'"
+            )
+            assert causes == []
+
+            # Verify provenance
+            ingested_rec = storage.get_asset_record("ingested")
+            assert len(record.last_input_data_versions) == 1
+            assert record.last_input_data_versions[0][0] == "ingested"
+            assert (
+                record.last_input_data_versions[0][1] == ingested_rec.last_data_version
+            )
+        finally:
+            daemon.stop()
+
+    def test_sensor_fan_out_multiple_downstream_eager(self, storage):
+        """Sensor materializes one upstream → three downstream eager assets
+        all get materialized by daemon.
+
+        Graph: ingested (sensor → ingest_job) → report_a (eager)
+                                               → report_b (eager)
+                                               → report_c (eager)
+
+        Pre-materialization pattern: resolve without sensor, materialize all,
+        then add sensor and start daemon.
+        """
+
+        @rs.Asset(name="ingested", io_handler=rs.InMemoryIOHandler())
+        def ingested() -> int:
+            return 1
+
+        @rs.Asset(
+            name="report_a",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def report_a(ingested: int) -> int:
+            return ingested + 1
+
+        @rs.Asset(
+            name="report_b",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def report_b(ingested: int) -> int:
+            return ingested + 2
+
+        @rs.Asset(
+            name="report_c",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def report_c(ingested: int) -> int:
+            return ingested + 3
+
+        ingest_job = rs.Job(name="ingest_job", assets=[ingested])
+
+        # resolve WITHOUT sensor, materialize everything → UpToDate
+        repo1 = rs.CodeRepository(
+            assets=[ingested, report_a, report_b, report_c],
+            jobs=[ingest_job],
+            sensors=[],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo1.resolve(storage=storage)
+        repo1.materialize()
+
+        prev_versions = {}
+        for key in ["report_a", "report_b", "report_c"]:
+            rec = storage.get_asset_record(key)
+            assert _stale(storage, key)[0] == "UpToDate"
+            prev_versions[key] = rec.last_data_version
+
+        # new repo WITH sensor targeting only 'ingested'
+        call_count = 0
+
+        @rs.Sensor(
+            job_name="ingest_job",
+            minimum_interval="5s",
+            default_status=rs.SensorStatus.Running,
+        )
+        def ingest_sensor(context: rs.SensorEvaluationContext):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 1:
+                return rs.RunRequest()
+            return rs.SkipReason("done")
+
+        repo2 = rs.CodeRepository(
+            assets=[ingested, report_a, report_b, report_c],
+            jobs=[ingest_job],
+            sensors=[ingest_sensor],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo2.resolve(storage=storage)
+
+        daemon = AutomationDaemon(
+            repo=repo2,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            for key in ["report_a", "report_b", "report_c"]:
+                record = _wait_for_asset_up_to_date(
+                    storage, key, timeout=20, prev_version=prev_versions[key]
+                )
+                assert record is not None
+                status, causes = _stale(storage, key)
+                assert status == "UpToDate", (
+                    f"'{key}' should have been re-materialized by daemon"
+                )
+                assert causes == []
+        finally:
+            daemon.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test: Schedule → Schedule → automation condition (chained triggers)
+# ---------------------------------------------------------------------------
+
+
+class TestChainedScheduleToCondition:
+    def test_two_schedules_feed_into_eager_downstream(self, storage):
+        """Schedule A materializes 'raw' (raw_job). Schedule B materializes
+        'clean' (clean_job, depends on raw). 'analytics' (eager) depends on
+        'clean' — daemon should materialize it.
+
+        Graph: raw (schedule A → raw_job) → clean (schedule B → clean_job) → analytics (eager)
+
+        Pre-materialization pattern: resolve without schedules, materialize all,
+        then add schedules and start daemon.
+        """
+
+        @rs.Asset(name="raw", io_handler=rs.InMemoryIOHandler())
+        def raw() -> int:
+            return 10
+
+        @rs.Asset(name="clean", io_handler=rs.InMemoryIOHandler())
+        def clean(raw: int) -> int:
+            return raw + 1
+
+        @rs.Asset(
+            name="analytics",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def analytics(clean: int) -> int:
+            return clean * 100
+
+        raw_job = rs.Job(name="raw_job", assets=[raw])
+        clean_job = rs.Job(name="clean_job", assets=[clean], allow_incomplete_deps=True)
+
+        # resolve WITHOUT schedules, materialize everything → UpToDate
+        repo1 = rs.CodeRepository(
+            assets=[raw, clean, analytics],
+            jobs=[raw_job, clean_job],
+            schedules=[],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo1.resolve(storage=storage)
+        repo1.materialize()
+
+        assert _stale(storage, "raw")[0] == "UpToDate"
+        assert _stale(storage, "clean")[0] == "UpToDate"
+        assert _stale(storage, "analytics")[0] == "UpToDate"
+        prev_analytics_version = storage.get_asset_record("analytics").last_data_version
+
+        # new repo WITH schedules targeting raw and clean
+        raw_count = 0
+        clean_count = 0
+
+        @rs.Schedule(
+            cron_schedule="*/5 * * * * *",
+            job_name="raw_job",
+            name="sched_raw",
+            default_status=rs.ScheduleStatus.Running,
+        )
+        def sched_raw(context: rs.ScheduleEvaluationContext):
+            nonlocal raw_count
+            raw_count += 1
+            if raw_count <= 1:
+                return rs.RunRequest()
+            return rs.SkipReason("done")
+
+        @rs.Schedule(
+            cron_schedule="*/5 * * * * *",
+            job_name="clean_job",
+            name="sched_clean",
+            default_status=rs.ScheduleStatus.Running,
+        )
+        def sched_clean(context: rs.ScheduleEvaluationContext):
+            nonlocal clean_count
+            clean_count += 1
+            # Wait a tick so raw is materialized first
+            if 2 <= clean_count <= 2:
+                return rs.RunRequest()
+            return rs.SkipReason("waiting" if clean_count < 2 else "done")
+
+        repo2 = rs.CodeRepository(
+            assets=[raw, clean, analytics],
+            jobs=[raw_job, clean_job],
+            schedules=[sched_raw, sched_clean],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo2.resolve(storage=storage)
+
+        daemon = AutomationDaemon(
+            repo=repo2,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            record = _wait_for_asset_up_to_date(
+                storage, "analytics", timeout=30, prev_version=prev_analytics_version
+            )
+            assert record is not None
+            assert _stale(storage, "analytics")[0] == "UpToDate", (
+                "'analytics' should have been materialized by daemon after schedule chain"
+            )
+
+            # Verify clean was re-materialized by schedule
+            clean_rec = storage.get_asset_record("clean")
+            assert clean_rec.last_data_version is not None
+
+            # Verify provenance chain
+            assert len(record.last_input_data_versions) == 1
+            assert record.last_input_data_versions[0][0] == "clean"
+            assert record.last_input_data_versions[0][1] == clean_rec.last_data_version
+        finally:
+            daemon.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test: External observation → downstream eager condition fires via daemon
+# ---------------------------------------------------------------------------
+
+
+class TestObservationTriggersEagerCondition:
+    def test_observation_triggers_downstream_eager(self, storage):
+        """External asset with on_cron condition gets observed by daemon →
+        downstream 'snapshot' (eager) detects change and gets materialized.
+
+        Graph: ext_feed (on_cron, external) → snapshot (eager)
+
+        No pre-observation: ext_feed starts as Missing. The daemon should:
+        1. Tick 1: on_cron establishes baseline, ext_feed is Missing so
+           eager() blocks snapshot (~AnyDepsMissing is false)
+        2. Tick 2: on_cron fires → ext_feed gets observed (no longer Missing)
+        3. Tick 3: eager() sees AnyDepsUpdated + ~AnyDepsMissing → snapshot materializes
+        """
+        handler = rs.InMemoryIOHandler()
+
+        obs_counter = [0]
+
+        @rs.Asset.external(
+            io_handler=handler,
+            automation_condition=rs.AutomationCondition.on_cron("* * * * * *"),
+        )
+        def ext_feed(context: rs.AssetExecutionContext):
+            obs_counter[0] += 1
+            handler.handle_output(
+                rs.OutputContext(asset_name="ext_feed"), {"price": 100}
+            )
+            return rs.Observation(data_version=f"v{obs_counter[0]}")
+
+        @rs.Asset(
+            name="snapshot",
+            io_handler=handler,
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def snapshot(ext_feed: dict) -> dict:
+            return {"snapshot_price": ext_feed["price"]}
+
+        repo = rs.CodeRepository(
+            assets=[ext_feed, snapshot],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo.resolve(storage=storage)
+
+        # Verify ext_feed starts as Missing
+        ext_rec = storage.get_asset_record("ext_feed")
+        assert _stale(storage, "ext_feed")[0] == "Missing"
+
+        daemon = AutomationDaemon(
+            repo=repo,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            # Wait for ext_feed to be observed first
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                ext_rec = storage.get_asset_record("ext_feed")
+                if ext_rec and ext_rec.last_data_version is not None:
+                    break
+                time.sleep(0.2)
+            ext_rec = storage.get_asset_record("ext_feed")
+            assert ext_rec.last_data_version is not None, (
+                "ext_feed should have been observed by daemon"
+            )
+
+            # Wait for snapshot to be materialized by eager()
+            record = _wait_for_asset_materialized(storage, "snapshot", timeout=20)
+            assert record is not None
+            assert _stale(storage, "snapshot")[0] == "UpToDate", (
+                "'snapshot' should have been materialized by daemon after ext_feed observation"
+            )
+
+            # Verify provenance
+            assert len(record.last_input_data_versions) == 1
+            assert record.last_input_data_versions[0][0] == "ext_feed"
+        finally:
+            daemon.stop()
+
+    def test_observation_chain_through_multiple_layers(self, storage):
+        """ext_feed (on_cron) → aggregated (eager) → report (eager).
+        Daemon observes ext_feed, then materializes aggregated, then report.
+
+        Graph: ext_feed (on_cron, external) → aggregated (eager) → report (eager)
+
+        Observation pre-setup pattern: resolve without on_cron, observe ext_feed
+        and materialize all downstream so everything is UpToDate. Then create
+        new repo with on_cron condition and start daemon.
+        """
+        handler = rs.InMemoryIOHandler()
+
+        obs_counter = [0]
+
+        @rs.Asset.external(
+            io_handler=handler,
+            name="ext_feed",
+        )
+        def ext_feed_plain(context: rs.AssetExecutionContext):
+            handler.handle_output(rs.OutputContext(asset_name="ext_feed"), [10, 20, 30])
+            return rs.Observation(data_version="v0")
+
+        @rs.Asset(
+            name="aggregated",
+            io_handler=handler,
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def aggregated(ext_feed: list) -> int:
+            return sum(ext_feed)
+
+        @rs.Asset(
+            name="report",
+            io_handler=handler,
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def report(aggregated: int) -> str:
+            return f"total={aggregated}"
+
+        # resolve WITHOUT on_cron, observe + materialize all → UpToDate
+        repo1 = rs.CodeRepository(
+            assets=[ext_feed_plain, aggregated, report],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo1.resolve(storage=storage)
+        repo1.observe(asset_names=["ext_feed"])
+        repo1.materialize()
+
+        assert storage.get_asset_record("ext_feed").last_data_version is not None
+        assert _stale(storage, "aggregated")[0] == "UpToDate"
+        assert _stale(storage, "report")[0] == "UpToDate"
+        prev_report_version = storage.get_asset_record("report").last_data_version
+        prev_agg_version = storage.get_asset_record("aggregated").last_data_version
+
+        # new repo WITH on_cron condition on ext_feed
+        @rs.Asset.external(
+            io_handler=handler,
+            automation_condition=rs.AutomationCondition.on_cron("*/5 * * * * *"),
+        )
+        def ext_feed(context: rs.AssetExecutionContext):
+            obs_counter[0] += 1
+            handler.handle_output(rs.OutputContext(asset_name="ext_feed"), [10, 20, 30])
+            return rs.Observation(data_version=f"v{obs_counter[0]}")
+
+        repo2 = rs.CodeRepository(
+            assets=[ext_feed, aggregated, report],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo2.resolve(storage=storage)
+
+        daemon = AutomationDaemon(
+            repo=repo2,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            # Wait for end of chain to be re-materialized
+            record = _wait_for_asset_up_to_date(
+                storage, "report", timeout=30, prev_version=prev_report_version
+            )
+            assert record is not None
+            assert _stale(storage, "report")[0] == "UpToDate", (
+                "'report' should have been materialized via chain: "
+                "on_cron→observe, eager→aggregated, eager→report"
+            )
+
+            # Intermediate should also be re-materialized
+            agg_rec = storage.get_asset_record("aggregated")
+            assert agg_rec.last_data_version is not None
+            assert agg_rec.last_data_version != prev_agg_version
+            assert _stale(storage, "aggregated")[0] == "UpToDate"
+        finally:
+            daemon.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test: Mixed — schedule + sensor feeding downstream eager
+# ---------------------------------------------------------------------------
+
+
+class TestMixedTriggersToEager:
+    def test_schedule_and_sensor_both_feed_eager_downstream(self, storage):
+        """Schedule materializes 'sched_data' (sched_job), sensor materializes
+        'sensor_data' (sensor_job). Both feed into 'combined' (eager).
+        Daemon should materialize 'combined'.
+
+        Graph: sched_data (schedule → sched_job) ─┐
+                                                    ├→ combined (eager)
+               sensor_data (sensor → sensor_job) ─┘
+
+        Pre-materialization pattern: resolve without schedule/sensor, materialize
+        all, then add schedule+sensor and start daemon.
+        """
+
+        @rs.Asset(name="sched_data", io_handler=rs.InMemoryIOHandler())
+        def sched_data() -> int:
+            return 1
+
+        @rs.Asset(name="sensor_data", io_handler=rs.InMemoryIOHandler())
+        def sensor_data() -> int:
+            return 2
+
+        @rs.Asset(
+            name="combined",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def combined(sched_data: int, sensor_data: int) -> int:
+            return sched_data + sensor_data
+
+        sched_job = rs.Job(name="sched_job", assets=[sched_data])
+        sensor_job = rs.Job(name="sensor_job", assets=[sensor_data])
+
+        # resolve WITHOUT schedule/sensor, materialize everything → UpToDate
+        repo1 = rs.CodeRepository(
+            assets=[sched_data, sensor_data, combined],
+            jobs=[sched_job, sensor_job],
+            schedules=[],
+            sensors=[],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo1.resolve(storage=storage)
+        repo1.materialize()
+
+        assert _stale(storage, "sched_data")[0] == "UpToDate"
+        assert _stale(storage, "sensor_data")[0] == "UpToDate"
+        assert _stale(storage, "combined")[0] == "UpToDate"
+        prev_combined_version = storage.get_asset_record("combined").last_data_version
+
+        # new repo WITH schedule + sensor targeting upstreams
+        sched_count = 0
+        sensor_count = 0
+
+        @rs.Schedule(
+            cron_schedule="*/5 * * * * *",
+            job_name="sched_job",
+            name="sched_trigger",
+            default_status=rs.ScheduleStatus.Running,
+        )
+        def sched_trigger(context: rs.ScheduleEvaluationContext):
+            nonlocal sched_count
+            sched_count += 1
+            if sched_count <= 1:
+                return rs.RunRequest()
+            return rs.SkipReason("done")
+
+        @rs.Sensor(
+            name="sensor_trigger",
+            job_name="sensor_job",
+            minimum_interval="5s",
+            default_status=rs.SensorStatus.Running,
+        )
+        def sensor_trigger(context: rs.SensorEvaluationContext):
+            nonlocal sensor_count
+            sensor_count += 1
+            if sensor_count <= 1:
+                return rs.RunRequest()
+            return rs.SkipReason("done")
+
+        repo2 = rs.CodeRepository(
+            assets=[sched_data, sensor_data, combined],
+            jobs=[sched_job, sensor_job],
+            schedules=[sched_trigger],
+            sensors=[sensor_trigger],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo2.resolve(storage=storage)
+
+        daemon = AutomationDaemon(
+            repo=repo2,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            record = _wait_for_asset_up_to_date(
+                storage, "combined", timeout=20, prev_version=prev_combined_version
+            )
+            assert record is not None
+            assert _stale(storage, "combined")[0] == "UpToDate", (
+                "'combined' should have been materialized by daemon "
+                "after both upstreams are ready"
+            )
+
+            # Both upstreams should have been re-materialized
+            assert storage.get_asset_record("sched_data").last_data_version is not None
+            assert storage.get_asset_record("sensor_data").last_data_version is not None
+
+            # Provenance should show both inputs
+            input_names = {iv[0] for iv in record.last_input_data_versions}
+            assert input_names == {"sched_data", "sensor_data"}
+        finally:
+            daemon.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test: Staleness assertions with exact values
+# ---------------------------------------------------------------------------
+
+
+class TestExactStaleCauses:
+    def test_upstream_rematerialization_exact_stale_causes(self, storage):
+        """After upstream re-materialization, downstream has exact stale causes."""
+
+        @rs.Asset(name="upstream", io_handler=rs.InMemoryIOHandler())
+        def upstream() -> int:
+            return 1
+
+        @rs.Asset(
+            name="downstream",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def downstream(upstream: int) -> int:
+            return upstream + 1
+
+        repo = rs.CodeRepository(assets=[upstream, downstream])
+        repo.resolve(storage=storage)
+        repo.materialize()
+
+        # Both up-to-date, no causes
+        snapshot = storage.compute_staleness()
+        assert snapshot["upstream"][0] == "UpToDate"
+        assert snapshot["upstream"][1] == []
+        assert snapshot["downstream"][0] == "UpToDate"
+        assert snapshot["downstream"][1] == []
+
+        # Re-materialize upstream only
+        repo.materialize(selection=["upstream"])
+
+        down_status, down_causes = _stale(storage, "downstream")
+        assert down_status == "Stale"
+        assert len(down_causes) == 1
+        cause = down_causes[0]
+        assert cause.asset_key == "downstream"
+        assert cause.category == "Data"
+        assert cause.dependency == "upstream"
+
+    def test_code_version_exact_stale_causes(self, storage):
+        """Code version change produces exact stale cause."""
+
+        @rs.Asset(name="x", code_version="v1", io_handler=rs.InMemoryIOHandler())
+        def x_v1() -> int:
+            return 1
+
+        repo = rs.CodeRepository(assets=[x_v1])
+        repo.resolve(storage=storage)
+        repo.materialize()
+
+        assert _stale(storage, "x")[1] == []
+
+        # Change code version
+        @rs.Asset(name="x", code_version="v2", io_handler=rs.InMemoryIOHandler())
+        def x_v2() -> int:
+            return 2
+
+        repo2 = rs.CodeRepository(assets=[x_v2])
+        repo2.resolve(storage=storage)
+
+        status, causes = _stale(storage, "x")
+        assert status == "Stale"
+        assert len(causes) == 1
+        cause = causes[0]
+        assert cause.asset_key == "x"
+        assert cause.category == "Code"
+        assert cause.dependency is None
+
+    def test_transitive_exact_stale_causes(self, storage):
+        """A (code change) → B (data stale) → C (data stale).
+        Each has exactly one stale cause pointing to the correct dependency."""
+
+        @rs.Asset(name="a", code_version="v1", io_handler=rs.InMemoryIOHandler())
+        def a() -> int:
+            return 1
+
+        @rs.Asset(name="b", io_handler=rs.InMemoryIOHandler())
+        def b(a: int) -> int:
+            return a + 1
+
+        @rs.Asset(name="c", io_handler=rs.InMemoryIOHandler())
+        def c(b: int) -> int:
+            return b + 1
+
+        repo = rs.CodeRepository(assets=[a, b, c])
+        repo.resolve(storage=storage)
+        repo.materialize()
+
+        # Change a's code version
+        @rs.Asset(name="a", code_version="v2", io_handler=rs.InMemoryIOHandler())
+        def a_v2() -> int:
+            return 10
+
+        repo2 = rs.CodeRepository(assets=[a_v2, b, c])
+        repo2.resolve(storage=storage)
+
+        snapshot = storage.compute_staleness()
+
+        # A: code stale
+        status_a, causes_a = snapshot["a"]
+        assert status_a == "Stale"
+        assert len(causes_a) == 1
+        assert causes_a[0].category == "Code"
+        assert causes_a[0].dependency is None
+
+        # B: data stale from A
+        status_b, causes_b = snapshot["b"]
+        assert status_b == "Stale"
+        assert len(causes_b) == 1
+        assert causes_b[0].category == "Data"
+        assert causes_b[0].dependency == "a"
+
+        # C: data stale from B
+        status_c, causes_c = snapshot["c"]
+        assert status_c == "Stale"
+        assert len(causes_c) == 1
+        assert causes_c[0].category == "Data"
+        assert causes_c[0].dependency == "b"
+
+
+# ---------------------------------------------------------------------------
+# Test: Selective condition evaluation (time-based + downstream only)
+# ---------------------------------------------------------------------------
+
+
+class TestSelectiveConditionEval:
+    def test_cron_subgraph_fires_independent_subgraph_skipped(self, storage):
+        """Selective eval: after the initial tick, only cron + downstream get
+        evaluated when nothing changed in storage. An independent eager subgraph
+        should fire once on the initial tick (catch-up) but NOT on subsequent
+        selective ticks.
+
+        Graph:
+          ext_feed (on_cron, external) → snapshot (eager)   [cron subgraph]
+          source (no condition) → independent (eager)       [independent subgraph]
+
+        The daemon logs which assets fire. We verify:
+        - ext_feed fires multiple times (cron triggers each tick)
+        - snapshot fires at least once
+        - independent fires at most once (initial catch-up only)
+        """
+        handler = rs.InMemoryIOHandler()
+
+        obs_counter = [0]
+        independent_materialize_count = [0]
+
+        @rs.Asset.external(
+            io_handler=handler,
+            automation_condition=rs.AutomationCondition.on_cron("* * * * * *"),
+        )
+        def ext_feed(context: rs.AssetExecutionContext):
+            obs_counter[0] += 1
+            handler.handle_output(
+                rs.OutputContext(asset_name="ext_feed"), {"v": obs_counter[0]}
+            )
+            return rs.Observation(data_version=f"v{obs_counter[0]}")
+
+        @rs.Asset(
+            name="snapshot",
+            io_handler=handler,
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def snapshot(ext_feed: dict) -> dict:
+            return {"snap": ext_feed["v"]}
+
+        @rs.Asset(name="source", io_handler=handler)
+        def source() -> int:
+            return 1
+
+        @rs.Asset(
+            name="independent",
+            io_handler=handler,
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def independent(source: int) -> int:
+            independent_materialize_count[0] += 1
+            return source * 10
+
+        repo = rs.CodeRepository(
+            assets=[ext_feed, snapshot, source, independent],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo.resolve(storage=storage)
+
+        # Pre-materialize source + independent so they're UpToDate
+        repo.materialize(selection=["source", "independent"])
+        assert _stale(storage, "independent")[0] == "UpToDate"
+        # Reset counter after pre-materialization
+        independent_materialize_count[0] = 0
+
+        daemon = AutomationDaemon(
+            repo=repo, storage=storage, condition_eval_interval="1s"
+        )
+        daemon.start()
+        try:
+            # Wait for multiple cron observations to prove selective eval is running
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if obs_counter[0] >= 3:
+                    break
+                time.sleep(0.2)
+            assert obs_counter[0] >= 3, (
+                f"Expected at least 3 observations, got {obs_counter[0]}"
+            )
+
+            # snapshot should have been materialized (downstream of cron)
+            snap_rec = storage.get_asset_record("snapshot")
+            assert snap_rec.last_data_version is not None
+
+            # independent should have materialized at most once (initial catch-up)
+            # On subsequent selective ticks, it's not in the eval set
+            assert independent_materialize_count[0] <= 1, (
+                f"independent materialized {independent_materialize_count[0]} times, "
+                f"expected at most 1 (initial catch-up only)"
+            )
+        finally:
+            daemon.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test: Same-tick cascading via WillBeRequested
+# ---------------------------------------------------------------------------
+
+
+class TestSameTickCascading:
+    def test_will_be_requested_cascades_through_fresh_chain(self, storage):
+        """Three-layer chain starting from Missing. WillBeRequested enables all
+        layers to fire in one daemon tick via Missing.newly_true cascading.
+
+        Graph: source (eager) → mid (eager) → leaf (eager)
+
+        All assets start Missing. On the first daemon tick:
+          source's eager: Missing.newly_true() fires → source in requested_this_tick
+          mid's eager: Missing.newly_true() fires AND any_deps_missing suppressed
+            (source is Missing but WillBeRequested → Missing & !true = false)
+          leaf's eager: same cascading from mid's WillBeRequested
+
+        Without WillBeRequested in any_deps_missing, mid would be blocked
+        (!any_deps_missing = false since source is Missing), requiring source
+        to materialize first. With it, all three fire in one tick.
+        """
+
+        @rs.Asset(
+            name="source",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def source() -> int:
+            return 42
+
+        @rs.Asset(
+            name="mid",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def mid(source: int) -> int:
+            return source * 10
+
+        @rs.Asset(
+            name="leaf",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def leaf(mid: int) -> int:
+            return mid + 1
+
+        repo = rs.CodeRepository(
+            assets=[source, mid, leaf],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo.resolve(storage=storage)
+
+        # All start as Missing
+        assert _stale(storage, "source")[0] == "Missing"
+        assert _stale(storage, "mid")[0] == "Missing"
+        assert _stale(storage, "leaf")[0] == "Missing"
+
+        daemon = AutomationDaemon(
+            repo=repo,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            # All three should fire on the first tick and materialize together
+            record = _wait_for_asset_up_to_date(storage, "leaf", timeout=15)
+            assert record is not None
+            snapshot = storage.compute_staleness()
+            assert snapshot["leaf"][0] == "UpToDate", (
+                "'leaf' should have been materialized via same-tick cascading: "
+                "eager→source, eager→mid, eager→leaf"
+            )
+
+            # Intermediate and source should also be UpToDate
+            mid_rec = storage.get_asset_record("mid")
+            assert mid_rec.last_data_version is not None
+            assert snapshot["mid"][0] == "UpToDate"
+
+            source_rec = storage.get_asset_record("source")
+            assert source_rec.last_data_version is not None
+            assert snapshot["source"][0] == "UpToDate"
+
+            # Verify provenance chain
+            assert len(record.last_input_data_versions) == 1
+            assert record.last_input_data_versions[0][0] == "mid"
+            assert record.last_input_data_versions[0][1] == mid_rec.last_data_version
+
+            assert len(mid_rec.last_input_data_versions) == 1
+            assert mid_rec.last_input_data_versions[0][0] == "source"
+            assert (
+                mid_rec.last_input_data_versions[0][1] == source_rec.last_data_version
+            )
+        finally:
+            daemon.stop()
+
+    def test_will_be_requested_cascades_through_deep_pre_materialized_chain(
+        self, storage
+    ):
+        """Five-layer pre-materialized chain. Schedule fires on A, then B→C→D→E
+        all cascade in the same tick via WillBeRequested.
+
+        Graph: a (schedule → a_job) → b (eager) → c (eager) → d (eager) → e (eager)
+
+        After schedule materializes A:
+          tick: b fires (NewlyUpdated for a) → requested_this_tick
+                c fires (WillBeRequested for b)
+                d fires (WillBeRequested for c)
+                e fires (WillBeRequested for d)
+                All four downstreams materialize in one batch.
+        """
+
+        @rs.Asset(name="a", io_handler=rs.InMemoryIOHandler())
+        def a() -> int:
+            return 1
+
+        @rs.Asset(
+            name="b",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def b(a: int) -> int:
+            return a + 10
+
+        @rs.Asset(
+            name="c",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def c(b: int) -> int:
+            return b + 100
+
+        @rs.Asset(
+            name="d",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def d(c: int) -> int:
+            return c + 1000
+
+        @rs.Asset(
+            name="e",
+            io_handler=rs.InMemoryIOHandler(),
+            automation_condition=rs.AutomationCondition.eager(),
+        )
+        def e(d: int) -> int:
+            return d + 10000
+
+        a_job = rs.Job(name="a_job", assets=[a])
+
+        # pre-materialize everything
+        repo1 = rs.CodeRepository(
+            assets=[a, b, c, d, e],
+            jobs=[a_job],
+            schedules=[],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo1.resolve(storage=storage)
+        repo1.materialize()
+
+        snapshot = storage.compute_staleness()
+        for key in ["a", "b", "c", "d", "e"]:
+            assert snapshot[key][0] == "UpToDate"
+        prev_e_version = storage.get_asset_record("e").last_data_version
+        prev_d_version = storage.get_asset_record("d").last_data_version
+
+        # add schedule targeting only 'a'
+        call_count = 0
+
+        @rs.Schedule(
+            cron_schedule="*/5 * * * * *",
+            job_name="a_job",
+            default_status=rs.ScheduleStatus.Running,
+        )
+        def trigger_a(context: rs.ScheduleEvaluationContext):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 1:
+                return rs.RunRequest()
+            return rs.SkipReason("done")
+
+        repo2 = rs.CodeRepository(
+            assets=[a, b, c, d, e],
+            jobs=[a_job],
+            schedules=[trigger_a],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo2.resolve(storage=storage)
+
+        daemon = AutomationDaemon(
+            repo=repo2,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            # Wait for end of 5-layer chain to be re-materialized
+            record_e = _wait_for_asset_up_to_date(
+                storage, "e", timeout=30, prev_version=prev_e_version
+            )
+            assert record_e is not None
+            snapshot = storage.compute_staleness()
+            assert snapshot["e"][0] == "UpToDate", (
+                "'e' should have been materialized via cascading: "
+                "schedule→a, eager→b, eager→c, eager→d, eager→e"
+            )
+
+            # All intermediate layers should also be re-materialized
+            record_d = storage.get_asset_record("d")
+            assert record_d.last_data_version != prev_d_version
+            assert snapshot["d"][0] == "UpToDate"
+
+            for key in ["b", "c"]:
+                assert snapshot[key][0] == "UpToDate", (
+                    f"'{key}' should have been re-materialized in the cascade"
+                )
+        finally:
+            daemon.stop()

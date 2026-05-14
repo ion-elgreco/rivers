@@ -1,0 +1,40 @@
+name: zizmor
+
+# Static analysis of our GitHub Actions workflows. Catches regressions in the
+# security hardening (unpinned actions, impostor commits, dangerous triggers,
+# overly broad permissions) on every PR — without this, drift creeps in over
+# time as someone copy-pastes a tag-pinned snippet from an example.
+
+on:
+  merge_group:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read  # checkout workflow files; no SARIF upload, so no security-events: write
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@b1d7e1fb5de872772f31590499237e7cce841e8e # v0.5.3
+        with:
+          # Skip the GitHub Code Scanning SARIF upload — code scanning
+          # isn't enabled for this repo and we only care about the
+          # workflow-audit pass/fail signal in the Actions log.
+          advanced-security: false

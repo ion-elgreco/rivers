@@ -1,0 +1,698 @@
+//! Per-tick orchestration for the condition evaluation engine.
+//!
+//! [`ConditionPass`] owns long-lived state across ticks. One tick is
+//! `refresh_cache` → `ensure_time_based_eval_set` → `should_skip` → `run`.
+//! `run` returns a [`MaterializationPlan`] classified into the three dispatch
+//! shapes; dispatch back to Python is the caller's responsibility.
+use std::collections::{HashMap, HashSet};
+
+use anyhow::Result;
+
+use crate::condition::cache::AssetConditionCache;
+use crate::condition::eval::evaluate_with_tree;
+use crate::condition::node::ConditionNode;
+use crate::condition::partition::{
+    PartitionEvalContext, PartitionMappingKind, PartitionResolver, PartitionSelection,
+};
+use crate::condition::state::{
+    CacheSnapshot, ConditionEvalState, EvalContext, EvalNodeResult, EvalResult, RunTagSnapshot,
+    StateUpdateContext, update_condition_state, update_dep_baselines,
+};
+use crate::storage::{BackfillStrategy, PartitionKey, StorageBackend};
+use crate::util::parse_key_datetime;
+
+/// Info about an asset with an automation condition, extracted at daemon
+/// start. Pure-Rust so the per-tick evaluation loop can run inside
+/// [`ConditionPass`] without crossing the FFI per asset.
+pub struct AssetConditionInfo {
+    pub asset_key: String,
+    pub condition: ConditionNode,
+    /// Partition info for this asset. `None` if unpartitioned.
+    pub partition_info: Option<PartitionInfo>,
+    /// Backfill strategy from the `@Asset` decorator (controls how
+    /// multi-partition condition selections are dispatched).
+    pub backfill_strategy: Option<BackfillStrategy>,
+}
+
+/// Partition-level info for a partitioned asset, extracted at daemon start.
+pub struct PartitionInfo {
+    /// All valid partition keys for this asset.
+    pub all_keys: HashSet<PartitionKey>,
+    /// Partition mappings for upstream deps. Key = `(this_asset, upstream_asset)`.
+    pub mappings: HashMap<(String, String), PartitionMappingKind>,
+    /// For time-windowed partitions: the format string used to parse keys.
+    /// Used by `InLatestTimeWindow` to select recent partitions per-tick.
+    pub time_window_fmt: Option<String>,
+}
+
+/// One row of the per-asset evaluation result list, accumulated during
+/// `evaluate` and consumed by `apply_results`.
+pub struct EvalResultRow {
+    pub info_idx: usize,
+    pub result: EvalResult,
+    pub tree: EvalNodeResult,
+    pub duration_us: u64,
+}
+
+/// One asset to materialize this tick, with its (optional) partition selection.
+pub struct ToMaterialize {
+    pub asset_key: String,
+    pub selection: Option<PartitionSelection>,
+}
+
+/// Materializations classified into the three dispatch shapes.
+///
+/// * `unpartitioned` — assets that materialize as a single combined run.
+/// * `single_partition_groups` — assets that fired with one partition key,
+///   bucketed by key so they share a combined run.
+/// * `multi_partition_backfills` — assets that fired across 2+ partition keys,
+///   each becoming its own backfill.
+pub struct MaterializationPlan {
+    pub unpartitioned: Vec<String>,
+    pub single_partition_groups: HashMap<PartitionKey, Vec<String>>,
+    pub multi_partition_backfills: Vec<(String, Vec<PartitionKey>)>,
+}
+
+impl MaterializationPlan {
+    pub fn is_empty(&self) -> bool {
+        self.unpartitioned.is_empty()
+            && self.single_partition_groups.is_empty()
+            && self.multi_partition_backfills.is_empty()
+    }
+}
+
+/// Output of [`ConditionPass::run`]: per-asset eval rows plus the dispatch plan.
+pub struct PassOutput {
+    pub results: Vec<EvalResultRow>,
+    pub plan: MaterializationPlan,
+}
+
+/// Compute partition keys that fall within the latest time window.
+///
+/// For time-windowed partitions (daily, hourly, etc.), parses each partition
+/// key as a datetime using `fmt`, then selects keys whose time is within
+/// `[now_nanos - lookback_delta * 1e9, now_nanos]` (`lookback_delta` is in
+/// seconds). If `lookback_delta` is `None`, only the single latest partition
+/// is returned.
+pub fn compute_latest_time_window_keys(
+    all_keys: &HashSet<PartitionKey>,
+    fmt: &str,
+    now_nanos: i64,
+    lookback_delta: Option<f64>,
+) -> HashSet<PartitionKey> {
+    let parse_nanos = |s: &str| -> Option<i64> {
+        parse_key_datetime(s, fmt)
+            .ok()?
+            .and_utc()
+            .timestamp_nanos_opt()
+    };
+
+    let mut parsed: Vec<(&PartitionKey, i64)> = all_keys
+        .iter()
+        .filter_map(|pk| {
+            let key_str = match pk {
+                PartitionKey::Single { keys } if !keys.is_empty() => &keys[0],
+                _ => return None,
+            };
+            let nanos = parse_nanos(key_str)?;
+            if nanos <= now_nanos {
+                Some((pk, nanos))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if parsed.is_empty() {
+        return HashSet::new();
+    }
+
+    parsed.sort_by(|a, b| b.1.cmp(&a.1));
+
+    match lookback_delta {
+        Some(delta_secs) => {
+            let lookback_nanos = (delta_secs * 1_000_000_000.0) as i64;
+            let cutoff = now_nanos - lookback_nanos;
+            parsed
+                .into_iter()
+                .filter(|(_, ts)| *ts >= cutoff)
+                .map(|(pk, _)| pk.clone())
+                .collect()
+        }
+        None => HashSet::from([parsed[0].0.clone()]),
+    }
+}
+
+/// Owns the long-lived state of the condition evaluation loop and exposes a
+/// per-tick `run` that returns evaluation results plus a classified
+/// [`MaterializationPlan`]. The outer Python orchestrator drives `refresh_cache`
+/// and `run`, then dispatches the plan via PyO3-bound launchers.
+pub struct ConditionPass {
+    pub cache: AssetConditionCache,
+    pub eval_state: ConditionEvalState,
+    pub conditions: Vec<AssetConditionInfo>,
+    /// Index into `conditions` keyed by asset name; built once at construction.
+    pub conditions_by_key: HashMap<String, usize>,
+    /// Set of asset keys with active conditions, used by `update_dep_baselines`.
+    pub active: HashSet<String>,
+    pub has_time_based: bool,
+    /// Lazily computed once `cache.initialized`; the asset subset to evaluate
+    /// when storage hasn't changed but time-based conditions need re-eval.
+    pub time_based_eval_set: Option<HashSet<String>>,
+    pub upstream_partition_keys: HashMap<String, HashSet<PartitionKey>>,
+}
+
+impl ConditionPass {
+    /// Build a new pass. `conditions` is expected to be in topological order
+    /// (deps before downstreams) so single-tick `WillBeRequested` cascading
+    /// works correctly.
+    pub fn new(
+        cache: AssetConditionCache,
+        eval_state: ConditionEvalState,
+        conditions: Vec<AssetConditionInfo>,
+        upstream_partition_keys: HashMap<String, HashSet<PartitionKey>>,
+    ) -> Self {
+        let conditions_by_key: HashMap<String, usize> = conditions
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.asset_key.clone(), i))
+            .collect();
+        let active: HashSet<String> = conditions.iter().map(|c| c.asset_key.clone()).collect();
+        let has_time_based = conditions
+            .iter()
+            .any(|c| c.condition.has_time_based_conditions());
+        Self {
+            cache,
+            eval_state,
+            conditions,
+            conditions_by_key,
+            active,
+            has_time_based,
+            time_based_eval_set: None,
+            upstream_partition_keys,
+        }
+    }
+
+    /// Refresh `cache` from storage atomically. Returns whether anything
+    /// changed; surface errors so the caller can decide whether to skip
+    /// the tick. `now` (wall-clock nanos) is used by the cache to evict
+    /// dispatched-but-never-confirmed run_ids that have outlived the
+    /// pending-grace window.
+    pub async fn refresh_cache<S: StorageBackend>(
+        &mut self,
+        storage: &S,
+        now: i64,
+    ) -> Result<bool> {
+        self.cache.refresh(storage, now).await
+    }
+
+    /// Lazily compute the time-based eval subset once cache is initialized.
+    /// Only relevant when conditions contain time-based nodes (e.g.
+    /// `CronTickPassed`). The subset includes their downstream descendants
+    /// so cron cascades fire same-tick.
+    pub fn ensure_time_based_eval_set(&mut self) {
+        if !self.has_time_based || !self.cache.initialized || self.time_based_eval_set.is_some() {
+            return;
+        }
+        let conds_for_set: Vec<(String, ConditionNode)> = self
+            .conditions
+            .iter()
+            .map(|c| (c.asset_key.clone(), c.condition.clone()))
+            .collect();
+        let eval_set = self.cache.compute_time_based_eval_set(&conds_for_set);
+        self.time_based_eval_set = Some(eval_set);
+    }
+
+    /// Skip this tick when nothing has changed in storage AND we're past
+    /// the initial tick AND no time-based conditions need re-eval.
+    pub fn should_skip(&self, has_changes: bool) -> bool {
+        !has_changes
+            && self.cache.initialized
+            && !self.eval_state.is_initial
+            && !self.has_time_based
+    }
+
+    /// One full tick: evaluate every condition tree (or the time-based subset
+    /// when `selective`), apply per-asset state mutations, and return the
+    /// classified materialization plan.
+    pub fn run(&mut self, now: i64, selective: bool) -> PassOutput {
+        if self.eval_state.is_initial {
+            self.eval_state.is_initial = false;
+        }
+        let results = self.evaluate(now, selective);
+        let to_materialize = self.apply_results(&results, now);
+        let plan = self.classify_materializations(to_materialize);
+        PassOutput { results, plan }
+    }
+
+    fn evaluate(&self, now: i64, selective: bool) -> Vec<EvalResultRow> {
+        let in_progress_keys: HashSet<String> =
+            self.cache.in_progress_assets.keys().cloned().collect();
+
+        // WillBeRequested reads this set inside dep pivots for single-tick cascading.
+        let mut requested_this_tick: HashSet<String> = HashSet::new();
+        let mut results: Vec<EvalResultRow> = Vec::new();
+
+        for (idx, info) in self.conditions.iter().enumerate() {
+            if selective
+                && let Some(ref eval_set) = self.time_based_eval_set
+                && !eval_set.contains(&info.asset_key)
+            {
+                continue;
+            }
+            let record = match self.cache.records.get(&info.asset_key) {
+                Some(r) => r,
+                None => continue,
+            };
+            let prev = &self.eval_state.assets[&info.asset_key];
+
+            let latest_tw_keys = info.partition_info.as_ref().and_then(|pi| {
+                let fmt = pi.time_window_fmt.as_ref()?;
+                let lookback = info.condition.find_lookback_delta()?;
+                Some(compute_latest_time_window_keys(
+                    &pi.all_keys,
+                    fmt,
+                    now,
+                    lookback,
+                ))
+            });
+
+            let pctx = info.partition_info.as_ref().and_then(|pi| {
+                self.cache
+                    .partition_status
+                    .get(&info.asset_key)
+                    .map(|status| PartitionEvalContext {
+                        all_keys: &pi.all_keys,
+                        materialized: &status.materialized,
+                        in_progress: &status.in_progress,
+                        failed: &status.failed,
+                        timestamps: &status.timestamps,
+                        resolver: PartitionResolver::new(
+                            pi.mappings.clone(),
+                            self.upstream_partition_keys.clone(),
+                        ),
+                        latest_time_window_keys: latest_tw_keys.as_ref(),
+                        all_partition_statuses: &self.cache.partition_status,
+                    })
+            });
+
+            let ctx = EvalContext {
+                target_key: &info.asset_key,
+                root_key: &info.asset_key,
+                target_record: record,
+                cache: CacheSnapshot {
+                    records: &self.cache.records,
+                    upstream_deps: &self.cache.upstream_deps,
+                    in_progress_assets: &in_progress_keys,
+                    failed_assets: &self.cache.failed_assets,
+                    backfill: &self.cache.backfill,
+                },
+                tags: RunTagSnapshot {
+                    last_run_tags: &self.cache.last_run_tags,
+                    partition_last_run_tags: &self.cache.partition_last_run_tags,
+                    tick_materialization_tags: &self.cache.tick_materialization_tags,
+                    tick_partition_materialization_tags: &self
+                        .cache
+                        .tick_partition_materialization_tags,
+                    last_run_asset_names: &self.cache.last_run_asset_names,
+                    partition_last_run_asset_names: &self.cache.partition_last_run_asset_names,
+                },
+                prev_state: prev,
+                all_asset_states: &self.eval_state.assets,
+                requested_this_tick: &requested_this_tick,
+                now,
+                is_initial: self.eval_state.is_initial || prev.is_initial,
+                partitions: pctx.as_ref(),
+            };
+            let start = std::time::Instant::now();
+            let (eval_result, tree) = evaluate_with_tree(&info.condition, &ctx);
+            let duration_us = start.elapsed().as_micros() as u64;
+
+            if eval_result.fired {
+                requested_this_tick.insert(info.asset_key.clone());
+            }
+
+            results.push(EvalResultRow {
+                info_idx: idx,
+                result: eval_result,
+                tree,
+                duration_us,
+            });
+        }
+        results
+    }
+
+    fn apply_results(&mut self, results: &[EvalResultRow], now: i64) -> Vec<ToMaterialize> {
+        let mut to_materialize: Vec<ToMaterialize> = Vec::new();
+
+        for row in results {
+            let info = &self.conditions[row.info_idx];
+            let record = match self.cache.records.get(&info.asset_key) {
+                Some(r) => r,
+                None => continue,
+            };
+            let prev = self.eval_state.assets.get_mut(&info.asset_key).unwrap();
+
+            let partition_timestamps = info.partition_info.as_ref().and_then(|_| {
+                self.cache
+                    .partition_status
+                    .get(&info.asset_key)
+                    .map(|status| &status.timestamps)
+            });
+            let was_initial = prev.is_initial;
+            let update_ctx = StateUpdateContext {
+                target_record_timestamp: record.last_timestamp,
+                target_data_version: record.last_data_version.as_ref(),
+                now,
+                is_initial: was_initial,
+                partition_timestamps,
+            };
+            update_condition_state(prev, &update_ctx, &row.result);
+
+            // Baseline dep state when fired or on initial tick so that
+            // NewlyUpdated has previous timestamps to compare against.
+            if row.result.fired || was_initial {
+                update_dep_baselines(
+                    &mut self.eval_state.assets,
+                    &self.cache.upstream_deps,
+                    &self.active,
+                    &self.cache.partition_status,
+                    &self.cache.records,
+                );
+            }
+
+            if row.result.fired && !self.cache.in_progress_assets.contains_key(&info.asset_key) {
+                to_materialize.push(ToMaterialize {
+                    asset_key: info.asset_key.clone(),
+                    selection: row.result.selection.clone(),
+                });
+            }
+        }
+
+        for tm in &to_materialize {
+            if let Some(prev) = self.eval_state.assets.get_mut(&tm.asset_key) {
+                prev.last_handled_timestamp = Some(now);
+            }
+            if let Some(PartitionSelection::Keys(keys)) = &tm.selection {
+                tracing::info!(
+                    target: "rivers::daemon",
+                    asset_key = %tm.asset_key,
+                    partitions = keys.len(),
+                    "condition fired, triggering partition materialization"
+                );
+            } else {
+                tracing::info!(
+                    target: "rivers::daemon",
+                    asset_key = %tm.asset_key,
+                    "condition fired, triggering materialization"
+                );
+            }
+        }
+
+        to_materialize
+    }
+
+    /// Split the materialization list into the three dispatch shapes:
+    /// * unpartitioned bulk
+    /// * single-partition groups (bucketed by partition key)
+    /// * multi-partition backfills
+    ///
+    /// Selections of `Some(All)` or `None` for a partitioned asset are
+    /// resolved to all of the asset's partition keys; for an unpartitioned
+    /// asset they collapse to the bulk path. Marks each materialized asset
+    /// present in `cache.in_progress_assets` so subsequent ticks see it as
+    /// in-progress before the dispatch loop pushes any run ids.
+    fn classify_materializations(
+        &mut self,
+        to_materialize: Vec<ToMaterialize>,
+    ) -> MaterializationPlan {
+        let mut unpartitioned: Vec<String> = Vec::new();
+        let mut partitioned_mats: Vec<(String, Vec<PartitionKey>)> = Vec::new();
+
+        for tm in to_materialize {
+            self.cache
+                .in_progress_assets
+                .entry(tm.asset_key.clone())
+                .or_default();
+            match tm.selection {
+                Some(PartitionSelection::Keys(keys)) if !keys.is_empty() => {
+                    partitioned_mats.push((tm.asset_key, keys.into_iter().collect()));
+                }
+                Some(PartitionSelection::All) | None => {
+                    let resolved = self
+                        .conditions_by_key
+                        .get(tm.asset_key.as_str())
+                        .map(|&idx| &self.conditions[idx])
+                        .and_then(|info| info.partition_info.as_ref())
+                        .map(|pi| pi.all_keys.iter().cloned().collect::<Vec<_>>());
+                    match resolved {
+                        Some(all_keys) if !all_keys.is_empty() => {
+                            partitioned_mats.push((tm.asset_key, all_keys));
+                        }
+                        Some(_) => {} // partitioned asset with zero keys — drop
+                        None => unpartitioned.push(tm.asset_key),
+                    }
+                }
+                _ => {
+                    unpartitioned.push(tm.asset_key);
+                }
+            }
+        }
+
+        let mut single_partition_groups: HashMap<PartitionKey, Vec<String>> = HashMap::new();
+        let mut multi_partition_backfills: Vec<(String, Vec<PartitionKey>)> = Vec::new();
+        for (asset_key, partition_keys) in partitioned_mats {
+            if partition_keys.len() == 1 {
+                single_partition_groups
+                    .entry(partition_keys.into_iter().next().unwrap())
+                    .or_default()
+                    .push(asset_key);
+            } else {
+                multi_partition_backfills.push((asset_key, partition_keys));
+            }
+        }
+
+        MaterializationPlan {
+            unpartitioned,
+            single_partition_groups,
+            multi_partition_backfills,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spk(s: &str) -> PartitionKey {
+        PartitionKey::Single {
+            keys: vec![s.to_string()],
+        }
+    }
+
+    fn make_daily_keys(keys: &[&str]) -> HashSet<PartitionKey> {
+        keys.iter().map(|k| spk(k)).collect()
+    }
+
+    /// Helper: convert "YYYY-MM-DD HH:MM" to nanos.
+    fn to_nanos(dt_str: &str) -> i64 {
+        chrono::NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%d %H:%M")
+            .unwrap()
+            .and_utc()
+            .timestamp_nanos_opt()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_compute_at_start_date_includes_current() {
+        let all_keys = make_daily_keys(&["2026-03-01"]);
+        let now = to_nanos("2026-03-01 00:00");
+        let result = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, None);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&spk("2026-03-01")));
+    }
+
+    #[test]
+    fn test_compute_latest_single_partition_no_lookback() {
+        let all_keys = make_daily_keys(&["2026-03-20", "2026-03-21", "2026-03-22", "2026-03-23"]);
+        let now = to_nanos("2026-03-23 01:00");
+        let result = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, None);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&spk("2026-03-23")));
+    }
+
+    #[test]
+    fn test_compute_latest_advances_with_time() {
+        let all_keys = make_daily_keys(&[
+            "2026-03-20",
+            "2026-03-21",
+            "2026-03-22",
+            "2026-03-23",
+            "2026-03-24",
+            "2026-03-25",
+            "2026-03-26",
+        ]);
+        let now1 = to_nanos("2026-03-22 01:00");
+        let r1 = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now1, None);
+        assert_eq!(r1.len(), 1);
+        assert!(r1.contains(&spk("2026-03-22")));
+
+        let now2 = to_nanos("2026-03-26 01:00");
+        let r2 = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now2, None);
+        assert_eq!(r2.len(), 1);
+        assert!(r2.contains(&spk("2026-03-26")));
+    }
+
+    #[test]
+    fn test_compute_lookback_3_days() {
+        let all_keys = make_daily_keys(&[
+            "2026-03-20",
+            "2026-03-21",
+            "2026-03-22",
+            "2026-03-23",
+            "2026-03-24",
+            "2026-03-25",
+            "2026-03-26",
+        ]);
+        let now = to_nanos("2026-03-26 01:00");
+        let lookback_secs = 3.0 * 86400.0;
+        let result =
+            compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, Some(lookback_secs));
+        // cutoff = 2026-03-23 01:00. 03-23 at midnight is before cutoff, excluded.
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(&spk("2026-03-24")));
+        assert!(result.contains(&spk("2026-03-25")));
+        assert!(result.contains(&spk("2026-03-26")));
+    }
+
+    #[test]
+    fn test_compute_lookback_advances_with_time() {
+        let all_keys = make_daily_keys(&[
+            "2026-03-15",
+            "2026-03-16",
+            "2026-03-17",
+            "2026-03-18",
+            "2026-03-19",
+            "2026-03-20",
+            "2026-03-21",
+        ]);
+        let now = to_nanos("2026-03-21 01:00");
+        let lookback_secs = 3.0 * 86400.0;
+        let result =
+            compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, Some(lookback_secs));
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(&spk("2026-03-19")));
+        assert!(result.contains(&spk("2026-03-20")));
+        assert!(result.contains(&spk("2026-03-21")));
+    }
+
+    #[test]
+    fn test_compute_future_partitions_excluded() {
+        let all_keys = make_daily_keys(&["2026-03-24", "2026-03-25", "2027-12-31"]);
+        let now = to_nanos("2026-03-25 12:00");
+        let result = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, None);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&spk("2026-03-25")));
+        assert!(!result.contains(&spk("2027-12-31")));
+    }
+
+    #[test]
+    fn test_compute_empty_keys() {
+        let all_keys: HashSet<PartitionKey> = HashSet::new();
+        let now = to_nanos("2026-03-25 12:00");
+        let result = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, None);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_compute_hourly_partitions() {
+        let all_keys = make_daily_keys(&[
+            "2026-03-25T08:00",
+            "2026-03-25T09:00",
+            "2026-03-25T10:00",
+            "2026-03-25T11:00",
+            "2026-03-25T12:00",
+        ]);
+        let now = to_nanos("2026-03-25 12:30");
+        let lookback_secs = 3.0 * 3600.0;
+        let result =
+            compute_latest_time_window_keys(&all_keys, "%Y-%m-%dT%H:%M", now, Some(lookback_secs));
+        // cutoff = 09:30; keys >= 09:30: 10:00, 11:00, 12:00.
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(&spk("2026-03-25T10:00")));
+        assert!(result.contains(&spk("2026-03-25T11:00")));
+        assert!(result.contains(&spk("2026-03-25T12:00")));
+    }
+
+    #[test]
+    fn test_classify_unpartitioned_only() {
+        let mut pass = empty_pass();
+        let to_mat = vec![
+            ToMaterialize {
+                asset_key: "a".into(),
+                selection: None,
+            },
+            ToMaterialize {
+                asset_key: "b".into(),
+                selection: None,
+            },
+        ];
+        let plan = pass.classify_materializations(to_mat);
+        assert_eq!(plan.unpartitioned, vec!["a".to_string(), "b".to_string()]);
+        assert!(plan.single_partition_groups.is_empty());
+        assert!(plan.multi_partition_backfills.is_empty());
+        assert!(pass.cache.in_progress_assets.contains_key("a"));
+        assert!(pass.cache.in_progress_assets.contains_key("b"));
+    }
+
+    #[test]
+    fn test_classify_single_partition_groups_share_run() {
+        let mut pass = empty_pass();
+        let pk = spk("2026-03-26");
+        let to_mat = vec![
+            ToMaterialize {
+                asset_key: "a".into(),
+                selection: Some(PartitionSelection::Keys([pk.clone()].into_iter().collect())),
+            },
+            ToMaterialize {
+                asset_key: "b".into(),
+                selection: Some(PartitionSelection::Keys([pk.clone()].into_iter().collect())),
+            },
+        ];
+        let plan = pass.classify_materializations(to_mat);
+        assert!(plan.unpartitioned.is_empty());
+        assert_eq!(plan.single_partition_groups.len(), 1);
+        let assets = plan.single_partition_groups.get(&pk).unwrap();
+        assert_eq!(assets.len(), 2);
+        assert!(assets.contains(&"a".to_string()));
+        assert!(assets.contains(&"b".to_string()));
+        assert!(plan.multi_partition_backfills.is_empty());
+    }
+
+    #[test]
+    fn test_classify_multi_partition_becomes_backfill() {
+        let mut pass = empty_pass();
+        let keys: HashSet<PartitionKey> =
+            [spk("2026-03-25"), spk("2026-03-26")].into_iter().collect();
+        let to_mat = vec![ToMaterialize {
+            asset_key: "a".into(),
+            selection: Some(PartitionSelection::Keys(keys)),
+        }];
+        let plan = pass.classify_materializations(to_mat);
+        assert!(plan.unpartitioned.is_empty());
+        assert!(plan.single_partition_groups.is_empty());
+        assert_eq!(plan.multi_partition_backfills.len(), 1);
+        let (asset, pks) = &plan.multi_partition_backfills[0];
+        assert_eq!(asset, "a");
+        assert_eq!(pks.len(), 2);
+    }
+
+    fn empty_pass() -> ConditionPass {
+        ConditionPass::new(
+            AssetConditionCache::new("test_cl".into()),
+            ConditionEvalState::default(),
+            Vec::new(),
+            HashMap::new(),
+        )
+    }
+}

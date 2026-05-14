@@ -1,0 +1,29 @@
+namespace: rivers
+
+# MinIO is dev-cluster scaffolding for the example pipelines; production
+# deployments bring their own S3-compatible store and wire creds via
+# CodeLocation.spec.env.
+minio:
+  image: minio/minio:latest
+  mcImage: minio/mc:latest
+  rootUser: rivers
+  rootPassword: riverstest
+  bucket: rivers-io
+
+# S3-compatible env vars stamped onto every CodeLocation's executor and
+# step pods. Defaults point at the in-cluster MinIO above.
+s3:
+  endpoint: http://minio.rivers.svc:9000
+  bucket: rivers-io
+  accessKey: rivers
+  secretKey: riverstest
+  region: us-east-1
+
+# CodeLocations to apply. The rivers operator is deployed with
+# `operator.allowInsecureRegistry: true` so it can resolve digests directly
+# from the HTTP-only k3d registry — `digest` here is optional.
+codeLocations: []
+  # - name: k8s-test-pipeline
+  #   image: k3d-rivers-registry:5000/rivers-code-location
+  #   module: k8s_test_pipeline.pipeline
+  #   replicas: 1

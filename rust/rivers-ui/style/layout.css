@@ -1,0 +1,225 @@
+/* Sidebar */
+.sidebar {
+    width: 232px;
+    min-width: 232px;
+    background: var(--bg-surface-low, #13161a);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    transition: width 0.2s ease, min-width 0.2s ease;
+}
+
+.sidebar--collapsed { width: 60px; min-width: 60px; }
+
+.sidebar-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 18px 18px;
+    white-space: nowrap;
+}
+.sidebar-brand svg { flex-shrink: 0; width: 22px; height: 22px; display: block; }
+.sidebar-brand .brand-stack {
+    display: flex;
+    flex-direction: column;
+    line-height: 1;
+}
+.sidebar-brand .brand-text {
+    font-family: var(--font-display);
+    font-size: 15px;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    color: var(--text);
+}
+.sidebar-brand .brand-version {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: -0.005em;
+    color: var(--text-muted);
+    margin-top: 3px;
+}
+
+.sidebar--collapsed .sidebar-brand { padding: 18px 14px; justify-content: center; }
+
+.sidebar-nav {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 0 8px;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
+}
+
+.sidebar-nav a {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    padding: 9px 12px;
+    border-radius: 4px;
+    color: var(--text-muted);
+    text-decoration: none;
+    font-family: var(--font-sans);
+    font-size: 13px;
+    font-weight: 400;
+    white-space: nowrap;
+    transition:
+        background 0.15s,
+        color 0.15s;
+}
+
+.sidebar--collapsed .sidebar-nav a {
+    justify-content: center;
+    padding: 0.625rem 0;
+    gap: 0;
+}
+
+.nav-icon {
+    flex-shrink: 0;
+    width: 15px;
+    height: 15px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.nav-icon svg { display: block; }
+
+.nav-label {
+    overflow: hidden;
+    white-space: nowrap;
+    transition: opacity 0.15s ease, width 0.2s ease;
+    opacity: 1;
+}
+
+.nav-label--hidden {
+    opacity: 0;
+    width: 0 !important;
+    overflow: hidden;
+}
+
+.sidebar-nav a:hover { background: var(--bg-hover); color: var(--text); }
+
+.sidebar-nav a.active {
+    background: var(--bg-surface);
+    color: var(--text);
+    font-weight: 500;
+    position: relative;
+}
+
+.sidebar-nav a.active::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 8px;
+    bottom: 8px;
+    width: 2px;
+    background: var(--accent);
+    border-radius: 2px;
+}
+
+.sidebar-nav a.active .nav-icon { color: var(--accent); }
+
+.sidebar--collapsed .sidebar-nav a.active::before { left: -2px; }
+
+/* Badge for nav items (e.g. queue count) */
+.nav-badge {
+    margin-left: auto;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--error-bg);
+    color: var(--error);
+    flex-shrink: 0;
+}
+.sidebar--collapsed .nav-badge { display: none; }
+
+/* Main content */
+.main-content {
+    flex: 1;
+    padding: 2rem;
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Prevent flex children from shrinking/collapsing — let them flow naturally
+   and allow main-content to scroll. The graph/lineage page opts in to flex
+   growth via .split-panel { flex: 1 }. */
+.main-content > * { flex-shrink: 0; }
+
+.page-header { margin-bottom: 1.5rem; }
+
+.page-header h1 {
+    font-family: var(--font-display);
+    font-size: 1.5rem;
+    font-weight: 600;
+}
+
+.page-header p {
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+    font-size: 0.875rem;
+}
+.page-header-num { font-family: var(--font-mono); color: var(--text); }
+.page-header-num--error { color: var(--error); }
+.page-header-num--warning { color: var(--warning); }
+.page-header-sep { margin: 0 10px; color: var(--outline-variant); }
+/* Shown in place of the normal count subtitle when the summary fetch
+ * errors — muted so it doesn't compete with the page title, but visible
+ * enough to signal "don't trust zeros here." Full error message lives in
+ * the `title` attribute for operators to inspect on hover. */
+.page-header-summary-error { color: var(--text-muted); font-style: italic; }
+
+/* Backfill-flavored chip: secondary-tinted background + border, with a "BF"
+   prefix. Used wherever a backfill id appears inline as a chip/tag (schedule
+   & sensor tick history, asset-detail automation ticks). */
+.tag--backfill,
+.item-row-chip--backfill {
+    background: color-mix(in oklab, var(--secondary) 12%, transparent);
+    color: var(--secondary);
+    border: 1px solid color-mix(in oklab, var(--secondary) 30%, transparent);
+}
+.chip-backfill-prefix {
+    font-size: 9px;
+    letter-spacing: 0.04em;
+    margin-right: 4px;
+    opacity: 0.7;
+}
+
+/* Rivers asset summary list: stacked rows + colored left rail.
+   Shared by backfill-detail and job-detail. */
+.asset-summary-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-bottom: 28px;
+}
+.asset-summary-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--bg-surface-low);
+    border-left: 2px solid var(--text-muted);
+    text-decoration: none;
+    color: inherit;
+    transition: background 140ms ease;
+}
+.asset-summary-row:hover { background: var(--bg-surface); }
+.asset-summary-key {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text);
+    flex: 1;
+}
+.asset-summary-mat {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: -0.005em;
+    color: var(--text-muted);
+}
+

@@ -1,0 +1,42 @@
+# Sample CodeLocation manifest.
+#
+# Apply with: kubectl apply -n <your-namespace> -f codelocation-sample.yaml
+#
+# The rivers operator reconciles this into a Deployment + Service and writes
+# the pinned digest back to `.status.resolvedImage`. Tag changes upstream
+# trigger a rolling update without editing this file.
+apiVersion: rivers.io/v1alpha1
+kind: CodeLocation
+metadata:
+  name: analytics
+  # Annotate when you trust the tag is immutable and want to skip re-polling
+  # regardless of whether it looks like semver. Optional; semver-like tags
+  # are auto-detected.
+  # annotations:
+  #   rivers.io/tag-immutable: "true"
+spec:
+  image: ghcr.io/acme/analytics-pipeline
+  tag: v1.0.0
+  # Pin the exact digest to bypass registry lookups entirely:
+  # digest: sha256:aabbccddeeff...
+  module: analytics.pipeline
+  replicas: 1
+  grpcPort: 3001
+  # digestRefreshInterval: 5m
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    # limits:
+    #   cpu: "500m"
+    #   memory: "1Gi"
+  # imagePullSecrets:
+  #   - name: ghcr-creds
+  # env:
+  #   - name: AWS_REGION
+  #     value: us-east-1
+  #   - name: API_TOKEN
+  #     valueFrom:
+  #       secretKeyRef:
+  #         name: team-secrets
+  #         key: api-token

@@ -1,0 +1,101 @@
+name: "Setup Python and Rust Environment"
+description: "Set up Python, virtual environment, and Rust toolchain"
+
+inputs:
+  python-version:
+    description: "The Python version to set up"
+    required: false
+    default: "3.13"
+
+  rust-toolchain:
+    description: "The Rust toolchain to set up"
+    required: false
+    default: "stable"
+
+  cache:
+    description: "Enable Swatinem rust-cache via setup-rust-toolchain. Release workflows should set this to 'false'"
+    required: false
+    default: "true"
+
+  cross_compile:
+    description: "Install the cross-compile toolchain (cargo-zigbuild + zig as the cross linker). Release workflows that produce linux/amd64 + linux/arm64 artifacts from a single runner set this to 'true'. binaryen for wasm-opt is installed unconditionally — it's needed by `just wasm` whenever the SSR rivers-ui binary is built, and the apt install is cheap."
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+
+  # Third-party actions are pinned to full commit SHAs (not floating tags), so a
+  # compromised maintainer can't ship malicious code to our CI by force-pushing
+  # the tag. Comment after the SHA records the human-readable version we
+  # originally selected. Bumping = update both.
+
+  steps:
+    # setup just command runner
+    - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+    # setup uv for python dependency/project management
+    - name: Install uv
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      with:
+        # Honor the composite's `cache` input. With cache: false we get
+        # release-safe (no cross-run uv cache) builds.
+        enable-cache: ${{ inputs.cache }}
+
+    - name: Install Python ${{ inputs.python-version }}
+      shell: bash
+      env:
+        PYTHON_VERSION: ${{ inputs.python-version }}
+      run: uv python install "${PYTHON_VERSION}"
+
+    # setup sscache for cache compilation — skipped when cache is disabled
+    # so we don't pay the install cost in release builds that won't use it.
+    - name: Setup sccache
+      if: inputs.cache == 'true'
+      uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+    - name: Setup Rust toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+      with:
+        toolchain: ${{ inputs.rust-toolchain }}
+        # `just wasm` / `just wasm-dev` invoke `cargo build --target
+        # wasm32-unknown-unknown` directly. wasm-pack used to install the
+        # target on demand; cargo doesn't, so we pre-add it here.
+        target: wasm32-unknown-unknown
+        cache: ${{ inputs.cache }}
+        # Save partial compilation
+        cache-on-failure: "true"
+
+    - name: Install protoc + binaryen
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update -qq
+        # binaryen ships `wasm-opt`, used by `just wasm` to optimize the
+        # rivers-ui hydration WASM. Cheap (~5s) so we install it on every
+        # run rather than gating on a flag — gating proved fragile.
+        sudo apt-get install -y -qq protobuf-compiler binaryen
+        wasm-opt --version
+
+    # wasm-bindgen-cli is used by `just wasm` / `just wasm-dev` (driven directly
+    # so we can pass a custom cargo profile — wasm-pack can't)
+    - name: Install wasm-bindgen-cli + wasm-pack
+      uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+      with:
+        tool: wasm-bindgen-cli@0.2.121,wasm-pack@0.14.0
+
+    # Cross-compile linker (cargo-zigbuild + zig) — only release
+    # workflows opt into this.
+    - name: Install cargo-zigbuild
+      if: inputs.cross_compile == 'true'
+      uses: taiki-e/install-action@f44ba2d13a74f48f97453869ad3244dae85c883c # main @ 2026-05-11
+      with:
+        tool: cargo-zigbuild
+
+    - name: Install zig
+      if: inputs.cross_compile == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        pipx install ziglang
+        cargo zigbuild --version

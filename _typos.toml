@@ -1,0 +1,13 @@
+[files]
+extend-exclude = ["python/tests/"]
+
+
+[default.extend-words]
+arro = "arro"
+anc = "anc"
+lod = "lod"
+nd = "nd"
+# `wheres` is a Vec of SQL WHERE clauses in surrealdb_backend.rs — not a typo of `whereas`.
+wheres = "wheres"
+# `abd` only appears as a literal byte string in a constant_time_eq test fixture.
+abd = "abd"

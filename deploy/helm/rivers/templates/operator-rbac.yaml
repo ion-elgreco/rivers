@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rivers-operator
+  namespace: {{ include "rivers.namespace" . }}
+  labels:
+    {{- include "rivers.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rivers-operator
+  labels:
+    {{- include "rivers.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["rivers.io"]
+    resources: ["runs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["rivers.io"]
+    resources: ["runs/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["rivers.io"]
+    resources: ["runs/finalizers"]
+    verbs: ["update"]
+  - apiGroups: ["rivers.io"]
+    resources: ["codelocations"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["rivers.io"]
+    resources: ["codelocations/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["rivers.io"]
+    resources: ["codelocations/finalizers"]
+    verbs: ["update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/status"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rivers-operator
+  labels:
+    {{- include "rivers.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rivers-operator
+subjects:
+  - kind: ServiceAccount
+    name: rivers-operator
+    namespace: {{ include "rivers.namespace" . }}

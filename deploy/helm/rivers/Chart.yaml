@@ -1,0 +1,11 @@
+apiVersion: v2
+name: rivers
+description: rivers orchestration platform — operator, UI, SurrealDB, and code location
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+dependencies:
+  - name: surrealdb
+    version: "0.4.0"
+    repository: "https://helm.surrealdb.com"
+    condition: surrealdb.enabled

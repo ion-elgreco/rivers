@@ -1,0 +1,50 @@
+# Updates run weekly on Mondays and group all patch + minor bumps into a
+# single PR per ecosystem. Major bumps stay split out so they get reviewed
+# individually (they're the ones likely to break the build).
+version: 2
+
+updates:
+  # GitHub Actions — pinned to commit SHAs in the workflows. Dependabot
+  # understands the `# vX.Y.Z` comment and bumps both the SHA and the
+  # version comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Rust workspace.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Python dependencies live under uv.lock at the repo root and python/
+  # (workspace + member). Dependabot's `uv` ecosystem support reads both.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      uv-minor-and-patch:
+        update-types:
+          - minor
+          - patch

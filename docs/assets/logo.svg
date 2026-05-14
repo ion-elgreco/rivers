@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" role="img" aria-label="rivers">
+  <title>rivers</title>
+  <!--
+    Rendered in two contexts:
+      • Inline inside rivers-ui (sidebar): the page's CSS variables
+        (`--accent`, `--accent-hover`, `--secondary`) cascade into the
+        inlined SVG, so the gradient re-themes with the user's accent
+        palette.
+      • Standalone (rivers-ui favicon, mkdocs theme.logo, README):
+        the SVG is loaded as its own document, page CSS doesn't reach
+        it, and the `var(..., fallback)` fallbacks render the default
+        rust + cyan palette.
+  -->
+  <defs>
+    <style>
+      .rivers-logo-stop-a { stop-color: var(--accent, #ff8f78); }
+      .rivers-logo-stop-b { stop-color: var(--accent-hover, #ff775d); }
+      .rivers-logo-secondary { stroke: var(--secondary, #50e1f9); }
+    </style>
+    <linearGradient id="rivers-logo-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" class="rivers-logo-stop-a"/>
+      <stop offset="100%" class="rivers-logo-stop-b"/>
+    </linearGradient>
+  </defs>
+  <!-- upper rust-gradient wave -->
+  <path d="M3 11c4 0 6 5 13 5s9-5 13-5"
+        stroke="url(#rivers-logo-grad)" stroke-width="2.2"
+        stroke-linecap="round" fill="none"/>
+  <!-- lower cyan wave, slightly translucent -->
+  <path d="M3 21c4 0 6-5 13-5s9 5 13 5"
+        class="rivers-logo-secondary" stroke-width="2.2"
+        stroke-linecap="round" fill="none" opacity="0.85"/>
+</svg>

@@ -1,0 +1,58 @@
+suite: operator deployment toggles
+templates:
+  - templates/operator-deployment.yaml
+  - templates/operator-pdb.yaml
+  - templates/operator-registry-networkpolicy.yaml
+  - templates/ui-deployment.yaml
+release:
+  name: rivers
+  namespace: rivers
+tests:
+  - it: emits a PodDisruptionBudget when operator runs HA (replicas > 1)
+    # Default replicas is 2 in values.yaml.
+    asserts:
+      - template: templates/operator-pdb.yaml
+        hasDocuments:
+          count: 1
+      - template: templates/operator-pdb.yaml
+        equal:
+          path: kind
+          value: PodDisruptionBudget
+      - template: templates/operator-pdb.yaml
+        equal:
+          path: spec.minAvailable
+          value: 1
+
+  - it: skips the PodDisruptionBudget for single-replica installs
+    set:
+      operator.replicas: 1
+    asserts:
+      - template: templates/operator-pdb.yaml
+        hasDocuments:
+          count: 0
+
+  - it: emits the registry NetworkPolicy by default
+    asserts:
+      - template: templates/operator-registry-networkpolicy.yaml
+        hasDocuments:
+          count: 1
+      - template: templates/operator-registry-networkpolicy.yaml
+        equal:
+          path: kind
+          value: NetworkPolicy
+
+  - it: skips the NetworkPolicy when disabled (CNIs without enforcement)
+    set:
+      operator.registry.networkPolicy.enabled: false
+    asserts:
+      - template: templates/operator-registry-networkpolicy.yaml
+        hasDocuments:
+          count: 0
+
+  - it: omits the UI Deployment when ui.enabled is false
+    set:
+      ui.enabled: false
+    asserts:
+      - template: templates/ui-deployment.yaml
+        hasDocuments:
+          count: 0

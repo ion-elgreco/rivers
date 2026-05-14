@@ -1,0 +1,17 @@
+{{- if gt (int .Values.operator.replicas) 1 }}
+# Keep at least one operator replica running through voluntary disruptions
+# (node drains, rolling upgrades) so the admission webhook stays available
+# under `failurePolicy: Fail`.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rivers-operator
+  namespace: {{ include "rivers.namespace" . }}
+  labels:
+    {{- include "rivers.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rivers-operator
+{{- end }}

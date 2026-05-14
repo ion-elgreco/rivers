@@ -1,0 +1,51 @@
+# Declarative deploy for the k3d dev cluster.
+#
+# Usage: helmfile sync (run from this directory)
+# Driven by dev/k3d/setup.sh which creates the cluster + local registry,
+# pushes images, then sync's. The operator runs with
+# allowInsecureRegistry=true so it can resolve digests directly from the
+# HTTP-only k3d registry — no manual digest-pinning needed on the CRs.
+
+kubeContext: k3d-{{ env "RIVERS_K3D_CLUSTER" | default "rivers-test" }}
+
+helmDefaults:
+  wait: true
+  timeout: 15
+  createNamespace: true
+
+# Pre-register repos so helmfile's automatic `helm dep build` can resolve
+# subcharts (rivers depends on the upstream surrealdb chart).
+repositories:
+  - name: surrealdb
+    url: https://helm.surrealdb.com
+
+releases:
+  # Cluster-scoped CRDs first; the rivers chart's templates reference them.
+  - name: rivers-crds
+    namespace: rivers
+    chart: ../../deploy/helm/rivers-crds
+
+  # Operator + UI + SurrealDB (subchart). Depends on CRDs.
+  - name: rivers
+    namespace: rivers
+    chart: ../../deploy/helm/rivers
+    needs:
+      - rivers/rivers-crds
+    values:
+      - operator:
+          allowInsecureRegistry: true
+
+  # Dev-cluster scaffolding: MinIO + example CodeLocation CRs.
+  - name: rivers-dev
+    namespace: rivers
+    chart: ./charts/rivers-dev
+    needs:
+      - rivers/rivers
+    values:
+      - codeLocations:
+          - name: {{ env "RIVERS_K8S_TEST_CODE_LOCATION" | default "k8s-test-pipeline" }}
+            image: k3d-rivers-registry:5000/rivers-code-location
+            module: k8s_test_pipeline.pipeline
+          - name: {{ env "RIVERS_K8S_DEMO_CODE_LOCATION" | default "demo" }}
+            image: k3d-rivers-registry:5000/rivers-demo
+            module: demo_project.pipeline

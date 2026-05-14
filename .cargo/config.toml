@@ -1,0 +1,5 @@
+# Use v0 symbol mangling to avoid macOS ld64 symbol name length limit.
+# Leptos components generate deeply nested generic types that exceed ld64's
+# maxLength assertion with the legacy mangling scheme.
+[build]
+rustflags = ["-C", "symbol-mangling-version=v0"]

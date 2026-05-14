@@ -1,0 +1,381 @@
+syntax = "proto3";
+package rivers.v1;
+
+// --- CodeLocationService (per-location pipeline service) ---
+//
+// gRPC surface of an individual pipeline container. The UI dials this once
+// `CodeLocationRegistryService` (below) has reported the location's endpoint.
+
+service CodeLocationService {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+  rpc Materialize(MaterializeRequest) returns (MaterializeResponse);
+  rpc ExecuteJob(ExecuteJobRequest) returns (ExecuteJobResponse);
+  rpc GetAssetsInfo(GetAssetsInfoRequest) returns (GetAssetsInfoResponse);
+  rpc GetSchedules(GetSchedulesRequest) returns (GetSchedulesResponse);
+  rpc GetSensors(GetSensorsRequest) returns (GetSensorsResponse);
+  rpc GetJobs(GetJobsRequest) returns (GetJobsResponse);
+  rpc EvaluateSchedule(EvaluateScheduleRequest) returns (EvaluateScheduleResponse);
+  rpc EvaluateSensor(EvaluateSensorRequest) returns (EvaluateSensorResponse);
+  rpc ObserveAsset(ObserveAssetRequest) returns (ObserveAssetResponse);
+  rpc LaunchBackfill(LaunchBackfillRequest) returns (LaunchBackfillResponse);
+  rpc RerunBackfill(RerunBackfillRequest) returns (RerunBackfillResponse);
+  rpc GetBackfillStatus(GetBackfillStatusRequest) returns (GetBackfillStatusResponse);
+  rpc CancelBackfill(CancelBackfillRequest) returns (CancelBackfillResponse);
+  rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
+}
+
+// --- Health & info ---
+
+message PingRequest {}
+message PingResponse {
+  string status = 1;
+  string location = 2;
+}
+
+message GetInfoRequest {}
+message GetInfoResponse {
+  string name = 1;
+  repeated string asset_names = 2;
+  repeated string job_names = 3;
+}
+
+// --- Materialization & job execution ---
+
+message MaterializeRequest {
+  repeated string selection = 1;
+  optional ProtoPartitionKey partition_key = 2;
+  repeated Tag tags = 3;
+}
+
+message MaterializeResponse {
+  string run_id = 1;
+  // "queued" if dispatched to the run queue, "direct" if executed inline.
+  string status = 2;
+}
+
+message Tag {
+  string key = 1;
+  string value = 2;
+}
+
+message ExecuteJobRequest {
+  string job_name = 1;
+  optional ProtoPartitionKey partition_key = 2;
+}
+
+message ExecuteJobResponse {
+  bool success = 1;
+  string run_id = 2;
+}
+
+// --- Assets ---
+
+message GetAssetsInfoRequest {}
+message GetAssetsInfoResponse {
+  repeated AssetDefinitionInfo assets = 1;
+}
+
+message AssetDefinitionInfo {
+  string asset_key = 1;
+  optional string description = 2;
+  optional PartitionDefInfo partition_def = 3;
+  repeated HookInfo hooks = 4;
+  optional string io_handler = 5;
+  bool has_self_dependency = 6;
+  bool is_external = 7;
+  optional string automation_condition = 8;
+  repeated string tags = 9;
+  repeated string kinds = 10;
+  optional string group = 11;
+  optional string code_version = 12;
+  string asset_type = 13;
+}
+
+message PartitionDefInfo {
+  string kind = 1;
+  // Single-dim enumerable keys (Static, TimeWindow). Empty for Multi
+  // (use `dimensions` instead) and for Dynamic (storage-managed).
+  repeated string keys = 2;
+  // Per-dimension keys for Multi partitions. Empty for non-Multi kinds.
+  repeated PartitionDimensionInfo dimensions = 3;
+}
+
+message PartitionDimensionInfo {
+  string name = 1;
+  repeated string keys = 2;
+}
+
+message HookInfo {
+  string hook_type = 1;
+  string function_name = 2;
+}
+
+// --- Schedules ---
+
+message GetSchedulesRequest {}
+message GetSchedulesResponse {
+  repeated ScheduleInfo schedules = 1;
+}
+
+message ScheduleInfo {
+  string name = 1;
+  string cron_schedule = 2;
+  string job_name = 3;
+  string status = 4;
+  optional string timezone = 5;
+  optional string description = 6;
+  repeated Tag tags = 7;
+}
+
+// --- Sensors ---
+
+message GetSensorsRequest {}
+message GetSensorsResponse {
+  repeated SensorInfo sensors = 1;
+}
+
+message SensorInfo {
+  string name = 1;
+  optional string job_name = 2;
+  string status = 3;
+  optional string minimum_interval = 4;
+  optional string description = 5;
+  repeated string asset_selection = 6;
+  repeated Tag tags = 7;
+}
+
+// --- Jobs ---
+
+message GetJobsRequest {}
+message GetJobsResponse {
+  repeated JobInfo jobs = 1;
+}
+
+message JobInfo {
+  string name = 1;
+  repeated string asset_selection = 2;
+  string executor_type = 3;
+}
+
+// --- Schedule & sensor evaluation ---
+
+message EvaluateScheduleRequest {
+  string schedule_name = 1;
+}
+message EvaluateScheduleResponse {
+  repeated string run_ids = 1;
+  optional string skip_reason = 2;
+}
+
+message EvaluateSensorRequest {
+  string sensor_name = 1;
+}
+message EvaluateSensorResponse {
+  repeated string run_ids = 1;
+  optional string skip_reason = 2;
+  optional string cursor = 3;
+}
+
+// --- External asset observation ---
+
+message ObserveAssetRequest {
+  string asset_key = 1;
+}
+message ObserveAssetResponse {
+  bool success = 1;
+  optional string error = 2;
+}
+
+// --- Backfills ---
+
+message ProtoPartitionKey {
+  oneof kind {
+    SinglePartitionKey single = 1;
+    MultiPartitionKey multi = 2;
+  }
+}
+
+message SinglePartitionKey {
+  repeated string keys = 1;
+}
+
+message MultiPartitionKey {
+  repeated MultiPartitionDimension dimensions = 1;
+}
+
+message MultiPartitionDimension {
+  string name = 1;
+  repeated string keys = 2;
+}
+
+message PartitionRange {
+  oneof kind {
+    SinglePartitionRange single = 1;
+    MultiPartitionRange multi = 2;
+  }
+}
+
+message SinglePartitionRange {
+  string from_key = 1;
+  string to_key = 2;
+}
+
+message MultiPartitionRange {
+  repeated DimensionRange dimensions = 1;
+}
+
+message DimensionRange {
+  string name = 1;
+  oneof selection {
+    SinglePartitionRange range = 2;
+    DimensionKeyList keys = 3;
+  }
+}
+
+message DimensionKeyList {
+  repeated string keys = 1;
+}
+
+message BackfillStrategyProto {
+  oneof kind {
+    string shorthand = 1;
+    PerDimensionStrategy per_dimension = 2;
+  }
+}
+
+message PerDimensionStrategy {
+  repeated string multi_run_dimensions = 1;
+  repeated string single_run_dimensions = 2;
+}
+
+message LaunchBackfillRequest {
+  repeated string selection = 1;
+  repeated ProtoPartitionKey partition_keys = 2;
+  optional PartitionRange partition_range = 3;
+  optional BackfillStrategyProto strategy = 4;
+  string failure_policy = 5;
+  uint32 max_concurrency = 6;
+  repeated Tag tags = 7;
+  bool dry_run = 8;
+}
+
+message LaunchBackfillResponse {
+  string backfill_id = 1;
+  uint32 num_partitions = 2;
+  uint32 num_runs = 3;
+  bool is_dry_run = 4;
+  string status = 5;
+}
+
+message RerunBackfillRequest {
+  string backfill_id = 1;
+  bool dry_run = 2;
+}
+
+message RerunBackfillResponse {
+  string backfill_id = 1;
+  uint32 num_partitions = 2;
+  uint32 num_runs = 3;
+  bool is_dry_run = 4;
+  string status = 5;
+}
+
+message GetBackfillStatusRequest {
+  string backfill_id = 1;
+}
+
+message GetBackfillStatusResponse {
+  string backfill_id = 1;
+  string status = 2;
+  uint32 total_partitions = 3;
+  uint32 completed_partitions = 4;
+  uint32 failed_partitions = 5;
+  uint32 canceled_partitions = 6;
+  repeated string run_ids = 7;
+  optional string error = 8;
+}
+
+message CancelBackfillRequest {
+  string backfill_id = 1;
+}
+
+message CancelBackfillResponse {
+  bool success = 1;
+}
+
+// --- Run cancellation ---
+
+message CancelRunRequest {
+  string run_id = 1;
+}
+
+message CancelRunResponse {
+  bool success = 1;
+}
+
+// --- CodeLocationRegistryService (operator-hosted directory service) ---
+//
+// Distinct from the per-location `CodeLocationService` above:
+//   * `CodeLocationService` is the gRPC surface of an individual pipeline container.
+//   * `CodeLocationRegistryService` is the operator-hosted directory of all
+//     CodeLocation CRs in the cluster — the thing the UI dials first to
+//     discover what locations exist before talking to any of them.
+//
+// Authentication: every RPC requires `authorization: Bearer <token>` metadata,
+// where the token is the value of the `rivers-registry-token` K8s Secret.
+
+service CodeLocationRegistryService {
+  // Returns a snapshot of all currently-known code locations.
+  rpc List(ListCodeLocationsRequest) returns (ListCodeLocationsResponse);
+
+  // Streams a snapshot followed by live updates. The server emits one synthetic
+  // ADDED event per entry in the initial snapshot, then a SYNCED marker, then
+  // live ADDED/MODIFIED/DELETED events as CRs change.
+  rpc Watch(WatchCodeLocationsRequest) returns (stream CodeLocationEvent);
+}
+
+message ListCodeLocationsRequest {
+  // Optional namespace filter. Empty string means "all watched namespaces".
+  string namespace = 1;
+}
+
+message ListCodeLocationsResponse {
+  repeated CodeLocationEntry entries = 1;
+}
+
+message WatchCodeLocationsRequest {
+  // Optional namespace filter. Empty string means "all watched namespaces".
+  string namespace = 1;
+}
+
+message CodeLocationEntry {
+  string namespace = 1;
+  string name = 2;
+  // In-cluster DNS + port of the backing Service, e.g. `analytics.team-data.svc:3001`.
+  string grpc_endpoint = 3;
+  // Digest reference, e.g. `repo@sha256:...`.
+  string image = 4;
+  // Python module path exporting the CodeRepository.
+  string module = 5;
+  // Current phase: "Pending" | "Deploying" | "Ready" | "Failed". Not an enum
+  // so we can evolve the CRD without breaking the proto.
+  string phase = 6;
+  int64  observed_generation = 7;
+  // Stable identity (UUID v4) from `CodeLocation.spec.identity`. Used by
+  // the operator-hosted admission webhook to stamp
+  // `Run.spec.codeLocationRef.identity` on CREATE.
+  string identity = 8;
+}
+
+message CodeLocationEvent {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_ADDED = 1;
+    TYPE_MODIFIED = 2;
+    TYPE_DELETED = 3;
+    TYPE_SYNCED = 4;
+  }
+  Type type = 1;
+  CodeLocationEntry entry = 2;
+}

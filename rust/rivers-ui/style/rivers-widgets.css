@@ -1,0 +1,2004 @@
+/* ── Rivers: status chips with dot indicators ── */
+.chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 8px;
+    border-radius: var(--round-sm);
+    background: var(--bg-hover);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.chip .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.dot-success, .dot-up-to-date { background: var(--success);    box-shadow: 0 0 8px var(--success); }
+.dot-running                  { background: var(--secondary);  box-shadow: 0 0 8px var(--secondary); }
+.dot-failed                   { background: var(--error);      box-shadow: 0 0 8px var(--error); }
+.dot-stale                    { background: var(--warning);    box-shadow: 0 0 8px var(--warning); }
+.dot-queued                   { background: var(--warning);    opacity: 0.85; }
+.dot-pending, .dot-missing    { background: var(--text-muted); opacity: 0.65; }
+.dot-canceled                 { background: var(--text-muted); opacity: 0.85; }
+.dot-skipped                  { background: var(--text-comment); }
+
+/* ── Rivers: flow + pulse animations ── */
+@keyframes river-pulse-ring {
+    0%   { box-shadow: 0 0 0 0 rgba(80, 225, 249, 0.4); }
+    70%  { box-shadow: 0 0 0 10px rgba(80, 225, 249, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(80, 225, 249, 0); }
+}
+
+@keyframes river-flow {
+    to { stroke-dashoffset: -24; }
+}
+
+@keyframes river-shimmer {
+    0%   { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+}
+
+@keyframes pulse-op {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.35; }
+}
+
+/* ── Rivers: DAG flowing edge — apply to <path> marked with class="dag-edge-flowing" ── */
+.dag-edge-flowing { stroke-dasharray: 3 8; animation: river-flow 1.2s linear infinite; }
+
+/* ── Rivers: Topbar (breadcrumbs + actions) ── */
+.topbar {
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    flex-shrink: 0;
+    margin-bottom: 1.25rem;
+}
+.topbar-row {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    min-height: 48px;
+    padding: 4px 0 14px;
+}
+.topbar-crumbs {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+}
+.topbar-crumb {
+    font-family: var(--font-sans);
+    font-size: 14px;
+    color: var(--text-muted);
+    text-decoration: none;
+    transition: color 120ms ease;
+}
+.topbar-crumb:hover { color: var(--text); }
+.topbar-crumb--mono { font-family: var(--font-mono); font-size: 13px; }
+.topbar-crumb--current { color: var(--text); font-weight: 500; }
+.topbar-crumb-sep { color: var(--text-comment); font-size: 11px; }
+.topbar-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* ── Rivers: Hero stat block ── */
+.hero-stat {
+    display: grid;
+    grid-template-columns: 1.3fr 1fr;
+    gap: 48px;
+    padding: 24px 0 36px;
+    align-items: end;
+}
+.hero-stat-label { color: var(--secondary); margin-bottom: 12px; }
+.hero-stat-value {
+    margin: 0 0 6px;
+    font-family: var(--font-display);
+    font-size: 64px;
+    line-height: 1.02;
+    letter-spacing: -0.03em;
+    font-weight: 500;
+}
+.hero-stat-value-unit {
+    color: var(--text-muted);
+    font-size: 0.45em;
+    font-weight: 400;
+    margin-left: 0.25em;
+}
+.hero-stat-meta {
+    display: flex;
+    gap: 24px;
+    margin-top: 14px;
+    color: var(--text-muted);
+}
+.hero-stat-meta span { font-family: var(--font-mono); font-size: 12.5px; }
+.hero-stat-meta strong { color: var(--text); font-weight: 500; }
+
+/* Throughput bars — mini histogram, bottom-aligned */
+.throughput-bars {
+    display: flex;
+    gap: 3px;
+    height: 64px;
+    align-items: flex-end;
+}
+.throughput-bars .bar {
+    flex: 1;
+    background: var(--bg-highest);
+    border-radius: 1px;
+    min-width: 2px;
+}
+.throughput-bars .bar.bar--recent { background: var(--info-bg); }
+.throughput-bars .bar.bar--now    { background: var(--secondary); box-shadow: 0 0 6px var(--secondary); }
+
+/* ── Rivers: Section header ── */
+.section-header {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding-bottom: 4px;
+    margin: 28px 0 10px;
+}
+.section-header:first-child { margin-top: 0; }
+.section-header-label {
+    font-family: var(--font-sans);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+.section-header-count {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-comment);
+}
+
+/* ── Rivers: Summary card (used in overview active pipelines + asset rows) ── */
+.summary-card {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 12px;
+    background: var(--bg-surface);
+    border-radius: 4px;
+    padding: 14px 16px 14px 18px;
+    position: relative;
+    width: 100%;
+    transition: background 140ms ease;
+    text-align: left;
+    color: inherit;
+    text-decoration: none;
+}
+.summary-card:hover { background: var(--bg-hover); }
+.summary-card-rail {
+    position: absolute;
+    left: 0;
+    top: 10px;
+    bottom: 10px;
+    width: 2px;
+    border-radius: 2px;
+}
+.summary-card-rail--success { background: var(--success); }
+.summary-card-rail--running { background: var(--secondary); box-shadow: 0 0 8px var(--secondary); }
+.summary-card-rail--error   { background: var(--error); }
+.summary-card-rail--muted   { background: var(--text-muted); }
+.summary-card-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+.summary-card-name {
+    font-family: var(--font-mono);
+    font-size: 13.5px;
+    color: var(--text);
+    font-weight: 500;
+}
+.summary-card-desc {
+    font-size: 12px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.summary-card-meta {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 2px;
+}
+.summary-card-meta span { font-family: var(--font-mono); font-size: 11.5px; }
+.summary-card-meta .meta-muted { color: var(--text-muted); }
+
+/* ── Rivers: Alert card ── */
+.alert-card {
+    background: var(--bg-surface);
+    border-radius: 4px;
+    padding: 12px 16px 12px 18px;
+    position: relative;
+}
+.alert-card-rail {
+    position: absolute;
+    left: 0;
+    top: 10px;
+    bottom: 10px;
+    width: 2px;
+    border-radius: 2px;
+}
+.alert-card-rail--critical { background: var(--error); }
+.alert-card-rail--warning { background: var(--warning); }
+.alert-card-rail--info { background: var(--text-muted); }
+.alert-card-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+.alert-card-sev {
+    display: inline-flex;
+    align-items: center;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 2px;
+    border: 1px solid transparent;
+}
+.alert-card-sev--critical { color: var(--error);      background: color-mix(in srgb, var(--error) 12%, transparent);   border-color: color-mix(in srgb, var(--error) 35%, transparent); }
+.alert-card-sev--warning  { color: var(--warning);    background: color-mix(in srgb, var(--warning) 10%, transparent); border-color: color-mix(in srgb, var(--warning) 30%, transparent); }
+.alert-card-sev--info     { color: var(--text-muted); background: rgba(255, 255, 255, 0.04);                            border-color: var(--border); }
+.alert-card-id, .alert-card-age {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.alert-card-age { margin-left: auto; }
+.alert-card-title {
+    font-size: 13px;
+    color: var(--text);
+    margin-bottom: 4px;
+}
+.alert-card-rule {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+}
+.alert-card-rule strong { color: var(--text-muted); font-weight: 500; }
+
+/* ── Rivers: StatTile (compact dashboard tile with left rail) ── */
+.stat-tile {
+    background: var(--bg-surface);
+    border-radius: 4px;
+    padding: 14px 18px;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    text-align: left;
+    color: inherit;
+    text-decoration: none;
+    transition: background 140ms ease;
+}
+.stat-tile:hover { background: var(--bg-hover); }
+.stat-tile-label {
+    font-family: var(--font-sans);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+.stat-tile-value {
+    font-family: var(--font-display);
+    font-size: 28px;
+    font-weight: 500;
+    color: var(--text);
+    letter-spacing: -0.02em;
+    line-height: 1;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.stat-tile-value-suffix {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 400;
+    letter-spacing: -0.005em;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+.stat-tile-rail {
+    position: absolute;
+    left: 0;
+    top: 12px;
+    bottom: 12px;
+    width: 2px;
+    border-radius: 2px;
+}
+.stat-tile-rail--success { background: var(--success); }
+.stat-tile-rail--error   { background: var(--error); }
+.stat-tile-rail--running { background: var(--secondary); box-shadow: 0 0 8px var(--secondary); }
+.stat-tile-rail--muted   { background: var(--text-muted); }
+.stat-tile-rail--primary { background: var(--accent); }
+
+/* ── Rivers: Donut stat card ── */
+.donut-stat {
+    background: var(--bg-surface);
+    border-radius: 6px;
+    padding: 14px 18px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    position: relative;
+}
+.donut-stat-svg { transform: rotate(-90deg); flex-shrink: 0; }
+.donut-stat-value {
+    font-family: var(--font-display);
+    font-size: 24px;
+    font-weight: 500;
+    color: var(--text);
+}
+.donut-stat-sub {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-muted);
+    margin-left: 6px;
+}
+.donut-stat-live {
+    position: absolute;
+    top: 8px;
+    right: 10px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    animation: pulse-op 1.4s ease-in-out infinite;
+}
+
+/* ── Rivers: Partition heatmap ── */
+.heatmap {
+    display: grid;
+    grid-template-columns: repeat(30, 1fr);
+    gap: 3px;
+}
+.heatmap--sm { grid-template-columns: repeat(20, 1fr); gap: 2px; }
+.heatmap-cell {
+    aspect-ratio: 1 / 1;
+    border-radius: 2px;
+    transition: opacity 400ms ease, background 400ms ease, outline 120ms ease;
+    min-width: 4px;
+    cursor: help;
+}
+.heatmap-cell:hover {
+    outline: 1px solid var(--text);
+    outline-offset: 1px;
+    z-index: 2;
+    position: relative;
+}
+.heatmap-cell--done { background: var(--success); opacity: 0.9; }
+.heatmap-cell--running { background: var(--secondary); opacity: 0.75; box-shadow: 0 0 6px var(--secondary); animation: pulse-op 1.4s ease-in-out infinite; }
+.heatmap-cell--failed { background: var(--error); opacity: 1; }
+.heatmap-cell--pending { background: var(--bg-highest); opacity: 0.6; }
+.heatmap-legend {
+    display: flex;
+    gap: 14px;
+    align-items: center;
+    margin-top: 10px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.heatmap-legend-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    display: inline-block;
+    margin-right: 6px;
+    vertical-align: middle;
+}
+
+/* Rivers hover-info bar: reveals when hovering a cell with labels */
+.heatmap-info {
+    margin-top: 12px;
+    padding: 8px 12px;
+    background: var(--bg-highest);
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+}
+.heatmap-info-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    flex-shrink: 0;
+}
+.heatmap-info-dot--done { background: var(--success); opacity: 0.9; }
+.heatmap-info-dot--running { background: var(--secondary); box-shadow: 0 0 6px var(--secondary); }
+.heatmap-info-dot--failed { background: var(--error); }
+.heatmap-info-dot--pending { background: var(--bg-highest); border: 1px solid var(--border); opacity: 0.6; }
+.heatmap-info-label { color: var(--text-muted); }
+.heatmap-info-key { color: var(--text); }
+.heatmap-info-sep { color: var(--text-comment); opacity: 0.6; }
+.heatmap-info-pos { color: var(--text-muted); }
+.heatmap-info-state--done { color: var(--success); }
+.heatmap-info-state--running { color: var(--secondary); }
+.heatmap-info-state--failed { color: var(--error); }
+.heatmap-info-state--pending { color: var(--text-muted); }
+
+/* ── Rivers: LineageMini SVG block ── */
+.lineage-mini-wrap {
+    background: var(--bg-surface-low);
+    border-radius: 6px;
+    padding: 28px 32px;
+    margin-top: 16px;
+    position: relative;
+    overflow: hidden;
+}
+.lineage-mini-edge { fill: none; stroke: var(--outline-variant); stroke-width: 1; opacity: 0.5; }
+.lineage-mini-node { fill: var(--bg-surface); }
+.lineage-mini-node-text {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    fill: var(--text);
+}
+.lineage-mini-rail--source { fill: var(--text-muted); }
+.lineage-mini-rail--pipeline { fill: var(--accent); }
+.lineage-mini-rail--asset { fill: var(--secondary); }
+
+/* ── Rivers: Recent runs strip (duration bars) ── */
+.runs-strip {
+    background: var(--bg-surface);
+    border-radius: 4px;
+    padding: 12px 14px;
+}
+.runs-strip-head {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    margin-bottom: 10px;
+}
+.runs-strip-head .stats {
+    margin-left: auto;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+    display: flex;
+    gap: 12px;
+}
+.runs-strip-bars {
+    display: flex;
+    align-items: flex-end;
+    gap: 4px;
+    height: 68px;
+    position: relative;
+}
+.runs-strip-bar {
+    flex: 1;
+    min-width: 4px;
+    border-radius: 2px;
+    position: relative;
+    transition: opacity 140ms ease;
+}
+.runs-strip-bar--ok    { background: var(--success); opacity: 0.9; }
+.runs-strip-bar--err   { background: var(--error); opacity: 0.7; }
+.runs-strip-bar--retry { background: var(--warning); opacity: 0.55; }
+.runs-strip-bar--live  { animation: pulse-op 1.4s ease-in-out infinite; }
+.runs-strip-bar-x {
+    position: absolute;
+    top: -14px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 10px;
+    color: var(--error);
+    font-family: var(--font-mono);
+}
+.runs-strip-avg {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: var(--text-muted);
+    opacity: 0.25;
+    pointer-events: none;
+}
+
+/* ── Rivers: Next ticks strip ── */
+.next-ticks {
+    background: var(--bg-surface);
+    border-radius: 6px;
+    padding: 16px 20px;
+}
+.next-ticks-track {
+    position: relative;
+    background: var(--bg-inset);
+    border-radius: 4px;
+    height: 72px;
+    padding: 8px 12px;
+    margin-top: 10px;
+}
+.next-ticks-gridline {
+    position: absolute;
+    top: 6px;
+    bottom: 6px;
+    width: 1px;
+    background: var(--bg-highest);
+    opacity: 0.6;
+}
+.next-ticks-tick {
+    position: absolute;
+    width: 3px;
+    height: 6px;
+    border-radius: 1px;
+    opacity: 0.85;
+    top: 2px;
+}
+.next-ticks-tick--schedule  { background: var(--accent); }
+.next-ticks-tick--sensor    { background: var(--secondary); }
+.next-ticks-tick--condition { background: var(--warning); }
+.next-ticks-playhead {
+    position: absolute;
+    left: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--text);
+    box-shadow: 0 0 0 3px rgba(228, 230, 235, 0.2);
+    animation: river-pulse-ring 1.8s infinite;
+}
+
+/* ── Rivers: Pool util stacked bar ── */
+.pool-bar {
+    display: flex;
+    height: 10px;
+    border-radius: 2px;
+    overflow: hidden;
+    background: var(--bg-inset);
+}
+.pool-bar-used { height: 100%; position: relative; }
+.pool-bar-used--ok    { background: var(--success); }
+.pool-bar-used--warn  { background: var(--warning); }
+.pool-bar-used--crit  { background: var(--error); }
+.pool-bar-free { height: 100%; background: var(--bg-highest); opacity: 0.6; }
+.pool-bar-queued {
+    height: 100%;
+    border-left: 1px dashed var(--warning);
+    background: rgba(234, 179, 8, 0.25);
+}
+
+/* ── Rivers: Queue lane ── */
+.queue-lanes {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 14px;
+    align-items: start;
+}
+.queue-lane {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.queue-lane-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-bottom: 2px solid var(--text-muted);
+}
+.queue-lane-head-swatch {
+    width: 8px;
+    height: 8px;
+    border-radius: 1px;
+    flex-shrink: 0;
+}
+.queue-lane-head-name {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text);
+    flex: 1;
+}
+.queue-lane-head-count {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.queue-lane-card {
+    background: var(--bg-surface);
+    padding: 12px 14px;
+    border-radius: 4px;
+    border-left: 3px solid var(--text-muted);
+    text-decoration: none;
+    color: inherit;
+    transition: background 120ms ease;
+    display: block;
+}
+.queue-lane-card:hover { background: var(--bg-hover); }
+.queue-lane-card-top {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+.queue-lane-card-id {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text);
+    font-weight: 500;
+}
+.queue-lane-card-priority {
+    margin-left: auto;
+    padding: 1px 6px;
+    border-radius: 2px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    background: var(--info-bg);
+    color: var(--secondary);
+}
+.queue-lane-card-priority--high { background: var(--error-bg); color: var(--error); }
+.queue-lane-card-priority--low  { background: var(--bg-highest); color: var(--text-muted); }
+.queue-lane-card-job {
+    font-size: 12px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.queue-lane-card-meta {
+    display: flex;
+    justify-content: space-between;
+    padding-top: 8px;
+    margin-top: 8px;
+    border-top: 1px solid var(--bg-highest);
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-muted);
+}
+
+/* ── Rivers: Deployment system diagram ── */
+.deployment-diagram {
+    background: var(--bg-surface);
+    border-radius: 6px;
+    padding: 16px 20px;
+}
+.deployment-link-base { stroke: var(--bg-highest); stroke-width: 2; }
+.deployment-link-flow {
+    stroke-width: 2;
+    stroke-dasharray: 18 80;
+    animation: river-flow-long 2.4s linear infinite;
+}
+@keyframes river-flow-long {
+    to { stroke-dashoffset: -98; }
+}
+.deployment-node-ring {
+    fill: none;
+    stroke-width: 2;
+    animation: pulse-op 2.6s ease-in-out infinite;
+}
+.deployment-node-ring--ok { stroke: var(--success); }
+.deployment-node-ring--warn { stroke: var(--warning); }
+.deployment-node-label {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    fill: var(--text);
+    text-anchor: middle;
+}
+.deployment-node-sub {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    fill: var(--text-muted);
+    text-anchor: middle;
+}
+
+/* ── Rivers: Event glyph timeline panel ── */
+.glyph-timeline-panel {
+    background: var(--bg-surface-low);
+    border-radius: 4px;
+    padding: 14px 18px 8px;
+    margin-bottom: 14px;
+}
+.glyph-timeline-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+    gap: 14px;
+    flex-wrap: wrap;
+}
+.glyph-legend {
+    display: flex;
+    gap: 10px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-muted);
+}
+.glyph-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+}
+.glyph-legend-icon { font-size: 11px; line-height: 1; }
+.glyph-legend-label { letter-spacing: 0.04em; }
+.glyph-runs-legend {
+    display: flex;
+    gap: 10px;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--bg-hover);
+    flex-wrap: wrap;
+    align-items: center;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.glyph-runs-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+.glyph-runs-legend-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    flex-shrink: 0;
+}
+
+.glyph-timeline {
+    position: relative;
+    height: 56px;
+    padding: 22px 8px 10px;
+    background: transparent;
+    border-radius: 0;
+    margin-bottom: 0;
+}
+.glyph-timeline-axis {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    top: 20px;
+    height: 1px;
+    background: var(--bg-highest);
+}
+.glyph-timeline-tick {
+    position: absolute;
+    top: 2px;
+    transform: translateX(-50%);
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--text-comment);
+}
+.glyph-event {
+    position: absolute;
+    top: 24px;
+    transform: translateX(-50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    cursor: default;
+    transition: opacity 120ms ease;
+}
+.glyph-event-icon { font-size: 14px; line-height: 1; }
+.glyph-event-icon--ok   { color: var(--success); }
+.glyph-event-icon--err  { color: var(--error); }
+.glyph-event-icon--warn { color: var(--warning); }
+.glyph-event-icon--info { color: var(--secondary); }
+.glyph-event-bar {
+    width: 14px;
+    height: 2px;
+    border-radius: 1px;
+    margin-top: 2px;
+}
+.glyph-event--dim { opacity: 0.2; }
+
+/* ── Rivers: Tag + KindBadge ── */
+.rv-tag {
+    display: inline-flex;
+    align-items: center;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 2px;
+    background: var(--bg-hover);
+    color: var(--text-muted);
+}
+.kind-badge {
+    display: inline-flex;
+    align-items: center;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.05em;
+    padding: 2px 7px;
+    border-radius: 2px;
+    text-transform: uppercase;
+}
+.kind-badge--python { background: var(--info-bg); color: var(--secondary); }
+.kind-badge--sql    { background: var(--warning-bg);  color: var(--warning); }
+.kind-badge--api    { background: var(--accent-bg); color: var(--accent); }
+.kind-badge--other  { background: var(--bg-highest);        color: var(--text-muted); }
+
+/* ── Rivers: ProgressBar ── */
+.rv-progress {
+    width: 100%;
+    background: var(--bg-highest);
+    border-radius: 999px;
+    overflow: hidden;
+}
+.rv-progress-fill {
+    height: 100%;
+    border-radius: 999px;
+    transition: width 240ms ease;
+}
+
+/* ── Rivers: AssetsHeroStrip (warehouse state cards) ── */
+.hero-strip {
+    background: var(--bg-surface);
+    border-radius: 6px;
+    padding: 18px 20px;
+    margin-bottom: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+.hero-strip-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.hero-strip-legend {
+    display: flex;
+    gap: 14px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.hero-strip-legend span {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.hero-strip-legend-swatch {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+}
+.hero-strip-row { display: grid; gap: 10px; }
+.hero-strip-card {
+    text-align: left;
+    padding: 12px 14px;
+    border-radius: 4px;
+    background: var(--bg-surface-low);
+    border: 1px solid transparent;
+    transition: all 160ms ease;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    cursor: pointer;
+    color: inherit;
+    text-decoration: none;
+}
+.hero-strip-card:hover { background: var(--bg-hover); }
+.hero-strip-card--active { background: var(--bg-hover); border-color: var(--accent); }
+.hero-strip-card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+}
+.hero-strip-card-name {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text);
+    font-weight: 500;
+    text-transform: lowercase;
+}
+.hero-strip-card-count {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-muted);
+}
+.hero-strip-card-stacked {
+    display: flex;
+    height: 6px;
+    border-radius: 2px;
+    overflow: hidden;
+    background: var(--bg-inset);
+}
+.hero-strip-card-stacked > span { height: 100%; }
+.hero-strip-card-foot {
+    display: flex;
+    justify-content: space-between;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-muted);
+}
+
+/* ── Rivers: WhoDependsBanner (blast radius) ── */
+.blast-banner {
+    background: var(--bg-surface-low);
+    border-radius: 4px;
+    border-left: 2px solid var(--text-muted);
+    padding: 12px 16px;
+    margin: 0 0 14px;
+}
+.blast-banner--critical { background: rgba(255, 143, 120, 0.08); border-left-color: var(--accent); }
+.blast-banner-head {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+}
+.blast-banner-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    text-transform: uppercase;
+}
+.blast-banner-pill {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    padding: 1px 6px;
+    border-radius: 2px;
+    background: var(--accent);
+    color: var(--on-accent);
+    letter-spacing: 0.06em;
+}
+.blast-banner-counts {
+    display: flex;
+    align-items: baseline;
+    gap: 18px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text);
+}
+.blast-banner-counts strong { color: var(--text); font-weight: 600; }
+.blast-banner-counts .muted { color: var(--text-muted); }
+.blast-banner-leaf {
+    background: var(--bg-surface-low);
+    border-radius: 4px;
+    padding: 10px 14px;
+    margin: 0 0 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-muted);
+}
+
+/* ── Rivers: FilterPillGroup — segmented filter bar ── */
+.filter-pill-group {
+    display: inline-flex;
+    gap: 2px;
+    background: var(--bg-surface-low);
+    padding: 3px;
+    border-radius: 4px;
+    align-items: center;
+}
+.filter-pill-group + .filter-pill-group { margin-left: 10px; }
+.filter-pill-group-label {
+    font-family: var(--font-sans);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    padding: 0 6px 0 8px;
+}
+/* Rivers search input — subdued, mono, surface-container-low bg */
+.rv-search {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg-surface-low);
+    padding: 7px 12px;
+    border-radius: 4px;
+    min-width: 280px;
+    flex: 0 1 360px;
+}
+.rv-search input {
+    flex: 1;
+    background: transparent;
+    border: 0;
+    outline: none;
+    color: var(--text);
+    font-size: 13px;
+    font-family: var(--font-mono);
+    min-width: 0;
+}
+.rv-search input::placeholder { color: var(--text-muted); }
+.rv-search svg { color: var(--text-muted); flex-shrink: 0; }
+.rv-toolbar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+}
+
+/* ── Rivers: AssetStack (+N overflow chip) ── */
+.asset-stack {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+}
+.asset-stack-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    padding: 2px 7px;
+    border-radius: 2px;
+    background: var(--bg-hover);
+    color: var(--text);
+    text-decoration: none;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+}
+.asset-stack-chip:hover { background: var(--bg-highest); color: var(--accent); }
+.asset-stack-chip-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--secondary);
+}
+.asset-stack-more {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    padding: 2px 6px;
+    color: var(--text-muted);
+    background: transparent;
+}
+
+/* ── Rivers: PartitionCell ── */
+.partition-cell {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.partition-cell-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 2px;
+    background: var(--bg-surface-low);
+    color: var(--text);
+    font-size: 9.5px;
+    font-weight: 600;
+}
+.partition-cell-count strong { color: var(--text); font-weight: 500; }
+
+/* ── Rivers: BottleneckCard (queue explainer) ── */
+.bottleneck-card {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 20px;
+    align-items: center;
+    padding: 14px 18px;
+    border-left: 3px solid var(--error);
+    background: rgba(255, 110, 132, 0.08);
+    border-radius: 4px;
+    margin-bottom: 14px;
+}
+.bottleneck-card--warn { background: rgba(234, 179, 8, 0.08); border-left-color: var(--warning); }
+.bottleneck-card-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    margin-bottom: 6px;
+}
+.bottleneck-card-title {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    color: var(--text);
+    margin-bottom: 4px;
+}
+.bottleneck-card-sub {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.drain-forecast {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 28px;
+    margin-top: 8px;
+}
+.drain-forecast-bar {
+    flex: 1;
+    min-width: 3px;
+    background: var(--error);
+    border-radius: 1px;
+    transition: opacity 200ms ease;
+}
+.drain-forecast-labels {
+    display: flex;
+    justify-content: space-between;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+
+/* ── Rivers: DAG Minimap ── */
+.dag-minimap {
+    position: absolute;
+    left: 16px;
+    bottom: 16px;
+    width: 232px;
+    background: var(--bg-surface);
+    border-radius: 4px;
+    padding: 6px;
+    z-index: 3;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+    pointer-events: auto;
+}
+.dag-minimap-label {
+    font-size: 10px;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    padding: 2px 4px 4px;
+    letter-spacing: 0.08em;
+}
+.dag-minimap svg {
+    display: block;
+    background: var(--bg-inset);
+    border-radius: 2px;
+    cursor: crosshair;
+}
+.dag-minimap-viewport {
+    fill: rgba(255, 143, 120, 0.08);
+    stroke: var(--accent);
+    stroke-width: 1;
+    stroke-dasharray: 3 2;
+    pointer-events: none;
+}
+
+/* ── Rivers: DAG Legend ── */
+.dag-legend {
+    position: absolute;
+    right: 16px;
+    bottom: 16px;
+    z-index: 3;
+    background: var(--bg-surface);
+    border-radius: 4px;
+    padding: 8px 12px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-muted);
+    pointer-events: none;
+    user-select: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.dag-legend-hint { letter-spacing: 0.05em; opacity: 0.75; }
+.dag-legend-row {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+.dag-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+.dag-legend-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.dag-legend-dot--success { background: var(--success); }
+.dag-legend-dot--running { background: var(--running, #60a5fa); box-shadow: 0 0 6px rgba(96, 165, 250, 0.5); }
+.dag-legend-dot--stale { background: var(--text-muted); opacity: 0.55; }
+.dag-legend-dot--external { background: transparent; border: 1px solid var(--text-muted); }
+
+/* Mini-lineage hover popover on asset rows */
+.mini-lineage-host { position: relative; }
+.mini-lineage-tip {
+    position: absolute;
+    left: 0;
+    top: calc(100% + 6px);
+    z-index: 50;
+    min-width: 280px;
+    background: rgba(29, 32, 36, 0.94);
+    backdrop-filter: blur(12px) saturate(1.2);
+    -webkit-backdrop-filter: blur(12px) saturate(1.2);
+    border-radius: 6px;
+    padding: 10px 12px;
+    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.5);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text);
+    display: none;
+    pointer-events: none;
+}
+.mini-lineage-host:hover .mini-lineage-tip { display: block; }
+.mini-lineage-col {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 6px;
+}
+.mini-lineage-col-label {
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-bottom: 2px;
+}
+.mini-lineage-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 0;
+}
+.mini-lineage-row-dot {
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--secondary);
+    flex-shrink: 0;
+}
+
+/* ── Rivers: polish — smooth transitions everywhere ── */
+.grid-row,
+.grid-row > *,
+.summary-card,
+.stat-tile,
+.deploy-card,
+.bottleneck-card,
+.alert-card,
+.runs-strip,
+.run-row { transition: background 140ms ease, border-color 160ms ease, box-shadow 160ms ease,
+        transform 160ms ease, opacity 160ms ease; }
+
+.sidebar-nav a { transition: background 140ms ease, color 140ms ease; }
+
+/* Progress bars + filled rectangles */
+.health-bar-fill,
+.rv-progress-fill,
+.pool-bar > span,
+.runs-strip-bar { transition: width 240ms ease, opacity 160ms ease, background 160ms ease; }
+
+/* Chevrons + toggles — rotate smoothly */
+.btn[aria-expanded],
+[class*="chevron"],
+.sidebar-toggle-icon { transition: transform 160ms ease, color 140ms ease; }
+
+/* Row hover: subtle brightness lift for tables/rows */
+.grid-row:hover { background: var(--bg-hover); box-shadow: inset 0 0 0 1px rgba(70, 72, 75, 0.25); }
+
+/* Running-status dot pulses */
+.dot-running { animation: pulse-op 1.8s ease-in-out infinite; }
+
+/* Shimmer on asset-health rows that have been recently updated */
+.health-card-link.shimmer-row { position: relative; overflow: hidden; }
+.health-card-link.shimmer-row::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+        110deg,
+        transparent 0%,
+        transparent 40%,
+        rgba(80, 225, 249, 0.06) 50%,
+        transparent 60%,
+        transparent 100%
+    );
+    background-size: 200% 100%;
+    animation: river-shimmer 2.4s linear infinite;
+    pointer-events: none;
+}
+
+/* ── Rivers: Minimap cursor feedback ── */
+.dag-minimap svg { cursor: crosshair; transition: filter 140ms ease; }
+.dag-minimap:hover svg { filter: brightness(1.08); }
+
+/* ── Rivers: focus ring polish for interactive elements ── */
+.grid-row:focus-visible,
+.summary-card:focus-visible,
+.stat-tile:focus-visible,
+.filter-pill:focus-visible,
+.btn:focus-visible,
+.rv-search:focus-within { outline: 2px solid var(--secondary); outline-offset: 2px; }
+
+/* ── Rivers: glowing status rails for running rows ── */
+.grid-row-rail--running,
+.summary-card-rail--running,
+.stat-tile-rail--running {
+    box-shadow: 0 0 10px var(--secondary);
+    animation: pulse-op 2.2s ease-in-out infinite;
+}
+
+/* ── Rivers: tooltip styling on truncated code/text ── */
+[title] code,
+[title] .grid-cell-mono {
+    text-decoration-style: dotted;
+    text-decoration-line: underline;
+    text-decoration-color: var(--text-muted);
+    text-underline-offset: 3px;
+    text-decoration-thickness: 1px;
+}
+
+/* ── Rivers: AssetStack/PartitionCell overflow tooltip popover ── */
+.asset-stack-more,
+.partition-cell-badge { position: relative; }
+.asset-stack-more[data-tip],
+.partition-cell-badge[data-tip] { cursor: help; }
+.asset-stack-more[data-tip]::after,
+.partition-cell-badge[data-tip]::after {
+    content: attr(data-tip);
+    position: absolute;
+    left: 0;
+    top: calc(100% + 6px);
+    z-index: 60;
+    min-width: 180px;
+    max-width: 320px;
+    background: rgba(29, 32, 36, 0.96);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    padding: 8px 10px;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text);
+    white-space: pre-line;
+    line-height: 1.55;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 120ms ease, transform 120ms ease;
+    transform: translateY(-2px);
+}
+.asset-stack-more[data-tip]:hover::after,
+.partition-cell-badge[data-tip]:hover::after { opacity: 1; transform: translateY(0); }
+
+/* ── Rivers: DeployCard + DeployRow ── */
+.deploy-card {
+    background: var(--bg-surface);
+    border-radius: 4px;
+    padding: 16px 20px;
+}
+.deploy-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+}
+.deploy-card-label {
+    font-family: var(--font-sans);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+.deploy-card-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.deploy-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 14px;
+    font-size: 13px;
+}
+.deploy-row-label { color: var(--text-muted); flex-shrink: 0; }
+.deploy-row-value {
+    color: var(--text);
+    text-align: right;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.deploy-row-value--mono { font-family: var(--font-mono); font-size: 12px; }
+.deploy-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-top: 14px;
+}
+
+/* ── Rivers: AttentionBanner ── */
+.attention-banner {
+    background: rgba(234, 179, 8, 0.06);
+    border-left: 2px solid var(--warning);
+    border-radius: 4px;
+    padding: 10px 14px;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+.attention-banner-dot {
+    width: 8px;
+    height: 8px;
+    background: var(--warning);
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.attention-banner-msg {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text);
+}
+.attention-banner-msg strong { color: var(--warning); }
+.attention-banner-sub {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+/* Pushes the toggle button to the right edge of the banner */
+.attention-banner-spacer { flex: 1; }
+.attention-banner-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: color 120ms ease;
+}
+.attention-banner-toggle:hover { color: var(--text); }
+.attention-banner-toggle-chevron {
+    display: inline-block;
+    font-size: 13px;
+    line-height: 1;
+    transform: rotate(90deg);
+    transition: transform 160ms ease;
+}
+.attention-banner-toggle-chevron--open { transform: rotate(270deg); }
+
+/* ── Rivers: FeaturedDonut — large 24h runs indicator ── */
+.featured-donut {
+    background: var(--bg-surface);
+    border-radius: 6px;
+    padding: 20px 24px;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    position: relative;
+}
+.featured-donut-ring { flex-shrink: 0; transform: rotate(-90deg); }
+.featured-donut-label {
+    font-family: var(--font-sans);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+}
+.featured-donut-value {
+    font-family: var(--font-display);
+    font-size: 44px;
+    line-height: 1.05;
+    letter-spacing: -0.025em;
+    font-weight: 500;
+    color: var(--text);
+}
+.featured-donut-unit {
+    color: var(--text-muted);
+    font-size: 0.5em;
+    font-weight: 400;
+    margin-left: 6px;
+}
+.featured-donut-meta {
+    display: flex;
+    gap: 18px;
+    margin-top: 12px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 12px;
+}
+.featured-donut-meta strong { color: var(--text); font-weight: 500; }
+
+/* ── Rivers: Grid-row tables (list pages) ── */
+.grid-table {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.grid-table-head {
+    display: grid;
+    gap: 16px;
+    padding: 10px 16px 10px 20px;
+    font-family: var(--font-sans);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+}
+.grid-row {
+    display: grid;
+    gap: 16px;
+    padding: 14px 16px 14px 20px;
+    background: var(--bg-surface);
+    position: relative;
+    align-items: center;
+    text-decoration: none;
+    color: inherit;
+    transition: background 120ms ease;
+    cursor: pointer;
+}
+.grid-row:hover { background: var(--bg-hover); }
+.grid-row-rail {
+    position: absolute;
+    left: 0;
+    top: 12px;
+    bottom: 12px;
+    width: 2px;
+    border-radius: 2px;
+}
+.grid-row-rail--success { background: var(--success); }
+.grid-row-rail--running { background: var(--secondary); box-shadow: 0 0 8px var(--secondary); }
+.grid-row-rail--failed, .grid-row-rail--failure  { background: var(--error); }
+.grid-row-rail--warning { background: var(--warning); }
+.grid-row-rail--queued  { background: var(--warning); opacity: 0.7; }
+.grid-row-rail--pending { background: var(--text-muted); opacity: 0.55; }
+.grid-row-rail--muted   { background: var(--text-muted); }
+.grid-row-rail--canceled { background: var(--text-comment); }
+.grid-cell-mono {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.grid-cell-muted {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-muted);
+    min-width: 0;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+/* Preserve newlines for code-like rendered strings (e.g. formatted strategy values) */
+.grid-cell-code { white-space: pre-wrap; }
+
+/* ── Rivers: Underline tab bar (replaces standard tab-bar) ── */
+.tabs-underline {
+    display: flex;
+    gap: 0;
+    padding: 0;
+    background: transparent;
+    border-bottom: 1px solid var(--bg-highest);
+    margin-bottom: 18px;
+}
+.tabs-underline .tab {
+    position: relative;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 10px 14px;
+    font-size: 13px;
+    font-weight: 400;
+    color: var(--text-muted);
+}
+.tabs-underline .tab:hover { background: transparent; color: var(--text); }
+.tabs-underline .tab.active {
+    color: var(--text);
+    background: transparent;
+    font-weight: 500;
+}
+.tabs-underline .tab.active::after {
+    content: "";
+    position: absolute;
+    left: 10px;
+    right: 10px;
+    bottom: -1px;
+    height: 2px;
+    background: var(--accent);
+    border-radius: 2px;
+}
+.tabs-underline .tab-count {
+    color: var(--text-comment);
+    margin-left: 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+}
+
+/* ── Rivers: filter bar (inline pill group) — legacy alias ── */
+.filter-pills {
+    display: flex;
+    gap: 2px;
+    background: var(--bg-surface-low);
+    padding: 3px;
+    border-radius: 4px;
+    width: fit-content;
+}
+.filter-pill {
+    padding: 4px 10px;
+    border-radius: 3px;
+    font-size: 11px;
+    background: transparent;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    border: none;
+    cursor: pointer;
+    transition: color 120ms ease, background 120ms ease;
+}
+.filter-pill:hover:not(:disabled) { color: var(--text); }
+.filter-pill.filter-pill--active { background: var(--bg-hover); color: var(--text); }
+.filter-pill.filter-pill--disabled,
+.filter-pill:disabled { opacity: 0.35; cursor: not-allowed; }
+.filter-pill .count { color: var(--text-comment); margin-left: 4px; }
+
+/* ── Rivers: chevron toggle inside grid rows (schedules/sensors/conditions) ── */
+.chev-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    transition: transform 160ms ease, color 120ms ease;
+    cursor: pointer;
+}
+.chev-btn--open { transform: rotate(90deg); color: var(--text); }
+
+/* ── Rivers: status dot + inline mono label (schedules/sensors status cell) ── */
+.status-dot-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+}
+.status-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.status-dot--ok { background: var(--success); }
+.status-dot--accent { background: var(--accent); }
+.status-dot--warn { background: var(--warning); }
+.status-dot--err { background: var(--error); }
+.status-dot--muted { background: var(--text-muted); opacity: 0.7; }
+
+/* ── Rivers: cron code cell — compact inset pill ── */
+.rivers-cron-code {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    background: var(--bg-inset);
+    padding: 2px 6px;
+    border-radius: 2px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+}
+
+/* ── Rivers: grid-row expansion (sensor fire debugger / condition replay) ── */
+.grid-row-expansion {
+    background: var(--bg-surface-low);
+    padding: 14px 20px 16px 44px;
+    margin-top: 1px;
+    margin-bottom: 1px;
+    border-left: 2px solid transparent;
+}
+.grid-row-expansion--accent {
+    background: color-mix(in oklab, var(--accent) 4%, var(--bg-surface-low));
+    border-left-color: var(--accent);
+}
+.grid-row--expanded { background: var(--bg-hover); }
+
+/* Compact section header strip (uppercase label) above a table */
+.section-header-row {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+
+/* Rivers inset content panel — used below a section-header-label for
+   asset-selection chip lists, tags, description prose, etc. */
+.detail-panel {
+    background: var(--bg-inset);
+    border-radius: 4px;
+    padding: 12px 16px;
+    margin-bottom: 8px;
+}
+.detail-panel--chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.detail-panel--prose {
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text);
+    white-space: pre-wrap;
+}
+
+/* ── Rivers: Condition replay (real per-sub-condition history) ── */
+.cond-replay {
+    background: var(--bg-surface);
+    border-radius: 4px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.cond-replay-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+.cond-replay-hint {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-comment);
+}
+.cond-replay-empty {
+    padding: 12px 0;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+.cond-tracks {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.cond-track {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    gap: 12px;
+    align-items: center;
+}
+.cond-track-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.cond-track-label--op { color: var(--text-muted); font-style: italic; }
+.cond-track-cells {
+    display: flex;
+    gap: 1px;
+    height: 14px;
+    align-items: stretch;
+}
+.cond-cell {
+    flex: 1;
+    min-width: 2px;
+    border-radius: 1px;
+    cursor: pointer;
+    transition: opacity 120ms ease;
+}
+.cond-cell:hover { opacity: 0.75; }
+.cond-cell--true { background: var(--success); }
+.cond-cell--false { background: color-mix(in oklab, var(--error) 30%, var(--bg-highest)); }
+.cond-cell--skipped { background: var(--bg-highest); opacity: 0.5; }
+.cond-cell--missing { background: transparent; border: 1px dashed var(--border); opacity: 0.5; }
+.cond-cell--cursor { outline: 1px solid var(--text); outline-offset: 0; z-index: 1; position: relative; }
+
+.cond-axis {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 4px;
+    padding-left: 252px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-comment);
+}
+
+.cond-cursor-detail {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-muted);
+    padding: 8px 10px;
+    background: var(--bg-surface-low);
+    border-radius: 4px;
+    border-left: 2px solid var(--accent);
+}
+.cond-verdict {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    padding: 2px 6px;
+    border-radius: 2px;
+    font-weight: 700;
+}
+.cond-verdict--fire { background: var(--success); color: var(--bg-inset); }
+.cond-verdict--block { background: var(--warning); color: var(--bg-inset); }
+.cond-verdict--skip { background: var(--text-comment); color: var(--bg-inset); }
+.cond-cursor-time b { color: var(--text); font-weight: 500; margin-left: 2px; }
+.cond-cursor-sep { color: var(--text-comment); opacity: 0.6; }
+.cond-cursor-blocker-list { color: var(--warning); font-weight: 500; }
+
+.cond-legend {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+    font-family: var(--font-sans);
+    font-size: 11px;
+    color: var(--text-muted);
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+}
+.cond-legend > span {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.cond-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+}
+.cond-swatch--true { background: var(--success); }
+.cond-swatch--false { background: color-mix(in oklab, var(--error) 30%, var(--bg-highest)); }
+.cond-swatch--skipped { background: var(--bg-highest); opacity: 0.5; }
+.cond-swatch--missing { background: transparent; border: 1px dashed var(--border); }
+
+/* ── Rivers: Global evaluation timeline panel ── */
+.eval-timeline-panel {
+    background: var(--bg-inset);
+    border-radius: 4px;
+    padding: 16px;
+    margin-top: 16px;
+}
+.eval-timeline-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+}
+.eval-timeline-stats {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.eval-timeline-stat-num {
+    color: var(--text);
+    font-weight: 500;
+    margin-right: 2px;
+}
+.eval-timeline-sep { color: var(--text-comment); opacity: 0.6; }
+.eval-timeline-bars {
+    display: flex;
+    gap: 1px;
+    align-items: flex-end;
+    height: 48px;
+}
+.eval-timeline-axis {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 8px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-comment);
+}
+.eval-timeline-legend {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+    flex-wrap: wrap;
+    font-family: var(--font-sans);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.eval-timeline-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.eval-timeline-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+}
+.eval-timeline-legend-hint {
+    margin-left: auto;
+    color: var(--text-comment);
+    font-size: 10.5px;
+}
+
+/* Rivers sensor job link: plain cyan mono, no underline */
+.sensor-job-link {
+    color: var(--secondary);
+    font-size: 11.5px;
+    text-decoration: none;
+}
+.sensor-job-link:hover { filter: brightness(1.15); }
+
+/* Non-linkable grid-row variant (used when the row itself is clickable via on:click) */
+.grid-row.grid-row--static { cursor: pointer; }
+
+/* Plain grid-row: no hover/cursor, no rail. Used for schedules where only the
+   name is clickable. */
+.grid-row.grid-row--plain { cursor: default; }
+.grid-row.grid-row--plain:hover { background: var(--bg-surface); }
+
+/* Rivers schedule name: mono 13px, weight 500, text color, no underline */
+.schedule-name-link {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text);
+    text-decoration: none;
+}
+.schedule-name-link:hover { color: var(--accent); }
+
+/* Bare icon-only button (copy icon next to cron pill, etc.) */
+.icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2px;
+    color: var(--text-muted);
+    background: transparent;
+    border: none;
+    border-radius: 2px;
+    cursor: pointer;
+    transition: color 120ms ease, background 120ms ease;
+}
+.icon-btn:hover { color: var(--text); background: var(--bg-hover); }
+
+/* Sortable header cells in grid-table */
+.grid-table-head .sortable { cursor: pointer; user-select: none; }
+.grid-table-head .sortable:hover { color: var(--text); }
+

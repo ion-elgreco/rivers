@@ -1,0 +1,80 @@
+name: release-docs
+
+# Builds the MkDocs (zensical) site and publishes a versioned copy to
+# GitHub Pages on tag push (v*.*.*) using `mike` — versioned docs are
+# branch-based: every release deploys a new subdirectory (e.g. /0.1.0/)
+# alongside the prior versions, all served from a single `gh-pages`
+# branch. The `latest` alias is updated to point at the most recent
+# release.
+#
+# One-time setup required outside this workflow:
+# - In repo Settings → Pages, set "Source" to "Deploy from a branch"
+#   and pick `gh-pages` / `(root)`. The first run of this workflow
+#   creates the branch.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-docs-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  release:
+    name: Build and publish versioned docs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # mike pushes the rendered site to gh-pages
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # mike inspects existing versions on gh-pages; full history
+          # isn't strictly required but `0` is the conservative choice.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git for mike push
+        env:
+          ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          git config user.name "${ACTOR}"
+          git config user.email "${ACTOR}@users.noreply.github.com"
+          # Embed the OIDC-minted GITHUB_TOKEN in the remote URL only
+          # at this point (vs. persist-credentials: true at checkout)
+          # — keeps zizmor's `artipacked` lint happy while still
+          # giving mike a working `git push origin gh-pages`.
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: false
+
+      - name: Install just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+      - name: Resolve version from tag
+        id: ver
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="${REF_NAME#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      # The mike pin + invocation lives in `justfile` so local users and CI
+      # both run the exact same command. `--push` is the default for both
+      # `docs-deploy` and `docs-set-default`.
+      - name: Deploy versioned docs
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: just docs-deploy "${VERSION}"
+
+      - name: Set 'latest' as the default
+        run: just docs-set-default

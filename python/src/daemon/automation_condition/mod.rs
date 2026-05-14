@@ -1,0 +1,325 @@
+//! Automation condition daemon loop — evaluates condition trees and triggers materializations.
+//!
+//! Uses `AssetConditionCache` for incremental evaluation state across ticks. Evaluates
+//! `ConditionNode` trees per asset (including partition-aware conditions), persists
+//! tick/eval records to storage, and emits `RunRequest`s to trigger materializations.
+//!
+//! The pure-Rust per-tick state machine — refresh / evaluate / apply /
+//! classify — lives in [`rivers_core::condition::ConditionPass`]. Python's
+//! [`engine::ConditionTickEngine`] holds the PyO3-bound resources (storage,
+//! repo cell, channels) and delegates each phase to the pass; the
+//! materialization fan-out (after a condition fires) lives in `materialize`.
+//! This module's `condition_eval_loop` is the entry point — it owns the
+//! engine and drives `engine.tick()` on a periodic interval.
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use rivers_core::condition::{
+    AssetConditionCache, AssetConditionInfo, ConditionEvalState, ConditionPass, PartitionInfo,
+    PartitionMappingKind,
+};
+use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::{PartitionKey as CorePartitionKey, ScopedStorageHandle};
+use tokio_util::sync::CancellationToken;
+
+use super::{ConditionEvalWriteMsg, TickWriteMsg};
+use crate::executor::ops::now_ts;
+use crate::partitions::{PartitionMapping, PartitionsDefinition};
+use crate::repository::PyCodeRepository;
+use crate::repository::resolved_node::ResolvedNode;
+
+mod engine;
+mod materialize;
+mod persist;
+
+use engine::ConditionTickEngine;
+
+/// Build a [`PartitionInfo`] from a graph node. Returns `None` if unpartitioned.
+fn partition_info_from_node(asset_name: &str, node: &ResolvedNode) -> Option<PartitionInfo> {
+    let def = node.partitions_def()?;
+    let all_keys = def
+        .get_partition_keys()
+        .ok()
+        .map(|keys| {
+            keys.iter()
+                .map(CorePartitionKey::from)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let time_window_fmt = match def {
+        PartitionsDefinition::TimeWindow { fmt, .. } => Some(fmt.clone()),
+        _ => None,
+    };
+    let mappings = extract_partition_mappings(asset_name, node);
+    Some(PartitionInfo {
+        all_keys,
+        mappings,
+        time_window_fmt,
+    })
+}
+
+impl PyCodeRepository {
+    /// Extract assets with automation conditions from the repo. Returns
+    /// conditions in topological order (deps before downstreams) so that
+    /// `WillBeRequested` can see upstream results during same-tick evaluation.
+    pub(in crate::daemon) fn extract_asset_conditions(&self) -> Vec<AssetConditionInfo> {
+        let guard = self.state.read().unwrap();
+        let Some(state) = guard.as_ref() else {
+            return Vec::new();
+        };
+
+        // Backfill strategy is converted to the pure-Rust core variant here
+        // while we have the GIL — the eval loop runs without it.
+        let mut by_key: HashMap<String, AssetConditionInfo> = HashMap::new();
+        for (name, node) in &state.node_map {
+            if let ResolvedNode::Asset(asset_node) = node
+                && let Some(ref cond) = asset_node.automation_condition
+            {
+                let partition_info = partition_info_from_node(name, node);
+                let backfill_strategy = node.backfill_strategy().map(|s| s.to_core());
+                by_key.insert(
+                    name.clone(),
+                    AssetConditionInfo {
+                        asset_key: name.clone(),
+                        condition: cond.node.clone(),
+                        partition_info,
+                        backfill_strategy,
+                    },
+                );
+            }
+        }
+
+        if by_key.is_empty() {
+            return Vec::new();
+        }
+
+        state.inner_repo.sort_topologically(by_key)
+    }
+
+    /// Extract upstream partition keys for all conditioned assets. Reads
+    /// the cached `PartitionsDefinition` value off each `ResolvedNode`, so
+    /// no GIL is required.
+    pub(in crate::daemon) fn extract_upstream_partition_keys(
+        &self,
+        conditions: &[AssetConditionInfo],
+    ) -> HashMap<String, HashSet<CorePartitionKey>> {
+        let guard = self.state.read().unwrap();
+        let Some(state) = guard.as_ref() else {
+            return HashMap::new();
+        };
+
+        let mut map: HashMap<String, HashSet<CorePartitionKey>> = HashMap::new();
+        for cond in conditions {
+            if let Some(ref pi) = cond.partition_info {
+                map.entry(cond.asset_key.clone())
+                    .or_insert_with(|| pi.all_keys.clone());
+                for (_, upstream_key) in pi.mappings.keys() {
+                    if !map.contains_key(upstream_key)
+                        && let Some(node) = state.node_map.get(upstream_key)
+                        && let Some(def) = node.partitions_def()
+                        && let Ok(keys) = def.get_partition_keys()
+                    {
+                        let core_keys: HashSet<CorePartitionKey> =
+                            keys.iter().map(CorePartitionKey::from).collect();
+                        map.insert(upstream_key.clone(), core_keys);
+                    }
+                }
+            }
+        }
+        map
+    }
+}
+
+fn mapping_to_kind(m: &PartitionMapping) -> PartitionMappingKind {
+    match m {
+        PartitionMapping::Identity {} => PartitionMappingKind::Identity,
+        PartitionMapping::AllPartitions {} => PartitionMappingKind::AllPartitions,
+        PartitionMapping::Static { mapping } => PartitionMappingKind::Static {
+            mapping: mapping.clone(),
+        },
+        PartitionMapping::TimeWindow { offset } => {
+            PartitionMappingKind::TimeWindow { offset: *offset }
+        }
+        PartitionMapping::SpecificPartitions { partition_keys } => {
+            PartitionMappingKind::SpecificPartitions {
+                keys: partition_keys.clone(),
+            }
+        }
+        PartitionMapping::Multi { dimension_mappings } => PartitionMappingKind::Multi {
+            dimension_mappings: dimension_mappings
+                .iter()
+                .map(|(up_dim, (down_dim, per_dim))| {
+                    (
+                        up_dim.clone(),
+                        (down_dim.clone(), Box::new(mapping_to_kind(per_dim))),
+                    )
+                })
+                .collect(),
+        },
+        PartitionMapping::MultiToSingle {
+            dimension_name,
+            partition_mapping,
+        } => PartitionMappingKind::MultiToSingle {
+            dimension_name: dimension_name.clone(),
+            inner: Box::new(mapping_to_kind(&partition_mapping.0)),
+        },
+        PartitionMapping::ForKeys { .. } => PartitionMappingKind::ForKeys,
+        PartitionMapping::Subset {} => PartitionMappingKind::Subset,
+    }
+}
+
+fn extract_partition_mappings(
+    asset_name: &str,
+    node: &crate::repository::resolved_node::ResolvedNode,
+) -> HashMap<(String, String), PartitionMappingKind> {
+    let mut result = HashMap::new();
+    if let Some(mappings) = node.partition_mapping() {
+        for (upstream_name, mapping) in &mappings {
+            let kind = mapping_to_kind(mapping);
+            result.insert((asset_name.to_string(), upstream_name.clone()), kind);
+        }
+    }
+    result
+}
+
+pub(super) struct ConditionEvalLoopConfig {
+    pub conditions: Vec<AssetConditionInfo>,
+    /// Storage scoped to the owning code location. Filters every per-CL
+    /// query in the loop and supplies `code_location_id` for queued
+    /// `RunRecord`s so the coordinator only dequeues this CL's runs.
+    pub storage: ScopedStorageHandle<SurrealStorage>,
+    /// Shared with the schedule/sensor loop — both run and backfill
+    /// shapes route through these dispatchers.
+    pub run_dispatcher: Arc<crate::daemon::dispatchers::RunDispatcherKind>,
+    pub backfill_dispatcher: Arc<crate::daemon::dispatchers::BackfillDispatcherKind>,
+    pub cancel: CancellationToken,
+    pub interval: std::time::Duration,
+    pub tick_tx: tokio::sync::mpsc::UnboundedSender<TickWriteMsg>,
+    pub max_ticks_retained: Option<usize>,
+    pub eval_tx: tokio::sync::mpsc::UnboundedSender<ConditionEvalWriteMsg>,
+    pub max_evals_retained: Option<usize>,
+    /// Upstream partition keys, pre-extracted with GIL at daemon start.
+    pub upstream_partition_keys: HashMap<String, HashSet<CorePartitionKey>>,
+}
+
+/// Background loop that periodically evaluates automation conditions on assets.
+/// Spawned as a separate tokio task alongside the schedule/sensor loop.
+///
+/// Owns one [`ConditionTickEngine`] for the lifetime of the daemon and drives
+/// `engine.tick()` on `interval`. All per-tick orchestration — cache refresh,
+/// evaluation, state mutation, persistence, materialization fan-out — lives
+/// inside the engine.
+#[tracing::instrument(skip_all, target = "rivers::daemon", name = "condition_loop", fields(asset_count = config.conditions.len()))]
+pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
+    let ConditionEvalLoopConfig {
+        conditions,
+        storage,
+        run_dispatcher,
+        backfill_dispatcher,
+        cancel,
+        interval,
+        tick_tx,
+        max_ticks_retained,
+        eval_tx,
+        max_evals_retained,
+        upstream_partition_keys,
+    } = config;
+
+    let code_location_id = storage.code_location_id().to_string();
+    let mut cache = AssetConditionCache::new(code_location_id.clone());
+
+    let mut eval_state: ConditionEvalState = storage
+        .scoped()
+        .get_condition_eval_state()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| ConditionEvalState {
+            is_initial: true,
+            ..Default::default()
+        });
+
+    for info in &conditions {
+        let current_fp = info.condition.fingerprint_hex();
+        let state = eval_state.assets.entry(info.asset_key.clone()).or_default();
+        if state.condition_fingerprint == current_fp {
+            continue;
+        }
+        tracing::debug!(
+            target: "rivers::daemon",
+            asset = %info.asset_key,
+            old_fp = %state.condition_fingerprint,
+            new_fp = %current_fp,
+            "condition tree changed, invalidating evaluation state"
+        );
+        state.reset_for_new_tree(current_fp);
+    }
+
+    // Prune state for assets that no longer have conditions. Keep dep
+    // entries with meaningful state (last_materialized_timestamp) — these
+    // are used by NewlyUpdated in dep pivots across daemon restarts.
+    let active: HashSet<String> = conditions.iter().map(|c| c.asset_key.clone()).collect();
+    eval_state
+        .assets
+        .retain(|k, v| active.contains(k) || v.last_materialized_timestamp.is_some());
+
+    // Register partitioned assets with the cache so refresh() loads their
+    // status. Include both conditioned assets AND their upstream deps —
+    // needed for accurate partition-level AnyDepsMissing / any_deps_updated.
+    let mut partitioned_asset_keys: Vec<String> = conditions
+        .iter()
+        .filter_map(|c| c.partition_info.as_ref().map(|_| c.asset_key.clone()))
+        .collect();
+    for cond in &conditions {
+        if let Some(ref pi) = cond.partition_info {
+            for (_, upstream) in pi.mappings.keys() {
+                if !partitioned_asset_keys.contains(upstream) {
+                    partitioned_asset_keys.push(upstream.clone());
+                }
+            }
+        }
+    }
+    cache.set_partitioned_assets(partitioned_asset_keys.clone());
+    let cond_nodes: Vec<_> = conditions.iter().map(|c| c.condition.clone()).collect();
+    cache.set_needs_tick_tags(&cond_nodes);
+
+    tracing::info!(
+        target: "rivers::daemon",
+        count = conditions.len(),
+        partitioned = partitioned_asset_keys.len(),
+        "condition eval loop started"
+    );
+
+    let pass = ConditionPass::new(cache, eval_state, conditions, upstream_partition_keys);
+
+    let mut engine = ConditionTickEngine {
+        pass,
+        code_location_id,
+        storage,
+        run_dispatcher,
+        backfill_dispatcher,
+        tick_tx,
+        eval_tx,
+        max_ticks_retained,
+        max_evals_retained,
+    };
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                // Persist state before exiting.
+                let _ = engine
+                    .storage
+                    .scoped()
+                    .set_condition_eval_state(&engine.pass.eval_state)
+                    .await;
+                tracing::info!(target: "rivers::daemon", "condition eval loop stopped");
+                return;
+            }
+            _ = tokio::time::sleep(interval) => {}
+        }
+
+        let now = now_ts();
+        engine.tick(now).await;
+    }
+}

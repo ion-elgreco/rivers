@@ -1,0 +1,76 @@
+{{- /*
+Defines the rivers DB user inside the bundled SurrealDB. Runs as a
+regular Job (not a `post-install` hook — that deadlocks because the
+hook fires after `--wait`, but `--wait` blocks on operator/UI Ready,
+which they can't reach until the user is defined). Operator/UI use
+a `wait-for-surreal` init container instead; this Job races them and
+the kubelet's pod restarts cover the SurrealDB cold-start window.
+`.Release.Revision` produces a fresh Job per upgrade — Job specs are
+immutable.
+*/ -}}
+{{- if .Values.surrealdb.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-surrealdb-user-init-r{{ .Release.Revision }}
+  namespace: {{ include "rivers.namespace" . }}
+  labels:
+    app.kubernetes.io/name: rivers-surrealdb-user-init
+    {{- include "rivers.labels" . | nindent 4 }}
+spec:
+  # Survives ~6 attempts × exponential backoff = several minutes —
+  # enough for a cold SurrealDB image pull on a fresh install.
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rivers-surrealdb-user-init
+        {{- include "rivers.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: setup
+          secret:
+            secretName: rivers-surrealdb-setup
+      containers:
+        - name: define-user
+          image: {{ .Values.surrealdb.image.repository }}:{{ .Values.surrealdb.image.tag }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: SURREAL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rivers.surrealBootstrapSecretName" . }}
+                  key: username
+            - name: SURREAL_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rivers.surrealBootstrapSecretName" . }}
+                  key: password
+            - name: SURREAL_NAMESPACE
+              value: {{ .Values.surrealdb.auth.namespace | quote }}
+            - name: SURREAL_DATABASE
+              value: {{ .Values.surrealdb.auth.database | quote }}
+          volumeMounts:
+            - name: setup
+              mountPath: /setup
+              readOnly: true
+          command: ["/surreal"]
+          args:
+            - "import"
+            - "--endpoint"
+            - {{ include "rivers.surrealHttpEndpoint" . | quote }}
+            - "/setup/setup.surql"
+{{- end }}

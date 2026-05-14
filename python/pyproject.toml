@@ -1,0 +1,47 @@
+[project]
+name = "rivers"
+version = "0.1.0"
+description = "Orchestration platform for tasks and assets, fully backed by Rust."
+readme = "README.md"
+license = "LICENSE"
+requires-python = ">=3.10"
+dependencies = [
+    "loky>=3.5",
+    "obstore>=0.9.1",
+    "pydantic>=2.11.9",
+    "pydantic-settings>=2.0",
+    "typer>=0.9",
+]
+
+[project.optional-dependencies]
+delta = ["deltalake>=0.25.0"]
+pyarrow = ["pyarrow>=18.0.0"]
+polars = ["polars>=1.33.1"]
+otel = ["opentelemetry-api>=1.0"]
+
+[project.scripts]
+rivers = "rivers.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+# Kubernetes integration tests need a live k3d cluster (`just k8s-up`),
+# so exclude them from the default `just test` / `pytest python/` run.
+# Run them explicitly: just k8s-test
+norecursedirs = ["tests/integration/kubernetes"]
+# Per-test timeout so a hang in native (Rust/tokio/rocksdb) code can't lock up
+# CI for the whole job. `thread` method runs a watchdog thread that dumps
+# tracebacks of every thread via faulthandler, then exits — pytest's signal
+# method can't interrupt code blocked inside a C extension.
+timeout = 60
+timeout_method = "thread"
+
+[tool.pyright]
+exclude = ["**/tests"]
+
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+# python-source = "python"
+module-name = "rivers._core"

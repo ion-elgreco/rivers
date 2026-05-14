@@ -1,0 +1,43 @@
+ARG BUILDER_IMAGE=debian:bookworm-slim
+ARG BASE_IMAGE=gcr.io/distroless/cc-debian12:nonroot
+
+FROM ${BUILDER_IMAGE} AS prep
+COPY rivers-ui /staging/usr/local/bin/rivers-ui
+RUN set -eux; \
+    chmod 0755 /staging/usr/local/bin/rivers-ui; \
+    install -d -m 0755 /staging/var/lib/rivers; \
+    chown -R 65532:65532 /staging/var/lib/rivers
+
+FROM ${BASE_IMAGE}
+
+ARG RIVERS_VERSION=dev
+ARG RIVERS_REVISION=unknown
+ARG BUILD_DATE=unknown
+ARG BASE_IMAGE
+
+LABEL org.opencontainers.image.title="rivers-ui" \
+      org.opencontainers.image.description="Web UI for the Rivers asset orchestration platform" \
+      org.opencontainers.image.vendor="Rivers" \
+      org.opencontainers.image.authors="Ion Koutsouris <ion@orchestration.rs>" \
+      org.opencontainers.image.source="https://github.com/ion-elgreco/rivers" \
+      org.opencontainers.image.url="https://github.com/ion-elgreco/rivers" \
+      org.opencontainers.image.documentation="https://github.com/ion-elgreco/rivers" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.version="${RIVERS_VERSION}" \
+      org.opencontainers.image.revision="${RIVERS_REVISION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.base.name="${BASE_IMAGE}"
+
+COPY --from=prep /staging/ /
+
+USER 65532:65532
+WORKDIR /var/lib/rivers
+
+VOLUME ["/var/lib/rivers"]
+
+EXPOSE 3000
+
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/usr/local/bin/rivers-ui"]
+CMD ["--host", "0.0.0.0", "--port", "3000"]

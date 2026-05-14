@@ -1,0 +1,237 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: runs.rivers.io
+spec:
+  group: rivers.io
+  names:
+    categories:
+    - rivers
+    kind: Run
+    plural: runs
+    shortNames:
+    - rr
+    singular: run
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.target
+      name: Target
+      type: string
+    - jsonPath: .status.completedSteps
+      name: Steps
+      type: string
+    - jsonPath: .status.restartsWithoutProgress
+      name: Restarts
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for RunSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              cancelGracePeriodSeconds:
+                default: 300
+                format: uint64
+                minimum: 0.0
+                type: integer
+              codeLocationRef:
+                default:
+                  identity: ''
+                  name: ''
+                description: |-
+                  Reference to the CodeLocation this run belongs to. The admission
+                  webhook stamps `image` and `module` from the referenced CodeLocation's
+                  `status.resolvedImage` and `spec.module` on CREATE; power-users can
+                  set `image` directly with a digest as an escape hatch.
+                properties:
+                  identity:
+                    default: ''
+                    description: |-
+                      Stable identity (UUID v4) of the referenced CodeLocation, copied from
+                      `CodeLocation.spec.identity` by the Run admission webhook on CREATE.
+                      Observability-only metadata — the executor pod scopes its storage
+                      from the operator-injected `RIVERS_CODE_LOCATION_ID` env, not from
+                      this field. Skipped on the digest escape-hatch path. Immutable after
+                      the webhook stamps it; the Run UPDATE check rejects any change.
+                    type: string
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              executor:
+                default: kubernetes
+                description: |-
+                  Which executor backend runs the steps. `kubernetes` (default) launches
+                  per-step pods; `parallel` runs in worker subprocesses inside the
+                  executor pod; `in_process` runs them in-thread (mostly for tests).
+                enum:
+                - in_process
+                - parallel
+                - kubernetes
+                type: string
+              image:
+                default: ''
+                description: |-
+                  Fully-qualified pinned digest reference (`registry/repo@sha256:...`)
+                  populated by the admission webhook from
+                  `CodeLocation.status.resolvedImage`. Immutable after creation. Empty
+                  string is acceptable on apply — webhook fills it.
+                type: string
+              maxConcurrentSteps:
+                default: 10
+                format: uint32
+                minimum: 0.0
+                type: integer
+              maxRestarts:
+                default: 3
+                format: uint32
+                minimum: 0.0
+                type: integer
+              module:
+                default: definitions
+                description: |-
+                  Python module path. Populated by the admission webhook from
+                  `CodeLocation.spec.module`. Immutable after creation.
+                type: string
+              parameters:
+                description: |-
+                  Free-form parameters object passed through to the user pipeline.
+                  `x-kubernetes-preserve-unknown-fields: true` so admission accepts
+                  arbitrary nested structure.
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              partitionKey:
+                nullable: true
+                type: string
+              runId:
+                nullable: true
+                type: string
+              runResources:
+                default:
+                  cpu: 500m
+                  memory: 512Mi
+                properties:
+                  cpu:
+                    default: 500m
+                    type: string
+                  memory:
+                    default: 512Mi
+                    type: string
+                type: object
+              serviceAccountName:
+                default: rivers-executor
+                type: string
+              surrealEndpoint:
+                default: ws://surrealdb.rivers.svc:8000
+                type: string
+              target:
+                description: Asset or job to materialize/execute.
+                type: string
+              timeoutSeconds:
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              workerResources:
+                default:
+                  cpu: 500m
+                  memory: 512Mi
+                properties:
+                  cpu:
+                    default: 500m
+                    type: string
+                  memory:
+                    default: 512Mi
+                    type: string
+                type: object
+            required:
+            - codeLocationRef
+            - target
+            type: object
+          status:
+            nullable: true
+            properties:
+              completedAt:
+                nullable: true
+                type: string
+              completedSteps:
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              conditions:
+                items:
+                  properties:
+                    lastTransitionTime:
+                      nullable: true
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    reason:
+                      nullable: true
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              executorPod:
+                nullable: true
+                type: string
+              lastProgressAt:
+                nullable: true
+                type: string
+              message:
+                nullable: true
+                type: string
+              phase:
+                enum:
+                - Pending
+                - Running
+                - Cancelling
+                - Succeeded
+                - Failed
+                - Cancelled
+                - TimedOut
+                - null
+                nullable: true
+                type: string
+              restartsWithoutProgress:
+                default: 0
+                format: uint32
+                minimum: 0.0
+                type: integer
+              runId:
+                nullable: true
+                type: string
+              startedAt:
+                nullable: true
+                type: string
+              totalSteps:
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+            type: object
+        required:
+        - spec
+        title: Run
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

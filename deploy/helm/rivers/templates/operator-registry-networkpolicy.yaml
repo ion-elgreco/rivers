@@ -1,0 +1,34 @@
+{{- if .Values.operator.registry.networkPolicy.enabled }}
+{{- /*
+  Restrict the registry port to pods labelled `rivers.io/role=registry-client`
+  (bearer-token auth still enforced). Metrics (:9090) and the admission
+  webhook port are left open — Prometheus scraping and the kube-apiserver
+  have no stable label to select on.
+*/ -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rivers-operator-registry
+  namespace: {{ include "rivers.namespace" . }}
+  labels:
+    {{- include "rivers.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rivers-operator
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 9090
+        - protocol: TCP
+          port: {{ .Values.operator.webhook.port }}
+    - from:
+        - podSelector:
+            matchLabels:
+              rivers.io/role: registry-client
+      ports:
+        - protocol: TCP
+          port: {{ .Values.operator.registry.port }}
+{{- end }}

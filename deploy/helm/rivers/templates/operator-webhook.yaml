@@ -1,0 +1,183 @@
+{{- /*
+Webhook serving cert + MutatingWebhookConfiguration.
+
+The two resources live in one template so they share Helm scope: the
+selfSigned mode generates a CA + serving cert at render time and inlines
+the same CA into the MWC `caBundle`. Splitting them into separate files
+would render twice and produce mismatched certs on first install.
+
+Two providers:
+
+  * selfSigned — chart generates a self-signed CA + serving cert with
+    `genCA` / `genSignedCert`. On `helm upgrade`, `lookup` reuses the
+    existing Secret so the cert (and matching caBundle) survive across
+    upgrades. No external dependency. Default. Manual rotation only —
+    delete the Secret and `helm upgrade` to regenerate.
+
+  * certManager — emit a cert-manager `Certificate`; the user provides
+    an `issuerRef`. cainjector populates `caBundle` on the MWC via the
+    `cert-manager.io/inject-ca-from` annotation. Recommended for prod.
+*/}}
+{{- $ns := include "rivers.namespace" . }}
+{{- $svc := "rivers-operator-webhook" }}
+{{- $secretName := "rivers-operator-webhook-cert" }}
+{{- $provider := .Values.operator.webhook.certProvider }}
+{{- /* $caCrt holds the base64-encoded CA in selfSigned mode (inlined into
+       the MWC caBundle below). In certManager mode it stays empty —
+       cainjector populates caBundle via the inject-ca-from annotation. */}}
+{{- $caCrt := "" }}
+
+{{- if eq $provider "selfSigned" }}
+{{- $existing := lookup "v1" "Secret" $ns $secretName }}
+{{- $tlsCrt := "" }}
+{{- $tlsKey := "" }}
+{{- if and $existing $existing.data (hasKey $existing.data "ca.crt") }}
+  {{- $tlsCrt = index $existing.data "tls.crt" }}
+  {{- $tlsKey = index $existing.data "tls.key" }}
+  {{- $caCrt = index $existing.data "ca.crt" }}
+{{- else }}
+  {{- $days := int .Values.operator.webhook.selfSigned.certDays }}
+  {{- $ca := genCA "rivers-operator-ca" $days }}
+  {{- $altNames := list $svc (printf "%s.%s.svc" $svc $ns) (printf "%s.%s.svc.cluster.local" $svc $ns) }}
+  {{- $cn := printf "%s.%s.svc" $svc $ns }}
+  {{- $cert := genSignedCert $cn nil $altNames $days $ca }}
+  {{- $tlsCrt = $cert.Cert | b64enc }}
+  {{- $tlsKey = $cert.Key | b64enc }}
+  {{- $caCrt = $ca.Cert | b64enc }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rivers.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  tls.crt: {{ $tlsCrt }}
+  tls.key: {{ $tlsKey }}
+  ca.crt: {{ $caCrt }}
+---
+{{- else if eq $provider "certManager" }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rivers.labels" . | nindent 4 }}
+spec:
+  secretName: {{ $secretName }}
+  duration: {{ .Values.operator.webhook.certManager.duration | quote }}
+  renewBefore: {{ .Values.operator.webhook.certManager.renewBefore | quote }}
+  issuerRef:
+    name: {{ required "operator.webhook.certManager.issuerRef.name is required when certProvider=certManager — point at an existing Issuer or ClusterIssuer." .Values.operator.webhook.certManager.issuerRef.name | quote }}
+    kind: {{ .Values.operator.webhook.certManager.issuerRef.kind | default "ClusterIssuer" | quote }}
+    {{- with .Values.operator.webhook.certManager.issuerRef.group }}
+    group: {{ . | quote }}
+    {{- end }}
+  dnsNames:
+    - {{ $svc }}
+    - {{ $svc }}.{{ $ns }}.svc
+    - {{ $svc }}.{{ $ns }}.svc.cluster.local
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+---
+{{- else }}
+{{ fail (printf "operator.webhook.certProvider must be 'selfSigned' or 'certManager', got %q" $provider) }}
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $svc }}
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: {{ $svc }}
+    {{- include "rivers.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: https
+      port: 443
+      targetPort: webhook
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: rivers-operator
+---
+# MutatingWebhookConfiguration for Run + CodeLocation CRs.
+#
+# Run webhook (RFC 033 Phase 4 + RFC 034 Phase 2): on CREATE, stamps
+# `.spec.image`, `.spec.module`, and `.spec.codeLocationRef.identity` from
+# the referenced CodeLocation. On UPDATE, rejects mutation of those fields
+# plus `codeLocationRef`.
+#
+# CodeLocation webhook (RFC 034 Phase 2): on CREATE, stamps a fresh UUID v4
+# into `.spec.identity` if empty, or rejects a malformed user-supplied one.
+# On UPDATE, rejects any change to `.spec.identity` (immutable).
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: rivers-run-webhook
+  {{- if eq $provider "certManager" }}
+  annotations:
+    # cainjector reads the cert from the Secret named here and patches
+    # caBundle on this resource on every rotation.
+    cert-manager.io/inject-ca-from: {{ $ns }}/{{ $secretName }}
+  {{- end }}
+  labels:
+    {{- include "rivers.labels" . | nindent 4 }}
+webhooks:
+  - name: run.rivers.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    # Soft 5s timeout — well under the 10s API-server default. Webhook handler
+    # is in-memory cache lookup + at most one quorum GET against the API
+    # server, both well under this budget.
+    timeoutSeconds: 5
+    # Loud failure on operator unavailability. Without the operator nothing
+    # would reconcile anyway, so a clear `kubectl apply` rejection is better
+    # UX than a silent stuck CR. RFC 033 line 445.
+    failurePolicy: Fail
+    clientConfig:
+      service:
+        name: {{ $svc }}
+        namespace: {{ $ns }}
+        path: /mutate-run
+        port: 443
+      {{- if eq $provider "selfSigned" }}
+      caBundle: {{ $caCrt }}
+      {{- else }}
+      # cainjector populates this from the Secret referenced by the
+      # cert-manager.io/inject-ca-from annotation above. Empty here so
+      # chart upgrades don't clobber the live value.
+      caBundle: ""
+      {{- end }}
+    rules:
+      - apiGroups: ["rivers.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["runs"]
+        scope: "Namespaced"
+  - name: codelocation.rivers.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    timeoutSeconds: 5
+    failurePolicy: Fail
+    clientConfig:
+      service:
+        name: {{ $svc }}
+        namespace: {{ $ns }}
+        path: /mutate-codelocation
+        port: 443
+      {{- if eq $provider "selfSigned" }}
+      caBundle: {{ $caCrt }}
+      {{- else }}
+      caBundle: ""
+      {{- end }}
+    rules:
+      - apiGroups: ["rivers.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["codelocations"]
+        scope: "Namespaced"

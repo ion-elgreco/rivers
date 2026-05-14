@@ -1,0 +1,225 @@
+name: release-python
+
+# Builds the rivers Python wheel + sdist for all supported platforms and
+# publishes to PyPI via Trusted Publishing on tag push (v*.*.*).
+#
+# Wheels are abi3-py310, so one wheel per (os, libc, arch) covers
+# Python 3.10+. Platforms: linux-gnu/{x86_64, aarch64} (manylinux_2_17),
+# linux-musl/{x86_64, aarch64} (musllinux_1_2), macos/{x86_64, arm64},
+# windows/x86_64, sdist.
+
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-python-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  build-linux:
+    name: Build wheel (linux ${{ matrix.libc }} ${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read       # checkout sources
+      id-token: write      # OIDC for Sigstore signing via attest-build-provenance
+      attestations: write  # publish SLSA provenance to repo attestation log
+
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # glibc — covers most distros (Debian/Ubuntu/RHEL/...).
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            libc: gnu
+            manylinux: "2014"
+          - target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            libc: gnu
+            manylinux: "2014"
+          # musl — covers Alpine and other distroless/musl-based images.
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+            libc: musl
+            manylinux: musllinux_1_2
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+            libc: musl
+            manylinux: musllinux_1_2
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist
+          sccache: false
+
+      - name: Attest wheel provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: "python/dist/*.whl"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheel-linux-${{ matrix.libc }}-${{ matrix.arch }}
+          path: python/dist/*.whl
+          if-no-files-found: error
+
+  build-macos:
+    name: Build wheel (macos ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read       # checkout sources
+      id-token: write      # OIDC for Sigstore signing via attest-build-provenance
+      attestations: write  # publish SLSA provenance to repo attestation log
+
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            arch: x86_64
+            runner: macos-13       # last GHA macOS runner with native Intel hw
+          - target: aarch64-apple-darwin
+            arch: arm64
+            runner: macos-14       # native Apple Silicon
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: python
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          sccache: false
+
+      - name: Attest wheel provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: "python/dist/*.whl"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheel-macos-${{ matrix.arch }}
+          path: python/dist/*.whl
+          if-no-files-found: error
+
+  build-windows:
+    name: Build wheel (windows ${{ matrix.arch }})
+    runs-on: windows-latest
+    permissions:
+      contents: read       # checkout sources
+      id-token: write      # OIDC for Sigstore signing via attest-build-provenance
+      attestations: write  # publish SLSA provenance to repo attestation log
+
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x86_64
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: python
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          sccache: false
+
+      - name: Attest wheel provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: "python/dist/*.whl"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheel-windows-${{ matrix.arch }}
+          path: python/dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read       # checkout sources
+      id-token: write      # OIDC for Sigstore signing via attest-build-provenance
+      attestations: write  # publish SLSA provenance to repo attestation log
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: python
+          command: sdist
+          args: --out dist
+
+      - name: Attest sdist provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: "python/dist/*.tar.gz"
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sdist
+          path: python/dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: [build-linux, build-macos, build-windows, sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # PyPI Trusted Publishing exchanges OIDC for upload token
+
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: "wheel-*"
+          merge-multiple: true
+
+      - name: Download sdist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sdist
+          path: dist
+
+      - name: List dist
+        run: ls -la dist
+
+      - name: Publish to PyPI
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          command: upload
+          args: --non-interactive --skip-existing --trusted-publishing automatic dist/*

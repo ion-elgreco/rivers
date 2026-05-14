@@ -1,0 +1,32 @@
+[package]
+name = "rivers-k8s"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+
+[dependencies]
+# Direct kube subcrate deps — `kube` umbrella replaced with the layers we
+# actually use. `kube-core` needs `schema` for `kube-derive`'s CustomResource
+# expansion. No `kube-runtime`: this crate doesn't run controllers itself
+# (the operator does).
+kube-client.workspace = true
+kube-derive.workspace = true
+kube-core = { workspace = true, features = ["schema"] }
+k8s-openapi = { workspace = true, features = ["schemars"] }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+rivers-core = { path = "../rivers-core" }
+anyhow.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+
+[[bin]]
+name = "rivers-gen-crd"
+path = "src/bin/gen_crd.rs"

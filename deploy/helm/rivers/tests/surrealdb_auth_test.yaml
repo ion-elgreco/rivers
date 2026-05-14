@@ -1,0 +1,202 @@
+suite: surrealdb authenticated connections
+templates:
+  - templates/operator-deployment.yaml
+  - templates/ui-deployment.yaml
+  - templates/surrealdb-auth-secret.yaml
+  - templates/surrealdb-bootstrap-secret.yaml
+  - templates/surrealdb-setup-secret.yaml
+  - templates/surrealdb-user-job.yaml
+release:
+  name: rivers
+  namespace: rivers
+tests:
+  - it: bundled DB defaults to authenticated — chart-managed Secrets + init Job rendered
+    asserts:
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: rivers-surrealdb-auth
+                key: username
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: rivers-surrealdb-auth
+                key: password
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_AUTH_SECRET_NAME
+            value: rivers-surrealdb-auth
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_NAMESPACE
+            value: rivers
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: rivers-surrealdb-auth
+                key: username
+      - template: templates/surrealdb-auth-secret.yaml
+        isKind:
+          of: Secret
+      - template: templates/surrealdb-auth-secret.yaml
+        equal:
+          path: metadata.name
+          value: rivers-surrealdb-auth
+      - template: templates/surrealdb-auth-secret.yaml
+        equal:
+          path: stringData.username
+          value: rivers
+      - template: templates/surrealdb-bootstrap-secret.yaml
+        isKind:
+          of: Secret
+      - template: templates/surrealdb-bootstrap-secret.yaml
+        equal:
+          path: metadata.name
+          value: rivers-surrealdb-bootstrap
+      - template: templates/surrealdb-user-job.yaml
+        isKind:
+          of: Job
+      - template: templates/surrealdb-user-job.yaml
+        matchRegex:
+          path: metadata.name
+          pattern: ^.+-surrealdb-user-init-r[0-9]+$
+      - template: templates/surrealdb-setup-secret.yaml
+        isKind:
+          of: Secret
+      - template: templates/surrealdb-setup-secret.yaml
+        matchRegex:
+          path: stringData["setup.surql"]
+          pattern: "OPTION IMPORT"
+      - template: templates/operator-deployment.yaml
+        equal:
+          path: spec.template.spec.initContainers[0].name
+          value: wait-for-surreal
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        equal:
+          path: spec.template.spec.initContainers[0].name
+          value: wait-for-surreal
+
+  - it: bundled DB with inline username/password materialises the supplied values
+    set:
+      surrealdb.auth.username: rivers-prod
+      surrealdb.auth.password: super-secret
+    asserts:
+      - template: templates/surrealdb-auth-secret.yaml
+        equal:
+          path: stringData.username
+          value: rivers-prod
+      - template: templates/surrealdb-auth-secret.yaml
+        equal:
+          path: stringData.password
+          value: super-secret
+
+  - it: bundled DB with existingSecret — no chart-managed auth Secret, env points at user Secret
+    set:
+      surrealdb.auth.existingSecret: my-team-creds
+      surrealdb.auth.secretKeys.username: surreal-user
+      surrealdb.auth.secretKeys.password: surreal-pass
+    asserts:
+      - template: templates/surrealdb-auth-secret.yaml
+        hasDocuments:
+          count: 0
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: my-team-creds
+                key: surreal-user
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_AUTH_USERNAME_KEY
+            value: surreal-user
+
+  - it: external DB without creds — no auth env, no Secrets, no init Job, no init container
+    set:
+      surrealdb.enabled: false
+      surrealdb.endpoint: wss://external.example.com:443
+    asserts:
+      - template: templates/operator-deployment.yaml
+        notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_USERNAME
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_ENDPOINT
+            value: wss://external.example.com:443
+      - template: templates/operator-deployment.yaml
+        isNull:
+          path: spec.template.spec.initContainers
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        isNull:
+          path: spec.template.spec.initContainers
+      - template: templates/surrealdb-auth-secret.yaml
+        hasDocuments:
+          count: 0
+      - template: templates/surrealdb-bootstrap-secret.yaml
+        hasDocuments:
+          count: 0
+      - template: templates/surrealdb-setup-secret.yaml
+        hasDocuments:
+          count: 0
+      - template: templates/surrealdb-user-job.yaml
+        hasDocuments:
+          count: 0
+
+  - it: external DB with existingSecret — auth env via secretKeyRef, no bootstrap or init Job
+    set:
+      surrealdb.enabled: false
+      surrealdb.endpoint: wss://external.example.com:443
+      surrealdb.auth.existingSecret: external-creds
+    asserts:
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: external-creds
+                key: username
+      - template: templates/surrealdb-bootstrap-secret.yaml
+        hasDocuments:
+          count: 0
+      - template: templates/surrealdb-user-job.yaml
+        hasDocuments:
+          count: 0
+
+  - it: existingSecret + inline creds together is rejected
+    set:
+      surrealdb.auth.existingSecret: my-creds
+      surrealdb.auth.username: rivers
+      surrealdb.auth.password: x
+    asserts:
+      - template: templates/surrealdb-auth-secret.yaml
+        failedTemplate:
+          errorPattern: "mutually exclusive"

@@ -1,0 +1,183 @@
+global:
+  namespace: rivers
+
+surrealdb:
+  # Install the bundled SurrealDB subchart
+  # (https://github.com/surrealdb/helm-charts). Set to false to point rivers
+  # at an external SurrealDB; you must then set `surrealdb.endpoint` below.
+  enabled: true
+
+  # External SurrealDB endpoint, used only when `enabled: false`.
+  # Format: ws://host:port (or wss://...). The helper that wires this into the
+  # operator/UI fails the install if `enabled: false` and `endpoint` is empty.
+  endpoint: ""
+
+  # Authenticated SurrealDB connections.
+  #
+  # The bundled SurrealDB always runs authenticated — every rivers pod
+  # (operator, UI, code-location, run, step) signs in as a database-scoped
+  # user (`DEFINE USER ... ON DATABASE`) before accessing storage. The chart
+  # manages the bootstrap Secret + post-install Job that defines the user;
+  # credentials flow into pods via `valueFrom.secretKeyRef` so the password
+  # value never lands in pod specs or CRs.
+  #
+  # For external SurrealDB (`surrealdb.enabled=false`), authentication is
+  # opt-in: provide `existingSecret` (or inline `username`/`password`) and
+  # rivers signs in. Leave them empty to connect to an unauthenticated
+  # external SurrealDB.
+  auth:
+    # SurrealDB namespace and database the user is scoped to. Pods call
+    # `use_ns` / `use_db` with these values, and the database-scoped signin
+    # carries them too — so the user defined in SurrealDB must match.
+    namespace: rivers
+    database: main
+    # Reference an existing Secret (recommended for production). The Secret
+    # must have entries for `secretKeys.username` and `secretKeys.password`.
+    # When set, `username` / `password` below are ignored.
+    existingSecret: ""
+    secretKeys:
+      username: username
+      password: password
+    # Inline credentials — convenience for dev / kind clusters. When both
+    # are non-empty and `existingSecret` is empty, the chart materializes a
+    # Secret named `rivers-surrealdb-auth` from these values. For the
+    # bundled DB, when both are empty too, the chart auto-generates a
+    # `rivers` user with a random password (preserved across `helm upgrade`
+    # via Helm's `lookup`).
+    username: ""
+    password: ""
+    # Bootstrap (root) credentials for the bundled SurrealDB pod. Used only
+    # by the post-install Job that runs `DEFINE USER ... ON DATABASE` on
+    # first install + every upgrade. The chart auto-generates a random
+    # password on first install and preserves it on upgrade via `lookup`;
+    # override here only if you must (e.g. for reproducible installs).
+    bootstrap:
+      username: rivers-root
+      password: ""
+
+  # Pin the in-cluster service name to "surrealdb" so the endpoint helper and
+  # existing label selectors stay stable across the rename from our hand-rolled
+  # StatefulSet to the upstream chart.
+  fullnameOverride: surrealdb
+
+  image:
+    repository: surrealdb/surrealdb
+    tag: "v3"
+
+  # Subchart values (passed through to the surrealdb chart).
+  # See https://github.com/surrealdb/helm-charts/tree/main/charts/surrealdb
+  surrealdb:
+    path: rocksdb:///data/rivers.db
+    # Bundled SurrealDB boots authenticated, with bootstrap root creds
+    # mounted via `podExtraEnv` (below) from the chart-managed Secret
+    # `rivers-surrealdb-bootstrap`. The post-install Job then defines the
+    # database-scoped rivers user inside the DB.
+    unauthenticated: false
+    port: 8000
+  podExtraEnv:
+    # Maps the chart-managed bootstrap Secret onto SURREAL_USER /
+    # SURREAL_PASS. The subchart wires these into the `surreal start`
+    # invocation, so the bundled DB's bootstrap root user is set deterministically
+    # without baking creds into values.yaml.
+    - name: SURREAL_USER
+      valueFrom:
+        secretKeyRef:
+          name: rivers-surrealdb-bootstrap
+          key: username
+    - name: SURREAL_PASS
+      valueFrom:
+        secretKeyRef:
+          name: rivers-surrealdb-bootstrap
+          key: password
+  service:
+    port: 8000
+  persistence:
+    enabled: true
+    size: 1Gi
+    mountPath: /data
+  # RocksDB single-writer requires Recreate so the new pod can attach to the PV.
+  strategy:
+    type: Recreate
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+operator:
+  image: rivers-operator:latest
+  imagePullPolicy: IfNotPresent
+  # PodDisruptionBudget(minAvailable: 1) is emitted automatically when > 1.
+  replicas: 2
+  # When true, the operator's registry-probe client uses plain HTTP for ALL
+  # registries instead of HTTPS. Only enable for trusted in-cluster or
+  # local-dev registries (e.g. k3d's HTTP-only local registry); production
+  # should leave this false. When false, CodeLocations against an HTTP-only
+  # registry must pre-set spec.digest to skip the probe.
+  allowInsecureRegistry: false
+  registry:
+    # gRPC port for the CodeLocationRegistry service.
+    port: 50052
+    networkPolicy:
+      # Restricts registry ingress to pods labelled `rivers.io/role=registry-client`.
+      # Set false on clusters without a NetworkPolicy-enforcing CNI.
+      enabled: true
+  webhook:
+    # HTTPS port the operator container serves on; the rivers-operator-webhook
+    # Service maps cluster-port 443 onto this.
+    port: 9443
+    # How the webhook serving cert is provisioned:
+    #   "selfSigned"  — chart generates a self-signed CA + serving cert at
+    #                   install time and reuses them across upgrades. No
+    #                   external dependency. Manual rotation only.
+    #   "certManager" — emit a cert-manager Certificate; you provide the
+    #                   issuerRef under `certManager.issuerRef`. cainjector
+    #                   handles caBundle injection and rotation.
+    certProvider: selfSigned
+    selfSigned:
+      # Validity of the generated CA + serving cert in days. Default 10y; on
+      # expiry, delete the rivers-operator-webhook-cert Secret and run
+      # `helm upgrade` to regenerate.
+      certDays: 3650
+    certManager:
+      duration: 8760h    # 1y
+      renewBefore: 720h  # re-issue 30d before expiry
+      issuerRef:
+        # Name of an existing Issuer / ClusterIssuer. Required when
+        # certProvider=certManager — `helm install` fails until set.
+        name: ""
+        kind: ClusterIssuer
+        # API group override. cert-manager.io is the default.
+        group: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+ui:
+  enabled: true
+  image: rivers-ui:latest
+  imagePullPolicy: IfNotPresent
+  port: 3000
+  serviceType: ClusterIP
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+executor:
+  serviceAccountName: rivers-executor
+  defaultRunResources:
+    cpu: 500m
+    memory: 512Mi
+  defaultWorkerResources:
+    cpu: "1"
+    memory: 2Gi

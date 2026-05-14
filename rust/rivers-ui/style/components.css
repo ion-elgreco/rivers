@@ -1,0 +1,553 @@
+/* Rivers backfill-detail runs list: 5-col grid rows */
+.backfill-runs-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.backfill-runs-row {
+    display: grid;
+    grid-template-columns: 100px 100px 1fr 120px 100px;
+    padding: 12px 16px;
+    gap: 14px;
+    align-items: center;
+    background: var(--bg-surface);
+    text-decoration: none;
+    color: inherit;
+    transition: background 140ms ease;
+}
+.backfill-runs-row:hover { background: var(--bg-hover); }
+.backfill-runs-id {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: -0.005em;
+    color: var(--secondary);
+}
+.backfill-runs-trigger {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: -0.005em;
+    color: var(--text-muted);
+}
+.backfill-runs-started {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: -0.005em;
+    color: var(--text-muted);
+}
+.backfill-runs-duration {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: -0.005em;
+    color: var(--text);
+    text-align: right;
+}
+
+/* Rivers partition heatmap panel (backfill detail): wrapper card + header + legend */
+.partition-panel {
+    background: var(--bg-surface-low);
+    border-radius: 6px;
+    padding: 16px 20px;
+    margin: 0 0 24px;
+    position: relative;
+}
+.partition-panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 14px;
+    gap: 20px;
+}
+.partition-panel-desc {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: -0.005em;
+    color: var(--text-muted);
+    margin-top: 2px;
+}
+.partition-panel-legend {
+    display: flex;
+    gap: 14px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+.partition-panel-legend > span {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+.partition-legend-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    display: inline-block;
+}
+.partition-legend-swatch--done { background: var(--success); }
+.partition-legend-swatch--running { background: var(--secondary); animation: pulse-op 1.4s ease-in-out infinite; }
+.partition-legend-swatch--failed { background: var(--error); }
+.partition-legend-swatch--pending { background: var(--bg-highest); }
+
+/* Rivers-style flat metadata tile grid — 4 or 3 column, 1px hairline separator
+ * via the container's background bleeding through the gap between tiles.
+ * Used on the asset detail overview page.
+ */
+.meta-tile-grid {
+    display: grid;
+    gap: 1px;
+    background: var(--bg-highest);
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 6px 0 10px;
+}
+.meta-tile-grid--4 { grid-template-columns: repeat(4, 1fr); }
+.meta-tile-grid--3 { grid-template-columns: repeat(3, 1fr); margin-bottom: 24px; }
+.meta-tile { background: var(--bg-surface-low); padding: 14px 18px; }
+.meta-tile-grid--3 .meta-tile { padding: 10px 14px; }
+.meta-tile-label {
+    font-family: var(--font-sans);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+}
+.meta-tile-value {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    letter-spacing: -0.005em;
+    color: var(--text);
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+.meta-tile-grid--3 .meta-tile-value,
+.meta-tile-value--secondary { font-size: 12px; color: var(--text-muted); }
+
+/* "Show / Hide metadata" toggle — flat tertiary chip with rotating chevron */
+.meta-toggle-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: 0;
+    padding: 4px 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+    cursor: pointer;
+    margin-bottom: 14px;
+    transition: color 120ms ease;
+}
+.meta-toggle-btn:hover { color: var(--text); }
+.meta-toggle-chevron {
+    display: inline-block;
+    font-size: 13px;
+    line-height: 1;
+    transition: transform 160ms ease;
+}
+.meta-toggle-chevron--open { transform: rotate(90deg); }
+
+/* Rivers backfill-detail metadata grid: 4×2 flat tiles, 1px separator lines */
+.backfill-meta-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--bg-highest);
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 6px 0 24px;
+}
+.backfill-meta-tile { background: var(--bg-surface-low); padding: 12px 16px; }
+.backfill-meta-label {
+    font-family: var(--font-sans);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+}
+.backfill-meta-value {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    letter-spacing: -0.005em;
+    color: var(--text);
+}
+
+/* Tables */
+.table-container {
+    background: var(--bg-surface);
+    border-radius: var(--round-lg);
+    overflow: hidden;
+}
+
+table { width: 100%; border-collapse: collapse; }
+
+th {
+    text-align: left;
+    padding: 0.75rem 1rem;
+    font-family: var(--font-sans);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    background: var(--bg);
+}
+
+td { padding: 0.75rem 1rem; font-size: 0.875rem; }
+
+tr:last-child td { border-bottom: none; }
+
+tr:hover td { background: var(--bg-hover); }
+
+/* Badges */
+.badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.125rem 0.5rem;
+    border-radius: 9999px;
+    font-size: 0.75rem;
+    font-weight: 500;
+}
+
+.badge-success { background: var(--success-bg); color: var(--success); }
+.badge-error   { background: var(--error-bg);   color: var(--error); }
+.badge-warning { background: var(--warning-bg); color: var(--warning); }
+.badge-info    { background: var(--info-bg);    color: var(--secondary); }
+.badge-muted   { background: var(--bg-hover);   color: var(--text-muted); }
+
+/* Tags */
+.tag {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.125rem 0.375rem;
+    background: var(--bg-hover);
+    border-radius: 4px;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-right: 0.25rem;
+}
+
+/* Cards */
+.card {
+    background: var(--bg-surface);
+    border-radius: var(--round-lg);
+    padding: 1.25rem;
+    border-left: 2px solid var(--accent);
+}
+
+.card h3 {
+    font-size: 0.875rem;
+    font-weight: 600;
+    margin-bottom: 0.75rem;
+}
+
+/* Event timeline */
+.timeline {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.timeline-item {
+    display: flex;
+    gap: 0.75rem;
+    padding: 0.625rem 0.75rem;
+    background: var(--bg-surface);
+    border-radius: var(--round-md);
+    font-size: 0.875rem;
+}
+
+.timeline-item .time {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    white-space: nowrap;
+}
+
+/* Rivers-style floating selection sidebar on the lineage canvas (right edge).
+ * Mirrors rivers-screens.jsx:1317-1346.
+ */
+.dag-selected-sidebar {
+    position: absolute;
+    right: 16px;
+    top: 120px;
+    bottom: 16px;
+    width: 320px;
+    background: var(--bg-surface);
+    border-radius: 4px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    overflow: auto;
+    z-index: 3;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+}
+.dag-sidebar-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+}
+.dag-sidebar-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-sans);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+}
+.dag-sidebar-status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+}
+.dag-sidebar-status--healthy { color: var(--success); }
+.dag-sidebar-status--healthy .dag-sidebar-status-dot { background: var(--success); box-shadow: 0 0 6px var(--success); }
+.dag-sidebar-status--failed { color: var(--error); }
+.dag-sidebar-status--failed .dag-sidebar-status-dot { background: var(--error); }
+.dag-sidebar-status--stale { color: var(--warning); }
+.dag-sidebar-status--stale .dag-sidebar-status-dot { background: var(--warning); }
+.dag-sidebar-status--pending { color: var(--text-muted); }
+.dag-sidebar-status--pending .dag-sidebar-status-dot { background: var(--text-muted); }
+.dag-sidebar-close {
+    background: transparent;
+    border: 0;
+    color: var(--text-muted);
+    font-size: 18px;
+    line-height: 1;
+    padding: 2px 6px;
+    cursor: pointer;
+    border-radius: 3px;
+    transition: background 120ms ease, color 120ms ease;
+}
+.dag-sidebar-close:hover { color: var(--text); background: var(--bg-hover); }
+.dag-sidebar-title {
+    font-family: var(--font-mono);
+    font-size: 15px;
+    color: var(--text);
+    word-break: break-all;
+}
+.dag-sidebar-subtitle {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+.dag-sidebar-chips {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.dag-sidebar-section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 12px;
+    border-top: 1px solid var(--bg-hover);
+}
+.dag-sidebar-links {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.dag-sidebar-link {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: 0;
+    padding: 3px 0;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: left;
+    cursor: pointer;
+    transition: color 120ms ease;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.dag-sidebar-link:hover { color: var(--secondary); }
+.dag-sidebar-link-arrow { color: var(--text-comment); flex-shrink: 0; }
+.dag-sidebar-empty {
+    color: var(--text-muted);
+    font-size: 12px;
+    font-family: var(--font-mono);
+}
+.dag-sidebar-footer {
+    margin-top: auto;
+    display: flex;
+    gap: 6px;
+    padding-top: 12px;
+}
+.dag-sidebar-action { flex: 1; justify-content: center; }
+
+/* Rivers-style floating zoom controls overlay on the lineage canvas:
+ * top-right column of btn-tertiary chips with SVG +/- icons, Fit, divider,
+ * and a centered-layers toggle whose text tints accent when active.
+ * Mirrors rivers-screens.jsx:1305-1311.
+ */
+.dag-zoom-controls {
+    position: absolute;
+    right: 16px;
+    top: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    background: var(--bg-surface);
+    border-radius: 4px;
+    padding: 4px;
+    z-index: 3;
+}
+.dag-zoom-btn {
+    padding: 6px !important;
+    justify-content: center;
+    min-width: 26px;
+}
+.dag-zoom-text-btn {
+    padding: 4px 8px !important;
+    font-size: 10px !important;
+    justify-content: center;
+    font-weight: 500;
+}
+.dag-zoom-text-btn--active { color: var(--accent) !important; }
+.dag-zoom-divider {
+    height: 1px;
+    background: var(--bg-hover);
+    margin: 4px 2px;
+}
+
+/* DAG — dotted-paper background (Rivers LineageScreen: radial-gradient at 24×24) */
+.dag-container {
+    background-color: var(--bg-inset);
+    background-image: radial-gradient(circle, var(--bg-hover) 1px, transparent 1px);
+    background-size: 24px 24px;
+    border-radius: var(--round-lg);
+    overflow: hidden;
+    position: relative;
+    width: 100%;
+    height: 100%;
+}
+
+.dag-container svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+.dag-viewport {
+    cursor: grab;
+    user-select: none;
+    position: relative;
+    height: 100%;
+}
+
+.dag-viewport:active { cursor: grabbing; }
+
+.dag-node { cursor: pointer; }
+
+.dag-node text { pointer-events: none; }
+
+.dag-node { transition: transform 160ms ease, filter 200ms ease; transform-origin: center; }
+.dag-node:hover { transform: translateY(-1px); }
+.dag-node:hover > rect:first-child {
+    stroke: var(--accent);
+    stroke-width: 2.4;
+    filter: drop-shadow(0 4px 12px rgba(255, 143, 120, 0.35))
+        drop-shadow(0 0 1px rgba(255, 143, 120, 0.4));
+}
+
+.dag-edge { transition: stroke 160ms ease, stroke-width 160ms ease, opacity 160ms ease; }
+
+.dag-edge:hover {
+    stroke: var(--accent) !important;
+    stroke-width: 2.4;
+    opacity: 1 !important;
+}
+
+/* Dim non-hovered nodes when a sibling is hovered */
+.dag-container svg:has(.dag-node:hover) .dag-node:not(:hover) {
+    opacity: 0.4;
+    transition: opacity 200ms ease;
+}
+.dag-container svg:has(.dag-node:hover) .dag-edge:not(:hover) { opacity: 0.2; }
+
+
+/* Links */
+a { color: var(--accent); text-decoration: none; }
+
+a:hover { color: var(--accent-hover); }
+
+/* Loading */
+.loading {
+    color: var(--text-muted);
+    padding: 2rem;
+    text-align: center;
+}
+
+/* Error */
+.error-msg {
+    color: var(--error);
+    padding: 1rem;
+    background: rgba(255, 110, 132, 0.1);
+    border-radius: var(--round-md);
+}
+
+/* Buttons — "Machine Parts" */
+.btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    border: none;
+    border-radius: var(--round-sm);
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition:
+        background 0.15s,
+        color 0.15s,
+        opacity 0.15s;
+    background: var(--bg-hover);
+    color: var(--text-muted);
+}
+
+.btn:hover { background: rgba(255, 255, 255, 0.06); color: var(--text); }
+
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-primary {
+    background: var(--accent-gradient);
+    color: #0c0e11;
+    font-weight: 600;
+}
+
+.btn-primary:hover { filter: brightness(1.1); }
+
+.btn-danger {
+    background: transparent;
+    color: var(--error);
+    border-color: color-mix(in srgb, var(--error) 40%, transparent);
+}
+.btn-danger:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--error) 10%, transparent);
+    border-color: var(--error);
+}
+
+/* Rivers tertiary button — subtle filled chip for header actions */
+.btn-tertiary {
+    background: var(--bg-hover);
+    color: var(--text-muted);
+    padding: 7px 12px;
+    font-weight: 500;
+    gap: 6px;
+}
+.btn-tertiary:hover:not(:disabled) { background: var(--bg-highest); color: var(--text); }
+.btn-tertiary svg { flex-shrink: 0; }
+

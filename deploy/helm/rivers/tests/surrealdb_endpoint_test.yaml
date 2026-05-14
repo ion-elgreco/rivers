@@ -1,0 +1,50 @@
+suite: surrealdb endpoint helper
+templates:
+  - templates/operator-deployment.yaml
+  - templates/ui-deployment.yaml
+release:
+  name: rivers
+  namespace: rivers
+tests:
+  - it: defaults route operator + UI at the bundled in-cluster surrealdb service
+    asserts:
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_ENDPOINT
+            value: ws://surrealdb.rivers.svc:8000
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        contains:
+          path: spec.template.spec.containers[0].args
+          content: ws://surrealdb.rivers.svc:8000
+
+  - it: routes to an external endpoint when the bundled subchart is disabled
+    set:
+      surrealdb.enabled: false
+      surrealdb.endpoint: wss://surreal.example.com:443
+    asserts:
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_ENDPOINT
+            value: wss://surreal.example.com:443
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        contains:
+          path: spec.template.spec.containers[0].args
+          content: wss://surreal.example.com:443
+
+  - it: fails the install when surrealdb is disabled and no endpoint is set
+    set:
+      # Disable the UI so the failure surfaces from operator-deployment.yaml,
+      # which is the template this suite is scoped to.
+      ui.enabled: false
+      surrealdb.enabled: false
+      surrealdb.endpoint: ""
+    asserts:
+      - template: templates/operator-deployment.yaml
+        failedTemplate:
+          errorPattern: "surrealdb.enabled is false; set surrealdb.endpoint"

@@ -1,0 +1,26 @@
+FROM python:3.10-slim-bookworm
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=0
+
+WORKDIR /app
+
+RUN uv venv /app/.venv
+ENV VIRTUAL_ENV=/app/.venv \
+    PATH="/app/.venv/bin:$PATH"
+
+COPY *.whl /tmp/wheels/
+COPY pyproject.toml /tmp/pyproject.toml
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install /tmp/wheels/*.whl \
+    && cd /tmp && uv pip install --requirement pyproject.toml \
+    && rm -rf /tmp/wheels /tmp/pyproject.toml
+
+COPY k8s_test_pipeline/ /app/k8s_test_pipeline/
+ENV PYTHONPATH=/app
+
+ENTRYPOINT ["rivers"]

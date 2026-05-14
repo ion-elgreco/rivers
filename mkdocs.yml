@@ -1,0 +1,102 @@
+site_name: rivers
+site_description: Orchestration platform for tasks and assets fully backed by Rust
+site_url: https://ion-elgreco.github.io/rivers/
+repo_url: https://github.com/ion-elgreco/rivers
+repo_name: rivers
+
+extra:
+  version:
+    provider: mike
+
+theme:
+  name: material
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - content.code.copy
+    - content.code.annotate
+    - navigation.sections
+    - navigation.expand
+    - navigation.indexes
+    - search.highlight
+    - search.share
+    - toc.follow
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.top
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Concepts:
+      - Assets: concepts/assets.md
+      - Jobs & Executors: concepts/jobs.md
+      - Partitions: concepts/partitions.md
+      - IO Handlers: concepts/io-handlers.md
+      - Configuration: concepts/configuration.md
+      - Resources: concepts/resources.md
+      - Backfills: concepts/backfills.md
+      - Scheduling & Automation: concepts/scheduling.md
+      - Concurrency: concepts/concurrency.md
+  - Installation:
+      - Overview: installation/overview.md
+      - Kubernetes: installation/kubernetes.md
+  - Guides:
+      - Graph Assets: guides/graph-assets.md
+      - Partitioned Assets: guides/partitioned-assets.md
+      - Delta Lake: guides/delta-lake.md
+  - API Reference:
+      - CodeRepository: api-reference/repository.md
+      - Assets: api-reference/assets.md
+      - Task: api-reference/task.md
+      - Job: api-reference/job.md
+      - Executors: api-reference/executors.md
+      - Context: api-reference/context.md
+      - Schedules: api-reference/schedules.md
+      - Sensors: api-reference/sensors.md
+      - Hooks: api-reference/hooks.md
+      - Automation: api-reference/automation.md
+      - Daemon: api-reference/daemon.md
+      - Partitions: api-reference/partitions.md
+      - Backfills: api-reference/backfills.md
+      - IO Handlers: api-reference/io-handlers.md
+      - Delta Lake: api-reference/delta.md
+      - MetadataValue: api-reference/metadata.md
+      - Schema: api-reference/schema.md
+      - Storage: api-reference/storage.md
+      - Concurrency & Queue: api-reference/concurrency.md
+      - Exceptions: api-reference/exceptions.md
+      - CLI: api-reference/cli.md
+      - Environment Variables: api-reference/environment-variables.md
+  - Architecture:
+      - Concurrency Flow: architecture/concurrency-flow.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.snippets
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true

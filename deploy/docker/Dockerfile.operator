@@ -1,0 +1,38 @@
+ARG BUILDER_IMAGE=debian:bookworm-slim
+ARG BASE_IMAGE=gcr.io/distroless/cc-debian12:nonroot
+
+FROM ${BUILDER_IMAGE} AS prep
+COPY rivers-operator /staging/usr/local/bin/rivers-operator
+RUN set -eux; \
+    chmod 0755 /staging/usr/local/bin/rivers-operator
+
+FROM ${BASE_IMAGE}
+
+ARG RIVERS_VERSION=dev
+ARG RIVERS_REVISION=unknown
+ARG BUILD_DATE=unknown
+ARG BASE_IMAGE
+
+LABEL org.opencontainers.image.title="rivers-operator" \
+      org.opencontainers.image.description="Kubernetes operator for the Rivers asset orchestration platform" \
+      org.opencontainers.image.vendor="Rivers" \
+      org.opencontainers.image.authors="Ion Koutsouris <ion@orchestration.rs>" \
+      org.opencontainers.image.source="https://github.com/ion-elgreco/rivers" \
+      org.opencontainers.image.url="https://github.com/ion-elgreco/rivers" \
+      org.opencontainers.image.documentation="https://github.com/ion-elgreco/rivers" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.version="${RIVERS_VERSION}" \
+      org.opencontainers.image.revision="${RIVERS_REVISION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.base.name="${BASE_IMAGE}"
+
+COPY --from=prep /staging/ /
+
+USER 65532:65532
+WORKDIR /home/nonroot
+
+EXPOSE 9090 9443 50052
+
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/usr/local/bin/rivers-operator"]

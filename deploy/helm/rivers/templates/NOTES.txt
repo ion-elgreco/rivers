@@ -1,0 +1,75 @@
+{{- /* Post-install banner. Helm prints this verbatim after a successful install. */ -}}
+rivers {{ .Chart.AppVersion | default .Chart.Version }} installed in namespace {{ include "rivers.namespace" . }}.
+
+Webhook serving cert
+--------------------
+{{- if eq .Values.operator.webhook.certProvider "selfSigned" }}
+certProvider=selfSigned: the chart generated a self-signed CA + serving
+cert and stored them in the `rivers-operator-webhook-cert` Secret. The
+matching CA is inlined into the MutatingWebhookConfiguration `caBundle`,
+so admission works without cert-manager. The cert is valid for
+{{ .Values.operator.webhook.selfSigned.certDays }} days and is reused on
+`helm upgrade` via a cluster lookup.
+
+When it expires (or you want to rotate sooner), delete the Secret and
+re-run helm upgrade:
+
+  kubectl -n {{ include "rivers.namespace" . }} delete secret rivers-operator-webhook-cert
+  helm upgrade rivers <chart> ...
+
+For automated rotation under cert-manager, set
+`operator.webhook.certProvider=certManager` and provide an issuerRef.
+{{- else if eq .Values.operator.webhook.certProvider "certManager" }}
+certProvider=certManager: the chart emitted a cert-manager `Certificate`
+backed by issuer `{{ .Values.operator.webhook.certManager.issuerRef.kind }}/{{ .Values.operator.webhook.certManager.issuerRef.name }}`.
+cainjector populates `caBundle` on the MutatingWebhookConfiguration via
+the `cert-manager.io/inject-ca-from` annotation and rotates it on its own.
+
+Prereqs:
+  1. cert-manager installed in the cluster (https://cert-manager.io).
+  2. The named Issuer / ClusterIssuer exists.
+
+Verify:
+  kubectl -n {{ include "rivers.namespace" . }} get certificate rivers-operator-webhook-cert
+  kubectl get mutatingwebhookconfiguration rivers-run-webhook \
+    -o jsonpath='{.webhooks[0].clientConfig.caBundle}' | head -c 40 ; echo
+
+The caBundle should be a non-empty base64 string within ~30s of the
+Certificate becoming Ready.
+{{- end }}
+
+For ad-hoc dev (`cargo run -p rivers-operator` against a cluster that
+doesn't have this chart installed), skip the webhook entirely with:
+  RIVERS_WEBHOOK_DISABLED=1 cargo run -p rivers-operator
+
+SurrealDB authentication
+------------------------
+{{- if .Values.surrealdb.enabled }}
+Bundled SurrealDB runs authenticated (always). Rivers pods sign in as the
+`{{ .Values.surrealdb.auth.namespace }}/{{ .Values.surrealdb.auth.database }}` user from Secret
+`{{ include "rivers.surrealAuthSecretName" . }}`. The bundled pod boots
+with bootstrap root creds from `{{ include "rivers.surrealBootstrapSecretName" . }}`,
+and a post-install Job (`{{ .Release.Name }}-surrealdb-user-init`) runs
+`DEFINE USER ... ON DATABASE ... ROLES OWNER` against the DB so the rivers
+app can sign in. On `helm upgrade`, the Job re-runs with `OVERWRITE` —
+rotating the rivers Secret followed by `helm upgrade` rotates the in-DB user.
+
+To inspect the auto-generated rivers password:
+  kubectl -n {{ include "rivers.namespace" . }} get secret {{ include "rivers.surrealAuthSecretName" . }} \
+    -o jsonpath='{.data.{{ .Values.surrealdb.auth.secretKeys.password }}}' | base64 -d
+
+For production, set `surrealdb.auth.existingSecret` to a Secret you manage
+out-of-band instead of relying on the chart-generated one.
+{{- else if include "rivers.surrealAuthRequested" . }}
+External SurrealDB with auth: rivers pods sign in using creds from Secret
+`{{ include "rivers.surrealAuthSecretName" . }}`. You must define the user
+externally, e.g.
+  DEFINE USER `{{ include "rivers.surrealRiversUsername" . }}` ON DATABASE PASSWORD '...' ROLES OWNER;
+inside namespace `{{ .Values.surrealdb.auth.namespace }}` / database
+`{{ .Values.surrealdb.auth.database }}`.
+{{- else }}
+External SurrealDB without auth: rivers pods connect without `signin`,
+matching `surreal start --unauthenticated`. Provide
+`surrealdb.auth.existingSecret` or inline `auth.username/auth.password` to
+require authenticated connections.
+{{- end }}

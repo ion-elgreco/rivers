@@ -1,0 +1,121 @@
+name: python_build
+
+on:
+  merge_group:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (PR pushes, force-pushes, rapid main
+# commits). Release workflows opt out of this — see release-*.yaml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+# Default to no permissions; each job opts in to whatever it actually needs.
+# Limits the blast radius if a step (or a transitively-pulled action) is ever
+# compromised — without this, jobs inherit the org/repo default which is
+# usually contents:write and can push tags, labels, releases, etc.
+permissions: {}
+
+defaults:
+  run:
+    working-directory: python
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+  # sccache silently no-ops when CARGO_INCREMENTAL=1 (its default). Force
+  # it off so `cargo test` and `maturin develop` (both dev-profile builds)
+  # actually route through sccache.
+  CARGO_INCREMENTAL: "0"
+  # Selects [profile.ci] from Cargo.toml for `just develop` / `just test-rust`
+  # — disables incremental, bumps deps to opt-level=3, strips debuginfo.
+  PROFILE: "ci"
+
+jobs:
+  linting:
+    name: Python linting (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup-env
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: setup venv
+        run: just venv
+
+      - name: Run linting (ruff, typos, pyright)
+        run: just pre-commit-check
+
+  rust-testing:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup-env
+
+      - name: Run Rust tests
+        working-directory: .
+        run: just test-rust
+
+      - name: Run rivers-ui WASM browser tests
+        working-directory: .
+        # GitHub's ubuntu image ships chromedriver at $CHROMEWEBDRIVER but
+        # wasm-bindgen-cli's test runner reads $CHROMEDRIVER (different name)
+        # or falls back to PATH. Bridge the two so `wasm-pack test --chrome`
+        # finds the driver.
+        run: |
+          export CHROMEDRIVER="$CHROMEWEBDRIVER/chromedriver"
+          just wasm-test
+
+  testing:
+    name: Python tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup-env
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build and install rivers
+        # Python tests don't need the optimized UI bundle; develop-fast
+        # skips wasm-opt to save a few seconds in CI.
+        run: just develop-fast
+
+      - name: Run tests
+        run: just test

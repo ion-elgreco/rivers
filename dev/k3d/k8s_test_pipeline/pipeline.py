@@ -1,0 +1,191 @@
+"""Minimal pipeline for K8s integration tests.
+
+Three jobs exercise different execution paths:
+  - k8s_inprocess_job: assets override to in_process executor via metadata
+  - k8s_step_job: Kubernetes step executor with S3-backed PickleIOHandler (full K8s flow)
+  - k8s_graph_job: graph asset with `rivers/node/executor=in_process` so the
+    graph asset gets one outer step pod and its internal tasks run in-process
+    within that pod (the "outer pod / inner in-process" pattern documented
+    in `docs/guides/graph-assets.md`).
+
+The repo's default executor is Kubernetes. The in-process job assets use
+metadata={"rivers/executor": "in_process"} to override per-asset.
+
+Configured with RunQueueConfig + RunBackendConfig.kubernetes() so that
+gRPC Materialize/ExecuteJob calls go through the daemon's run coordinator,
+which creates Run CRs via K8sRunBackend.
+"""
+
+import os
+import time
+
+import obstore.store
+from rivers import (
+    Asset,
+    CodeRepository,
+    Executor,
+    InMemoryIOHandler,
+    Job,
+    Output,
+    PickleIOHandler,
+    RunBackendConfig,
+    RunQueueConfig,
+    Task,
+)
+
+S3_ENDPOINT = os.environ.get("RIVERS_S3_ENDPOINT", "http://minio.rivers.svc:9000")
+S3_BUCKET = os.environ.get("RIVERS_S3_BUCKET", "rivers-io")
+
+s3_store = obstore.store.S3Store(
+    S3_BUCKET,
+    endpoint_url=S3_ENDPOINT,
+    access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "rivers"),
+    secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "riverstest"),
+    region="us-east-1",
+    skip_signature=False,
+    virtual_hosted_style_request=False,
+    client_options={"allow_http": "true"},
+)
+s3_io = PickleIOHandler(store=s3_store, prefix="k8s-test")
+mem_io = InMemoryIOHandler()
+
+INPROCESS_META = {"rivers/executor": "in_process"}
+
+
+# --- In-process job (assets override executor via metadata) ---
+
+
+@Asset(io_handler=mem_io, metadata=INPROCESS_META)
+def source_data():
+    return Output(value={"records": 42, "timestamp": time.time()})
+
+
+@Asset(io_handler=mem_io, metadata=INPROCESS_META)
+def transform_data(source_data: dict):
+    return Output(value={"processed": True, "count": source_data["records"]})
+
+
+@Asset(io_handler=mem_io, metadata=INPROCESS_META)
+def final_report(transform_data: dict):
+    return Output(value={"status": "complete", "processed": transform_data["processed"]})
+
+
+k8s_inprocess_job = Job(
+    name="k8s_inprocess_job",
+    assets=[source_data, transform_data, final_report],
+)
+
+
+# --- K8s step executor job (full flow with S3 IO) ---
+
+
+@Asset(io_handler=s3_io)
+def s3_source():
+    return Output(value={"records": 100, "origin": "s3_test"})
+
+
+@Asset(io_handler=s3_io)
+def s3_transform(s3_source: dict):
+    return Output(value={"transformed": True, "count": s3_source["records"]})
+
+
+@Asset(io_handler=s3_io)
+def s3_report(s3_transform: dict):
+    return Output(value={"status": "complete", "transformed": s3_transform["transformed"]})
+
+
+k8s_step_job = Job(
+    name="k8s_step_job",
+    assets=[s3_source, s3_transform, s3_report],
+)
+
+
+# --- Failing job (in-process; asset always raises) ---
+
+
+@Asset(io_handler=mem_io, metadata=INPROCESS_META)
+def always_fails():
+    raise RuntimeError("intentional failure for k8s integration test")
+
+
+k8s_failing_job = Job(
+    name="k8s_failing_job",
+    assets=[always_fails],
+)
+
+
+# --- Slow job (in-process; sleeps long enough for timeout/cancel/delete tests) ---
+
+
+@Asset(io_handler=mem_io, metadata=INPROCESS_META)
+def slow_asset():
+    time.sleep(120)
+    return Output(value={"done": True})
+
+
+k8s_slow_job = Job(
+    name="k8s_slow_job",
+    assets=[slow_asset],
+)
+
+
+# --- Graph asset with internal tasks running in-process ---
+#
+# This proves the "outer pod / inner in-process" pattern end-to-end on K8s:
+# the graph asset itself runs as one step pod (via the default kubernetes
+# executor), and its internal tasks run in-process inside that pod thanks
+# to `rivers/node/executor=in_process`. Internal task outputs are still
+# persisted through `s3_io` so a downstream task in the graph can read
+# from the upstream one's S3 object.
+
+
+@Task(io_handler=s3_io)
+def graph_inner_load() -> dict:
+    return {"records": 7}
+
+
+@Task(io_handler=s3_io)
+def graph_inner_transform(graph_inner_load: dict) -> dict:
+    return {"records": graph_inner_load["records"], "doubled": graph_inner_load["records"] * 2}
+
+
+@Asset.from_graph(
+    name="graph_pipeline",
+    io_handler=s3_io,
+    metadata={"rivers/node/executor": "in_process"},
+)
+def graph_pipeline():
+    return graph_inner_transform(graph_inner_load())
+
+
+k8s_graph_job = Job(
+    name="k8s_graph_job",
+    assets=[graph_pipeline],
+)
+
+
+all_assets = [
+    source_data, transform_data, final_report,
+    s3_source, s3_transform, s3_report,
+    always_fails, slow_asset,
+    graph_pipeline,
+]
+
+all_tasks = [graph_inner_load, graph_inner_transform]
+
+repo = CodeRepository(
+    assets=all_assets,
+    tasks=all_tasks,
+    jobs=[k8s_inprocess_job, k8s_step_job, k8s_failing_job, k8s_slow_job, k8s_graph_job],
+    default_executor=Executor.kubernetes(
+        worker_cpu="250m",
+        worker_memory="256Mi",
+    ),
+    run_queue=RunQueueConfig(max_concurrent_runs=3),
+    run_backend=RunBackendConfig.kubernetes(
+        run_cpu="250m",
+        run_memory="256Mi",
+        worker_cpu="250m",
+        worker_memory="256Mi",
+    ),
+)

@@ -1,0 +1,60 @@
+[package]
+name = "rivers-operator"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+
+[[bin]]
+name = "rivers-operator"
+path = "src/main.rs"
+
+[dependencies]
+rivers-k8s = { path = "../rivers-k8s" }
+rivers-core = { path = "../rivers-core" }
+rivers-api = { path = "../rivers-api" }
+# Direct kube subcrate deps — needs all four layers (controller runtime,
+# CRD derives, admission types in kube-core, plus the client).
+kube-client = { workspace = true, features = ["admission"] }
+kube-runtime.workspace = true
+kube-derive.workspace = true
+kube-core = { workspace = true, features = ["schema", "admission"] }
+tonic.workspace = true
+k8s-openapi.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rustls.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+chrono.workspace = true
+uuid.workspace = true
+futures-util = { workspace = true }
+thiserror.workspace = true
+reqwest = { workspace = true, features = ["rustls", "http2", "json", "query"] }
+regex.workspace = true
+prometheus = "0.14"
+once_cell.workspace = true
+axum.workspace = true
+base64.workspace = true
+# Admission webhook serves TLS over an HTTPS server. Cert + key are
+# provisioned by cert-manager (Issuer + Certificate shipped by the Helm
+# chart); the operator just reads them from a mounted Secret and reloads on
+# rotation via axum-server's RustlsConfig::reload_from_pem_file.
+axum-server.workspace = true
+# Used to build JSON Patches for the admission webhook response. Pulled in
+# transitively by `kube/admission`; declared explicitly so the version is
+# pinned alongside that feature. `jsonptr` provides the `PointerBuf` paths
+# json-patch operations are built from.
+json-patch = "4"
+jsonptr = "0.7"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http = "1"
+bytes = "1"
+http-body-util = "0.1"
+wiremock = "0.6"
+tokio-stream = { workspace = true, features = ["net"] }

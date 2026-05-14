@@ -1,0 +1,296 @@
+name: release-rust
+
+# Builds the rivers-operator + rivers-ui binaries once per architecture,
+# then ships them in two parallel publishing paths:
+#   • binary tarballs attached to the GitHub Release (with sha256s)
+#   • multi-arch (amd64 + arm64) Docker images on ghcr.io
+#
+# Triggered on tag push (v*.*.*). rivers-code-location lives in
+# dev/k3d and is intentionally not shipped — it's a dev/integration
+# image, not a release artifact.
+#
+# Strategy: cross-compile all per-arch artifacts on a vanilla ubuntu
+# runner with cargo zigbuild (no QEMU emulation at build time), then
+# fork into a tarball job and per-arch image builds with a manifest
+# stitching them into a multi-arch index. This avoids changing the
+# existing Dockerfiles (the local `just k8s-build` flow also depends
+# on them) and dedupes the cross-compile that would otherwise run
+# twice (once for tarballs, once for images).
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-rust-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-artifacts:
+    name: Cross-compile artifacts (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read  # read-only checkout; upload-artifact needs no extra perms
+
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup environment (no cache — release builds run from fresh state)
+        uses: ./.github/actions/setup-env
+        with:
+          cache: "false"
+          cross_compile: "true"
+
+      - name: Add cross-compile target
+        run: rustup target add "${TARGET}"
+
+      - name: Build rivers-ui hydration WASM
+        run: just wasm
+
+      - name: Cross-compile binaries
+        run: |
+          cargo zigbuild -p rivers-operator --release --target "${TARGET}"
+          cargo zigbuild -p rivers-ui --release --target "${TARGET}" --features ssr
+
+      - name: Stage binaries
+        run: |
+          mkdir -p bins
+          cp "target/${TARGET}/release/rivers-operator" bins/
+          cp "target/${TARGET}/release/rivers-ui" bins/
+          ls -la bins
+
+      # Single artifact reused by `release-tarballs` (downloads all
+      # archs, produces GH Release tarballs) and `build-images`
+      # (downloads its own arch, packages a single-arch image).
+      - name: Upload binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bins-${{ matrix.arch }}
+          path: bins/
+          if-no-files-found: error
+          retention-days: 1
+
+  release-tarballs:
+    name: Package + publish binary tarballs to GitHub Release
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # upload assets to the GitHub Release
+      id-token: write      # OIDC for Sigstore signing via attest-build-provenance
+      attestations: write  # publish SLSA provenance to repo attestation log
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download all per-arch binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: bins
+          pattern: bins-*
+          # Don't merge — same filenames per arch would clobber. Each
+          # artifact lands in its own bins/<artifact-name>/ subdir.
+
+      - name: Package tarballs + checksums
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${REF_NAME#v}"
+          mkdir -p dist
+          for arch_dir in bins/bins-*; do
+            arch="${arch_dir#bins/bins-}"
+            for bin in rivers-operator rivers-ui; do
+              stage="dist/${bin}-${version}-linux-${arch}"
+              mkdir -p "${stage}"
+              cp "${arch_dir}/${bin}" "${stage}/"
+              cp LICENSE "${stage}/" 2>/dev/null || true
+              tar -czf "${stage}.tar.gz" -C dist "$(basename "${stage}")"
+              rm -rf "${stage}"
+            done
+            (cd dist && sha256sum *-linux-${arch}.tar.gz > "checksums-linux-${arch}.txt")
+          done
+          ls -la dist
+
+      - name: Attest binary provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: "dist/*.tar.gz"
+
+      # Idempotent: create the release on first run for a tag, upload
+      # with --clobber on re-runs (workflow_dispatch).
+      - name: Create / update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*.tar.gz dist/checksums-linux-*.txt)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "no release assets found in dist/" >&2
+            exit 1
+          fi
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "release ${TAG} exists; uploading assets with --clobber"
+            gh release upload "${TAG}" "${assets[@]}" --clobber
+          else
+            pre_flag=()
+            if [[ "${TAG}" == *-* ]]; then
+              pre_flag=(--prerelease)
+            fi
+            echo "creating release ${TAG}"
+            gh release create "${TAG}" "${assets[@]}" "${pre_flag[@]}" --generate-notes
+          fi
+
+  build-images:
+    name: Build & push ${{ matrix.image.name }} (${{ matrix.arch }})
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read       # checkout for Dockerfile path resolution
+      packages: write      # push images to ghcr.io
+      id-token: write      # OIDC for Sigstore signing via attest-build-provenance
+      attestations: write  # publish SLSA provenance to repo attestation log
+
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [amd64, arm64]
+        image:
+          - name: rivers-operator
+            dockerfile: deploy/docker/Dockerfile.operator
+          - name: rivers-ui
+            dockerfile: deploy/docker/Dockerfile.ui
+
+    env:
+      ARCH: ${{ matrix.arch }}
+      IMAGE_NAME: ${{ matrix.image.name }}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download binaries for this arch
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bins-${{ matrix.arch }}
+          path: staging/
+
+      - name: Resolve image ref
+        id: ref
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          owner_lc="${OWNER,,}"
+          version="${REF_NAME#v}"
+          repo="${REGISTRY}/${owner_lc}/${IMAGE_NAME}"
+          arch_tag="${repo}:${version}-${ARCH}"
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "arch_tag=${arch_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push (${{ matrix.arch }})
+        id: push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: staging
+          file: ${{ matrix.image.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ steps.ref.outputs.arch_tag }}
+          # No GHA cache for releases. Buildx still benefits from
+          # in-job local layer reuse when the same step runs twice.
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ${{ steps.ref.outputs.repo }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  manifest:
+    name: Multi-arch manifest (${{ matrix.image }})
+    needs: build-images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # no checkout actually needed; kept minimal anyway
+      packages: write  # push the multi-arch index manifest to ghcr.io
+
+    strategy:
+      fail-fast: true
+      matrix:
+        image: [rivers-operator, rivers-ui]
+
+    env:
+      IMAGE_NAME: ${{ matrix.image }}
+
+    steps:
+      - name: Resolve refs
+        id: ref
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          owner_lc="${OWNER,,}"
+          version="${REF_NAME#v}"
+          repo="${REGISTRY}/${owner_lc}/${IMAGE_NAME}"
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest (versioned + latest)
+        env:
+          REPO: ${{ steps.ref.outputs.repo }}
+          VERSION: ${{ steps.ref.outputs.version }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${REPO}:${VERSION}" \
+            --tag "${REPO}:latest" \
+            "${REPO}:${VERSION}-amd64" \
+            "${REPO}:${VERSION}-arm64"
