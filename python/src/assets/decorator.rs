@@ -30,6 +30,7 @@ fn ensure_callable(py: Python, func: &Option<Py<PyAny>>) -> PyResult<()> {
     Ok(())
 }
 
+#[derive(Default)]
 struct ProcessedDeps {
     partition_mappings: Option<PartitionMappingDict>,
     input_dep_names: Vec<String>,
@@ -38,43 +39,153 @@ struct ProcessedDeps {
     input_metadata: HashMap<String, HashMap<String, String>>,
 }
 
-fn process_deps(py: Python, deps: &[&DepDef]) -> ProcessedDeps {
-    let mut pm_map: HashMap<String, PartitionMapping> = HashMap::new();
-    let mut input_dep_names = Vec::new();
-    let mut dep_only_names = Vec::new();
-    let mut input_io_handlers: HashMap<String, IOHandler> = HashMap::new();
-    let mut input_metadata: HashMap<String, HashMap<String, String>> = HashMap::new();
+impl ProcessedDeps {
+    /// Record the per-edge fields (`partition_mapping`, `io_handler`,
+    /// `metadata`) from one dep. Caller is responsible for adding the
+    /// dep's name to `input_dep_names` or `dep_only_names`.
+    fn record_fields(&mut self, py: Python, d: &DepDef) {
+        if let Some(pm) = &d.partition_mapping {
+            self.partition_mappings
+                .get_or_insert_with(|| PartitionMappingDict(HashMap::new()))
+                .0
+                .insert(d.name.clone(), pm.clone());
+        }
+        if let Some(h) = &d.io_handler {
+            self.input_io_handlers
+                .insert(d.name.clone(), h.clone_ref(py));
+        }
+        if let Some(m) = &d.metadata {
+            self.input_metadata.insert(d.name.clone(), m.clone());
+        }
+    }
+}
 
+fn process_deps(py: Python, deps: &[&DepDef]) -> ProcessedDeps {
+    let mut pd = ProcessedDeps::default();
     for d in deps {
         if d.is_input {
-            input_dep_names.push(d.name.clone());
+            pd.input_dep_names.push(d.name.clone());
         } else {
+            pd.dep_only_names.push(d.name.clone());
+        }
+        pd.record_fields(py, d);
+    }
+    pd
+}
+
+/// Merge one per-output input `DepDef` into the multi-asset's top-level
+/// input collections. Dedups by name; raises if the same name is declared
+/// twice with conflicting `partition_mapping`, `io_handler`, or `metadata`.
+fn merge_input_dep(
+    py: Python,
+    pd: &mut ProcessedDeps,
+    def: &DepDef,
+    output_name: &str,
+) -> PyResult<()> {
+    fn input_dep_conflict(output_name: &str, dep_name: &str, field: &str) -> PyErr {
+        AssetDefinitionError::new_err(format!(
+            "Multi-asset output '{output_name}': input dep '{dep_name}' declared with \
+             a {field} that conflicts with an earlier declaration."
+        ))
+    }
+
+    if !pd.input_dep_names.iter().any(|n| n == &def.name) {
+        pd.input_dep_names.push(def.name.clone());
+        pd.record_fields(py, def);
+        return Ok(());
+    }
+    let existing_pm = pd
+        .partition_mappings
+        .as_ref()
+        .and_then(|m| m.0.get(&def.name));
+    if existing_pm != def.partition_mapping.as_ref() {
+        return Err(input_dep_conflict(
+            output_name,
+            &def.name,
+            "partition_mapping",
+        ));
+    }
+    if !io_handler_eq(
+        py,
+        pd.input_io_handlers.get(&def.name),
+        def.io_handler.as_ref(),
+    ) {
+        return Err(input_dep_conflict(output_name, &def.name, "io_handler"));
+    }
+    if pd.input_metadata.get(&def.name) != def.metadata.as_ref() {
+        return Err(input_dep_conflict(output_name, &def.name, "metadata"));
+    }
+    Ok(())
+}
+
+/// Process one multi-asset output's `deps`. Input deps merge into `pd`
+/// (the function-level input set, shared across outputs); lineage-only
+/// deps yield this output's `dep_only_names` and a merged
+/// `partition_mapping` (combining per-edge mappings from `deps=` with the
+/// `AssetDef.partition_mapping` dict the user passed directly).
+fn collect_output_deps(
+    py: Python,
+    pd: &mut ProcessedDeps,
+    asset_def: &AssetDef,
+) -> PyResult<(Vec<String>, Option<PartitionMappingDict>)> {
+    let mut dep_only_names: Vec<String> = Vec::new();
+    let mut dep_pms: HashMap<String, PartitionMapping> = HashMap::new();
+    for raw_dep in &asset_def.deps {
+        let d = raw_dep.get();
+        if d.is_input {
+            merge_input_dep(py, pd, d, &asset_def.name)?;
+            continue;
+        }
+        if !dep_only_names.contains(&d.name) {
             dep_only_names.push(d.name.clone());
         }
-        if let Some(ref pm) = d.partition_mapping {
-            pm_map.insert(d.name.clone(), pm.clone());
-        }
-        if let Some(ref h) = d.io_handler {
-            input_io_handlers.insert(d.name.clone(), h.clone_ref(py));
-        }
-        if let Some(ref m) = d.metadata {
-            input_metadata.insert(d.name.clone(), m.clone());
+        if let Some(pm) = &d.partition_mapping {
+            if let Some(existing) = dep_pms.get(&d.name)
+                && existing != pm
+            {
+                return Err(AssetDefinitionError::new_err(format!(
+                    "Multi-asset output '{}': dep '{}' declared with \
+                     conflicting partition_mappings on the same AssetDef.",
+                    asset_def.name, d.name,
+                )));
+            }
+            dep_pms.insert(d.name.clone(), pm.clone());
         }
     }
+    let partition_mapping = merge_partition_mappings(asset_def, &dep_pms)?;
+    Ok((dep_only_names, partition_mapping))
+}
 
-    let partition_mappings = if pm_map.is_empty() {
-        None
-    } else {
-        Some(PartitionMappingDict(pm_map))
-    };
-
-    ProcessedDeps {
-        partition_mappings,
-        input_dep_names,
-        dep_only_names,
-        input_io_handlers,
-        input_metadata,
+/// Combine the `AssetDef.partition_mapping` dict (user-provided per-output
+/// overrides keyed by dep name) with partition mappings derived from
+/// per-output lineage-only `deps`. Raises on conflicting values for the
+/// same dep name.
+fn merge_partition_mappings(
+    asset_def: &AssetDef,
+    dep_pms: &HashMap<String, PartitionMapping>,
+) -> PyResult<Option<PartitionMappingDict>> {
+    if dep_pms.is_empty() {
+        return Ok(asset_def.partition_mapping.clone());
     }
+    let mut merged = asset_def
+        .partition_mapping
+        .as_ref()
+        .map(|pm| pm.0.clone())
+        .unwrap_or_default();
+    for (k, v) in dep_pms {
+        if let Some(prev) = merged.get(k)
+            && prev != v
+        {
+            return Err(AssetDefinitionError::new_err(format!(
+                "Multi-asset output '{}': dep '{}' has a partition_mapping \
+                 from `deps=` that conflicts with the entry in \
+                 `partition_mapping=`.",
+                asset_def.name, k,
+            )));
+        }
+        merged.insert(k.clone(), v.clone());
+    }
+    Ok(Some(PartitionMappingDict(merged)))
 }
 
 fn validate_input_dep_names(
@@ -152,7 +263,7 @@ fn py_opt_eq<T: pyo3::PyTypeInfo>(py: Python, a: &Option<Py<T>>, b: &Option<Py<T
     }
 }
 
-fn io_handler_eq(py: Python, a: &Option<IOHandler>, b: &Option<IOHandler>) -> bool {
+fn io_handler_eq(py: Python, a: Option<&IOHandler>, b: Option<&IOHandler>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(IOHandler::ResourceRef(a)), Some(IOHandler::ResourceRef(b))) => a == b,
@@ -314,6 +425,10 @@ pub struct AssetDef {
     /// Pool membership: normalized (pool_key, slots_consumed) pairs.
     #[pyo3(get)]
     pub pool: Vec<(String, u32)>,
+    /// Per-output dependencies. Combined with the multi-asset's top-level
+    /// `deps=` at build time: input deps merge into the function's input set
+    /// (de-duplicated by name), lineage-only deps become edges to this output.
+    pub deps: Vec<Py<DepDef>>,
 }
 
 #[pymethods]
@@ -327,7 +442,7 @@ impl AssetDef {
             && self.metadata == other.metadata
             && self.pool == other.pool
             && py_opt_eq(py, &self.partitions_def, &other.partitions_def)
-            && io_handler_eq(py, &self.io_handler, &other.io_handler)
+            && io_handler_eq(py, self.io_handler.as_ref(), other.io_handler.as_ref())
     }
 
     fn __hash__(&self) -> u64 {
@@ -351,6 +466,7 @@ impl AssetDef {
         partition_mapping = None,
         pool = None,
         pool_slots = None,
+        deps = vec![],
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new<'py>(
@@ -366,6 +482,7 @@ impl AssetDef {
         partition_mapping: Option<PartitionMappingDict>,
         pool: Option<&Bound<'py, PyAny>>,
         pool_slots: Option<&Bound<'py, PyAny>>,
+        deps: Vec<Py<DepDef>>,
     ) -> PyResult<Self> {
         let pool = normalize_pool(pool, pool_slots)?;
         Ok(Self {
@@ -379,7 +496,14 @@ impl AssetDef {
             partitions_def,
             partition_mapping,
             pool,
+            deps,
         })
+    }
+
+    /// Read-only access to the per-output dependency list (the `deps=` argument).
+    #[getter]
+    fn deps(&self, py: Python) -> Vec<Py<DepDef>> {
+        self.deps.iter().map(|d| d.clone_ref(py)).collect()
     }
 
     /// Create an input dependency definition for use with `deps=[...]`.
@@ -884,6 +1008,12 @@ impl PyAsset {
     /// Each `AssetDef` describes one output. Top-level arguments (tags, kinds,
     /// group, code_version, io_handler) are used as defaults when the individual
     /// `AssetDef` does not specify them.
+    ///
+    /// Dependencies can be declared at the top level via `deps=` (applied to
+    /// every output) or per-output via `AssetDef(deps=[...])`. Input deps from
+    /// either source merge into the multi-asset's function-level input set
+    /// (the function fires once for all outputs); lineage-only deps declared
+    /// per-output only become edges to that specific output.
     #[classmethod]
     #[pyo3(signature = (
         wraps = None,
@@ -917,15 +1047,16 @@ impl PyAsset {
     ) -> PyResult<Py<PyAny>> {
         let py = cls.py();
         let handler = io_handler;
-        let deps: Vec<&DepDef> = deps.iter().map(|d| d.get()).collect();
+        let top_level_deps: Vec<&DepDef> = deps.iter().map(|d| d.get()).collect();
         let kinds = kinds.unwrap_or_default();
-
-        let mut py_assets = Vec::with_capacity(output_defs.len());
 
         ensure_callable(py, &wraps)?;
 
         name = name_or_fn_name(py, name, &wraps);
 
+        let mut pd = process_deps(py, &top_level_deps);
+
+        let mut py_assets = Vec::with_capacity(output_defs.len());
         for asset in output_defs {
             let borrow_asset_def = asset.borrow(py);
             let io_handler = borrow_asset_def
@@ -939,6 +1070,12 @@ impl PyAsset {
             } else {
                 &borrow_asset_def.kinds
             };
+
+            // The fn fires once for all outputs, so input deps from any
+            // AssetDef merge into the top-level input set; lineage-only
+            // deps stay scoped to this output.
+            let (dep_only_names, partition_mapping) =
+                collect_output_deps(py, &mut pd, &borrow_asset_def)?;
 
             py_assets.push(SingleAsset {
                 wraps: None,
@@ -958,9 +1095,9 @@ impl PyAsset {
                     .as_ref()
                     .or(borrow_asset_def.partitions_def.as_ref())
                     .map(|p| p.clone_ref(py)),
-                partition_mapping: borrow_asset_def.partition_mapping.clone(),
+                partition_mapping,
                 input_dep_names: Vec::new(),
-                dep_only_names: Vec::new(),
+                dep_only_names,
                 input_io_handlers: HashMap::new(),
                 input_metadata: HashMap::new(),
                 hooks: None,
@@ -1016,8 +1153,6 @@ impl PyAsset {
                 }
             }
         }
-
-        let pd = process_deps(py, &deps);
 
         let is_async = is_coroutine_function(py, &wraps);
         let py_asset = Asset::Multi(MultiAsset {

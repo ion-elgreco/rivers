@@ -333,8 +333,20 @@ class AssetDef:
         partition_mapping: dict[str | AssetDef, PartitionMapping] | None = ...,
         pool: str | list[str] | None = ...,
         pool_slots: int | dict[str, int] | None = ...,
+        deps: list["DepDef"] = ...,
     ) -> None:
         """Build an asset definition shared between multi-asset outputs and deps."""
+        ...
+
+    @property
+    def deps(self) -> list["DepDef"]:
+        """Per-output dependencies declared on this output.
+
+        When used inside :meth:`Asset.from_multi`, input deps (from
+        :meth:`AssetDef.input`) merge into the multi-asset's function-level
+        input set, and lineage-only deps (:meth:`AssetDef.dep`) become edges
+        to this specific output.
+        """
         ...
 
     @staticmethod

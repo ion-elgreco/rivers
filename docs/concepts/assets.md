@@ -114,6 +114,20 @@ def report(source: int):
     yield rs.Output(value=source * 2, output_name="report")
 ```
 
+`deps` can also be declared per-output on `AssetDef`. Input deps merge into the multi-asset's function-level input set (the function fires once for all outputs); lineage-only deps become edges to that specific output only:
+
+```python
+@rs.Asset.from_multi(
+    output_defs=[
+        rs.AssetDef("users", deps=[rs.AssetDef.dep("users_source")]),
+        rs.AssetDef("orders", deps=[rs.AssetDef.dep("orders_source")]),
+    ],
+)
+def extract():
+    yield rs.Output(value=..., output_name="users")
+    yield rs.Output(value=..., output_name="orders")
+```
+
 See the [API reference](../api-reference/assets.md#assetdefinput) for the full `AssetDef.input()` and `AssetDef.dep()` signatures.
 
 ## Graph assets

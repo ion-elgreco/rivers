@@ -615,7 +615,7 @@ pub(crate) fn build_unresolved_graph(
                 let func = multi_asset.wraps.as_ref().unwrap();
                 append_deps(py, &mut deps, func, resource_keys)?;
 
-                // Add lineage-only deps from explicit deps list.
+                // Top-level lineage-only deps apply to every output.
                 for dep_name in &multi_asset.dep_only_names {
                     deps.push(NodeRef::ByName(dep_name.clone()));
                 }
@@ -623,7 +623,17 @@ pub(crate) fn build_unresolved_graph(
                 for inner in &multi_asset.assets {
                     let asset_name = inner.name.clone().unwrap();
                     let output_name = asset_name.clone();
-                    unresolved_graph.insert(asset_name.clone(), deps.clone());
+                    // Per-output lineage-only deps add edges only to this output.
+                    let mut per_output_deps = deps.clone();
+                    for dep_name in &inner.dep_only_names {
+                        let already_present = per_output_deps.iter().any(
+                            |n| matches!(n, NodeRef::ByName(existing) if existing == dep_name),
+                        );
+                        if !already_present {
+                            per_output_deps.push(NodeRef::ByName(dep_name.clone()));
+                        }
+                    }
+                    unresolved_graph.insert(asset_name.clone(), per_output_deps);
                     node_map.insert(
                         asset_name,
                         ResolvedNode::Asset(Box::new(ResolvedAsset::new(

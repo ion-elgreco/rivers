@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.10"
 
 [manifest]
@@ -1220,7 +1220,7 @@ requires-dist = [
     { name = "polars", marker = "extra == 'polars'", specifier = ">=1.33.1" },
     { name = "pyarrow", marker = "extra == 'pyarrow'", specifier = ">=18.0.0" },
     { name = "pydantic", specifier = ">=2.11.9" },
-    { name = "pydantic-settings", specifier = ">=2.14.1" },
+    { name = "pydantic-settings", specifier = ">=2.0" },
     { name = "typer", specifier = ">=0.9" },
 ]
 provides-extras = ["delta", "pyarrow", "polars", "otel"]
