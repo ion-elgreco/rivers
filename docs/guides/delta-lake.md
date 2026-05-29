@@ -1,6 +1,6 @@
 # Delta Lake
 
-The `DeltaIOHandler` persists asset outputs as Delta Lake tables. It supports PyArrow, Polars, and DataFusion data types, partitioned writes, and full MERGE INTO operations.
+The `DeltaIOHandler` persists asset outputs as Delta Lake tables. It supports PyArrow, Polars, pandas, and DataFusion data types, partitioned writes, and full MERGE INTO operations.
 
 ## Setup
 
@@ -10,6 +10,7 @@ pip install rivers[delta]
 # Plus at least one of:
 pip install rivers[pyarrow]
 pip install rivers[polars]
+pip install rivers[pandas]
 pip install rivers[datafusion]
 ```
 
@@ -40,6 +41,7 @@ The handler creates a Delta table at `/data/delta/users/`.
 | `pyarrow.RecordBatchReader` | `rivers[pyarrow]` |
 | `polars.DataFrame` | `rivers[polars]` |
 | `polars.LazyFrame` | `rivers[polars]` |
+| `pandas.DataFrame` | `rivers[pandas]` |
 | `datafusion.DataFrame` | `rivers[datafusion]` |
 
 The type is detected automatically from the object passed to `handle_output`, and `load_input` uses the `type_hint` from the downstream parameter annotation.

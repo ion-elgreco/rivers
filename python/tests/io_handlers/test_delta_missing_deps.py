@@ -79,6 +79,33 @@ def test_missing_polars_lazyframe_error(tmp_path):
             handler.load_input(ctx)
 
 
+def test_missing_pandas_output_error(tmp_path):
+    """Writing a pandas DataFrame without the handler suggests rivers[pandas]."""
+    import pandas as pd
+
+    handler = _handler_without_extras(tmp_path)
+    df = pd.DataFrame({"a": [1]})
+    ctx = rs.OutputContext(asset_name="tbl")
+
+    with patch.object(type(handler), "type_handlers", staticmethod(lambda: {})):
+        with pytest.raises(TypeError, match=r"pip install rivers\[pandas\]"):
+            handler.handle_output(ctx, df)
+
+
+def test_missing_pandas_input_error(tmp_path):
+    """Loading as pandas DataFrame without the handler suggests rivers[pandas]."""
+    import pandas as pd
+
+    handler = _handler_without_extras(tmp_path)
+    ctx = rs.InputContext(
+        asset_name="tbl", downstream_asset="x", type_hint=pd.DataFrame
+    )
+
+    with patch.object(type(handler), "type_handlers", staticmethod(lambda: {})):
+        with pytest.raises(TypeError, match=r"pip install rivers\[pandas\]"):
+            handler.load_input(ctx)
+
+
 def test_missing_pyarrow_recordbatchreader_error(tmp_path):
     """Loading as RecordBatchReader without pyarrow suggests rivers[pyarrow]."""
     import pyarrow as pa

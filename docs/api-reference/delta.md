@@ -90,6 +90,7 @@ class MyTypeHandler(DeltaTypeHandler[MyType]):
 |---------|--------|-------|
 | `PyArrowTypeHandler` | `rivers.io_handlers.delta.pyarrow` | `pyarrow.Table`, `pyarrow.RecordBatchReader` |
 | `PolarsTypeHandler` | `rivers.io_handlers.delta.polars` | `polars.DataFrame`, `polars.LazyFrame` |
+| `PandasTypeHandler` | `rivers.io_handlers.delta.pandas` | `pandas.DataFrame` |
 | `DataFusionTypeHandler` | `rivers.io_handlers.delta.datafusion` | `datafusion.DataFrame` |
 
 ---
