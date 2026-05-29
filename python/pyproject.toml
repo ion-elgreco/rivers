@@ -14,9 +14,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-delta = ["deltalake>=0.25.0"]
+polars  = ["polars>=1.33.1"]
 pyarrow = ["pyarrow>=18.0.0"]
-polars = ["polars>=1.33.1"]
+delta   = ["deltalake>=0.25.0"]
+delta-polars = ["rivers[polars]", "rivers[delta]", "polars-deltalake>=1.2.0"]
+delta-pyarrow = ["rivers[pyarrow]", "rivers[delta]"]
 otel = ["opentelemetry-api>=1.0"]
 
 [project.scripts]

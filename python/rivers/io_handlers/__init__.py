@@ -2,7 +2,7 @@
 
 Always available: :class:`BaseIOHandler`, :class:`InMemoryIOHandler`,
 :class:`PickleIOHandler`. The Delta Lake handler is exported only when
-``deltalake`` is installed (``pip install rivers[deltalake]``).
+``deltalake`` is installed (``pip install rivers[delta]``).
 """
 
 from rivers.io_handlers.base import BaseIOHandler

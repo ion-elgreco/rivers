@@ -7,6 +7,7 @@ from typing import Union
 
 import polars as pl
 from arro3.core import RecordBatchReader
+from polars_deltalake import scan_delta
 
 from rivers.io_handlers.delta.base import DeltaTypeHandler
 
@@ -49,14 +50,7 @@ class PolarsTypeHandler(DeltaTypeHandler[PolarsTypes]):
         ``target_type`` is :class:`pl.LazyFrame` the lazy frame is returned
         as-is, otherwise it is collected with the streaming engine.
         """
-        delta_opts: dict[str, object] = {}
-        if version is not None:
-            delta_opts["version"] = version
-        lf = pl.scan_delta(
-            table_uri,
-            storage_options=storage_options,
-            delta_table_options=delta_opts if delta_opts else None,
-        )
+        lf = scan_delta(table_uri, storage_options=storage_options, version=version)
         if columns:
             lf = lf.select(columns)
         if predicate is not None:
