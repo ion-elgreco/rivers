@@ -2,10 +2,9 @@ import json
 
 import polars as pl
 import pyarrow as pa
+import rivers as rs
 from deltalake import DeltaTable
 from polars.testing import assert_frame_equal
-
-import rivers as rs
 
 from .helpers import (
     make_daily_partition,
@@ -51,6 +50,58 @@ def test_round_trip_polars(tmp_path):
     assert isinstance(result, pl.DataFrame)
     expected = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
     assert_frame_equal(result, expected)
+
+
+def test_round_trip_pandas(tmp_path):
+    """Write a pd.DataFrame, read back as pd.DataFrame when type_hint is pd.DataFrame."""
+    import pandas as pd
+    from pandas.testing import assert_frame_equal
+
+    handler, _ = _make_handler(tmp_path)
+    df = pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+
+    ctx_out = rs.OutputContext(asset_name="tbl")
+    handler.handle_output(ctx_out, df)
+
+    ctx_in = rs.InputContext(
+        asset_name="tbl", downstream_asset="consumer", type_hint=pd.DataFrame
+    )
+    result = handler.load_input(ctx_in)
+    assert isinstance(result, pd.DataFrame)
+    assert_frame_equal(result, df)
+
+
+def test_write_pandas_read_polars(tmp_path):
+    """A pd.DataFrame output is readable back through another type handler."""
+    import pandas as pd
+
+    handler, _ = _make_handler(tmp_path)
+    df = pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+
+    handler.handle_output(rs.OutputContext(asset_name="tbl"), df)
+
+    ctx_in = rs.InputContext(
+        asset_name="tbl", downstream_asset="consumer", type_hint=pl.DataFrame
+    )
+    result = handler.load_input(ctx_in)
+    assert isinstance(result, pl.DataFrame)
+    assert_frame_equal(result, pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]}))
+
+
+def test_round_trip_pandas_index_dropped(tmp_path):
+    """A non-trivial pandas index is not persisted as a phantom column."""
+    import pandas as pd
+
+    handler, _ = _make_handler(tmp_path)
+    df = pd.DataFrame({"v": [10, 20]}, index=pd.Index(["r1", "r2"], name="label"))
+
+    handler.handle_output(rs.OutputContext(asset_name="tbl"), df)
+
+    ctx_in = rs.InputContext(
+        asset_name="tbl", downstream_asset="consumer", type_hint=pa.Table
+    )
+    result = handler.load_input(ctx_in)
+    assert result.column_names == ["v"]
 
 
 def test_root_name_override(tmp_path):
