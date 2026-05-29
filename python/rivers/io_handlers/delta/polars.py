@@ -38,6 +38,7 @@ class PolarsTypeHandler(DeltaTypeHandler[PolarsTypes]):
     def load_input(
         self,
         table_uri: str,
+        table_name: str,
         storage_options: dict[str, str] | None,
         predicate: str | None,
         target_type: type[PolarsTypes],

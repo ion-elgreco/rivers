@@ -1,6 +1,6 @@
 # Delta Lake
 
-The `DeltaIOHandler` persists asset outputs as Delta Lake tables. It supports PyArrow and Polars data types, partitioned writes, and full MERGE INTO operations.
+The `DeltaIOHandler` persists asset outputs as Delta Lake tables. It supports PyArrow, Polars, and DataFusion data types, partitioned writes, and full MERGE INTO operations.
 
 ## Setup
 
@@ -10,6 +10,7 @@ pip install rivers[delta]
 # Plus at least one of:
 pip install rivers[pyarrow]
 pip install rivers[polars]
+pip install rivers[datafusion]
 ```
 
 ## Basic usage
@@ -39,8 +40,22 @@ The handler creates a Delta table at `/data/delta/users/`.
 | `pyarrow.RecordBatchReader` | `rivers[pyarrow]` |
 | `polars.DataFrame` | `rivers[polars]` |
 | `polars.LazyFrame` | `rivers[polars]` |
+| `datafusion.DataFrame` | `rivers[datafusion]` |
 
 The type is detected automatically from the object passed to `handle_output`, and `load_input` uses the `type_hint` from the downstream parameter annotation.
+
+When read back as a `datafusion.DataFrame`, the Delta table is registered with a DataFusion `SessionContext` and returned as a lazy query — column projection and the partition predicate are pushed into the scan, and execution happens when the consumer collects or streams it (like a `polars.LazyFrame`).
+
+```python
+import datafusion
+import rivers as rs
+
+@rs.Asset
+def enriched(users: datafusion.DataFrame, orders: datafusion.DataFrame) -> datafusion.DataFrame:
+    return users.join(orders, on="id", how="inner")
+```
+
+The backing `SessionContext` is attached to the returned frame as `rivers_ctx`. Reach for it only when you want the session handle itself — for example, to register an extra table and query it by name with `ctx.sql(...)`.
 
 ## Write modes
 

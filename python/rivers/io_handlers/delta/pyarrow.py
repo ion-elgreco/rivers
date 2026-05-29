@@ -29,6 +29,7 @@ class PyArrowTypeHandler(DeltaTypeHandler[ArrowTypes]):
     def load_input(
         self,
         table_uri: str,
+        table_name: str,
         storage_options: dict[str, str] | None,
         predicate: str | None,
         target_type: type[ArrowTypes],
@@ -43,11 +44,11 @@ class PyArrowTypeHandler(DeltaTypeHandler[ArrowTypes]):
         """
         dt = DeltaTable(table_uri, storage_options=storage_options, version=version)
         select = ", ".join(columns) if columns else "*"
-        sql_query = f"SELECT {select} FROM delta"
+        sql_query = f'SELECT {select} FROM "{table_name}"'
         if predicate is not None:
             sql_query += f" WHERE {predicate}"
 
-        reader = QueryBuilder().register("delta", dt).execute(sql_query)
+        reader = QueryBuilder().register(table_name, dt).execute(sql_query)
         data = pa.RecordBatchReader.from_stream(reader)
         if target_type is pa.RecordBatchReader:
             return data

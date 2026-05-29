@@ -34,6 +34,7 @@ class DeltaTypeHandler(ABC, Generic[T]):
     def load_input(
         self,
         table_uri: str,
+        table_name: str,
         storage_options: dict[str, str] | None,
         predicate: str | None,
         target_type: type[T],
@@ -44,6 +45,7 @@ class DeltaTypeHandler(ABC, Generic[T]):
 
         Args:
             table_uri: Location of the Delta table.
+            table_name: The asset / root name, usable as a SQL table identifier.
             storage_options: Filesystem credentials / options forwarded to ``deltalake``.
             predicate: Optional SQL ``WHERE`` clause for partition / row filtering.
             target_type: The exact type the caller expects back.

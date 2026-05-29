@@ -69,6 +69,7 @@ def _build_type_handler_map() -> dict[type, DeltaTypeHandler]:
     for mod_path, cls_name in [
         ("rivers.io_handlers.delta.pyarrow", "PyArrowTypeHandler"),
         ("rivers.io_handlers.delta.polars", "PolarsTypeHandler"),
+        ("rivers.io_handlers.delta.datafusion", "DataFusionTypeHandler"),
     ]:
         try:
             mod = __import__(mod_path, fromlist=[cls_name])
@@ -302,6 +303,7 @@ class DeltaIOHandler(BaseIOHandler):
         handler = self._resolve_handler(context.type_hint)
         return handler.load_input(
             uri,
+            table_name,
             self.storage_options,
             predicate,
             context.type_hint,

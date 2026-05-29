@@ -84,6 +84,14 @@ class MyTypeHandler(DeltaTypeHandler[MyType]):
 | `to_arrow(obj)` | Convert object to `arro3.core.RecordBatchReader`. |
 | `load_input(...)` | Load data from a Delta table. |
 
+**Built-in handlers** (auto-registered when their library is installed):
+
+| Handler | Module | Types |
+|---------|--------|-------|
+| `PyArrowTypeHandler` | `rivers.io_handlers.delta.pyarrow` | `pyarrow.Table`, `pyarrow.RecordBatchReader` |
+| `PolarsTypeHandler` | `rivers.io_handlers.delta.polars` | `polars.DataFrame`, `polars.LazyFrame` |
+| `DataFusionTypeHandler` | `rivers.io_handlers.delta.datafusion` | `datafusion.DataFrame` |
+
 ---
 
 ## `PartitionExpr`
