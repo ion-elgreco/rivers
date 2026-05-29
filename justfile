@@ -16,7 +16,7 @@ _default:
 
 # Sync venv with all deps (without building rivers native extension)
 venv:
-    uv sync --no-install-workspace --all-extras
+    uv sync --no-install-workspace --all-extras --all-packages
 
 # Build the UI's hydration WASM (release).
 wasm:

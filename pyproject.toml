@@ -8,17 +8,8 @@ members = ["python"]
 
 [tool.uv]
 dev-dependencies = [
-    # rivers runtime deps (so `just venv` installs them without building the native extension)
-    "loky>=3.5",
-    "obstore>=0.9.1",
-    "pydantic>=2.11.9",
-    "pydantic-settings>=2.0",
-    "typer>=0.9",
     # test & dev tooling
-    "deltalake>=0.25.0",
-    "polars>=1.33.1",
     "py-spy>=0.4.0",
-    "pyarrow>=18.0.0",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
     "pytest-timeout>=2.4.0",
