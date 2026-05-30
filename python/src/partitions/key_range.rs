@@ -76,9 +76,9 @@ impl PyPartitionKeyRange {
                 };
                 // Static defs: use positional ordering (keys may not be lexicographic)
                 if let Some(PartitionsDefinition::Static { keys }) = def {
-                    let from_pos = keys.iter().position(|x| x == from_key);
-                    let to_pos = keys.iter().position(|x| x == to_key);
-                    let key_pos = keys.iter().position(|x| x.as_str() == k);
+                    let from_pos = keys.get_index_of(from_key.as_str());
+                    let to_pos = keys.get_index_of(to_key.as_str());
+                    let key_pos = keys.get_index_of(k);
                     match (from_pos, to_pos, key_pos) {
                         (Some(f), Some(t), Some(p)) => p >= f && p <= t,
                         _ => false,

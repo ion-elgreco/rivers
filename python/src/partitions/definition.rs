@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use chrono::{Local, NaiveDateTime, TimeZone};
 use croner::Cron;
+use ordermap::OrderSet;
 use pyo3::exceptions::PyNotImplementedError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
@@ -18,6 +19,67 @@ use rivers_core::util::parse_key_datetime;
 
 use super::key::PyPartitionKey;
 
+/// Insertion-ordered set of static partition keys.
+#[derive(Clone, PartialEq)]
+pub struct OrderedKeySet(OrderSet<String>);
+
+impl OrderedKeySet {
+    /// Build from a key list; duplicate keys collapse (set semantics).
+    pub fn new(keys: Vec<String>) -> Self {
+        Self(keys.into_iter().collect())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &String> {
+        self.0.iter()
+    }
+
+    /// O(1) membership.
+    pub fn contains(&self, key: &str) -> bool {
+        self.0.contains(key)
+    }
+
+    /// O(1) position of `key` in definition order, if present.
+    pub fn get_index_of(&self, key: &str) -> Option<usize> {
+        self.0.get_index_of(key)
+    }
+}
+
+impl std::fmt::Debug for OrderedKeySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Render as a list literal so the PartitionsDefinition repr stays
+        // `static_(["a", "b"])`.
+        f.debug_list().entries(self.0.iter()).finish()
+    }
+}
+
+impl<'py> IntoPyObject<'py> for &OrderedKeySet {
+    type Target = PyList;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        PyList::new(py, &self.0)
+    }
+}
+
+impl<'py> IntoPyObject<'py> for OrderedKeySet {
+    type Target = PyList;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        PyList::new(py, &self.0)
+    }
+}
+
+impl FromPyObject<'_, '_> for OrderedKeySet {
+    type Error = PyErr;
+
+    fn extract(ob: pyo3::Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
+        Ok(OrderedKeySet::new(ob.extract::<Vec<String>>()?))
+    }
+}
+
 #[pyclass(
     name = "PartitionsDefinition",
     frozen,
@@ -27,7 +89,7 @@ use super::key::PyPartitionKey;
 #[derive(Clone, Debug, PartialEq)]
 pub enum PartitionsDefinition {
     Static {
-        keys: Vec<String>,
+        keys: OrderedKeySet,
     },
     TimeWindow {
         cron_schedule: Option<String>,
@@ -60,8 +122,8 @@ impl PartitionsDefinition {
         std::mem::discriminant(self) == std::mem::discriminant(other)
     }
 
-    /// For Static definitions, return the keys. Returns None for other variants.
-    pub fn static_keys(&self) -> Option<&[String]> {
+    /// For Static definitions, return the key set. Returns None for other variants.
+    pub fn static_keys(&self) -> Option<&OrderedKeySet> {
         match self {
             Self::Static { keys } => Some(keys),
             _ => None,
@@ -234,7 +296,9 @@ impl PartitionsDefinition {
                 if common.is_empty() {
                     Err(format!("disjoint Static keys ({:?} vs {:?})", a, b))
                 } else {
-                    Ok(Self::Static { keys: common })
+                    Ok(Self::Static {
+                        keys: OrderedKeySet::new(common),
+                    })
                 }
             }
             (
@@ -345,7 +409,9 @@ impl PartitionsDefinition {
                 "Static partitions must have at least one key",
             ));
         }
-        Ok(Self::Static { keys })
+        Ok(Self::Static {
+            keys: OrderedKeySet::new(keys),
+        })
     }
 
     #[staticmethod]
@@ -490,7 +556,7 @@ impl PartitionsDefinition {
         match self {
             Self::Static { keys } => {
                 data.set_item("variant", "Static")?;
-                data.set_item("keys", keys.clone())?;
+                data.set_item("keys", keys)?;
             }
             Self::TimeWindow {
                 cron_schedule,

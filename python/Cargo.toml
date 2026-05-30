@@ -42,6 +42,7 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
 humantime.workspace = true
+ordermap = "1"
 rivers-k8s = { path = "../rust/rivers-k8s" }
 # Direct kube subcrate dep — python only uses `kube_client::{Client, Api,
 # api::PostParams, Error}`. Skipping `kube-runtime`/`kube-derive` here keeps
