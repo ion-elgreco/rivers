@@ -17,6 +17,8 @@ Example::
     repo.materialize()
 """
 
+import atexit
+
 from rivers import exceptions
 from rivers._core import (
     DynamicOutput,
@@ -92,6 +94,11 @@ from rivers._core.storage import (
 from rivers._core.tasks import BashTask, Task, TaskExecutionContext
 from rivers.io_handlers import BaseIOHandler, InMemoryIOHandler, PickleIOHandler
 from rivers.resource import Resource
+from rivers._core import drain_in_flight as _drain_in_flight
+
+# Join in-flight materialization / backfill / run worker threads before the
+# interpreter finalizes. it's a no-op once the pools are already drained.
+atexit.register(_drain_in_flight)
 
 __all__ = [
     "exceptions",

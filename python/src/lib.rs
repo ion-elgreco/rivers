@@ -192,6 +192,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(shutdown::py_wait_for_exit, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(shutdown::py_drain_in_flight, m)?)?;
 
     Ok(())
 }

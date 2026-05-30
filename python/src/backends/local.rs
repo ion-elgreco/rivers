@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -10,7 +11,10 @@ use crate::partitions::PyPartitionKey;
 use crate::repository::PyCodeRepository;
 
 pub struct LocalRunBackend {
-    active_runs: Mutex<HashMap<String, std::thread::JoinHandle<()>>>,
+    /// `run_id` → "finished" flag (for health / terminate). The `JoinHandle`
+    /// lives in the global run-handle pool, joined before finalize via
+    /// [`crate::shutdown::register_run_handle`].
+    active_runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl Default for LocalRunBackend {
@@ -43,6 +47,8 @@ impl RunBackend for LocalRunBackend {
         let partition_key = run_info.partition_key.as_ref().map(PyPartitionKey::from);
 
         let run_id_for_key = run_id.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_for_thread = Arc::clone(&done);
         let handle = std::thread::spawn(move || {
             let selection = if node_names.is_empty() {
                 None
@@ -69,25 +75,28 @@ impl RunBackend for LocalRunBackend {
                     "dequeued run execution failed"
                 );
             }
+            done_for_thread.store(true, Ordering::Release);
         });
 
+        // Joined before finalize (holds the GIL); health tracked via `done`.
+        crate::shutdown::register_run_handle(handle);
         self.active_runs
             .lock()
             .unwrap()
-            .insert(run_id_for_key, handle);
+            .insert(run_id_for_key, done);
         Ok(())
     }
 
     async fn terminate_run(&self, run_id: &str) -> Result<bool> {
-        let handle = self.active_runs.lock().unwrap().remove(run_id);
+        let entry = self.active_runs.lock().unwrap().remove(run_id);
         // TODO(ion): add ability to cancel runs for local runs.
-        Ok(handle.is_some())
+        Ok(entry.is_some())
     }
 
     async fn check_run_health(&self, run_id: &str) -> Result<RunHealthStatus> {
         let mut active = self.active_runs.lock().unwrap();
         match active.get(run_id) {
-            Some(handle) if handle.is_finished() => {
+            Some(done) if done.load(Ordering::Acquire) => {
                 active.remove(run_id);
                 Ok(RunHealthStatus::Exited)
             }

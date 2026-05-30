@@ -117,6 +117,18 @@ pub fn register_backfill_handle(h: std::thread::JoinHandle<()>) {
     guard.push(h);
 }
 
+// In-flight run-execution threads: Direct-dispatched job launches
+// (`daemon::dispatchers::launch_started_run`) and dequeued queued runs
+// (`backends::local::LocalRunBackend`). Like the pools above, each attaches
+// the GIL to run user asset code.
+static RUN_HANDLES: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+pub fn register_run_handle(h: std::thread::JoinHandle<()>) {
+    let mut guard = RUN_HANDLES.lock().unwrap();
+    guard.retain(|h| !h.is_finished());
+    guard.push(h);
+}
+
 // ── Signal handler ──
 
 static SIGNAL_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -255,6 +267,10 @@ async fn drain_backfills() {
     drain_thread_pool(&BACKFILL_HANDLES, "backfills").await;
 }
 
+async fn drain_runs() {
+    drain_thread_pool(&RUN_HANDLES, "runs").await;
+}
+
 async fn drain_thread_pool(pool: &Mutex<Vec<std::thread::JoinHandle<()>>>, label: &'static str) {
     let handles = std::mem::take(&mut *pool.lock().unwrap());
     if handles.is_empty() {
@@ -311,6 +327,7 @@ async fn run_shutdown() {
         drain_service(Service::Ui),
         drain_materializations(),
         drain_backfills(),
+        drain_runs(),
     );
 
     watchdog.abort();
@@ -334,4 +351,24 @@ pub fn py_wait_for_exit(py: Python<'_>) -> PyResult<()> {
         rt().block_on(run_shutdown());
     });
     Ok(())
+}
+
+/// Join in-flight worker threads (materializations, backfills, runs) with the
+/// GIL released, before `Py_Finalize` — one still attached at finalization
+/// aborts the process. A Python `atexit` hook; no-op after a SIGTERM `run_shutdown`.
+#[pyfunction]
+#[pyo3(name = "drain_in_flight")]
+pub fn py_drain_in_flight(py: Python<'_>) {
+    // Nothing dispatched: skip spinning up the tokio runtime to drain empty pools.
+    let idle = MATERIALIZATION_HANDLES.lock().unwrap().is_empty()
+        && BACKFILL_HANDLES.lock().unwrap().is_empty()
+        && RUN_HANDLES.lock().unwrap().is_empty();
+    if idle {
+        return;
+    }
+    py.detach(|| {
+        rt().block_on(async {
+            tokio::join!(drain_materializations(), drain_backfills(), drain_runs());
+        });
+    });
 }

@@ -34,7 +34,7 @@ pub(crate) fn launch_started_run(
     partition_key: Option<PyPartitionKey>,
     run_id: String,
 ) {
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         Python::try_attach(|py| {
             let job = match handle.get_job(py, &job_name) {
                 Ok(j) => j,
@@ -63,6 +63,8 @@ pub(crate) fn launch_started_run(
             }
         });
     });
+    // Joined before shutdown / finalize — the thread holds the GIL.
+    crate::shutdown::register_run_handle(handle);
 }
 
 /// Result of dispatching a batch of run or backfill requests.
