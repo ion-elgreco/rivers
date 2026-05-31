@@ -357,12 +357,18 @@ pub enum JobPartitionPicker {
     /// Static / TimeWindow / etc. — flat list of keys, intersection
     /// across the job's partitioned assets in first-encounter order.
     SingleDim { keys: Vec<String> },
-    /// Multi — per-dimension selectors. Each dimension's `keys` is the
-    /// intersection across that dimension on every Multi-partitioned
-    /// asset in the job. Dimensions are ordered as the first asset
-    /// declared them.
+    /// Single-dim with more partitions than fit in the inline key window —
+    /// paged on demand by `asset_key` as the user scrolls (`total` sizes the
+    /// scrollbar). Avoids ever shipping the full key list to the browser.
+    SingleDimPaged { asset_key: String, total: u64 },
+    /// Multi — per-dimension selectors; each dimension's `keys` is the
+    /// intersection across the job's Multi assets, in the first asset's order.
+    /// `asset_key` is `Some` only for a single-Multi-asset job, enabling
+    /// per-dimension paging; `None` (several Multi assets) keeps the intersected
+    /// windows inline — same cross-asset guard as `SingleDimPaged`.
     Multi {
         dimensions: Vec<crate::types::PartitionDimensionInfo>,
+        asset_key: Option<String>,
     },
 }
 
@@ -389,7 +395,8 @@ pub fn partition_picker_for_assets(
     if defs.is_empty() {
         return JobPartitionPicker::None;
     }
-    if defs.iter().any(|d| !d.dimensions.is_empty()) {
+    let multi_count = defs.iter().filter(|d| !d.dimensions.is_empty()).count();
+    if multi_count > 0 {
         // Multi: per-dimension intersection. Use the first def's
         // dimension order; later defs are guaranteed to carry the same
         // dimension names by the resolve-time validator.
@@ -408,7 +415,57 @@ pub fn partition_picker_for_assets(
         if dims.iter().all(|d| d.keys.is_empty()) {
             return JobPartitionPicker::None;
         }
-        return JobPartitionPicker::Multi { dimensions: dims };
+        // Page dimensions only for a single Multi asset (no cross-asset
+        // intersection to honor); else `asset_key` None → inline windows.
+        let asset_key = (multi_count == 1)
+            .then(|| {
+                assets.iter().find(|a| {
+                    asset_info_by_key
+                        .get(*a)
+                        .and_then(|i| i.partition_def.as_ref())
+                        .is_some_and(|pd| !pd.dimensions.is_empty())
+                })
+            })
+            .flatten()
+            .cloned();
+        return JobPartitionPicker::Multi {
+            dimensions: dims,
+            asset_key,
+        };
+    }
+    // Single-dim (Static / TimeWindow). If the driving asset has more
+    // partitions than fit in the inline key window, page it on demand;
+    // otherwise show the intersection across the job's single-dim assets.
+    // Dynamic is excluded: its keys are storage-managed and can't be enumerated
+    // through the gRPC paged endpoint (selecting dynamic partitions in the picker
+    // is a separate, storage-backed follow-up).
+    let first_single = assets.iter().find_map(|a| {
+        let pd = asset_info_by_key.get(a)?.partition_def.as_ref()?;
+        (pd.dimensions.is_empty()
+            && pd.dynamic_namespace().is_none()
+            && (pd.total_count > 0 || !pd.keys.is_empty()))
+        .then(|| (a.clone(), pd))
+    });
+    let Some((asset_key, first_def)) = first_single else {
+        return JobPartitionPicker::None;
+    };
+    let needs_paging =
+        first_def.keys_truncated || first_def.total_count as usize > first_def.keys.len();
+    // Page only when every single-dim asset shares the same key space (same
+    // total + window). The paged endpoint serves one asset's keys, so paging a
+    // merely-overlapping job (the validator only requires a non-empty
+    // intersection) could offer a key invalid for another; differing defs fall
+    // through to the intersection path, which only shows shared keys.
+    let same_key_space = defs.iter().all(|d| {
+        d.dimensions.is_empty()
+            && d.total_count == first_def.total_count
+            && d.keys == first_def.keys
+    });
+    if needs_paging && same_key_space {
+        return JobPartitionPicker::SingleDimPaged {
+            asset_key,
+            total: first_def.total_count,
+        };
     }
     let key_lists: Vec<&Vec<String>> = defs
         .iter()
@@ -652,6 +709,9 @@ mod tests {
                 kind: "Static".to_string(),
                 keys: ks.iter().map(|s| s.to_string()).collect(),
                 dimensions: vec![],
+                total_count: ks.len() as u64,
+                keys_truncated: false,
+                dynamic_name: String::new(),
             }),
             hooks: vec![],
             io_handler: None,
@@ -676,8 +736,13 @@ mod tests {
                 .map(|(name, ks)| PartitionDimensionInfo {
                     name: name.to_string(),
                     keys: ks.iter().map(|s| s.to_string()).collect(),
+                    total_count: ks.len() as u64,
+                    keys_truncated: false,
                 })
                 .collect(),
+            total_count: 0,
+            keys_truncated: false,
+            dynamic_name: String::new(),
         });
         info
     }
@@ -774,12 +839,16 @@ mod tests {
 
     #[test]
     fn picker_none_when_partition_def_has_no_keys() {
-        // Dynamic-shape: kind=Dynamic, keys=[], dimensions=[].
+        // Dynamic-shape: kind=Dynamic, keys=[], dimensions=[]. Even with a real
+        // storage-sourced count, the picker stays None (Dynamic isn't paged here).
         let mut info = make_info("dyn", None);
         info.partition_def = Some(PartitionDefinitionInfo {
             kind: "Dynamic".to_string(),
             keys: vec![],
             dimensions: vec![],
+            total_count: 42,
+            keys_truncated: false,
+            dynamic_name: "customers".to_string(),
         });
         let infos = make_map(vec![info]);
         assert_eq!(picker(&["dyn"], &infos), JobPartitionPicker::None);
@@ -798,7 +867,7 @@ mod tests {
             &[("color", &["r", "g"]), ("size", &["s", "m"])],
         )]);
         let picker = picker(&["m"], &infos);
-        let JobPartitionPicker::Multi { dimensions } = picker else {
+        let JobPartitionPicker::Multi { dimensions, .. } = picker else {
             panic!("expected Multi, got {picker:?}");
         };
         assert_eq!(dimensions.len(), 2);
@@ -817,7 +886,7 @@ mod tests {
             make_multi("b", &[("color", &["g", "b", "y"]), ("size", &["m", "l"])]),
         ]);
         let picker = picker(&["a", "b"], &infos);
-        let JobPartitionPicker::Multi { dimensions } = picker else {
+        let JobPartitionPicker::Multi { dimensions, .. } = picker else {
             panic!("expected Multi");
         };
         assert_eq!(dimensions[0].keys, vec!["g", "b"]);
@@ -833,6 +902,61 @@ mod tests {
             make_multi("b", &[("color", &["g"]), ("size", &["m"])]),
         ]);
         assert_eq!(picker(&["a", "b"], &infos), JobPartitionPicker::None);
+    }
+
+    /// A single-dim asset with more partitions than fit in the key window — the
+    /// `keys` field is a truncated window, `total_count` the true size.
+    fn make_paged(asset_key: &str, window: &[&str], total: u64) -> AssetDefinitionInfo {
+        let mut info = make_info(asset_key, Some(window));
+        if let Some(pd) = info.partition_def.as_mut() {
+            pd.total_count = total;
+            pd.keys_truncated = true;
+        }
+        info
+    }
+
+    #[test]
+    fn picker_single_large_asset_pages() {
+        let infos = make_map(vec![make_paged("big", &["k0", "k1", "k2"], 10_000)]);
+        assert_eq!(
+            picker(&["big"], &infos),
+            JobPartitionPicker::SingleDimPaged {
+                asset_key: "big".into(),
+                total: 10_000,
+            }
+        );
+    }
+
+    #[test]
+    fn picker_identical_large_assets_page() {
+        // Same key space (same total + same window) → safe to page one asset.
+        let infos = make_map(vec![
+            make_paged("a", &["k0", "k1", "k2"], 10_000),
+            make_paged("b", &["k0", "k1", "k2"], 10_000),
+        ]);
+        assert_eq!(
+            picker(&["a", "b"], &infos),
+            JobPartitionPicker::SingleDimPaged {
+                asset_key: "a".into(),
+                total: 10_000,
+            }
+        );
+    }
+
+    #[test]
+    fn picker_divergent_large_assets_do_not_page() {
+        // Different key spaces must NOT page one asset's keys (could offer a key
+        // invalid for the other). Fall back to intersecting the visible windows.
+        let infos = make_map(vec![
+            make_paged("a", &["k0", "k1", "k2"], 10_000),
+            make_paged("b", &["k1", "k2", "k3"], 12_000),
+        ]);
+        assert_eq!(
+            picker(&["a", "b"], &infos),
+            JobPartitionPicker::SingleDim {
+                keys: vec!["k1".into(), "k2".into()],
+            }
+        );
     }
 
     use crate::types::SubmitPartitionKey;

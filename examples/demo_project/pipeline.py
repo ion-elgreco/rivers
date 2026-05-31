@@ -39,9 +39,11 @@ from rivers import (
     PickleIOHandler,
     RunQueueConfig,
     RunRequest,
+    Schedule,
     ScheduleEvaluationContext,
     ScheduleStatus,
     SelfDependency,
+    Sensor,
     SensorEvaluationContext,
     SensorResult,
     SensorStatus,
@@ -49,8 +51,6 @@ from rivers import (
     TagConcurrencyLimit,
     Task,
 )
-
-from rivers import Schedule, Sensor
 
 # =============================================================================
 # Configuration (Config + Pydantic)
@@ -88,7 +88,9 @@ if _deployment == "cloud":
     _s3_store = obstore.store.S3Store(
         bucket=os.environ.get("RIVERS_S3_BUCKET", "rivers-io"),
         config={
-            "endpoint": os.environ.get("RIVERS_S3_ENDPOINT", "http://minio.rivers.svc:9000"),
+            "endpoint": os.environ.get(
+                "RIVERS_S3_ENDPOINT", "http://minio.rivers.svc:9000"
+            ),
             "access_key_id": os.environ.get("AWS_ACCESS_KEY_ID", ""),
             "secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
             "region": os.environ.get("AWS_REGION", "us-east-1"),
@@ -105,7 +107,6 @@ else:
     raw_io = VersionedPickleIOHandler(store=_local_store, prefix="raw")
     processed_io = VersionedPickleIOHandler(store=_local_store, prefix="processed")
     output_io = VersionedPickleIOHandler(store=_local_store, prefix="output")
-
 
 
 # =============================================================================
@@ -395,7 +396,9 @@ def regional_users(context: AssetExecutionContext, active_users: dict) -> dict:
     kinds="metric",
     group="regional",
     partitions_def=region_partitions,
-    deps=[AssetDef.input("regional_users", partition_mapping=PartitionMapping.identity())],
+    deps=[
+        AssetDef.input("regional_users", partition_mapping=PartitionMapping.identity())
+    ],
 )
 def regional_revenue(
     context: AssetExecutionContext, regional_users: dict, enriched_orders: dict
@@ -1308,6 +1311,7 @@ def file_watcher_sensor(context: SensorEvaluationContext) -> SensorResult:
 #   rivers backfill examples.demo_project.pipeline \
 #       --assets daily_events --from 2025-01-01 --to 2025-01-31
 
+
 @Asset(
     name="daily_events",
     partitions_def=daily_partitions,
@@ -1326,11 +1330,14 @@ def daily_events(context: AssetExecutionContext) -> dict:
 # Each partition runs independently. When daily_events is updated,
 # the daemon triggers one run per stale partition.
 
+
 @Asset(
     name="daily_aggregates",
     partitions_def=daily_partitions,
     io_handler=processed_io,
-    deps=[AssetDef.input("daily_events", partition_mapping=PartitionMapping.identity())],
+    deps=[
+        AssetDef.input("daily_events", partition_mapping=PartitionMapping.identity())
+    ],
     automation_condition=AutomationCondition.eager(),
     tags=["backfill", "processing"],
     kinds="transform",
@@ -1355,11 +1362,23 @@ def daily_aggregates(context: AssetExecutionContext, daily_events: dict) -> dict
 #       strategy=BackfillStrategy.single_run(),
 #   )
 
-monthly_partitions = PartitionsDefinition.static_([
-    "2025-01", "2025-02", "2025-03", "2025-04",
-    "2025-05", "2025-06", "2025-07", "2025-08",
-    "2025-09", "2025-10", "2025-11", "2025-12",
-])
+monthly_partitions = PartitionsDefinition.static_(
+    [
+        "2025-01",
+        "2025-02",
+        "2025-03",
+        "2025-04",
+        "2025-05",
+        "2025-06",
+        "2025-07",
+        "2025-08",
+        "2025-09",
+        "2025-10",
+        "2025-11",
+        "2025-12",
+    ]
+)
+
 
 @Asset(
     name="monthly_rollup",
@@ -1399,10 +1418,13 @@ def monthly_rollup(context: AssetExecutionContext) -> dict:
 #       ),
 #   )
 
-regional_daily_partitions = PartitionsDefinition.multi({
-    "region": PartitionsDefinition.static_(["us", "eu", "apac"]),
-    "date": PartitionsDefinition.static_(["2025-01", "2025-02", "2025-03"]),
-})
+regional_daily_partitions = PartitionsDefinition.multi(
+    {
+        "region": PartitionsDefinition.static_(["us", "eu", "apac"]),
+        "date": PartitionsDefinition.static_(["2025-01", "2025-02", "2025-03"]),
+    }
+)
+
 
 @Asset(
     name="regional_daily_metrics",
@@ -1438,6 +1460,7 @@ def regional_daily_metrics(context: AssetExecutionContext) -> dict:
 
 # --- Sensor-triggered backfill ---
 # A sensor that detects data quality issues and triggers a targeted backfill.
+
 
 @Sensor(
     name="data_quality_sensor",
@@ -1493,6 +1516,74 @@ multi_partition_demo_job = Job(
 
 
 # =============================================================================
+# Scale demo — 1,000,001 partitions (UI partition-view scale test)
+# =============================================================================
+
+million_partitions = PartitionsDefinition.static_(
+    [f"k{i:07d}" for i in range(1_000_001)]
+)
+
+
+@Asset(
+    name="million_partition_events",
+    partitions_def=million_partitions,
+    io_handler=raw_io,
+    tags=["partitioned", "scale-test"],
+    kinds="source",
+    group="scale_demo",
+    metadata={"partitions": "1000001"},
+)
+def million_partition_events(context: AssetExecutionContext) -> dict:
+    """One partition of a 1,000,001-partition asset (UI scale test)."""
+    key = context.partition.key.key[0]
+    return {"partition": key, "value": hash(key) % 1000}
+
+
+million_partition_job = Job(
+    name="million_partition_demo",
+    assets=[million_partition_events],
+    executor=Executor.in_process(),
+)
+
+
+# Multi asset whose "sku" dimension overflows the 1000-key inline window, so the
+# picker pages that dimension (region stays inline) — exercises per-dimension paging.
+regional_sku_partitions = PartitionsDefinition.multi(
+    {
+        "region": PartitionsDefinition.static_(["us", "eu", "apac"]),
+        "sku": PartitionsDefinition.static_([f"sku{i:05d}" for i in range(5000)]),
+    }
+)
+
+
+@Asset(
+    name="regional_sku_inventory",
+    partitions_def=regional_sku_partitions,
+    io_handler=raw_io,
+    tags=["partitioned", "scale-test"],
+    kinds="source",
+    group="scale_demo",
+    metadata={"partitions": "15000"},
+    backfill_strategy=BackfillStrategy.single_run(),
+)
+def regional_sku_inventory(context: AssetExecutionContext) -> dict:
+    """One partition of a region × sku Multi asset (per-dimension paging test)."""
+    keys = context.partition.keys
+    regions, skus = set(), set()
+    for k in keys:
+        regions.update(k.keys.get("region", []))
+        skus.update(k.keys.get("sku", []))
+    return {"regions": sorted(regions), "skus": sorted(skus)}
+
+
+multi_scale_demo_job = Job(
+    name="multi_scale_demo",
+    assets=[regional_sku_inventory],
+    executor=Executor.in_process(),
+)
+
+
+# =============================================================================
 # Repository
 # =============================================================================
 
@@ -1541,6 +1632,9 @@ all_assets = [
     daily_aggregates,
     monthly_rollup,
     regional_daily_metrics,
+    # Scale demo (1M+ partitions)
+    million_partition_events,
+    regional_sku_inventory,
 ]
 
 if _deployment == "cloud":
@@ -1566,6 +1660,8 @@ repo = CodeRepository(
         metadata_showcase_job,
         backfill_demo_job,
         multi_partition_demo_job,
+        million_partition_job,
+        multi_scale_demo_job,
     ],
     schedules=[
         daily_ingestion_schedule,

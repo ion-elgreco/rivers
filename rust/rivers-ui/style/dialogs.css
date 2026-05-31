@@ -474,6 +474,52 @@ th.sortable:hover { color: var(--text); }
     padding: 4px;
     user-select: none;
 }
+/* Virtualised variant: a scroll container holding a full-height spacer with
+   only the visible rows absolutely positioned inside it. */
+.exec-dialog-partition-vlist {
+    position: relative;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--round-md);
+    background: var(--bg-inset);
+    padding: 4px;
+    user-select: none;
+}
+.exec-dialog-partition-vspacer { position: relative; }
+.exec-dialog-partition-vrow {
+    position: absolute;
+    left: 0;
+    right: 0;
+    box-sizing: border-box;
+}
+.exec-dialog-partition-vrow--loading {
+    justify-content: center;
+    color: var(--text-muted);
+    cursor: default;
+}
+/* Search / jump toolbar above the virtualised list. */
+.exec-dialog-partition-vtools {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin-bottom: 0.4rem;
+}
+.exec-dialog-partition-search {
+    flex: 1;
+    min-width: 0;
+    padding: 4px 8px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text);
+    background: var(--bg-inset);
+    border: 1px solid var(--border);
+    border-radius: var(--round-md);
+}
+.exec-dialog-partition-search:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+.exec-dialog-partition-notfound { color: var(--warning); }
 .exec-dialog-partition-row {
     display: flex;
     align-items: center;

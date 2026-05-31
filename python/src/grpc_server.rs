@@ -22,7 +22,7 @@ use crate::partitions::key_range::{
     DimensionSelection, PartitionKeyRangeInner, PyPartitionKeyRange,
 };
 use crate::partitions::{PartitionsDefinition, PyPartitionKey};
-use crate::repository::{PyCodeRepository, RepoHandle};
+use crate::repository::{PyCodeRepository, RepoHandle, ResolvedState};
 
 const PY_UNAVAILABLE: &str = "Python interpreter not available";
 
@@ -183,6 +183,72 @@ impl CodeLocationService for CodeLocationImpl {
             success: true,
             run_id,
         }))
+    }
+
+    #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.get_partition_keys")]
+    async fn get_partition_keys(
+        &self,
+        request: Request<GetPartitionKeysRequest>,
+    ) -> Result<Response<GetPartitionKeysResponse>, Status> {
+        let req = request.into_inner();
+        let resp = self
+            .run_on_python(move |_py, repo| {
+                let repo_ref = repo.get();
+                let guard = repo_ref.state.read().unwrap();
+                let state = guard.as_ref().ok_or("repository not resolved")?;
+                let target = resolve_partition_target(state, &req.asset_key, &req.dimension)?;
+                // Empty query = browse (cheap total + window); non-empty = filter
+                // (page the matches; `total` is the match count).
+                let (keys, total) = if req.query.is_empty() {
+                    let total = target.partition_count() as u64;
+                    let keys = target
+                        .get_partition_keys_window(req.offset as usize, req.limit as usize)
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .map(py_partition_key_display)
+                        .collect();
+                    (keys, total)
+                } else {
+                    let (keys, total) = target
+                        .get_partition_keys_filtered(
+                            &req.query,
+                            req.offset as usize,
+                            req.limit as usize,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    (keys, total as u64)
+                };
+                Ok(GetPartitionKeysResponse { keys, total })
+            })
+            .await?;
+        Ok(Response::new(resp))
+    }
+
+    #[tracing::instrument(
+        skip_all,
+        target = "rivers::grpc",
+        name = "grpc.get_partition_key_index"
+    )]
+    async fn get_partition_key_index(
+        &self,
+        request: Request<GetPartitionKeyIndexRequest>,
+    ) -> Result<Response<GetPartitionKeyIndexResponse>, Status> {
+        let req = request.into_inner();
+        let resp = self
+            .run_on_python(move |_py, repo| {
+                let repo_ref = repo.get();
+                let guard = repo_ref.state.read().unwrap();
+                let state = guard.as_ref().ok_or("repository not resolved")?;
+                let target = resolve_partition_target(state, &req.asset_key, &req.dimension)?;
+                let index = target
+                    .single_dim_key_index(&req.key)
+                    .map_err(|e| e.to_string())?
+                    .map(|i| i as i64)
+                    .unwrap_or(-1);
+                Ok(GetPartitionKeyIndexResponse { index })
+            })
+            .await?;
+        Ok(Response::new(resp))
     }
 
     #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.get_assets_info")]
@@ -596,43 +662,95 @@ fn collect_run_ids(py: Python<'_>, run_requests: &[TickRequest]) -> Vec<String> 
         .collect()
 }
 
+/// Resolve the `PartitionsDefinition` a partition-keys request targets: the
+/// asset's own def, or — when `dimension` is non-empty — that dimension's
+/// sub-definition of a Multi. Shared by `get_partition_keys` /
+/// `get_partition_key_index` so the lookup + error strings live in one place.
+fn resolve_partition_target<'a>(
+    state: &'a ResolvedState,
+    asset_key: &str,
+    dimension: &str,
+) -> Result<&'a PartitionsDefinition, String> {
+    let node = state
+        .node_map
+        .get(asset_key)
+        .ok_or_else(|| format!("asset '{asset_key}' not found"))?;
+    let pd = node
+        .partitions_def()
+        .ok_or_else(|| format!("asset '{asset_key}' is not partitioned"))?;
+    if dimension.is_empty() {
+        Ok(pd)
+    } else {
+        pd.dimension_def(dimension)
+            .ok_or_else(|| format!("asset '{asset_key}' has no partition dimension '{dimension}'"))
+    }
+}
+
 /// For Multi, surface per-dimension keys so the UI can render one selector per
 /// dimension instead of the cartesian-product enumeration. Static and TimeWindow
 /// populate the flat `keys` list. Dynamic returns Err from `get_partition_keys`
 /// — both lists stay empty and the UI hides the picker.
 fn node_partition_def_info(pd: &PartitionsDefinition) -> PartitionDefInfo {
-    let flat_keys = || {
-        pd.get_partition_keys()
+    // Max keys shipped inline. Beyond this the UI pages via the windowed API,
+    // so the payload stays bounded no matter how many partitions exist.
+    const KEYS_WINDOW: usize = 1000;
+    let window = |d: &PartitionsDefinition| {
+        d.get_partition_keys_window(0, KEYS_WINDOW)
             .ok()
-            .map(|pks| pks.into_iter().map(py_partition_key_display).collect())
+            .map(|pks| {
+                pks.into_iter()
+                    .map(py_partition_key_display)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default()
     };
-    let (kind, keys, dimensions) = match pd {
-        PartitionsDefinition::Static { .. } => ("Static", flat_keys(), vec![]),
-        PartitionsDefinition::TimeWindow { .. } => ("TimeWindow", flat_keys(), vec![]),
+    let total = pd.partition_count() as u64;
+    let (kind, keys, dimensions, keys_truncated) = match pd {
+        // Static and TimeWindow are both single-dim: a windowed `keys` list,
+        // truncated when shorter than the total.
+        PartitionsDefinition::Static { .. } | PartitionsDefinition::TimeWindow { .. } => {
+            let k = window(pd);
+            let trunc = (k.len() as u64) < total;
+            (pd.variant_name(), k, vec![], trunc)
+        }
         PartitionsDefinition::Multi { dimensions } => {
+            // Each dimension's keys are windowed independently; flag truncation
+            // if any dimension was capped (the flat `keys` list is empty here).
+            let mut trunc = false;
             let dims = dimensions
                 .iter()
                 .map(|(name, dim_def)| {
-                    let dim_keys = dim_def
-                        .get_partition_keys()
-                        .ok()
-                        .map(|pks| pks.into_iter().map(py_partition_key_display).collect())
-                        .unwrap_or_default();
+                    let k = window(dim_def);
+                    let dim_total = dim_def.partition_count();
+                    let dim_trunc = k.len() < dim_total;
+                    if dim_trunc {
+                        trunc = true;
+                    }
                     PartitionDimensionInfo {
                         name: name.clone(),
-                        keys: dim_keys,
+                        keys: k,
+                        total_count: dim_total as u64,
+                        keys_truncated: dim_trunc,
                     }
                 })
                 .collect();
-            ("Multi", vec![], dims)
+            ("Multi", vec![], dims, trunc)
         }
-        PartitionsDefinition::Dynamic { .. } => ("Dynamic", vec![], vec![]),
+        PartitionsDefinition::Dynamic { .. } => ("Dynamic", vec![], vec![], false),
+    };
+    // Dynamic keys are storage-managed; ship the namespace so the UI can source
+    // the real count + keys from storage (def-level `total_count` is 0 here).
+    let dynamic_name = match pd {
+        PartitionsDefinition::Dynamic { name } => name.clone(),
+        _ => String::new(),
     };
     PartitionDefInfo {
         kind: kind.to_string(),
         keys,
         dimensions,
+        total_count: total,
+        keys_truncated,
+        dynamic_name,
     }
 }
 
