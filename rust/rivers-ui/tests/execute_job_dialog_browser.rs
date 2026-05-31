@@ -129,12 +129,17 @@ async fn submit_with_empty_multi_selection_shows_multi_dim_error() {
                 PartitionDimensionInfo {
                     name: "color".into(),
                     keys: vec!["r".into(), "g".into()],
+                    total_count: 2,
+                    keys_truncated: false,
                 },
                 PartitionDimensionInfo {
                     name: "size".into(),
                     keys: vec!["s".into(), "m".into()],
+                    total_count: 2,
+                    keys_truncated: false,
                 },
             ],
+            asset_key: None,
         },
     );
     flush_effects().await;
@@ -186,12 +191,17 @@ async fn run_count_label_reflects_cartesian_product_size() {
                 PartitionDimensionInfo {
                     name: "color".into(),
                     keys: vec!["r".into(), "g".into()],
+                    total_count: 2,
+                    keys_truncated: false,
                 },
                 PartitionDimensionInfo {
                     name: "size".into(),
                     keys: vec!["s".into()],
+                    total_count: 1,
+                    keys_truncated: false,
                 },
             ],
+            asset_key: None,
         },
     );
     flush_effects().await;

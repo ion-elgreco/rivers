@@ -43,8 +43,11 @@ fn multi_picker(dims: &[(&str, &[&str])]) -> JobPartitionPicker {
             .map(|(name, keys)| PartitionDimensionInfo {
                 name: name.to_string(),
                 keys: keys.iter().map(|s| s.to_string()).collect(),
+                total_count: keys.len() as u64,
+                keys_truncated: false,
             })
             .collect(),
+        asset_key: None,
     }
 }
 

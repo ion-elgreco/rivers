@@ -213,12 +213,17 @@ async fn submit_button_label_reflects_partition_count_under_multi_picker() {
                 PartitionDimensionInfo {
                     name: "color".into(),
                     keys: vec!["r".into(), "g".into()],
+                    total_count: 2,
+                    keys_truncated: false,
                 },
                 PartitionDimensionInfo {
                     name: "size".into(),
                     keys: vec!["s".into()],
+                    total_count: 1,
+                    keys_truncated: false,
                 },
             ],
+            asset_key: None,
         },
     );
     flush_effects().await;
