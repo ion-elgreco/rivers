@@ -308,6 +308,7 @@ DEFINE INDEX IF NOT EXISTS idx_events_run_type ON events FIELDS run_id, event_ty
 -- code locations don't bleed into each other.
 DEFINE INDEX IF NOT EXISTS idx_events_loc_asset ON events FIELDS code_location_id, asset_key;
 DEFINE INDEX IF NOT EXISTS idx_events_loc_asset_part ON events FIELDS code_location_id, asset_key, partition_key;
+DEFINE INDEX IF NOT EXISTS idx_events_loc_asset_type_ts ON events FIELDS code_location_id, asset_key, event_type, timestamp;
 
 DEFINE TABLE IF NOT EXISTS assets SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS code_location_id ON assets TYPE string DEFAULT 'default';
