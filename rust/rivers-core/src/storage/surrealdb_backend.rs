@@ -1495,35 +1495,41 @@ impl StorageBackend for SurrealStorage {
             && event.event_type.is_materialization() {
                 let code_version = materialization_code_version;
                 let input_data_versions = event.input_data_versions.clone();
-
                 let data_version = event.event_type.data_version().map(|s| s.to_string());
-                self.db
-                    .query("UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv, last_input_data_versions = $idv WHERE code_location_id = $cl AND asset_key = $asset_key")
-                    .bind(("cl", cl.to_string()))
-                    .bind(("asset_key", asset_key.clone()))
-                    .bind(("event_id", event_id.clone()))
-                    .bind(("run_id", event.run_id.clone()))
-                    .bind(("timestamp", event.timestamp))
-                    .bind(("data_version", data_version))
-                    .bind(("mcv", code_version))
-                    .bind(("idv", input_data_versions))
-                    .await?;
 
                 if let Some(partition_key) = &event.partition_key {
+                    // Partitioned materialization: batch the asset-pointer update
+                    // and the partition upsert into ONE transaction
                     self.db
-                        .query("DELETE FROM asset_partitions WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key = $partition_key")
+                        .query(
+                            "BEGIN; \
+                             UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv, last_input_data_versions = $idv WHERE code_location_id = $cl AND asset_key = $asset_key; \
+                             DELETE FROM asset_partitions WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key = $partition_key; \
+                             CREATE asset_partitions SET code_location_id = $cl, asset_key = $asset_key, partition_key = $partition_key, last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp; \
+                             COMMIT;",
+                        )
                         .bind(("cl", cl.to_string()))
                         .bind(("asset_key", asset_key.clone()))
-                        .bind(("partition_key", partition_key.clone()))
-                        .await?;
-                    self.db
-                        .query("CREATE asset_partitions SET code_location_id = $cl, asset_key = $asset_key, partition_key = $partition_key, last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp")
-                        .bind(("cl", cl.to_string()))
-                        .bind(("asset_key", asset_key.clone()))
-                        .bind(("partition_key", partition_key.clone()))
                         .bind(("event_id", event_id.clone()))
                         .bind(("run_id", event.run_id.clone()))
                         .bind(("timestamp", event.timestamp))
+                        .bind(("data_version", data_version))
+                        .bind(("mcv", code_version))
+                        .bind(("idv", input_data_versions))
+                        .bind(("partition_key", partition_key.clone()))
+                        .await?;
+                } else {
+                    // Unpartitioned: a single statement, no transaction needed.
+                    self.db
+                        .query("UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv, last_input_data_versions = $idv WHERE code_location_id = $cl AND asset_key = $asset_key")
+                        .bind(("cl", cl.to_string()))
+                        .bind(("asset_key", asset_key.clone()))
+                        .bind(("event_id", event_id.clone()))
+                        .bind(("run_id", event.run_id.clone()))
+                        .bind(("timestamp", event.timestamp))
+                        .bind(("data_version", data_version))
+                        .bind(("mcv", code_version))
+                        .bind(("idv", input_data_versions))
                         .await?;
                 }
             }
@@ -1571,35 +1577,40 @@ impl StorageBackend for SurrealStorage {
                 && event.event_type.is_materialization() {
                     let code_version = self.get_code_version(cl, asset_key).await?;
                     let input_data_versions = event.input_data_versions.clone();
-
                     let data_version = event.event_type.data_version().map(|s| s.to_string());
-                    self.db
-                        .query("UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv, last_input_data_versions = $idv WHERE code_location_id = $cl AND asset_key = $asset_key")
-                        .bind(("cl", cl.to_string()))
-                        .bind(("asset_key", asset_key.clone()))
-                        .bind(("event_id", event_id.clone()))
-                        .bind(("run_id", event.run_id.clone()))
-                        .bind(("timestamp", event.timestamp))
-                        .bind(("data_version", data_version))
-                        .bind(("mcv", code_version.clone()))
-                        .bind(("idv", input_data_versions.clone()))
-                        .await?;
 
                     if let Some(partition_key) = &event.partition_key {
+                        // Partitioned materialization: asset-pointer update +
+                        // partition upsert in ONE transaction (one round-trip).
                         self.db
-                            .query("DELETE FROM asset_partitions WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key = $partition_key")
+                            .query(
+                                "BEGIN; \
+                                 UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv, last_input_data_versions = $idv WHERE code_location_id = $cl AND asset_key = $asset_key; \
+                                 DELETE FROM asset_partitions WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key = $partition_key; \
+                                 CREATE asset_partitions SET code_location_id = $cl, asset_key = $asset_key, partition_key = $partition_key, last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp; \
+                                 COMMIT;",
+                            )
                             .bind(("cl", cl.to_string()))
                             .bind(("asset_key", asset_key.clone()))
-                            .bind(("partition_key", partition_key.clone()))
-                            .await?;
-                        self.db
-                            .query("CREATE asset_partitions SET code_location_id = $cl, asset_key = $asset_key, partition_key = $partition_key, last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp")
-                            .bind(("cl", cl.to_string()))
-                            .bind(("asset_key", asset_key.clone()))
-                            .bind(("partition_key", partition_key.clone()))
                             .bind(("event_id", event_id.clone()))
                             .bind(("run_id", event.run_id.clone()))
                             .bind(("timestamp", event.timestamp))
+                            .bind(("data_version", data_version))
+                            .bind(("mcv", code_version))
+                            .bind(("idv", input_data_versions))
+                            .bind(("partition_key", partition_key.clone()))
+                            .await?;
+                    } else {
+                        self.db
+                            .query("UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv, last_input_data_versions = $idv WHERE code_location_id = $cl AND asset_key = $asset_key")
+                            .bind(("cl", cl.to_string()))
+                            .bind(("asset_key", asset_key.clone()))
+                            .bind(("event_id", event_id.clone()))
+                            .bind(("run_id", event.run_id.clone()))
+                            .bind(("timestamp", event.timestamp))
+                            .bind(("data_version", data_version))
+                            .bind(("mcv", code_version))
+                            .bind(("idv", input_data_versions))
                             .await?;
                     }
                 }
