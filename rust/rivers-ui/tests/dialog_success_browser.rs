@@ -235,12 +235,17 @@ async fn execute_job_with_multi_picker_fires_one_request_per_combination() {
             PartitionDimensionInfo {
                 name: "color".into(),
                 keys: vec!["r".into(), "g".into()],
+                total_count: 2,
+                keys_truncated: false,
             },
             PartitionDimensionInfo {
                 name: "size".into(),
                 keys: vec!["s".into()],
+                total_count: 1,
+                keys_truncated: false,
             },
         ],
+        asset_key: None,
     };
     mount_to(target.clone(), move || {
         view! {

@@ -13,8 +13,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::errors::PartitionDefinitionError;
-
-const MAX_PARTITION_KEYS: usize = 1_000_000;
 use rivers_core::util::parse_key_datetime;
 
 use super::key::PyPartitionKey;
@@ -33,14 +31,27 @@ impl OrderedKeySet {
         self.0.iter()
     }
 
-    /// O(1) membership.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Membership test.
     pub fn contains(&self, key: &str) -> bool {
         self.0.contains(key)
     }
 
-    /// O(1) position of `key` in definition order, if present.
+    /// Position of `key` in definition order, if present.
     pub fn get_index_of(&self, key: &str) -> Option<usize> {
         self.0.get_index_of(key)
+    }
+
+    /// The key at position `idx` in definition order, if in range.
+    pub fn get_at(&self, idx: usize) -> Option<&String> {
+        self.0.get_index(idx)
     }
 }
 
@@ -130,6 +141,36 @@ impl PartitionsDefinition {
         }
     }
 
+    /// The single-dim sub-definition of `Multi` dimension `name` (so the UI can
+    /// page it via the single-dim path).
+    pub fn dimension_def(&self, name: &str) -> Option<&PartitionsDefinition> {
+        match self {
+            Self::Multi { dimensions } => {
+                dimensions.iter().find(|(n, _)| n == name).map(|(_, d)| d)
+            }
+            _ => None,
+        }
+    }
+
+    /// The `idx`-th key (in definition order) of a single-dimension definition —
+    /// the per-dimension lookup behind the `Multi` window. `Static` indexes the
+    /// `OrderSet` directly; `TimeWindow` reuses the windowing seek (a window of
+    /// length 1 at `idx`). `None` if out of range or not single-dim.
+    fn nth_single_dim_key(&self, idx: usize) -> PyResult<Option<String>> {
+        match self {
+            Self::Static { keys } => Ok(keys.get_at(idx).cloned()),
+            Self::TimeWindow { .. } => Ok(self
+                .get_partition_keys_window(idx, 1)?
+                .into_iter()
+                .next()
+                .and_then(|pk| match pk {
+                    PyPartitionKey::Single { key } => key.into_iter().next(),
+                    PyPartitionKey::Multi { .. } => None,
+                })),
+            _ => Ok(None),
+        }
+    }
+
     /// Enumerate keys for a single-dimension definition (Static or TimeWindow),
     /// returning them as plain strings. Errors if `self` is Multi or Dynamic,
     /// since both yield non-Single PyPartitionKey values.
@@ -173,12 +214,6 @@ impl PartitionsDefinition {
                 for (name, def) in dimensions {
                     dim_keys.push((name.clone(), def.enumerate_single_dim_keys()?));
                 }
-                let total: usize = dim_keys.iter().map(|(_, k)| k.len()).product();
-                if total > MAX_PARTITION_KEYS {
-                    return Err(PartitionDefinitionError::new_err(format!(
-                        "Multi partition cartesian product ({total}) exceeds limit of {MAX_PARTITION_KEYS}"
-                    )));
-                }
                 let combos = cartesian_product(&dim_keys);
                 Ok(combos
                     .into_iter()
@@ -190,6 +225,224 @@ impl PartitionsDefinition {
             Self::Dynamic { .. } => Err(PyNotImplementedError::new_err(
                 "Cannot enumerate dynamic partition keys",
             )),
+        }
+    }
+
+    /// A window `[offset, offset+limit)` of keys without materializing the full
+    /// set. `Static` slices the `OrderSet`; `TimeWindow` seeks lazily (interval
+    /// by arithmetic, cron by skipping the occurrence iterator); `Multi` /
+    /// `Dynamic` enumerate then slice.
+    pub fn get_partition_keys_window(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> PyResult<Vec<PyPartitionKey>> {
+        let single = |k: String| PyPartitionKey::Single { key: vec![k] };
+        match self {
+            Self::Static { keys } => Ok(keys
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .map(|k| single(k.clone()))
+                .collect()),
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => {
+                let end_dt = time_window_end(end);
+                let keys = if let Some(secs) = interval_seconds {
+                    interval_window(*secs, start, end_dt, fmt, offset, limit)
+                } else if let Some(expr) = cron_schedule {
+                    let mut out = Vec::new();
+                    let mut idx = 0usize;
+                    for_each_cron_tick(expr, start, end_dt, |naive| {
+                        if idx >= offset && out.len() < limit {
+                            out.push(naive.format(fmt).to_string());
+                        }
+                        idx += 1;
+                        out.len() < limit
+                    })?;
+                    out
+                } else {
+                    Vec::new()
+                };
+                Ok(keys.into_iter().map(single).collect())
+            }
+            Self::Multi { dimensions } => {
+                // Lazy mixed-radix window: build only combos `[offset, offset+limit)`,
+                // never the full cartesian product. First dimension is most
+                // significant, matching `cartesian_product` / `get_partition_keys`.
+                // Count each dimension once and take the product (matches
+                // `partition_count`'s Multi arm) — don't re-walk per dimension.
+                let n = dimensions.len();
+                let sizes: Vec<usize> = dimensions
+                    .iter()
+                    .map(|(_, d)| d.partition_count())
+                    .collect();
+                let total = sizes.iter().fold(1usize, |acc, &s| acc.saturating_mul(s));
+                let end = offset.saturating_add(limit).min(total);
+                if offset >= end {
+                    return Ok(Vec::new());
+                }
+                let mut strides = vec![1usize; n];
+                for i in (0..n.saturating_sub(1)).rev() {
+                    strides[i] = strides[i + 1].saturating_mul(sizes[i + 1]);
+                }
+                let mut out = Vec::with_capacity(end - offset);
+                for k in offset..end {
+                    let mut rem = k;
+                    let mut combo: HashMap<String, Vec<String>> = HashMap::new();
+                    for (i, (name, def)) in dimensions.iter().enumerate() {
+                        let idx_i = rem / strides[i];
+                        rem %= strides[i];
+                        let key = def.nth_single_dim_key(idx_i)?.ok_or_else(|| {
+                            PartitionDefinitionError::new_err(format!(
+                                "dimension '{name}' has no key at index {idx_i}"
+                            ))
+                        })?;
+                        combo.insert(name.clone(), vec![key]);
+                    }
+                    out.push(PyPartitionKey::Multi { keys: combo });
+                }
+                Ok(out)
+            }
+            // Dynamic can't be enumerated — `get_partition_keys` propagates the error.
+            Self::Dynamic { .. } => Ok(self
+                .get_partition_keys()?
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect()),
+        }
+    }
+
+    /// `(page, match_count)` for single-dim keys containing `query`, in one pass.
+    /// `Static` scans the `OrderSet`; `TimeWindow` walks lazily (interval / cron).
+    /// `Multi`/`Dynamic` return `(empty, 0)` (not single-dim).
+    pub fn get_partition_keys_filtered(
+        &self,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> PyResult<(Vec<String>, usize)> {
+        let mut total = 0usize;
+        let mut page: Vec<String> = Vec::new();
+        let mut consume = |k: String| {
+            if k.contains(query) {
+                if total >= offset && page.len() < limit {
+                    page.push(k);
+                }
+                total += 1;
+            }
+        };
+        match self {
+            Self::Static { keys } => {
+                for k in keys.iter() {
+                    consume(k.clone());
+                }
+            }
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => {
+                let end_dt = time_window_end(end);
+                if let Some(secs) = interval_seconds {
+                    for_each_interval_tick(*secs, start, end_dt, |dt| {
+                        consume(dt.format(fmt).to_string());
+                        true
+                    });
+                } else if let Some(expr) = cron_schedule {
+                    for_each_cron_tick(expr, start, end_dt, |naive| {
+                        consume(naive.format(fmt).to_string());
+                        true
+                    })?;
+                }
+            }
+            _ => {}
+        }
+        Ok((page, total))
+    }
+
+    /// Index of `key` in single-dim order — the "jump to key" target. Direct for
+    /// `Static`; `TimeWindow` is arithmetic (interval) or a lazy scan (cron).
+    /// `None` for absent keys, `Multi`, or `Dynamic`.
+    pub fn single_dim_key_index(&self, key: &str) -> PyResult<Option<usize>> {
+        match self {
+            Self::Static { keys } => Ok(keys.get_index_of(key)),
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => {
+                let end_dt = time_window_end(end);
+                if let Some(secs) = interval_seconds {
+                    Ok(interval_index(*secs, start, end_dt, fmt, key))
+                } else if let Some(expr) = cron_schedule {
+                    let mut idx = 0usize;
+                    let mut found = None;
+                    for_each_cron_tick(expr, start, end_dt, |naive| {
+                        if naive.format(fmt).to_string() == key {
+                            found = Some(idx);
+                            return false;
+                        }
+                        idx += 1;
+                        true
+                    })?;
+                    Ok(found)
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Total partitions, as cheaply as the kind allows: `len` for `Static`,
+    /// product for `Multi`, arithmetic for interval `TimeWindow` (exact), a lazy
+    /// count for cron `TimeWindow` (exact, but walks the range), 0 for `Dynamic`
+    /// (storage-managed).
+    pub fn partition_count(&self) -> usize {
+        match self {
+            Self::Static { keys } => keys.len(),
+            // Saturating product — a huge cartesian product must not overflow
+            // (panic in debug / silent wrap in release).
+            Self::Multi { dimensions } => dimensions
+                .iter()
+                .map(|(_, d)| d.partition_count())
+                .fold(1usize, |acc, n| acc.saturating_mul(n)),
+            // Storage-managed: the def holds no keys, so it has no count here.
+            // The UI sources the real count from storage (`count_dynamic_partitions`).
+            Self::Dynamic { .. } => 0,
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                ..
+            } => {
+                let end_dt = time_window_end(end);
+                if let Some(secs) = interval_seconds {
+                    interval_window_count(*secs, start, end_dt)
+                } else if let Some(expr) = cron_schedule {
+                    // No closed form for cron — count lazily over the full range.
+                    let mut n = 0usize;
+                    let _ = for_each_cron_tick(expr, start, end_dt, |_| {
+                        n += 1;
+                        true
+                    });
+                    n
+                } else {
+                    0
+                }
+            }
         }
     }
 
@@ -665,7 +918,8 @@ fn validate_time_window_key(
     Ok(true)
 }
 
-/// Enumerate time window partition keys between start and end (or now).
+/// Enumerate all time window partition keys in `[start, end)` (or now) — the
+/// eager collect-everything form of the lazy `for_each_*_tick` walkers.
 fn enumerate_time_windows(
     cron_schedule: &Option<String>,
     interval_seconds: &Option<f64>,
@@ -673,45 +927,152 @@ fn enumerate_time_windows(
     end: &Option<NaiveDateTime>,
     fmt: &str,
 ) -> PyResult<Vec<String>> {
-    let now = Local::now().naive_local();
-    let end_dt = end.unwrap_or(now);
-
+    let end_dt = time_window_end(end);
+    let mut keys = Vec::new();
     if let Some(secs) = interval_seconds {
-        let interval = chrono::Duration::nanoseconds((*secs * 1_000_000_000.0) as i64);
-        let mut keys = Vec::new();
-        let mut current = *start;
-        while current < end_dt {
-            if keys.len() >= MAX_PARTITION_KEYS {
-                return Err(PartitionDefinitionError::new_err(format!(
-                    "TimeWindow partition count exceeds limit of {MAX_PARTITION_KEYS}"
-                )));
-            }
-            keys.push(current.format(fmt).to_string());
-            current += interval;
-        }
-        Ok(keys)
-    } else if let Some(cron_expr) = cron_schedule {
-        let cron = parse_cron(cron_expr)?;
-        let start_local = naive_to_local(start)?;
-        let mut keys = Vec::new();
-        for tick in cron.iter_from(start_local, croner::Direction::Forward) {
-            let naive = tick.naive_local();
-            if naive >= end_dt {
-                break;
-            }
-            if keys.len() >= MAX_PARTITION_KEYS {
-                return Err(PartitionDefinitionError::new_err(format!(
-                    "TimeWindow partition count exceeds limit of {MAX_PARTITION_KEYS}"
-                )));
-            }
+        for_each_interval_tick(*secs, start, end_dt, |dt| {
+            keys.push(dt.format(fmt).to_string());
+            true
+        });
+    } else if let Some(expr) = cron_schedule {
+        for_each_cron_tick(expr, start, end_dt, |naive| {
             keys.push(naive.format(fmt).to_string());
-        }
-        Ok(keys)
+            true
+        })?;
     } else {
-        Err(PartitionDefinitionError::new_err(
+        return Err(PartitionDefinitionError::new_err(
             "TimeWindow requires either cron_schedule or interval_seconds",
-        ))
+        ));
     }
+    Ok(keys)
+}
+
+/// Effective end bound for a TimeWindow: the explicit `end`, else now.
+fn time_window_end(end: &Option<NaiveDateTime>) -> NaiveDateTime {
+    end.unwrap_or_else(|| Local::now().naive_local())
+}
+
+/// Count of interval windows in `[start, end)` — the number of `k >= 0` with
+/// `start + k*interval < end`. Exact: the span is computed in i128 nanoseconds
+/// (i64 ns overflows past ~292 years), then clamped to the `usize` range.
+fn interval_window_count(secs: f64, start: &NaiveDateTime, end_dt: NaiveDateTime) -> usize {
+    if end_dt <= *start {
+        return 0;
+    }
+    let interval_ns = (secs * 1_000_000_000.0) as i128;
+    if interval_ns <= 0 {
+        return 0;
+    }
+    let delta = end_dt - *start;
+    let span_ns =
+        i128::from(delta.num_seconds()) * 1_000_000_000 + i128::from(delta.subsec_nanos());
+    let count = ((span_ns - 1) / interval_ns) + 1;
+    count.clamp(0, usize::MAX as i128) as usize
+}
+
+/// Up to `limit` interval keys from index `offset`, via arithmetic seek.
+fn interval_window(
+    secs: f64,
+    start: &NaiveDateTime,
+    end_dt: NaiveDateTime,
+    fmt: &str,
+    offset: usize,
+    limit: usize,
+) -> Vec<String> {
+    let interval_ns = (secs * 1_000_000_000.0) as i64;
+    if interval_ns <= 0 || limit == 0 {
+        return Vec::new();
+    }
+    let step = chrono::Duration::nanoseconds(interval_ns);
+    let Some(off_ns) = (offset as i64).checked_mul(interval_ns) else {
+        return Vec::new();
+    };
+    let Some(mut current) = start.checked_add_signed(chrono::Duration::nanoseconds(off_ns)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(limit.min(1024));
+    while current < end_dt && out.len() < limit {
+        out.push(current.format(fmt).to_string());
+        current = match current.checked_add_signed(step) {
+            Some(c) => c,
+            None => break,
+        };
+    }
+    out
+}
+
+/// Index of `key` if it's an aligned interval window in `[start, end)`, else `None`.
+fn interval_index(
+    secs: f64,
+    start: &NaiveDateTime,
+    end_dt: NaiveDateTime,
+    fmt: &str,
+    key: &str,
+) -> Option<usize> {
+    let interval_ns = (secs * 1_000_000_000.0) as i64;
+    if interval_ns <= 0 {
+        return None;
+    }
+    let dt = parse_key_datetime(key, fmt).ok()?;
+    if dt < *start || dt >= end_dt {
+        return None;
+    }
+    let delta = (dt - *start).num_nanoseconds()?;
+    if delta % interval_ns != 0 {
+        return None;
+    }
+    Some((delta / interval_ns) as usize)
+}
+
+/// Walk interval windows in `[start, end)` lazily; `f` returns false to stop.
+/// Always terminates at `end_dt` (the explicit `end`, or now if open-ended);
+/// uncapped, so a fine-grained def over a wide range is slow but never hides
+/// partitions.
+fn for_each_interval_tick(
+    secs: f64,
+    start: &NaiveDateTime,
+    end_dt: NaiveDateTime,
+    mut f: impl FnMut(NaiveDateTime) -> bool,
+) {
+    let interval_ns = (secs * 1_000_000_000.0) as i64;
+    if interval_ns <= 0 {
+        return;
+    }
+    let step = chrono::Duration::nanoseconds(interval_ns);
+    let mut current = *start;
+    while current < end_dt {
+        if !f(current) {
+            break;
+        }
+        current = match current.checked_add_signed(step) {
+            Some(c) => c,
+            None => break,
+        };
+    }
+}
+
+/// Walk cron occurrences in `[start, end)` lazily; `f` returns false to stop.
+/// Always terminates at `end_dt` (the explicit `end`, or now if open-ended);
+/// uncapped, so a fine-grained schedule over a wide range is slow but never
+/// hides partitions.
+fn for_each_cron_tick(
+    cron_expr: &str,
+    start: &NaiveDateTime,
+    end_dt: NaiveDateTime,
+    mut f: impl FnMut(NaiveDateTime) -> bool,
+) -> PyResult<()> {
+    let cron = parse_cron(cron_expr)?;
+    let start_local = naive_to_local(start)?;
+    for tick in cron.iter_from(start_local, croner::Direction::Forward) {
+        let naive = tick.naive_local();
+        if naive >= end_dt {
+            break;
+        }
+        if !f(naive) {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Compute the cartesian product of dimension keys.

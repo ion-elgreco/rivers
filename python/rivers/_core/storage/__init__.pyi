@@ -330,6 +330,10 @@ class Storage:
         """Return every partition key that has at least one materialization recorded."""
         ...
 
+    def count_materialized_partitions(self, asset_key: str) -> int:
+        """Count materialized partitions for ``asset_key`` via an aggregate query."""
+        ...
+
     def set_pool_limit(
         self, pool_key: str, limit: int, lease_duration: str = "5m"
     ) -> None:

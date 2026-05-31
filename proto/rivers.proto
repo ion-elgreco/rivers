@@ -12,6 +12,8 @@ service CodeLocationService {
   rpc Materialize(MaterializeRequest) returns (MaterializeResponse);
   rpc ExecuteJob(ExecuteJobRequest) returns (ExecuteJobResponse);
   rpc GetAssetsInfo(GetAssetsInfoRequest) returns (GetAssetsInfoResponse);
+  rpc GetPartitionKeys(GetPartitionKeysRequest) returns (GetPartitionKeysResponse);
+  rpc GetPartitionKeyIndex(GetPartitionKeyIndexRequest) returns (GetPartitionKeyIndexResponse);
   rpc GetSchedules(GetSchedulesRequest) returns (GetSchedulesResponse);
   rpc GetSensors(GetSensorsRequest) returns (GetSensorsResponse);
   rpc GetJobs(GetJobsRequest) returns (GetJobsResponse);
@@ -71,6 +73,39 @@ message ExecuteJobResponse {
 
 // --- Assets ---
 
+// Paged enumeration of one asset's partition keys for the UI picker —
+// `keys` is the window `[offset, offset+limit)` of `total`, so the client can
+// virtual-scroll without ever loading every key.
+message GetPartitionKeysRequest {
+  string asset_key = 1;
+  uint64 offset = 2;
+  uint64 limit = 3;
+  // Optional case-sensitive substring filter. Empty = browse all; non-empty =
+  // only matching keys (then `total` is the match count).
+  string query = 4;
+  // Optional Multi dimension name. Empty = the asset's single-dim key space.
+  // Set = page that dimension's sub-definition of a Multi asset.
+  string dimension = 5;
+}
+message GetPartitionKeysResponse {
+  repeated string keys = 1;
+  // Size of the set the window is drawn from: the full partition count when
+  // `query` is empty, otherwise the number of matching keys.
+  uint64 total = 2;
+}
+
+// Index of a single-dim key in definition order, for the picker's jump.
+// `index` is -1 when `key` isn't a partition of the asset.
+message GetPartitionKeyIndexRequest {
+  string asset_key = 1;
+  string key = 2;
+  // Optional Multi dimension name (see GetPartitionKeysRequest.dimension).
+  string dimension = 3;
+}
+message GetPartitionKeyIndexResponse {
+  int64 index = 1;
+}
+
 message GetAssetsInfoRequest {}
 message GetAssetsInfoResponse {
   repeated AssetDefinitionInfo assets = 1;
@@ -94,16 +129,31 @@ message AssetDefinitionInfo {
 
 message PartitionDefInfo {
   string kind = 1;
-  // Single-dim enumerable keys (Static, TimeWindow). Empty for Multi
-  // (use `dimensions` instead) and for Dynamic (storage-managed).
+  // Single-dim keys (Static, TimeWindow) — a BOUNDED WINDOW, not necessarily
+  // every key. Empty for Multi (use `dimensions`) and for Dynamic. The UI pages
+  // the rest; `total_count` is the true size and `keys_truncated` flags capping.
   repeated string keys = 2;
   // Per-dimension keys for Multi partitions. Empty for non-Multi kinds.
   repeated PartitionDimensionInfo dimensions = 3;
+  // Total partition count (cheap aggregate, not derived from `keys`). For
+  // Dynamic this is 0 here — the keys are storage-managed, so the UI sources
+  // the real count from storage via `dynamic_name`.
+  uint64 total_count = 4;
+  // True when `keys` is a truncated window of the full single-dim key set.
+  bool keys_truncated = 5;
+  // For Dynamic partitions, the namespace name to query storage with. Empty
+  // for all other kinds.
+  string dynamic_name = 6;
 }
 
 message PartitionDimensionInfo {
   string name = 1;
+  // A bounded window of this dimension's keys (see `keys_truncated`).
   repeated string keys = 2;
+  // True size of this dimension; `keys` may be a window of it.
+  uint64 total_count = 3;
+  // True when `keys` is a truncated window — the UI pages the dimension.
+  bool keys_truncated = 4;
 }
 
 message HookInfo {

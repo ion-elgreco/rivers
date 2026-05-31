@@ -2842,6 +2842,42 @@ impl PerCodeLocationStorage for SurrealStorage {
         Ok(rows.into_iter().map(|r| r.partition_key).collect())
     }
 
+    async fn count_materialized_partitions(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+    ) -> Result<u64> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query("SELECT count() AS total FROM asset_partitions WHERE code_location_id = $cl AND asset_key = $asset_key GROUP ALL")
+                .bind(("cl", code_location_id.to_string()))
+                .bind(("asset_key", asset_key.to_string()))
+                .await?;
+            let total: Option<u64> = result.take((0, "total"))?;
+            Ok(total.unwrap_or(0))
+        })
+        .await
+    }
+
+    async fn count_dynamic_partitions(
+        &self,
+        code_location_id: &str,
+        partitions_def_name: &str,
+    ) -> Result<u64> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query("SELECT count() AS total FROM dynamic_partitions WHERE code_location_id = $cl AND partitions_def_name = $name GROUP ALL")
+                .bind(("cl", code_location_id.to_string()))
+                .bind(("name", partitions_def_name.to_string()))
+                .await?;
+            let total: Option<u64> = result.take((0, "total"))?;
+            Ok(total.unwrap_or(0))
+        })
+        .await
+    }
+
     async fn get_partition_timestamps(
         &self,
         code_location_id: &str,
@@ -3651,6 +3687,129 @@ mod tests {
             input_data_versions: vec![],
         };
         assert_eq!(latest, expected);
+    }
+
+    #[tokio::test]
+    async fn test_count_materialized_partitions() {
+        let storage = make_storage().await;
+        register(&storage, &["a", "b"]).await;
+
+        // Empty → 0. The `count() ... GROUP ALL` aggregate returns no row when
+        // nothing matches, so the impl must map None → 0 rather than error.
+        let n = storage
+            .count_materialized_partitions(crate::storage::DEFAULT_CODE_LOCATION_ID, "a")
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+
+        let materialize = |asset: &str, run: &str, key: &str, ts: i64| EventRecord {
+            code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+            event_type: EventType::Materialization { data_version: None },
+            asset_key: Some(asset.to_string()),
+            run_id: run.to_string(),
+            partition_key: Some(PartitionKey::Single {
+                keys: vec![key.to_string()],
+            }),
+            timestamp: ts,
+            metadata: vec![],
+            input_data_versions: vec![],
+        };
+
+        // Three distinct partitions of "a" + a re-materialization of one — the
+        // UNIQUE index upserts, so the count must not double-count p1.
+        for ev in [
+            materialize("a", "r1", "p1", 100),
+            materialize("a", "r2", "p2", 200),
+            materialize("a", "r3", "p3", 300),
+            materialize("a", "r4", "p1", 400),
+            // A different asset's partition must not leak into "a"'s count.
+            materialize("b", "r5", "p9", 500),
+        ] {
+            storage.store_event(&ev).await.unwrap();
+        }
+
+        let n = storage
+            .count_materialized_partitions(crate::storage::DEFAULT_CODE_LOCATION_ID, "a")
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 3,
+            "3 distinct partitions despite the p1 re-materialization"
+        );
+
+        // The aggregate agrees with the full row enumeration.
+        let rows = storage
+            .get_materialized_partitions(crate::storage::DEFAULT_CODE_LOCATION_ID, "a")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // Scoped per asset.
+        let nb = storage
+            .count_materialized_partitions(crate::storage::DEFAULT_CODE_LOCATION_ID, "b")
+            .await
+            .unwrap();
+        assert_eq!(nb, 1);
+    }
+
+    #[tokio::test]
+    async fn test_count_dynamic_partitions() {
+        let storage = make_storage().await;
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+
+        // Empty namespace → 0 (GROUP ALL returns no row → None → 0).
+        assert_eq!(
+            storage
+                .count_dynamic_partitions(cl, "customers")
+                .await
+                .unwrap(),
+            0
+        );
+
+        // add_dynamic_partitions dedupes, so a repeated key must not double-count.
+        storage
+            .add_dynamic_partitions(
+                cl,
+                "customers",
+                &["acme".into(), "globex".into(), "initech".into()],
+            )
+            .await
+            .unwrap();
+        storage
+            .add_dynamic_partitions(cl, "customers", &["acme".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .count_dynamic_partitions(cl, "customers")
+                .await
+                .unwrap(),
+            3,
+            "3 distinct customers despite the duplicate add"
+        );
+
+        // Scoped per namespace.
+        storage
+            .add_dynamic_partitions(cl, "regions", &["us".into(), "eu".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .count_dynamic_partitions(cl, "regions")
+                .await
+                .unwrap(),
+            2
+        );
+
+        // Agrees with the full key enumeration.
+        assert_eq!(
+            storage
+                .get_dynamic_partitions(cl, "customers")
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[tokio::test]

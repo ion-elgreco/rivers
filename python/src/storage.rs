@@ -1051,6 +1051,16 @@ impl PyStorage {
         Ok(storage_keys.iter().map(PyPartitionKey::from).collect())
     }
 
+    /// Number of materialized partitions for an asset (aggregate count, not the
+    /// keys) — backs the UI's partition summary.
+    fn count_materialized_partitions(&self, py: Python<'_>, asset_key: &str) -> PyResult<u64> {
+        py.detach(|| {
+            io_rt()
+                .block_on(self.scoped().count_materialized_partitions(asset_key))
+                .map_err(to_py_err)
+        })
+    }
+
     // Concurrency pools
 
     #[pyo3(signature = (pool_key, limit, lease_duration="5m"))]

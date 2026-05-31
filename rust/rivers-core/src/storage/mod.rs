@@ -1288,6 +1288,21 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         asset_key: &str,
     ) -> impl Future<Output = Result<Vec<PartitionKey>>> + Send;
 
+    fn count_materialized_partitions(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+    ) -> impl Future<Output = Result<u64>> + Send;
+
+    /// Number of registered keys for a dynamic partition namespace (aggregate
+    /// count, not the keys). Dynamic partitions are storage-managed, so this is
+    /// the authoritative count the UI shows (the def-level `partition_count` is 0).
+    fn count_dynamic_partitions(
+        &self,
+        code_location_id: &str,
+        partitions_def_name: &str,
+    ) -> impl Future<Output = Result<u64>> + Send;
+
     fn get_partition_timestamps(
         &self,
         code_location_id: &str,
@@ -1643,6 +1658,18 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
     pub async fn get_materialized_partitions(&self, asset_key: &str) -> Result<Vec<PartitionKey>> {
         self.backend
             .get_materialized_partitions(self.code_location_id, asset_key)
+            .await
+    }
+
+    pub async fn count_materialized_partitions(&self, asset_key: &str) -> Result<u64> {
+        self.backend
+            .count_materialized_partitions(self.code_location_id, asset_key)
+            .await
+    }
+
+    pub async fn count_dynamic_partitions(&self, partitions_def_name: &str) -> Result<u64> {
+        self.backend
+            .count_dynamic_partitions(self.code_location_id, partitions_def_name)
             .await
     }
 

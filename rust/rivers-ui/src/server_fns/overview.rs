@@ -59,6 +59,7 @@ pub async fn get_assets_info(
     loc_name: String,
 ) -> Result<Vec<AssetDefinitionInfo>, ServerFnError> {
     use rivers_api::rivers::GetAssetsInfoRequest;
+    use rivers_core::storage::StorageBackend;
 
     let state = expect_context::<crate::state::AppState>();
     let (_, mut client) = state
@@ -71,7 +72,7 @@ pub async fn get_assets_info(
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    Ok(resp
+    let mut assets: Vec<AssetDefinitionInfo> = resp
         .into_inner()
         .assets
         .into_iter()
@@ -87,8 +88,13 @@ pub async fn get_assets_info(
                         .map(|d| crate::types::PartitionDimensionInfo {
                             name: d.name,
                             keys: d.keys,
+                            total_count: d.total_count,
+                            keys_truncated: d.keys_truncated,
                         })
                         .collect(),
+                    total_count: pd.total_count,
+                    keys_truncated: pd.keys_truncated,
+                    dynamic_name: pd.dynamic_name,
                 });
             let hooks = a
                 .hooks
@@ -114,7 +120,32 @@ pub async fn get_assets_info(
                 asset_type: a.asset_type,
             }
         })
-        .collect())
+        .collect();
+
+    // Dynamic partitions are storage-managed, so the def-level `total_count` is 0.
+    // Fill in the real count from storage — but only when the location actually
+    // has a Dynamic asset, so the common all-static case skips the registry
+    // lookup + per-asset storage round-trips entirely.
+    let has_dynamic = assets.iter().any(|a| {
+        a.partition_def
+            .as_ref()
+            .is_some_and(|pd| pd.dynamic_namespace().is_some())
+    });
+    if has_dynamic && let Ok(ctx) = super::resolve_identity(&loc_ns, &loc_name).await {
+        let scoped = state.storage.for_code_location(&ctx);
+        for asset in assets.iter_mut() {
+            let Some(pd) = asset.partition_def.as_mut() else {
+                continue;
+            };
+            let Some(ns) = pd.dynamic_namespace().map(str::to_string) else {
+                continue;
+            };
+            if let Ok(n) = scoped.count_dynamic_partitions(&ns).await {
+                pd.total_count = n;
+            }
+        }
+    }
+    Ok(assets)
 }
 
 /// Expand a stored `PartitionKey` into the individual partition-definition
@@ -144,15 +175,63 @@ pub async fn get_partition_status(
     loc_ns: String,
     loc_name: String,
     asset_key: String,
+    offset: u64,
+    // For a Dynamic asset, its namespace name (keys are storage-managed); empty
+    // for all other kinds, which window via gRPC.
+    dynamic_name: String,
 ) -> Result<PartitionStatus, ServerFnError> {
-    use rivers_api::rivers::GetAssetsInfoRequest;
+    use rivers_api::rivers::GetPartitionKeysRequest;
     use rivers_core::storage::StorageBackend;
     use std::collections::HashSet;
+
+    // The heatmap renders one cell per key, so it pages in fixed windows
+    // (`offset` = page start); the summary counts below stay global. Keep in
+    // sync with `PartitionsTab`'s `PAGE`.
+    const HEATMAP_PAGE: u64 = 1000;
 
     let ctx = super::resolve_identity(&loc_ns, &loc_name).await?;
     let state = expect_context::<crate::state::AppState>();
     let scoped = state.storage.for_code_location(&ctx);
 
+    // Summary count — an aggregate, not one row per materialized partition.
+    let materialized_count = scoped
+        .count_materialized_partitions(&asset_key)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))? as usize;
+
+    // Total + key window at `offset`. Dynamic keys are storage-managed, so source
+    // them from storage; every other kind windows via gRPC.
+    let mut window_keys: Vec<String> = Vec::new();
+    let mut total: usize = 0;
+    if !dynamic_name.is_empty() {
+        if let Ok(all) = scoped.get_dynamic_partitions(&dynamic_name).await {
+            total = all.len();
+            window_keys = all
+                .into_iter()
+                .skip(offset as usize)
+                .take(HEATMAP_PAGE as usize)
+                .collect();
+        }
+    } else if let Ok((_, mut client)) = state.connect_to(&loc_ns, &loc_name).await
+        && let Ok(resp) = client
+            .get_partition_keys(GetPartitionKeysRequest {
+                asset_key: asset_key.clone(),
+                offset,
+                limit: HEATMAP_PAGE,
+                query: String::new(),
+                dimension: String::new(),
+            })
+            .await
+    {
+        let resp = resp.into_inner();
+        total = resp.total as usize;
+        window_keys = resp.keys;
+    }
+
+    // Classify only the visible window. Materialized membership comes from the
+    // materialized set and failed from a bounded event scan. (A windowed status
+    // query that avoids fetching the full materialized set for the window is a
+    // follow-up.)
     let materialized_spks = scoped
         .get_materialized_partitions(&asset_key)
         .await
@@ -162,7 +241,6 @@ pub async fn get_partition_status(
         .flat_map(partition_key_members)
         .collect();
 
-    // Failed partitions are inferred by scanning events for StepFailure.
     let events = scoped
         .get_events_for_asset(&asset_key, 10000)
         .await
@@ -179,80 +257,114 @@ pub async fn get_partition_status(
             }
         }
     }
+    let failed_count = failed_keys.len();
 
-    let mut all_keys: Vec<String> = Vec::new();
-    if let Ok((_, mut client)) = state.connect_to(&loc_ns, &loc_name).await
-        && let Ok(resp) = client.get_assets_info(GetAssetsInfoRequest {}).await
-    {
-        for a in resp.into_inner().assets {
-            if a.asset_key == asset_key
-                && let Some(pd) = a.partition_def
-            {
-                all_keys = pd.keys;
-            }
-        }
-    }
-
-    if all_keys.is_empty() {
-        // Fallback: only show materialized
-        let details: Vec<PartitionDetail> = materialized_keys
+    // gRPC unavailable / no partition def → fall back to listing materialized keys.
+    let detail_keys: Vec<String> = if total == 0 {
+        total = materialized_keys.len();
+        materialized_keys
             .iter()
-            .map(|key| PartitionDetail {
-                key: key.clone(),
-                status: "Materialized".to_string(),
-                last_timestamp: None,
-            })
-            .collect();
-        let count = details.len();
-        Ok(PartitionStatus {
-            asset_key,
-            total_partitions: count,
-            materialized: count,
-            failed: 0,
-            missing: 0,
-            partition_details: details,
-        })
+            .take(HEATMAP_PAGE as usize)
+            .cloned()
+            .collect()
     } else {
-        let total = all_keys.len();
-        let mut details: Vec<PartitionDetail> = Vec::with_capacity(total);
-        let mut mat_count = 0;
-        let mut fail_count = 0;
-        let mut miss_count = 0;
+        window_keys
+    };
 
-        for key in &all_keys {
-            if materialized_keys.contains(key) {
-                mat_count += 1;
-                details.push(PartitionDetail {
-                    key: key.clone(),
-                    status: "Materialized".to_string(),
-                    last_timestamp: None,
-                });
+    let partition_details: Vec<PartitionDetail> = detail_keys
+        .iter()
+        .map(|key| {
+            let status = if materialized_keys.contains(key) {
+                "Materialized"
             } else if failed_keys.contains(key) {
-                fail_count += 1;
-                details.push(PartitionDetail {
-                    key: key.clone(),
-                    status: "Failed".to_string(),
-                    last_timestamp: None,
-                });
+                "Failed"
             } else {
-                miss_count += 1;
-                details.push(PartitionDetail {
-                    key: key.clone(),
-                    status: "Missing".to_string(),
-                    last_timestamp: None,
-                });
+                "Missing"
+            };
+            PartitionDetail {
+                key: key.clone(),
+                status: status.to_string(),
+                last_timestamp: None,
             }
-        }
-
-        Ok(PartitionStatus {
-            asset_key,
-            total_partitions: total,
-            materialized: mat_count,
-            failed: fail_count,
-            missing: miss_count,
-            partition_details: details,
         })
-    }
+        .collect();
+
+    // Clamp to the definition's total: stale storage rows (partitions no longer
+    // in the current def) must not make the summary show materialized > total.
+    let materialized = materialized_count.min(total);
+    let failed = failed_count.min(total - materialized);
+    let missing = total - materialized - failed;
+    Ok(PartitionStatus {
+        asset_key,
+        total_partitions: total,
+        materialized,
+        failed,
+        missing,
+        partition_details,
+    })
+}
+
+/// A window `[offset, offset+limit)` of an asset's keys plus the `total`, fetched
+/// on demand. `query` filters by substring (`total` = match count); `dimension`
+/// pages a Multi dimension instead of the asset's single-dim keys.
+#[server]
+pub async fn get_partition_keys_page(
+    loc_ns: String,
+    loc_name: String,
+    asset_key: String,
+    dimension: String,
+    query: String,
+    offset: u64,
+    limit: u64,
+) -> Result<(Vec<String>, u64), ServerFnError> {
+    use rivers_api::rivers::GetPartitionKeysRequest;
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let resp = client
+        .get_partition_keys(GetPartitionKeysRequest {
+            asset_key,
+            offset,
+            limit,
+            query,
+            dimension,
+        })
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .into_inner();
+    Ok((resp.keys, resp.total))
+}
+
+/// Index of a key in definition order for the picker's jump; `dimension`
+/// resolves within a Multi dimension. `-1` if absent.
+#[server]
+pub async fn get_partition_key_index(
+    loc_ns: String,
+    loc_name: String,
+    asset_key: String,
+    dimension: String,
+    key: String,
+) -> Result<i64, ServerFnError> {
+    use rivers_api::rivers::GetPartitionKeyIndexRequest;
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let resp = client
+        .get_partition_key_index(GetPartitionKeyIndexRequest {
+            asset_key,
+            key,
+            dimension,
+        })
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .into_inner();
+    Ok(resp.index)
 }
 
 /// Aggregate stats for the deployment page: storage-side counts (assets,

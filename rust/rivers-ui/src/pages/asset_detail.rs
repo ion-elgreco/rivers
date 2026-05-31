@@ -238,7 +238,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                     let partitioned_val = info
                         .as_ref()
                         .and_then(|i| i.partition_def.as_ref())
-                        .map(|pd| format!("{} · {} keys", pd.kind, pd.keys.len()))
+                        .map(|pd| format!("{} · {} keys", pd.kind, pd.total_count))
                         .unwrap_or_else(|| "no".to_string());
 
                     let code_version = record.code_version.clone().unwrap_or_else(|| "—".to_string());
@@ -572,7 +572,18 @@ pub fn AssetDetailPage() -> impl IntoView {
         </div>
 
         <div class="tab-content" style=move || if active_tab.get() == "partitions" { "" } else { "display:none" }>
-            <PartitionsTab asset_key=key()/>
+            <PartitionsTab
+                asset_key=key()
+                dynamic_name=Signal::derive(move || {
+                    assets_info
+                        .get()
+                        .and_then(|r| r.ok())
+                        .and_then(|infos| infos.into_iter().find(|a| a.asset_key == key()))
+                        .and_then(|a| a.partition_def)
+                        .and_then(|pd| pd.dynamic_namespace().map(str::to_string))
+                        .unwrap_or_default()
+                })
+            />
         </div>
 
         <div class="tab-content" style=move || if active_tab.get() == "automation" { "" } else { "display:none" }>
@@ -662,13 +673,25 @@ pub fn AssetDetailPage() -> impl IntoView {
 }
 
 #[component]
-fn PartitionsTab(asset_key: String) -> impl IntoView {
+fn PartitionsTab(
+    asset_key: String,
+    /// For a Dynamic asset, its namespace name (so `get_partition_status` sources
+    /// the storage-managed keys); empty for other kinds.
+    #[prop(into)]
+    dynamic_name: Signal<String>,
+) -> impl IntoView {
     let key = asset_key.clone();
     let mat_key = asset_key.clone();
     let loc = use_current_location();
+    // Heatmap page start (one cell per key). Keep `PAGE` in sync with the
+    // server's `HEATMAP_PAGE`.
+    const PAGE: u64 = 1000;
+    let offset = RwSignal::new(0u64);
     let partition_status = Resource::new(
-        move || (key.clone(), loc.get()),
-        |(key, (ns, name))| async move { get_partition_status(ns, name, key).await },
+        move || (key.clone(), loc.get(), offset.get(), dynamic_name.get()),
+        |(key, (ns, name), offset, dyn_name)| async move {
+            get_partition_status(ns, name, key, offset, dyn_name).await
+        },
     );
 
     let materialize_missing = Action::new(move |_: &()| {
@@ -698,6 +721,10 @@ fn PartitionsTab(asset_key: String) -> impl IntoView {
                         let heatmap_labels: Vec<String> = status.partition_details.iter()
                             .map(|p| p.key.clone())
                             .collect();
+                        // The backend caps `partition_details` to a window, so the
+                        // heatmap stays bounded even for million-partition assets.
+                        let shown = status.partition_details.len();
+                        let total_n = status.total_partitions;
                         view! {
                             <div class="partition-header">
                                 <div class="partition-summary">
@@ -705,6 +732,29 @@ fn PartitionsTab(asset_key: String) -> impl IntoView {
                                     <span class="stat-inline"><strong>{status.failed}</strong>" failed"</span>
                                     <span class="stat-inline"><strong>{status.missing}</strong>" missing"</span>
                                     <span class="stat-inline">"of "<strong>{status.total_partitions}</strong>" total"</span>
+                                    {(total_n > PAGE as usize).then(|| {
+                                        let off = offset.get() as usize;
+                                        view! {
+                                            <span class="stat-inline muted">
+                                                {format!("showing {}–{} of {}", off + 1, off + shown, total_n)}
+                                            </span>
+                                            <button
+                                                class="btn btn-tertiary btn-small"
+                                                disabled={move || offset.get() == 0}
+                                                on:click=move |_| offset.update(|o| *o = o.saturating_sub(PAGE))
+                                            >
+                                                "Prev"
+                                            </button>
+                                            <button
+                                                class="btn btn-tertiary btn-small"
+                                                // Braced: the `>=` would otherwise read as a tag close in `view!`.
+                                                disabled={move || offset.get() as usize + shown >= total_n}
+                                                on:click=move |_| offset.update(|o| *o += PAGE)
+                                            >
+                                                "Next"
+                                            </button>
+                                        }
+                                    })}
                                 </div>
                                 {has_missing.then(|| view! {
                                     <button
