@@ -503,3 +503,4 @@ def test_multi_window_past_one_million(grpc_stubs):
         ]
     finally:
         channel.close()
+        repo._stop_grpc_server()

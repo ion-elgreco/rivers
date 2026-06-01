@@ -279,9 +279,9 @@ pub(crate) fn spawn_schedule_sensor_loop(
     tokio::spawn(async move {
         let mut join_set = tokio::task::JoinSet::<TickResult>::new();
 
-        loop {
+        'outer: loop {
             if cancel.is_cancelled() {
-                break;
+                break 'outer;
             }
 
             while let Some(Ok(tick_result)) = join_set.try_join_next() {
@@ -313,7 +313,7 @@ pub(crate) fn spawn_schedule_sensor_loop(
             loop {
                 tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => { return; }
+                    _ = cancel.cancelled() => break 'outer,
                     Some(Ok(tick_result)) = join_set.join_next(), if !join_set.is_empty() => {
                         let completed_idx = tick_result.index;
                         process_tick_result(&mut automations, &tick_tx, &handle, &run_dispatcher, &backfill_dispatcher, tick_result, max_ticks_retained).await;
@@ -334,6 +334,10 @@ pub(crate) fn spawn_schedule_sensor_loop(
                 }
             }
         }
+
+        // Drain in-flight evals so their `spawn_blocking` GIL workers aren't
+        // abandoned on the shared runtime (see `gil_threads`); results dropped.
+        while join_set.join_next().await.is_some() {}
     })
 }
 
