@@ -15,6 +15,7 @@ use super::eval_dispatcher::{DueEval, EvalDispatcher};
 use super::tick_processing::process_tick_result;
 use super::types::{TickResult, TickWriteMsg};
 use crate::executor::ops::now_ts;
+use crate::gil_threads::GilThreads;
 use crate::repository::PyCodeRepository;
 
 /// Backfill pickup loop — polls for Requested backfills owned by this CL every
@@ -25,6 +26,7 @@ pub(crate) fn spawn_backfill_pickup_loop(
     handle: ScopedStorageHandle<SurrealStorage>,
     cancel: CancellationToken,
     run_queue_enabled: bool,
+    gil_threads: GilThreads,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = std::time::Duration::from_secs(5);
@@ -55,7 +57,7 @@ pub(crate) fn spawn_backfill_pickup_loop(
             for record in pending {
                 let repo = repo.clone();
                 let backfill_id = record.backfill_id.clone();
-                let h = std::thread::spawn(move || {
+                gil_threads.spawn(move || {
                     let repo_ref = repo.get();
                     if run_queue_enabled {
                         if let Err(e) = repo_ref.execute_backfill_queued_inner(&backfill_id) {
@@ -75,7 +77,6 @@ pub(crate) fn spawn_backfill_pickup_loop(
                         );
                     }
                 });
-                crate::shutdown::register_backfill_handle(h);
             }
         }
     })
@@ -278,9 +279,9 @@ pub(crate) fn spawn_schedule_sensor_loop(
     tokio::spawn(async move {
         let mut join_set = tokio::task::JoinSet::<TickResult>::new();
 
-        loop {
+        'outer: loop {
             if cancel.is_cancelled() {
-                break;
+                break 'outer;
             }
 
             while let Some(Ok(tick_result)) = join_set.try_join_next() {
@@ -312,7 +313,7 @@ pub(crate) fn spawn_schedule_sensor_loop(
             loop {
                 tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => { return; }
+                    _ = cancel.cancelled() => break 'outer,
                     Some(Ok(tick_result)) = join_set.join_next(), if !join_set.is_empty() => {
                         let completed_idx = tick_result.index;
                         process_tick_result(&mut automations, &tick_tx, &handle, &run_dispatcher, &backfill_dispatcher, tick_result, max_ticks_retained).await;
@@ -333,6 +334,10 @@ pub(crate) fn spawn_schedule_sensor_loop(
                 }
             }
         }
+
+        // Drain in-flight evals so their `spawn_blocking` GIL workers aren't
+        // abandoned on the shared runtime (see `gil_threads`); results dropped.
+        while join_set.join_next().await.is_some() {}
     })
 }
 

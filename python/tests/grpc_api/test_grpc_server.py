@@ -43,6 +43,7 @@ def grpc_channel(grpc_stubs):
     pb2, pb2_grpc = grpc_stubs
     yield channel, pb2, pb2_grpc, repo
     channel.close()
+    repo._stop_grpc_server()
 
 
 @pytest.fixture
@@ -95,6 +96,7 @@ def full_grpc_channel(grpc_stubs):
     pb2, pb2_grpc = grpc_stubs
     yield channel, pb2, pb2_grpc, repo
     channel.close()
+    repo._stop_grpc_server()
 
 
 # ── Tests ──
@@ -306,6 +308,7 @@ def queued_grpc_channel(grpc_stubs, storage):
     pb2, pb2_grpc = grpc_stubs
     yield channel, pb2, pb2_grpc, repo, storage
     channel.close()
+    repo._stop_grpc_server()
 
 
 def test_materialize_with_run_queue_creates_queued_run(queued_grpc_channel):
@@ -410,6 +413,7 @@ def slow_grpc_channel(grpc_stubs, storage):
     pb2, pb2_grpc = grpc_stubs
     yield channel, pb2, pb2_grpc, repo, storage
     channel.close()
+    repo._stop_grpc_server()
 
 
 def test_cancel_run_during_execution(slow_grpc_channel):
@@ -475,6 +479,7 @@ def backfill_grpc_channel(grpc_stubs, storage):
     pb2, pb2_grpc = grpc_stubs
     yield channel, pb2, pb2_grpc, repo, storage
     channel.close()
+    repo._stop_grpc_server()
 
 
 def _single_partition_key(pb2, key: str):

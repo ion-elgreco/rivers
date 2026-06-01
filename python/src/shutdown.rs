@@ -91,42 +91,21 @@ pub fn register_ui_handle(h: tokio::task::JoinHandle<()>) {
     replace_handle(Service::Ui, ServiceHandle::Tokio(h), None);
 }
 
-// In-flight Direct-dispatched materialization threads. Drained by
-// `drain_materializations` so SIGTERM waits for them before Python
-// finalizes — otherwise `Python::try_attach` returns None mid-step and
-// the run silently dies. Unbounded per-request so it doesn't fit the
-// fixed-slot HANDLES array.
-static MATERIALIZATION_HANDLES: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
-
-pub fn register_materialization_handle(h: std::thread::JoinHandle<()>) {
-    let mut guard = MATERIALIZATION_HANDLES.lock().unwrap();
-    guard.retain(|h| !h.is_finished());
-    guard.push(h);
-}
-
-// In-flight backfill execution threads spawned by the backfill pickup loop
-// (`subdaemons::spawn_backfill_pickup_loop`) and the BackfillDispatcher.
-// Each thread owns an `Arc<Py<PyCodeRepository>>` clone — and transitively
-// `Arc<SurrealStorage>` — so leaving them untracked means storage refs
-// outlive the daemon that spawned them.
-static BACKFILL_HANDLES: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
-
-pub fn register_backfill_handle(h: std::thread::JoinHandle<()>) {
-    let mut guard = BACKFILL_HANDLES.lock().unwrap();
-    guard.retain(|h| !h.is_finished());
-    guard.push(h);
-}
-
-// In-flight run-execution threads: Direct-dispatched job launches
-// (`daemon::dispatchers::launch_started_run`) and dequeued queued runs
-// (`backends::local::LocalRunBackend`). Like the pools above, each attaches
-// the GIL to run user asset code.
-static RUN_HANDLES: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
-
-pub fn register_run_handle(h: std::thread::JoinHandle<()>) {
-    let mut guard = RUN_HANDLES.lock().unwrap();
-    guard.retain(|h| !h.is_finished());
-    guard.push(h);
+/// Stop the running gRPC server (if any): cancel its token and join its thread,
+/// which drains its in-flight workers before exiting. MUST run with the GIL
+/// released so those workers can finish. SIGTERM takes the same path via
+/// `shutdown_token` + `drain_service(Grpc)`.
+pub fn stop_grpc() {
+    let slot = SLOTS.lock().unwrap()[Service::Grpc as usize].take();
+    let Some(Slot { handle, cancel }) = slot else {
+        return;
+    };
+    if let Some(token) = cancel {
+        token.cancel();
+    }
+    if let ServiceHandle::Thread(j) = handle {
+        let _ = j.join();
+    }
 }
 
 // ── Signal handler ──
@@ -256,37 +235,6 @@ async fn drain_service(svc: Service) {
     tracing::info!(target: "rivers::shutdown", service = SERVICE_NAMES[idx], "drained");
 }
 
-/// Block until every Direct-dispatched materialization thread has exited.
-/// Joins on a `spawn_blocking` worker so the shutdown coordinator (which
-/// runs on a tokio worker) doesn't park itself.
-async fn drain_materializations() {
-    drain_thread_pool(&MATERIALIZATION_HANDLES, "materializations").await;
-}
-
-async fn drain_backfills() {
-    drain_thread_pool(&BACKFILL_HANDLES, "backfills").await;
-}
-
-async fn drain_runs() {
-    drain_thread_pool(&RUN_HANDLES, "runs").await;
-}
-
-async fn drain_thread_pool(pool: &Mutex<Vec<std::thread::JoinHandle<()>>>, label: &'static str) {
-    let handles = std::mem::take(&mut *pool.lock().unwrap());
-    if handles.is_empty() {
-        return;
-    }
-    let count = handles.len();
-    tokio::task::spawn_blocking(move || {
-        for h in handles {
-            let _ = h.join();
-        }
-    })
-    .await
-    .ok();
-    tracing::info!(target: "rivers::shutdown", count, kind = label, "in-flight threads drained");
-}
-
 async fn run_shutdown() {
     drain_token().cancelled().await;
     tracing::info!(target: "rivers::shutdown", "drain signal received, starting graceful shutdown");
@@ -318,17 +266,11 @@ async fn run_shutdown() {
     //   - daemon sees child token cancelled, stops scheduling, drains evals
     drain_service(Service::Daemon).await;
 
-    // Phase 2: stop servers in parallel and wait for any in-flight
-    // Direct-dispatched materializations (the gRPC handler returns the
-    // run_id and detaches the actual work).
+    // Phase 2: stop servers. Each subsystem self-drains its in-flight runs
+    // before its handle resolves (daemon in `daemon_main_loop`, gRPC in its
+    // serve thread), so there's no separate pool to drain here.
     shutdown_token().cancel();
-    tokio::join!(
-        drain_service(Service::Grpc),
-        drain_service(Service::Ui),
-        drain_materializations(),
-        drain_backfills(),
-        drain_runs(),
-    );
+    tokio::join!(drain_service(Service::Grpc), drain_service(Service::Ui));
 
     watchdog.abort();
     tracing::info!(target: "rivers::shutdown", "shutdown complete");
@@ -351,24 +293,4 @@ pub fn py_wait_for_exit(py: Python<'_>) -> PyResult<()> {
         rt().block_on(run_shutdown());
     });
     Ok(())
-}
-
-/// Join in-flight worker threads (materializations, backfills, runs) with the
-/// GIL released, before `Py_Finalize` — one still attached at finalization
-/// aborts the process. A Python `atexit` hook; no-op after a SIGTERM `run_shutdown`.
-#[pyfunction]
-#[pyo3(name = "drain_in_flight")]
-pub fn py_drain_in_flight(py: Python<'_>) {
-    // Nothing dispatched: skip spinning up the tokio runtime to drain empty pools.
-    let idle = MATERIALIZATION_HANDLES.lock().unwrap().is_empty()
-        && BACKFILL_HANDLES.lock().unwrap().is_empty()
-        && RUN_HANDLES.lock().unwrap().is_empty();
-    if idle {
-        return;
-    }
-    py.detach(|| {
-        rt().block_on(async {
-            tokio::join!(drain_materializations(), drain_backfills(), drain_runs());
-        });
-    });
 }

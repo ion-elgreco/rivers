@@ -23,6 +23,7 @@ pub mod context;
 pub mod daemon;
 pub mod errors;
 pub mod executor;
+pub(crate) mod gil_threads;
 pub mod grpc_server;
 pub mod hooks;
 mod job;
@@ -192,7 +193,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(shutdown::py_wait_for_exit, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(shutdown::py_drain_in_flight, m)?)?;
 
     Ok(())
 }

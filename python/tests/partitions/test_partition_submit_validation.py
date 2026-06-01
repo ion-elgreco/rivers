@@ -259,6 +259,7 @@ def partitioned_grpc_channel(grpc_stubs, tmp_path_factory):
     pb2, pb2_grpc = grpc_stubs
     yield channel, pb2, pb2_grpc, repo, storage
     channel.close()
+    repo._stop_grpc_server()
 
 
 def test_grpc_execute_job_partitioned_no_key_propagates_error(
@@ -379,6 +380,7 @@ def multi_partitioned_grpc_channel(grpc_stubs, tmp_path_factory):
     pb2, pb2_grpc = grpc_stubs
     yield channel, pb2, pb2_grpc, repo, storage
     channel.close()
+    repo._stop_grpc_server()
 
 
 def test_grpc_execute_job_multi_partition_key_queues_run(

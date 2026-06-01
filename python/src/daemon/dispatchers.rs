@@ -17,6 +17,7 @@ use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{LaunchedBy, RunRecord, RunStatus};
 
 use super::types::{BackfillRequestData, MaterializationRequestData, RunRequestData};
+use crate::gil_threads::GilThreads;
 use crate::partitions::PyPartitionKey;
 use crate::repository::{PyBackfillResult, PyCodeRepository, RepoHandle, priority_from_tags};
 
@@ -33,8 +34,9 @@ pub(crate) fn launch_started_run(
     job_name: String,
     partition_key: Option<PyPartitionKey>,
     run_id: String,
+    gil_threads: &GilThreads,
 ) {
-    let handle = std::thread::spawn(move || {
+    gil_threads.spawn(move || {
         Python::try_attach(|py| {
             let job = match handle.get_job(py, &job_name) {
                 Ok(j) => j,
@@ -63,8 +65,6 @@ pub(crate) fn launch_started_run(
             }
         });
     });
-    // Joined before shutdown / finalize — the thread holds the GIL.
-    crate::shutdown::register_run_handle(handle);
 }
 
 /// Result of dispatching a batch of run or backfill requests.
@@ -86,6 +86,7 @@ pub(crate) struct DirectRunDispatcher {
     /// to run user asset code.
     repo: Arc<Py<PyCodeRepository>>,
     handle: RepoHandle,
+    gil_threads: GilThreads,
 }
 
 pub(crate) struct QueuedRunDispatcher {
@@ -110,6 +111,7 @@ impl RunDispatcherKind {
         storage: Arc<SurrealStorage>,
         code_location_id: String,
         run_queue_enabled: bool,
+        gil_threads: GilThreads,
     ) -> Self {
         if run_queue_enabled {
             Self::Queued(QueuedRunDispatcher {
@@ -118,7 +120,11 @@ impl RunDispatcherKind {
                 code_location_id,
             })
         } else {
-            Self::Direct(DirectRunDispatcher { repo, handle })
+            Self::Direct(DirectRunDispatcher {
+                repo,
+                handle,
+                gil_threads,
+            })
         }
     }
 
@@ -238,7 +244,7 @@ impl DirectRunDispatcher {
             let run_id = req.run_id.clone();
             let py_pk = req.partition_key.as_ref().map(PyPartitionKey::from);
             let launched_by = req.launched_by.clone();
-            let handle = std::thread::spawn(move || {
+            self.gil_threads.spawn(move || {
                 if let Err(e) = repo.get().materialize_with_launcher(
                     Some(assets),
                     py_pk,
@@ -257,8 +263,6 @@ impl DirectRunDispatcher {
                     );
                 }
             });
-            // Tracked so SIGTERM waits for the run before Python finalize.
-            crate::shutdown::register_materialization_handle(handle);
         }
         Ok(DispatchOutcome { ids, errors })
     }
@@ -304,7 +308,13 @@ impl DirectRunDispatcher {
                 .await
             {
                 Ok(run_id) => {
-                    launch_started_run(self.handle.clone(), job_name, py_pk, run_id.clone());
+                    launch_started_run(
+                        self.handle.clone(),
+                        job_name,
+                        py_pk,
+                        run_id.clone(),
+                        &self.gil_threads,
+                    );
                     ids.push(run_id);
                 }
                 Err(e) => errors.push(anyhow!(
@@ -420,6 +430,7 @@ impl QueuedRunDispatcher {
 
 pub(crate) struct LocalBackfillDispatcher {
     repo: Arc<Py<PyCodeRepository>>,
+    gil_threads: GilThreads,
 }
 
 pub(crate) enum BackfillDispatcherKind {
@@ -441,8 +452,8 @@ pub(crate) struct BackfillDispatchOutcome {
 }
 
 impl BackfillDispatcherKind {
-    pub(crate) fn new_local(repo: Arc<Py<PyCodeRepository>>) -> Self {
-        Self::Local(LocalBackfillDispatcher { repo })
+    pub(crate) fn new_local(repo: Arc<Py<PyCodeRepository>>, gil_threads: GilThreads) -> Self {
+        Self::Local(LocalBackfillDispatcher { repo, gil_threads })
     }
 
     pub(crate) fn mode_label(&self) -> &'static str {
@@ -488,7 +499,7 @@ impl LocalBackfillDispatcher {
             let bf = bf.clone();
             let selection = bf.selection.clone();
             let (tx, rx) = tokio::sync::oneshot::channel::<Result<PyBackfillResult, String>>();
-            let h = std::thread::spawn(move || {
+            self.gil_threads.spawn(move || {
                 let tags = bf.tags.as_ref().map(|t| {
                     t.iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
@@ -520,7 +531,6 @@ impl LocalBackfillDispatcher {
                 };
                 let _ = tx.send(result);
             });
-            crate::shutdown::register_backfill_handle(h);
             pending.push((selection, rx));
         }
 

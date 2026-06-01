@@ -1705,6 +1705,9 @@ pub struct PyCodeRepository {
     pub(crate) state: Arc<std::sync::RwLock<Option<ResolvedState>>>,
     backfill_cancel_flags:
         Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    /// Worker threads for this location's runs, shared into the daemon and gRPC
+    /// dispatchers and drained at their shutdown. See [`crate::gil_threads`].
+    pub(crate) gil_threads: crate::gil_threads::GilThreads,
 }
 
 impl PyCodeRepository {
@@ -2293,7 +2296,7 @@ impl PyCodeRepository {
             )))
         } else {
             Ok(Arc::new(crate::daemon::RunBackendKind::Local(
-                crate::backends::local::LocalRunBackend::new(),
+                crate::backends::local::LocalRunBackend::new(self.gil_threads.clone()),
             )))
         }
     }
@@ -2544,6 +2547,7 @@ impl PyCodeRepository {
             pool_limits,
             state: Arc::new(std::sync::RwLock::new(None)),
             backfill_cancel_flags: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            gil_threads: crate::gil_threads::GilThreads::new(),
         })
     }
 
@@ -3187,6 +3191,7 @@ impl PyCodeRepository {
                 .expect("ensure_resolved succeeded above");
             (Arc::clone(&state.storage), state.code_location_id.clone())
         };
+        let gil_threads = binding.gil_threads.clone();
         let repo_arc = Arc::new(repo.clone_ref(py));
         let run_dispatcher = Arc::new(crate::daemon::RunDispatcherKind::new(
             Arc::clone(&repo_arc),
@@ -3194,9 +3199,12 @@ impl PyCodeRepository {
             storage,
             code_location_id,
             has_run_queue,
+            gil_threads.clone(),
         ));
-        let backfill_dispatcher =
-            Arc::new(crate::daemon::BackfillDispatcherKind::new_local(repo_arc));
+        let backfill_dispatcher = Arc::new(crate::daemon::BackfillDispatcherKind::new_local(
+            repo_arc,
+            gil_threads.clone(),
+        ));
 
         let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
 
@@ -3208,6 +3216,7 @@ impl PyCodeRepository {
         let cancel_for_grace = server_cancel.clone();
 
         tracing::trace!(target: "rivers::dbg::grpc", "_start_grpc_server: spawning std::thread for new tokio Runtime");
+        let gil_threads_for_server = gil_threads.clone();
         let handle = std::thread::spawn(move || {
             tracing::trace!(target: "rivers::dbg::grpc", "_start_grpc_server thread: creating Runtime");
             let rt = tokio::runtime::Runtime::new().expect("Failed to create gRPC runtime");
@@ -3218,6 +3227,7 @@ impl PyCodeRepository {
                     repo_handle,
                     run_dispatcher,
                     backfill_dispatcher,
+                    gil_threads_for_server,
                     host,
                     port,
                     port_tx,
@@ -3243,6 +3253,12 @@ impl PyCodeRepository {
                     }
                 }
             });
+            // Serving has stopped, so no handler can spawn more work — drain this
+            // server's in-flight runs before tearing down the runtime.
+            let drained = gil_threads.drain();
+            if drained > 0 {
+                tracing::info!(target: "rivers::shutdown", count = drained, kind = "grpc", "in-flight threads drained");
+            }
             rt.shutdown_timeout(GRPC_SHUTDOWN_GRACE);
             tracing::trace!(target: "rivers::dbg::grpc", "_start_grpc_server thread: EXIT");
         });
@@ -3257,6 +3273,13 @@ impl PyCodeRepository {
 
         tracing::trace!(target: "rivers::dbg::grpc", actual_port, "_start_grpc_server: EXIT (returning port)");
         Ok(actual_port)
+    }
+
+    /// Stop the gRPC server started by [`Self::_start_grpc_server`]: cancel and
+    /// join its serve thread, which drains its in-flight runs. No-op if none
+    /// running; idempotent.
+    fn _stop_grpc_server(&self, py: Python<'_>) {
+        py.detach(crate::shutdown::stop_grpc);
     }
 }
 

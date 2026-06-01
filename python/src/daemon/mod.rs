@@ -5,6 +5,7 @@
 //! `CancellationToken` for graceful shutdown from `PyCodeRepository.stop_daemon()`.
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use chrono::Utc;
 use pyo3::PyTypeInfo;
@@ -94,9 +95,13 @@ struct AutomationDaemon {
     storage: Arc<SurrealStorage>,
     cancel: CancellationToken,
     /// Cancelled when the spawned `daemon_main_loop` task fully exits
-    /// (after every subdaemon has joined). `stop()` awaits this so we
-    /// don't return until the runtime is genuinely free of our work.
+    /// (after every subdaemon has joined and in-flight runs are drained).
+    /// `stop()` / `Drop` await this so we don't return until the runtime is
+    /// genuinely free of our work.
     done: CancellationToken,
+    /// Set once `start()` has spawned `daemon_main_loop`. `Drop` only waits on
+    /// `done` when started — otherwise the token never fires and the wait hangs.
+    started: AtomicBool,
     /// Max ticks retained per automation. `None` disables pruning.
     max_ticks_retained: Option<usize>,
     is_memory_storage: bool,
@@ -115,6 +120,7 @@ impl AutomationDaemon {
             storage,
             cancel: crate::shutdown::drain_token().child_token(),
             done: CancellationToken::new(),
+            started: AtomicBool::new(false),
             max_ticks_retained: Some(100),
             is_memory_storage,
             condition_eval_interval: std::time::Duration::from_secs(30),
@@ -237,6 +243,7 @@ impl AutomationDaemon {
             done.cancel();
         });
         crate::shutdown::register_daemon_handle(handle, self.cancel.clone());
+        self.started.store(true, Relaxed);
         tracing::trace!(target: "rivers::dbg::daemon", "AutomationDaemon.start: EXIT");
 
         Ok(())
@@ -366,14 +373,20 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
         run_queue_config,
     } = config;
 
-    let (run_backend, code_location_id, repo_handle) = {
+    let (run_backend, code_location_id, repo_handle, gil_threads) = {
         let repo_ref = repo.get();
         let handle = repo_ref.handle();
+        let gil_threads = repo_ref.gil_threads.clone();
         let state = repo_ref.state.read().unwrap();
         let s = state
             .as_ref()
             .expect("daemon spawned only after CodeRepository::resolve");
-        (s.run_backend.clone(), s.code_location_id.clone(), handle)
+        (
+            s.run_backend.clone(),
+            s.code_location_id.clone(),
+            handle,
+            gil_threads,
+        )
     };
 
     let mut automations: Vec<AutomationEntry> = Vec::new();
@@ -443,8 +456,12 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
         Arc::clone(&storage),
         handle.code_location_id().to_string(),
         run_queue_enabled,
+        gil_threads.clone(),
     ));
-    let backfill_dispatcher = Arc::new(BackfillDispatcherKind::new_local(Arc::clone(&repo)));
+    let backfill_dispatcher = Arc::new(BackfillDispatcherKind::new_local(
+        Arc::clone(&repo),
+        gil_threads.clone(),
+    ));
     let eval_dispatcher = Arc::new(EvalDispatcher::new(loky_executor, resources));
 
     if !asset_conditions.is_empty() {
@@ -475,6 +492,7 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
         handle.clone(),
         cancel.clone(),
         run_queue_enabled,
+        gil_threads.clone(),
     ));
 
     if let Some(rq_config) = run_queue_config {
@@ -511,6 +529,16 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
         tracing::trace!(target: "rivers::dbg::daemon", subdaemon_idx = i, "daemon_main_loop: awaiting subdaemon");
         let _ = h.await;
         tracing::trace!(target: "rivers::dbg::daemon", subdaemon_idx = i, "daemon_main_loop: subdaemon joined");
+    }
+
+    // Subdaemon loops are the only spawners and have all exited, so draining now
+    // is race-free. On `spawn_blocking` because `drain()` joins (blocks).
+    tracing::trace!(target: "rivers::dbg::daemon", "daemon_main_loop: draining in-flight runs");
+    let drained = tokio::task::spawn_blocking(move || gil_threads.drain())
+        .await
+        .unwrap_or(0);
+    if drained > 0 {
+        tracing::info!(target: "rivers::shutdown", count = drained, kind = "daemon", "in-flight threads drained");
     }
     tracing::trace!(target: "rivers::dbg::daemon", "daemon_main_loop: ALL subdaemons drained, returning");
 }
@@ -552,5 +580,15 @@ impl PyAutomationDaemon {
 impl Drop for PyAutomationDaemon {
     fn drop(&mut self) {
         self.inner.cancel.cancel();
+        // Safety net if dropped without `stop()`: wait for `daemon_main_loop`'s
+        // drain. Skipped if never started (`done` never fires) or finalizing
+        // (`try_attach` → None) — draining mid-finalize is the race we're closing.
+        if !self.inner.started.load(Relaxed) {
+            return;
+        }
+        let done = self.inner.done.clone();
+        Python::try_attach(|py| {
+            py.detach(|| rt().block_on(done.cancelled()));
+        });
     }
 }

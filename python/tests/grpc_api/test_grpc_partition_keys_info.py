@@ -101,6 +101,7 @@ def partition_kinds_grpc_channel(grpc_stubs):
     pb2, pb2_grpc = grpc_stubs
     yield channel, pb2, pb2_grpc
     channel.close()
+    repo._stop_grpc_server()
 
 
 def _asset(response, name):
@@ -502,3 +503,4 @@ def test_multi_window_past_one_million(grpc_stubs):
         ]
     finally:
         channel.close()
+        repo._stop_grpc_server()

@@ -143,7 +143,6 @@ impl EvalDispatcher {
             match submit_result {
                 Ok(py_future) => {
                     let timeout = params.timeout;
-                    let timeout_secs = timeout.as_secs();
                     let name = params.name.clone();
                     let kind = params.kind.clone();
                     let default_job_name = params.default_job_name.clone();
@@ -152,24 +151,17 @@ impl EvalDispatcher {
                     let tags = params.tags.clone();
                     join_set.spawn(
                         async move {
-                            let result = tokio::time::timeout(
+                            let result = wait_subprocess_result(
+                                py_future,
                                 timeout,
-                                wait_subprocess_result(
-                                    py_future,
-                                    &kind,
-                                    default_job_name.as_deref(),
-                                    default_asset_selection.as_deref(),
-                                    &launched_by,
-                                    &tags,
-                                ),
+                                &kind,
+                                &name,
+                                default_job_name.as_deref(),
+                                default_asset_selection.as_deref(),
+                                &launched_by,
+                                &tags,
                             )
-                            .await
-                            .unwrap_or(Err(format!(
-                                "{} '{}' subprocess eval timed out after {}s",
-                                automation_type_str(&kind),
-                                name,
-                                timeout_secs
-                            )));
+                            .await;
                             TickResult {
                                 index,
                                 result,
@@ -458,7 +450,9 @@ async fn batch_submit_subprocess(
 /// `__reduce__` methods.
 async fn wait_subprocess_result(
     py_future: Py<PyAny>,
+    timeout: std::time::Duration,
     kind: &AutomationKind,
+    name: &str,
     default_job_name: Option<&str>,
     default_asset_selection: Option<&[String]>,
     launched_by: &rivers_core::storage::LaunchedBy,
@@ -469,16 +463,35 @@ async fn wait_subprocess_result(
     let launched_by = launched_by.clone();
     let tags = tags.clone();
     let kind = kind.clone();
+    let name = name.to_string();
+    let timeout_secs = timeout.as_secs_f64();
+    let kind_label = automation_type_str(&kind);
 
     let raw_result = tokio::task::spawn_blocking(move || {
         Python::try_attach(|py| -> Result<Py<PyAny>, String> {
-            py_future
-                .bind(py)
-                .call_method1("result", (300.0,))
-                .map(|r| r.unbind())
-                .map_err(|e| e.to_string())
+            match py_future.bind(py).call_method1("result", (timeout_secs,)) {
+                Ok(r) => Ok(r.unbind()),
+                // Distinguish loky's deadline from a genuine eval failure
+                Err(e) => {
+                    let is_timeout = py
+                        .import("concurrent.futures")
+                        .and_then(|m| m.getattr("TimeoutError"))
+                        .map(|te| e.is_instance(py, &te))
+                        .unwrap_or(false);
+                    Err(if is_timeout {
+                        format!(
+                            "{} '{}' subprocess eval timed out after {}s",
+                            kind_label,
+                            name,
+                            timeout.as_secs()
+                        )
+                    } else {
+                        e.to_string()
+                    })
+                }
+            }
         })
-        .unwrap_or(Err("Python not attached".into()))
+        .unwrap_or_else(|| Err("Python not attached".into()))
     })
     .await
     .map_err(|e| e.to_string())??;

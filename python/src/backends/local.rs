@@ -7,26 +7,24 @@ use pyo3::prelude::*;
 use rivers_core::run_backend::{RunBackend, RunHealthStatus};
 use rivers_core::storage::{CoordinatorRunInfo, LaunchedBy};
 
+use crate::gil_threads::GilThreads;
 use crate::partitions::PyPartitionKey;
 use crate::repository::PyCodeRepository;
 
 pub struct LocalRunBackend {
     /// `run_id` → "finished" flag (for health / terminate). The `JoinHandle`
-    /// lives in the global run-handle pool, joined before finalize via
-    /// [`crate::shutdown::register_run_handle`].
+    /// is tracked in the code location's [`GilThreads`], joined at daemon
+    /// shutdown.
     active_runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
-}
-
-impl Default for LocalRunBackend {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Shared registry of in-flight worker threads for this code location.
+    gil_threads: GilThreads,
 }
 
 impl LocalRunBackend {
-    pub fn new() -> Self {
+    pub(crate) fn new(gil_threads: GilThreads) -> Self {
         Self {
             active_runs: Mutex::new(HashMap::new()),
+            gil_threads,
         }
     }
 }
@@ -49,7 +47,7 @@ impl RunBackend for LocalRunBackend {
         let run_id_for_key = run_id.clone();
         let done = Arc::new(AtomicBool::new(false));
         let done_for_thread = Arc::clone(&done);
-        let handle = std::thread::spawn(move || {
+        self.gil_threads.spawn(move || {
             let selection = if node_names.is_empty() {
                 None
             } else {
@@ -78,8 +76,7 @@ impl RunBackend for LocalRunBackend {
             done_for_thread.store(true, Ordering::Release);
         });
 
-        // Joined before finalize (holds the GIL); health tracked via `done`.
-        crate::shutdown::register_run_handle(handle);
+        // The thread is tracked in the location's `GilThreads`; health via `done`.
         self.active_runs
             .lock()
             .unwrap()

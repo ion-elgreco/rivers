@@ -660,10 +660,6 @@ def wait_for_exit() -> None:
     """Block until graceful shutdown completes (drain → shutdown → exit)."""
     ...
 
-def drain_in_flight() -> None:
-    """Join in-flight worker threads before finalize (an :mod:`atexit` hook)."""
-    ...
-
 def runtime_info() -> dict[str, int]:
     """Return ``{"main_workers": N, "io_workers": M}`` for the two tokio runtimes.
 

@@ -17,6 +17,7 @@ use crate::automation::schedule::TickRequest;
 use crate::automation::{PyScheduleStatus, PySensorStatus};
 use crate::daemon::{BackfillDispatcherKind, RunDispatcherKind};
 use crate::executor::Executor;
+use crate::gil_threads::GilThreads;
 use crate::partitions::backfill_strategy::PyBackfillStrategy;
 use crate::partitions::key_range::{
     DimensionSelection, PartitionKeyRangeInner, PyPartitionKeyRange,
@@ -38,6 +39,9 @@ pub struct CodeLocationImpl {
     /// Routes `LaunchBackfill` through the same dispatcher the daemon's
     /// schedule/sensor and condition loops use.
     backfill_dispatcher: Arc<BackfillDispatcherKind>,
+    /// `run_on_python` workers and dispatched runs for this server, drained when
+    /// it stops. See [`crate::gil_threads`].
+    gil_threads: GilThreads,
 }
 
 impl CodeLocationImpl {
@@ -57,7 +61,7 @@ impl CodeLocationImpl {
     {
         let repo = self.clone_repo()?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
+        self.gil_threads.spawn(move || {
             let result = Python::try_attach(|py| f(py, repo));
             let _ = tx.send(result);
         });
@@ -830,6 +834,7 @@ pub(crate) async fn start_grpc_server(
     handle: RepoHandle,
     run_dispatcher: Arc<RunDispatcherKind>,
     backfill_dispatcher: Arc<BackfillDispatcherKind>,
+    gil_threads: GilThreads,
     host: String,
     port: u16,
     port_tx: std::sync::mpsc::Sender<u16>,
@@ -840,6 +845,7 @@ pub(crate) async fn start_grpc_server(
         handle,
         run_dispatcher,
         backfill_dispatcher,
+        gil_threads,
     };
 
     tracing::trace!(target: "rivers::dbg::grpc", host = %host, port, "start_grpc_server: ENTER, finding port");
