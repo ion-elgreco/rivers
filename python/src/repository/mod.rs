@@ -1703,7 +1703,11 @@ impl RepoHandle {
                 PartitionsDefinition::Dynamic { name } => Universe::Dynamic(name.clone()),
                 _ => Universe::Keys(def.get_partition_keys_window(0, def.partition_count())?),
             };
-            (universe, state.storage.clone(), state.code_location_id.clone())
+            (
+                universe,
+                state.storage.clone(),
+                state.code_location_id.clone(),
+            )
         };
 
         let ctx = rivers_core::storage::CodeLocationContext::new(code_location_id);

@@ -120,6 +120,20 @@ pub struct BackfillRerunResult {
     pub status: String,
 }
 
+// `LaunchBackfill` and `MaterializeMissing` both return a `LaunchBackfillResponse`;
+// map it once.
+#[cfg(feature = "ssr")]
+impl From<rivers_api::rivers::LaunchBackfillResponse> for BackfillRerunResult {
+    fn from(r: rivers_api::rivers::LaunchBackfillResponse) -> Self {
+        Self {
+            backfill_id: r.backfill_id,
+            num_partitions: r.num_partitions,
+            num_runs: r.num_runs,
+            status: r.status,
+        }
+    }
+}
+
 /// Re-execute an existing backfill by id. Server reads the original record and resubmits
 /// with identical configuration (partition keys, strategy, failure policy, concurrency, tags).
 #[server]
@@ -178,13 +192,48 @@ pub async fn materialize_missing_partitions(
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let r = resp.into_inner();
-    Ok(BackfillRerunResult {
-        backfill_id: r.backfill_id,
-        num_partitions: r.num_partitions,
-        num_runs: r.num_runs,
-        status: r.status,
-    })
+    Ok(resp.into_inner().into())
+}
+
+/// Launch a backfill over an explicit set of partition keys for `selection`.
+/// Used when a multi-partition materialize selection is large enough to warrant
+/// one backfill instead of many individual runs. Strategy defers to each asset's
+/// configured default; concurrency matches `repo.backfill`'s default.
+#[server]
+pub async fn launch_backfill(
+    loc_ns: String,
+    loc_name: String,
+    selection: Vec<String>,
+    partition_keys: Vec<SubmitPartitionKey>,
+    tags: Option<Vec<(String, String)>>,
+) -> Result<BackfillRerunResult, ServerFnError> {
+    use rivers_api::rivers::{LaunchBackfillRequest, Tag};
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let resp = client
+        .launch_backfill(LaunchBackfillRequest {
+            selection,
+            partition_keys: partition_keys.into_iter().map(submit_to_proto).collect(),
+            partition_range: None,
+            strategy: None,
+            failure_policy: String::new(),
+            max_concurrency: 4,
+            tags: tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(k, v)| Tag { key: k, value: v })
+                .collect(),
+            dry_run: false,
+        })
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    Ok(resp.into_inner().into())
 }
 
 /// Run a named job at the given code location. Fire-and-forget: returns

@@ -740,7 +740,9 @@ def test_rerun_run_not_found(rerun_grpc_channel):
 # ── materialize_missing ──
 
 
-def test_materialize_missing_backfills_all_when_none_materialized(backfill_grpc_channel):
+def test_materialize_missing_backfills_all_when_none_materialized(
+    backfill_grpc_channel,
+):
     """Nothing materialized yet → the backfill covers the full partition set."""
     channel, pb2, pb2_grpc, _, _ = backfill_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)

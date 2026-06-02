@@ -20,7 +20,10 @@ use crate::types::SubmitPartitionKey;
 #[derive(Clone)]
 enum KeySource {
     /// Asset keys via gRPC. `dimension` empty = single-dim, else a Multi dimension.
-    Asset { asset_key: String, dimension: String },
+    Asset {
+        asset_key: String,
+        dimension: String,
+    },
     /// Storage-managed Dynamic keys, by namespace.
     Dynamic { dynamic_name: String },
 }
