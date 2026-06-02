@@ -5,9 +5,10 @@ use leptos_router::components::A;
 
 use crate::components::dag::render::DagGraph;
 use crate::components::live::{LiveStatusChip, use_live_kick};
+use crate::components::materialize_dialog::MaterializeDialog;
 use crate::components::multi_select::{MultiSelect, SelectOption};
 use crate::components::ui_kit::{Crumb, DagMinimap, KindBadge, MinimapNode, Tag, Topbar};
-use crate::helpers::use_query_param_list;
+use crate::helpers::{JobPartitionPicker, partition_picker_for_assets, use_query_param_list};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::actions::trigger_materialize;
 use crate::server_fns::assets::{get_asset, get_assets};
@@ -176,6 +177,35 @@ pub fn GraphPage() -> impl IntoView {
         let k = key.clone();
         let (ns, name) = loc.get();
         async move { trigger_materialize(ns, name, Some(vec![k]), None, None).await }
+    });
+
+    // Materialize routing: partitioned node → picker dialog, else one-click run.
+    // `mat_target` is the asset the dialog acts on.
+    let asset_info_by_key = Signal::derive(move || {
+        assets_info
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|i| (i.asset_key.clone(), i))
+            .collect::<std::collections::HashMap<String, crate::types::AssetDefinitionInfo>>()
+    });
+    let (mat_target, set_mat_target) = signal(None::<String>);
+    let show_dialog = RwSignal::new(false);
+    let materialize_picker = Signal::derive(move || match mat_target.get() {
+        Some(k) => partition_picker_for_assets(&[k], &asset_info_by_key.get()),
+        None => JobPartitionPicker::None,
+    });
+    let dialog_asset_keys =
+        Signal::derive(move || mat_target.get().map(|k| vec![k]).unwrap_or_default());
+    let start_materialize: Callback<String> = Callback::new(move |key: String| {
+        let picker = partition_picker_for_assets(&[key.clone()], &asset_info_by_key.get_untracked());
+        if matches!(picker, JobPartitionPicker::None) {
+            materialize_action.dispatch(key);
+        } else {
+            set_mat_target.set(Some(key));
+            show_dialog.set(true);
+        }
     });
 
     let all_kinds = Signal::derive(move || {
@@ -551,7 +581,7 @@ pub fn GraphPage() -> impl IntoView {
                         view! {
                             <div class="context-menu" style=format!("left: {x}px; top: {y}px")>
                                 <button class="context-menu-item" on:click=move |_| {
-                                    materialize_action.dispatch(name_for_mat.clone());
+                                    start_materialize.run(name_for_mat.clone());
                                     set_ctx_menu.set(None);
                                 }>"Materialize"</button>
                                 <button class="context-menu-item" on:click=move |_| {
@@ -720,7 +750,7 @@ pub fn GraphPage() -> impl IntoView {
                                                     <A href={href} attr:class="btn btn-tertiary dag-sidebar-action">"Details"</A>
                                                     <button
                                                         class="btn btn-primary dag-sidebar-action"
-                                                        on:click=move |_| { materialize_action.dispatch(mat_key.clone()); }
+                                                        on:click=move |_| { start_materialize.run(mat_key.clone()); }
                                                     >
                                                         <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
                                                             <path d="M3 2l7 4-7 4V2z"/>
@@ -741,5 +771,11 @@ pub fn GraphPage() -> impl IntoView {
             }}
         </div>
         </Transition>
+
+        <MaterializeDialog
+            show=show_dialog
+            asset_keys=dialog_asset_keys
+            picker=materialize_picker
+        />
     }
 }

@@ -1628,6 +1628,132 @@ impl RepoHandle {
         })
     }
 
+    /// Build a re-execution request from the stored `RunRecord`, reusing its
+    /// partition key + tags (job runs replay as jobs, ad-hoc as materializations).
+    /// Tags the new run with `RERUN_OF` = the original id.
+    pub(crate) async fn build_run_rerun_request(
+        &self,
+        run_id: &str,
+    ) -> PyResult<crate::daemon::RunRerunRequest> {
+        let storage = {
+            let guard = self.state.read().unwrap();
+            let state = guard.as_ref().ok_or_else(|| {
+                ExecutionError::new_err("Repository not resolved — call resolve() first")
+            })?;
+            state.storage.clone()
+        };
+        let record = storage
+            .get_run(run_id)
+            .await
+            .map_err(|e| ExecutionError::new_err(format!("Failed to load run: {e}")))?
+            .ok_or_else(|| ExecutionError::new_err(format!("run '{run_id}' not found")))?;
+
+        let mut tags = record.tags;
+        tags.retain(|(k, _)| k != tag_keys::RERUN_OF);
+        tags.push((tag_keys::RERUN_OF.to_string(), run_id.to_string()));
+
+        match record.job_name {
+            Some(job_name) => Ok(crate::daemon::RunRerunRequest::Job(
+                crate::daemon::RunRequestData {
+                    run_key: None,
+                    tags: Some(tags.into_iter().collect()),
+                    partition_key: record.partition_key.as_ref().map(PyPartitionKey::from),
+                    job_name: Some(job_name),
+                },
+            )),
+            None => Ok(crate::daemon::RunRerunRequest::Materialization(
+                crate::daemon::MaterializationRequestData {
+                    run_id: uuid::Uuid::new_v4().to_string(),
+                    asset_selection: record.node_names,
+                    partition_key: record.partition_key,
+                    tags,
+                    launched_by: rivers_core::storage::LaunchedBy::Manual,
+                },
+            )),
+        }
+    }
+
+    /// Build a backfill over an asset's not-yet-materialized partitions (full
+    /// universe − materialized). Errors if the asset is unpartitioned or nothing
+    /// is missing.
+    pub(crate) async fn build_missing_backfill_request(
+        &self,
+        asset_key: &str,
+        max_concurrency: u32,
+    ) -> PyResult<crate::daemon::BackfillRequestData> {
+        // Dynamic keys live in storage, not the def — capture the namespace and
+        // fetch after dropping the guard; other kinds enumerate from the def here.
+        enum Universe {
+            Keys(Vec<PyPartitionKey>),
+            Dynamic(String),
+        }
+        let (universe, storage, code_location_id) = {
+            let guard = self.state.read().unwrap();
+            let state = guard.as_ref().ok_or_else(|| {
+                ExecutionError::new_err("Repository not resolved — call resolve() first")
+            })?;
+            let def = state
+                .node_map
+                .get(asset_key)
+                .and_then(|n| n.partitions_def())
+                .ok_or_else(|| {
+                    ExecutionError::new_err(format!("asset '{asset_key}' is not partitioned"))
+                })?;
+            let universe = match def {
+                PartitionsDefinition::Dynamic { name } => Universe::Dynamic(name.clone()),
+                _ => Universe::Keys(def.get_partition_keys_window(0, def.partition_count())?),
+            };
+            (universe, state.storage.clone(), state.code_location_id.clone())
+        };
+
+        let ctx = rivers_core::storage::CodeLocationContext::new(code_location_id);
+        let scoped = storage.for_code_location(&ctx);
+
+        let all: Vec<PyPartitionKey> = match universe {
+            Universe::Keys(keys) => keys,
+            Universe::Dynamic(name) => scoped
+                .get_dynamic_partitions(&name)
+                .await
+                .map_err(|e| {
+                    ExecutionError::new_err(format!("Failed to load dynamic partitions: {e}"))
+                })?
+                .into_iter()
+                .map(|k| PyPartitionKey::Single { key: vec![k] })
+                .collect(),
+        };
+
+        let materialized: std::collections::HashSet<PartitionKey> = scoped
+            .get_materialized_partitions(asset_key)
+            .await
+            .map_err(|e| {
+                ExecutionError::new_err(format!("Failed to load materialized partitions: {e}"))
+            })?
+            .into_iter()
+            .collect();
+
+        let missing: Vec<PyPartitionKey> = all
+            .into_iter()
+            .filter(|pk| !materialized.contains(&rivers_core::storage::PartitionKey::from(pk)))
+            .collect();
+
+        if missing.is_empty() {
+            return Err(ExecutionError::new_err(format!(
+                "asset '{asset_key}' has no missing partitions to materialize"
+            )));
+        }
+
+        Ok(crate::daemon::BackfillRequestData {
+            selection: vec![asset_key.to_string()],
+            partition_keys: Some(missing),
+            partition_range: None,
+            strategy: None,
+            failure_policy: None,
+            max_concurrency,
+            tags: None,
+            dry_run: false,
+        })
+    }
+
     /// Cancel an in-progress backfill: signal the in-process coordinator
     /// (if any) and mark the record `Canceled`. Returns whether a live
     /// coordinator was signalled.

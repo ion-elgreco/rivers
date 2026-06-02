@@ -5,15 +5,16 @@ use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 
 use crate::components::live::{LiveStatusChip, use_live_kick};
+use crate::components::materialize_dialog::MaterializeDialog;
 use crate::components::ui_kit::{
     Crumb, EventGlyphTimeline, GlyphEvent, RecentRunsStrip, StripRun, Topbar,
 };
 use crate::helpers::{
-    format_duration, format_relative_time, format_timestamp, run_status_class, run_status_kind,
-    short_id, use_query_param,
+    JobPartitionPicker, format_duration, format_relative_time, format_timestamp,
+    partition_picker_for_assets, run_status_class, run_status_kind, short_id, use_query_param,
 };
 use crate::loc::{loc_path, use_current_location};
-use crate::server_fns::actions::trigger_materialize;
+use crate::server_fns::actions::{materialize_missing_partitions, trigger_materialize};
 use crate::server_fns::assets::{get_asset, get_asset_events, get_assets};
 use crate::server_fns::automation::{get_condition_evals, observe_asset};
 use crate::server_fns::graph::get_graph_topology;
@@ -111,9 +112,29 @@ pub fn AssetDetailPage() -> impl IntoView {
     });
     let observe_pending = observe_action.pending();
 
-    let mat_key = key();
+    // Picker for this asset: drives dialog-vs-one-click below. Tracks params so
+    // it follows navigation between assets.
+    let materialize_picker = Signal::derive(move || {
+        params.track();
+        let current = key();
+        let by_key: std::collections::HashMap<String, crate::types::AssetDefinitionInfo> =
+            assets_info
+                .get()
+                .and_then(|r| r.ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|i| (i.asset_key.clone(), i))
+                .collect();
+        partition_picker_for_assets(&[current], &by_key)
+    });
+    let dialog_asset_keys = Signal::derive(move || {
+        params.track();
+        vec![key()]
+    });
+    let show_dialog = RwSignal::new(false);
+
     let materialize_action = Action::new(move |_: &()| {
-        let k = mat_key.clone();
+        let k = key();
         let (ns, lname) = loc.get();
         async move { trigger_materialize(ns, lname, Some(vec![k]), None, None).await }
     });
@@ -147,7 +168,13 @@ pub fn AssetDetailPage() -> impl IntoView {
                     view! {
                         <button
                             class="btn btn-primary"
-                            on:click=move |_| { materialize_action.dispatch(()); }
+                            on:click=move |_| {
+                                if matches!(materialize_picker.get(), JobPartitionPicker::None) {
+                                    materialize_action.dispatch(());
+                                } else {
+                                    show_dialog.set(true);
+                                }
+                            }
                             disabled=move || materialize_pending.get()
                         >
                             {move || if materialize_pending.get() { "Materializing..." } else { "Materialize" }}
@@ -669,6 +696,12 @@ pub fn AssetDetailPage() -> impl IntoView {
                 }}
             </Transition>
         </div>
+
+        <MaterializeDialog
+            show=show_dialog
+            asset_keys=dialog_asset_keys
+            picker=materialize_picker
+        />
     }
 }
 
@@ -694,12 +727,29 @@ fn PartitionsTab(
         },
     );
 
+    // Launches a backfill over the asset's unmaterialized partitions; the server
+    // resolves which are missing.
     let materialize_missing = Action::new(move |_: &()| {
         let k = mat_key.clone();
         let (ns, name) = loc.get();
-        async move { trigger_materialize(ns, name, Some(vec![k]), None, None).await }
+        async move { materialize_missing_partitions(ns, name, k).await }
     });
     let mat_pending = materialize_missing.pending();
+
+    // On success, jump to the new backfill.
+    let (mm_nav, set_mm_nav) = signal(Option::<String>::None);
+    Effect::new(move |_| {
+        if let Some(Ok(res)) = materialize_missing.value().get()
+            && !res.backfill_id.is_empty()
+        {
+            let (ns, name) = loc.get();
+            set_mm_nav.set(Some(loc_path(
+                &ns,
+                &name,
+                &format!("backfills/{}", res.backfill_id),
+            )));
+        }
+    });
 
     view! {
         <Transition fallback=move || view! { <div class="loading">"Loading partitions..."</div> }>
@@ -773,6 +823,10 @@ fn PartitionsTab(
                 })
             }}
         </Transition>
+
+        {move || mm_nav.get().map(|path| view! {
+            <leptos_router::components::Redirect path={path}/>
+        })}
     }
 }
 

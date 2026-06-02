@@ -9,8 +9,21 @@ use leptos::prelude::*;
 
 use crate::helpers::{JobPartitionPicker, cartesian_partition_keys};
 use crate::loc::use_current_location;
-use crate::server_fns::overview::{get_partition_key_index, get_partition_keys_page};
+use crate::server_fns::overview::{
+    get_dynamic_partition_key_index, get_dynamic_partition_keys_page, get_partition_key_index,
+    get_partition_keys_page,
+};
 use crate::types::SubmitPartitionKey;
+
+/// Where a [`VirtualPartitionList`] pages its keys: an asset definition (gRPC)
+/// or a storage-managed Dynamic namespace.
+#[derive(Clone)]
+enum KeySource {
+    /// Asset keys via gRPC. `dimension` empty = single-dim, else a Multi dimension.
+    Asset { asset_key: String, dimension: String },
+    /// Storage-managed Dynamic keys, by namespace.
+    Dynamic { dynamic_name: String },
+}
 
 /// `selected` is parent-owned and written by this component as the user
 /// toggles keys. It always carries the cartesian-expanded list of
@@ -119,7 +132,24 @@ pub fn PartitionPicker(
                         )}
                     </div>
                     <VirtualPartitionList
-                        asset_key=asset_key
+                        source=KeySource::Asset { asset_key, dimension: String::new() }
+                        total=total as usize
+                        selected=single_selected
+                        reset=reset
+                    />
+                </div>
+            }
+            .into_any(),
+            JobPartitionPicker::Dynamic { dynamic_name, total } => view! {
+                <div class="form-group">
+                    <label>"Partitions"</label>
+                    <div class="exec-dialog-partition-hint">
+                        {format!(
+                            "{total} dynamic partitions — scroll to browse, search to filter, or jump to a key.",
+                        )}
+                    </div>
+                    <VirtualPartitionList
+                        source=KeySource::Dynamic { dynamic_name }
                         total=total as usize
                         selected=single_selected
                         reset=reset
@@ -158,8 +188,7 @@ pub fn PartitionPicker(
                                         {format!("{dim_total} values — scroll, search, or jump.")}
                                     </div>
                                     <VirtualPartitionList
-                                        asset_key=ak
-                                        dimension=dim_name
+                                        source=KeySource::Asset { asset_key: ak, dimension: dim_name }
                                         total=dim_total
                                         selected=dim_sel
                                         reset=reset
@@ -218,13 +247,13 @@ fn collect_submit_keys(
 ) -> Vec<SubmitPartitionKey> {
     match picker {
         JobPartitionPicker::None => Vec::new(),
-        JobPartitionPicker::SingleDim { .. } | JobPartitionPicker::SingleDimPaged { .. } => {
-            single_selected
-                .iter()
-                .cloned()
-                .map(SubmitPartitionKey::Single)
-                .collect()
-        }
+        JobPartitionPicker::SingleDim { .. }
+        | JobPartitionPicker::SingleDimPaged { .. }
+        | JobPartitionPicker::Dynamic { .. } => single_selected
+            .iter()
+            .cloned()
+            .map(SubmitPartitionKey::Single)
+            .collect(),
         JobPartitionPicker::Multi { dimensions, .. } => {
             let mut per_dim: Vec<(String, Vec<String>)> = Vec::with_capacity(dimensions.len());
             for dim in dimensions {
@@ -298,19 +327,17 @@ fn scroll_for_row(row: usize, total: usize) -> f64 {
     }
 }
 
-/// Virtualised, on-demand-paged list for a single-dim asset (or one Multi
-/// dimension) too large to ship inline: renders only visible rows, paging keys
-/// via `get_partition_keys_page` on scroll. Three ways to reach any key past the
+/// Virtualised, on-demand-paged list for a key set too large to ship inline (an
+/// asset, a Multi dimension, or a Dynamic namespace — see [`KeySource`]): renders
+/// only visible rows, paging on scroll. Three ways to reach any key past the
 /// element-height cap — **scroll** (rolling window, scaled past the cap),
 /// **search** (substring filter, position-independent), **jump** (resolve index,
-/// seek there) — plus a **Selected (N)** toggle listing the chosen keys
-/// client-side. Selection is by key string, so it survives all of them.
+/// seek there) — plus a **Selected (N)** toggle. Selection is by key string, so
+/// it survives all of them.
 #[component]
 fn VirtualPartitionList(
-    asset_key: String,
-    /// Multi dimension to page (empty = the asset's single-dim key space).
-    #[prop(optional, into)]
-    dimension: String,
+    /// Key source — see [`KeySource`].
+    source: KeySource,
     total: usize,
     selected: RwSignal<Vec<String>>,
     /// Dialog-open signal — clears the list's state + selection on reopen.
@@ -376,8 +403,7 @@ fn VirtualPartitionList(
 
     // Fetch the pages covering the visible range, once each, for the current
     // query. A response whose query no longer matches is dropped (stale).
-    let fetch_asset = asset_key.clone();
-    let fetch_dim = dimension.clone();
+    let fetch_source = source.clone();
     Effect::new(move |_| {
         if show_selected.get() {
             return;
@@ -395,20 +421,38 @@ fn VirtualPartitionList(
                 r.insert(pg);
             });
             let (ns, nm) = loc.get_untracked();
-            let ak = fetch_asset.clone();
-            let dim = fetch_dim.clone();
+            let src = fetch_source.clone();
             let q = q.clone();
             leptos::task::spawn_local(async move {
-                let res = get_partition_keys_page(
-                    ns,
-                    nm,
-                    ak,
-                    dim,
-                    q.clone(),
-                    (pg * PAGE) as u64,
-                    PAGE as u64,
-                )
-                .await;
+                let offset = (pg * PAGE) as u64;
+                let res = match src {
+                    KeySource::Asset {
+                        asset_key,
+                        dimension,
+                    } => {
+                        get_partition_keys_page(
+                            ns,
+                            nm,
+                            asset_key,
+                            dimension,
+                            q.clone(),
+                            offset,
+                            PAGE as u64,
+                        )
+                        .await
+                    }
+                    KeySource::Dynamic { dynamic_name } => {
+                        get_dynamic_partition_keys_page(
+                            ns,
+                            nm,
+                            dynamic_name,
+                            q.clone(),
+                            offset,
+                            PAGE as u64,
+                        )
+                        .await
+                    }
+                };
                 // Query changed under us — the cache was reset; drop this result.
                 if query.get_untracked() != q {
                     return;
@@ -463,18 +507,25 @@ fn VirtualPartitionList(
 
     // Jump to a typed key in the full (unfiltered) list: resolve its index, then
     // seek the window straight there.
-    let jump_asset = asset_key.clone();
-    let jump_dim = dimension.clone();
+    let jump_source = source.clone();
     let do_jump = move || {
         let key = query_input.get_untracked();
         if key.is_empty() {
             return;
         }
         let (ns, nm) = loc.get_untracked();
-        let ak = jump_asset.clone();
-        let dim = jump_dim.clone();
+        let src = jump_source.clone();
         leptos::task::spawn_local(async move {
-            match get_partition_key_index(ns, nm, ak, dim, key).await {
+            let res = match src {
+                KeySource::Asset {
+                    asset_key,
+                    dimension,
+                } => get_partition_key_index(ns, nm, asset_key, dimension, key).await,
+                KeySource::Dynamic { dynamic_name } => {
+                    get_dynamic_partition_key_index(ns, nm, dynamic_name, key).await
+                }
+            };
+            match res {
                 Ok(idx) if idx >= 0 => {
                     not_found.set(false);
                     show_selected.set(false);

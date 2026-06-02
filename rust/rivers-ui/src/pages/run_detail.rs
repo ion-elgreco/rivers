@@ -12,7 +12,7 @@ use crate::helpers::{
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::now::use_now;
-use crate::server_fns::actions::{cancel_run, execute_job, trigger_materialize};
+use crate::server_fns::actions::{cancel_run, rerun_run};
 use crate::server_fns::locations::list_code_locations;
 use crate::server_fns::runs::{get_run, get_run_events};
 use crate::types::{EventType, RunStatus, StoredEvent};
@@ -137,15 +137,12 @@ pub fn RunDetailPage() -> impl IntoView {
     let (log_level, set_log_level) = signal("all".to_string());
     let (view_mode, set_view_mode) = signal("gantt".to_string());
 
-    let reexecute = Action::new(move |input: &(Option<String>, Vec<String>)| {
-        let (job_name, assets) = input.clone();
+    // Re-execute reuses the run's exact config server-side (partition, tags, job
+    // vs. materialization), so a partitioned run replays on its partition.
+    let reexecute = Action::new(move |run_id: &String| {
+        let run_id = run_id.clone();
         let (ns, name) = loc.get();
-        async move {
-            match job_name {
-                Some(j) => execute_job(ns, name, j, None).await,
-                None => trigger_materialize(ns, name, Some(assets), None, None).await,
-            }
-        }
+        async move { rerun_run(ns, name, run_id).await }
     });
     let reexecute_pending = reexecute.pending();
 
@@ -169,8 +166,7 @@ pub fn RunDetailPage() -> impl IntoView {
             {move || {
                 run.get().map(|result| match result {
                     Ok(Some(record)) => {
-                        let reexec_job = record.job_name.clone();
-                        let assets_for_reexec = record.node_names.clone();
+                        let rerun_run_id = record.run_id.clone();
                         let status_kind = run_status_kind(&record.status);
                         let sid = short_id(&record.run_id, 8);
                         let is_active_status = matches!(record.status, RunStatus::Started | RunStatus::NotStarted | RunStatus::Queued);
@@ -211,7 +207,7 @@ pub fn RunDetailPage() -> impl IntoView {
                                 </button>
                                 <button
                                     class="btn btn-tertiary"
-                                    on:click=move |_| { reexecute.dispatch((reexec_job.clone(), assets_for_reexec.clone())); }
+                                    on:click=move |_| { reexecute.dispatch(rerun_run_id.clone()); }
                                     disabled=move || reexecute_pending.get()
                                 >
                                     <svg width="12" height="12" viewBox="0 0 14 14" fill="none">

@@ -367,6 +367,71 @@ pub async fn get_partition_key_index(
     Ok(resp.index)
 }
 
+/// Load a Dynamic partition set's full key list from storage (`partition_key
+/// ASC`). Its keys are storage-managed, not in the in-memory def, so this reads
+/// storage directly like `get_partition_status`; callers filter/window in memory.
+#[cfg(feature = "ssr")]
+async fn load_dynamic_partition_keys(
+    loc_ns: &str,
+    loc_name: &str,
+    dynamic_name: &str,
+) -> Result<Vec<String>, ServerFnError> {
+    use rivers_core::storage::StorageBackend;
+
+    let ctx = super::resolve_identity(loc_ns, loc_name).await?;
+    let state = expect_context::<crate::state::AppState>();
+    state
+        .storage
+        .for_code_location(&ctx)
+        .get_dynamic_partitions(dynamic_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// `[offset, offset+limit)` window of a Dynamic set's keys + total; `query`
+/// filters by substring. Dynamic companion of `get_partition_keys_page`.
+#[server]
+pub async fn get_dynamic_partition_keys_page(
+    loc_ns: String,
+    loc_name: String,
+    dynamic_name: String,
+    query: String,
+    offset: u64,
+    limit: u64,
+) -> Result<(Vec<String>, u64), ServerFnError> {
+    let all = load_dynamic_partition_keys(&loc_ns, &loc_name, &dynamic_name).await?;
+    // Case-sensitive, like the asset-side `get_partition_keys_filtered`.
+    let filtered: Vec<String> = if query.is_empty() {
+        all
+    } else {
+        all.into_iter().filter(|k| k.contains(&query)).collect()
+    };
+    let total = filtered.len() as u64;
+    let window: Vec<String> = filtered
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    Ok((window, total))
+}
+
+/// Index of `key` in a Dynamic set's stored order (`-1` if absent), for the
+/// picker's jump. Dynamic companion of `get_partition_key_index`.
+#[server]
+pub async fn get_dynamic_partition_key_index(
+    loc_ns: String,
+    loc_name: String,
+    dynamic_name: String,
+    key: String,
+) -> Result<i64, ServerFnError> {
+    let all = load_dynamic_partition_keys(&loc_ns, &loc_name, &dynamic_name).await?;
+    Ok(all
+        .iter()
+        .position(|k| k == &key)
+        .map(|i| i as i64)
+        .unwrap_or(-1))
+}
+
 /// Aggregate stats for the deployment page: storage-side counts (assets,
 /// runs, events), gRPC-side daemon counts (schedules, sensors, ticks),
 /// connectivity, and a heuristic `daemon_active` flag (a tick within the

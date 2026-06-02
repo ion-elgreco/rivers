@@ -11,6 +11,7 @@ service CodeLocationService {
   rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
   rpc Materialize(MaterializeRequest) returns (MaterializeResponse);
   rpc ExecuteJob(ExecuteJobRequest) returns (ExecuteJobResponse);
+  rpc RerunRun(RerunRunRequest) returns (RerunRunResponse);
   rpc GetAssetsInfo(GetAssetsInfoRequest) returns (GetAssetsInfoResponse);
   rpc GetPartitionKeys(GetPartitionKeysRequest) returns (GetPartitionKeysResponse);
   rpc GetPartitionKeyIndex(GetPartitionKeyIndexRequest) returns (GetPartitionKeyIndexResponse);
@@ -21,6 +22,7 @@ service CodeLocationService {
   rpc EvaluateSensor(EvaluateSensorRequest) returns (EvaluateSensorResponse);
   rpc ObserveAsset(ObserveAssetRequest) returns (ObserveAssetResponse);
   rpc LaunchBackfill(LaunchBackfillRequest) returns (LaunchBackfillResponse);
+  rpc MaterializeMissing(MaterializeMissingRequest) returns (LaunchBackfillResponse);
   rpc RerunBackfill(RerunBackfillRequest) returns (RerunBackfillResponse);
   rpc GetBackfillStatus(GetBackfillStatusRequest) returns (GetBackfillStatusResponse);
   rpc CancelBackfill(CancelBackfillRequest) returns (CancelBackfillResponse);
@@ -69,6 +71,19 @@ message ExecuteJobRequest {
 message ExecuteJobResponse {
   bool success = 1;
   string run_id = 2;
+}
+
+// Re-execute an existing run by id: the server reads the stored RunRecord and
+// replays it on its original partition, reusing its tags — caller supplies the id.
+message RerunRunRequest {
+  string run_id = 1;
+}
+
+message RerunRunResponse {
+  // Id of the new run.
+  string run_id = 1;
+  // "queued" if dispatched to the run queue, "direct" if executed inline.
+  string status = 2;
 }
 
 // --- Assets ---
@@ -316,6 +331,13 @@ message LaunchBackfillResponse {
   uint32 num_runs = 3;
   bool is_dry_run = 4;
   string status = 5;
+}
+
+// Backfill an asset's not-yet-materialized partitions (full universe minus what
+// storage records as materialized). Powers the "Materialize Missing" button.
+message MaterializeMissingRequest {
+  string asset_key = 1;
+  uint32 max_concurrency = 2;
 }
 
 message RerunBackfillRequest {

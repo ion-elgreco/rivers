@@ -84,6 +84,34 @@ pub async fn trigger_materialize(
     })
 }
 
+/// Re-execute a run by id, server-side: replays it on its original partition,
+/// reusing tags + job/materialization shape. Returns the new `run_id`.
+#[server]
+pub async fn rerun_run(
+    loc_ns: String,
+    loc_name: String,
+    run_id: String,
+) -> Result<MaterializeResult, ServerFnError> {
+    use rivers_api::rivers::RerunRunRequest;
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let resp = client
+        .rerun_run(RerunRunRequest { run_id })
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let r = resp.into_inner();
+    Ok(MaterializeResult {
+        run_id: r.run_id,
+        status: r.status,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackfillRerunResult {
     pub backfill_id: String,
@@ -112,6 +140,40 @@ pub async fn rerun_backfill(
         .rerun_backfill(RerunBackfillRequest {
             backfill_id,
             dry_run: false,
+        })
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let r = resp.into_inner();
+    Ok(BackfillRerunResult {
+        backfill_id: r.backfill_id,
+        num_partitions: r.num_partitions,
+        num_runs: r.num_runs,
+        status: r.status,
+    })
+}
+
+/// Backfill an asset's missing partitions — the server computes the set (full
+/// universe − materialized). Backs the "Materialize Missing" button.
+#[server]
+pub async fn materialize_missing_partitions(
+    loc_ns: String,
+    loc_name: String,
+    asset_key: String,
+) -> Result<BackfillRerunResult, ServerFnError> {
+    use rivers_api::rivers::MaterializeMissingRequest;
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let resp = client
+        .materialize_missing(MaterializeMissingRequest {
+            asset_key,
+            // Matches `repo.backfill`'s default fan-out.
+            max_concurrency: 4,
         })
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;

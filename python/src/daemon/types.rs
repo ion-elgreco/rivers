@@ -66,6 +66,13 @@ pub(crate) struct MaterializationRequestData {
     pub(crate) launched_by: rivers_core::storage::LaunchedBy,
 }
 
+/// A run re-execution from a stored `RunRecord`: `Job` → `dispatch_jobs`,
+/// `Materialization` → `dispatch_materialization`. Reuses the run's partition + tags.
+pub(crate) enum RunRerunRequest {
+    Job(RunRequestData),
+    Materialization(MaterializationRequestData),
+}
+
 #[derive(Clone)]
 pub(crate) struct BackfillRequestData {
     pub(crate) selection: Vec<String>,
