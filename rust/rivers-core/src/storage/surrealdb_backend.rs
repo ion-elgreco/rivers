@@ -1280,20 +1280,17 @@ impl SurrealStorage {
             .map(|r| DbEventWrite::from(&run_queued_event(r)))
             .collect();
         let result = super::retry::with_retry(&self.retry_config, || async {
-            let mut q = String::from("BEGIN TRANSACTION;\n");
-            for i in 0..records.len() {
-                q += &format!("CREATE runs CONTENT $r{i};\n");
-                q += &format!("CREATE events CONTENT $e{i};\n");
-            }
-            q += "COMMIT TRANSACTION;\n";
-            let mut query = self.db.query(&q);
-            for (i, run) in records.iter().enumerate() {
-                query = query.bind((format!("r{i}"), run.clone()));
-            }
-            for (i, event) in events.iter().enumerate() {
-                query = query.bind((format!("e{i}"), event.clone()));
-            }
-            query.await.context("failed to enqueue runs batch")?;
+            self.db
+                .query(
+                    "BEGIN TRANSACTION;\n\
+                     INSERT INTO runs $runs;\n\
+                     INSERT INTO events $events;\n\
+                     COMMIT TRANSACTION;",
+                )
+                .bind(("runs", records.to_vec()))
+                .bind(("events", events.clone()))
+                .await
+                .context("failed to enqueue runs batch")?;
             Ok(())
         })
         .await;
@@ -7601,6 +7598,48 @@ mod tests {
 
         let all = storage.get_all_queued_runs().await.unwrap();
         assert_eq!(all.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_runs_bulk_round_trip() {
+        let storage = make_storage().await;
+
+        let records: Vec<RunRecord> = (0..4)
+            .map(|i| RunRecord {
+                run_id: format!("bulk{i}"),
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                job_name: Some("jb".to_string()),
+                status: RunStatus::Queued,
+                start_time: 1000 + i,
+                end_time: None,
+                tags: vec![("k".to_string(), format!("v{i}"))],
+                node_names: vec![format!("asset{i}")],
+                priority: i as i32,
+                partition_key: Some(PartitionKey::Single {
+                    keys: vec![format!("p{i}")],
+                }),
+                block_reason: None,
+                launched_by: LaunchedBy::Manual,
+            })
+            .collect();
+
+        storage.enqueue_runs(&records).await.unwrap();
+
+        let mut all = storage.get_all_queued_runs().await.unwrap();
+        assert_eq!(all.len(), 4);
+        all.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+        let r = &all[2];
+        assert_eq!(r.run_id, "bulk2");
+        assert_eq!(r.priority, 2);
+        assert_eq!(r.job_name.as_deref(), Some("jb"));
+        assert_eq!(r.node_names, vec!["asset2".to_string()]);
+        assert_eq!(r.tags, vec![("k".to_string(), "v2".to_string())]);
+        assert_eq!(
+            r.partition_key,
+            Some(PartitionKey::Single {
+                keys: vec!["p2".to_string()]
+            })
+        );
     }
 
     #[tokio::test]
