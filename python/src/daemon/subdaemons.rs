@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -30,6 +31,11 @@ pub(crate) fn spawn_backfill_pickup_loop(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = std::time::Duration::from_secs(5);
+        // backfill_ids whose execution thread is in flight. The `Requested →
+        // InProgress` flip happens inside that thread, so without this the next
+        // poll (under GIL-pool load) can re-pick the same still-`Requested` record
+        // and spawn a second, redundant execution.
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         loop {
             tokio::select! {
                 biased;
@@ -55,8 +61,12 @@ pub(crate) fn spawn_backfill_pickup_loop(
                 }
             };
             for record in pending {
-                let repo = repo.clone();
                 let backfill_id = record.backfill_id.clone();
+                if !in_flight.lock().unwrap().insert(backfill_id.clone()) {
+                    continue; // already being executed by an earlier poll
+                }
+                let repo = repo.clone();
+                let in_flight = in_flight.clone();
                 gil_threads.spawn(move || {
                     let repo_ref = repo.get();
                     if run_queue_enabled {
@@ -76,6 +86,7 @@ pub(crate) fn spawn_backfill_pickup_loop(
                             "backfill execution failed"
                         );
                     }
+                    in_flight.lock().unwrap().remove(&backfill_id);
                 });
             }
         }
