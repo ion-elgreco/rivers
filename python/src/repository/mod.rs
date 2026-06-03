@@ -3738,10 +3738,16 @@ impl PyCodeRepository {
             });
             let result = match &record.job_name {
                 Some(job_name) => match state.jobs.get(job_name) {
-                    Some(job) => {
-                        self.execute_backfill_job_run(job, job_name, batch_pk, run_config, backfill_id)
-                    }
-                    None => Err(ExecutionError::new_err(format!("Job '{job_name}' not found"))),
+                    Some(job) => self.execute_backfill_job_run(
+                        job,
+                        job_name,
+                        batch_pk,
+                        run_config,
+                        backfill_id,
+                    ),
+                    None => Err(ExecutionError::new_err(format!(
+                        "Job '{job_name}' not found"
+                    ))),
                 },
                 None => self.materialize_with_launcher(
                     Some(record.asset_selection.clone()),
@@ -3860,19 +3866,14 @@ impl PyCodeRepository {
             ));
         }
 
-        let partition_keys: Vec<PyPartitionKey> = run_groups
+        let runs: Vec<RunSubmission> = run_groups
             .iter()
-            .flatten()
-            .map(PyPartitionKey::from)
-            .collect();
-
-        let runs: Vec<RunSubmission> = partition_keys
-            .into_iter()
-            .map(|pk| RunSubmission {
+            .map(|group| RunSubmission {
                 selection: Some(record.asset_selection.clone()),
-                partition_key: Some(pk),
+                partition_key: Some(PyPartitionKey::from(
+                    &rivers_core::execution::backfill::bundle_keys(group),
+                )),
                 tags: Some(run_tags.clone()),
-                // Job target → each queued run resolves the job on dequeue.
                 job_name: record.job_name.clone(),
             })
             .collect();

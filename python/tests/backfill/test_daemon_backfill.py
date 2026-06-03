@@ -285,6 +285,9 @@ class TestDaemonConditionBackfill:
             # SingleRun strategy: the backfill record should show
             # completed_partitions == 2 (both a and b processed)
             assert bf_status.completed_partitions == 2
+            # ...in ONE batched run (queued path), not one run per partition.
+            backfill_runs = [r for r in tagged_runs if r.launched_by.kind == "backfill"]
+            assert len(backfill_runs) == 1
         finally:
             daemon.stop()
 
@@ -382,6 +385,11 @@ class TestDaemonConditionBackfill:
                 if r.launched_by.kind == "backfill"
             }
             assert len(bf_ids) == 1, f"Expected 1 backfill, got {len(bf_ids)}"
+            # per_dimension(multi_run=["region"]) → one batched run per region.
+            backfill_runs = [r for r in tagged_runs if r.launched_by.kind == "backfill"]
+            assert len(backfill_runs) == 2, (
+                f"Expected 2 batched runs (one per region), got {len(backfill_runs)}"
+            )
         finally:
             daemon.stop()
 

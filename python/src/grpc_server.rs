@@ -861,6 +861,11 @@ fn py_partition_key_display(pk: PyPartitionKey) -> String {
                 .collect::<Vec<_>>()
                 .join("|")
         }
+        PyPartitionKey::Set { keys } => keys
+            .into_iter()
+            .map(py_partition_key_display)
+            .collect::<Vec<_>>()
+            .join(", "),
     }
 }
 

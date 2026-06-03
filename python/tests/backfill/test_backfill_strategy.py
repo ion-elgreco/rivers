@@ -320,6 +320,41 @@ class TestPerDimensionExecution:
         assert result.completed == 4
         assert sorted(keys_per_call) == [2, 2]
 
+    def test_per_dimension_sparse_multi_dim_no_over_inclusion(self, executor_env):
+        executor, _ = executor_env
+        pd = rs.PartitionsDefinition.multi(
+            {
+                "region": rs.PartitionsDefinition.static_(["us", "eu"]),
+                "date": rs.PartitionsDefinition.static_(["d1", "d2"]),
+                "hour": rs.PartitionsDefinition.static_(["h1", "h2"]),
+            }
+        )
+        keys_per_call: list[int] = []
+
+        @rs.Asset(partitions_def=pd)
+        def asset(context: rs.AssetExecutionContext) -> int:
+            keys_per_call.append(len(context.partition.keys))
+            return 1
+
+        repo = rs.CodeRepository(assets=[asset], default_executor=executor)
+        # Sparse within region=us: (d1,h1) and (d2,h2) only — not the 2x2 cartesian.
+        result = repo.backfill(
+            selection=["asset"],
+            partition_keys=[
+                rs.PartitionKey.multi({"region": "us", "date": "d1", "hour": "h1"}),
+                rs.PartitionKey.multi({"region": "us", "date": "d2", "hour": "h2"}),
+            ],
+            strategy=rs.BackfillStrategy.per_dimension(
+                multi_run=["region"], single_run=["date", "hour"]
+            ),
+        )
+        # Exactly the 2 selected partitions run — the cartesian closure (4) does not.
+        assert result.num_partitions == 2
+        assert result.completed == 2
+        # One batched run (the us group, bundled as an explicit Set), invoked once.
+        assert len(result.run_ids) == 1
+        assert keys_per_call == [2]
+
 
 # ---------------------------------------------------------------------------
 # Asset-level default strategy

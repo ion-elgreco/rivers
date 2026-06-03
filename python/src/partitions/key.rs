@@ -9,8 +9,16 @@ use pyo3::types::{PyDict, PyTuple};
 #[pyclass(name = "PartitionKey", frozen, from_py_object, module = "rivers._core")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PyPartitionKey {
-    Single { key: Vec<String> },
-    Multi { keys: HashMap<String, Vec<String>> },
+    Single {
+        key: Vec<String>,
+    },
+    Multi {
+        keys: HashMap<String, Vec<String>>,
+    },
+    /// Internal/transport-only
+    Set {
+        keys: Vec<PyPartitionKey>,
+    },
 }
 
 impl std::hash::Hash for PyPartitionKey {
@@ -24,6 +32,11 @@ impl std::hash::Hash for PyPartitionKey {
                 for (k, v) in sorted {
                     k.hash(state);
                     v.hash(state);
+                }
+            }
+            Self::Set { keys } => {
+                for k in keys {
+                    k.hash(state);
                 }
             }
         }
@@ -103,6 +116,10 @@ impl PyPartitionKey {
                     .collect();
                 format!("PartitionKey({{{}}})", pairs.join(", "))
             }
+            Self::Set { keys } => {
+                let members: Vec<String> = keys.iter().map(|k| k.__repr__()).collect();
+                format!("PartitionKey.Set([{}])", members.join(", "))
+            }
         }
     }
 
@@ -124,6 +141,14 @@ impl PyPartitionKey {
             Self::Multi { keys } => {
                 data.set_item("variant", "Multi")?;
                 data.set_item("keys", keys.clone())?;
+            }
+            Self::Set { keys } => {
+                data.set_item("variant", "Set")?;
+                let members: Vec<Py<PyPartitionKey>> = keys
+                    .iter()
+                    .map(|k| Py::new(py, k.clone()))
+                    .collect::<PyResult<_>>()?;
+                data.set_item("keys", members)?;
             }
         }
         let args = PyTuple::new(py, [data.into_any()])?;
@@ -165,6 +190,12 @@ impl PyPartitionKey {
                     }
                 }
             }
+            Self::Set { keys } => {
+                2u8.hash(&mut hasher);
+                for k in keys {
+                    k.hash(&mut hasher);
+                }
+            }
         }
         hasher.finish()
     }
@@ -201,6 +232,9 @@ impl From<&rivers_core::storage::PartitionKey> for PyPartitionKey {
                     .collect();
                 Self::Multi { keys }
             }
+            rivers_core::storage::PartitionKey::Set { keys } => Self::Set {
+                keys: keys.iter().map(PyPartitionKey::from).collect(),
+            },
         }
     }
 }
@@ -211,6 +245,9 @@ impl From<&PyPartitionKey> for rivers_core::storage::PartitionKey {
             PyPartitionKey::Single { key } => Self::Single { keys: key.clone() },
             PyPartitionKey::Multi { keys } => Self::Multi {
                 dims: keys.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            },
+            PyPartitionKey::Set { keys } => Self::Set {
+                keys: keys.iter().map(|k| k.into()).collect(),
             },
         }
     }

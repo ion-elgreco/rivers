@@ -233,6 +233,10 @@ pub enum PartitionKey {
     Single { keys: Vec<String> },
     /// Multi-dimension key (e.g. `{"date": ["2024-01-01"], "region": ["us"]}`).
     Multi { dims: Vec<(String, Vec<String>)> },
+    /// Explicit set of concrete keys (each member a single Single/Multi key,
+    /// never nested). Internal/transport only: bundles a sparse backfill group
+    /// no cartesian Multi can express; expanded via `members()` at execution.
+    Set { keys: Vec<PartitionKey> },
 }
 
 impl PartitionKey {
@@ -266,6 +270,7 @@ impl PartitionKey {
                     .map(|dims| Self::Multi { dims })
                     .collect()
             }
+            Self::Set { keys } => keys.iter().flat_map(|k| k.members()).collect(),
         }
     }
 
@@ -278,6 +283,13 @@ impl PartitionKey {
                 let map: std::collections::BTreeMap<&str, &Vec<String>> =
                     dims.iter().map(|(k, v)| (k.as_str(), v)).collect();
                 serde_json::json!({"multi": map}).to_string()
+            }
+            Self::Set { keys } => {
+                let members: Vec<serde_json::Value> = keys
+                    .iter()
+                    .filter_map(|k| serde_json::from_str(&k.to_json()).ok())
+                    .collect();
+                serde_json::json!({ "set": members }).to_string()
             }
         }
     }
@@ -297,8 +309,17 @@ impl PartitionKey {
             Ok(Self::Multi {
                 dims: map.into_iter().collect(),
             })
+        } else if let Some(set) = v.get("set") {
+            let arr = set
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("invalid set partition key: expected array"))?;
+            let keys = arr
+                .iter()
+                .map(|m| Self::from_json(&m.to_string()))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Self::Set { keys })
         } else {
-            anyhow::bail!("partition key JSON must have 'single' or 'multi' key")
+            anyhow::bail!("partition key JSON must have 'single', 'multi', or 'set' key")
         }
     }
 }
@@ -317,6 +338,7 @@ impl PartialEq for PartitionKey {
                 b_sorted.sort_by(|x, y| x.0.cmp(&y.0));
                 a_sorted == b_sorted
             }
+            (Self::Set { keys: a }, Self::Set { keys: b }) => a == b,
             _ => false,
         }
     }
@@ -334,6 +356,7 @@ impl std::hash::Hash for PartitionKey {
                 sorted.sort_by(|a, b| a.0.cmp(&b.0));
                 sorted.hash(state);
             }
+            Self::Set { keys } => keys.hash(state),
         }
     }
 }
@@ -353,6 +376,10 @@ impl SurrealValue for PartitionKey {
             Self::Multi { dims } => {
                 map.insert("variant".to_string(), "Multi".to_string().into_value());
                 map.insert("dims".to_string(), dims.into_value());
+            }
+            Self::Set { keys } => {
+                map.insert("variant".to_string(), "Set".to_string().into_value());
+                map.insert("keys".to_string(), keys.into_value());
             }
         }
         Value::Object(map.into())
@@ -385,6 +412,14 @@ impl SurrealValue for PartitionKey {
                     .transpose()?
                     .unwrap_or_default();
                 Ok(Self::Multi { dims })
+            }
+            "Set" => {
+                let keys = map
+                    .get("keys")
+                    .map(|v| Vec::<PartitionKey>::from_value(v.clone()))
+                    .transpose()?
+                    .unwrap_or_default();
+                Ok(Self::Set { keys })
             }
             _ => Err(SurrealError::internal(format!(
                 "unknown PartitionKey variant: {variant}"

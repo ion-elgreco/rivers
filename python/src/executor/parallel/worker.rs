@@ -277,6 +277,10 @@ pub fn _reconstruct_partition_key(py: Python, data: Bound<'_, PyDict>) -> PyResu
             let keys = data.get_item("keys")?.unwrap();
             Ok(cls.call1((keys,))?.unbind())
         }
+        "Set" => {
+            let keys = data.get_item("keys")?.unwrap();
+            Ok(cls.call1((keys,))?.unbind())
+        }
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "Unknown PartitionKey variant: {variant}"
         ))),

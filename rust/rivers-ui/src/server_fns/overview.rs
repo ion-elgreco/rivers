@@ -162,6 +162,7 @@ fn partition_key_members(pk: &rivers_core::storage::PartitionKey) -> Vec<String>
                 .collect::<Vec<_>>()
                 .join(", "),
         ],
+        PartitionKey::Set { keys } => keys.iter().flat_map(partition_key_members).collect(),
     }
 }
 

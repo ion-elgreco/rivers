@@ -29,11 +29,11 @@ pub fn group_into_runs(
     }
 }
 
-/// Collapse a run group into one batched key. NOTE: `Multi` collapses to the
-/// per-dimension union, i.e. the cartesian *closure* — exact for full ranges,
-/// an over-approximation for sparse selections spanning ≥2 single-run dims.
+/// Collapse a run group into one batched key: the tightest *exact* form —
+/// `Single` (single-dim) or `Multi` (clean cartesian), falling back to an
+/// explicit `Set` for a sparse multi-dim group no cartesian Multi can express.
 pub fn bundle_keys(keys: &[PartitionKey]) -> PartitionKey {
-    match keys.first() {
+    let candidate = match keys.first() {
         Some(PartitionKey::Multi { .. }) => {
             // Union values per dimension, preserving first-seen dimension order.
             let mut order: Vec<String> = Vec::new();
@@ -68,7 +68,7 @@ pub fn bundle_keys(keys: &[PartitionKey]) -> PartitionKey {
                 .iter()
                 .filter_map(|k| match k {
                     PartitionKey::Single { keys } => Some(keys.clone()),
-                    PartitionKey::Multi { .. } => None,
+                    _ => None,
                 })
                 .flatten()
                 .collect();
@@ -76,7 +76,22 @@ pub fn bundle_keys(keys: &[PartitionKey]) -> PartitionKey {
             union.dedup();
             PartitionKey::Single { keys: union }
         }
+    };
+
+    // Keep the compact cartesian form only when it reproduces the group exactly;
+    // otherwise an explicit Set preserves a sparse multi-dim selection.
+    if same_set(&candidate.members(), keys) {
+        candidate
+    } else {
+        let mut members = keys.to_vec();
+        members.sort_by(|a, b| a.to_json().cmp(&b.to_json()));
+        PartitionKey::Set { keys: members }
     }
+}
+
+/// Order-independent equality of two partition-key collections.
+fn same_set(a: &[PartitionKey], b: &[PartitionKey]) -> bool {
+    a.len() == b.len() && a.iter().all(|k| b.contains(k))
 }
 
 fn extract_multi_run_dims(pk: &PartitionKey, multi_run: &[String]) -> Vec<(String, Vec<String>)> {
@@ -90,7 +105,7 @@ fn extract_multi_run_dims(pk: &PartitionKey, multi_run: &[String]) -> Vec<(Strin
             result.sort_by(|a, b| a.0.cmp(&b.0));
             result
         }
-        PartitionKey::Single { .. } => vec![],
+        _ => vec![],
     }
 }
 
@@ -215,5 +230,27 @@ mod tests {
         assert_eq!(single_key("x").members(), vec![single_key("x")]);
         let m = multi_key(&[("region", "us"), ("date", "d1")]);
         assert_eq!(m.members(), vec![m]);
+    }
+
+    #[test]
+    fn test_bundle_sparse_multi_dim_uses_set() {
+        // region × date × hour, sparse: no cartesian Multi reproduces this group.
+        let keys = vec![
+            multi_key(&[("region", "us"), ("date", "d1"), ("hour", "h1")]),
+            multi_key(&[("region", "us"), ("date", "d2"), ("hour", "h2")]),
+        ];
+        let bundled = bundle_keys(&keys);
+        assert!(matches!(bundled, PartitionKey::Set { .. }));
+        // The explicit Set still expands back to exactly the group (no over-include).
+        assert_eq!(canon_set(&bundled.members()), canon_set(&keys));
+    }
+
+    #[test]
+    fn test_set_json_round_trip() {
+        let set = PartitionKey::Set {
+            keys: vec![single_key("a"), single_key("b")],
+        };
+        let back = PartitionKey::from_json(&set.to_json()).unwrap();
+        assert_eq!(canon_set(&back.members()), canon_set(&set.members()));
     }
 }

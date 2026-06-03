@@ -566,31 +566,37 @@ impl AssetConditionCache {
         let run_asset_names: Arc<[String]> = Arc::from(run.node_names.as_slice());
         let run_tags: Arc<[(String, String)]> = Arc::from(run.tags.as_slice());
         let is_failure = matches!(run.status, RunStatus::Failure);
+        let run_partitions: Vec<Option<PartitionKey>> = match &run.partition_key {
+            Some(pk) => pk.members().into_iter().map(Some).collect(),
+            None => vec![None],
+        };
         for asset in &run.node_names {
             if is_failure {
                 delta.failed_adds.insert(asset.clone());
             } else {
                 delta.failed_removes.insert(asset.clone());
             }
-            if !run_tags.is_empty() {
-                delta.run_tag_updates.push((
+            for partition_key in &run_partitions {
+                if !run_tags.is_empty() {
+                    delta.run_tag_updates.push((
+                        asset.clone(),
+                        partition_key.clone(),
+                        Arc::clone(&run_tags),
+                    ));
+                }
+                if !is_failure && self.needs_tick_tags {
+                    delta.tick_tag_updates.push((
+                        asset.clone(),
+                        partition_key.clone(),
+                        Arc::clone(&run_tags),
+                    ));
+                }
+                delta.asset_names_updates.push((
                     asset.clone(),
-                    run.partition_key.clone(),
-                    Arc::clone(&run_tags),
+                    partition_key.clone(),
+                    Arc::clone(&run_asset_names),
                 ));
             }
-            if !is_failure && self.needs_tick_tags {
-                delta.tick_tag_updates.push((
-                    asset.clone(),
-                    run.partition_key.clone(),
-                    Arc::clone(&run_tags),
-                ));
-            }
-            delta.asset_names_updates.push((
-                asset.clone(),
-                run.partition_key.clone(),
-                Arc::clone(&run_asset_names),
-            ));
         }
     }
 
@@ -865,14 +871,25 @@ impl AssetConditionCache {
                 .values()
                 .filter_map(|record| {
                     let run = runs_by_id.get(record.last_run_id.as_deref()?)?;
-                    Some((
-                        record.asset_key.clone(),
-                        run.status.clone(),
-                        run.partition_key.clone(),
-                        Arc::from(run.tags.as_slice()),
-                        Arc::from(run.node_names.as_slice()),
-                    ))
+                    let partitions: Vec<Option<PartitionKey>> = match &run.partition_key {
+                        Some(pk) => pk.members().into_iter().map(Some).collect(),
+                        None => vec![None],
+                    };
+                    let rows: Vec<AssetRunRow> = partitions
+                        .into_iter()
+                        .map(|pk| {
+                            (
+                                record.asset_key.clone(),
+                                run.status.clone(),
+                                pk,
+                                Arc::from(run.tags.as_slice()),
+                                Arc::from(run.node_names.as_slice()),
+                            )
+                        })
+                        .collect();
+                    Some(rows)
                 })
+                .flatten()
                 .collect();
             for (asset_key, status, partition_key, tags, asset_names) in &asset_runs {
                 if *status == RunStatus::Failure {

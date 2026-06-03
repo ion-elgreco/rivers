@@ -18,6 +18,11 @@ fn partition_key_to_display(pk: rivers_core::storage::PartitionKey) -> String {
                 .collect::<Vec<_>>()
                 .join("|")
         }
+        rivers_core::storage::PartitionKey::Set { keys } => keys
+            .into_iter()
+            .map(partition_key_to_display)
+            .collect::<Vec<_>>()
+            .join(", "),
     }
 }
 
@@ -860,13 +865,20 @@ mod conversions {
 
     impl From<rivers_core::storage::RunRecord> for RunRecord {
         fn from(r: rivers_core::storage::RunRecord) -> Self {
-            let partition_key = r.partition_key.as_ref().map(|pk| match pk {
-                rivers_core::storage::PartitionKey::Single { keys } => keys.join("|"),
-                rivers_core::storage::PartitionKey::Multi { dims } => dims
+            let partition_key = r.partition_key.as_ref().map(|pk| {
+                pk.members()
                     .iter()
-                    .map(|(d, ks)| format!("{d}={}", ks.join("|")))
+                    .map(|m| match m {
+                        rivers_core::storage::PartitionKey::Multi { dims } => dims
+                            .iter()
+                            .map(|(d, ks)| format!("{d}={}", ks.join("|")))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        rivers_core::storage::PartitionKey::Single { keys } => keys.join("|"),
+                        _ => String::new(),
+                    })
                     .collect::<Vec<_>>()
-                    .join(", "),
+                    .join(", ")
             });
             Self {
                 run_id: r.run_id,
