@@ -41,8 +41,8 @@ pub(crate) fn build_partition_context(
             node.name()?
         )));
     }
-    Ok(Some(PartitionContext::new(
-        partition_key.clone(),
+    Ok(Some(PartitionContext::new_multi(
+        partition_key.members(),
         def.clone(),
     )))
 }

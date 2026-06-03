@@ -3727,50 +3727,48 @@ impl PyCodeRepository {
             let mut group_completed = Vec::new();
             let mut group_failed = Vec::new();
 
-            for core_pk in group {
-                let py_pk = PyPartitionKey::from(core_pk);
-                let run_config = config.as_ref().map(|c| {
-                    Python::attach(|py| {
-                        c.iter()
-                            .map(|(k, v)| (k.clone(), v.clone_ref(py)))
-                            .collect::<HashMap<String, Py<PyAny>>>()
-                    })
-                });
-                let result = match &record.job_name {
-                    Some(job_name) => match state.jobs.get(job_name) {
-                        Some(job) => self
-                            .execute_backfill_job_run(job, job_name, py_pk, run_config, backfill_id),
-                        None => Err(ExecutionError::new_err(format!(
-                            "Job '{job_name}' not found"
-                        ))),
+            let batch_pk =
+                PyPartitionKey::from(&rivers_core::execution::backfill::bundle_keys(group));
+            let run_config = config.as_ref().map(|c| {
+                Python::attach(|py| {
+                    c.iter()
+                        .map(|(k, v)| (k.clone(), v.clone_ref(py)))
+                        .collect::<HashMap<String, Py<PyAny>>>()
+                })
+            });
+            let result = match &record.job_name {
+                Some(job_name) => match state.jobs.get(job_name) {
+                    Some(job) => {
+                        self.execute_backfill_job_run(job, job_name, batch_pk, run_config, backfill_id)
+                    }
+                    None => Err(ExecutionError::new_err(format!("Job '{job_name}' not found"))),
+                },
+                None => self.materialize_with_launcher(
+                    Some(record.asset_selection.clone()),
+                    Some(batch_pk),
+                    Some(run_tags.clone()),
+                    false,
+                    run_config,
+                    None,
+                    false,
+                    false,
+                    LaunchedBy::Backfill {
+                        backfill_id: backfill_id.to_string(),
                     },
-                    None => self.materialize_with_launcher(
-                        Some(record.asset_selection.clone()),
-                        Some(py_pk),
-                        Some(run_tags.clone()),
-                        false,
-                        run_config,
-                        None,
-                        false,
-                        false,
-                        LaunchedBy::Backfill {
-                            backfill_id: backfill_id.to_string(),
-                        },
-                    ),
-                };
+                ),
+            };
 
-                match result {
-                    Ok(run_result) => {
-                        group_run_ids.push(run_result.run_id);
-                        if run_result.success {
-                            group_completed.push(core_pk.clone());
-                        } else {
-                            group_failed.push(core_pk.clone());
-                        }
+            match result {
+                Ok(run_result) => {
+                    group_run_ids.push(run_result.run_id);
+                    if run_result.success {
+                        group_completed.extend(group.iter().cloned());
+                    } else {
+                        group_failed.extend(group.iter().cloned());
                     }
-                    Err(_) => {
-                        group_failed.push(core_pk.clone());
-                    }
+                }
+                Err(_) => {
+                    group_failed.extend(group.iter().cloned());
                 }
             }
 

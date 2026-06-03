@@ -236,6 +236,39 @@ pub enum PartitionKey {
 }
 
 impl PartitionKey {
+    /// Expand a possibly-batched key into its individual single-valued members
+    /// (`Single`: one per value; `Multi`: the cartesian product).
+    pub fn members(&self) -> Vec<PartitionKey> {
+        match self {
+            Self::Single { keys } => keys
+                .iter()
+                .map(|k| Self::Single {
+                    keys: vec![k.clone()],
+                })
+                .collect(),
+            Self::Multi { dims } => {
+                let mut sorted = dims.clone();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut combos: Vec<Vec<(String, Vec<String>)>> = vec![Vec::new()];
+                for (name, vals) in &sorted {
+                    let mut next = Vec::new();
+                    for combo in &combos {
+                        for v in vals {
+                            let mut c = combo.clone();
+                            c.push((name.clone(), vec![v.clone()]));
+                            next.push(c);
+                        }
+                    }
+                    combos = next;
+                }
+                combos
+                    .into_iter()
+                    .map(|dims| Self::Multi { dims })
+                    .collect()
+            }
+        }
+    }
+
     /// Serialize to JSON for CLI args / K8s CRD fields.
     /// Single: `{"single":["2025-01-16"]}`, Multi: `{"multi":{"region":["us"],"date":["2025-03"]}}`.
     pub fn to_json(&self) -> String {

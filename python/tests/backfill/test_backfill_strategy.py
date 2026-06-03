@@ -104,7 +104,7 @@ class TestSingleRunStrategy:
             strategy=rs.BackfillStrategy.single_run(),
         )
         assert result.completed == 3
-        assert len(calls) == 3
+        assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +184,141 @@ class TestPerDimensionStrategy:
             ),
         )
         assert result.completed == 4
-        assert len(calls) == 4
+        assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# SingleRun / PerDimension run each group as ONE run that invokes the asset
+# once over all the group's keys, emitting one materialization per key.
+# ---------------------------------------------------------------------------
+
+
+class TestSingleRunExecution:
+    def test_single_run_creates_one_run_record(self, executor_env, is_async):
+        executor, _ = executor_env
+
+        if is_async:
+
+            @rs.Asset(partitions_def=_static_pd(["a", "b", "c"]))
+            async def asset(context: rs.AssetExecutionContext) -> int:
+                await asyncio.sleep(0)
+                return 1
+        else:
+
+            @rs.Asset(partitions_def=_static_pd(["a", "b", "c"]))
+            def asset(context: rs.AssetExecutionContext) -> int:
+                return 1
+
+        repo = rs.CodeRepository(assets=[asset], default_executor=executor)
+        result = repo.backfill(
+            selection=["asset"],
+            partition_keys=[
+                rs.PartitionKey.single("a"),
+                rs.PartitionKey.single("b"),
+                rs.PartitionKey.single("c"),
+            ],
+            strategy=rs.BackfillStrategy.single_run(),
+        )
+        assert result.completed == 3
+        assert len(result.run_ids) == 1
+
+    def test_single_run_invokes_asset_once_with_all_keys(self, executor_env, is_async):
+        executor, _ = executor_env
+        keys_per_call: list[int] = []
+
+        if is_async:
+
+            @rs.Asset(partitions_def=_static_pd(["a", "b", "c"]))
+            async def asset(context: rs.AssetExecutionContext) -> int:
+                await asyncio.sleep(0)
+                keys_per_call.append(len(context.partition.keys))
+                return 1
+        else:
+
+            @rs.Asset(partitions_def=_static_pd(["a", "b", "c"]))
+            def asset(context: rs.AssetExecutionContext) -> int:
+                keys_per_call.append(len(context.partition.keys))
+                return 1
+
+        repo = rs.CodeRepository(assets=[asset], default_executor=executor)
+        result = repo.backfill(
+            selection=["asset"],
+            partition_keys=[
+                rs.PartitionKey.single("a"),
+                rs.PartitionKey.single("b"),
+                rs.PartitionKey.single("c"),
+            ],
+            strategy=rs.BackfillStrategy.single_run(),
+        )
+        assert result.completed == 3
+        assert keys_per_call == [3]
+
+
+class TestPerDimensionExecution:
+    def test_per_dimension_creates_one_run_per_group(self, executor_env, is_async):
+        executor, _ = executor_env
+
+        if is_async:
+
+            @rs.Asset(partitions_def=_multi_pd())
+            async def asset(context: rs.AssetExecutionContext) -> int:
+                await asyncio.sleep(0)
+                return 1
+        else:
+
+            @rs.Asset(partitions_def=_multi_pd())
+            def asset(context: rs.AssetExecutionContext) -> int:
+                return 1
+
+        repo = rs.CodeRepository(assets=[asset], default_executor=executor)
+        result = repo.backfill(
+            selection=["asset"],
+            partition_keys=[
+                rs.PartitionKey.multi({"region": "us", "date": "d1"}),
+                rs.PartitionKey.multi({"region": "us", "date": "d2"}),
+                rs.PartitionKey.multi({"region": "eu", "date": "d1"}),
+                rs.PartitionKey.multi({"region": "eu", "date": "d2"}),
+            ],
+            strategy=rs.BackfillStrategy.per_dimension(
+                multi_run=["region"], single_run=["date"]
+            ),
+        )
+        assert result.completed == 4
+        assert len(result.run_ids) == 2
+
+    def test_per_dimension_invokes_asset_once_per_group(self, executor_env, is_async):
+        executor, _ = executor_env
+        keys_per_call: list[int] = []
+
+        if is_async:
+
+            @rs.Asset(partitions_def=_multi_pd())
+            async def asset(context: rs.AssetExecutionContext) -> int:
+                await asyncio.sleep(0)
+                keys_per_call.append(len(context.partition.keys))
+                return 1
+        else:
+
+            @rs.Asset(partitions_def=_multi_pd())
+            def asset(context: rs.AssetExecutionContext) -> int:
+                keys_per_call.append(len(context.partition.keys))
+                return 1
+
+        repo = rs.CodeRepository(assets=[asset], default_executor=executor)
+        result = repo.backfill(
+            selection=["asset"],
+            partition_keys=[
+                rs.PartitionKey.multi({"region": "us", "date": "d1"}),
+                rs.PartitionKey.multi({"region": "us", "date": "d2"}),
+                rs.PartitionKey.multi({"region": "eu", "date": "d1"}),
+                rs.PartitionKey.multi({"region": "eu", "date": "d2"}),
+            ],
+            strategy=rs.BackfillStrategy.per_dimension(
+                multi_run=["region"], single_run=["date"]
+            ),
+        )
+        assert result.completed == 4
+        assert sorted(keys_per_call) == [2, 2]
 
 
 # ---------------------------------------------------------------------------

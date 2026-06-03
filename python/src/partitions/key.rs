@@ -170,6 +170,18 @@ impl PyPartitionKey {
     }
 }
 
+impl PyPartitionKey {
+    /// Expand a possibly-batched key into its individual single-valued members.
+    /// `Single{key:[a,b]}` → `[Single{[a]}, Single{[b]}]`; `Multi` → the cartesian
+    /// product of its per-dimension value lists, one member per combination. A
+    /// single-valued key yields a one-element Vec. Used to fan a batched backfill
+    /// run into per-partition contexts and materialization events.
+    pub fn members(&self) -> Vec<PyPartitionKey> {
+        let core: rivers_core::storage::PartitionKey = self.into();
+        core.members().iter().map(PyPartitionKey::from).collect()
+    }
+}
+
 impl From<&rivers_core::storage::PartitionKey> for PyPartitionKey {
     fn from(spk: &rivers_core::storage::PartitionKey) -> Self {
         match spk {

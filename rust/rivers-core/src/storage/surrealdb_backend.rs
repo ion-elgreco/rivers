@@ -2088,13 +2088,13 @@ impl StorageBackend for SurrealStorage {
         for run in &runs {
             if let Some(ref pk) = run.partition_key {
                 match run.status {
-                    RunStatus::Success => completed_pks.push(pk.clone()),
+                    RunStatus::Success => completed_pks.extend(pk.members()),
                     RunStatus::Failure => {
-                        failed_pks.push(pk.clone());
+                        failed_pks.extend(pk.members());
                         any_failed = true;
                     }
                     RunStatus::Canceled => {
-                        canceled_pks.push(pk.clone());
+                        canceled_pks.extend(pk.members());
                         any_canceled = true;
                     }
                     _ => {}

@@ -195,14 +195,22 @@ impl PyAssetExecutionContext {
     #[getter]
     fn partition_key(&self) -> PyResult<String> {
         match &self.partition {
-            Some(ctx) => match ctx.first_key() {
-                crate::partitions::PyPartitionKey::Single { key } if !key.is_empty() => {
-                    Ok(key[0].clone())
+            Some(ctx) => {
+                if ctx.key_count() > 1 {
+                    return Err(PartitionValidationError::new_err(
+                        "partition_key is ambiguous for a batched (SingleRun/PerDimension) run; \
+                         use context.partition.keys instead",
+                    ));
                 }
-                _ => Err(PartitionValidationError::new_err(
-                    "partition_key is only available for single-key partitions",
-                )),
-            },
+                match ctx.first_key() {
+                    crate::partitions::PyPartitionKey::Single { key } if key.len() == 1 => {
+                        Ok(key[0].clone())
+                    }
+                    _ => Err(PartitionValidationError::new_err(
+                        "partition_key is only available for single-key partitions",
+                    )),
+                }
+            }
             None => Err(PartitionValidationError::new_err(
                 "No partition key available — asset is not partitioned",
             )),

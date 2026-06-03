@@ -29,6 +29,56 @@ pub fn group_into_runs(
     }
 }
 
+/// Collapse a run group into one batched key. NOTE: `Multi` collapses to the
+/// per-dimension union, i.e. the cartesian *closure* — exact for full ranges,
+/// an over-approximation for sparse selections spanning ≥2 single-run dims.
+pub fn bundle_keys(keys: &[PartitionKey]) -> PartitionKey {
+    match keys.first() {
+        Some(PartitionKey::Multi { .. }) => {
+            // Union values per dimension, preserving first-seen dimension order.
+            let mut order: Vec<String> = Vec::new();
+            let mut values: HashMap<String, Vec<String>> = HashMap::new();
+            for key in keys {
+                if let PartitionKey::Multi { dims } = key {
+                    for (name, vals) in dims {
+                        let entry = values.entry(name.clone()).or_insert_with(|| {
+                            order.push(name.clone());
+                            Vec::new()
+                        });
+                        for v in vals {
+                            if !entry.contains(v) {
+                                entry.push(v.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            let dims = order
+                .into_iter()
+                .map(|name| {
+                    let mut vals = values.remove(&name).unwrap_or_default();
+                    vals.sort();
+                    (name, vals)
+                })
+                .collect();
+            PartitionKey::Multi { dims }
+        }
+        _ => {
+            let mut union: Vec<String> = keys
+                .iter()
+                .filter_map(|k| match k {
+                    PartitionKey::Single { keys } => Some(keys.clone()),
+                    PartitionKey::Multi { .. } => None,
+                })
+                .flatten()
+                .collect();
+            union.sort();
+            union.dedup();
+            PartitionKey::Single { keys: union }
+        }
+    }
+}
+
 fn extract_multi_run_dims(pk: &PartitionKey, multi_run: &[String]) -> Vec<(String, Vec<String>)> {
     match pk {
         PartitionKey::Multi { dims } => {
@@ -102,5 +152,68 @@ mod tests {
     fn test_group_empty() {
         let groups = group_into_runs(&BackfillStrategy::SingleRun, &[]);
         assert!(groups.is_empty());
+    }
+
+    /// Canonical (dim-order-insensitive) set of keys for comparison, since core
+    /// `Multi` equality is Vec-order-sensitive but dimension order is incidental.
+    fn canon_set(keys: &[PartitionKey]) -> std::collections::BTreeSet<String> {
+        keys.iter()
+            .map(|k| {
+                let mut k = k.clone();
+                if let PartitionKey::Multi { dims } = &mut k {
+                    dims.sort_by(|a, b| a.0.cmp(&b.0));
+                }
+                format!("{k:?}")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_bundle_single_run_round_trips_to_members() {
+        let keys = vec![single_key("a"), single_key("b"), single_key("c")];
+        let group = &group_into_runs(&BackfillStrategy::SingleRun, &keys)[0];
+        let bundled = bundle_keys(group);
+        assert_eq!(
+            bundled,
+            PartitionKey::Single {
+                keys: vec!["a".into(), "b".into(), "c".into()]
+            }
+        );
+        // The execution boundary expands the bundle back into its members.
+        assert_eq!(bundled.members(), keys);
+    }
+
+    #[test]
+    fn test_bundle_per_dimension_group_expands_to_group() {
+        let keys = vec![
+            multi_key(&[("region", "us"), ("date", "2024-01-01")]),
+            multi_key(&[("region", "us"), ("date", "2024-01-02")]),
+            multi_key(&[("region", "eu"), ("date", "2024-01-01")]),
+            multi_key(&[("region", "eu"), ("date", "2024-01-02")]),
+        ];
+        let strategy = BackfillStrategy::PerDimension {
+            multi_run: vec!["region".to_string()],
+            single_run: vec!["date".to_string()],
+        };
+        for group in group_into_runs(&strategy, &keys) {
+            // Each region-group bundles into one Multi key whose members are
+            // exactly that group's keys (the dates for that region).
+            let members = bundle_keys(&group).members();
+            assert_eq!(members.len(), group.len());
+            assert_eq!(canon_set(&members), canon_set(&group));
+        }
+    }
+
+    #[test]
+    fn test_bundle_single_key_group_is_identity() {
+        let group = vec![single_key("a")];
+        assert_eq!(bundle_keys(&group), single_key("a"));
+    }
+
+    #[test]
+    fn test_members_single_valued_key_is_self() {
+        assert_eq!(single_key("x").members(), vec![single_key("x")]);
+        let m = multi_key(&[("region", "us"), ("date", "d1")]);
+        assert_eq!(m.members(), vec![m]);
     }
 }

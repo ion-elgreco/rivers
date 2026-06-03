@@ -289,7 +289,7 @@ class TestGraphAssetBackfillStrategySingleRun:
 
         @rs.Asset(partitions_def=pd, io_handler=handler)
         async def source(context: rs.AssetExecutionContext) -> int:
-            calls.append(context.partition_key)
+            calls.append(len(context.partition.keys))
             return 1
 
         @rs.Task
@@ -313,7 +313,7 @@ class TestGraphAssetBackfillStrategySingleRun:
             strategy=rs.BackfillStrategy.single_run(),
         )
         assert result.completed == 3
-        assert len(calls) == 3
+        assert calls == [3]
 
 
 class TestGraphAssetBackfillStrategyPerDimension:
@@ -399,7 +399,7 @@ class TestGraphAssetBackfillStrategyPerDimension:
             ),
         )
         assert result.completed == 4
-        assert len(calls) == 4
+        assert len(calls) == 2
 
 
 class TestGraphAssetBackfillExplicitStrategy:

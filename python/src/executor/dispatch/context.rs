@@ -148,16 +148,32 @@ impl<'a> BatchContext<'a> {
         input_versions: Vec<(String, String)>,
         ts: i64,
     ) {
-        ops::emit_materialization(
-            self.sink.writer,
-            self.scope.run_id,
-            step_name,
-            self.scope.partition_key,
-            metadata,
-            data_version,
-            input_versions,
-            ts,
-        );
+        match self.scope.partition_key {
+            Some(pk) => {
+                for member in pk.members() {
+                    ops::emit_materialization(
+                        self.sink.writer,
+                        self.scope.run_id,
+                        step_name,
+                        &Some(member),
+                        metadata,
+                        data_version.clone(),
+                        input_versions.clone(),
+                        ts,
+                    );
+                }
+            }
+            None => ops::emit_materialization(
+                self.sink.writer,
+                self.scope.run_id,
+                step_name,
+                &None,
+                metadata,
+                data_version,
+                input_versions,
+                ts,
+            ),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -168,15 +184,30 @@ impl<'a> BatchContext<'a> {
         data_version: Option<String>,
         ts: i64,
     ) {
-        ops::emit_observation(
-            self.sink.writer,
-            self.scope.run_id,
-            step_name,
-            self.scope.partition_key,
-            metadata,
-            data_version,
-            ts,
-        );
+        match self.scope.partition_key {
+            Some(pk) => {
+                for member in pk.members() {
+                    ops::emit_observation(
+                        self.sink.writer,
+                        self.scope.run_id,
+                        step_name,
+                        &Some(member),
+                        metadata,
+                        data_version.clone(),
+                        ts,
+                    );
+                }
+            }
+            None => ops::emit_observation(
+                self.sink.writer,
+                self.scope.run_id,
+                step_name,
+                &None,
+                metadata,
+                data_version,
+                ts,
+            ),
+        }
     }
 
     pub(crate) fn emit_log_output(
