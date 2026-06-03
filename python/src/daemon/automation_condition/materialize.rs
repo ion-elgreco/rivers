@@ -143,7 +143,7 @@ impl ConditionTickEngine {
                 crate::repository::DEFAULT_BACKFILL_PRIORITY.to_string(),
             );
             requests.push(BackfillRequestData {
-                selection: vec![asset_key],
+                target: crate::daemon::RunType::Materialization(vec![asset_key]),
                 partition_keys: Some(py_keys),
                 partition_range: None,
                 strategy,

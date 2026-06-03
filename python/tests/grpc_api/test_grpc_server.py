@@ -787,3 +787,54 @@ def test_materialize_missing_unpartitioned_errors(backfill_grpc_channel):
             pb2.MaterializeMissingRequest(asset_key="does_not_exist", max_concurrency=4)
         )
     assert exc_info.value.code() == grpc.StatusCode.INTERNAL
+
+
+# ── launch_backfill: job-aware vs ad-hoc target ──
+
+
+def test_launch_backfill_for_job_runs_as_job(rerun_grpc_channel):
+    """A job-targeted backfill runs each partition with the job's own spec — its
+    runs are attributed to the job (job_name set), not ad-hoc materializations."""
+    channel, pb2, pb2_grpc, repo, storage = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    resp = stub.LaunchBackfill(
+        pb2.LaunchBackfillRequest(
+            job_name="part_job",
+            partition_keys=[_single_partition_key(pb2, k) for k in ("p1", "p2", "p3")],
+            failure_policy="continue",
+            max_concurrency=1,
+        )
+    )
+    assert resp.backfill_id != ""
+    assert resp.num_partitions == 3
+
+    # No daemon in this fixture, so execute inline, then check attribution.
+    repo.execute_backfill(resp.backfill_id)
+    job_runs = [r for r in storage.get_runs(100) if r.job_name == "part_job"]
+    assert len(job_runs) == 3
+    assert {repr(r.partition_key) for r in job_runs} == {
+        repr(rs.PartitionKey.single(k)) for k in ("p1", "p2", "p3")
+    }
+
+
+def test_launch_backfill_without_job_is_ad_hoc(rerun_grpc_channel):
+    """A selection-targeted backfill (no job_name) runs ad-hoc materializations —
+    its runs carry no job_name."""
+    channel, pb2, pb2_grpc, repo, storage = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    resp = stub.LaunchBackfill(
+        pb2.LaunchBackfillRequest(
+            selection=["part_asset"],
+            partition_keys=[_single_partition_key(pb2, k) for k in ("p1", "p2")],
+            failure_policy="continue",
+            max_concurrency=1,
+        )
+    )
+    assert resp.num_partitions == 2
+
+    repo.execute_backfill(resp.backfill_id)
+    runs = [r for r in storage.get_runs(100) if r.partition_key is not None]
+    assert runs, "expected partitioned runs"
+    assert all(r.job_name is None for r in runs)

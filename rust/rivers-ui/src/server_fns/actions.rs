@@ -195,17 +195,23 @@ pub async fn materialize_missing_partitions(
     Ok(resp.into_inner().into())
 }
 
-/// Launch a backfill over an explicit set of partition keys for `selection`.
-/// Used when a multi-partition materialize selection is large enough to warrant
+/// Launch a backfill over an explicit set of partition keys. With `job_name` set
+/// it targets that job (its own plan + executor; the server resolves its assets,
+/// so `selection` may be empty); otherwise it's an ad-hoc materialization of
+/// `selection`. Used when a multi-partition selection is large enough to warrant
 /// one backfill instead of many individual runs. Strategy defers to each asset's
 /// configured default; concurrency matches `repo.backfill`'s default.
 #[server]
 pub async fn launch_backfill(
     loc_ns: String,
     loc_name: String,
-    selection: Vec<String>,
+    // `Option` (not a bare `Vec`) so an empty selection survives the server-fn
+    // arg encoding — a job backfill sends `None` (the server resolves the job's
+    // assets). Same reason `trigger_materialize` takes `Option<Vec<String>>`.
+    selection: Option<Vec<String>>,
     partition_keys: Vec<SubmitPartitionKey>,
     tags: Option<Vec<(String, String)>>,
+    job_name: Option<String>,
 ) -> Result<BackfillRerunResult, ServerFnError> {
     use rivers_api::rivers::{LaunchBackfillRequest, Tag};
 
@@ -217,7 +223,7 @@ pub async fn launch_backfill(
 
     let resp = client
         .launch_backfill(LaunchBackfillRequest {
-            selection,
+            selection: selection.unwrap_or_default(),
             partition_keys: partition_keys.into_iter().map(submit_to_proto).collect(),
             partition_range: None,
             strategy: None,
@@ -229,6 +235,7 @@ pub async fn launch_backfill(
                 .map(|(k, v)| Tag { key: k, value: v })
                 .collect(),
             dry_run: false,
+            job_name,
         })
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;

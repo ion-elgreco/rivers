@@ -562,6 +562,10 @@ pub struct BackfillInfo {
     pub backfill_id: String,
     pub status: String,
     pub strategy: String,
+    /// `Some` when the backfill targets a named job (runs use the job's plan +
+    /// executor); `None` for an ad-hoc asset-selection backfill.
+    #[serde(default)]
+    pub job_name: Option<String>,
     pub asset_selection: Vec<String>,
     pub total_partitions: u32,
     pub completed_partitions: u32,
@@ -1108,6 +1112,7 @@ mod conversions {
                 backfill_id: b.backfill_id,
                 status: format!("{:?}", b.status),
                 strategy,
+                job_name: b.job_name,
                 asset_selection: b.asset_selection,
                 total_partitions: b.partition_keys.len() as u32,
                 completed_partitions: b.completed_partitions.len() as u32,

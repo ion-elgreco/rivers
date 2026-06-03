@@ -830,6 +830,10 @@ pub struct BackfillRecord {
     pub strategy: BackfillStrategy,
     pub failure_policy: BackfillFailurePolicy,
     pub asset_selection: Vec<String>,
+    /// Set when the backfill targets a named `Job` — each partition runs with the
+    /// job's own plan + executor. `None` for ad-hoc asset-selection backfills.
+    #[serde(default)]
+    pub job_name: Option<String>,
     pub partition_keys: Vec<PartitionKey>,
     pub run_ids: Vec<String>,
     pub completed_partitions: Vec<PartitionKey>,

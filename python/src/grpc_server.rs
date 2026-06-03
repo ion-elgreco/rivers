@@ -547,8 +547,12 @@ impl CodeLocationService for CodeLocationImpl {
         let tags = proto_tags_to_pairs(req.tags)
             .map(|pairs| pairs.into_iter().collect::<HashMap<String, String>>());
 
+        let target = match req.job_name {
+            Some(name) => crate::daemon::RunType::Job(name),
+            None => crate::daemon::RunType::Materialization(req.selection),
+        };
         let backfill_request = crate::daemon::BackfillRequestData {
-            selection: req.selection,
+            target,
             partition_keys,
             partition_range,
             strategy,

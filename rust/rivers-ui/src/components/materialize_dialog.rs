@@ -54,7 +54,7 @@ pub fn MaterializeDialog(
         async move {
             let tags_opt = if t.is_empty() { None } else { Some(t) };
             if pks.len() > BACKFILL_THRESHOLD {
-                let r = launch_backfill(ns, name, sel, pks, tags_opt).await?;
+                let r = launch_backfill(ns, name, Some(sel), pks, tags_opt, None).await?;
                 return Ok::<_, ServerFnError>(DialogOutcome::Backfill(r.backfill_id));
             }
             // ≤2 keys → a run each; empty pks (unpartitioned / None picker) → one

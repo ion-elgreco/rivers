@@ -497,7 +497,12 @@ impl LocalBackfillDispatcher {
         for bf in requests {
             let repo = Arc::clone(&self.repo);
             let bf = bf.clone();
-            let selection = bf.selection.clone();
+            let target = bf.target.clone();
+            // Display label for error context: the asset list, or `job:<name>`.
+            let label: Vec<String> = match &target {
+                crate::daemon::RunType::Materialization(sel) => sel.clone(),
+                crate::daemon::RunType::Job(name) => vec![format!("job:{name}")],
+            };
             let (tx, rx) = tokio::sync::oneshot::channel::<Result<PyBackfillResult, String>>();
             self.gil_threads.spawn(move || {
                 let tags = bf.tags.as_ref().map(|t| {
@@ -506,7 +511,7 @@ impl LocalBackfillDispatcher {
                         .collect::<Vec<(String, String)>>()
                 });
                 let result = match repo.get().backfill_inner(
-                    Some(bf.selection.clone()),
+                    target,
                     bf.partition_keys.clone(),
                     bf.partition_range.clone(),
                     bf.strategy.clone(),
@@ -531,7 +536,7 @@ impl LocalBackfillDispatcher {
                 };
                 let _ = tx.send(result);
             });
-            pending.push((selection, rx));
+            pending.push((label, rx));
         }
 
         let mut results: Vec<PyBackfillResult> = Vec::with_capacity(pending.len());

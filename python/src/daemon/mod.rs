@@ -52,7 +52,7 @@ pub(crate) use parse::{
 pub(crate) use types::{
     BackfillRequestData, BoxedPyFuture, ConditionEvalWriteMsg, GIL_SEMAPHORE,
     MaterializationRequestData, PrecomputedArgs, ResolvedEvalMode, RunRequestData, RunRerunRequest,
-    SensorOutcome, TickOutcome, TickWriteMsg,
+    RunType, SensorOutcome, TickOutcome, TickWriteMsg,
 };
 
 // RunBackend uses RPITIT so isn't object-safe; enum dispatch instead.

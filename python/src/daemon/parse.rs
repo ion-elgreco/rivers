@@ -146,7 +146,7 @@ pub(crate) fn extract_backfill_request_data(
         .map(|br| {
             let br = br.borrow(py);
             BackfillRequestData {
-                selection: br.selection.clone(),
+                target: crate::daemon::RunType::Materialization(br.selection.clone()),
                 partition_keys: br.partition_keys.clone(),
                 partition_range: br.partition_range.clone(),
                 strategy: br.strategy.clone(),

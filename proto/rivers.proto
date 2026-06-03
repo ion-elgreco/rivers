@@ -323,6 +323,9 @@ message LaunchBackfillRequest {
   uint32 max_concurrency = 6;
   repeated Tag tags = 7;
   bool dry_run = 8;
+  // When set, the backfill targets a named Job — each partition runs with the
+  // job's own plan + executor. Mutually exclusive with `selection`.
+  optional string job_name = 9;
 }
 
 message LaunchBackfillResponse {
