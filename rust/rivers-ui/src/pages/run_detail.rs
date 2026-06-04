@@ -396,6 +396,31 @@ fn render_event_cards(events: Vec<StoredEvent>, variant: &'static str) -> Vec<im
         .collect()
 }
 
+/// Step-completion status for an asset within a run drawer. A per-partition
+/// StepFailure (`mark_partition_failed`) is partial and must not flip a
+/// succeeded step to "Failed"; only a step-level StepFailure (no `partition_key`)
+/// does. Returns `(label, chip_class)`.
+fn asset_chip_status(asset_events: &[StoredEvent]) -> (&'static str, &'static str) {
+    let has_success = asset_events
+        .iter()
+        .any(|e| matches!(e.event_type, EventType::StepSuccess));
+    let has_failure = asset_events
+        .iter()
+        .any(|e| matches!(e.event_type, EventType::StepFailure) && e.partition_key.is_none());
+    let has_start = asset_events
+        .iter()
+        .any(|e| matches!(e.event_type, EventType::StepStart));
+    if has_failure {
+        ("Failed", "failed")
+    } else if has_success {
+        ("Success", "success")
+    } else if has_start {
+        ("Running", "running")
+    } else {
+        ("Pending", "pending")
+    }
+}
+
 /// Event log lives in the main LogPanel below — selection filters it, so we
 /// don't duplicate here.
 #[component]
@@ -426,22 +451,9 @@ fn RunAssetDrawer(
         })
         .map(|e| e.timestamp)
         .max();
-    let has_success = asset_events
-        .iter()
-        .any(|e| matches!(e.event_type, EventType::StepSuccess));
-    let has_failure = asset_events
-        .iter()
-        .any(|e| matches!(e.event_type, EventType::StepFailure));
     let has_start = start_ns.is_some();
-    let (status_label, status_for_chip) = if has_failure {
-        ("Failed", "failed".to_string())
-    } else if has_success {
-        ("Success", "success".to_string())
-    } else if has_start {
-        ("Running", "running".to_string())
-    } else {
-        ("Pending", "pending".to_string())
-    };
+    let (status_label, chip) = asset_chip_status(&asset_events);
+    let status_for_chip = chip.to_string();
     // For finished steps the duration is fixed; for running steps it ticks
     // each second by re-reading the global `now` clock.
     let duration_view = {
@@ -1420,5 +1432,52 @@ fn RunLogPanel(
                 }
             </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(event_type: EventType, partition_key: Option<&str>) -> StoredEvent {
+        StoredEvent {
+            id: String::new(),
+            event_type,
+            asset_key: Some("a".to_string()),
+            run_id: "r".to_string(),
+            partition_key: partition_key.map(str::to_string),
+            timestamp: 0,
+            metadata: vec![],
+            data_version: None,
+        }
+    }
+
+    #[test]
+    fn per_partition_failure_keeps_step_success() {
+        // A succeeded step with a partial (per-partition) failure stays "Success".
+        let events = [
+            ev(EventType::StepStart, None),
+            ev(EventType::StepFailure, Some("b")),
+            ev(EventType::StepSuccess, None),
+        ];
+        assert_eq!(asset_chip_status(&events), ("Success", "success"));
+    }
+
+    #[test]
+    fn step_level_failure_is_failed() {
+        let events = [
+            ev(EventType::StepStart, None),
+            ev(EventType::StepFailure, None),
+        ];
+        assert_eq!(asset_chip_status(&events), ("Failed", "failed"));
+    }
+
+    #[test]
+    fn running_then_pending() {
+        assert_eq!(
+            asset_chip_status(&[ev(EventType::StepStart, None)]),
+            ("Running", "running")
+        );
+        assert_eq!(asset_chip_status(&[]), ("Pending", "pending"));
     }
 }
