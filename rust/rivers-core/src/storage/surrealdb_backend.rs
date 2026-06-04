@@ -2093,9 +2093,42 @@ impl StorageBackend for SurrealStorage {
         let mut any_failed = false;
         let mut any_canceled = false;
 
+        // One query for every Success run's per-partition StepFailures, keyed by
+        // run_id, instead of a round-trip per run.
         #[derive(SurrealValue)]
-        struct PartRow {
+        struct FailRow {
+            run_id: String,
             partition_key: PartitionKey,
+        }
+        let success_run_ids: Vec<String> = runs
+            .iter()
+            .filter(|r| matches!(r.status, RunStatus::Success))
+            .map(|r| r.run_id.clone())
+            .collect();
+        let mut failed_by_run: std::collections::HashMap<
+            String,
+            std::collections::HashSet<PartitionKey>,
+        > = std::collections::HashMap::new();
+        if !success_run_ids.is_empty() {
+            let rows: Vec<FailRow> = super::retry::with_retry(&self.retry_config, || async {
+                let mut res = self
+                    .db
+                    .query(
+                        "SELECT run_id, partition_key FROM events \
+                         WHERE run_id IN $rids AND event_type = 'StepFailure' \
+                         AND partition_key IS NOT NULL GROUP BY run_id, partition_key",
+                    )
+                    .bind(("rids", success_run_ids.clone()))
+                    .await?;
+                Ok(res.take(0)?)
+            })
+            .await?;
+            for row in rows {
+                failed_by_run
+                    .entry(row.run_id)
+                    .or_default()
+                    .insert(row.partition_key);
+            }
         }
 
         for run in &runs {
@@ -2109,23 +2142,9 @@ impl StorageBackend for SurrealStorage {
             };
             match run.status {
                 RunStatus::Success => {
-                    let failed_members: std::collections::HashSet<PartitionKey> =
-                        super::retry::with_retry(&self.retry_config, || async {
-                            let mut fres = self
-                                .db
-                                .query(
-                                    "SELECT partition_key FROM events WHERE run_id = $rid \
-                                     AND event_type = 'StepFailure' AND partition_key IS NOT NULL \
-                                     GROUP BY partition_key",
-                                )
-                                .bind(("rid", run.run_id.clone()))
-                                .await?;
-                            let rows: Vec<PartRow> = fres.take(0)?;
-                            Ok(rows.into_iter().map(|r| r.partition_key).collect())
-                        })
-                        .await?;
+                    let failed_members = failed_by_run.get(&run.run_id);
                     for member in pk.members() {
-                        if failed_members.contains(&member) {
+                        if failed_members.is_some_and(|f| f.contains(&member)) {
                             failed_pks.push(member);
                             any_failed = true;
                         } else {

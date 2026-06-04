@@ -560,6 +560,48 @@ class TestBatchedPartialFailure:
         assert result.failed == 3, result.failed  # A/d1, B/d1, B/d2
         assert result.canceled == 2, result.canceled  # C/d1, C/d2
 
+    def test_per_dimension_partial_failure_keyed_by_run(self):
+        # Two Success runs each mark a different partition; the batched crediting
+        # query must attribute each failure to its own run.
+        pd = rs.PartitionsDefinition.multi(
+            {
+                "region": rs.PartitionsDefinition.static_(["A", "B"]),
+                "date": rs.PartitionsDefinition.static_(["d1", "d2"]),
+            }
+        )
+        a_d1 = rs.PartitionKey.multi({"region": "A", "date": "d1"})
+        b_d2 = rs.PartitionKey.multi({"region": "B", "date": "d2"})
+
+        @rs.Asset(partitions_def=pd)
+        def asset(context: rs.AssetExecutionContext) -> int:
+            keys = set(context.partition.keys)
+            if a_d1 in keys:
+                context.mark_partition_failed(a_d1, error="a-fail")
+            if b_d2 in keys:
+                context.mark_partition_failed(b_d2, error="b-fail")
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+        result = repo.backfill(
+            selection=["asset"],
+            partition_keys=[
+                rs.PartitionKey.multi({"region": r, "date": d})
+                for r in ("A", "B")
+                for d in ("d1", "d2")
+            ],
+            strategy=rs.BackfillStrategy.per_dimension(
+                multi_run=["region"], single_run=["date"]
+            ),
+        )
+        assert result.completed == 2, result.completed  # A/d2, B/d1
+        assert result.failed == 2, result.failed  # A/d1, B/d2
+        assert set(repo.storage.get_materialized_partitions("asset")) == {
+            rs.PartitionKey.multi({"region": "A", "date": "d2"}),
+            rs.PartitionKey.multi({"region": "B", "date": "d1"}),
+        }
+
 
 # ---------------------------------------------------------------------------
 # Asset-level default strategy
