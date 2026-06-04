@@ -511,18 +511,14 @@ pub fn AssetsListPage() -> impl IntoView {
                     };
                     const GRID: &str = "grid-template-columns: 32px 1.4fr 90px 120px 120px 1fr 120px 100px";
 
+                    // Hover preview caps each column; the full lineage is on the
+                    // asset's Lineage tab / DAG sidebar.
+                    const LINEAGE_PREVIEW: usize = 3;
                     let (upstream, downstream): (Vec<String>, Vec<String>) = if let Some(t) = topo {
-                        let up: Vec<String> = t.edges.iter()
-                            .filter(|(_, to)| to == &record.asset_key)
-                            .map(|(from, _)| from.clone())
-                            .take(3)
-                            .collect();
-                        let down: Vec<String> = t.edges.iter()
-                            .filter(|(from, _)| from == &record.asset_key)
-                            .map(|(_, to)| to.clone())
-                            .take(3)
-                            .collect();
-                        (up, down)
+                        (
+                            t.direct_upstream(&record.asset_key),
+                            t.direct_downstream(&record.asset_key),
+                        )
                     } else {
                         (Vec::new(), Vec::new())
                     };
@@ -532,32 +528,40 @@ pub fn AssetsListPage() -> impl IntoView {
                         <A href=href attr:class="grid-row mini-lineage-host" attr:style=GRID attr:title=last_ts_abs>
                             <span class=rail></span>
                             {has_lineage.then(|| {
-                                let up_rows = upstream.iter().map(|k| view! {
+                                let up_rows = upstream.iter().take(LINEAGE_PREVIEW).map(|k| view! {
                                     <div class="mini-lineage-row">
                                         <span class="mini-lineage-row-dot" style="background:var(--secondary)"></span>
                                         <span>{k.clone()}</span>
                                     </div>
                                 }).collect::<Vec<_>>();
-                                let down_rows = downstream.iter().map(|k| view! {
+                                let up_more = upstream.len().saturating_sub(LINEAGE_PREVIEW);
+                                let down_rows = downstream.iter().take(LINEAGE_PREVIEW).map(|k| view! {
                                     <div class="mini-lineage-row">
                                         <span class="mini-lineage-row-dot" style="background:var(--accent)"></span>
                                         <span>{k.clone()}</span>
                                     </div>
                                 }).collect::<Vec<_>>();
-                                let has_up = !up_rows.is_empty();
-                                let has_down = !down_rows.is_empty();
+                                let down_more = downstream.len().saturating_sub(LINEAGE_PREVIEW);
+                                let has_up = !upstream.is_empty();
+                                let has_down = !downstream.is_empty();
                                 view! {
                                     <span class="mini-lineage-tip">
                                         {has_up.then(|| view! {
                                             <div class="mini-lineage-col">
                                                 <span class="mini-lineage-col-label">"UPSTREAM"</span>
                                                 {up_rows}
+                                                {(up_more > 0).then(|| view! {
+                                                    <div class="mini-lineage-more">{format!("+{up_more} more")}</div>
+                                                })}
                                             </div>
                                         })}
                                         {has_down.then(|| view! {
                                             <div class="mini-lineage-col">
                                                 <span class="mini-lineage-col-label">"DOWNSTREAM"</span>
                                                 {down_rows}
+                                                {(down_more > 0).then(|| view! {
+                                                    <div class="mini-lineage-more">{format!("+{down_more} more")}</div>
+                                                })}
                                             </div>
                                         })}
                                     </span>

@@ -478,13 +478,7 @@ fn RunAssetDrawer(
 
     let upstream: Vec<String> = topology
         .as_ref()
-        .map(|t| {
-            t.edges
-                .iter()
-                .filter(|(_, to)| to == &asset_key)
-                .map(|(from, _)| from.clone())
-                .collect()
-        })
+        .map(|t| t.direct_upstream(&asset_key))
         .unwrap_or_default();
 
     let materializations: Vec<StoredEvent> = asset_events
