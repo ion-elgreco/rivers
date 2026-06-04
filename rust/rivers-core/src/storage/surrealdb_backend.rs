@@ -2109,18 +2109,21 @@ impl StorageBackend for SurrealStorage {
             };
             match run.status {
                 RunStatus::Success => {
-                    let mut fres = self
-                        .db
-                        .query(
-                            "SELECT partition_key FROM events WHERE run_id = $rid \
-                             AND event_type = 'StepFailure' AND partition_key IS NOT NULL \
-                             GROUP BY partition_key",
-                        )
-                        .bind(("rid", run.run_id.clone()))
-                        .await?;
-                    let rows: Vec<PartRow> = fres.take(0)?;
                     let failed_members: std::collections::HashSet<PartitionKey> =
-                        rows.into_iter().map(|r| r.partition_key).collect();
+                        super::retry::with_retry(&self.retry_config, || async {
+                            let mut fres = self
+                                .db
+                                .query(
+                                    "SELECT partition_key FROM events WHERE run_id = $rid \
+                                     AND event_type = 'StepFailure' AND partition_key IS NOT NULL \
+                                     GROUP BY partition_key",
+                                )
+                                .bind(("rid", run.run_id.clone()))
+                                .await?;
+                            let rows: Vec<PartRow> = fres.take(0)?;
+                            Ok(rows.into_iter().map(|r| r.partition_key).collect())
+                        })
+                        .await?;
                     for member in pk.members() {
                         if failed_members.contains(&member) {
                             failed_pks.push(member);
@@ -2151,19 +2154,23 @@ impl StorageBackend for SurrealStorage {
         // Set partition tracking from the authoritative run statuses.
         // Uses direct SET (not array::union) so this is idempotent regardless
         // of whether the local execute_backfill path already tracked partitions.
-        self.db
-            .query(
-                "UPDATE backfills SET \
-                 completed_partitions = $completed, \
-                 failed_partitions = $failed, \
-                 canceled_partitions = $canceled \
-                 WHERE backfill_id = $id",
-            )
-            .bind(("id", backfill_id.to_string()))
-            .bind(("completed", completed_pks))
-            .bind(("failed", failed_pks))
-            .bind(("canceled", canceled_pks))
-            .await?;
+        super::retry::with_retry(&self.retry_config, || async {
+            self.db
+                .query(
+                    "UPDATE backfills SET \
+                     completed_partitions = $completed, \
+                     failed_partitions = $failed, \
+                     canceled_partitions = $canceled \
+                     WHERE backfill_id = $id",
+                )
+                .bind(("id", backfill_id.to_string()))
+                .bind(("completed", completed_pks.clone()))
+                .bind(("failed", failed_pks.clone()))
+                .bind(("canceled", canceled_pks.clone()))
+                .await?;
+            Ok(())
+        })
+        .await?;
 
         let new_status = if any_failed {
             BackfillStatus::CompletedFailed

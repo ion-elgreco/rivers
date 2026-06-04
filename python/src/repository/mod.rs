@@ -3794,12 +3794,16 @@ impl PyCodeRepository {
         }
 
         // Single finalizer: reconciles per-partition credit and records the
-        // never-launched (stop-on-failure / cancel) keys as canceled.
-        let _ = io_rt().block_on(
+        // never-launched (stop-on-failure / cancel) keys as canceled. Transient
+        // errors retry inside the storage layer; a remaining error is surfaced
+        // rather than swallowed (it would otherwise leave the backfill InProgress).
+        if let Err(e) = io_rt().block_on(
             state
                 .storage
                 .try_complete_backfill(backfill_id, &canceled_keys),
-        );
+        ) {
+            tracing::error!(target: "rivers::repo", backfill_id = %backfill_id, error = %e, "backfill finalize failed");
+        }
 
         // External cancel takes precedence over the failure-derived status.
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
