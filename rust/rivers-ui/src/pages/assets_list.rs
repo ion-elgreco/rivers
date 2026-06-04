@@ -512,16 +512,10 @@ pub fn AssetsListPage() -> impl IntoView {
                     const GRID: &str = "grid-template-columns: 32px 1.4fr 90px 120px 120px 1fr 120px 100px";
 
                     let (upstream, downstream): (Vec<String>, Vec<String>) = if let Some(t) = topo {
-                        let up: Vec<String> = t.edges.iter()
-                            .filter(|(_, to)| to == &record.asset_key)
-                            .map(|(from, _)| from.clone())
-                            .take(3)
-                            .collect();
-                        let down: Vec<String> = t.edges.iter()
-                            .filter(|(from, _)| from == &record.asset_key)
-                            .map(|(_, to)| to.clone())
-                            .take(3)
-                            .collect();
+                        let mut up = t.direct_upstream(&record.asset_key);
+                        up.truncate(3);
+                        let mut down = t.direct_downstream(&record.asset_key);
+                        down.truncate(3);
                         (up, down)
                     } else {
                         (Vec::new(), Vec::new())

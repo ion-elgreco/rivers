@@ -603,17 +603,9 @@ pub fn AssetDetailPage() -> impl IntoView {
                         .map(|r| (r.asset_key.clone(), r))
                         .collect();
 
-                    let (upstream, downstream): (Vec<String>, Vec<String>) = topo.map(|t| {
-                        let up: Vec<String> = t.edges.iter()
-                            .filter(|(_, to)| to == &current_key)
-                            .map(|(from, _)| from.clone())
-                            .collect();
-                        let down: Vec<String> = t.edges.iter()
-                            .filter(|(from, _)| from == &current_key)
-                            .map(|(_, to)| to.clone())
-                            .collect();
-                        (up, down)
-                    }).unwrap_or_default();
+                    let (upstream, downstream): (Vec<String>, Vec<String>) = topo
+                        .map(|t| (t.direct_upstream(&current_key), t.direct_downstream(&current_key)))
+                        .unwrap_or_default();
 
                     let (lns, lnm) = loc.get();
                     let render_col = |label: &'static str, keys: Vec<String>, empty_msg: &'static str, records: &std::collections::HashMap<String, crate::types::AssetRecord>| {

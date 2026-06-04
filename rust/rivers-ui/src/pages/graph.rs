@@ -603,17 +603,9 @@ pub fn GraphPage() -> impl IntoView {
             {move || {
                 selected_node.get().map(|node_name| {
                     let topo = topology.get().and_then(|r| r.ok());
-                    let (upstream, downstream): (Vec<String>, Vec<String>) = topo.map(|t| {
-                        let up: Vec<String> = t.edges.iter()
-                            .filter(|(_, to)| to == &node_name)
-                            .map(|(from, _)| from.clone())
-                            .collect();
-                        let down: Vec<String> = t.edges.iter()
-                            .filter(|(from, _)| from == &node_name)
-                            .map(|(_, to)| to.clone())
-                            .collect();
-                        (up, down)
-                    }).unwrap_or_default();
+                    let (upstream, downstream): (Vec<String>, Vec<String>) = topo
+                        .map(|t| (t.direct_upstream(&node_name), t.direct_downstream(&node_name)))
+                        .unwrap_or_default();
 
                     view! {
                         <div class="dag-selected-sidebar">

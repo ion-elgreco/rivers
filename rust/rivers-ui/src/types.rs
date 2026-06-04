@@ -257,6 +257,30 @@ impl GraphTopology {
         (anc, desc)
     }
 
+    /// Direct upstream dependencies (one hop) of `node_name`.
+    ///
+    /// Edges are `(from, to)` where `from` depends on `to`, so the upstream of
+    /// `node_name` are the `to` of edges where it is the `from`.
+    pub fn direct_upstream(&self, node_name: &str) -> Vec<String> {
+        self.edges
+            .iter()
+            .filter(|(from, _)| from == node_name)
+            .map(|(_, to)| to.clone())
+            .collect()
+    }
+
+    /// Direct downstream dependents (one hop) of `node_name`.
+    ///
+    /// The downstream of `node_name` are the `from` of edges where it is the
+    /// `to` (i.e. the assets that depend on it).
+    pub fn direct_downstream(&self, node_name: &str) -> Vec<String> {
+        self.edges
+            .iter()
+            .filter(|(_, to)| to == node_name)
+            .map(|(from, _)| from.clone())
+            .collect()
+    }
+
     /// Return a new topology with collapsed graph assets.
     /// Nodes whose `parent_graph` points to a graph asset NOT in `expanded` are removed.
     /// Edges to/from removed nodes are rewired to their parent graph asset node.
@@ -1248,5 +1272,38 @@ mod conversions {
             let core: rivers_core::storage::BackfillFilter = ui.into();
             assert!(core.status.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod topology_tests {
+    use super::{GraphTopology, TopologyNode};
+
+    fn node(name: &str) -> TopologyNode {
+        TopologyNode {
+            name: name.into(),
+            kind: "asset".into(),
+            group: None,
+            parent_graph: None,
+        }
+    }
+
+    /// `summary` depends on `raw_data` → edge `(summary, raw_data)`. Selecting
+    /// `raw_data`, `summary` must be DOWNSTREAM (it consumes raw_data), not
+    /// upstream. Regression for the swapped lineage labels (issue #57).
+    #[test]
+    fn direct_upstream_downstream_directions() {
+        let topo = GraphTopology {
+            nodes: vec![node("raw_data"), node("summary")],
+            edges: vec![("summary".into(), "raw_data".into())],
+        };
+
+        // raw_data is a source: no upstream, summary downstream.
+        assert!(topo.direct_upstream("raw_data").is_empty());
+        assert_eq!(topo.direct_downstream("raw_data"), vec!["summary"]);
+
+        // summary consumes raw_data: raw_data upstream, no downstream.
+        assert_eq!(topo.direct_upstream("summary"), vec!["raw_data"]);
+        assert!(topo.direct_downstream("summary").is_empty());
     }
 }
