@@ -2278,10 +2278,11 @@ impl StorageBackend for SurrealStorage {
                 .query(
                     "SELECT \
                          math::sum(IF event_type = 'StepStart' THEN 1 ELSE 0 END) AS total, \
-                         math::sum(IF event_type IN ['StepSuccess', 'StepFailure'] THEN 1 ELSE 0 END) AS completed \
+                         math::sum(IF event_type = 'StepSuccess' OR (event_type = 'StepFailure' AND partition_key IS NONE) THEN 1 ELSE 0 END) AS completed \
                      FROM events WHERE run_id = $run_id GROUP ALL; \
                      SELECT asset_key, timestamp FROM events \
-                         WHERE run_id = $run_id AND event_type IN ['StepSuccess', 'StepFailure'] \
+                         WHERE run_id = $run_id \
+                         AND (event_type = 'StepSuccess' OR (event_type = 'StepFailure' AND partition_key IS NONE)) \
                          ORDER BY timestamp DESC LIMIT 1",
                 )
                 .bind(("run_id", run_id.to_string()))
@@ -10144,6 +10145,54 @@ mod tests {
         assert_eq!(progress.completed_steps, 2);
         assert_eq!(progress.last_step_completed_at, Some(250));
         assert_eq!(progress.last_completed_step.as_deref(), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn test_get_run_progress_excludes_per_partition_failures() {
+        let storage = make_storage().await;
+        let run_id = "run-progress-partial";
+
+        // One step: StepStart + StepSuccess.
+        for (event_type, ts) in [(EventType::StepStart, 100), (EventType::StepSuccess, 200)] {
+            storage
+                .store_event(&EventRecord {
+                    code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+                    event_type,
+                    asset_key: Some("a".to_string()),
+                    run_id: run_id.to_string(),
+                    partition_key: None,
+                    timestamp: ts,
+                    metadata: vec![],
+                    input_data_versions: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        // Per-partition StepFailure events (mark_partition_failed) must NOT count
+        // toward step progress, or completed would exceed total.
+        for (key, ts) in [("p1", 150), ("p2", 160)] {
+            storage
+                .store_event(&EventRecord {
+                    code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+                    event_type: EventType::StepFailure,
+                    asset_key: Some("a".to_string()),
+                    run_id: run_id.to_string(),
+                    partition_key: Some(PartitionKey::Single {
+                        keys: vec![key.to_string()],
+                    }),
+                    timestamp: ts,
+                    metadata: vec![("error".to_string(), "boom".to_string())],
+                    input_data_versions: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        let progress = storage.get_run_progress(run_id).await.unwrap();
+        assert_eq!(progress.total_steps, 1);
+        assert_eq!(progress.completed_steps, 1);
+        assert_eq!(progress.last_step_completed_at, Some(200));
+        assert_eq!(progress.last_completed_step.as_deref(), Some("a"));
     }
 
     #[tokio::test]

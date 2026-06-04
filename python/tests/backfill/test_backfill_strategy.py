@@ -499,6 +499,25 @@ class TestBatchedPartialFailure:
             }, out
             self._assert_partition_failure_event(repo, out)
 
+    def test_partial_failure_run_progress_not_inflated(self):
+        # A batched partial-failure run is ONE step; its per-partition
+        # StepFailure events must not inflate run progress past total_steps.
+        @rs.Asset(partitions_def=_static_pd(["a", "b", "c"]))
+        def asset(context: rs.AssetExecutionContext) -> int:
+            context.mark_partition_failed(rs.PartitionKey.single("b"), error="boom")
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+        result = repo.backfill(
+            selection=["asset"],
+            partition_keys=[rs.PartitionKey.single(k) for k in ("a", "b", "c")],
+            strategy=rs.BackfillStrategy.single_run(),
+        )
+        completed, total = repo.storage.get_run_progress(result.run_ids[0])
+        assert (completed, total) == (1, 1), (completed, total)
+
 
 # ---------------------------------------------------------------------------
 # Asset-level default strategy
