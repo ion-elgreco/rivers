@@ -371,13 +371,24 @@ class TestBatchedPartialFailure:
         assert failures[0].partition_key == rs.PartitionKey.single(key)
         assert dict(failures[0].metadata).get("error") == error
 
-    def _assert_single_run_partial_failure(self, executor, io_handler=None):
+    def _assert_single_run_partial_failure(
+        self, executor, io_handler=None, is_async=False
+    ):
         kwargs = {"io_handler": io_handler} if io_handler is not None else {}
 
-        @rs.Asset(partitions_def=_static_pd(["a", "b", "c"]), **kwargs)
-        def asset(context: rs.AssetExecutionContext) -> int:
-            context.mark_partition_failed(rs.PartitionKey.single("b"), error="boom")
-            return 1
+        if is_async:
+
+            @rs.Asset(partitions_def=_static_pd(["a", "b", "c"]), **kwargs)
+            async def asset(context: rs.AssetExecutionContext) -> int:
+                await asyncio.sleep(0)
+                context.mark_partition_failed(rs.PartitionKey.single("b"), error="boom")
+                return 1
+        else:
+
+            @rs.Asset(partitions_def=_static_pd(["a", "b", "c"]), **kwargs)
+            def asset(context: rs.AssetExecutionContext) -> int:
+                context.mark_partition_failed(rs.PartitionKey.single("b"), error="boom")
+                return 1
 
         repo = rs.CodeRepository(assets=[asset], default_executor=executor)
         result = repo.backfill(
@@ -393,6 +404,9 @@ class TestBatchedPartialFailure:
         assert len(result.run_ids) == 1
         assert result.completed == 2
         assert result.failed == 1
+        # The persisted backfill record agrees on the counts.
+        status = repo.get_backfill(result.backfill_id)
+        assert (status.completed_partitions, status.failed_partitions) == (2, 1)
         # Only the succeeded partitions are materialized.
         assert set(repo.storage.get_materialized_partitions("asset")) == {
             rs.PartitionKey.single("a"),
@@ -402,6 +416,9 @@ class TestBatchedPartialFailure:
 
     def test_single_run_partial_failure(self):
         self._assert_single_run_partial_failure(rs.Executor.in_process())
+
+    def test_single_run_partial_failure_async(self):
+        self._assert_single_run_partial_failure(rs.Executor.in_process(), is_async=True)
 
     def test_single_run_partial_failure_parallel(self, tmp_path):
         # The parallel backend short-circuits a *single* sync step to in-process
