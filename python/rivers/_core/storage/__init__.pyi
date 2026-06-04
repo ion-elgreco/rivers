@@ -23,7 +23,7 @@ class StoredEvent:
     event_type: str
     asset_key: str | None
     run_id: str
-    partition_key: str | None
+    partition_key: "PartitionKey | None"
     timestamp: int
     metadata: list[tuple[str, str]]
     data_version: str | None

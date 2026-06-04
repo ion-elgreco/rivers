@@ -357,6 +357,150 @@ class TestPerDimensionExecution:
 
 
 # ---------------------------------------------------------------------------
+# Per-partition partial failure (mark_partition_failed) within a batched run
+# ---------------------------------------------------------------------------
+
+
+class TestBatchedPartialFailure:
+    def _assert_partition_failure_event(self, repo, asset_key, key="b", error="boom"):
+        # The marked partition must surface as a per-partition StepFailure event
+        # (partition_key set + the user's error), not just an absent materialization.
+        events = repo.storage.get_events_for_asset(asset_key)
+        failures = [e for e in events if e.event_type == "StepFailure"]
+        assert len(failures) == 1, [e.event_type for e in failures]
+        assert failures[0].partition_key == rs.PartitionKey.single(key)
+        assert dict(failures[0].metadata).get("error") == error
+
+    def _assert_single_run_partial_failure(self, executor, io_handler=None):
+        kwargs = {"io_handler": io_handler} if io_handler is not None else {}
+
+        @rs.Asset(partitions_def=_static_pd(["a", "b", "c"]), **kwargs)
+        def asset(context: rs.AssetExecutionContext) -> int:
+            context.mark_partition_failed(rs.PartitionKey.single("b"), error="boom")
+            return 1
+
+        repo = rs.CodeRepository(assets=[asset], default_executor=executor)
+        result = repo.backfill(
+            selection=["asset"],
+            partition_keys=[
+                rs.PartitionKey.single("a"),
+                rs.PartitionKey.single("b"),
+                rs.PartitionKey.single("c"),
+            ],
+            strategy=rs.BackfillStrategy.single_run(),
+        )
+        # One batched run, but a per-partition outcome: a, c done; b failed.
+        assert len(result.run_ids) == 1
+        assert result.completed == 2
+        assert result.failed == 1
+        # Only the succeeded partitions are materialized.
+        assert set(repo.storage.get_materialized_partitions("asset")) == {
+            rs.PartitionKey.single("a"),
+            rs.PartitionKey.single("c"),
+        }
+        self._assert_partition_failure_event(repo, "asset")
+
+    def test_single_run_partial_failure(self):
+        self._assert_single_run_partial_failure(rs.Executor.in_process())
+
+    def test_single_run_partial_failure_parallel(self, tmp_path):
+        # The parallel backend short-circuits a *single* sync step to in-process
+        # (execute.rs), so a lone asset never reaches a loky worker. Add an
+        # independent sibling to force ≥2 sync instances onto the worker path;
+        # the marking asset must then carry its marks back across the worker
+        # boundary for the partition to be recorded failed.
+        import obstore
+
+        store = obstore.store.LocalStore(str(tmp_path), mkdir=True)
+        io = rs.PickleIOHandler(store=store)
+
+        @rs.Asset(partitions_def=_static_pd(["a", "b", "c"]), io_handler=io)
+        def marks(context: rs.AssetExecutionContext) -> int:
+            context.mark_partition_failed(rs.PartitionKey.single("b"), error="boom")
+            return 1
+
+        @rs.Asset(partitions_def=_static_pd(["a", "b", "c"]), io_handler=io)
+        def sibling(context: rs.AssetExecutionContext) -> int:
+            return 1  # forces ≥2 sync instances → loky worker path
+
+        repo = rs.CodeRepository(
+            assets=[marks, sibling],
+            default_executor=rs.Executor.parallel(max_workers=2),
+        )
+        repo.backfill(
+            selection=["marks", "sibling"],
+            partition_keys=[rs.PartitionKey.single(k) for k in ("a", "b", "c")],
+            strategy=rs.BackfillStrategy.single_run(),
+        )
+        # The marking asset's failed partition must NOT be materialized.
+        assert set(repo.storage.get_materialized_partitions("marks")) == {
+            rs.PartitionKey.single("a"),
+            rs.PartitionKey.single("c"),
+        }
+        self._assert_partition_failure_event(repo, "marks")
+
+    def test_single_run_partial_failure_generator(self):
+        # Single-output generator: marks are set only as the generator body runs
+        # (lazily, during output iteration), so they must be drained from the
+        # generator context before emission.
+        handler = rs.InMemoryIOHandler()
+
+        @rs.Asset.from_multi(
+            partitions_def=_static_pd(["a", "b", "c"]),
+            output_defs=[rs.AssetDef("gen", io_handler=handler)],
+        )
+        def gen_asset(context: rs.AssetExecutionContext):
+            context.mark_partition_failed(rs.PartitionKey.single("b"), error="boom")
+            yield rs.Output(value=1, output_name="gen")
+
+        repo = rs.CodeRepository(
+            assets=[gen_asset], default_executor=rs.Executor.in_process()
+        )
+        repo.backfill(
+            selection=["gen"],
+            partition_keys=[rs.PartitionKey.single(k) for k in ("a", "b", "c")],
+            strategy=rs.BackfillStrategy.single_run(),
+        )
+        assert set(repo.storage.get_materialized_partitions("gen")) == {
+            rs.PartitionKey.single("a"),
+            rs.PartitionKey.single("c"),
+        }
+        self._assert_partition_failure_event(repo, "gen")
+
+    def test_single_run_partial_failure_multi_asset(self):
+        # The mark is step-level, so it must apply to every output of a
+        # multi-asset (lookup keyed by output name, not the step name).
+        handler = rs.InMemoryIOHandler()
+
+        @rs.Asset.from_multi(
+            partitions_def=_static_pd(["a", "b", "c"]),
+            output_defs=[
+                rs.AssetDef("x", io_handler=handler),
+                rs.AssetDef("y", io_handler=handler),
+            ],
+        )
+        def multi(context: rs.AssetExecutionContext):
+            context.mark_partition_failed(rs.PartitionKey.single("b"), error="boom")
+            yield rs.Output(value=1, output_name="x")
+            yield rs.Output(value=2, output_name="y")
+
+        repo = rs.CodeRepository(
+            assets=[multi], default_executor=rs.Executor.in_process()
+        )
+        repo.backfill(
+            selection=["x", "y"],
+            partition_keys=[rs.PartitionKey.single(k) for k in ("a", "b", "c")],
+            strategy=rs.BackfillStrategy.single_run(),
+        )
+        for out in ("x", "y"):
+            assert set(repo.storage.get_materialized_partitions(out)) == {
+                rs.PartitionKey.single("a"),
+                rs.PartitionKey.single("c"),
+            }, out
+            self._assert_partition_failure_event(repo, out)
+
+
+# ---------------------------------------------------------------------------
 # Asset-level default strategy
 # ---------------------------------------------------------------------------
 
