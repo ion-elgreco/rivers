@@ -38,6 +38,7 @@ pub(crate) struct RunState<'a> {
     pub failed_names: &'a mut HashSet<String>,
     pub graph_started: &'a mut HashSet<String>,
     pub mapped_instance_keys: &'a mut HashMap<String, Vec<String>>,
+    pub failed_partitions: &'a mut HashMap<String, Vec<(PyPartitionKey, String)>>,
     /// Per-step record of `dynamic_keys` produced when an asset was executed
     /// in this orchestrator process. Presence is the signal "we saw this
     /// source step run in this batch": empty `Vec` means it ran with plain
@@ -148,19 +149,36 @@ impl<'a> BatchContext<'a> {
         input_versions: Vec<(String, String)>,
         ts: i64,
     ) {
+        let failed = self
+            .state
+            .failed_partitions
+            .get(step_name)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         match self.scope.partition_key {
             Some(pk) => {
                 for member in pk.members() {
-                    ops::emit_materialization(
-                        self.sink.writer,
-                        self.scope.run_id,
-                        step_name,
-                        &Some(member),
-                        metadata,
-                        data_version.clone(),
-                        input_versions.clone(),
-                        ts,
-                    );
+                    if let Some((_, error)) = failed.iter().find(|(k, _)| *k == member) {
+                        ops::emit_partition_failure(
+                            self.sink.writer,
+                            self.scope.run_id,
+                            step_name,
+                            &member,
+                            error,
+                            ts,
+                        );
+                    } else {
+                        ops::emit_materialization(
+                            self.sink.writer,
+                            self.scope.run_id,
+                            step_name,
+                            &Some(member),
+                            metadata,
+                            data_version.clone(),
+                            input_versions.clone(),
+                            ts,
+                        );
+                    }
                 }
             }
             None => ops::emit_materialization(

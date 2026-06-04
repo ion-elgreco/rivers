@@ -2085,26 +2085,52 @@ impl StorageBackend for SurrealStorage {
         let mut any_failed = false;
         let mut any_canceled = false;
 
+        #[derive(SurrealValue)]
+        struct PartRow {
+            partition_key: PartitionKey,
+        }
+
         for run in &runs {
-            if let Some(ref pk) = run.partition_key {
-                match run.status {
-                    RunStatus::Success => completed_pks.extend(pk.members()),
-                    RunStatus::Failure => {
-                        failed_pks.extend(pk.members());
-                        any_failed = true;
-                    }
-                    RunStatus::Canceled => {
-                        canceled_pks.extend(pk.members());
-                        any_canceled = true;
-                    }
-                    _ => {}
-                }
-            } else {
+            let Some(ref pk) = run.partition_key else {
                 match run.status {
                     RunStatus::Failure => any_failed = true,
                     RunStatus::Canceled => any_canceled = true,
                     _ => {}
                 }
+                continue;
+            };
+            match run.status {
+                RunStatus::Success => {
+                    let mut fres = self
+                        .db
+                        .query(
+                            "SELECT partition_key FROM events WHERE run_id = $rid \
+                             AND event_type = 'StepFailure' AND partition_key IS NOT NULL \
+                             GROUP BY partition_key",
+                        )
+                        .bind(("rid", run.run_id.clone()))
+                        .await?;
+                    let rows: Vec<PartRow> = fres.take(0)?;
+                    let failed_members: std::collections::HashSet<PartitionKey> =
+                        rows.into_iter().map(|r| r.partition_key).collect();
+                    for member in pk.members() {
+                        if failed_members.contains(&member) {
+                            failed_pks.push(member);
+                            any_failed = true;
+                        } else {
+                            completed_pks.push(member);
+                        }
+                    }
+                }
+                RunStatus::Failure => {
+                    failed_pks.extend(pk.members());
+                    any_failed = true;
+                }
+                RunStatus::Canceled => {
+                    canceled_pks.extend(pk.members());
+                    any_canceled = true;
+                }
+                _ => {}
             }
         }
 

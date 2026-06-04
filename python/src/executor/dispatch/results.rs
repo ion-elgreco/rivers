@@ -76,6 +76,29 @@ fn emit_materialization_and_hooks(
 /// `step_name` is the IO + event scope: `step.name` for non-mapped (single
 /// or multi-asset), `instance_name` for a mapped fan-out instance. Multi-
 /// asset paths are never mapped, so `step_name == step.name` for them.
+/// Stash per-partition failure marks (`mark_partition_failed`) so
+/// `emit_materialization` emits a StepFailure for them instead of a
+/// Materialization. Keyed by every name the step emits under — a multi-asset
+/// emits per output name, not under `step.name`.
+fn stash_failed_partitions(
+    ctx: &mut BatchContext,
+    step: &ExecutionStep,
+    marks: Vec<(crate::partitions::PyPartitionKey, String)>,
+) {
+    if marks.is_empty() {
+        return;
+    }
+    if step.outputs.is_empty() {
+        ctx.state.failed_partitions.insert(step.name.clone(), marks);
+    } else {
+        for out in &step.outputs {
+            ctx.state
+                .failed_partitions
+                .insert(out.clone(), marks.clone());
+        }
+    }
+}
+
 pub(crate) fn process_step_result(
     py: Python,
     ctx: &mut BatchContext,
@@ -84,6 +107,7 @@ pub(crate) fn process_step_result(
     step_result: ops::StepResult,
     failures: &mut Vec<(String, PyErr)>,
 ) {
+    stash_failed_partitions(ctx, step, step_result.failed_partitions.clone());
     let node = ctx.repo.node_map.get(&step.name).unwrap();
 
     // External asset observation: skip iteration, emit Observation only.
@@ -145,6 +169,16 @@ pub(crate) fn process_step_result(
         None
     };
 
+    // A generator's marks are set only as its body runs (lazily, while
+    // for_each_output drives it), so drain the generator context before the
+    // first output is emitted rather than up-front like the return path.
+    let gen_ctx: Option<Py<PyAny>> = match &step_result.generator {
+        Some(ops::GeneratorType::Sync { context })
+        | Some(ops::GeneratorType::Async { context }) => context.as_ref().map(|c| c.clone_ref(py)),
+        None => None,
+    };
+    let mut gen_marks_stashed = false;
+
     let result = ops::for_each_output(
         py,
         &step_result,
@@ -152,6 +186,14 @@ pub(crate) fn process_step_result(
         step_name,
         bridge,
         |py, item| {
+            if !gen_marks_stashed {
+                gen_marks_stashed = true;
+                stash_failed_partitions(
+                    ctx,
+                    step,
+                    ops::drain_failed_partitions(py, gen_ctx.as_ref()),
+                );
+            }
             match item {
                 ops::OutputItem::Materialization {
                     name,
@@ -469,6 +511,24 @@ pub(crate) fn process_worker_result(
     } else {
         None
     };
+
+    // Worker-drained mark_partition_failed marks cross IPC as (key_json, error);
+    // stash them like process_step_result so emit_materialization emits a
+    // per-partition StepFailure instead of a Materialization.
+    let worker_marks: Vec<(String, String)> = worker_result
+        .getattr(py, "failed_partitions")
+        .ok()
+        .and_then(|o| o.extract::<Vec<(String, String)>>(py).ok())
+        .unwrap_or_default();
+    let marks: Vec<(crate::partitions::PyPartitionKey, String)> = worker_marks
+        .into_iter()
+        .filter_map(|(json, err)| {
+            rivers_core::storage::PartitionKey::from_json(&json)
+                .ok()
+                .map(|core| ((&core).into(), err))
+        })
+        .collect();
+    stash_failed_partitions(ctx, step, marks);
 
     for item_any in outputs_list.iter() {
         if let Err(e) = process_one_worker_item(

@@ -102,6 +102,26 @@ pub(crate) fn emit_step_failure(
     );
 }
 
+pub(crate) fn emit_partition_failure(
+    writer: &EventWriter,
+    run_id: &str,
+    step_name: &str,
+    partition_key: &PyPartitionKey,
+    error: &str,
+    ts: i64,
+) {
+    writer.emit(EventRecord {
+        code_location_id: String::new(),
+        event_type: EventType::StepFailure,
+        asset_key: Some(step_name.to_string()),
+        run_id: run_id.to_string(),
+        partition_key: Some(partition_key.into()),
+        timestamp: ts,
+        metadata: vec![("error".to_string(), error.to_string())],
+        input_data_versions: vec![],
+    });
+}
+
 pub(crate) fn emit_log_output(
     writer: &EventWriter,
     run_id: &str,
