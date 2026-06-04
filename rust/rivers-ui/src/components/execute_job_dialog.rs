@@ -108,7 +108,11 @@ pub fn ExecuteJobDialog(
             Ok(ExecOutcome::Backfill(backfill_id)) if !backfill_id.is_empty() => {
                 show.set(false);
                 let (ns, name) = loc.get();
-                nav_to.set(Some(loc_path(&ns, &name, &format!("backfills/{backfill_id}"))));
+                nav_to.set(Some(loc_path(
+                    &ns,
+                    &name,
+                    &format!("backfills/{backfill_id}"),
+                )));
             }
             Ok(_) => error.set(Some("Execution returned no id.".to_string())),
             Err(e) => error.set(Some(e)),

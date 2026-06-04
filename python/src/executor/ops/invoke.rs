@@ -634,15 +634,12 @@ pub(crate) fn drain_failed_partitions(
 ) -> Vec<(crate::partitions::PyPartitionKey, String)> {
     ctx_ref
         .and_then(|c| {
-            c.bind(py)
-                .cast::<PyAssetExecutionContext>()
-                .ok()
-                .map(|b| {
-                    b.get()
-                        .drain_failed_backfill_partitions()
-                        .into_iter()
-                        .collect()
-                })
+            c.bind(py).cast::<PyAssetExecutionContext>().ok().map(|b| {
+                b.get()
+                    .drain_failed_backfill_partitions()
+                    .into_iter()
+                    .collect()
+            })
         })
         .unwrap_or_default()
 }
