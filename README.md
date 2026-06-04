@@ -41,7 +41,7 @@ spec:
 
 The operator resolves the image to a digest, reconciles a `Deployment` + `Service` running `rivers serve`, registers it with the UI's discovery registry, and re-polls the registry to keep the digest fresh. Multi-arch images (`linux/amd64`, `linux/arm64`) and Helm charts are published to `ghcr.io` on every release with SLSA build-provenance attestations.
 
-See the [installation guide](https://ion-elgreco.github.io/rivers/installation/kubernetes/) for the full setup — helm install commands, common values, and an [architecture overview](https://ion-elgreco.github.io/rivers/installation/overview/) with the reconciliation and run sequence diagrams.
+See the [installation guide](https://ion-elgreco.github.io/rivers/latest/installation/kubernetes/) for the full setup — helm install commands, common values, and an [architecture overview](https://ion-elgreco.github.io/rivers/latest/installation/overview/) with the reconciliation and run sequence diagrams.
 
 ## Install
 
