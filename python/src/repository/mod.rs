@@ -3793,31 +3793,21 @@ impl PyCodeRepository {
             ));
         }
 
-        if !canceled_keys.is_empty() {
-            let _ = io_rt().block_on(state.storage.update_backfill_progress(
-                backfill_id,
-                &[],
-                &[],
-                &[],
-                &canceled_keys,
-            ));
-        }
+        // Single finalizer: reconciles per-partition credit and records the
+        // never-launched (stop-on-failure / cancel) keys as canceled.
+        let _ = io_rt().block_on(
+            state
+                .storage
+                .try_complete_backfill(backfill_id, &canceled_keys),
+        );
 
+        // External cancel takes precedence over the failure-derived status.
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = io_rt().block_on(state.storage.update_backfill_status(
                 backfill_id,
                 BackfillStatus::Canceled,
                 Some(now_ts()),
             ));
-        } else if !canceled_keys.is_empty() {
-            // Stop-on-failure caused early termination
-            let _ = io_rt().block_on(state.storage.update_backfill_status(
-                backfill_id,
-                BackfillStatus::CompletedFailed,
-                Some(now_ts()),
-            ));
-        } else {
-            let _ = io_rt().block_on(state.storage.try_complete_backfill(backfill_id));
         }
 
         {

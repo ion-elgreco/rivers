@@ -2087,9 +2087,11 @@ pub trait StorageBackend: PerCodeLocationStorage {
     /// Check if all runs for a backfill are terminal. If so, transition the
     /// backfill to CompletedSuccess/CompletedFailed/Canceled and set end_time.
     /// Returns the new status if finalized, None if still in progress.
+    /// `extra_canceled`: never-launched partitions (no run record) to count canceled.
     fn try_complete_backfill(
         &self,
         backfill_id: &str,
+        extra_canceled: &[PartitionKey],
     ) -> impl Future<Output = Result<Option<BackfillStatus>>> + Send;
 
     /// Release all concurrency slots held by a specific step (across all pools).

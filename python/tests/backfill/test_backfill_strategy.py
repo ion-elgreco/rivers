@@ -518,6 +518,48 @@ class TestBatchedPartialFailure:
         completed, total = repo.storage.get_run_progress(result.run_ids[0])
         assert (completed, total) == (1, 1), (completed, total)
 
+    def test_stop_on_failure_reconciles_partial_failure_credit(self):
+        # Group A partial-fails (marks A/d1, succeeds), group B hard-fails (→
+        # stop), group C is canceled. The stop-on-failure terminal path must
+        # still reconcile A/d1 as failed, not leave it credited completed.
+        pd = rs.PartitionsDefinition.multi(
+            {
+                "region": rs.PartitionsDefinition.static_(["A", "B", "C"]),
+                "date": rs.PartitionsDefinition.static_(["d1", "d2"]),
+            }
+        )
+        a_d1 = rs.PartitionKey.multi({"region": "A", "date": "d1"})
+        b_d1 = rs.PartitionKey.multi({"region": "B", "date": "d1"})
+
+        @rs.Asset(partitions_def=pd)
+        def asset(context: rs.AssetExecutionContext) -> int:
+            keys = set(context.partition.keys)
+            if b_d1 in keys:
+                raise RuntimeError("boom")  # region B hard-fails → stop
+            if a_d1 in keys:
+                context.mark_partition_failed(a_d1, error="partial")
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+        result = repo.backfill(
+            selection=["asset"],
+            partition_keys=[
+                rs.PartitionKey.multi({"region": r, "date": d})
+                for r in ("A", "B", "C")
+                for d in ("d1", "d2")
+            ],
+            strategy=rs.BackfillStrategy.per_dimension(
+                multi_run=["region"], single_run=["date"]
+            ),
+            failure_policy="stop_on_failure",
+        )
+        assert result.status == "CompletedFailed", result.status
+        assert result.completed == 1, result.completed  # A/d2
+        assert result.failed == 3, result.failed  # A/d1, B/d1, B/d2
+        assert result.canceled == 2, result.canceled  # C/d1, C/d2
+
 
 # ---------------------------------------------------------------------------
 # Asset-level default strategy

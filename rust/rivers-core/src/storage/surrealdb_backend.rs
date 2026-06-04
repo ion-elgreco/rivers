@@ -2054,7 +2054,11 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
-    async fn try_complete_backfill(&self, backfill_id: &str) -> Result<Option<BackfillStatus>> {
+    async fn try_complete_backfill(
+        &self,
+        backfill_id: &str,
+        extra_canceled: &[PartitionKey],
+    ) -> Result<Option<BackfillStatus>> {
         let backfill = self
             .get_backfill(backfill_id)
             .await?
@@ -2064,11 +2068,11 @@ impl StorageBackend for SurrealStorage {
             return Ok(None);
         }
 
-        if backfill.run_ids.is_empty() {
-            return Ok(None);
-        }
-
-        let runs = self.get_runs_by_ids(&backfill.run_ids, None).await?;
+        let runs = if backfill.run_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.get_runs_by_ids(&backfill.run_ids, None).await?
+        };
         let all_terminal = runs.iter().all(|r| {
             matches!(
                 r.status,
@@ -2076,6 +2080,10 @@ impl StorageBackend for SurrealStorage {
             )
         });
         if !all_terminal {
+            return Ok(None);
+        }
+        // Nothing to finalize: no terminal runs and no externally-canceled keys.
+        if runs.is_empty() && extra_canceled.is_empty() {
             return Ok(None);
         }
 
@@ -2132,6 +2140,12 @@ impl StorageBackend for SurrealStorage {
                 }
                 _ => {}
             }
+        }
+
+        // Never-launched partitions (stop-on-failure / cancel) have no run record.
+        if !extra_canceled.is_empty() {
+            canceled_pks.extend(extra_canceled.iter().cloned());
+            any_canceled = true;
         }
 
         // Set partition tracking from the authoritative run statuses.

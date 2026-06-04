@@ -24,7 +24,11 @@ pub fn group_into_runs(
                 let group_key = extract_multi_run_dims(pk, multi_run);
                 groups.entry(group_key).or_default().push(pk.clone());
             }
-            groups.into_values().collect()
+            // Sort for deterministic order (HashMap iteration is randomized) so
+            // execution / stop-on-failure cancellation is reproducible.
+            let mut ordered: Vec<_> = groups.into_iter().collect();
+            ordered.sort_by(|a, b| a.0.cmp(&b.0));
+            ordered.into_iter().map(|(_, g)| g).collect()
         }
     }
 }
@@ -161,6 +165,32 @@ mod tests {
         for group in &groups {
             assert_eq!(group.len(), 2);
         }
+    }
+
+    #[test]
+    fn test_group_per_dimension_deterministic_order() {
+        // Deterministic order regardless of input order (not HashMap iteration).
+        let keys = vec![
+            multi_key(&[("region", "us"), ("date", "2024-01-01")]),
+            multi_key(&[("region", "eu"), ("date", "2024-01-01")]),
+            multi_key(&[("region", "ap"), ("date", "2024-01-01")]),
+        ];
+        let strategy = BackfillStrategy::PerDimension {
+            multi_run: vec!["region".to_string()],
+            single_run: vec!["date".to_string()],
+        };
+        let regions: Vec<String> = group_into_runs(&strategy, &keys)
+            .iter()
+            .map(|g| match &g[0] {
+                PartitionKey::Multi { dims } => dims
+                    .iter()
+                    .find(|(n, _)| n == "region")
+                    .map(|(_, v)| v[0].clone())
+                    .unwrap(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(regions, vec!["ap", "eu", "us"]);
     }
 
     #[test]
