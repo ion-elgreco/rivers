@@ -149,16 +149,16 @@ impl<'a> BatchContext<'a> {
         input_versions: Vec<(String, String)>,
         ts: i64,
     ) {
-        let failed = self
-            .state
-            .failed_partitions
-            .get(step_name)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
         match self.scope.partition_key {
             Some(pk) => {
+                let failed: HashMap<&PyPartitionKey, &str> = self
+                    .state
+                    .failed_partitions
+                    .get(step_name)
+                    .map(|f| f.iter().map(|(k, e)| (k, e.as_str())).collect())
+                    .unwrap_or_default();
                 for member in pk.members() {
-                    if let Some((_, error)) = failed.iter().find(|(k, _)| *k == member) {
+                    if let Some(&error) = failed.get(&member) {
                         ops::emit_partition_failure(
                             self.sink.writer,
                             self.scope.run_id,
