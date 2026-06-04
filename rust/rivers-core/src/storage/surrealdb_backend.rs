@@ -2094,7 +2094,8 @@ impl StorageBackend for SurrealStorage {
         let mut any_canceled = false;
 
         // One query for every Success run's per-partition StepFailures, keyed by
-        // run_id, instead of a round-trip per run.
+        // run_id. Safe because EventWriter::flush makes events durable before a
+        // run is marked terminal (TODO.md: durable RunRecord field alternative).
         #[derive(SurrealValue)]
         struct FailRow {
             run_id: String,
