@@ -6,6 +6,16 @@ For larger changes, please open an [issue](https://github.com/ion-elgreco/rivers
 
 ## Prerequisites
 
+**Recommended:** use [`mise`](https://mise.jdx.dev/) to install all development tools at once. A `mise.toml` is included in at root-level of the repository with exact tool stack and version definitions:
+
+```shell
+mise install --locked
+```
+
+> **Note:** `mise` manages the Docker CLI and Compose plugin, but not the Docker daemon itself. You still need Docker Desktop (macOS/Windows) or a running Docker engine (Linux) separately.
+
+If you prefer to manage tools yourself, the individual prerequisites are listed below.
+
 - **Rust** (stable) — install via [rustup](https://rustup.rs)
 - **Python** ≥ 3.10
 - **[uv](https://docs.astral.sh/uv/)** — package manager for the Python side
