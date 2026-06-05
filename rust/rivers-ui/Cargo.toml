@@ -97,6 +97,9 @@ web-sys = { version = "0.3", features = [
     "AddEventListenerOptions",
 ], optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+mimalloc = "0.1"
+
 # Brotli quality 11 of the 5 MB WASM bundle takes 2.5 min on a 0.5 vCPU
 # pod and ~2 s per request via `CompressionLayer` — both unacceptable, so
 # `build.rs` precompresses once on the host and `lib.rs` `include_bytes!`s

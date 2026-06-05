@@ -50,3 +50,5 @@ rivers-k8s = { path = "../rust/rivers-k8s" }
 # them where needed).
 kube-client.workspace = true
 k8s-openapi.workspace = true
+
+mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }

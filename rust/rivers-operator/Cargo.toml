@@ -50,6 +50,7 @@ axum-server.workspace = true
 # json-patch operations are built from.
 json-patch = "4"
 jsonptr = "0.7"
+mimalloc = "0.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

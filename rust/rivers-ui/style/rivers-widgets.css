@@ -1266,6 +1266,13 @@
     background: var(--secondary);
     flex-shrink: 0;
 }
+.mini-lineage-more {
+    /* align under the row labels: 4px dot + 6px gap */
+    padding: 2px 0 2px 10px;
+    color: var(--text-muted);
+    font-size: 10px;
+    font-style: italic;
+}
 
 /* ── Rivers: polish — smooth transitions everywhere ── */
 .grid-row,

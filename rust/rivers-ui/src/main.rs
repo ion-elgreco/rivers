@@ -3,6 +3,9 @@
 //! Embeds the compiled WASM/JS client bundle and serves it alongside the
 //! Leptos+Axum server-rendered application.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::Parser;
 use rivers_core::assets::graph::GraphTopology;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;

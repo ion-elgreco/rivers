@@ -4,6 +4,9 @@ mod metrics;
 mod run;
 mod webhook;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Arc;
 
 use axum::Router;

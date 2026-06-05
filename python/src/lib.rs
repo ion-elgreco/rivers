@@ -5,6 +5,9 @@
 //! submodules (assets, executor, storage, daemon, etc.) into the `rivers._core` package.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use opentelemetry::trace::TracerProvider;
 use pyo3::prelude::*;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
