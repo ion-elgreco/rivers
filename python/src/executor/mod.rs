@@ -277,6 +277,8 @@ impl Executor {
             // on-disk `__keys` files when the source has actually been re-run with
             // plain values in this batch.
             let mut step_dynamic_keys: HashMap<String, Vec<String>> = HashMap::new();
+            let mut step_failed_partitions: HashMap<String, Vec<(PyPartitionKey, String)>> =
+                HashMap::new();
 
             prefill_external_dep_versions(plan, storage, &mut data_versions);
 
@@ -383,6 +385,7 @@ impl Executor {
                             graph_started: &mut graph_started,
                             mapped_instance_keys: &mut mapped_instance_keys,
                             step_dynamic_keys: &mut step_dynamic_keys,
+                            failed_partitions: &mut step_failed_partitions,
                         },
                         sink: dispatch::EventSink {
                             writer: &writer,

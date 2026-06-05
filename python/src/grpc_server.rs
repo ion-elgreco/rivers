@@ -189,6 +189,54 @@ impl CodeLocationService for CodeLocationImpl {
         }))
     }
 
+    #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.rerun_run")]
+    async fn rerun_run(
+        &self,
+        request: Request<RerunRunRequest>,
+    ) -> Result<Response<RerunRunResponse>, Status> {
+        let req = request.into_inner();
+        // Rebuilds the request from the stored run (partition + tags) for replay.
+        let rerun = self
+            .handle
+            .build_run_rerun_request(&req.run_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let status = self.run_dispatcher.mode_label().to_string();
+        let run_id = match rerun {
+            crate::daemon::RunRerunRequest::Job(run_request) => {
+                let mut outcome = self
+                    .run_dispatcher
+                    .dispatch_jobs(&[run_request], rivers_core::storage::LaunchedBy::Manual)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                if let Some(err) = outcome.errors.pop() {
+                    return Err(Status::internal(err.to_string()));
+                }
+                outcome
+                    .ids
+                    .pop()
+                    .expect("dispatch_jobs returned no id for a single non-empty input")
+            }
+            crate::daemon::RunRerunRequest::Materialization(mat_request) => {
+                // Materialization run_ids are caller-minted — capture before the
+                // request moves into dispatch (it isn't returned).
+                let run_id = mat_request.run_id.clone();
+                let mut outcome = self
+                    .run_dispatcher
+                    .dispatch_materialization(&[mat_request])
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                if let Some(err) = outcome.errors.pop() {
+                    return Err(Status::internal(err.to_string()));
+                }
+                run_id
+            }
+        };
+
+        Ok(Response::new(RerunRunResponse { run_id, status }))
+    }
+
     #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.get_partition_keys")]
     async fn get_partition_keys(
         &self,
@@ -499,8 +547,12 @@ impl CodeLocationService for CodeLocationImpl {
         let tags = proto_tags_to_pairs(req.tags)
             .map(|pairs| pairs.into_iter().collect::<HashMap<String, String>>());
 
+        let target = match req.job_name {
+            Some(name) => crate::daemon::RunType::Job(name),
+            None => crate::daemon::RunType::Materialization(req.selection),
+        };
         let backfill_request = crate::daemon::BackfillRequestData {
-            selection: req.selection,
+            target,
             partition_keys,
             partition_range,
             strategy,
@@ -509,6 +561,42 @@ impl CodeLocationService for CodeLocationImpl {
             tags,
             dry_run: req.dry_run,
         };
+
+        let mut outcome = self
+            .backfill_dispatcher
+            .dispatch(&[backfill_request])
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        if let Some(err) = outcome.errors.pop() {
+            return Err(Status::internal(err.to_string()));
+        }
+        let result = outcome
+            .results
+            .pop()
+            .expect("dispatch returned no result for a single non-empty input");
+
+        Ok(Response::new(LaunchBackfillResponse {
+            backfill_id: result.backfill_id,
+            num_partitions: result.num_partitions as u32,
+            num_runs: result.num_runs as u32,
+            is_dry_run: result.is_dry_run,
+            status: result.status,
+        }))
+    }
+
+    #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.materialize_missing")]
+    async fn materialize_missing(
+        &self,
+        request: Request<MaterializeMissingRequest>,
+    ) -> Result<Response<LaunchBackfillResponse>, Status> {
+        let req = request.into_inner();
+        // Builds a backfill over the missing partitions; same dispatch as `launch_backfill`.
+        let backfill_request = self
+            .handle
+            .build_missing_backfill_request(&req.asset_key, req.max_concurrency)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         let mut outcome = self
             .backfill_dispatcher
@@ -773,6 +861,11 @@ fn py_partition_key_display(pk: PyPartitionKey) -> String {
                 .collect::<Vec<_>>()
                 .join("|")
         }
+        PyPartitionKey::Set { keys } => keys
+            .into_iter()
+            .map(py_partition_key_display)
+            .collect::<Vec<_>>()
+            .join(", "),
     }
 }
 

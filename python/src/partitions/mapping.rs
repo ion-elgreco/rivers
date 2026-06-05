@@ -672,6 +672,9 @@ impl PartitionMapping {
                         };
                         partition_mapping.0.map_key(&single_key, None)
                     }
+                    PyPartitionKey::Set { .. } => {
+                        Err("MultiToSingle mapping does not support batched Set keys".to_string())
+                    }
                 }
             }
         }

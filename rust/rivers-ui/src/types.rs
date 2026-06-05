@@ -18,6 +18,11 @@ fn partition_key_to_display(pk: rivers_core::storage::PartitionKey) -> String {
                 .collect::<Vec<_>>()
                 .join("|")
         }
+        rivers_core::storage::PartitionKey::Set { keys } => keys
+            .into_iter()
+            .map(partition_key_to_display)
+            .collect::<Vec<_>>()
+            .join(", "),
     }
 }
 
@@ -586,6 +591,10 @@ pub struct BackfillInfo {
     pub backfill_id: String,
     pub status: String,
     pub strategy: String,
+    /// `Some` when the backfill targets a named job (runs use the job's plan +
+    /// executor); `None` for an ad-hoc asset-selection backfill.
+    #[serde(default)]
+    pub job_name: Option<String>,
     pub asset_selection: Vec<String>,
     pub total_partitions: u32,
     pub completed_partitions: u32,
@@ -880,13 +889,20 @@ mod conversions {
 
     impl From<rivers_core::storage::RunRecord> for RunRecord {
         fn from(r: rivers_core::storage::RunRecord) -> Self {
-            let partition_key = r.partition_key.as_ref().map(|pk| match pk {
-                rivers_core::storage::PartitionKey::Single { keys } => keys.join("|"),
-                rivers_core::storage::PartitionKey::Multi { dims } => dims
+            let partition_key = r.partition_key.as_ref().map(|pk| {
+                pk.members()
                     .iter()
-                    .map(|(d, ks)| format!("{d}={}", ks.join("|")))
+                    .map(|m| match m {
+                        rivers_core::storage::PartitionKey::Multi { dims } => dims
+                            .iter()
+                            .map(|(d, ks)| format!("{d}={}", ks.join("|")))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        rivers_core::storage::PartitionKey::Single { keys } => keys.join("|"),
+                        _ => String::new(),
+                    })
                     .collect::<Vec<_>>()
-                    .join(", "),
+                    .join(", ")
             });
             Self {
                 run_id: r.run_id,
@@ -1132,6 +1148,7 @@ mod conversions {
                 backfill_id: b.backfill_id,
                 status: format!("{:?}", b.status),
                 strategy,
+                job_name: b.job_name,
                 asset_selection: b.asset_selection,
                 total_partitions: b.partition_keys.len() as u32,
                 completed_partitions: b.completed_partitions.len() as u32,

@@ -12,7 +12,7 @@ use crate::helpers::{
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::now::use_now;
-use crate::server_fns::actions::{cancel_run, execute_job, trigger_materialize};
+use crate::server_fns::actions::{cancel_run, rerun_run};
 use crate::server_fns::locations::list_code_locations;
 use crate::server_fns::runs::{get_run, get_run_events};
 use crate::types::{EventType, RunStatus, StoredEvent};
@@ -137,15 +137,12 @@ pub fn RunDetailPage() -> impl IntoView {
     let (log_level, set_log_level) = signal("all".to_string());
     let (view_mode, set_view_mode) = signal("gantt".to_string());
 
-    let reexecute = Action::new(move |input: &(Option<String>, Vec<String>)| {
-        let (job_name, assets) = input.clone();
+    // Re-execute reuses the run's exact config server-side (partition, tags, job
+    // vs. materialization), so a partitioned run replays on its partition.
+    let reexecute = Action::new(move |run_id: &String| {
+        let run_id = run_id.clone();
         let (ns, name) = loc.get();
-        async move {
-            match job_name {
-                Some(j) => execute_job(ns, name, j, None).await,
-                None => trigger_materialize(ns, name, Some(assets), None, None).await,
-            }
-        }
+        async move { rerun_run(ns, name, run_id).await }
     });
     let reexecute_pending = reexecute.pending();
 
@@ -169,8 +166,7 @@ pub fn RunDetailPage() -> impl IntoView {
             {move || {
                 run.get().map(|result| match result {
                     Ok(Some(record)) => {
-                        let reexec_job = record.job_name.clone();
-                        let assets_for_reexec = record.node_names.clone();
+                        let rerun_run_id = record.run_id.clone();
                         let status_kind = run_status_kind(&record.status);
                         let sid = short_id(&record.run_id, 8);
                         let is_active_status = matches!(record.status, RunStatus::Started | RunStatus::NotStarted | RunStatus::Queued);
@@ -211,7 +207,7 @@ pub fn RunDetailPage() -> impl IntoView {
                                 </button>
                                 <button
                                     class="btn btn-tertiary"
-                                    on:click=move |_| { reexecute.dispatch((reexec_job.clone(), assets_for_reexec.clone())); }
+                                    on:click=move |_| { reexecute.dispatch(rerun_run_id.clone()); }
                                     disabled=move || reexecute_pending.get()
                                 >
                                     <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
@@ -400,6 +396,31 @@ fn render_event_cards(events: Vec<StoredEvent>, variant: &'static str) -> Vec<im
         .collect()
 }
 
+/// Step-completion status for an asset within a run drawer. A per-partition
+/// StepFailure (`mark_partition_failed`) is partial and must not flip a
+/// succeeded step to "Failed"; only a step-level StepFailure (no `partition_key`)
+/// does. Returns `(label, chip_class)`.
+fn asset_chip_status(asset_events: &[StoredEvent]) -> (&'static str, &'static str) {
+    let has_success = asset_events
+        .iter()
+        .any(|e| matches!(e.event_type, EventType::StepSuccess));
+    let has_failure = asset_events
+        .iter()
+        .any(|e| matches!(e.event_type, EventType::StepFailure) && e.partition_key.is_none());
+    let has_start = asset_events
+        .iter()
+        .any(|e| matches!(e.event_type, EventType::StepStart));
+    if has_failure {
+        ("Failed", "failed")
+    } else if has_success {
+        ("Success", "success")
+    } else if has_start {
+        ("Running", "running")
+    } else {
+        ("Pending", "pending")
+    }
+}
+
 /// Event log lives in the main LogPanel below — selection filters it, so we
 /// don't duplicate here.
 #[component]
@@ -430,22 +451,9 @@ fn RunAssetDrawer(
         })
         .map(|e| e.timestamp)
         .max();
-    let has_success = asset_events
-        .iter()
-        .any(|e| matches!(e.event_type, EventType::StepSuccess));
-    let has_failure = asset_events
-        .iter()
-        .any(|e| matches!(e.event_type, EventType::StepFailure));
     let has_start = start_ns.is_some();
-    let (status_label, status_for_chip) = if has_failure {
-        ("Failed", "failed".to_string())
-    } else if has_success {
-        ("Success", "success".to_string())
-    } else if has_start {
-        ("Running", "running".to_string())
-    } else {
-        ("Pending", "pending".to_string())
-    };
+    let (status_label, chip) = asset_chip_status(&asset_events);
+    let status_for_chip = chip.to_string();
     // For finished steps the duration is fixed; for running steps it ticks
     // each second by re-reading the global `now` clock.
     let duration_view = {
@@ -1418,5 +1426,52 @@ fn RunLogPanel(
                 }
             </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(event_type: EventType, partition_key: Option<&str>) -> StoredEvent {
+        StoredEvent {
+            id: String::new(),
+            event_type,
+            asset_key: Some("a".to_string()),
+            run_id: "r".to_string(),
+            partition_key: partition_key.map(str::to_string),
+            timestamp: 0,
+            metadata: vec![],
+            data_version: None,
+        }
+    }
+
+    #[test]
+    fn per_partition_failure_keeps_step_success() {
+        // A succeeded step with a partial (per-partition) failure stays "Success".
+        let events = [
+            ev(EventType::StepStart, None),
+            ev(EventType::StepFailure, Some("b")),
+            ev(EventType::StepSuccess, None),
+        ];
+        assert_eq!(asset_chip_status(&events), ("Success", "success"));
+    }
+
+    #[test]
+    fn step_level_failure_is_failed() {
+        let events = [
+            ev(EventType::StepStart, None),
+            ev(EventType::StepFailure, None),
+        ];
+        assert_eq!(asset_chip_status(&events), ("Failed", "failed"));
+    }
+
+    #[test]
+    fn running_then_pending() {
+        assert_eq!(
+            asset_chip_status(&[ev(EventType::StepStart, None)]),
+            ("Running", "running")
+        );
+        assert_eq!(asset_chip_status(&[]), ("Pending", "pending"));
     }
 }

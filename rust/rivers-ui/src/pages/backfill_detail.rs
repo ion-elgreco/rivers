@@ -179,6 +179,12 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                     <div class="backfill-meta-label">"Strategy"</div>
                                     <div class="backfill-meta-value grid-cell-code">{format_call_multiline(&record.strategy)}</div>
                                 </div>
+                                {record.job_name.clone().map(|job| view! {
+                                    <div class="backfill-meta-tile">
+                                        <div class="backfill-meta-label">"Job"</div>
+                                        <div class="backfill-meta-value grid-cell-mono">{job}</div>
+                                    </div>
+                                })}
                                 <div class="backfill-meta-tile">
                                     <div class="backfill-meta-label">"Max concurrency"</div>
                                     <div class="backfill-meta-value">{format!("{} partitions", record.max_concurrency)}</div>

@@ -4,6 +4,7 @@ import grpc
 import pytest
 
 import rivers as rs
+from _polling import wait_for_asset_materialized as _wait_for_asset_materialized
 
 
 # ── Test helpers ──
@@ -640,3 +641,200 @@ def test_rerun_backfill_not_found(backfill_grpc_channel):
             pb2.RerunBackfillRequest(backfill_id="missing-id", dry_run=False)
         )
     assert exc_info.value.code() == grpc.StatusCode.INTERNAL
+
+
+# ── rerun_run ──
+
+
+@pytest.fixture
+def rerun_grpc_channel(grpc_stubs, storage):
+    """gRPC server with a partitioned asset and a job over it, for rerun_run tests."""
+    handler = DictIOHandler()
+    pd = rs.PartitionsDefinition.static_(["p1", "p2", "p3"])
+
+    @rs.Asset(io_handler=handler, partitions_def=pd)
+    def part_asset(context: rs.AssetExecutionContext):
+        return context.partition_key
+
+    job = rs.Job(name="part_job", assets=[part_asset])
+    repo = rs.CodeRepository(
+        assets=[part_asset],
+        jobs=[job],
+        default_executor=rs.Executor.in_process(),
+    )
+    repo.resolve(storage=storage)
+    port = repo._start_grpc_server("127.0.0.1", 0)
+
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+
+    pb2, pb2_grpc = grpc_stubs
+    yield channel, pb2, pb2_grpc, repo, storage
+    channel.close()
+    repo._stop_grpc_server()
+
+
+def test_rerun_run_reuses_partition(rerun_grpc_channel):
+    """Re-executing a materialization run replays it on the SAME partition and
+    links back via the rerun_of tag — the run-detail "Retry from" path (#49)."""
+    channel, pb2, pb2_grpc, _, storage = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    original = stub.Materialize(
+        pb2.MaterializeRequest(
+            selection=["part_asset"],
+            partition_key=_single_partition_key(pb2, "p2"),
+        )
+    )
+    assert original.run_id != ""
+    orig_record = storage.get_run(original.run_id)
+    assert orig_record is not None
+    assert orig_record.partition_key == rs.PartitionKey.single("p2")
+
+    rerun = stub.RerunRun(pb2.RerunRunRequest(run_id=original.run_id))
+    assert rerun.run_id != ""
+    assert rerun.run_id != original.run_id
+
+    rerun_record = storage.get_run(rerun.run_id)
+    assert rerun_record is not None
+    # No job; partition reused, origin tagged.
+    assert rerun_record.job_name is None
+    assert rerun_record.partition_key == rs.PartitionKey.single("p2")
+    assert ("rivers/rerun_of", original.run_id) in rerun_record.tags
+
+
+def test_rerun_run_job_reuses_partition(rerun_grpc_channel):
+    """The job branch of rerun_run replays the same job on the same partition."""
+    channel, pb2, pb2_grpc, _, storage = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    original = stub.ExecuteJob(
+        pb2.ExecuteJobRequest(
+            job_name="part_job",
+            partition_key=_single_partition_key(pb2, "p3"),
+        )
+    )
+    assert original.run_id != ""
+
+    rerun = stub.RerunRun(pb2.RerunRunRequest(run_id=original.run_id))
+    assert rerun.run_id != ""
+    assert rerun.run_id != original.run_id
+
+    rerun_record = storage.get_run(rerun.run_id)
+    assert rerun_record is not None
+    assert rerun_record.job_name == "part_job"
+    assert rerun_record.partition_key == rs.PartitionKey.single("p3")
+    # No rerun_of-tag assertion here: job reruns don't persist per-run tags yet
+    # (`RunRequestData.tags` is unused), so the marker only lands on materialization reruns.
+
+
+def test_rerun_run_not_found(rerun_grpc_channel):
+    channel, pb2, pb2_grpc, _, _ = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    with pytest.raises(grpc.RpcError) as exc_info:
+        stub.RerunRun(pb2.RerunRunRequest(run_id="missing-id"))
+    assert exc_info.value.code() == grpc.StatusCode.INTERNAL
+
+
+# ── materialize_missing ──
+
+
+def test_materialize_missing_backfills_all_when_none_materialized(
+    backfill_grpc_channel,
+):
+    """Nothing materialized yet → the backfill covers the full partition set."""
+    channel, pb2, pb2_grpc, _, _ = backfill_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    resp = stub.MaterializeMissing(
+        pb2.MaterializeMissingRequest(asset_key="partitioned_asset", max_concurrency=4)
+    )
+    assert resp.backfill_id != ""
+    assert resp.num_partitions == 3  # p1, p2, p3 — all missing
+
+
+def test_materialize_missing_excludes_already_materialized(backfill_grpc_channel):
+    """The backfill skips partitions already materialized in storage."""
+    channel, pb2, pb2_grpc, _, storage = backfill_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    # Materialize p1, then wait until storage records it.
+    stub.Materialize(
+        pb2.MaterializeRequest(
+            selection=["partitioned_asset"],
+            partition_key=_single_partition_key(pb2, "p1"),
+        )
+    )
+    _wait_for_asset_materialized(storage, "partitioned_asset")
+    assert rs.PartitionKey.single("p1") in storage.get_materialized_partitions(
+        "partitioned_asset"
+    )
+
+    resp = stub.MaterializeMissing(
+        pb2.MaterializeMissingRequest(asset_key="partitioned_asset", max_concurrency=4)
+    )
+    assert resp.backfill_id != ""
+    assert resp.num_partitions == 2  # only p2, p3 remain
+
+
+def test_materialize_missing_unpartitioned_errors(backfill_grpc_channel):
+    channel, pb2, pb2_grpc, _, _ = backfill_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    with pytest.raises(grpc.RpcError) as exc_info:
+        stub.MaterializeMissing(
+            pb2.MaterializeMissingRequest(asset_key="does_not_exist", max_concurrency=4)
+        )
+    assert exc_info.value.code() == grpc.StatusCode.INTERNAL
+
+
+# ── launch_backfill: job-aware vs ad-hoc target ──
+
+
+def test_launch_backfill_for_job_runs_as_job(rerun_grpc_channel):
+    """A job-targeted backfill runs each partition with the job's own spec — its
+    runs are attributed to the job (job_name set), not ad-hoc materializations."""
+    channel, pb2, pb2_grpc, repo, storage = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    resp = stub.LaunchBackfill(
+        pb2.LaunchBackfillRequest(
+            job_name="part_job",
+            partition_keys=[_single_partition_key(pb2, k) for k in ("p1", "p2", "p3")],
+            failure_policy="continue",
+            max_concurrency=1,
+        )
+    )
+    assert resp.backfill_id != ""
+    assert resp.num_partitions == 3
+
+    # No daemon in this fixture, so execute inline, then check attribution.
+    repo.execute_backfill(resp.backfill_id)
+    job_runs = [r for r in storage.get_runs(100) if r.job_name == "part_job"]
+    assert len(job_runs) == 3
+    assert {repr(r.partition_key) for r in job_runs} == {
+        repr(rs.PartitionKey.single(k)) for k in ("p1", "p2", "p3")
+    }
+
+
+def test_launch_backfill_without_job_is_ad_hoc(rerun_grpc_channel):
+    """A selection-targeted backfill (no job_name) runs ad-hoc materializations —
+    its runs carry no job_name."""
+    channel, pb2, pb2_grpc, repo, storage = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    resp = stub.LaunchBackfill(
+        pb2.LaunchBackfillRequest(
+            selection=["part_asset"],
+            partition_keys=[_single_partition_key(pb2, k) for k in ("p1", "p2")],
+            failure_policy="continue",
+            max_concurrency=1,
+        )
+    )
+    assert resp.num_partitions == 2
+
+    repo.execute_backfill(resp.backfill_id)
+    runs = [r for r in storage.get_runs(100) if r.partition_key is not None]
+    assert runs, "expected partitioned runs"
+    assert all(r.job_name is None for r in runs)

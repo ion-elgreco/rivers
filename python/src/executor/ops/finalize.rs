@@ -27,13 +27,14 @@ fn emit_step_event(
     event_type: EventType,
     metadata: Vec<(String, String)>,
     ts: i64,
+    partition_key: Option<&PyPartitionKey>,
 ) {
     writer.emit(EventRecord {
         code_location_id: String::new(),
         event_type,
         asset_key: Some(step_name.to_string()),
         run_id: run_id.to_string(),
-        partition_key: None,
+        partition_key: partition_key.map(|k| k.into()),
         timestamp: ts,
         metadata,
         input_data_versions: vec![],
@@ -48,6 +49,7 @@ pub(crate) fn emit_step_start(writer: &EventWriter, run_id: &str, step_name: &st
         EventType::StepStart,
         Vec::new(),
         ts,
+        None,
     );
 }
 
@@ -82,6 +84,7 @@ pub(crate) fn emit_step_success(writer: &EventWriter, run_id: &str, step_name: &
         EventType::StepSuccess,
         Vec::new(),
         ts,
+        None,
     );
 }
 
@@ -99,6 +102,26 @@ pub(crate) fn emit_step_failure(
         EventType::StepFailure,
         vec![("error".to_string(), error_msg.to_string())],
         ts,
+        None,
+    );
+}
+
+pub(crate) fn emit_partition_failure(
+    writer: &EventWriter,
+    run_id: &str,
+    step_name: &str,
+    partition_key: &PyPartitionKey,
+    error: &str,
+    ts: i64,
+) {
+    emit_step_event(
+        writer,
+        run_id,
+        step_name,
+        EventType::StepFailure,
+        vec![("error".to_string(), error.to_string())],
+        ts,
+        Some(partition_key),
     );
 }
 

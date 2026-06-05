@@ -218,21 +218,27 @@ pub struct PyWorkerResult {
     pub captured_logs: Option<(String, String, String)>,
     #[pyo3(get)]
     pub dynamic_keys: Option<Vec<String>>,
+    /// `(partition_key_json, error)` for each `mark_partition_failed` mark,
+    /// drained from the worker context and carried back to the orchestrator.
+    #[pyo3(get)]
+    pub failed_partitions: Vec<(String, String)>,
 }
 
 #[pymethods]
 impl PyWorkerResult {
     #[new]
-    #[pyo3(signature = (outputs, captured_logs=None, dynamic_keys=None))]
+    #[pyo3(signature = (outputs, captured_logs=None, dynamic_keys=None, failed_partitions=vec![]))]
     fn new(
         outputs: Py<PyAny>,
         captured_logs: Option<(String, String, String)>,
         dynamic_keys: Option<Vec<String>>,
+        failed_partitions: Vec<(String, String)>,
     ) -> Self {
         Self {
             outputs,
             captured_logs,
             dynamic_keys,
+            failed_partitions,
         }
     }
 
@@ -245,6 +251,7 @@ impl PyWorkerResult {
             Py<PyAny>,
             Option<(String, String, String)>,
             Option<Vec<String>>,
+            Vec<(String, String)>,
         ),
     )> {
         let cls = py.import("rivers._core")?.getattr("WorkerResult")?;
@@ -254,6 +261,7 @@ impl PyWorkerResult {
                 self.outputs.clone_ref(py),
                 self.captured_logs.clone(),
                 self.dynamic_keys.clone(),
+                self.failed_partitions.clone(),
             ),
         ))
     }
@@ -274,6 +282,10 @@ pub fn _reconstruct_partition_key(py: Python, data: Bound<'_, PyDict>) -> PyResu
             Ok(cls.call1((key,))?.unbind())
         }
         "Multi" => {
+            let keys = data.get_item("keys")?.unwrap();
+            Ok(cls.call1((keys,))?.unbind())
+        }
+        "Set" => {
             let keys = data.get_item("keys")?.unwrap();
             Ok(cls.call1((keys,))?.unbind())
         }
@@ -558,6 +570,7 @@ pub fn worker_execute_step(
                 tags: None,
                 dynamic_keys: None,
                 result_kind: ResultKind::Output,
+                failed_partitions: Vec::new(),
                 generator: is_gen.then(|| ops::GeneratorType::Sync {
                     context: ctx_obj.as_ref().map(|c| c.clone_ref(py)),
                 }),
@@ -660,6 +673,7 @@ pub fn worker_execute_step(
                 dynamic_keys: dynamic_keys.clone(),
                 result_kind,
                 generator: None,
+                failed_partitions: Vec::new(),
             };
 
             ops::for_each_output(py, &synth, &[], &asset_name, None, |py, item| {
@@ -723,10 +737,12 @@ pub fn worker_execute_step(
 
     match outputs_or_err {
         Ok((outputs, dynamic_keys)) => {
+            let failed_partitions = drain_ctx_failed_partitions(py, ctx_obj.as_ref());
             let wr = PyWorkerResult {
                 outputs,
                 captured_logs,
                 dynamic_keys,
+                failed_partitions,
             };
             Ok(Py::new(py, wr)?.into_any())
         }
@@ -757,6 +773,22 @@ fn drain_ctx_state(
         return Ok((metadata, dv));
     }
     Ok((Vec::new(), None))
+}
+
+/// Drain `mark_partition_failed` marks from a worker-side context, serialized as
+/// `(partition_key_json, error)` for transport back to the orchestrator.
+fn drain_ctx_failed_partitions(py: Python, ctx_obj: Option<&Py<PyAny>>) -> Vec<(String, String)> {
+    if let Some(ctx) = ctx_obj
+        && let Ok(bound) = ctx.bind(py).cast::<PyAssetExecutionContext>()
+    {
+        return bound
+            .borrow()
+            .drain_failed_backfill_partitions()
+            .into_iter()
+            .map(|(pk, err)| (rivers_core::storage::PartitionKey::from(&pk).to_json(), err))
+            .collect();
+    }
+    Vec::new()
 }
 
 /// Append `(name, kind_tag, metadata_or_none, dv_or_none)` to the

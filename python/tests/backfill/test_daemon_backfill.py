@@ -6,10 +6,10 @@ Tests verify that the automation condition eval loop emits backfills
 
 import time
 
+import pytest
 import rivers as rs
-from rivers._core import AutomationDaemon
-
 from _polling import wait_for_backfill_runs as _wait_for_backfill_runs
+from rivers._core import AutomationDaemon
 
 
 def _wait_for_backfill(repo, timeout=15.0):
@@ -285,6 +285,9 @@ class TestDaemonConditionBackfill:
             # SingleRun strategy: the backfill record should show
             # completed_partitions == 2 (both a and b processed)
             assert bf_status.completed_partitions == 2
+            # ...in ONE batched run (queued path), not one run per partition.
+            backfill_runs = [r for r in tagged_runs if r.launched_by.kind == "backfill"]
+            assert len(backfill_runs) == 1
         finally:
             daemon.stop()
 
@@ -382,6 +385,11 @@ class TestDaemonConditionBackfill:
                 if r.launched_by.kind == "backfill"
             }
             assert len(bf_ids) == 1, f"Expected 1 backfill, got {len(bf_ids)}"
+            # per_dimension(multi_run=["region"]) → one batched run per region.
+            backfill_runs = [r for r in tagged_runs if r.launched_by.kind == "backfill"]
+            assert len(backfill_runs) == 2, (
+                f"Expected 2 batched runs (one per region), got {len(backfill_runs)}"
+            )
         finally:
             daemon.stop()
 
@@ -544,5 +552,82 @@ class TestDaemonConditionBackfill:
                 f"but got {len(bf_runs)}. "
                 f"Backfill IDs: {set((r.launched_by.backfill_id or '?') for r in bf_runs)}"
             )
+        finally:
+            daemon.stop()
+
+
+class TestMarkedFailedPartitionNotRematerialized:
+    @pytest.mark.parametrize("condition_name", ["eager", "on_missing"])
+    def test_automation_does_not_rerun_marked_failed_partition(
+        self, storage, condition_name
+    ):
+        """A partition skipped with ``mark_partition_failed`` lands in an overall
+        Success run; automation (``eager`` / ``on_missing``) must leave it alone
+        rather than re-requesting it (review #1). Asserts no new condition- or
+        backfill-launched run appears for the marked partition.
+        """
+        io = rs.InMemoryIOHandler()
+        condition = getattr(rs.AutomationCondition, condition_name)()
+
+        @rs.Asset(
+            name="widget",
+            partitions_def=rs.PartitionsDefinition.static_(["a", "b", "c"]),
+            io_handler=io,
+            automation_condition=condition,
+        )
+        def widget(context: rs.AssetExecutionContext) -> int:
+            # Skip 'b' wherever it appears: marks it in the backfill, and re-fails
+            # it if automation wrongly re-requests it as a single-partition run.
+            if rs.PartitionKey.single("b") in context.partition.keys:
+                context.mark_partition_failed(rs.PartitionKey.single("b"), error="boom")
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[widget], default_executor=rs.Executor.in_process()
+        )
+        repo.resolve(storage=storage)
+
+        # Batched backfill: a, c materialized; b deliberately failed.
+        result = repo.backfill(
+            selection=["widget"],
+            partition_keys=[rs.PartitionKey.single(k) for k in ("a", "b", "c")],
+            strategy=rs.BackfillStrategy.single_run(),
+        )
+        assert result.failed == 1
+        assert set(storage.get_materialized_partitions("widget")) == {
+            rs.PartitionKey.single("a"),
+            rs.PartitionKey.single("c"),
+        }
+
+        baseline_ids = {r.run_id for r in storage.get_runs(limit=200)}
+
+        def daemon_runs():
+            return [
+                r for r in storage.get_runs(limit=200) if r.run_id not in baseline_ids
+            ]
+
+        daemon = AutomationDaemon(
+            repo=repo, storage=storage, condition_eval_interval="1s"
+        )
+        daemon.start()
+        try:
+            # Break as soon as a run for 'b' appears (fast red); else wait the full
+            # window to prove none is dispatched (green).
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                if daemon_runs():
+                    break
+                time.sleep(0.3)
+
+            extra = daemon_runs()
+            assert extra == [], (
+                f"{condition_name}() re-requested the deliberately mark_partition_failed "
+                f"'b': {len(extra)} new {[r.launched_by.kind for r in extra]} run(s)"
+            )
+            # 'b' must remain unmaterialized.
+            assert set(storage.get_materialized_partitions("widget")) == {
+                rs.PartitionKey.single("a"),
+                rs.PartitionKey.single("c"),
+            }
         finally:
             daemon.stop()

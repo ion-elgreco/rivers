@@ -66,9 +66,25 @@ pub(crate) struct MaterializationRequestData {
     pub(crate) launched_by: rivers_core::storage::LaunchedBy,
 }
 
+/// A run re-execution from a stored `RunRecord`: `Job` → `dispatch_jobs`,
+/// `Materialization` → `dispatch_materialization`. Reuses the run's partition + tags.
+pub(crate) enum RunRerunRequest {
+    Job(RunRequestData),
+    Materialization(MaterializationRequestData),
+}
+
+/// What a backfill runs each partition as: an ad-hoc materialization of an asset
+/// selection, or a named `Job` (whose own plan + executor are used). Reconstructed
+/// from `BackfillRecord` (`job_name` → `Job`, else `Materialization`) at execution.
+#[derive(Clone)]
+pub(crate) enum RunType {
+    Materialization(Vec<String>),
+    Job(String),
+}
+
 #[derive(Clone)]
 pub(crate) struct BackfillRequestData {
-    pub(crate) selection: Vec<String>,
+    pub(crate) target: RunType,
     pub(crate) partition_keys: Option<Vec<crate::partitions::PyPartitionKey>>,
     pub(crate) partition_range: Option<crate::partitions::PyPartitionKeyRange>,
     pub(crate) strategy: Option<crate::partitions::PyBackfillStrategy>,

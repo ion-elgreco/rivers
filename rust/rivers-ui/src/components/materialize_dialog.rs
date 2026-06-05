@@ -1,25 +1,34 @@
 //! Materialize confirmation dialog.
 //!
-//! Each cartesian-expanded partition fires its own `trigger_materialize`
-//! call so a Multi selection lands as N independent runs.
+//! ≤2 selected partitions fire one `trigger_materialize` run each; a larger
+//! selection lands as a single backfill over the assets + chosen keys.
 
 use leptos::prelude::*;
 
 use crate::components::partition_picker::PartitionPicker;
 use crate::helpers::JobPartitionPicker;
 use crate::loc::{loc_path, use_current_location};
-use crate::server_fns::actions::trigger_materialize;
+use crate::server_fns::actions::{launch_backfill, trigger_materialize};
 use crate::types::SubmitPartitionKey;
+
+/// Above this many selected partitions, submit one backfill instead of a run each.
+const BACKFILL_THRESHOLD: usize = 2;
+
+/// What a submit produced, so the success Effect navigates to the right page.
+#[derive(Clone)]
+enum DialogOutcome {
+    Run(String),
+    Backfill(String),
+}
 
 #[component]
 pub fn MaterializeDialog(
     #[prop(into)] show: RwSignal<bool>,
     #[prop(into)] asset_keys: Signal<Vec<String>>,
-    /// `JobPartitionPicker::None` omits the partition section entirely and
-    /// the dialog submits a single unpartitioned run. Otherwise the
-    /// shared partition picker renders a flat list (SingleDim) or one
-    /// labelled selector per dimension (Multi); the cartesian product
-    /// of selections fires one materialize per combination.
+    /// `JobPartitionPicker::None` omits the partition section and submits a
+    /// single unpartitioned run. Otherwise the shared picker renders the keys;
+    /// the cartesian product of selections becomes per-partition runs (≤2) or a
+    /// backfill (more).
     #[prop(optional, into)]
     picker: Option<Signal<JobPartitionPicker>>,
 ) -> impl IntoView {
@@ -44,51 +53,46 @@ pub fn MaterializeDialog(
         let (ns, name) = loc.get();
         async move {
             let tags_opt = if t.is_empty() { None } else { Some(t) };
-            // Empty pks means either no partitioned assets, or the
-            // user hasn't picked any (None-picker case). Fire a single
-            // unpartitioned materialize; otherwise one per key.
-            let mut last: Option<crate::server_fns::actions::MaterializeResult> = None;
-            if pks.is_empty() {
-                last = Some(
-                    trigger_materialize(
-                        ns.clone(),
-                        name.clone(),
-                        Some(sel.clone()),
-                        None,
-                        tags_opt.clone(),
-                    )
-                    .await?,
-                );
-            } else {
-                for pk in pks {
-                    last = Some(
-                        trigger_materialize(
-                            ns.clone(),
-                            name.clone(),
-                            Some(sel.clone()),
-                            Some(pk),
-                            tags_opt.clone(),
-                        )
-                        .await?,
-                    );
-                }
+            if pks.len() > BACKFILL_THRESHOLD {
+                let r = launch_backfill(ns, name, Some(sel), pks, tags_opt, None).await?;
+                return Ok::<_, ServerFnError>(DialogOutcome::Backfill(r.backfill_id));
             }
-            Ok::<_, ServerFnError>(last.expect("at least one materialize call ran"))
+            // ≤2 keys → a run each; empty pks (unpartitioned / None picker) → one
+            // keyless run. Both are the same loop over `Option<key>`.
+            let keys = if pks.is_empty() {
+                vec![None]
+            } else {
+                pks.into_iter().map(Some).collect::<Vec<_>>()
+            };
+            let mut run_id = String::new();
+            for pk in keys {
+                run_id = trigger_materialize(
+                    ns.clone(),
+                    name.clone(),
+                    Some(sel.clone()),
+                    pk,
+                    tags_opt.clone(),
+                )
+                .await?
+                .run_id;
+            }
+            Ok(DialogOutcome::Run(run_id))
         }
     });
 
     let pending = materialize_action.pending();
 
     Effect::new(move || {
-        if let Some(Ok(result)) = materialize_action.value().get() {
+        if let Some(Ok(outcome)) = materialize_action.value().get() {
             show.set(false);
-            if !result.run_id.is_empty() {
+            let rel = match outcome {
+                DialogOutcome::Run(id) if !id.is_empty() => Some(format!("runs/{id}")),
+                DialogOutcome::Backfill(id) if !id.is_empty() => Some(format!("backfills/{id}")),
+                _ => None,
+            };
+            if let Some(rel) = rel {
                 let (ns, name) = loc.get();
-                set_nav_to.set(Some(loc_path(
-                    &ns,
-                    &name,
-                    &format!("runs/{}", result.run_id),
-                )));
+                set_nav_to.set(Some(loc_path(&ns, &name, &rel)));
             }
         }
     });
@@ -210,14 +214,20 @@ pub fn MaterializeDialog(
                             }
                         >
                             {move || if pending.get() {
-                                "Materializing...".to_string()
+                                "Submitting...".to_string()
                             } else {
                                 let n = if matches!(picker_signal.get(), JobPartitionPicker::None) {
                                     1
                                 } else {
                                     partition_keys.get().len()
                                 };
-                                if n > 1 { format!("Materialize {n} runs") } else { "Materialize".to_string() }
+                                if n > BACKFILL_THRESHOLD {
+                                    format!("Backfill {n} partitions")
+                                } else if n > 1 {
+                                    format!("Materialize {n} runs")
+                                } else {
+                                    "Materialize".to_string()
+                                }
                             }}
                         </button>
                     </div>

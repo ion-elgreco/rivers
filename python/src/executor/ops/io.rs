@@ -41,8 +41,8 @@ pub(crate) fn build_partition_context(
             node.name()?
         )));
     }
-    Ok(Some(PartitionContext::new(
-        partition_key.clone(),
+    Ok(Some(PartitionContext::new_multi(
+        partition_key.members(),
         def.clone(),
     )))
 }
@@ -81,6 +81,15 @@ pub(crate) fn map_partition_key_for_upstream(
     upstream_node: &ResolvedNode,
     partition_key: &Option<PyPartitionKey>,
 ) -> PyResult<UpstreamKeyResolution> {
+    // A batched (SingleRun/PerDimension) run carries a bundled key; resolving a
+    // partition-mapped upstream for a whole batch isn't supported yet. Reject it
+    // consistently here for every mapping kind, rather than per-variant.
+    if let Some(PyPartitionKey::Set { .. }) = partition_key {
+        return Err(PartitionValidationError::new_err(
+            "partition-mapped upstream loading is not supported for batched \
+             (SingleRun/PerDimension) runs",
+        ));
+    }
     let mapping = downstream_node
         .partition_mapping()
         .and_then(|m| m.get(upstream_name).cloned());

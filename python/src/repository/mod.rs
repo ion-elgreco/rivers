@@ -1139,6 +1139,17 @@ pub(crate) struct RepoHandle {
         Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
 }
 
+/// One run to enqueue via [`RepoHandle::submit_runs`].
+pub(crate) struct RunSubmission {
+    /// `None` = all assets.
+    pub(crate) selection: Option<Vec<String>>,
+    pub(crate) partition_key: Option<PyPartitionKey>,
+    pub(crate) tags: Option<Vec<(String, String)>>,
+    /// `Some(job)` enqueues the run as a job execution (resolved with the job's
+    /// plan + executor on dequeue); `None` for an ad-hoc materialization.
+    pub(crate) job_name: Option<String>,
+}
+
 impl RepoHandle {
     /// Look up a user-defined job's asset selection. `None` if the repo
     /// isn't resolved or the job doesn't exist. GIL-free — reads the
@@ -1274,11 +1285,7 @@ impl RepoHandle {
 
     pub(crate) async fn submit_runs(
         &self,
-        runs: Vec<(
-            Option<Vec<String>>,
-            Option<&PyPartitionKey>,
-            Option<Vec<(String, String)>>,
-        )>,
+        runs: Vec<RunSubmission>,
         launched_by: LaunchedBy,
     ) -> PyResult<Vec<String>> {
         let (records, storage) = {
@@ -1300,22 +1307,22 @@ impl RepoHandle {
 
             let mut records: Vec<RunRecord> = Vec::with_capacity(runs.len());
 
-            for (selection, partition_key, tags) in &runs {
-                let asset_names = selection.clone().unwrap_or_else(|| all_names.clone());
+            for sub in &runs {
+                let asset_names = sub.selection.clone().unwrap_or_else(|| all_names.clone());
                 validate_partition_for_selection(
                     state,
                     asset_names.iter().map(String::as_str),
-                    *partition_key,
+                    sub.partition_key.as_ref(),
                 )?;
                 let run_id = uuid::Uuid::new_v4().to_string();
-                let run_tags = tags.clone().unwrap_or_default();
+                let run_tags = sub.tags.clone().unwrap_or_default();
                 let priority = priority_from_tags(&run_tags);
-                let core_pk = partition_key.map(|pk| pk.into());
+                let core_pk = sub.partition_key.as_ref().map(|pk| pk.into());
 
                 records.push(RunRecord {
                     run_id,
                     code_location_id: state.code_location_id.clone(),
-                    job_name: None,
+                    job_name: sub.job_name.clone(),
                     status: RunStatus::Queued,
                     start_time: now,
                     end_time: None,
@@ -1616,8 +1623,13 @@ impl RepoHandle {
         let mut tag_map: HashMap<String, String> = record.tags.into_iter().collect();
         tag_map.insert(tag_keys::RERUN_OF.to_string(), backfill_id.to_string());
 
+        let target = match record.job_name {
+            Some(name) => crate::daemon::RunType::Job(name),
+            None => crate::daemon::RunType::Materialization(record.asset_selection),
+        };
+
         Ok(crate::daemon::BackfillRequestData {
-            selection: record.asset_selection,
+            target,
             partition_keys: Some(partition_keys),
             partition_range: None,
             strategy: Some(strategy),
@@ -1625,6 +1637,136 @@ impl RepoHandle {
             max_concurrency,
             tags: Some(tag_map),
             dry_run,
+        })
+    }
+
+    /// Build a re-execution request from the stored `RunRecord`, reusing its
+    /// partition key + tags (job runs replay as jobs, ad-hoc as materializations).
+    /// Tags the new run with `RERUN_OF` = the original id.
+    pub(crate) async fn build_run_rerun_request(
+        &self,
+        run_id: &str,
+    ) -> PyResult<crate::daemon::RunRerunRequest> {
+        let storage = {
+            let guard = self.state.read().unwrap();
+            let state = guard.as_ref().ok_or_else(|| {
+                ExecutionError::new_err("Repository not resolved — call resolve() first")
+            })?;
+            state.storage.clone()
+        };
+        let record = storage
+            .get_run(run_id)
+            .await
+            .map_err(|e| ExecutionError::new_err(format!("Failed to load run: {e}")))?
+            .ok_or_else(|| ExecutionError::new_err(format!("run '{run_id}' not found")))?;
+
+        let mut tags = record.tags;
+        tags.retain(|(k, _)| k != tag_keys::RERUN_OF);
+        tags.push((tag_keys::RERUN_OF.to_string(), run_id.to_string()));
+
+        match record.job_name {
+            Some(job_name) => Ok(crate::daemon::RunRerunRequest::Job(
+                crate::daemon::RunRequestData {
+                    run_key: None,
+                    tags: Some(tags.into_iter().collect()),
+                    partition_key: record.partition_key.as_ref().map(PyPartitionKey::from),
+                    job_name: Some(job_name),
+                },
+            )),
+            None => Ok(crate::daemon::RunRerunRequest::Materialization(
+                crate::daemon::MaterializationRequestData {
+                    run_id: uuid::Uuid::new_v4().to_string(),
+                    asset_selection: record.node_names,
+                    partition_key: record.partition_key,
+                    tags,
+                    launched_by: rivers_core::storage::LaunchedBy::Manual,
+                },
+            )),
+        }
+    }
+
+    /// Build a backfill over an asset's not-yet-materialized partitions (full
+    /// universe − materialized). Errors if the asset is unpartitioned or nothing
+    /// is missing.
+    pub(crate) async fn build_missing_backfill_request(
+        &self,
+        asset_key: &str,
+        max_concurrency: u32,
+    ) -> PyResult<crate::daemon::BackfillRequestData> {
+        // Dynamic keys live in storage, not the def — capture the namespace and
+        // fetch after dropping the guard; other kinds enumerate from the def here.
+        enum Universe {
+            Keys(Vec<PyPartitionKey>),
+            Dynamic(String),
+        }
+        let (universe, storage, code_location_id) = {
+            let guard = self.state.read().unwrap();
+            let state = guard.as_ref().ok_or_else(|| {
+                ExecutionError::new_err("Repository not resolved — call resolve() first")
+            })?;
+            let def = state
+                .node_map
+                .get(asset_key)
+                .and_then(|n| n.partitions_def())
+                .ok_or_else(|| {
+                    ExecutionError::new_err(format!("asset '{asset_key}' is not partitioned"))
+                })?;
+            let universe = match def {
+                PartitionsDefinition::Dynamic { name } => Universe::Dynamic(name.clone()),
+                _ => Universe::Keys(def.get_partition_keys_window(0, def.partition_count())?),
+            };
+            (
+                universe,
+                state.storage.clone(),
+                state.code_location_id.clone(),
+            )
+        };
+
+        let ctx = rivers_core::storage::CodeLocationContext::new(code_location_id);
+        let scoped = storage.for_code_location(&ctx);
+
+        let all: Vec<PyPartitionKey> = match universe {
+            Universe::Keys(keys) => keys,
+            Universe::Dynamic(name) => scoped
+                .get_dynamic_partitions(&name)
+                .await
+                .map_err(|e| {
+                    ExecutionError::new_err(format!("Failed to load dynamic partitions: {e}"))
+                })?
+                .into_iter()
+                .map(|k| PyPartitionKey::Single { key: vec![k] })
+                .collect(),
+        };
+
+        let materialized: std::collections::HashSet<PartitionKey> = scoped
+            .get_materialized_partitions(asset_key)
+            .await
+            .map_err(|e| {
+                ExecutionError::new_err(format!("Failed to load materialized partitions: {e}"))
+            })?
+            .into_iter()
+            .collect();
+
+        let missing: Vec<PyPartitionKey> = all
+            .into_iter()
+            .filter(|pk| !materialized.contains(&rivers_core::storage::PartitionKey::from(pk)))
+            .collect();
+
+        if missing.is_empty() {
+            return Err(ExecutionError::new_err(format!(
+                "asset '{asset_key}' has no missing partitions to materialize"
+            )));
+        }
+
+        Ok(crate::daemon::BackfillRequestData {
+            target: crate::daemon::RunType::Materialization(vec![asset_key.to_string()]),
+            partition_keys: Some(missing),
+            partition_range: None,
+            strategy: None,
+            failure_policy: None,
+            max_concurrency,
+            tags: None,
+            dry_run: false,
         })
     }
 
@@ -1741,11 +1883,7 @@ impl PyCodeRepository {
     /// Batched storage write.
     pub(crate) async fn submit_runs(
         &self,
-        runs: Vec<(
-            Option<Vec<String>>,
-            Option<&PyPartitionKey>,
-            Option<Vec<(String, String)>>,
-        )>,
+        runs: Vec<RunSubmission>,
         launched_by: LaunchedBy,
     ) -> PyResult<Vec<String>> {
         self.handle().submit_runs(runs, launched_by).await
@@ -3010,7 +3148,7 @@ impl PyCodeRepository {
     ) -> PyResult<PyBackfillResult> {
         py.detach(|| {
             self.backfill_inner(
-                selection,
+                crate::daemon::RunType::Materialization(selection.unwrap_or_default()),
                 partition_keys,
                 partition_range,
                 strategy,
@@ -3104,8 +3242,13 @@ impl PyCodeRepository {
             let mut tags = record.tags.clone();
             tags.push((tag_keys::RERUN_OF.to_string(), backfill_id));
 
+            let target = match &record.job_name {
+                Some(name) => crate::daemon::RunType::Job(name.clone()),
+                None => crate::daemon::RunType::Materialization(record.asset_selection.clone()),
+            };
+
             self.backfill_inner(
-                Some(record.asset_selection),
+                target,
                 Some(partition_keys),
                 None,
                 Some(strategy),
@@ -3290,7 +3433,7 @@ impl PyCodeRepository {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn backfill_inner(
         &self,
-        selection: Option<Vec<String>>,
+        target: crate::daemon::RunType,
         partition_keys: Option<Vec<PyPartitionKey>>,
         partition_range: Option<PyPartitionKeyRange>,
         strategy: Option<PyBackfillStrategy>,
@@ -3304,13 +3447,27 @@ impl PyCodeRepository {
         let guard = self.ensure_resolved()?;
         let state = guard.as_ref().unwrap();
 
+        // A `Job` target resolves to its own asset selection; everything below
+        // (partition resolution, strategy, the record) is identical for both kinds.
+        let (selection, job_name): (Vec<String>, Option<String>) = match target {
+            crate::daemon::RunType::Materialization(sel) => (sel, None),
+            crate::daemon::RunType::Job(name) => {
+                let assets = state
+                    .jobs_info
+                    .get(&name)
+                    .map(|j| j.asset_names.clone())
+                    .ok_or_else(|| ExecutionError::new_err(format!("Job '{name}' not found")))?;
+                (assets, Some(name))
+            }
+        };
+
         let resolved_keys: Vec<PyPartitionKey> = if let Some(keys) = partition_keys {
             if keys.is_empty() {
                 return Err(ExecutionError::new_err("partition_keys must not be empty"));
             }
             keys
         } else if let Some(range) = partition_range {
-            let selected = selection.as_deref().unwrap_or(&[]);
+            let selected = selection.as_slice();
             let parts_def = selected
                 .iter()
                 .filter_map(|name| state.node_map.get(name).and_then(|n| n.partitions_def()))
@@ -3340,7 +3497,7 @@ impl PyCodeRepository {
         let resolved_strategy = if let Some(s) = strategy {
             s
         } else {
-            let selected_names = selection.as_deref().unwrap_or(&[]);
+            let selected_names = selection.as_slice();
             let asset_strategies: Vec<PyBackfillStrategy> = selected_names
                 .iter()
                 .filter_map(|name| state.node_map.get(name)?.backfill_strategy())
@@ -3393,7 +3550,8 @@ impl PyCodeRepository {
             status: BackfillStatus::Requested,
             strategy: core_strategy,
             failure_policy: fp.clone(),
-            asset_selection: selection.clone().unwrap_or_default(),
+            asset_selection: selection.clone(),
+            job_name: job_name.clone(),
             partition_keys: core_keys,
             run_ids: Vec::new(),
             completed_partitions: Vec::new(),
@@ -3472,6 +3630,33 @@ impl PyCodeRepository {
         }
     }
 
+    /// Run one partition of a Job-targeted backfill with the job's *own* plan +
+    /// executor: mint a Started run attributed to the job + backfill, then drive
+    /// it via [`PyJob::execute_run`] — identical to how `execute_job` runs a
+    /// single partition. The Materialization counterpart is
+    /// [`Self::materialize_with_launcher`].
+    fn execute_backfill_job_run(
+        &self,
+        job: &Py<PyJob>,
+        job_name: &str,
+        py_pk: PyPartitionKey,
+        config: Option<HashMap<String, Py<PyAny>>>,
+        backfill_id: &str,
+    ) -> PyResult<PyRunResult> {
+        let run_id = io_rt().block_on(self.handle().create_started_run(
+            job_name,
+            Some(&py_pk),
+            LaunchedBy::Backfill {
+                backfill_id: backfill_id.to_string(),
+            },
+        ))?;
+        Python::attach(|py| {
+            job.bind(py)
+                .borrow()
+                .execute_run(py, Some(py_pk), &run_id, config, false, false)
+        })
+    }
+
     pub(crate) fn execute_backfill_inner(
         &self,
         backfill_id: &str,
@@ -3542,18 +3727,31 @@ impl PyCodeRepository {
             let mut group_completed = Vec::new();
             let mut group_failed = Vec::new();
 
-            for core_pk in group {
-                let py_pk = PyPartitionKey::from(core_pk);
-                let run_config = config.as_ref().map(|c| {
-                    Python::attach(|py| {
-                        c.iter()
-                            .map(|(k, v)| (k.clone(), v.clone_ref(py)))
-                            .collect::<HashMap<String, Py<PyAny>>>()
-                    })
-                });
-                let result = self.materialize_with_launcher(
+            let batch_pk =
+                PyPartitionKey::from(&rivers_core::execution::backfill::bundle_keys(group));
+            let run_config = config.as_ref().map(|c| {
+                Python::attach(|py| {
+                    c.iter()
+                        .map(|(k, v)| (k.clone(), v.clone_ref(py)))
+                        .collect::<HashMap<String, Py<PyAny>>>()
+                })
+            });
+            let result = match &record.job_name {
+                Some(job_name) => match state.jobs.get(job_name) {
+                    Some(job) => self.execute_backfill_job_run(
+                        job,
+                        job_name,
+                        batch_pk,
+                        run_config,
+                        backfill_id,
+                    ),
+                    None => Err(ExecutionError::new_err(format!(
+                        "Job '{job_name}' not found"
+                    ))),
+                },
+                None => self.materialize_with_launcher(
                     Some(record.asset_selection.clone()),
-                    Some(py_pk),
+                    Some(batch_pk),
                     Some(run_tags.clone()),
                     false,
                     run_config,
@@ -3563,20 +3761,20 @@ impl PyCodeRepository {
                     LaunchedBy::Backfill {
                         backfill_id: backfill_id.to_string(),
                     },
-                );
+                ),
+            };
 
-                match result {
-                    Ok(run_result) => {
-                        group_run_ids.push(run_result.run_id);
-                        if run_result.success {
-                            group_completed.push(core_pk.clone());
-                        } else {
-                            group_failed.push(core_pk.clone());
-                        }
+            match result {
+                Ok(run_result) => {
+                    group_run_ids.push(run_result.run_id);
+                    if run_result.success {
+                        group_completed.extend(group.iter().cloned());
+                    } else {
+                        group_failed.extend(group.iter().cloned());
                     }
-                    Err(_) => {
-                        group_failed.push(core_pk.clone());
-                    }
+                }
+                Err(_) => {
+                    group_failed.extend(group.iter().cloned());
                 }
             }
 
@@ -3595,31 +3793,25 @@ impl PyCodeRepository {
             ));
         }
 
-        if !canceled_keys.is_empty() {
-            let _ = io_rt().block_on(state.storage.update_backfill_progress(
-                backfill_id,
-                &[],
-                &[],
-                &[],
-                &canceled_keys,
-            ));
+        // Single finalizer: reconciles per-partition credit and records the
+        // never-launched (stop-on-failure / cancel) keys as canceled. Transient
+        // errors retry inside the storage layer; a remaining error is surfaced
+        // rather than swallowed (it would otherwise leave the backfill InProgress).
+        if let Err(e) = io_rt().block_on(
+            state
+                .storage
+                .try_complete_backfill(backfill_id, &canceled_keys),
+        ) {
+            tracing::error!(target: "rivers::repo", backfill_id = %backfill_id, error = %e, "backfill finalize failed");
         }
 
+        // External cancel takes precedence over the failure-derived status.
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = io_rt().block_on(state.storage.update_backfill_status(
                 backfill_id,
                 BackfillStatus::Canceled,
                 Some(now_ts()),
             ));
-        } else if !canceled_keys.is_empty() {
-            // Stop-on-failure caused early termination
-            let _ = io_rt().block_on(state.storage.update_backfill_status(
-                backfill_id,
-                BackfillStatus::CompletedFailed,
-                Some(now_ts()),
-            ));
-        } else {
-            let _ = io_rt().block_on(state.storage.try_complete_backfill(backfill_id));
         }
 
         {
@@ -3668,20 +3860,15 @@ impl PyCodeRepository {
             ));
         }
 
-        let partition_keys: Vec<PyPartitionKey> = run_groups
+        let runs: Vec<RunSubmission> = run_groups
             .iter()
-            .flatten()
-            .map(PyPartitionKey::from)
-            .collect();
-
-        let runs: Vec<_> = partition_keys
-            .iter()
-            .map(|pk| {
-                (
-                    Some(record.asset_selection.clone()),
-                    Some(pk),
-                    Some(run_tags.clone()),
-                )
+            .map(|group| RunSubmission {
+                selection: Some(record.asset_selection.clone()),
+                partition_key: Some(PyPartitionKey::from(
+                    &rivers_core::execution::backfill::bundle_keys(group),
+                )),
+                tags: Some(run_tags.clone()),
+                job_name: record.job_name.clone(),
             })
             .collect();
 

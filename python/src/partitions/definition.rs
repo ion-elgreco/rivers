@@ -165,7 +165,7 @@ impl PartitionsDefinition {
                 .next()
                 .and_then(|pk| match pk {
                     PyPartitionKey::Single { key } => key.into_iter().next(),
-                    PyPartitionKey::Multi { .. } => None,
+                    _ => None,
                 })),
             _ => Ok(None),
         }
@@ -179,9 +179,11 @@ impl PartitionsDefinition {
             .into_iter()
             .map(|pk| match pk {
                 PyPartitionKey::Single { mut key } => Ok(key.remove(0)),
-                PyPartitionKey::Multi { .. } => Err(PartitionDefinitionError::new_err(
-                    "enumerate_single_dim_keys called on a Multi partition definition",
-                )),
+                PyPartitionKey::Multi { .. } | PyPartitionKey::Set { .. } => {
+                    Err(PartitionDefinitionError::new_err(
+                        "enumerate_single_dim_keys called on a non-single-dimension definition",
+                    ))
+                }
             })
             .collect()
     }
@@ -522,6 +524,15 @@ impl PartitionsDefinition {
             }
             // Dynamic partitions accept any single key (keys are storage-managed, not statically validated).
             (Self::Dynamic { .. }, PyPartitionKey::Single { .. }) => Ok(true),
+            // A batched Set is valid iff every member is valid for this definition.
+            (_, PyPartitionKey::Set { keys }) => {
+                for member in keys {
+                    if !self.validate_partition_key(member)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }

@@ -233,9 +233,47 @@ pub enum PartitionKey {
     Single { keys: Vec<String> },
     /// Multi-dimension key (e.g. `{"date": ["2024-01-01"], "region": ["us"]}`).
     Multi { dims: Vec<(String, Vec<String>)> },
+    /// Explicit set of concrete keys (each member a single Single/Multi key,
+    /// never nested). Internal/transport only: bundles a sparse backfill group
+    /// no cartesian Multi can express; expanded via `members()` at execution.
+    Set { keys: Vec<PartitionKey> },
 }
 
 impl PartitionKey {
+    /// Expand a possibly-batched key into its individual single-valued members
+    /// (`Single`: one per value; `Multi`: the cartesian product).
+    pub fn members(&self) -> Vec<PartitionKey> {
+        match self {
+            Self::Single { keys } => keys
+                .iter()
+                .map(|k| Self::Single {
+                    keys: vec![k.clone()],
+                })
+                .collect(),
+            Self::Multi { dims } => {
+                let mut sorted = dims.clone();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut combos: Vec<Vec<(String, Vec<String>)>> = vec![Vec::new()];
+                for (name, vals) in &sorted {
+                    let mut next = Vec::new();
+                    for combo in &combos {
+                        for v in vals {
+                            let mut c = combo.clone();
+                            c.push((name.clone(), vec![v.clone()]));
+                            next.push(c);
+                        }
+                    }
+                    combos = next;
+                }
+                combos
+                    .into_iter()
+                    .map(|dims| Self::Multi { dims })
+                    .collect()
+            }
+            Self::Set { keys } => keys.iter().flat_map(|k| k.members()).collect(),
+        }
+    }
+
     /// Serialize to JSON for CLI args / K8s CRD fields.
     /// Single: `{"single":["2025-01-16"]}`, Multi: `{"multi":{"region":["us"],"date":["2025-03"]}}`.
     pub fn to_json(&self) -> String {
@@ -245,6 +283,13 @@ impl PartitionKey {
                 let map: std::collections::BTreeMap<&str, &Vec<String>> =
                     dims.iter().map(|(k, v)| (k.as_str(), v)).collect();
                 serde_json::json!({"multi": map}).to_string()
+            }
+            Self::Set { keys } => {
+                let members: Vec<serde_json::Value> = keys
+                    .iter()
+                    .filter_map(|k| serde_json::from_str(&k.to_json()).ok())
+                    .collect();
+                serde_json::json!({ "set": members }).to_string()
             }
         }
     }
@@ -264,8 +309,17 @@ impl PartitionKey {
             Ok(Self::Multi {
                 dims: map.into_iter().collect(),
             })
+        } else if let Some(set) = v.get("set") {
+            let arr = set
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("invalid set partition key: expected array"))?;
+            let keys = arr
+                .iter()
+                .map(|m| Self::from_json(&m.to_string()))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Self::Set { keys })
         } else {
-            anyhow::bail!("partition key JSON must have 'single' or 'multi' key")
+            anyhow::bail!("partition key JSON must have 'single', 'multi', or 'set' key")
         }
     }
 }
@@ -284,6 +338,7 @@ impl PartialEq for PartitionKey {
                 b_sorted.sort_by(|x, y| x.0.cmp(&y.0));
                 a_sorted == b_sorted
             }
+            (Self::Set { keys: a }, Self::Set { keys: b }) => a == b,
             _ => false,
         }
     }
@@ -301,6 +356,7 @@ impl std::hash::Hash for PartitionKey {
                 sorted.sort_by(|a, b| a.0.cmp(&b.0));
                 sorted.hash(state);
             }
+            Self::Set { keys } => keys.hash(state),
         }
     }
 }
@@ -320,6 +376,10 @@ impl SurrealValue for PartitionKey {
             Self::Multi { dims } => {
                 map.insert("variant".to_string(), "Multi".to_string().into_value());
                 map.insert("dims".to_string(), dims.into_value());
+            }
+            Self::Set { keys } => {
+                map.insert("variant".to_string(), "Set".to_string().into_value());
+                map.insert("keys".to_string(), keys.into_value());
             }
         }
         Value::Object(map.into())
@@ -352,6 +412,14 @@ impl SurrealValue for PartitionKey {
                     .transpose()?
                     .unwrap_or_default();
                 Ok(Self::Multi { dims })
+            }
+            "Set" => {
+                let keys = map
+                    .get("keys")
+                    .map(|v| Vec::<PartitionKey>::from_value(v.clone()))
+                    .transpose()?
+                    .unwrap_or_default();
+                Ok(Self::Set { keys })
             }
             _ => Err(SurrealError::internal(format!(
                 "unknown PartitionKey variant: {variant}"
@@ -830,6 +898,10 @@ pub struct BackfillRecord {
     pub strategy: BackfillStrategy,
     pub failure_policy: BackfillFailurePolicy,
     pub asset_selection: Vec<String>,
+    /// Set when the backfill targets a named `Job` — each partition runs with the
+    /// job's own plan + executor. `None` for ad-hoc asset-selection backfills.
+    #[serde(default)]
+    pub job_name: Option<String>,
     pub partition_keys: Vec<PartitionKey>,
     pub run_ids: Vec<String>,
     pub completed_partitions: Vec<PartitionKey>,
@@ -1315,10 +1387,14 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         asset_key: &str,
     ) -> impl Future<Output = Result<Vec<PartitionKey>>> + Send;
 
+    /// Partitions whose latest `StepFailure` isn't superseded by a later
+    /// materialization. `materialized` is the caller's per-partition timestamps
+    /// (from `get_partition_timestamps`), so we don't re-read `asset_partitions`.
     fn get_failed_partitions(
         &self,
         code_location_id: &str,
         asset_key: &str,
+        materialized: &HashMap<PartitionKey, i64>,
     ) -> impl Future<Output = Result<Vec<PartitionKey>>> + Send;
 
     fn get_backfills(
@@ -1688,9 +1764,13 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
             .await
     }
 
-    pub async fn get_failed_partitions(&self, asset_key: &str) -> Result<Vec<PartitionKey>> {
+    pub async fn get_failed_partitions(
+        &self,
+        asset_key: &str,
+        materialized: &HashMap<PartitionKey, i64>,
+    ) -> Result<Vec<PartitionKey>> {
         self.backend
-            .get_failed_partitions(self.code_location_id, asset_key)
+            .get_failed_partitions(self.code_location_id, asset_key, materialized)
             .await
     }
 
@@ -2015,9 +2095,11 @@ pub trait StorageBackend: PerCodeLocationStorage {
     /// Check if all runs for a backfill are terminal. If so, transition the
     /// backfill to CompletedSuccess/CompletedFailed/Canceled and set end_time.
     /// Returns the new status if finalized, None if still in progress.
+    /// `extra_canceled`: never-launched partitions (no run record) to count canceled.
     fn try_complete_backfill(
         &self,
         backfill_id: &str,
+        extra_canceled: &[PartitionKey],
     ) -> impl Future<Output = Result<Option<BackfillStatus>>> + Send;
 
     /// Release all concurrency slots held by a specific step (across all pools).

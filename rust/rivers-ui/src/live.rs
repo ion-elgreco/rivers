@@ -923,6 +923,7 @@ mod tests {
                         strategy: BackfillStrategy::MultiRun,
                         failure_policy: BackfillFailurePolicy::Continue,
                         asset_selection: vec!["sse_asset".into()],
+                        job_name: None,
                         partition_keys: vec![],
                         run_ids: vec![],
                         completed_partitions: vec![],

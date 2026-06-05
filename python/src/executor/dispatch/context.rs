@@ -38,6 +38,7 @@ pub(crate) struct RunState<'a> {
     pub failed_names: &'a mut HashSet<String>,
     pub graph_started: &'a mut HashSet<String>,
     pub mapped_instance_keys: &'a mut HashMap<String, Vec<String>>,
+    pub failed_partitions: &'a mut HashMap<String, Vec<(PyPartitionKey, String)>>,
     /// Per-step record of `dynamic_keys` produced when an asset was executed
     /// in this orchestrator process. Presence is the signal "we saw this
     /// source step run in this batch": empty `Vec` means it ran with plain
@@ -139,6 +140,23 @@ impl<'a> BatchContext<'a> {
         );
     }
 
+    /// A failed partitioned step materialized none of its partitions, so record
+    /// them all with one StepFailure carrying the whole key (a `Set` for a batched
+    /// run); `get_failed_partitions` expands it. The None-keyed step-level failure
+    /// (emitted separately) still drives run/step status.
+    pub(crate) fn emit_partition_failures(&self, step_name: &str, error: &str, ts: i64) {
+        if let Some(pk) = self.scope.partition_key {
+            ops::emit_partition_failure(
+                self.sink.writer,
+                self.scope.run_id,
+                step_name,
+                pk,
+                error,
+                ts,
+            );
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_materialization(
         &self,
@@ -148,16 +166,49 @@ impl<'a> BatchContext<'a> {
         input_versions: Vec<(String, String)>,
         ts: i64,
     ) {
-        ops::emit_materialization(
-            self.sink.writer,
-            self.scope.run_id,
-            step_name,
-            self.scope.partition_key,
-            metadata,
-            data_version,
-            input_versions,
-            ts,
-        );
+        match self.scope.partition_key {
+            Some(pk) => {
+                let failed: HashMap<&PyPartitionKey, &str> = self
+                    .state
+                    .failed_partitions
+                    .get(step_name)
+                    .map(|f| f.iter().map(|(k, e)| (k, e.as_str())).collect())
+                    .unwrap_or_default();
+                for member in pk.members() {
+                    if let Some(&error) = failed.get(&member) {
+                        ops::emit_partition_failure(
+                            self.sink.writer,
+                            self.scope.run_id,
+                            step_name,
+                            &member,
+                            error,
+                            ts,
+                        );
+                    } else {
+                        ops::emit_materialization(
+                            self.sink.writer,
+                            self.scope.run_id,
+                            step_name,
+                            &Some(member),
+                            metadata,
+                            data_version.clone(),
+                            input_versions.clone(),
+                            ts,
+                        );
+                    }
+                }
+            }
+            None => ops::emit_materialization(
+                self.sink.writer,
+                self.scope.run_id,
+                step_name,
+                &None,
+                metadata,
+                data_version,
+                input_versions,
+                ts,
+            ),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -168,15 +219,30 @@ impl<'a> BatchContext<'a> {
         data_version: Option<String>,
         ts: i64,
     ) {
-        ops::emit_observation(
-            self.sink.writer,
-            self.scope.run_id,
-            step_name,
-            self.scope.partition_key,
-            metadata,
-            data_version,
-            ts,
-        );
+        match self.scope.partition_key {
+            Some(pk) => {
+                for member in pk.members() {
+                    ops::emit_observation(
+                        self.sink.writer,
+                        self.scope.run_id,
+                        step_name,
+                        &Some(member),
+                        metadata,
+                        data_version.clone(),
+                        ts,
+                    );
+                }
+            }
+            None => ops::emit_observation(
+                self.sink.writer,
+                self.scope.run_id,
+                step_name,
+                &None,
+                metadata,
+                data_version,
+                ts,
+            ),
+        }
     }
 
     pub(crate) fn emit_log_output(
@@ -205,13 +271,10 @@ impl<'a> BatchContext<'a> {
         error: PyErr,
         failures: &mut Vec<(String, PyErr)>,
     ) {
-        ops::emit_step_failure(
-            self.sink.writer,
-            self.scope.run_id,
-            step_name,
-            &error.to_string(),
-            now_ts(),
-        );
+        let err_msg = error.to_string();
+        let ts = now_ts();
+        ops::emit_step_failure(self.sink.writer, self.scope.run_id, step_name, &err_msg, ts);
+        self.emit_partition_failures(step_name, &err_msg, ts);
         self.state.mark_failed(step_name.to_string());
         failures.push((step_name.to_string(), error));
     }

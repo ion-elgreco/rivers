@@ -25,9 +25,9 @@ def fill_gaps() -> int:
 
 | Method | Description |
 |--------|-------------|
-| `AutomationCondition.eager()` | Materialize whenever any dependency is updated. |
+| `AutomationCondition.eager()` | Materialize whenever any dependency is updated. Excludes failed partitions/assets, so they aren't auto-retried until re-run. |
 | `AutomationCondition.on_cron(cron_schedule, timezone=None)` | Materialize on a cron schedule. |
-| `AutomationCondition.on_missing()` | Materialize only when the asset has never been materialized. |
+| `AutomationCondition.on_missing()` | Materialize only when the asset has never been materialized; leaves failed partitions alone. |
 
 ---
 

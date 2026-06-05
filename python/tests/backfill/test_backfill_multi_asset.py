@@ -305,7 +305,7 @@ class TestMultiAssetBackfillStrategySingleRun:
         )
         async def multi(context: rs.AssetExecutionContext):
             await asyncio.sleep(0)
-            calls.append(context.partition_key)
+            calls.append(len(context.partition.keys))
             yield rs.Output(value=1, output_name="x")
 
         repo = rs.CodeRepository(assets=[multi], default_executor=executor)
@@ -319,7 +319,7 @@ class TestMultiAssetBackfillStrategySingleRun:
             strategy=rs.BackfillStrategy.single_run(),
         )
         assert result.completed == 3
-        assert len(calls) == 3
+        assert calls == [3]
 
 
 class TestMultiAssetBackfillStrategyPerDimension:
@@ -401,7 +401,7 @@ class TestMultiAssetBackfillStrategyPerDimension:
             ),
         )
         assert result.completed == 4
-        assert len(calls) == 4
+        assert len(calls) == 2
 
 
 class TestMultiAssetBackfillExplicitStrategy:

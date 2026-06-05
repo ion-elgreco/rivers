@@ -361,6 +361,9 @@ pub enum JobPartitionPicker {
     /// paged on demand by `asset_key` as the user scrolls (`total` sizes the
     /// scrollbar). Avoids ever shipping the full key list to the browser.
     SingleDimPaged { asset_key: String, total: u64 },
+    /// Storage-managed keys (not in the in-memory def), paged from storage by
+    /// `dynamic_name`; `total` sizes the scrollbar. Single-dim-shaped.
+    Dynamic { dynamic_name: String, total: u64 },
     /// Multi — per-dimension selectors; each dimension's `keys` is the
     /// intersection across the job's Multi assets, in the first asset's order.
     /// `asset_key` is `Some` only for a single-Multi-asset job, enabling
@@ -375,11 +378,12 @@ pub enum JobPartitionPicker {
 /// Compute the picker shape for a job's partitioned assets.
 ///
 /// `SingleDim` keys = intersection of `partition_def.keys` across all
-/// partitioned assets in encounter order, dropping Dynamic / unparti-
-/// tioned. `Multi` dimensions = per-dimension intersection across every
+/// partitioned assets in encounter order, dropping unpartitioned assets.
+/// `Multi` dimensions = per-dimension intersection across every
 /// Multi-partitioned asset (resolve-time validator guarantees the
-/// dimension name sets match). Mixed kinds are rejected at resolve time
-/// so the helper picks whichever kind the partitioned assets share.
+/// dimension name sets match). `Dynamic` when every partitioned asset shares one
+/// Dynamic namespace. Mixed kinds are rejected at resolve time so the helper
+/// picks whichever kind the partitioned assets share.
 pub fn partition_picker_for_assets(
     assets: &[String],
     asset_info_by_key: &std::collections::HashMap<String, AssetDefinitionInfo>,
@@ -433,12 +437,27 @@ pub fn partition_picker_for_assets(
             asset_key,
         };
     }
+    // Only when every partitioned asset shares one Dynamic namespace — a mixed
+    // job can't share a key (validator rejects it), so it falls to single-dim below.
+    let dynamic_names: Vec<&str> = defs.iter().filter_map(|d| d.dynamic_namespace()).collect();
+    if !dynamic_names.is_empty() {
+        let first = dynamic_names[0];
+        let all_dynamic_one_namespace =
+            dynamic_names.len() == defs.len() && dynamic_names.iter().all(|n| *n == first);
+        if all_dynamic_one_namespace {
+            // Emit even at 0 so the dialog shows an empty state instead of the
+            // button silently firing a keyless (rejected) materialize.
+            let total = defs.iter().map(|d| d.total_count).max().unwrap_or(0);
+            return JobPartitionPicker::Dynamic {
+                dynamic_name: first.to_string(),
+                total,
+            };
+        }
+    }
     // Single-dim (Static / TimeWindow). If the driving asset has more
     // partitions than fit in the inline key window, page it on demand;
     // otherwise show the intersection across the job's single-dim assets.
-    // Dynamic is excluded: its keys are storage-managed and can't be enumerated
-    // through the gRPC paged endpoint (selecting dynamic partitions in the picker
-    // is a separate, storage-backed follow-up).
+    // Dynamic defs excluded here: `dynamic_namespace()` is `Some`, `keys` empty.
     let first_single = assets.iter().find_map(|a| {
         let pd = asset_info_by_key.get(a)?.partition_def.as_ref()?;
         (pd.dimensions.is_empty()
@@ -837,21 +856,84 @@ mod tests {
         );
     }
 
-    #[test]
-    fn picker_none_when_partition_def_has_no_keys() {
-        // Dynamic-shape: kind=Dynamic, keys=[], dimensions=[]. Even with a real
-        // storage-sourced count, the picker stays None (Dynamic isn't paged here).
-        let mut info = make_info("dyn", None);
+    /// A Dynamic asset: empty `keys`/`dimensions`, storage-sourced `total_count`.
+    fn make_dynamic(asset_key: &str, namespace: &str, total: u64) -> AssetDefinitionInfo {
+        let mut info = make_info(asset_key, None);
         info.partition_def = Some(PartitionDefinitionInfo {
             kind: "Dynamic".to_string(),
             keys: vec![],
             dimensions: vec![],
-            total_count: 42,
+            total_count: total,
             keys_truncated: false,
-            dynamic_name: "customers".to_string(),
+            dynamic_name: namespace.to_string(),
         });
-        let infos = make_map(vec![info]);
-        assert_eq!(picker(&["dyn"], &infos), JobPartitionPicker::None);
+        info
+    }
+
+    #[test]
+    fn picker_dynamic_single_asset_pages_from_namespace() {
+        let infos = make_map(vec![make_dynamic("dyn", "customers", 42)]);
+        assert_eq!(
+            picker(&["dyn"], &infos),
+            JobPartitionPicker::Dynamic {
+                dynamic_name: "customers".into(),
+                total: 42,
+            }
+        );
+    }
+
+    #[test]
+    fn picker_dynamic_zero_total_still_emits_dynamic() {
+        // Zero keys → still emit (empty state), not None.
+        let infos = make_map(vec![make_dynamic("dyn", "customers", 0)]);
+        assert_eq!(
+            picker(&["dyn"], &infos),
+            JobPartitionPicker::Dynamic {
+                dynamic_name: "customers".into(),
+                total: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn picker_dynamic_multiple_assets_same_namespace() {
+        // Two assets backed by the same Dynamic definition share one key space.
+        let infos = make_map(vec![
+            make_dynamic("a", "customers", 42),
+            make_dynamic("b", "customers", 42),
+        ]);
+        assert_eq!(
+            picker(&["a", "b"], &infos),
+            JobPartitionPicker::Dynamic {
+                dynamic_name: "customers".into(),
+                total: 42,
+            }
+        );
+    }
+
+    #[test]
+    fn picker_dynamic_mixed_with_static_falls_through_to_singledim() {
+        // Mixed kinds can't share a key; helper skips Dynamic, uses the static keys.
+        let infos = make_map(vec![
+            make_dynamic("dyn", "customers", 42),
+            make_info("stat", Some(&["x", "y"])),
+        ]);
+        assert_eq!(
+            picker(&["dyn", "stat"], &infos),
+            JobPartitionPicker::SingleDim {
+                keys: vec!["x".into(), "y".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn picker_dynamic_distinct_namespaces_do_not_merge() {
+        // Distinct namespaces share no keys → None (don't page one for both).
+        let infos = make_map(vec![
+            make_dynamic("a", "customers", 42),
+            make_dynamic("b", "orders", 7),
+        ]);
+        assert_eq!(picker(&["a", "b"], &infos), JobPartitionPicker::None);
     }
 
     #[test]

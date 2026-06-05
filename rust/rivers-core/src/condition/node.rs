@@ -140,6 +140,7 @@ impl ConditionNode {
     ///     Not(AnyDepsMissing),
     ///     Not(AnyDepsInProgress),
     ///     Not(InProgress),
+    ///     Not(ExecutionFailed),
     /// ])
     /// ```
     ///
@@ -149,12 +150,16 @@ impl ConditionNode {
     /// hack needed. Users can compose `InitialEvaluation` explicitly for custom
     /// first-tick behavior.
     ///
+    /// `Not(ExecutionFailed)` excludes failed partitions/assets, so they aren't
+    /// auto-retried every tick until re-run.
+    ///
     pub fn eager() -> Self {
         (ConditionNode::Missing.newly_true() | ConditionNode::any_deps_updated())
             .since_last_handled()
             & !ConditionNode::any_deps_missing()
             & !ConditionNode::any_deps_in_progress()
             & !ConditionNode::InProgress
+            & !ConditionNode::ExecutionFailed
     }
 
     /// Composite: true if any dep was updated (and the run didn't already
@@ -233,11 +238,13 @@ impl ConditionNode {
     }
 
     /// On-missing preset. Fires when an asset becomes missing and has no
-    /// missing deps. Users can compose with `InLatestTimeWindow` to restrict
-    /// to recent partitions.
+    /// missing deps, skipping partitions in a failed state (so a deliberate
+    /// `mark_partition_failed` isn't re-requested). Users can compose with
+    /// `InLatestTimeWindow` to restrict to recent partitions.
     pub fn on_missing() -> Self {
         ConditionNode::Missing.newly_true().since_last_handled()
             & !ConditionNode::any_deps_missing()
+            & !ConditionNode::ExecutionFailed
     }
 
     /// Returns true if this condition tree contains any time-based nodes

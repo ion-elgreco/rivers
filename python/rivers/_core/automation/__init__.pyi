@@ -29,10 +29,13 @@ class AutomationCondition:
     def eager() -> AutomationCondition:
         """Materialize when deps update or asset becomes missing.
 
+        Excludes failed partitions/assets (not auto-retried until re-run).
+
         Equivalent to::
 
             (missing().newly_true() | any_deps_updated()).since_last_handled()
             & ~any_deps_missing() & ~any_deps_in_progress() & ~in_progress()
+            & ~execution_failed()
         """
         ...
     @staticmethod
@@ -51,7 +54,11 @@ class AutomationCondition:
         ...
     @staticmethod
     def on_missing() -> AutomationCondition:
-        """Materialize once when the asset becomes missing, then stop."""
+        """Materialize once when the asset becomes missing, then stop.
+
+        Skips partitions in a failed state, so a ``mark_partition_failed``
+        skip isn't re-requested.
+        """
         ...
 
     # Leaf conditions

@@ -39,6 +39,11 @@ impl PartitionContext {
         &self.keys[0]
     }
 
+    /// Number of partition keys in this context (>1 for batched backfill runs).
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
+    }
+
     /// For TimeWindow partitions, return the (start, end) datetimes of this window.
     /// Only works when there's a single key.
     pub fn time_window(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {

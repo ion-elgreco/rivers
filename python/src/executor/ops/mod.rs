@@ -54,6 +54,7 @@ pub(crate) struct StepResult {
     /// (sync or async). `None` for single-output and dict multi-asset.
     /// Carries the per-yield context inside the variant.
     pub generator: Option<GeneratorType>,
+    pub failed_partitions: Vec<(crate::partitions::PyPartitionKey, String)>,
 }
 
 /// Upsert: for each overlay entry, remove any existing entry with the same key, then append.
@@ -90,12 +91,13 @@ pub(crate) use fan_out::{
 };
 pub(crate) use finalize::{
     collect_input_data_versions, emit_log_output, emit_materialization, emit_observation,
-    emit_step_failure, emit_step_start, emit_step_start_via_tx, emit_step_success,
-    extract_data_version, now_ts, register_assets_from_nodes, run_failure_hooks, run_success_hooks,
+    emit_partition_failure, emit_step_failure, emit_step_start, emit_step_start_via_tx,
+    emit_step_success, extract_data_version, now_ts, register_assets_from_nodes, run_failure_hooks,
+    run_success_hooks,
 };
 pub(crate) use invoke::{
-    annotation_is, enumerate_params, execute_step, extract_config_from_annotation,
-    extract_return_hint, get_annotations, is_context_annotation,
+    annotation_is, drain_failed_partitions, enumerate_params, execute_step,
+    extract_config_from_annotation, extract_return_hint, get_annotations, is_context_annotation,
 };
 pub(crate) use io::{
     build_mapped_partition_context, build_partition_context, handle_step_output,

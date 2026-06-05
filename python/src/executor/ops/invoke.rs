@@ -563,6 +563,7 @@ pub(crate) fn execute_step(
                     dynamic_keys: None,
                     result_kind: ResultKind::Output,
                     generator: Some(kind),
+                    failed_partitions: Vec::new(),
                 });
             }
         }
@@ -591,6 +592,8 @@ pub(crate) fn execute_step(
             &step.name,
         )?;
 
+        let failed_partitions = drain_failed_partitions(py, built.ctx_ref.as_ref());
+
         Ok(StepResult {
             result: processed.result,
             return_hint: built.return_hint,
@@ -601,6 +604,7 @@ pub(crate) fn execute_step(
             dynamic_keys: processed.dynamic_keys,
             result_kind: processed.kind,
             generator: None,
+            failed_partitions,
         })
     } else if node.is_bash_task() {
         let result = func.call0(py)?;
@@ -614,6 +618,7 @@ pub(crate) fn execute_step(
             dynamic_keys: None,
             result_kind: ResultKind::Output,
             generator: None,
+            failed_partitions: Vec::new(),
         })
     } else {
         Err(ExecutionError::new_err(format!(
@@ -621,4 +626,20 @@ pub(crate) fn execute_step(
             step.name
         )))
     }
+}
+
+pub(crate) fn drain_failed_partitions(
+    py: Python,
+    ctx_ref: Option<&Py<PyAny>>,
+) -> Vec<(crate::partitions::PyPartitionKey, String)> {
+    ctx_ref
+        .and_then(|c| {
+            c.bind(py).cast::<PyAssetExecutionContext>().ok().map(|b| {
+                b.get()
+                    .drain_failed_backfill_partitions()
+                    .into_iter()
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
 }
