@@ -71,6 +71,9 @@ croner = "3"
 thiserror = "2"
 once_cell = "1"
 
+mimalloc = { version = "=0.1.48", features = ["local_dynamic_tls"] }
+libmimalloc-sys = { version = "=0.1.38" }
+
 # Pin surrealdb to ion-elgreco's fork at the IndexBuilder Arc-cycle fix
 # (https://github.com/ion-elgreco/surrealdb/tree/fix/index-builder-arc-cycle).
 # Without it, every `DEFINE INDEX` permanently leaks the underlying
