@@ -140,6 +140,23 @@ impl<'a> BatchContext<'a> {
         );
     }
 
+    /// A failed partitioned step materialized none of its partitions, so record
+    /// them all with one StepFailure carrying the whole key (a `Set` for a batched
+    /// run); `get_failed_partitions` expands it. The None-keyed step-level failure
+    /// (emitted separately) still drives run/step status.
+    pub(crate) fn emit_partition_failures(&self, step_name: &str, error: &str, ts: i64) {
+        if let Some(pk) = self.scope.partition_key {
+            ops::emit_partition_failure(
+                self.sink.writer,
+                self.scope.run_id,
+                step_name,
+                pk,
+                error,
+                ts,
+            );
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_materialization(
         &self,
@@ -254,13 +271,10 @@ impl<'a> BatchContext<'a> {
         error: PyErr,
         failures: &mut Vec<(String, PyErr)>,
     ) {
-        ops::emit_step_failure(
-            self.sink.writer,
-            self.scope.run_id,
-            step_name,
-            &error.to_string(),
-            now_ts(),
-        );
+        let err_msg = error.to_string();
+        let ts = now_ts();
+        ops::emit_step_failure(self.sink.writer, self.scope.run_id, step_name, &err_msg, ts);
+        self.emit_partition_failures(step_name, &err_msg, ts);
         self.state.mark_failed(step_name.to_string());
         failures.push((step_name.to_string(), error));
     }

@@ -294,7 +294,9 @@ impl AssetConditionCache {
                 entry.in_progress.insert(pk.clone());
             }
 
-            let failed = scoped.get_failed_partitions(asset_key).await?;
+            let failed = scoped
+                .get_failed_partitions(asset_key, &entry.timestamps)
+                .await?;
             for pk in &failed {
                 entry.failed.insert(pk.clone());
             }
@@ -647,7 +649,7 @@ impl AssetConditionCache {
                 .into_iter()
                 .collect();
             entry.failed = scoped
-                .get_failed_partitions(asset_key)
+                .get_failed_partitions(asset_key, &entry.timestamps)
                 .await?
                 .into_iter()
                 .collect();

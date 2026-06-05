@@ -308,6 +308,8 @@ DEFINE INDEX IF NOT EXISTS idx_events_run_type ON events FIELDS run_id, event_ty
 -- code locations don't bleed into each other.
 DEFINE INDEX IF NOT EXISTS idx_events_loc_asset ON events FIELDS code_location_id, asset_key;
 DEFINE INDEX IF NOT EXISTS idx_events_loc_asset_part ON events FIELDS code_location_id, asset_key, partition_key;
+-- Lets get_failed_partitions skip to an asset's failures by event_type.
+DEFINE INDEX IF NOT EXISTS idx_events_loc_asset_type ON events FIELDS code_location_id, asset_key, event_type;
 
 DEFINE TABLE IF NOT EXISTS assets SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS code_location_id ON assets TYPE string DEFAULT 'default';
@@ -2115,9 +2117,10 @@ impl StorageBackend for SurrealStorage {
                 let mut res = self
                     .db
                     .query(
+                        // IS NOT NONE: exclude None-keyed step-level failures (see get_failed_partitions).
                         "SELECT run_id, partition_key FROM events \
                          WHERE run_id IN $rids AND event_type = 'StepFailure' \
-                         AND partition_key IS NOT NULL GROUP BY run_id, partition_key",
+                         AND partition_key IS NOT NONE GROUP BY run_id, partition_key",
                     )
                     .bind(("rids", success_run_ids.clone()))
                     .await?;
@@ -2976,8 +2979,9 @@ impl PerCodeLocationStorage for SurrealStorage {
         let mut result = self
             .db
             .query(
+                // IS NOT NONE: exclude None-keyed step-level events (see get_failed_partitions).
                 "SELECT partition_key FROM events WHERE code_location_id = $cl AND asset_key = $asset_key \
-                 AND event_type = 'StepStart' AND partition_key IS NOT NULL \
+                 AND event_type = 'StepStart' AND partition_key IS NOT NONE \
                  AND run_id IN (SELECT VALUE run_id FROM runs WHERE code_location_id = $cl AND status = 'Started' \
                  AND $asset_key IN node_names) \
                  GROUP BY partition_key",
@@ -2999,14 +3003,16 @@ impl PerCodeLocationStorage for SurrealStorage {
         &self,
         code_location_id: &str,
         asset_key: &str,
+        materialized: &std::collections::HashMap<PartitionKey, i64>,
     ) -> Result<Vec<PartitionKey>> {
+        // No run-status filter: mark_partition_failed lands in a Success run (review #1).
         let mut result = self
             .db
             .query(
-                "SELECT partition_key FROM events WHERE code_location_id = $cl AND asset_key = $asset_key \
-                 AND event_type = 'StepFailure' AND partition_key IS NOT NULL \
-                 AND run_id IN (SELECT VALUE run_id FROM runs WHERE code_location_id = $cl AND status = 'Failure' \
-                 AND $asset_key IN node_names) \
+                // IS NOT NONE, not NULL — `NONE IS NOT NULL` holds in SurrealDB.
+                "SELECT partition_key, math::max(timestamp) AS ts FROM events \
+                 WHERE code_location_id = $cl AND asset_key = $asset_key \
+                 AND event_type = 'StepFailure' AND partition_key IS NOT NONE \
                  GROUP BY partition_key",
             )
             .bind(("cl", code_location_id.to_string()))
@@ -3014,12 +3020,28 @@ impl PerCodeLocationStorage for SurrealStorage {
             .await?;
 
         #[derive(Debug, SurrealValue)]
-        struct PartRow {
+        struct FailRow {
             partition_key: PartitionKey,
+            ts: i64,
         }
 
-        let rows: Vec<PartRow> = result.take(0)?;
-        Ok(rows.into_iter().map(|r| r.partition_key).collect())
+        let failed_rows: Vec<FailRow> = result.take(0)?;
+        // Expand each failure key to members (a raised batch records one Set), latest ts each.
+        let mut latest_failure: std::collections::HashMap<PartitionKey, i64> =
+            std::collections::HashMap::new();
+        for row in failed_rows {
+            for member in row.partition_key.members() {
+                latest_failure
+                    .entry(member)
+                    .and_modify(|t| *t = (*t).max(row.ts))
+                    .or_insert(row.ts);
+            }
+        }
+        Ok(latest_failure
+            .into_iter()
+            .filter(|(pk, ts)| materialized.get(pk).is_none_or(|&mat_ts| mat_ts < *ts))
+            .map(|(pk, _)| pk)
+            .collect())
     }
 
     async fn get_backfills(
@@ -7185,7 +7207,11 @@ mod tests {
         }
 
         let failed = storage
-            .get_failed_partitions(crate::storage::DEFAULT_CODE_LOCATION_ID, "asset")
+            .get_failed_partitions(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                "asset",
+                &std::collections::HashMap::new(),
+            )
             .await
             .unwrap();
         assert_eq!(failed.len(), 2);
@@ -7202,10 +7228,270 @@ mod tests {
         // Asset with no failures
         register(&storage, &["clean_asset"]).await;
         let empty = storage
-            .get_failed_partitions(crate::storage::DEFAULT_CODE_LOCATION_ID, "clean_asset")
+            .get_failed_partitions(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                "clean_asset",
+                &std::collections::HashMap::new(),
+            )
             .await
             .unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_failed_partitions_includes_marked_in_success_run() {
+        // review #1: a mark_partition_failed key lands in a Success run but must
+        // still report failed, else automation re-materializes it.
+        let storage = make_storage().await;
+        register(&storage, &["asset"]).await;
+
+        let run = RunRecord {
+            run_id: "run_ok".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Success,
+            start_time: 1000,
+            end_time: Some(1500),
+            tags: vec![],
+            node_names: vec!["asset".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        };
+        storage.create_run(&run).await.unwrap();
+
+        storage
+            .store_event(&EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("asset".to_string()),
+                run_id: "run_ok".to_string(),
+                partition_key: Some(PartitionKey::Single {
+                    keys: vec!["b".to_string()],
+                }),
+                timestamp: 1000,
+                metadata: vec![("error".to_string(), "boom".to_string())],
+                input_data_versions: vec![],
+            })
+            .await
+            .unwrap();
+
+        let failed = storage
+            .get_failed_partitions(
+                DEFAULT_CODE_LOCATION_ID,
+                "asset",
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            failed,
+            vec![PartitionKey::Single {
+                keys: vec!["b".to_string()]
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_failed_partitions_uses_latest_event_per_partition() {
+        // Latest event wins: failed-then-materialized clears; materialized-then-failed stays failed.
+        let storage = make_storage().await;
+        register(&storage, &["asset"]).await;
+
+        let run = RunRecord {
+            run_id: "run_ok".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Success,
+            start_time: 1000,
+            end_time: Some(2000),
+            tags: vec![],
+            node_names: vec!["asset".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        };
+        storage.create_run(&run).await.unwrap();
+
+        let single = |k: &str| PartitionKey::Single {
+            keys: vec![k.to_string()],
+        };
+        let event = |event_type: EventType, pk: &str, ts: i64| EventRecord {
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            event_type,
+            asset_key: Some("asset".to_string()),
+            run_id: "run_ok".to_string(),
+            partition_key: Some(single(pk)),
+            timestamp: ts,
+            metadata: vec![],
+            input_data_versions: vec![],
+        };
+        let mat = || EventType::Materialization {
+            data_version: Some("v".to_string()),
+        };
+
+        // b: fail@1000 then materialize@1500 → cleared.
+        storage
+            .store_event(&event(EventType::StepFailure, "b", 1000))
+            .await
+            .unwrap();
+        storage.store_event(&event(mat(), "b", 1500)).await.unwrap();
+        // c: materialize@1000 then fail@1500 → still failed.
+        storage.store_event(&event(mat(), "c", 1000)).await.unwrap();
+        storage
+            .store_event(&event(EventType::StepFailure, "c", 1500))
+            .await
+            .unwrap();
+
+        // Supersede uses the caller's materialization map (as the condition cache does).
+        let materialized: std::collections::HashMap<_, _> = storage
+            .get_partition_timestamps(DEFAULT_CODE_LOCATION_ID, "asset")
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        let failed = storage
+            .get_failed_partitions(DEFAULT_CODE_LOCATION_ID, "asset", &materialized)
+            .await
+            .unwrap();
+        assert_eq!(failed, vec![single("c")], "only c (latest event = failure)");
+    }
+
+    #[tokio::test]
+    async fn test_get_failed_partitions_ignores_step_level_failures() {
+        // A whole-step raise emits a None-keyed StepFailure; it must be excluded
+        // (not reported, and not breaking FailRow deserialization).
+        let storage = make_storage().await;
+        register(&storage, &["asset"]).await;
+
+        let run = RunRecord {
+            run_id: "run_fail".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Failure,
+            start_time: 1000,
+            end_time: Some(1500),
+            tags: vec![],
+            node_names: vec!["asset".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        };
+        storage.create_run(&run).await.unwrap();
+
+        // step-level failure (a raise) — partition_key None
+        storage
+            .store_event(&EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("asset".to_string()),
+                run_id: "run_fail".to_string(),
+                partition_key: None,
+                timestamp: 1000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            })
+            .await
+            .unwrap();
+        // per-partition failure (a mark) — partition_key Some(b)
+        storage
+            .store_event(&EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("asset".to_string()),
+                run_id: "run_fail".to_string(),
+                partition_key: Some(PartitionKey::Single {
+                    keys: vec!["b".to_string()],
+                }),
+                timestamp: 1000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            })
+            .await
+            .unwrap();
+
+        let failed = storage
+            .get_failed_partitions(
+                DEFAULT_CODE_LOCATION_ID,
+                "asset",
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            failed,
+            vec![PartitionKey::Single {
+                keys: vec!["b".to_string()]
+            }],
+            "only the per-partition failure; None-keyed step-level failure must be excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_failed_partitions_expands_set_failure() {
+        // A raised batch records one Set-keyed StepFailure; expanded back to members here.
+        let storage = make_storage().await;
+        register(&storage, &["asset"]).await;
+
+        let run = RunRecord {
+            run_id: "run_fail".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Failure,
+            start_time: 1000,
+            end_time: Some(1500),
+            tags: vec![],
+            node_names: vec!["asset".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        };
+        storage.create_run(&run).await.unwrap();
+
+        let single = |k: &str| PartitionKey::Single {
+            keys: vec![k.to_string()],
+        };
+        storage
+            .store_event(&EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("asset".to_string()),
+                run_id: "run_fail".to_string(),
+                partition_key: Some(PartitionKey::Set {
+                    keys: vec![single("a"), single("b"), single("c")],
+                }),
+                timestamp: 1000,
+                metadata: vec![("error".to_string(), "boom".to_string())],
+                input_data_versions: vec![],
+            })
+            .await
+            .unwrap();
+
+        let failed = storage
+            .get_failed_partitions(
+                DEFAULT_CODE_LOCATION_ID,
+                "asset",
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let mut keys: Vec<String> = failed
+            .iter()
+            .map(|pk| match pk {
+                PartitionKey::Single { keys } => keys[0].clone(),
+                _ => panic!("expected Single after expansion"),
+            })
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["a", "b", "c"],
+            "Set failure expands to its members"
+        );
     }
 
     #[tokio::test]
@@ -7249,6 +7535,7 @@ mod tests {
             "idx_events_run_type",
             "idx_events_loc_asset",
             "idx_events_loc_asset_part",
+            "idx_events_loc_asset_type",
         ] {
             assert!(indexes.contains_key(idx), "events missing index: {idx}");
         }

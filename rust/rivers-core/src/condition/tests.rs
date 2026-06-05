@@ -2790,13 +2790,15 @@ fn test_bitor_flattens_nested_or() {
 
 #[test]
 fn test_without_removes_matching_child() {
-    // eager = SinceLastHandled(...) & !any_deps_missing & !any_deps_in_progress & !InProgress
+    // eager = SinceLastHandled(...) & !any_deps_missing & !any_deps_in_progress
+    //         & !InProgress & !ExecutionFailed
     let eager = ConditionNode::eager();
     let result = eager.without("any_deps_in_progress");
     let expected = (ConditionNode::Missing.newly_true() | ConditionNode::any_deps_updated())
         .since_last_handled()
         & !ConditionNode::any_deps_missing()
-        & !ConditionNode::InProgress;
+        & !ConditionNode::InProgress
+        & !ConditionNode::ExecutionFailed;
     assert_eq!(result, expected);
 }
 
@@ -2808,7 +2810,8 @@ fn test_without_removes_only_exact_match() {
     let expected = (ConditionNode::Missing.newly_true() | ConditionNode::any_deps_updated())
         .since_last_handled()
         & !ConditionNode::any_deps_missing()
-        & !ConditionNode::any_deps_in_progress();
+        & !ConditionNode::any_deps_in_progress()
+        & !ConditionNode::ExecutionFailed;
     assert_eq!(result, expected);
 }
 
@@ -2826,7 +2829,8 @@ fn test_replace_swaps_matching_node() {
         .since_last_handled()
         & !ConditionNode::any_deps_missing()
         & !ConditionNode::any_deps_in_progress()
-        & !ConditionNode::InProgress;
+        & !ConditionNode::InProgress
+        & !ConditionNode::ExecutionFailed;
     assert_eq!(result, expected);
 }
 
@@ -2857,7 +2861,8 @@ fn test_replace_by_node_structural_match() {
         .since_last_handled()
         & !ConditionNode::any_deps_missing()
         & !ConditionNode::InProgress
-        & !ConditionNode::InProgress;
+        & !ConditionNode::InProgress
+        & !ConditionNode::ExecutionFailed;
     assert_eq!(result, expected);
 }
 

@@ -70,6 +70,7 @@ Semantics:
 - The key must be in `context.partition.keys`; passing an unrelated key raises `ExecutionError("partition key … is not in this context's partition keys")`.
 - Failures recorded this way roll up into the same `BackfillStatus.failed_partitions` / `BackfillResult.failed` counters as full-run failures — the UI and `repo.get_backfill()` see them identically.
 - The function may still raise to signal a whole-run failure; `mark_partition_failed` is for the partial-failure case where you want some keys preserved as successes.
+- Automation leaves a marked-failed partition alone: `eager()` / `on_missing()` treat it as *failed* (not *missing*), so they won't auto-re-request it. The deliberate failure sticks until you re-run that partition.
 
 ### PerDimension
 

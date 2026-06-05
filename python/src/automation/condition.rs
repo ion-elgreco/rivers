@@ -134,7 +134,8 @@ impl PyAutomationCondition {
 
 #[pymethods]
 impl PyAutomationCondition {
-    /// Eager materialization: run when deps update or asset becomes missing.
+    /// Eager materialization: run when deps update or asset becomes missing;
+    /// excludes failed partitions/assets, so they aren't auto-retried until re-run.
     #[staticmethod]
     fn eager() -> Self {
         Self {
@@ -158,7 +159,7 @@ impl PyAutomationCondition {
         }
     }
 
-    /// Only run when asset becomes missing.
+    /// Only run when asset becomes missing; skips failed partitions.
     #[staticmethod]
     fn on_missing() -> Self {
         Self {

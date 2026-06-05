@@ -723,3 +723,67 @@ class TestMarkPartitionFailed:
         )
         assert len(ctx.keys) == 1
         assert ctx.key == rs.PartitionKey.single("a")
+
+
+class TestPartitionedRaiseRecordsFailure:
+    """A genuine ``raise`` records the failed partition(s) as a per-partition
+    StepFailure (so automation sees them); a raised batch is one Set-keyed
+    StepFailure, not one event per partition."""
+
+    def test_multi_run_raise_records_partition_keyed_failure(self):
+        handler = rs.InMemoryIOHandler()
+
+        @rs.Asset(partitions_def=_static_pd(["a", "b", "c"]), io_handler=handler)
+        def widget(context: rs.AssetExecutionContext) -> int:
+            if rs.PartitionKey.single("b") in context.partition.keys:
+                raise ValueError("boom")
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[widget], default_executor=rs.Executor.in_process()
+        )
+        repo.backfill(
+            selection=["widget"],
+            partition_keys=[rs.PartitionKey.single(k) for k in ("a", "b", "c")],
+            strategy=rs.BackfillStrategy.multi_run(),
+        )
+        # a, c materialized; b raised (its own per-partition run failed).
+        assert set(repo.storage.get_materialized_partitions("widget")) == {
+            rs.PartitionKey.single("a"),
+            rs.PartitionKey.single("c"),
+        }
+        # b's run records a partition-keyed StepFailure so eager sees 'b' failed.
+        events = repo.storage.get_events_for_asset("widget")
+        pfails = [
+            e
+            for e in events
+            if e.event_type == "StepFailure" and e.partition_key is not None
+        ]
+        assert [e.partition_key for e in pfails] == [rs.PartitionKey.single("b")]
+        assert "boom" in dict(pfails[0].metadata).get("error", "")
+
+    def test_single_run_raise_records_one_set_failure(self):
+        handler = rs.InMemoryIOHandler()
+
+        @rs.Asset(partitions_def=_static_pd(["a", "b", "c"]), io_handler=handler)
+        def widget(context: rs.AssetExecutionContext) -> int:
+            raise ValueError("boom")
+
+        repo = rs.CodeRepository(
+            assets=[widget], default_executor=rs.Executor.in_process()
+        )
+        repo.backfill(
+            selection=["widget"],
+            partition_keys=[rs.PartitionKey.single(k) for k in ("a", "b", "c")],
+            strategy=rs.BackfillStrategy.single_run(),
+        )
+        # The whole batch raised → nothing materialized.
+        assert set(repo.storage.get_materialized_partitions("widget")) == set()
+        # Exactly ONE partition-keyed StepFailure (the whole Set), not one per partition.
+        events = repo.storage.get_events_for_asset("widget")
+        pfails = [
+            e
+            for e in events
+            if e.event_type == "StepFailure" and e.partition_key is not None
+        ]
+        assert len(pfails) == 1, [e.partition_key for e in pfails]
