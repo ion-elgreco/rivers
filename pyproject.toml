@@ -4,7 +4,10 @@ version = "0.0.0"
 requires-python = ">=3.10"
 
 [tool.uv.workspace]
-members = ["python"]
+members = [
+    "python",
+    "examples/package_demo",
+]
 
 [dependency-groups]
 dev = [

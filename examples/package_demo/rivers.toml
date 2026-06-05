@@ -1,0 +1,4 @@
+[rivers]
+module = "package_demo.repository"
+repo_var = "repo"
+port=3000
