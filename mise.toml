@@ -1,0 +1,23 @@
+[settings]
+experimental = true
+lockfile = true
+
+[tools]
+"cargo:cargo-zigbuild" = "v0.22.3"
+docker-cli = "29.3.0"
+docker-compose = "5.0.2"
+helmfile = "1.5.2"
+just = "1.51.0"
+k3d = "5.9.0"
+rust = "stable"
+uv = "0.11.16"
+"cargo:wasm-bindgen-cli" = "0.2.121"
+"cargo:wasm-pack" = "v0.15.0"
+helm = "4.2.0"
+protobuf = "35.0"
+
+[hooks]
+postinstall = [
+  "rustup target add wasm32-unknown-unknown",
+  "helm plugin install https://github.com/helm-unittest/helm-unittest.git --verify=false || true"
+]
