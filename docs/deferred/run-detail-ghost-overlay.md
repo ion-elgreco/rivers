@@ -82,6 +82,7 @@ The following classes were removed. Recreate them when the overlay returns:
   `.gantt-legend-swatch--ghost`, `.gantt-legend-sep`, `.gantt-legend-spacer`
 
 Keyframes to keep:
+
 - `river-flow` — already used by the running-bar stripes animation.
 
 ## Related

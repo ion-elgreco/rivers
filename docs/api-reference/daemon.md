@@ -121,9 +121,9 @@ At daemon startup, each eval function is classified:
 
 - **`inspect.iscoroutinefunction`** detects async functions
 - Combined with the user's `eval_mode` setting, this determines the dispatch:
-  - **Async in-process**: the coroutine runs automatically on the Python event loop managed from Rust. The GIL is released during `await` points, allowing true I/O concurrency.
-  - **Sync in-process**: the function runs on a dedicated tokio blocking thread, holding the GIL for the duration of the call.
-  - **Subprocess**: the eval function and context data are submitted to a loky process pool. The subprocess reconstructs the context from primitives and calls the function (no resources / config injection available across the boundary).
+    - **Async in-process**: the coroutine runs automatically on the Python event loop managed from Rust. The GIL is released during `await` points, allowing true I/O concurrency.
+    - **Sync in-process**: the function runs on a dedicated tokio blocking thread, holding the GIL for the duration of the call.
+    - **Subprocess**: the eval function and context data are submitted to a loky process pool. The subprocess reconstructs the context from primitives and calls the function (no resources / config injection available across the boundary).
 
 ## API
 

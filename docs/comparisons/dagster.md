@@ -1,6 +1,6 @@
 # Comparison with Dagster
 
-rivers takes the asset-graph orchestration model that Dagster pioneered and brings it to the compiled world. 
+rivers takes the asset-graph orchestration model that Dagster pioneered and brings it to the compiled world.
 
 This page is intentionally **not** a feature-parity matrix. It only lists what rivers does *differently or better*; for everything else (assets, partitions, IO handlers, schedules, sensors, automation conditions, backfills, jobs) assume the surface area is comparable.
 
@@ -396,7 +396,6 @@ The Python pymethods intentionally skip the queue — they are the "I want to ru
 ## Run lifecycle controls
 
 - **Sensors can yield `BackfillRequest`** — one `SensorResult` can carry `run_requests=[...]` (mixed `RunRequest` / `BackfillRequest`), a `cursor`, and a `skip_reason` from the same tick.
-
 
 ## Observability
 

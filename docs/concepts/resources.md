@@ -73,7 +73,7 @@ def my_schedule(context: rs.ScheduleEvaluationContext, db: DatabaseResource):
 
 ## Lifecycle
 
-```
+```text
 CodeRepository.__init__()
   └─ stores raw resource instances
 

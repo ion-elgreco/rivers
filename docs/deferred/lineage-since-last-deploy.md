@@ -73,6 +73,6 @@ about surfacing the toggle and feeding real data into it.
 
 - `rust/rivers-ui/src/pages/graph.rs` (deploy_view signal + toggle removed here)
 - `rust/rivers-ui/src/components/dag/render.rs` (`changed_keys` prop + NEW chip
-  + accent ring rendering — preserved)
+    - accent ring rendering — preserved)
 - Rivers reference: `/tmp/design/rivers-v2/project/components/rivers-screens.jsx`
   `LineageGraphScreen` deploy-diff banner + node NEW chip

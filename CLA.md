@@ -1,6 +1,6 @@
 # rivers Contributor License Agreement
 
-**Version 1.0**
+## Version 1.0
 
 Thank you for your interest in contributing to rivers (the "Project"), maintained by Ion Koutsouris (the "Project Owner"). This Contributor License Agreement ("Agreement") clarifies the intellectual property rights granted with Contributions from any person or entity to the Project. It protects You, the Project Owner, and users of the Project; it does not change Your rights to use Your own Contributions for any other purpose.
 
@@ -78,7 +78,7 @@ git commit -s -m "your message"
 
 This appends a trailer to Your commit message of the form:
 
-```
+```text
 Signed-off-by: Your Name <you@example.com>
 ```
 

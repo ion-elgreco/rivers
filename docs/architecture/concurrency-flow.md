@@ -15,7 +15,7 @@ The first two are **run-level** gates (before execution starts). The other two a
 
 ## Flow Diagram
 
-```
+```text
                          USER / SCHEDULER / SENSOR
                                    │
                     ┌──────────────┴──────────────┐

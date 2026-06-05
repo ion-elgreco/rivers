@@ -73,12 +73,14 @@ wasm-test browser="chrome":
 
 # Run linter, formatter, static type checker
 pre-commit:
+    uv run --no-sync rumdl check . --fix --flavor mkdocs --fail-on never --disable MD013,MD033,MD041
     uv run --no-sync ruff check python/
     uv run --no-sync ruff format python/
     cd python && uv run --no-sync pyright .
 
 # Run linter, formatter, static type checker in CI
 pre-commit-check:
+    uv run --no-sync rumdl check . --fix --flavor mkdocs --fail-on never --disable MD013,MD033,MD041
     uv run --no-sync ruff check python/
     uv run --no-sync ruff format --check --diff python/
     uv run --no-sync typos python/
