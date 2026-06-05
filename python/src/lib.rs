@@ -5,6 +5,7 @@
 //! submodules (assets, executor, storage, daemon, etc.) into the `rivers._core` package.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+#[cfg(not(target_os = "macos"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
