@@ -10,7 +10,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import tomllib
 import typer
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    TomlConfigSettingsSource,
+)
 
 from rivers._core.storage import Storage
 
@@ -19,6 +26,73 @@ pools_app = typer.Typer(name="pools", help="Inspect and manage concurrency pools
 queue_app = typer.Typer(name="queue", help="Inspect and manage the run queue")
 app.add_typer(pools_app)
 app.add_typer(queue_app)
+
+
+class RiversTomlSource(TomlConfigSettingsSource):
+    """Handles both rivers.toml ([rivers]) and pyproject.toml ([tool.rivers])."""
+
+    def _read_file(self, file_path: Path) -> dict:
+        with open(file_path, "rb") as f:
+            raw = tomllib.load(f)
+
+        if file_path.name == "pyproject.toml":
+            # `[tool.rivers]` expected for pyproject.toml files.
+            return raw.get("tool", {}).get("rivers", {})
+        else:
+            # `[rivers]` expected for rivers.toml files.
+            return raw.get("rivers", {})
+
+
+class RiversConfig(BaseSettings):
+    module: str | None = None
+    repo_var: str = "repo"
+    host: str = "127.0.0.1"
+    port: int = 3000
+    grpc_port: int = 3001
+    storage_path: str = ".rivers/storage/"
+    surreal_endpoint: str | None = None
+    no_daemon: bool = False
+    synthetic: str | None = None
+
+    model_config = SettingsConfigDict(
+        env_prefix="RIVERS_",
+        env_ignore_empty=True,
+        extra="ignore",
+        toml_file=["rivers.toml", "pyproject.toml"],
+    )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        sources: list[PydanticBaseSettingsSource] = [init_settings, env_settings]
+
+        # Using _find_toml() to recursively lookup the TOML configuration files
+        # within the current code location. This makes it possible to run operations
+        # such as `rivers dev` from anywhere inside the code location.
+        rivers_toml = _find_toml("rivers.toml")
+        pyproject_toml = _find_toml("pyproject.toml")
+
+        if rivers_toml:
+            sources.append(RiversTomlSource(settings_cls, toml_file=rivers_toml))
+        if pyproject_toml:
+            sources.append(RiversTomlSource(settings_cls, toml_file=pyproject_toml))
+
+        return tuple(sources)
+
+
+def _find_toml(filename: str, start_path: Path = Path.cwd()) -> Path | None:
+    """Recursively lookup TOML-file from current terminal path."""
+    for directory in [start_path, *start_path.parents]:
+        path = directory / filename
+        if path.exists():
+            return path
+    return None
 
 
 def _parse_partition_key(raw: str | None):
@@ -54,16 +128,17 @@ def _create_storage(memory: bool, storage_path: str) -> Storage:
 
 @app.command()
 def dev(
-    module: str = typer.Argument(help="Python module path containing CodeRepository"),
-    repo_var: str = typer.Option(
-        "repo", help="Variable name of CodeRepository in module"
+    module: str | None = typer.Argument(
+        None,
+        help="Python module path containing CodeRepository",
     ),
-    host: str = typer.Option("127.0.0.1", help="Host to bind to"),
-    port: int = typer.Option(3000, help="Port to bind to"),
-    grpc_port: int = typer.Option(3001, help="Port for gRPC backend server"),
-    storage_path: str = typer.Option(
-        ".rivers/storage/", help="Path for embedded storage"
+    repo_var: str | None = typer.Option(
+        None, help="Variable name of CodeRepository in module"
     ),
+    host: str | None = typer.Option(None, help="Host to bind to"),
+    port: int | None = typer.Option(None, help="Port to bind to"),
+    grpc_port: int | None = typer.Option(None, help="Port for gRPC backend server"),
+    storage_path: str | None = typer.Option(None, help="Path for embedded storage"),
     surreal_endpoint: str | None = typer.Option(
         None, help="Remote SurrealDB endpoint (overrides --storage-path)"
     ),
@@ -79,21 +154,46 @@ def dev(
     Resolves the repository (registering assets and graph topology in storage),
     then starts the gRPC backend and web UI servers in-process.
     """
-    os.environ["RIVERS_MODULE"] = module
+    cfg = RiversConfig(
+        **{
+            k: v
+            for k, v in {
+                "module": module,
+                "repo_var": repo_var,
+                "host": host,
+                "port": port,
+                "grpc_port": grpc_port,
+                "storage_path": storage_path,
+                "surreal_endpoint": surreal_endpoint,
+                "no_daemon": no_daemon,
+                "synthetic": synthetic,
+            }.items()
+            if v is not None
+        }
+    )
+
     os.environ["RIVERS_DEPLOYMENT"] = "dev"
-    if surreal_endpoint:
-        os.environ["RIVERS_SURREAL_ENDPOINT"] = surreal_endpoint
+    if cfg.module:
+        os.environ["RIVERS_MODULE"] = cfg.module
+    if cfg.surreal_endpoint:
+        os.environ["RIVERS_SURREAL_ENDPOINT"] = cfg.surreal_endpoint
+
+    if cfg.module is None:
+        typer.echo(
+            "Error: no module configured. Set 'module' in [rivers] config or pass --module",
+            err=True,
+        )
+        raise typer.Exit(1)
 
     # Import user module and resolve repository before opening storage —
     # otherwise a bad module name strands a RocksDB-locked dir on disk.
-    sys.path.insert(0, ".")
     try:
-        mod = importlib.import_module(module)
+        mod = importlib.import_module(cfg.module)
     except ModuleNotFoundError:
         typer.echo(f"Error: module '{module}' not found", err=True)
         raise typer.Exit(1)
 
-    repo_obj = getattr(mod, repo_var, None)
+    repo_obj = getattr(mod, cfg.repo_var, None)
     if repo_obj is None:
         typer.echo(f"Error: '{repo_var}' not found in module '{module}'", err=True)
         raise typer.Exit(1)
@@ -107,20 +207,20 @@ def dev(
     if surreal_endpoint:
         storage = Storage.connect(surreal_endpoint)
     else:
-        storage = Storage.embedded(storage_path)
-        atexit.register(_cleanup_storage, storage_path)
+        storage = Storage.embedded(cfg.storage_path)
+        atexit.register(_cleanup_storage, cfg.storage_path)
 
     repo_obj.resolve(storage=storage)
 
     # Start gRPC backend server (returns actual port, may differ if requested was in use)
-    actual_grpc_port = repo_obj._start_grpc_server(host, grpc_port)
+    actual_grpc_port = repo_obj._start_grpc_server(cfg.host, cfg.grpc_port)
 
     # Start UI server in-process (shares same storage, no lock conflict)
     grpc_url = f"http://{host}:{actual_grpc_port}"
-    repo_obj._start_ui_server(host, port, grpc_url, synthetic=synthetic)
+    repo_obj._start_ui_server(cfg.host, cfg.port, grpc_url, synthetic=cfg.synthetic)
 
     # Start automation daemon (schedules + sensors)
-    if not no_daemon:
+    if not cfg.no_daemon:
         from rivers._core import AutomationDaemon
 
         daemon = AutomationDaemon(repo=repo_obj, storage=storage)

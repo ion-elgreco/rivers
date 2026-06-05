@@ -1,0 +1,21 @@
+[project]
+name = "package-demo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "rivers",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.16,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+rivers = { workspace = true, editable = true }
+
+#[tool.rivers]
+#repository = "package_demo.repository:repo"
+#module = "package_demo.repository"
+#repo_var = "repo"
