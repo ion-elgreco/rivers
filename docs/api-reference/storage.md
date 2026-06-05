@@ -298,10 +298,9 @@ A run/step currently holding pool slots — surfaced by `get_pool_slot_holders()
 | `set_run_outcome(run_id, status, completed_steps, total_steps, message=None)` | `None` | Persist the terminal status of a run (`"Success" \| "Failure" \| "Cancelled"`). |
 | `get_run_progress(run_id)` | `tuple[int, int]` | `(completed_steps, total_steps)` for an in-flight run. |
 
-
 The claim/release methods (`_claim_concurrency_slots`, `_free_concurrency_slots`, `_free_concurrency_slots_for_run`) and the lease management methods (`_renew_slot_lease`, `_free_expired_leases`) are internal — called by the executor during step scheduling and background lease management, not by user code.
 
-#### Executor Integration
+### Executor Integration
 
 Pool limits are enforced during execution. When a step with `pool` configuration runs, the executor:
 

@@ -70,7 +70,7 @@ just demo 1k               # same, but with a 1000-node synthetic graph
 
 ## Project layout
 
-```
+```text
 rust/
   rivers-core/      Pure Rust core: graph, execution plan, storage (SurrealDB + RocksDB)
   rivers-api/       gRPC proto + generated code (shared between Python server and UI)
@@ -125,7 +125,7 @@ git commit -s -m "your message"
 
 That appends a trailer like:
 
-```
+```text
 Signed-off-by: Your Name <you@example.com>
 ```
 

@@ -14,7 +14,7 @@ The `rivers` Helm chart wires all three together; the `rivers-crds` Helm chart s
 
 ## How it fits together
 
-```
+```text
    ┌────────────────┐                                ┌─────────────┐
    │  User Browser  │                                │   kubectl   │
    └────────┬───────┘                                └──────┬──────┘
@@ -58,7 +58,7 @@ The UI, on every page load, queries that registry over gRPC `:50052` to discover
 
 A `CodeLocation` going from `kubectl apply` to `Ready`:
 
-```
+```text
    kubectl     k8s API      operator      img registry    Pod      SurrealDB
       │           │             │              │            │            │
       │           │             │              │            │            │
@@ -98,7 +98,7 @@ The mutating admission webhook stamps `spec.identity` (UUID) on create; the vali
 
 A user opens the UI and triggers an asset materialization:
 
-```
+```text
    Browser     rivers-ui      operator       Pod       SurrealDB
       │            │             │            │             │
       │            │             │            │             │
