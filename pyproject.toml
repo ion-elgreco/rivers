@@ -6,8 +6,8 @@ requires-python = ">=3.10"
 [tool.uv.workspace]
 members = ["python"]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     # test & dev tooling
     "py-spy>=0.4.0",
     "pytest>=9.0.3",
