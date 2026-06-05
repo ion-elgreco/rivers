@@ -1568,7 +1568,7 @@ requires-dist = [
     { name = "deltalake", marker = "extra == 'delta-datafusion'", specifier = ">=1.6.0" },
     { name = "loky", specifier = ">=3.5" },
     { name = "obstore", specifier = ">=0.9.1" },
-    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.42.1" },
+    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.0" },
     { name = "pandas", marker = "extra == 'pandas'", specifier = ">=2.0.0" },
     { name = "polars", marker = "extra == 'polars'", specifier = ">=1.33.1" },
     { name = "polars-deltalake", marker = "extra == 'delta-polars'", specifier = ">=1.2.0" },
