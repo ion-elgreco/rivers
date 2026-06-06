@@ -374,6 +374,10 @@ class CodeRepository:
         """(Internal) start the in-process gRPC code-location server."""
         ...
 
+    def _stop_grpc_server(self) -> None:
+        """(Internal) stop the in-process gRPC code-location server."""
+        ...
+
 __all__ = [
     "BackfillResult",
     "BackfillStatus",

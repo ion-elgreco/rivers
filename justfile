@@ -76,6 +76,7 @@ pre-commit:
     uv run --no-sync rumdl check . --fix --flavor mkdocs --fail-on never --disable MD013,MD033,MD041
     uv run --no-sync ruff check python/
     uv run --no-sync ruff format python/
+    uv run --no-sync ty check . --ignore unresolved-import --exit-zero
     cd python && uv run --no-sync pyright .
 
 # Run linter, formatter, static type checker in CI
