@@ -3588,10 +3588,24 @@ mod tests {
             .unwrap();
 
         // Upsert on the unique index updates in place: one row, latest values.
-        let parts = storage.get_materialized_partitions(cl, "inventory").await.unwrap();
-        assert_eq!(parts, vec![pk.clone()], "must not duplicate the partition row");
-        let ts = storage.get_partition_timestamps(cl, "inventory").await.unwrap();
-        assert_eq!(ts, vec![(pk.clone(), 2)], "must update the existing row in place");
+        let parts = storage
+            .get_materialized_partitions(cl, "inventory")
+            .await
+            .unwrap();
+        assert_eq!(
+            parts,
+            vec![pk.clone()],
+            "must not duplicate the partition row"
+        );
+        let ts = storage
+            .get_partition_timestamps(cl, "inventory")
+            .await
+            .unwrap();
+        assert_eq!(
+            ts,
+            vec![(pk.clone(), 2)],
+            "must update the existing row in place"
+        );
     }
 
     fn make_event(asset_key: &str, run_id: &str, ts: i64) -> EventRecord {
