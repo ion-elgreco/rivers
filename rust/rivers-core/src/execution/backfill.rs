@@ -93,9 +93,16 @@ pub fn bundle_keys(keys: &[PartitionKey]) -> PartitionKey {
     }
 }
 
-/// Order-independent equality of two partition-key collections.
+/// Order-independent equality of two partition-key collections. O(n) via a hash
+/// set keyed on `PartitionKey`'s own (dimension-order-insensitive) `Eq`/`Hash`,
+/// rather than the O(n²) of pairwise `contains` — a single-run group can bundle
+/// tens of thousands of keys, where the quadratic form wedges the process.
 fn same_set(a: &[PartitionKey], b: &[PartitionKey]) -> bool {
-    a.len() == b.len() && a.iter().all(|k| b.contains(k))
+    if a.len() != b.len() {
+        return false;
+    }
+    let b_set: std::collections::HashSet<&PartitionKey> = b.iter().collect();
+    a.iter().all(|k| b_set.contains(k))
 }
 
 fn extract_multi_run_dims(pk: &PartitionKey, multi_run: &[String]) -> Vec<(String, Vec<String>)> {
@@ -282,5 +289,29 @@ mod tests {
         };
         let back = PartitionKey::from_json(&set.to_json()).unwrap();
         assert_eq!(canon_set(&back.members()), canon_set(&set.members()));
+    }
+
+    #[test]
+    fn test_bundle_large_cartesian_is_compact_multi() {
+        // Regression: a clean region×sku cartesian (3×2000) must bundle into a
+        // compact Multi, and the set-equality check must stay O(n) — the old
+        // O(n²) `contains` form wedged single-run backfills at this size.
+        let mut keys = Vec::new();
+        for r in ["us", "eu", "apac"] {
+            for i in 0..2000 {
+                keys.push(PartitionKey::Multi {
+                    dims: vec![
+                        ("region".to_string(), vec![r.to_string()]),
+                        ("sku".to_string(), vec![format!("sku{i:05}")]),
+                    ],
+                });
+            }
+        }
+        let group = &group_into_runs(&BackfillStrategy::SingleRun, &keys)[0];
+        let bundled = bundle_keys(group);
+        // Compact cartesian form, not an explicit Set.
+        assert!(matches!(bundled, PartitionKey::Multi { .. }));
+        assert_eq!(bundled.members().len(), keys.len());
+        assert_eq!(canon_set(&bundled.members()), canon_set(&keys));
     }
 }

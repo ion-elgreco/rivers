@@ -49,6 +49,18 @@ struct DbEventWrite {
     input_data_versions: Vec<(String, String)>,
 }
 
+/// One `asset_partitions` row. Written via `upsert_asset_partitions` so a run
+/// materializing N partitions costs O(1) bulk statements, not O(N) writes.
+#[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
+struct DbAssetPartitionWrite {
+    code_location_id: String,
+    asset_key: String,
+    partition_key: PartitionKey,
+    last_event_id: String,
+    last_run_id: String,
+    last_timestamp: i64,
+}
+
 #[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
 struct DbStoredEvent {
     id: RecordId,
@@ -1314,6 +1326,26 @@ impl SurrealStorage {
         Ok(rows.first().and_then(|r| r.value.clone()))
     }
 
+    /// Bulk upsert `asset_partitions` rows, matched on the table's UNIQUE
+    /// (code_location_id, asset_key, partition_key) index — one statement that
+    /// updates existing rows in place and inserts new ones. Shared by the
+    /// batched `store_events` flush and the single-event `store_event` path.
+    async fn upsert_asset_partitions(&self, rows: Vec<DbAssetPartitionWrite>) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.db
+            .query(
+                "INSERT INTO asset_partitions $rows ON DUPLICATE KEY UPDATE \
+                 last_event_id = $input.last_event_id, \
+                 last_run_id = $input.last_run_id, \
+                 last_timestamp = $input.last_timestamp",
+            )
+            .bind(("rows", rows))
+            .await?;
+        Ok(())
+    }
+
     async fn query_pool_usage(
         &self,
         code_location_id: &str,
@@ -1508,21 +1540,15 @@ impl StorageBackend for SurrealStorage {
                     .await?;
 
                 if let Some(partition_key) = &event.partition_key {
-                    self.db
-                        .query("DELETE FROM asset_partitions WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key = $partition_key")
-                        .bind(("cl", cl.to_string()))
-                        .bind(("asset_key", asset_key.clone()))
-                        .bind(("partition_key", partition_key.clone()))
-                        .await?;
-                    self.db
-                        .query("CREATE asset_partitions SET code_location_id = $cl, asset_key = $asset_key, partition_key = $partition_key, last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp")
-                        .bind(("cl", cl.to_string()))
-                        .bind(("asset_key", asset_key.clone()))
-                        .bind(("partition_key", partition_key.clone()))
-                        .bind(("event_id", event_id.clone()))
-                        .bind(("run_id", event.run_id.clone()))
-                        .bind(("timestamp", event.timestamp))
-                        .await?;
+                    self.upsert_asset_partitions(vec![DbAssetPartitionWrite {
+                        code_location_id: cl.to_string(),
+                        asset_key: asset_key.clone(),
+                        partition_key: partition_key.clone(),
+                        last_event_id: event_id.clone(),
+                        last_run_id: event.run_id.clone(),
+                        last_timestamp: event.timestamp,
+                    }])
+                    .await?;
                 }
             }
 
@@ -1563,45 +1589,67 @@ impl StorageBackend for SurrealStorage {
 
         let event_ids: Vec<String> = results.iter().map(|e| record_id_str(&e.id)).collect();
 
-        for (event, event_id) in events.iter().zip(event_ids.iter()) {
+        // Materialization bookkeeping, collapsed from O(events) to O(assets)
+        // queries: the old path ran a code-version read, an `assets` UPDATE, and
+        // a DELETE+CREATE on `asset_partitions` for every event, so one run
+        // materializing thousands of partitions flooded storage and stalled the
+        // event writer. Group by asset (latest event wins) and rewrite the
+        // affected partition rows with one bulk upsert.
+        let mut latest_mat: std::collections::HashMap<(&str, &str), usize> =
+            std::collections::HashMap::new();
+        // Dedup partition rows within the batch (last write wins), keyed by the
+        // unique (code_location_id, asset_key, partition_key) index.
+        let mut part_rows: std::collections::HashMap<
+            (&str, &str, &PartitionKey),
+            DbAssetPartitionWrite,
+        > = std::collections::HashMap::new();
+
+        for (idx, (event, event_id)) in events.iter().zip(event_ids.iter()).enumerate() {
+            let Some(asset_key) = &event.asset_key else {
+                continue;
+            };
+            if !event.event_type.is_materialization() {
+                continue;
+            }
             let cl = event.code_location_id.as_str();
-            if let Some(asset_key) = &event.asset_key
-                && event.event_type.is_materialization() {
-                    let code_version = self.get_code_version(cl, asset_key).await?;
-                    let input_data_versions = event.input_data_versions.clone();
-
-                    let data_version = event.event_type.data_version().map(|s| s.to_string());
-                    self.db
-                        .query("UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv, last_input_data_versions = $idv WHERE code_location_id = $cl AND asset_key = $asset_key")
-                        .bind(("cl", cl.to_string()))
-                        .bind(("asset_key", asset_key.clone()))
-                        .bind(("event_id", event_id.clone()))
-                        .bind(("run_id", event.run_id.clone()))
-                        .bind(("timestamp", event.timestamp))
-                        .bind(("data_version", data_version))
-                        .bind(("mcv", code_version.clone()))
-                        .bind(("idv", input_data_versions.clone()))
-                        .await?;
-
-                    if let Some(partition_key) = &event.partition_key {
-                        self.db
-                            .query("DELETE FROM asset_partitions WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key = $partition_key")
-                            .bind(("cl", cl.to_string()))
-                            .bind(("asset_key", asset_key.clone()))
-                            .bind(("partition_key", partition_key.clone()))
-                            .await?;
-                        self.db
-                            .query("CREATE asset_partitions SET code_location_id = $cl, asset_key = $asset_key, partition_key = $partition_key, last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp")
-                            .bind(("cl", cl.to_string()))
-                            .bind(("asset_key", asset_key.clone()))
-                            .bind(("partition_key", partition_key.clone()))
-                            .bind(("event_id", event_id.clone()))
-                            .bind(("run_id", event.run_id.clone()))
-                            .bind(("timestamp", event.timestamp))
-                            .await?;
-                    }
-                }
+            latest_mat.insert((cl, asset_key.as_str()), idx);
+            if let Some(partition_key) = &event.partition_key {
+                part_rows.insert(
+                    (cl, asset_key.as_str(), partition_key),
+                    DbAssetPartitionWrite {
+                        code_location_id: cl.to_string(),
+                        asset_key: asset_key.clone(),
+                        partition_key: partition_key.clone(),
+                        last_event_id: event_id.clone(),
+                        last_run_id: event.run_id.clone(),
+                        last_timestamp: event.timestamp,
+                    },
+                );
+            }
         }
+
+        // One `assets` row update per materialized asset (latest event wins).
+        for (&(cl, asset_key), &idx) in &latest_mat {
+            let event = &events[idx];
+            let event_id = &event_ids[idx];
+            let code_version = self.get_code_version(cl, asset_key).await?;
+            let data_version = event.event_type.data_version().map(|s| s.to_string());
+            self.db
+                .query("UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv, last_input_data_versions = $idv WHERE code_location_id = $cl AND asset_key = $asset_key")
+                .bind(("cl", cl.to_string()))
+                .bind(("asset_key", asset_key.to_string()))
+                .bind(("event_id", event_id.clone()))
+                .bind(("run_id", event.run_id.clone()))
+                .bind(("timestamp", event.timestamp))
+                .bind(("data_version", data_version))
+                .bind(("mcv", code_version))
+                .bind(("idv", event.input_data_versions.clone()))
+                .await?;
+        }
+
+        // Upsert the affected partition rows in one bulk statement.
+        self.upsert_asset_partitions(part_rows.into_values().collect())
+            .await?;
 
         for (event, event_id) in events.iter().zip(event_ids.iter()) {
             let cl = event.code_location_id.as_str();
@@ -3504,6 +3552,46 @@ mod tests {
         SurrealStorage::new_memory()
             .await
             .expect("failed to create in-memory storage")
+    }
+
+    /// `store_events`/`store_event` upsert `asset_partitions` via `INSERT ... ON
+    /// DUPLICATE KEY UPDATE`, which must fire on the table's UNIQUE
+    /// (code_location_id, asset_key, partition_key) index — not the record id —
+    /// to replace rather than duplicate. Guard that on the RocksDB backend the
+    /// demo uses (kv-mem enforces indexes differently).
+    #[tokio::test]
+    async fn test_upsert_asset_partitions_replaces_on_unique_index() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let pk = PartitionKey::Single {
+            keys: vec!["p1".to_string()],
+        };
+        let row = |event_id: &str, ts: i64| super::DbAssetPartitionWrite {
+            code_location_id: cl.to_string(),
+            asset_key: "inventory".to_string(),
+            partition_key: pk.clone(),
+            last_event_id: event_id.to_string(),
+            last_run_id: "r".to_string(),
+            last_timestamp: ts,
+        };
+
+        storage
+            .upsert_asset_partitions(vec![row("ev1", 1)])
+            .await
+            .unwrap();
+        storage
+            .upsert_asset_partitions(vec![row("ev2", 2)])
+            .await
+            .unwrap();
+
+        // Upsert on the unique index updates in place: one row, latest values.
+        let parts = storage.get_materialized_partitions(cl, "inventory").await.unwrap();
+        assert_eq!(parts, vec![pk.clone()], "must not duplicate the partition row");
+        let ts = storage.get_partition_timestamps(cl, "inventory").await.unwrap();
+        assert_eq!(ts, vec![(pk.clone(), 2)], "must update the existing row in place");
     }
 
     fn make_event(asset_key: &str, run_id: &str, ts: i64) -> EventRecord {
