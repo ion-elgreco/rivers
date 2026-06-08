@@ -15,6 +15,7 @@ from typing import Any, Literal
 from deltalake import CommitProperties, DeltaTable, WriterProperties, write_deltalake
 from deltalake.exceptions import TableNotFoundError
 from pydantic_settings import SettingsConfigDict
+from pyspark.sql.dataframe import DataFrame as SparkDataFrame
 
 from rivers._core import InputContext, OutputContext
 from rivers.io_handlers.base import BaseIOHandler
@@ -33,6 +34,7 @@ from rivers.io_handlers.delta.config import (
 )
 from rivers.io_handlers.delta.merge import _merge_execute
 from rivers.io_handlers.delta.predicate import _build_predicate, _resolve_partition_expr
+from rivers.io_handlers.delta.pyspark import write_delta_spark
 
 __all__: list[str] = [
     "DeltaIOHandler",
@@ -51,18 +53,19 @@ __all__: list[str] = [
 
 
 # Keyed by the type's top-level module rather than its class name: ``DataFrame``
-# is shared by pandas, polars and datafusion, so a name-based map can't tell them
-# apart when suggesting the right install extra.
+# is shared by pandas, polars, datafusion, and pyspark, so a name-based map
+# can't tell them apart when suggesting the right install extra.
 _MODULE_TO_EXTRA: dict[str, str] = {
     "pyarrow": "pyarrow",
     "polars": "polars",
     "pandas": "pandas",
     "datafusion": "datafusion",
+    "pyspark": "pyspark",
 }
 
 
 def _build_type_handler_map() -> dict[type, DeltaTypeHandler]:
-    """Best-effort discovery of installed type handlers (pyarrow, polars, pandas).
+    """Best-effort discovery of installed type handlers (pyarrow, polars, pandas, pyspark).
 
     Returns a mapping from supported Python type to its handler. Missing optional
     dependencies are silently skipped — the handler is only registered when its
@@ -74,6 +77,7 @@ def _build_type_handler_map() -> dict[type, DeltaTypeHandler]:
         ("rivers.io_handlers.delta.polars", "PolarsTypeHandler"),
         ("rivers.io_handlers.delta.datafusion", "DataFusionTypeHandler"),
         ("rivers.io_handlers.delta.pandas", "PandasTypeHandler"),
+        ("rivers.io_handlers.delta.pyspark", "PySparkTypeHandler"),
     ]:
         try:
             mod = __import__(mod_path, fromlist=[cls_name])
@@ -125,7 +129,20 @@ class DeltaIOHandler(BaseIOHandler):
         Suggests the right install extra (e.g. ``rivers[polars]``) when a known
         type is requested but its handler library is not installed.
         """
-        handler = self.type_handlers().get(target_type)
+
+        handler = None
+        # Spark 4.0+ introduced a split between the public DataFrame API
+        # (``pyspark.sql.dataframe.DataFrame``) and the underlying classic
+        # implementation (``pyspark.sql.classic.dataframe.DataFrame``).
+        # So a direct type lookup can therefore fail because ``type(df)`` may
+        # resolve to the classic implementation while handlers are registered
+        # against the public API class. Using ``issubclass()`` is therefore a
+        # more robust check instead of exact class comparison.
+        for type, type_handler in self.type_handlers().items():
+            if issubclass(target_type, type):
+                handler = type_handler
+                break
+
         if handler is not None:
             return handler
         extra = _MODULE_TO_EXTRA.get(target_type.__module__.split(".", 1)[0])
@@ -176,13 +193,28 @@ class DeltaIOHandler(BaseIOHandler):
             except TableNotFoundError:
                 predicate = None
 
-        data = self._resolve_handler(type(obj)).to_arrow(obj)
+        handler = self._resolve_handler(type(obj))
 
         # Resolve table configuration (IO manager default + per-asset override)
         table_cfg = dict(self.table_config) if self.table_config else {}
         if "delta/table_configuration" in meta:
             table_cfg.update(json.loads(meta["delta/table_configuration"]))
         table_configuration = table_cfg or None
+
+        # If obj is a spark dataframe we delegate the writing to delta-spark.
+        if isinstance(obj, SparkDataFrame):
+            return write_delta_spark(
+                context=context,
+                spark_df=obj,
+                delta_write_mode=mode,
+                meta=meta,
+                table_uri=uri,
+                predicate=predicate,
+                partition_by=partition_by,
+                schema_mode=schema_mode,
+                merge_config=self.merge_config,
+                table_config=table_configuration,
+            )
 
         # Resolve writer/commit properties (per-asset override > handler default)
         writer_properties = self.writer_properties
@@ -199,6 +231,7 @@ class DeltaIOHandler(BaseIOHandler):
 
         merge_stats: dict[str, Any] | None = None
         start = time.monotonic()
+        data = handler.to_arrow(obj)
         if mode == "merge":
             merge_predicate_override = meta.get("delta/merge_predicate")
             merge_stats = _merge_execute(
