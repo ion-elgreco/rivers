@@ -3,8 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Format a partition key to match gRPC's `py_partition_key_display` (`Multi` →
+/// sorted `dim=v|dim=v`), so UI keys line up with the heatmap's gRPC-windowed keys.
 #[cfg(feature = "ssr")]
-fn partition_key_to_display(pk: rivers_core::storage::PartitionKey) -> String {
+pub(crate) fn partition_key_to_display(pk: rivers_core::storage::PartitionKey) -> String {
     match pk {
         rivers_core::storage::PartitionKey::Single { keys } => {
             keys.first().cloned().unwrap_or_default()
@@ -115,6 +117,26 @@ pub enum LaunchedBy {
     Condition,
 }
 
+/// A run's partition members, capped: a few keys + the total, so the run list
+/// renders "a, b, c +N more" without shipping a whole `single_run` batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionPreview {
+    pub preview: Vec<String>,
+    pub total: usize,
+}
+
+impl PartitionPreview {
+    /// "a, b, c +N more".
+    pub fn label(&self) -> String {
+        let more = self.total.saturating_sub(self.preview.len());
+        if more > 0 {
+            format!("{} +{more} more", self.preview.join(", "))
+        } else {
+            self.preview.join(", ")
+        }
+    }
+}
+
 /// One row in the runs table — produced by every `materialize` /
 /// `execute_job` / queued backfill submission. Mirrors
 /// `rivers_core::storage::RunRecord`.
@@ -133,7 +155,7 @@ pub struct RunRecord {
     #[serde(default)]
     pub priority: i32,
     #[serde(default)]
-    pub partition_key: Option<String>,
+    pub partition_key: Option<PartitionPreview>,
     #[serde(default)]
     pub block_reason: Option<String>,
     #[serde(default)]
@@ -159,12 +181,29 @@ pub struct RunFilter {
     pub partition_substring: Option<String>,
 }
 
-/// One page of runs plus the total number of rows matching the filter.
+/// A page of rows + the matching total — what every paginated server-fn returns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunsPage {
-    pub rows: Vec<RunRecord>,
+pub struct Page<T> {
+    pub rows: Vec<T>,
     pub total: u64,
 }
+
+/// One page of runs plus the total number of rows matching the filter.
+pub type RunsPage = Page<RunRecord>;
+
+/// One page of an asset's events plus the total number matching the type filter.
+pub type EventsPage = Page<StoredEvent>;
+
+/// One windowed partition of a backfill: its display key and status
+/// ("done" | "failed" | "canceled" | "pending").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackfillPartitionCell {
+    pub key: String,
+    pub status: String,
+}
+
+/// A window of a backfill's partitions plus the total partition count.
+pub type BackfillPartitionsPage = Page<BackfillPartitionCell>;
 
 /// Aggregate run counts for the runs-list page header.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -890,19 +929,17 @@ mod conversions {
     impl From<rivers_core::storage::RunRecord> for RunRecord {
         fn from(r: rivers_core::storage::RunRecord) -> Self {
             let partition_key = r.partition_key.as_ref().map(|pk| {
-                pk.members()
-                    .iter()
-                    .map(|m| match m {
-                        rivers_core::storage::PartitionKey::Multi { dims } => dims
-                            .iter()
-                            .map(|(d, ks)| format!("{d}={}", ks.join("|")))
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        rivers_core::storage::PartitionKey::Single { keys } => keys.join("|"),
-                        _ => String::new(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                // Bounded preview — never materialize every member of a large
+                // (single_run) batch just to show the first few in the run list.
+                const PREVIEW_N: usize = 3;
+                PartitionPreview {
+                    preview: pk
+                        .members_preview(PREVIEW_N)
+                        .into_iter()
+                        .map(partition_key_to_display)
+                        .collect(),
+                    total: pk.member_count(),
+                }
             });
             Self {
                 run_id: r.run_id,
@@ -995,7 +1032,7 @@ mod conversions {
                 event_type: e.event_type.into(),
                 asset_key: e.asset_key,
                 run_id: e.run_id,
-                partition_key: e.partition_key.map(|pk| format!("{:?}", pk)),
+                partition_key: e.partition_key.map(partition_key_to_display),
                 timestamp: e.timestamp,
                 metadata: e
                     .metadata

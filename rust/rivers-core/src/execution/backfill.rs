@@ -93,10 +93,9 @@ pub fn bundle_keys(keys: &[PartitionKey]) -> PartitionKey {
     }
 }
 
-/// Order-independent equality of two partition-key collections. O(n) via a hash
-/// set keyed on `PartitionKey`'s own (dimension-order-insensitive) `Eq`/`Hash`,
-/// rather than the O(n²) of pairwise `contains` — a single-run group can bundle
-/// tens of thousands of keys, where the quadratic form wedges the process.
+/// Order-independent set equality, O(n) via `PartitionKey`'s `Eq`/`Hash` rather
+/// than O(n²) pairwise `contains` — a single-run group can bundle tens of
+/// thousands of keys, where the quadratic form wedges the process.
 fn same_set(a: &[PartitionKey], b: &[PartitionKey]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -313,5 +312,38 @@ mod tests {
         assert!(matches!(bundled, PartitionKey::Multi { .. }));
         assert_eq!(bundled.members().len(), keys.len());
         assert_eq!(canon_set(&bundled.members()), canon_set(&keys));
+    }
+
+    #[test]
+    fn test_member_count_and_preview() {
+        // Multi cartesian: count is the product (no materialization); preview is
+        // the first N in `members()` order without building the other ~15k.
+        let key = PartitionKey::Multi {
+            dims: vec![
+                (
+                    "region".to_string(),
+                    vec!["us".into(), "eu".into(), "apac".into()],
+                ),
+                (
+                    "sku".to_string(),
+                    (0..5000).map(|i| format!("sku{i:05}")).collect(),
+                ),
+            ],
+        };
+        assert_eq!(key.member_count(), 15_000);
+        let preview = key.members_preview(3);
+        assert_eq!(preview, key.members().into_iter().take(3).collect::<Vec<_>>());
+
+        // Single and Set.
+        let single = PartitionKey::Single {
+            keys: vec!["a".into(), "b".into(), "c".into()],
+        };
+        assert_eq!(single.member_count(), 3);
+        assert_eq!(single.members_preview(2).len(), 2);
+        let set = PartitionKey::Set {
+            keys: vec![single_key("x"), single_key("y")],
+        };
+        assert_eq!(set.member_count(), 2);
+        assert_eq!(set.members_preview(10).len(), 2);
     }
 }

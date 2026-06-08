@@ -17,7 +17,7 @@ use leptos_router::components::A;
 
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::GridRowSkeleton;
-use crate::components::pagination::Pagination;
+use crate::components::pagination::PaginatedView;
 use crate::components::ui_kit::{
     AssetStack, Crumb, DurationCell, EmptyState, FilterPillGroup, LaunchedByCell, PartitionCell,
     RiversSearch, StatusChip, Topbar, partition_scheme_for,
@@ -106,19 +106,6 @@ pub fn RunsListPage() -> impl IntoView {
     let on_tab = Callback::new(move |v: String| {
         set_active_tab.set(v);
         set_page.set(0);
-    });
-
-    // Guard: if the current page slips past the last page after a filter
-    // change or a deletion shrinks `total`, snap back to page 0. Fires inside
-    // a regular effect (not SSR) because Resource reads only resolve there.
-    Effect::new(move |_| {
-        if let Some(Ok(p)) = runs_page.get()
-            && p.rows.is_empty()
-            && p.total > 0
-            && page.get_untracked() > 0
-        {
-            set_page.set(0);
-        }
     });
 
     view! {
@@ -221,36 +208,24 @@ pub fn RunsListPage() -> impl IntoView {
             />
         </div>
 
-        <Transition fallback=move || view! { <GridRowSkeleton rows=10 cols=7/> }>
-            {move || match runs_page.get() {
-                None => view! { <GridRowSkeleton rows=10 cols=7/> }.into_any(),
-                Some(Err(e)) => view! {
-                    <div class="error-msg">{format!("Error loading runs: {e}")}</div>
-                }.into_any(),
-                Some(Ok(page_data)) if page_data.total == 0 => view! {
-                    <EmptyState
-                        message="No runs match the current filters"
-                        hint="clear a filter or widen the status tab"
-                    />
-                }.into_any(),
-                Some(Ok(page_data)) => {
-                    let locs = locations
-                        .get()
-                        .and_then(|r| r.ok())
-                        .unwrap_or_default();
-                    view! {
-                        <RunsTable rows=page_data.rows locations=locs/>
-                        <Pagination
-                            total=page_data.total
-                            page=page
-                            set_page=set_page
-                            page_size=page_size
-                            set_page_size=set_page_size
-                        />
-                    }.into_any()
-                }
+        <PaginatedView
+            data=runs_page
+            page=page
+            set_page=set_page
+            page_size=page_size
+            set_page_size=set_page_size
+            fallback=move || view! { <GridRowSkeleton rows=10 cols=7/> }
+            empty=move || view! {
+                <EmptyState
+                    message="No runs match the current filters"
+                    hint="clear a filter or widen the status tab"
+                />
+            }
+            render={move |rows: Vec<RunRecord>| {
+                let locs = locations.get().and_then(|r| r.ok()).unwrap_or_default();
+                view! { <RunsTable rows=rows locations=locs/> }.into_any()
             }}
-        </Transition>
+        />
     }
 }
 
@@ -297,14 +272,15 @@ fn RunRow(record: RunRecord, code_location_label: String) -> impl IntoView {
     let created_abs = format_timestamp(Some(record.start_time));
     let duration = format_duration(Some(record.start_time), record.end_time);
     let asset_names = record.node_names.clone();
-    let partition_val: Option<String> = record.partition_key.clone();
+    let partition_val = record.partition_key.clone();
     let cl_title = record.code_location_id.clone();
     let job_name = record.job_name.clone();
     let launched_by = record.launched_by.clone();
     let rail_cls = format!("grid-row-rail grid-row-rail--{}", st_class);
     let part_scheme = partition_val
-        .as_deref()
-        .map(partition_scheme_for)
+        .as_ref()
+        .and_then(|p| p.preview.first())
+        .map(|k| partition_scheme_for(k))
         .unwrap_or("·");
     let launched_cell = match (&launched_by, job_name.as_ref()) {
         (crate::types::LaunchedBy::Manual, Some(j)) => {
@@ -321,7 +297,7 @@ fn RunRow(record: RunRecord, code_location_label: String) -> impl IntoView {
             <StatusChip kind=st_kind small=true/>
             <AssetStack assets=asset_names/>
             {partition_val
-                .map(|p| view! { <PartitionCell scheme=part_scheme count_label=p/> }.into_any())
+                .map(|p| view! { <PartitionCell scheme=part_scheme count_label=p.label()/> }.into_any())
                 .unwrap_or_else(|| view! { <span class="grid-cell-muted">"—"</span> }.into_any())}
             <span class="grid-cell-muted"><RelTime ts=start_ts/></span>
             <DurationCell human=duration clock="".to_string()/>

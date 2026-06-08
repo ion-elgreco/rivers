@@ -918,6 +918,157 @@ impl SurrealStorage {
         .await
     }
 
+    /// A page of an asset's events (newest first) restricted to `event_types`,
+    /// plus the total count matching that filter — backs the asset-detail events
+    /// pagination. Mirrors `get_runs_page`.
+    pub async fn get_events_for_asset_page(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        event_types: &[String],
+        offset: u64,
+        limit: u64,
+    ) -> Result<(Vec<StoredEvent>, u64)> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(
+                    "SELECT * FROM events \
+                     WHERE code_location_id = $cl AND asset_key = $ak AND event_type IN $types \
+                     ORDER BY timestamp DESC, sort_order DESC, id DESC LIMIT $limit START $offset; \
+                     SELECT count() AS total FROM events \
+                     WHERE code_location_id = $cl AND asset_key = $ak AND event_type IN $types GROUP ALL;",
+                )
+                .bind(("cl", code_location_id.to_string()))
+                .bind(("ak", asset_key.to_string()))
+                .bind(("types", event_types.to_vec()))
+                .bind(("limit", limit))
+                .bind(("offset", offset))
+                .await?;
+            let events: Vec<DbStoredEvent> = result.take(0)?;
+            let total: Option<u64> = result.take((1, "total"))?;
+            Ok((
+                events.into_iter().map(|e| e.into_stored_event()).collect(),
+                total.unwrap_or(0),
+            ))
+        })
+        .await
+    }
+
+    /// A run's step events (`StepStart`/`Success`/`Failure`) — O(steps), not
+    /// O(partitions). Backs the timeline/DAG without the 15k+ materialization events.
+    pub async fn get_run_step_events(&self, run_id: &str) -> Result<Vec<StoredEvent>> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(
+                    "SELECT * FROM events WHERE run_id = $id \
+                     AND event_type IN ['StepStart', 'StepSuccess', 'StepFailure'] \
+                     ORDER BY timestamp ASC, sort_order ASC, id ASC",
+                )
+                .bind(("id", run_id.to_string()))
+                .await?;
+            let events: Vec<DbStoredEvent> = result.take(0)?;
+            Ok(events.into_iter().map(|e| e.into_stored_event()).collect())
+        })
+        .await
+    }
+
+    /// A run's `LogOutput` events (stdout/stderr/logs) — small, kept out of the
+    /// materialization stream so the log tabs don't pull it.
+    pub async fn get_run_log_events(&self, run_id: &str) -> Result<Vec<StoredEvent>> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(
+                    "SELECT * FROM events WHERE run_id = $id AND event_type = 'LogOutput' \
+                     ORDER BY timestamp ASC, sort_order ASC, id ASC",
+                )
+                .bind(("id", run_id.to_string()))
+                .await?;
+            let events: Vec<DbStoredEvent> = result.take(0)?;
+            Ok(events.into_iter().map(|e| e.into_stored_event()).collect())
+        })
+        .await
+    }
+
+    /// A page of a run's structured (non-`LogOutput`) events, optionally scoped
+    /// to one asset, plus the total — backs the run-detail events table.
+    pub async fn get_run_structured_events_page(
+        &self,
+        run_id: &str,
+        asset_key: Option<&str>,
+        offset: u64,
+        limit: u64,
+    ) -> Result<(Vec<StoredEvent>, u64)> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let asset_clause = if asset_key.is_some() {
+                " AND asset_key = $ak"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT * FROM events WHERE run_id = $id AND event_type != 'LogOutput'{asset_clause} \
+                 ORDER BY timestamp ASC, sort_order ASC, id ASC LIMIT $limit START $offset; \
+                 SELECT count() AS total FROM events WHERE run_id = $id AND event_type != 'LogOutput'{asset_clause} GROUP ALL;"
+            );
+            let mut q = self
+                .db
+                .query(sql)
+                .bind(("id", run_id.to_string()))
+                .bind(("limit", limit))
+                .bind(("offset", offset));
+            if let Some(ak) = asset_key {
+                q = q.bind(("ak", ak.to_string()));
+            }
+            let mut result = q.await?;
+            let events: Vec<DbStoredEvent> = result.take(0)?;
+            let total: Option<u64> = result.take((1, "total"))?;
+            Ok((
+                events.into_iter().map(|e| e.into_stored_event()).collect(),
+                total.unwrap_or(0),
+            ))
+        })
+        .await
+    }
+
+    /// A page of one asset's events of a single type within a run (e.g.
+    /// `Materialization`) + total — so the drawer pages a 15k-partition asset's
+    /// materializations instead of rendering all of them.
+    pub async fn get_run_asset_events_page(
+        &self,
+        run_id: &str,
+        asset_key: &str,
+        event_type: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<(Vec<StoredEvent>, u64)> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(
+                    "SELECT * FROM events \
+                     WHERE run_id = $id AND asset_key = $ak AND event_type = $type \
+                     ORDER BY timestamp ASC, sort_order ASC, id ASC LIMIT $limit START $offset; \
+                     SELECT count() AS total FROM events \
+                     WHERE run_id = $id AND asset_key = $ak AND event_type = $type GROUP ALL;",
+                )
+                .bind(("id", run_id.to_string()))
+                .bind(("ak", asset_key.to_string()))
+                .bind(("type", event_type.to_string()))
+                .bind(("limit", limit))
+                .bind(("offset", offset))
+                .await?;
+            let events: Vec<DbStoredEvent> = result.take(0)?;
+            let total: Option<u64> = result.take((1, "total"))?;
+            Ok((
+                events.into_iter().map(|e| e.into_stored_event()).collect(),
+                total.unwrap_or(0),
+            ))
+        })
+        .await
+    }
+
     /// Aggregate run counts for the runs-list page header. Unfiltered so the
     /// pill badges stay stable as substring filters change.
     pub async fn get_all_runs_summary(&self, cutoff_24h_ns: i64) -> Result<RunsSummary> {
@@ -1589,12 +1740,10 @@ impl StorageBackend for SurrealStorage {
 
         let event_ids: Vec<String> = results.iter().map(|e| record_id_str(&e.id)).collect();
 
-        // Materialization bookkeeping, collapsed from O(events) to O(assets)
-        // queries: the old path ran a code-version read, an `assets` UPDATE, and
-        // a DELETE+CREATE on `asset_partitions` for every event, so one run
-        // materializing thousands of partitions flooded storage and stalled the
-        // event writer. Group by asset (latest event wins) and rewrite the
-        // affected partition rows with one bulk upsert.
+        // Materialization bookkeeping, collapsed from O(events) to O(assets): the
+        // old per-event code-version read + `assets` UPDATE + `asset_partitions`
+        // DELETE+CREATE flooded storage on big runs. Group by asset (latest wins),
+        // then one bulk upsert.
         let mut latest_mat: std::collections::HashMap<(&str, &str), usize> =
             std::collections::HashMap::new();
         // Dedup partition rows within the batch (last write wins), keyed by the

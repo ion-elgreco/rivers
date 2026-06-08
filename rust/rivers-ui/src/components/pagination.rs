@@ -3,6 +3,8 @@
 
 use leptos::prelude::*;
 
+use crate::types::{Page, StoredEvent};
+
 /// Compute total-page count from a row total and a page size. Treats
 /// `page_size == 0` as "show all rows on one page" — guards against a
 /// panic in `u64::div_ceil(0)` that would otherwise crash the whole WASM
@@ -67,6 +69,150 @@ pub fn Pagination(
                     on:click=move |_| set_page.update(|p| *p += 1)
                 >"Next"</button>
             </div>
+        </div>
+    }
+}
+
+/// Renders a server-paginated list (fallback / error / empty / rows +
+/// `Pagination`) and snaps the page back to 0 when it slips past the last page.
+/// Shared by the runs / asset-event / backfill-partition lists.
+#[component]
+pub fn PaginatedView<T, R>(
+    /// Server-paginated data, keyed by the caller on its own filters + page.
+    data: Resource<Result<Page<T>, ServerFnError>>,
+    page: ReadSignal<u64>,
+    set_page: WriteSignal<u64>,
+    page_size: ReadSignal<u64>,
+    set_page_size: WriteSignal<u64>,
+    /// Renders the current page's rows (table, cards, heatmap, …).
+    render: R,
+    /// Shown while the first page resolves.
+    #[prop(optional, into)]
+    fallback: ViewFn,
+    /// Shown when `total == 0` (nothing matches).
+    #[prop(optional, into)]
+    empty: ViewFn,
+) -> impl IntoView
+where
+    T: Clone + Send + Sync + 'static,
+    R: Fn(Vec<T>) -> AnyView + Send + Sync + 'static,
+{
+    // Snap a past-the-end page back to 0 (filter shrank `total`). Effect-only —
+    // resource reads resolve outside SSR.
+    Effect::new(move |_| {
+        if let Some(Ok(p)) = data.get()
+            && p.rows.is_empty()
+            && p.total > 0
+            && page.get_untracked() > 0
+        {
+            set_page.set(0);
+        }
+    });
+    view! {
+        <Transition fallback=move || fallback.run()>
+            {move || {
+                data.get().map(|result| match result {
+                    Ok(p) if p.total == 0 => empty.run(),
+                    Ok(p) => {
+                        let total = p.total;
+                        view! {
+                            {render(p.rows)}
+                            <Pagination
+                                total=total
+                                page=page
+                                set_page=set_page
+                                page_size=page_size
+                                set_page_size=set_page_size
+                            />
+                        }
+                        .into_any()
+                    }
+                    Err(e) => {
+                        view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any()
+                    }
+                })
+            }}
+        </Transition>
+    }
+}
+
+/// Infinite-scroll event list: accumulates rows and bumps `set_page` when
+/// scrolled near the bottom. A keyed `<For>` keeps scroll position on append;
+/// resetting `page` to 0 replaces the buffer.
+#[component]
+pub fn InfiniteEventList<R>(
+    data: Resource<Result<Page<StoredEvent>, ServerFnError>>,
+    page: ReadSignal<u64>,
+    set_page: WriteSignal<u64>,
+    /// Renders one event row.
+    row: R,
+    /// Shown when there are zero events.
+    #[prop(optional, into)]
+    empty: ViewFn,
+    /// CSS max-height of the scroll viewport.
+    #[prop(default = "320px".to_string(), into)]
+    max_height: String,
+) -> impl IntoView
+where
+    R: Fn(StoredEvent) -> AnyView + Clone + Send + Sync + 'static,
+{
+    let acc = RwSignal::new(Vec::<StoredEvent>::new());
+    let total = RwSignal::new(0u64);
+    let loaded_page = RwSignal::new(-1i64);
+
+    // Page 0 replaces the buffer (initial / filter reset); later pages append.
+    Effect::new(move |_| {
+        if let Some(Ok(pg)) = data.get() {
+            let p = page.get_untracked();
+            total.set(pg.total);
+            if p == 0 {
+                acc.set(pg.rows);
+                loaded_page.set(0);
+            } else if loaded_page.get_untracked() < p as i64 {
+                acc.update(|v| v.extend(pg.rows));
+                loaded_page.set(p as i64);
+            }
+        }
+    });
+
+    // web-sys (DOM scroll metrics) is client-only, so this is a server no-op.
+    let on_scroll = move |_ev: leptos::ev::Event| {
+        #[cfg(any(feature = "hydrate", feature = "csr"))]
+        {
+            let el = event_target::<web_sys::HtmlElement>(&_ev);
+            let near =
+                (el.scroll_top() + el.client_height()) as f64 >= el.scroll_height() as f64 - 200.0;
+            if near
+                && loaded_page.get_untracked() == page.get_untracked() as i64
+                && (acc.with_untracked(Vec::len) as u64) < total.get_untracked()
+            {
+                set_page.update(|p| *p += 1);
+            }
+        }
+        #[cfg(not(any(feature = "hydrate", feature = "csr")))]
+        let _ = set_page;
+    };
+
+    view! {
+        <div
+            class="infinite-scroll"
+            style=format!("max-height:{max_height};overflow-y:auto")
+            on:scroll=on_scroll
+        >
+            <For each=move || acc.get() key=|e: &StoredEvent| e.id.clone() children=row/>
+            {move || {
+                if acc.with(Vec::is_empty) {
+                    if loaded_page.get() >= 0 && total.get() == 0 {
+                        empty.run()
+                    } else {
+                        view! { <div class="infinite-scroll-status">"Loading…"</div> }.into_any()
+                    }
+                } else if loaded_page.get() < page.get() as i64 {
+                    view! { <div class="infinite-scroll-status">"Loading more…"</div> }.into_any()
+                } else {
+                    ().into_any()
+                }
+            }}
         </div>
     }
 }

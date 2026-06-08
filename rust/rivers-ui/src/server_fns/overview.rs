@@ -153,17 +153,13 @@ pub async fn get_assets_info(
 /// materializes several at once — each one counts independently.
 #[cfg(feature = "ssr")]
 fn partition_key_members(pk: &rivers_core::storage::PartitionKey) -> Vec<String> {
-    use rivers_core::storage::PartitionKey;
-    match pk {
-        PartitionKey::Single { keys } => keys.clone(),
-        PartitionKey::Multi { dims } => vec![
-            dims.iter()
-                .map(|(d, ks)| format!("{d}={}", ks.join("|")))
-                .collect::<Vec<_>>()
-                .join(", "),
-        ],
-        PartitionKey::Set { keys } => keys.iter().flat_map(partition_key_members).collect(),
-    }
+    // Each individual member, formatted to match the gRPC-windowed keys so the
+    // heatmap's `materialized_keys.contains(window_key)` lookups hit. A Multi
+    // format mismatch here is what grays out every block despite a right count.
+    pk.members()
+        .into_iter()
+        .map(crate::types::partition_key_to_display)
+        .collect()
 }
 
 /// Tri-state per-partition status (Materialized / Failed / Missing) for the

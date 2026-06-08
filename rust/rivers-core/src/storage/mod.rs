@@ -274,6 +274,70 @@ impl PartitionKey {
         }
     }
 
+    /// Number of individual members this key expands to, computed *without*
+    /// materializing them — `Single`: value count; `Multi`: cartesian product of
+    /// per-dimension value counts; `Set`: sum over members.
+    pub fn member_count(&self) -> usize {
+        match self {
+            Self::Single { keys } => keys.len(),
+            Self::Multi { dims } => dims.iter().map(|(_, vs)| vs.len()).product(),
+            Self::Set { keys } => keys.iter().map(Self::member_count).sum(),
+        }
+    }
+
+    /// The first `limit` members in `members()` order, without building the rest
+    /// — a cheap preview for keys that expand to thousands (e.g. `single_run`
+    /// backfills), where the UI shows a few plus a total count.
+    pub fn members_preview(&self, limit: usize) -> Vec<PartitionKey> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        match self {
+            Self::Single { keys } => keys
+                .iter()
+                .take(limit)
+                .map(|k| Self::Single { keys: vec![k.clone()] })
+                .collect(),
+            Self::Multi { dims } => {
+                let mut sorted = dims.clone();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                // Extend the cartesian product one dimension at a time, capping
+                // at `limit` after each (`take` is lazy, so we never build the
+                // full product of a huge key).
+                let mut combos: Vec<Vec<(String, Vec<String>)>> = vec![Vec::new()];
+                for (name, vals) in &sorted {
+                    combos = combos
+                        .into_iter()
+                        .flat_map(|combo| {
+                            vals.iter().map(move |v| {
+                                let mut c = combo.clone();
+                                c.push((name.clone(), vec![v.clone()]));
+                                c
+                            })
+                        })
+                        .take(limit)
+                        .collect();
+                }
+                combos
+                    .into_iter()
+                    .map(|dims| Self::Multi { dims })
+                    .collect()
+            }
+            Self::Set { keys } => {
+                let mut out = Vec::new();
+                for k in keys {
+                    for m in k.members_preview(limit - out.len()) {
+                        out.push(m);
+                        if out.len() >= limit {
+                            return out;
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
     /// Serialize to JSON for CLI args / K8s CRD fields.
     /// Single: `{"single":["2025-01-16"]}`, Multi: `{"multi":{"region":["us"],"date":["2025-03"]}}`.
     pub fn to_json(&self) -> String {

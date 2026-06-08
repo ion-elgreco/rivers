@@ -7,7 +7,7 @@
 
 use leptos::prelude::*;
 
-use crate::types::{AssetRecord, StoredEvent};
+use crate::types::{AssetRecord, EventsPage, StoredEvent};
 
 #[server]
 pub async fn get_assets(
@@ -109,6 +109,39 @@ pub async fn get_asset_events(
         .await
         .map(|evts| evts.into_iter().map(Into::into).collect())
         .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// Paginated events for the asset-detail Events tab. `filter` is the active pill;
+/// the server filters by event type so `total` is the true per-filter count.
+#[server]
+pub async fn get_asset_events_page(
+    loc_ns: String,
+    loc_name: String,
+    key: String,
+    filter: String,
+    offset: u64,
+    limit: u64,
+) -> Result<EventsPage, ServerFnError> {
+    let ctx = super::resolve_identity(&loc_ns, &loc_name).await?;
+    let state = expect_context::<crate::state::AppState>();
+    let event_types: Vec<String> = match filter.as_str() {
+        "mat" => vec!["Materialization".to_string()],
+        "fail" => vec!["StepFailure".to_string()],
+        _ => vec![
+            "Materialization".to_string(),
+            "Observation".to_string(),
+            "StepFailure".to_string(),
+        ],
+    };
+    let (rows, total) = state
+        .storage
+        .get_events_for_asset_page(ctx.id(), &key, &event_types, offset, limit)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(EventsPage {
+        rows: rows.into_iter().map(Into::into).collect(),
+        total,
+    })
 }
 
 #[server]
