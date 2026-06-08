@@ -316,6 +316,7 @@ DEFINE FIELD IF NOT EXISTS input_data_versions ON events TYPE array DEFAULT [];
 DEFINE INDEX IF NOT EXISTS idx_events_run ON events FIELDS run_id;
 DEFINE INDEX IF NOT EXISTS idx_events_type ON events FIELDS event_type;
 DEFINE INDEX IF NOT EXISTS idx_events_run_type ON events FIELDS run_id, event_type;
+DEFINE INDEX IF NOT EXISTS idx_events_run_ts ON events FIELDS run_id, timestamp, sort_order;
 -- Per-CL by-asset filters; events for the same asset_key under different
 -- code locations don't bleed into each other.
 DEFINE INDEX IF NOT EXISTS idx_events_loc_asset ON events FIELDS code_location_id, asset_key;
@@ -3701,6 +3702,63 @@ mod tests {
         SurrealStorage::new_memory()
             .await
             .expect("failed to create in-memory storage")
+    }
+
+    /// The run-detail events page (`ORDER BY timestamp ... LIMIT`) must scan
+    /// `idx_events_run_ts` in timestamp order, not sort every matching event.
+    /// Guards the index that keeps large-run pagination O(page) instead of
+    /// O(run events). RocksDB (the demo backend) — kv-mem plans differently.
+    #[tokio::test]
+    async fn run_events_page_uses_ordering_index() {
+        let temp = test_temp_dir::test_temp_dir!();
+        let s = SurrealStorage::new_embedded(temp.as_path_untracked().to_str().unwrap())
+            .await
+            .unwrap();
+        let rows: Vec<DbEventWrite> = (0..2000i64)
+            .map(|i| DbEventWrite {
+                code_location_id: "default".into(),
+                event_type: if i % 50 == 0 {
+                    "LogOutput"
+                } else {
+                    "Materialization"
+                }
+                .into(),
+                asset_key: Some("a".into()),
+                run_id: "r".into(),
+                partition_key: None,
+                timestamp: i,
+                sort_order: 0,
+                metadata: vec![],
+                data_version: None,
+                code_version: None,
+                input_data_versions: vec![],
+            })
+            .collect();
+        s.db.query("INSERT INTO events $rows RETURN NONE")
+            .bind(("rows", rows))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let plan: Vec<serde_json::Value> =
+            s.db.query(
+                "SELECT * FROM events WHERE run_id = 'r' AND event_type != 'LogOutput' \
+                 ORDER BY timestamp ASC, sort_order ASC, id ASC LIMIT 50 START 0 EXPLAIN",
+            )
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        let plan = serde_json::to_string(&plan).unwrap();
+        assert!(
+            plan.contains("idx_events_run_ts"),
+            "page should scan idx_events_run_ts: {plan}"
+        );
+        assert!(
+            !plan.contains("SortTopKByKey") && !plan.contains("\"operator\":\"Sort\""),
+            "page should not sort — the ordering index covers it: {plan}"
+        );
     }
 
     /// `store_events`/`store_event` upsert `asset_partitions` via `INSERT ... ON
@@ -7784,6 +7842,7 @@ mod tests {
             "idx_events_run",
             "idx_events_type",
             "idx_events_run_type",
+            "idx_events_run_ts",
             "idx_events_loc_asset",
             "idx_events_loc_asset_part",
             "idx_events_loc_asset_type",
