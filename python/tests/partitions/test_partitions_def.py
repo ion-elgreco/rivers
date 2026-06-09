@@ -210,3 +210,81 @@ def test_dynamic_construction():
     """Dynamic partitions can be created with a name."""
     dyn = rs.PartitionsDefinition.dynamic("my_set")
     assert isinstance(dyn, rs.PartitionsDefinition.Dynamic)
+
+
+# ---------------------------------------------------------------------------
+# Empty keys never validate — empty vectors otherwise pass via vacuous
+# iteration (`all()` / a never-entered loop) on every kind.
+# ---------------------------------------------------------------------------
+
+
+def test_empty_single_key_invalid_for_static():
+    pd = rs.PartitionsDefinition.static_(["a", "b"])
+    pk = rs.PartitionKey.from_json('{"single":[]}')
+    assert pd.validate_partition_key(pk) is False
+
+
+def test_empty_single_key_invalid_for_timewindow():
+    pd = rs.PartitionsDefinition.daily(
+        start=datetime.datetime(2024, 1, 1), end=datetime.datetime(2024, 1, 5)
+    )
+    pk = rs.PartitionKey.from_json('{"single":[]}')
+    assert pd.validate_partition_key(pk) is False
+
+
+def test_empty_single_key_invalid_for_dynamic():
+    pd = rs.PartitionsDefinition.dynamic("users")
+    pk = rs.PartitionKey.from_json('{"single":[]}')
+    assert pd.validate_partition_key(pk) is False
+
+
+def test_empty_dim_values_invalid_for_multi():
+    pd = rs.PartitionsDefinition.multi(
+        {"region": rs.PartitionsDefinition.static_(["us"])}
+    )
+    pk = rs.PartitionKey.from_json('{"multi":{"region":[]}}')
+    assert pd.validate_partition_key(pk) is False
+
+
+def test_multi_key_with_extra_dimension_invalid():
+    """A key carrying a dimension the def doesn't declare must not validate —
+    the def-dims loop can't see extra dims."""
+    pd = rs.PartitionsDefinition.multi(
+        {"region": rs.PartitionsDefinition.static_(["us"])}
+    )
+    key = rs.PartitionKey.multi({"region": "us", "bogus": "x"})
+    assert pd.validate_partition_key(key) is False
+
+
+def test_empty_set_key_invalid():
+    pd = rs.PartitionsDefinition.static_(["a"])
+    pk = rs.PartitionKey.from_json('{"set":[]}')
+    assert pd.validate_partition_key(pk) is False
+
+
+# ---------------------------------------------------------------------------
+# Non-positive / sub-nanosecond intervals are rejected at construction —
+# interval_ns == 0 would otherwise panic on `n % 0` during key validation.
+# ---------------------------------------------------------------------------
+
+
+def test_time_window_zero_interval_rejected():
+    with pytest.raises(PartitionDefinitionError, match="interval_seconds"):
+        rs.PartitionsDefinition.time_window(
+            start=datetime.datetime(2024, 1, 1), interval_seconds=0.0
+        )
+
+
+def test_time_window_negative_interval_rejected():
+    with pytest.raises(PartitionDefinitionError, match="interval_seconds"):
+        rs.PartitionsDefinition.time_window(
+            start=datetime.datetime(2024, 1, 1), interval_seconds=-3600.0
+        )
+
+
+def test_time_window_sub_nanosecond_interval_rejected():
+    """1e-12 seconds is positive but truncates to 0 nanoseconds internally."""
+    with pytest.raises(PartitionDefinitionError, match="interval_seconds"):
+        rs.PartitionsDefinition.time_window(
+            start=datetime.datetime(2024, 1, 1), interval_seconds=1e-12
+        )

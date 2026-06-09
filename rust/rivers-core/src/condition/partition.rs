@@ -75,18 +75,15 @@ impl PartitionSelection {
         }
     }
 
-    /// Set difference (self - other).
-    pub fn difference(&self, other: &Self) -> Self {
+    /// Set difference (self - other) — takes the universe of all valid keys
+    /// so `All - Keys` resolves to the concrete complement (mirrors
+    /// [`Self::complement`]).
+    pub fn difference(&self, other: &Self, all_keys: &HashSet<PartitionKey>) -> Self {
         match (self, other) {
             (Self::Empty, _) => Self::Empty,
             (_, Self::All) => Self::Empty,
             (x, Self::Empty) => x.clone(),
-            (Self::All, Self::Keys(_)) => {
-                // Can't resolve `All - Keys` without the universe; shouldn't
-                // arise in practice (All only appears for unpartitioned assets
-                // or universal conditions). Fall back to All.
-                Self::All
-            }
+            (Self::All, Self::Keys(_)) => other.complement(all_keys),
             (Self::Keys(a), Self::Keys(b)) => {
                 let diff: HashSet<PartitionKey> = a.difference(b).cloned().collect();
                 if diff.is_empty() {

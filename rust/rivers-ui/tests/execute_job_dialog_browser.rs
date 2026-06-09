@@ -90,6 +90,7 @@ async fn single_dim_picker_renders_one_row_per_key() {
                 "2025-01-02".into(),
                 "2025-01-03".into(),
             ],
+            truncated: false,
         },
     );
     flush_effects().await;
@@ -105,6 +106,7 @@ async fn submit_with_empty_single_dim_selection_shows_error() {
         "daily_job",
         JobPartitionPicker::SingleDim {
             keys: vec!["2025-01-01".into(), "2025-01-02".into()],
+            truncated: false,
         },
     );
     flush_effects().await;
@@ -229,6 +231,7 @@ async fn reopen_clears_previous_error() {
         "daily_job",
         JobPartitionPicker::SingleDim {
             keys: vec!["2025-01-01".into()],
+            truncated: false,
         },
     );
     flush_effects().await;

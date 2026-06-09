@@ -64,7 +64,7 @@ pub fn PartitionPicker(
 
     let toggle_single = move |idx: usize, shift: bool| {
         let keys = match picker.get_untracked() {
-            JobPartitionPicker::SingleDim { keys } => keys,
+            JobPartitionPicker::SingleDim { keys, .. } => keys,
             _ => return,
         };
         let next = apply_toggle(
@@ -108,7 +108,7 @@ pub fn PartitionPicker(
     view! {
         {move || match picker.get() {
             JobPartitionPicker::None => ().into_any(),
-            JobPartitionPicker::SingleDim { keys } => {
+            JobPartitionPicker::SingleDim { keys, truncated } => {
                 let keys_for_select_all = keys.clone();
                 view! {
                     <div class="form-group">
@@ -122,6 +122,14 @@ pub fn PartitionPicker(
                                 single_selected.set(keys_for_select_all.clone())
                             })
                         />
+                        {truncated
+                            .then(|| {
+                                view! {
+                                    <p class="exec-dialog-partition-hint">
+                                        "Key lists were truncated — only shared keys from the first window are shown."
+                                    </p>
+                                }
+                            })}
                     </div>
                 }
                 .into_any()
@@ -1061,6 +1069,7 @@ mod tests {
     fn submit_keys_single_dim_wraps_each_selected_in_single() {
         let picker = JobPartitionPicker::SingleDim {
             keys: vec!["a".into(), "b".into(), "c".into()],
+            truncated: false,
         };
         let selected = vec!["a".to_string(), "c".to_string()];
         let multi = HashMap::new();

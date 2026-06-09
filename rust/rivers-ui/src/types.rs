@@ -5,25 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "ssr")]
 fn partition_key_to_display(pk: rivers_core::storage::PartitionKey) -> String {
-    match pk {
-        rivers_core::storage::PartitionKey::Single { keys } => {
-            keys.first().cloned().unwrap_or_default()
-        }
-        rivers_core::storage::PartitionKey::Multi { dims } => {
-            let mut sorted = dims;
-            sorted.sort_by(|a, b| a.0.cmp(&b.0));
-            sorted
-                .iter()
-                .map(|(dim, vals)| format!("{}={}", dim, vals.join(",")))
-                .collect::<Vec<_>>()
-                .join("|")
-        }
-        rivers_core::storage::PartitionKey::Set { keys } => keys
-            .into_iter()
-            .map(partition_key_to_display)
-            .collect::<Vec<_>>()
-            .join(", "),
-    }
+    pk.to_display()
 }
 
 /// Mirrors `rivers_core::storage::StaleStatus`. Computed on demand via
@@ -889,21 +871,7 @@ mod conversions {
 
     impl From<rivers_core::storage::RunRecord> for RunRecord {
         fn from(r: rivers_core::storage::RunRecord) -> Self {
-            let partition_key = r.partition_key.as_ref().map(|pk| {
-                pk.members()
-                    .iter()
-                    .map(|m| match m {
-                        rivers_core::storage::PartitionKey::Multi { dims } => dims
-                            .iter()
-                            .map(|(d, ks)| format!("{d}={}", ks.join("|")))
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        rivers_core::storage::PartitionKey::Single { keys } => keys.join("|"),
-                        _ => String::new(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            });
+            let partition_key = r.partition_key.as_ref().map(|pk| pk.to_display());
             Self {
                 run_id: r.run_id,
                 job_name: r.job_name,
@@ -1242,6 +1210,37 @@ mod conversions {
             assert!(core.job_substring.is_none());
             assert!(core.asset_substring.is_none());
             assert!(core.partition_substring.is_none());
+        }
+
+        /// Run-list partition labels must use the same canonical `dim=v|dim=v`
+        /// encoding as the picker/heatmap — a second hand-rolled format here
+        /// renders the same partition differently across pages.
+        #[test]
+        fn run_record_partition_key_uses_canonical_display() {
+            let core = rivers_core::storage::RunRecord {
+                run_id: "r1".into(),
+                code_location_id: rivers_core::storage::default_code_location_id(),
+                job_name: None,
+                status: rivers_core::storage::RunStatus::Success,
+                start_time: 0,
+                end_time: None,
+                tags: vec![],
+                node_names: vec![],
+                priority: 0,
+                partition_key: Some(rivers_core::storage::PartitionKey::Multi {
+                    dims: vec![
+                        ("region".into(), vec!["us".into()]),
+                        ("date".into(), vec!["2024-01-01".into()]),
+                    ],
+                }),
+                block_reason: None,
+                launched_by: rivers_core::storage::LaunchedBy::Manual,
+            };
+            let ui: RunRecord = core.into();
+            assert_eq!(
+                ui.partition_key.as_deref(),
+                Some("date=2024-01-01|region=us")
+            );
         }
 
         /// Non-empty filter values round-trip unchanged.

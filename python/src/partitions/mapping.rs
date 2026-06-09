@@ -550,12 +550,19 @@ impl PartitionMapping {
             }
 
             Self::TimeWindow { offset } => {
-                // TimeWindow offset is handled at the IO level (not key transformation).
-                // The key itself stays the same — the offset shifts which time window is loaded.
-                // For now, pass through as-is.
-                // TODO: implement actual time window offset key shifting
-                let _ = offset;
-                Ok(downstream_key.clone())
+                if *offset == 0 {
+                    return Ok(downstream_key.clone());
+                }
+                let PyPartitionKey::Single { key } = downstream_key else {
+                    return Err(
+                        "TimeWindow mapping only works with Single partition keys".to_string()
+                    );
+                };
+                let k = key.first().ok_or("Empty partition key")?;
+                let def =
+                    upstream_def.ok_or("TimeWindow mapping requires a partitioned upstream")?;
+                let shifted = def.shift_time_key(k, *offset).map_err(|e| e.to_string())?;
+                Ok(PyPartitionKey::Single { key: vec![shifted] })
             }
 
             Self::Multi { dimension_mappings } => match downstream_key {
@@ -576,7 +583,16 @@ impl PartitionMapping {
                         let single_key = PyPartitionKey::Single {
                             key: dim_values.clone(),
                         };
-                        let mapped = per_dim_mapping.map_key(&single_key, None)?;
+                        // Thread the upstream dimension's own def so nested
+                        // mappings that need it (TimeWindow offset) can shift.
+                        let dim_def = upstream_def.and_then(|d| match d {
+                            PartitionsDefinition::Multi { dimensions } => dimensions
+                                .iter()
+                                .find(|(n, _)| n == upstream_dim)
+                                .map(|(_, dd)| dd),
+                            _ => None,
+                        });
+                        let mapped = per_dim_mapping.map_key(&single_key, dim_def)?;
                         match mapped {
                             PyPartitionKey::Single { key } => {
                                 upstream_keys.insert(upstream_dim.clone(), key);
@@ -620,13 +636,6 @@ impl PartitionMapping {
                     // The named dimension gets the (mapped) single key value.
                     // Unmapped dimensions get ALL their partition keys (fan-in).
                     PyPartitionKey::Single { key } => {
-                        let single_key = PyPartitionKey::Single { key: key.clone() };
-                        let mapped_single = partition_mapping.0.map_key(&single_key, None)?;
-                        let mapped_values = match &mapped_single {
-                            PyPartitionKey::Single { key } => key.clone(),
-                            _ => return Err("Inner mapping produced a Multi key".to_string()),
-                        };
-
                         // Get the upstream Multi definition to enumerate unmapped dimensions
                         let up_def = upstream_def.ok_or(
                             "MultiToSingle (Single→Multi) requires upstream PartitionsDefinition",
@@ -639,6 +648,20 @@ impl PartitionMapping {
                                         .to_string(),
                                 ),
                             };
+
+                        let single_key = PyPartitionKey::Single { key: key.clone() };
+                        // The inner mapping maps within the named dimension —
+                        // give it that dimension's def (TimeWindow offset).
+                        let named_dim_def = dimensions
+                            .iter()
+                            .find(|(n, _)| n == dimension_name)
+                            .map(|(_, dd)| dd);
+                        let mapped_single =
+                            partition_mapping.0.map_key(&single_key, named_dim_def)?;
+                        let mapped_values = match &mapped_single {
+                            PyPartitionKey::Single { key } => key.clone(),
+                            _ => return Err("Inner mapping produced a Multi key".to_string()),
+                        };
 
                         let mut multi_keys = HashMap::new();
                         for (dim_name, dim_def) in dimensions {
@@ -670,7 +693,9 @@ impl PartitionMapping {
                         let single_key = PyPartitionKey::Single {
                             key: dim_values.clone(),
                         };
-                        partition_mapping.0.map_key(&single_key, None)
+                        // Upstream is Single here, so its whole def belongs to
+                        // the inner mapping (TimeWindow offset shifts in it).
+                        partition_mapping.0.map_key(&single_key, upstream_def)
                     }
                     PyPartitionKey::Set { .. } => {
                         Err("MultiToSingle mapping does not support batched Set keys".to_string())

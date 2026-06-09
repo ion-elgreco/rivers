@@ -195,6 +195,12 @@ Returns the half-open `(start, end)` time window for the current key, or `None` 
 
 An inclusive range of partition keys for backfills and lookups.
 
+Range endpoints follow the **partition definition's ordering**, resolved when
+the range is used: positional order for static keys (which need not be
+alphabetical) and chronological order for time windows (so custom formats
+like `%m/%d/%Y` work). Unknown endpoints and inverted ranges are rejected
+with a precise error at backfill submission.
+
 ### `PartitionKeyRange.single()`
 
 ```python
@@ -241,7 +247,10 @@ Explicit key-to-key mapping.
 PartitionMapping.time_window(offset: int) -> PartitionMapping.TimeWindow
 ```
 
-Offset by N time periods (e.g., `-1` for previous day).
+Offset by N time periods (e.g., `-1` for previous day): materializing
+`2024-01-05` with `offset=-1` loads the upstream's `2024-01-04` partition.
+Works for cron and interval windows alike; a key that shifts outside the
+upstream's `[start, end)` range fails the run with a precise error.
 
 ### `PartitionMapping.specific_partitions(partition_keys)`
 

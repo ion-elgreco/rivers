@@ -441,7 +441,7 @@ def test_partitioned_task_materialize():
     assert repo.load_node("sink", partition_key=pk) == "sink(computed-p1)"
 
 
-def test_dynamic_partitioned_task():
+def test_dynamic_partitioned_task(storage):
     """Task with dynamic partitions_def works correctly."""
     dyn = rs.PartitionsDefinition.dynamic("tenants")
 
@@ -450,7 +450,8 @@ def test_dynamic_partitioned_task():
         return f"tenant={context.partition_key}"
 
     repo = rs.CodeRepository(assets=[], tasks=[process])
-    repo.resolve()
+    repo.resolve(storage=storage)
+    storage.add_dynamic_partitions("tenants", ["acme"])
     result = repo.materialize(["process"], partition_key=rs.PartitionKey.single("acme"))
     assert result.success
     assert (

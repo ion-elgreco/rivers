@@ -1,5 +1,7 @@
 import datetime
 
+import pytest
+
 import rivers as rs
 
 
@@ -68,3 +70,11 @@ def test_keys_and_key():
     )
     assert len(ctx.keys) == 2
     assert ctx.key == rs.PartitionKey.single("a")
+
+
+def test_empty_keys_rejected():
+    """PartitionContext(keys=[]) raises ValueError instead of arming an
+    index-out-of-bounds panic on `.key`."""
+    pd = rs.PartitionsDefinition.static_(["a"])
+    with pytest.raises(ValueError, match="must not be empty"):
+        rs.PartitionContext(keys=[], definition=pd)

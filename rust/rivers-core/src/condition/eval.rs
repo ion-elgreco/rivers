@@ -1104,7 +1104,7 @@ fn eval_partitioned<O: PartEvalOutput>(
                 .cloned()
                 .unwrap_or(PartitionSelection::Empty);
             // First-tick behavior handled via InitialEvaluation composition.
-            let result = current.difference(&previous);
+            let result = current.difference(&previous, pctx.all_keys);
             sub_selections.insert(my_idx, current);
             O::composite(result, my_idx, node, total, vec![child_part])
         }
@@ -1122,7 +1122,9 @@ fn eval_partitioned<O: PartEvalOutput>(
                 .cloned()
                 .unwrap_or(PartitionSelection::Empty);
             // (prev_latched ∪ trigger) - reset
-            let result = prev_latch.union(&trigger_sel).difference(&reset_sel);
+            let result = prev_latch
+                .union(&trigger_sel)
+                .difference(&reset_sel, pctx.all_keys);
             sub_selections.insert(my_idx, result.clone());
             O::composite(result, my_idx, node, total, vec![trigger_part, reset_part])
         }
@@ -1159,7 +1161,7 @@ fn eval_partitioned<O: PartEvalOutput>(
                             } else {
                                 PartitionSelection::Keys(handled_set.clone())
                             };
-                            current.difference(&handled_sel)
+                            current.difference(&handled_sel, pctx.all_keys)
                         } else {
                             current
                         }

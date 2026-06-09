@@ -599,3 +599,113 @@ def test_mixed_mapping_types_in_single_asset():
     assert rs.PartitionKey.single("a") in keys_loaded
     # Static: "a" → "x"
     assert rs.PartitionKey.single("x") in keys_loaded
+
+
+# ---------------------------------------------------------------------------
+# TimeWindow offset mapping — the offset parameter must shift which upstream
+# window is loaded, not silently behave as identity.
+# ---------------------------------------------------------------------------
+
+
+def _daily_jan() -> rs.PartitionsDefinition:
+    return rs.PartitionsDefinition.daily(
+        start=datetime(2024, 1, 1), end=datetime(2024, 1, 10)
+    )
+
+
+def test_time_window_offset_loads_previous_window():
+    handler = TrackingHandler()
+
+    @rs.Asset(partitions_def=_daily_jan(), io_handler=handler)
+    def upstream(context: rs.AssetExecutionContext) -> str:
+        return f"up-{context.partition_key}"
+
+    @rs.Asset(
+        partitions_def=_daily_jan(),
+        io_handler=handler,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.time_window(offset=-1),
+            )
+        ],
+    )
+    def downstream(upstream: str) -> str:
+        return f"down({upstream})"
+
+    repo = make_repo([upstream, downstream])
+    repo.materialize(["upstream"], partition_key=rs.PartitionKey.single("2024-01-04"))
+
+    handler.load_input_partitions.clear()
+    result = repo.materialize(
+        ["downstream"], partition_key=rs.PartitionKey.single("2024-01-05")
+    )
+    assert result.success
+    # The dep load was routed to the previous window's partition.
+    assert [p.key for p in handler.load_input_partitions] == [
+        rs.PartitionKey.single("2024-01-04")
+    ]
+
+
+def test_time_window_offset_zero_is_identity():
+    handler = TrackingHandler()
+
+    @rs.Asset(partitions_def=_daily_jan(), io_handler=handler)
+    def upstream(context: rs.AssetExecutionContext) -> str:
+        return f"up-{context.partition_key}"
+
+    @rs.Asset(
+        partitions_def=_daily_jan(),
+        io_handler=handler,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.time_window(offset=0),
+            )
+        ],
+    )
+    def downstream(upstream: str) -> str:
+        return f"down({upstream})"
+
+    repo = make_repo([upstream, downstream])
+    repo.materialize(["upstream"], partition_key=rs.PartitionKey.single("2024-01-05"))
+
+    handler.load_input_partitions.clear()
+    result = repo.materialize(
+        ["downstream"], partition_key=rs.PartitionKey.single("2024-01-05")
+    )
+    assert result.success
+    assert [p.key for p in handler.load_input_partitions] == [
+        rs.PartitionKey.single("2024-01-05")
+    ]
+
+
+def test_time_window_offset_before_start_errors():
+    """offset=-1 from the first partition maps before the upstream's start —
+    a precise error, not a silent identity load."""
+    handler = TrackingHandler()
+
+    @rs.Asset(partitions_def=_daily_jan(), io_handler=handler)
+    def upstream(context: rs.AssetExecutionContext) -> str:
+        return f"up-{context.partition_key}"
+
+    @rs.Asset(
+        partitions_def=_daily_jan(),
+        io_handler=handler,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.time_window(offset=-1),
+            )
+        ],
+    )
+    def downstream(upstream: str) -> str:
+        return f"down({upstream})"
+
+    repo = make_repo([upstream, downstream])
+    result = repo.materialize(
+        ["downstream"],
+        partition_key=rs.PartitionKey.single("2024-01-01"),
+        raise_on_error=False,
+    )
+    assert not result.success

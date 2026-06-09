@@ -21,6 +21,12 @@ class PartitionKey:
 
         keys: dict[str, list[str]]
 
+    class Set(PartitionKey):
+        """Explicit key set bundling a sparse backfill group — internal /
+        transport form, returned by :meth:`from_json`."""
+
+        keys: list[PartitionKey]
+
     @staticmethod
     def single(key: str | list[str]) -> PartitionKey.Single:
         """Build a single-dimension key from a value or list of values."""
@@ -87,7 +93,8 @@ class PartitionKeyRange:
 
     @staticmethod
     def single(from_key: str, to_key: str) -> PartitionKeyRange:
-        """Single-dimension range from ``from_key`` to ``to_key`` (inclusive)."""
+        """Single-dimension range from ``from_key`` to ``to_key`` (inclusive),
+        ordered by the partition definition at resolve time."""
         ...
 
     @staticmethod
@@ -162,6 +169,10 @@ class PartitionsDefinition:
         """Custom time-window partitions defined by a cron schedule or interval.
 
         Provide exactly one of ``cron_schedule`` or ``interval_seconds``.
+
+        Raises:
+            PartitionDefinitionError: If ``interval_seconds`` is not positive
+                or is below one nanosecond.
         """
         ...
 
@@ -197,7 +208,11 @@ class PartitionContext:
     def __init__(
         self, keys: list[PartitionKey], definition: PartitionsDefinition
     ) -> None:
-        """Construct a context (typically only the executor calls this)."""
+        """Construct a context (typically only the executor calls this).
+
+        Raises:
+            ValueError: If ``keys`` is empty.
+        """
         ...
 
     def time_window(self) -> tuple[datetime.datetime, datetime.datetime] | None:
@@ -263,7 +278,8 @@ class PartitionMapping:
 
     @staticmethod
     def time_window(offset: int) -> PartitionMapping.TimeWindow:
-        """Offset the downstream by ``offset`` upstream windows (negative = lag)."""
+        """Offset the downstream by ``offset`` upstream windows (negative = lag);
+        shifts outside the upstream's ``[start, end)`` range fail the run."""
         ...
 
     @staticmethod

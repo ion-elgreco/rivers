@@ -71,8 +71,13 @@ impl PartitionContext {
 impl PartitionContext {
     #[new]
     #[pyo3(signature = (keys, definition))]
-    fn py_new(keys: Vec<PyPartitionKey>, definition: PartitionsDefinition) -> Self {
-        Self { keys, definition }
+    fn py_new(keys: Vec<PyPartitionKey>, definition: PartitionsDefinition) -> PyResult<Self> {
+        if keys.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "PartitionContext keys must not be empty",
+            ));
+        }
+        Ok(Self { keys, definition })
     }
 
     /// The single partition key. Convenience for `keys[0]` when processing

@@ -1,5 +1,6 @@
 """Tests for dynamic partitions — storage-backed partition management."""
 
+import re
 from typing import Any
 
 import pytest
@@ -228,7 +229,7 @@ def test_dynamic_partitions_via_repo_storage():
 # ---------------------------------------------------------------------------
 
 
-def test_dynamic_materialize_partition_context():
+def test_dynamic_materialize_partition_context(storage):
     """Materializing a dynamic-partitioned asset provides correct PartitionContext."""
     dyn = rs.PartitionsDefinition.dynamic("tenants")
     captured = {}
@@ -243,7 +244,8 @@ def test_dynamic_materialize_partition_context():
         return f"data-for-{context.partition_key}"
 
     repo = rs.CodeRepository(assets=[tenant_data])
-    repo.resolve()
+    repo.resolve(storage=storage)
+    storage.add_dynamic_partitions("tenants", ["acme"])
     result = repo.materialize(
         ["tenant_data"], partition_key=rs.PartitionKey.single("acme")
     )
@@ -262,7 +264,7 @@ def test_dynamic_materialize_partition_context():
     assert captured["partition_time_window"] is None
 
 
-def test_dynamic_materialize_chain():
+def test_dynamic_materialize_chain(storage):
     """Two dynamic-partitioned assets in a chain receive the same partition key."""
     dyn = rs.PartitionsDefinition.dynamic("regions")
     seen_keys = {}
@@ -278,7 +280,8 @@ def test_dynamic_materialize_chain():
         return f"processed({raw})"
 
     repo = rs.CodeRepository(assets=[raw, processed])
-    repo.resolve()
+    repo.resolve(storage=storage)
+    storage.add_dynamic_partitions("regions", ["us-west"])
     result = repo.materialize(
         ["raw", "processed"], partition_key=rs.PartitionKey.single("us-west")
     )
@@ -291,7 +294,7 @@ def test_dynamic_materialize_chain():
     assert repo.load_node("processed", partition_key=pk) == "processed(raw-us-west)"
 
 
-def test_dynamic_materialize_io_handler_receives_partition():
+def test_dynamic_materialize_io_handler_receives_partition(storage):
     """IO handler's OutputContext has the correct partition for dynamic assets."""
     dyn = rs.PartitionsDefinition.dynamic("datasets")
     captured_contexts = []
@@ -308,7 +311,8 @@ def test_dynamic_materialize_io_handler_receives_partition():
         return 42
 
     repo = rs.CodeRepository(assets=[my_dataset])
-    repo.resolve()
+    repo.resolve(storage=storage)
+    storage.add_dynamic_partitions("datasets", ["2024-q1"])
     repo.materialize(["my_dataset"], partition_key=rs.PartitionKey.single("2024-q1"))
 
     assert len(captured_contexts) == 1
@@ -331,3 +335,63 @@ def test_dynamic_materialize_without_partition_key_raises():
 
     with pytest.raises(ExecutionError, match="partition_key"):
         repo.materialize(["tenant_data"])
+
+
+def test_dynamic_materialize_unregistered_key_raises(storage):
+    """A dynamic key that was never registered in storage is rejected at submit
+    — the def can't know its keys, so membership is checked against storage."""
+    dyn = rs.PartitionsDefinition.dynamic("tenants")
+
+    @rs.Asset(partitions_def=dyn)
+    def tenant_data() -> int:
+        return 1
+
+    repo = rs.CodeRepository(assets=[tenant_data])
+    repo.resolve(storage=storage)
+    storage.add_dynamic_partitions("tenants", ["acme"])
+
+    with pytest.raises(
+        ExecutionError,
+        match=re.escape(
+            "Invalid partition_key 'acmme' for asset 'tenant_data': not a "
+            "registered dynamic partition key of namespace 'tenants'. Register "
+            'it with add_dynamic_partitions("tenants", [...]) first.'
+        ),
+    ):
+        repo.materialize(
+            ["tenant_data"], partition_key=rs.PartitionKey.single("acmme")
+        )
+
+    # No run/materialization recorded for the rejected key.
+    assert storage.get_materialized_partitions("tenant_data") == []
+
+
+def test_dynamic_materialize_deleted_key_raises(storage):
+    """A dynamic key that was registered and later deleted is rejected."""
+    dyn = rs.PartitionsDefinition.dynamic("tenants")
+
+    @rs.Asset(partitions_def=dyn)
+    def tenant_data() -> int:
+        return 1
+
+    repo = rs.CodeRepository(assets=[tenant_data])
+    repo.resolve(storage=storage)
+    storage.add_dynamic_partitions("tenants", ["acme", "globex"])
+    storage.delete_dynamic_partition("tenants", "globex")
+
+    result = repo.materialize(
+        ["tenant_data"], partition_key=rs.PartitionKey.single("acme")
+    )
+    assert result.success
+
+    with pytest.raises(
+        ExecutionError,
+        match=re.escape(
+            "Invalid partition_key 'globex' for asset 'tenant_data': not a "
+            "registered dynamic partition key of namespace 'tenants'. Register "
+            'it with add_dynamic_partitions("tenants", [...]) first.'
+        ),
+    ):
+        repo.materialize(
+            ["tenant_data"], partition_key=rs.PartitionKey.single("globex")
+        )

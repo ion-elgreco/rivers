@@ -356,7 +356,9 @@ pub enum JobPartitionPicker {
     None,
     /// Static / TimeWindow / etc. — flat list of keys, intersection
     /// across the job's partitioned assets in first-encounter order.
-    SingleDim { keys: Vec<String> },
+    /// `truncated` is set when any contributing key list was a bounded
+    /// window, i.e. shared keys beyond the window exist but can't be shown.
+    SingleDim { keys: Vec<String>, truncated: bool },
     /// Single-dim with more partitions than fit in the inline key window —
     /// paged on demand by `asset_key` as the user scrolls (`total` sizes the
     /// scrollbar). Avoids ever shipping the full key list to the browser.
@@ -407,6 +409,17 @@ pub fn partition_picker_for_assets(
         let first = defs[0];
         let mut dims: Vec<crate::types::PartitionDimensionInfo> = first.dimensions.clone();
         for other in defs.iter().skip(1) {
+            // Dimension-name sets must match exactly — a key carrying a dim
+            // the other asset lacks (or missing one it has) can never
+            // validate for both, so there is nothing to offer. Jobs are
+            // guarded at resolve time; ad-hoc selections reach here.
+            let dims_match = other.dimensions.len() == dims.len()
+                && dims
+                    .iter()
+                    .all(|d| other.dimensions.iter().any(|od| od.name == d.name));
+            if !dims_match {
+                return JobPartitionPicker::None;
+            }
             for dim in dims.iter_mut() {
                 let Some(other_dim) = other.dimensions.iter().find(|d| d.name == dim.name) else {
                     continue;
@@ -486,23 +499,28 @@ pub fn partition_picker_for_assets(
             total: first_def.total_count,
         };
     }
-    let key_lists: Vec<&Vec<String>> = defs
-        .iter()
-        .filter(|d| !d.keys.is_empty())
-        .map(|d| &d.keys)
-        .collect();
-    let Some((first, rest)) = key_lists.split_first() else {
+    let contributing: Vec<&&crate::types::PartitionDefinitionInfo> =
+        defs.iter().filter(|d| !d.keys.is_empty()).collect();
+    let Some((first, rest)) = contributing.split_first() else {
         return JobPartitionPicker::None;
     };
-    let mut intersection: Vec<String> = first.to_vec();
-    for keys in rest {
-        let next: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+    let mut intersection: Vec<String> = first.keys.to_vec();
+    for d in rest {
+        let next: std::collections::HashSet<&str> = d.keys.iter().map(String::as_str).collect();
         intersection.retain(|k| next.contains(k.as_str()));
     }
+    // Intersecting bounded windows can only see the shared keys inside them
+    // — surface that so the dialog doesn't present the list as exhaustive.
+    let truncated = contributing
+        .iter()
+        .any(|d| d.keys_truncated || d.total_count as usize > d.keys.len());
     if intersection.is_empty() {
         JobPartitionPicker::None
     } else {
-        JobPartitionPicker::SingleDim { keys: intersection }
+        JobPartitionPicker::SingleDim {
+            keys: intersection,
+            truncated,
+        }
     }
 }
 
@@ -796,6 +814,7 @@ mod tests {
             picker(&["a", "b"], &infos),
             JobPartitionPicker::SingleDim {
                 keys: vec!["y".into()],
+                truncated: false,
             }
         );
     }
@@ -822,6 +841,7 @@ mod tests {
             picker(&["first", "second"], &infos),
             JobPartitionPicker::SingleDim {
                 keys: vec!["b".into(), "a".into()],
+                truncated: false,
             }
         );
     }
@@ -836,6 +856,7 @@ mod tests {
             picker(&["known", "missing"], &infos),
             JobPartitionPicker::SingleDim {
                 keys: vec!["x".into(), "y".into()],
+                truncated: false,
             }
         );
     }
@@ -852,6 +873,7 @@ mod tests {
             picker(&["part", "plain"], &infos),
             JobPartitionPicker::SingleDim {
                 keys: vec!["x".into(), "y".into()],
+                truncated: false,
             }
         );
     }
@@ -922,6 +944,7 @@ mod tests {
             picker(&["dyn", "stat"], &infos),
             JobPartitionPicker::SingleDim {
                 keys: vec!["x".into(), "y".into()],
+                truncated: false,
             }
         );
     }
@@ -1028,7 +1051,8 @@ mod tests {
     #[test]
     fn picker_divergent_large_assets_do_not_page() {
         // Different key spaces must NOT page one asset's keys (could offer a key
-        // invalid for the other). Fall back to intersecting the visible windows.
+        // invalid for the other). Fall back to intersecting the visible windows
+        // — and say so: shared keys beyond the windows exist but can't be shown.
         let infos = make_map(vec![
             make_paged("a", &["k0", "k1", "k2"], 10_000),
             make_paged("b", &["k1", "k2", "k3"], 12_000),
@@ -1037,8 +1061,22 @@ mod tests {
             picker(&["a", "b"], &infos),
             JobPartitionPicker::SingleDim {
                 keys: vec!["k1".into(), "k2".into()],
+                truncated: true,
             }
         );
+    }
+
+    #[test]
+    fn picker_mismatched_multi_dims_returns_none() {
+        // a has {region,date}, b has {region} only: a key with `date` is
+        // invalid for b, a key without it is invalid for a — no shared key
+        // exists, so the picker must offer nothing instead of a's full
+        // `date` keyset.
+        let infos = make_map(vec![
+            make_multi("a", &[("region", &["us", "eu"]), ("date", &["d1", "d2"])]),
+            make_multi("b", &[("region", &["us", "eu"])]),
+        ]);
+        assert_eq!(picker(&["a", "b"], &infos), JobPartitionPicker::None);
     }
 
     use crate::types::SubmitPartitionKey;

@@ -274,6 +274,32 @@ impl PartitionKey {
         }
     }
 
+    /// Canonical key-as-string encoding for display and string matching:
+    /// `Single` → values comma-joined; `Multi` → dims sorted, `dim=v,v`
+    /// pipe-joined; `Set` → member displays joined with `", "`. Every layer
+    /// that renders or matches keys as strings (gRPC window keys, heatmap
+    /// members, run labels, picker rows) must use this — a divergent encoding
+    /// silently breaks cross-layer matching.
+    pub fn to_display(&self) -> String {
+        match self {
+            Self::Single { keys } => keys.join(","),
+            Self::Multi { dims } => {
+                let mut sorted = dims.clone();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                sorted
+                    .iter()
+                    .map(|(dim, vals)| format!("{}={}", dim, vals.join(",")))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            }
+            Self::Set { keys } => keys
+                .iter()
+                .map(|k| k.to_display())
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+
     /// Serialize to JSON for CLI args / K8s CRD fields.
     /// Single: `{"single":["2025-01-16"]}`, Multi: `{"multi":{"region":["us"],"date":["2025-03"]}}`.
     pub fn to_json(&self) -> String {
@@ -2178,4 +2204,56 @@ pub trait StorageBackend: PerCodeLocationStorage {
         &self,
         run_id: &str,
     ) -> impl Future<Output = Result<HashMap<String, String>>> + Send;
+}
+
+#[cfg(test)]
+mod partition_key_tests {
+    use super::PartitionKey;
+
+    // `to_display` is THE canonical key-as-string encoding: every layer that
+    // renders or matches keys as strings (gRPC window keys, heatmap members,
+    // run labels, picker rows) must agree on it. Format: dims sorted and
+    // pipe-joined, values comma-joined — `dim=v,v|dim=v`.
+
+    #[test]
+    fn single_displays_bare_value() {
+        let pk = PartitionKey::Single {
+            keys: vec!["2024-01-01".into()],
+        };
+        assert_eq!(pk.to_display(), "2024-01-01");
+    }
+
+    #[test]
+    fn batched_single_joins_values_with_comma() {
+        let pk = PartitionKey::Single {
+            keys: vec!["a".into(), "b".into()],
+        };
+        assert_eq!(pk.to_display(), "a,b");
+    }
+
+    #[test]
+    fn multi_sorts_dims_and_pipe_joins() {
+        let pk = PartitionKey::Multi {
+            dims: vec![
+                ("region".into(), vec!["us".into(), "eu".into()]),
+                ("date".into(), vec!["2024-01-01".into()]),
+            ],
+        };
+        assert_eq!(pk.to_display(), "date=2024-01-01|region=us,eu");
+    }
+
+    #[test]
+    fn set_joins_member_displays() {
+        let pk = PartitionKey::Set {
+            keys: vec![
+                PartitionKey::Single {
+                    keys: vec!["a".into()],
+                },
+                PartitionKey::Multi {
+                    dims: vec![("d".into(), vec!["x".into()])],
+                },
+            ],
+        };
+        assert_eq!(pk.to_display(), "a, d=x");
+    }
 }

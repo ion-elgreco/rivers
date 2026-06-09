@@ -4,10 +4,12 @@ Covers plain @rs.Asset across executor (in_process, parallel) and sync/async.
 """
 
 import asyncio
+import re
 from datetime import datetime
 
 import pytest
 import rivers as rs
+from rivers.exceptions import ExecutionError
 
 from _helpers import multi_pd as _multi_pd
 from _helpers import static_pd as _static_pd
@@ -787,3 +789,94 @@ class TestPartitionedRaiseRecordsFailure:
             if e.event_type == "StepFailure" and e.partition_key is not None
         ]
         assert len(pfails) == 1, [e.partition_key for e in pfails]
+
+
+# ---------------------------------------------------------------------------
+# Strategy ↔ definition validation — a typo'd dimension name or a
+# PerDimension strategy on a single-dim asset would otherwise silently
+# collapse the whole backfill into ONE run.
+# ---------------------------------------------------------------------------
+
+UNKNOWN_DIM_MSG = (
+    "BackfillStrategy.per_dimension references dimension '{dim}', "
+    "which is not a dimension of asset 'asset'"
+)
+NOT_MULTI_MSG = (
+    "BackfillStrategy.per_dimension requires Multi-partitioned assets; "
+    "asset 'asset' is not Multi-partitioned"
+)
+
+
+class TestPerDimensionValidation:
+    def _multi_repo(self):
+        @rs.Asset(partitions_def=_multi_pd())
+        def asset(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        return rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+
+    def test_unknown_multi_run_dim_rejected(self):
+        repo = self._multi_repo()
+        with pytest.raises(
+            ExecutionError, match=re.escape(UNKNOWN_DIM_MSG.format(dim="reigon"))
+        ):
+            repo.backfill(
+                selection=["asset"],
+                partition_keys=[
+                    rs.PartitionKey.multi({"region": "us", "date": "d1"})
+                ],
+                strategy=rs.BackfillStrategy.per_dimension(
+                    multi_run=["reigon"], single_run=["date"]
+                ),
+            )
+        assert repo.storage.get_runs(limit=10) == []
+
+    def test_unknown_single_run_dim_rejected(self):
+        repo = self._multi_repo()
+        with pytest.raises(
+            ExecutionError, match=re.escape(UNKNOWN_DIM_MSG.format(dim="daet"))
+        ):
+            repo.backfill(
+                selection=["asset"],
+                partition_keys=[
+                    rs.PartitionKey.multi({"region": "us", "date": "d1"})
+                ],
+                strategy=rs.BackfillStrategy.per_dimension(
+                    multi_run=["region"], single_run=["daet"]
+                ),
+            )
+
+    def test_per_dimension_on_single_dim_asset_rejected(self):
+        @rs.Asset(partitions_def=_static_pd(["a", "b"]))
+        def asset(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+        with pytest.raises(ExecutionError, match=re.escape(NOT_MULTI_MSG)):
+            repo.backfill(
+                selection=["asset"],
+                partition_keys=[rs.PartitionKey.single("a")],
+                strategy=rs.BackfillStrategy.per_dimension(
+                    multi_run=["region"], single_run=["date"]
+                ),
+            )
+
+    def test_dry_run_also_validates(self):
+        repo = self._multi_repo()
+        with pytest.raises(
+            ExecutionError, match=re.escape(UNKNOWN_DIM_MSG.format(dim="reigon"))
+        ):
+            repo.backfill(
+                selection=["asset"],
+                partition_keys=[
+                    rs.PartitionKey.multi({"region": "us", "date": "d1"})
+                ],
+                strategy=rs.BackfillStrategy.per_dimension(
+                    multi_run=["reigon"], single_run=["date"]
+                ),
+                dry_run=True,
+            )

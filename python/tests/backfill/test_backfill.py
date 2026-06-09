@@ -4,10 +4,12 @@ Covers plain @rs.Asset across executor (in_process, parallel) and sync/async.
 """
 
 import asyncio
+import re
 from datetime import datetime
 
 import pytest
 import rivers as rs
+from rivers.exceptions import ExecutionError
 
 from _helpers import daily_pd as _daily_pd
 from _helpers import static_pd as _static_pd
@@ -627,3 +629,118 @@ class TestBackfillRerun:
         rerun = repo.rerun_backfill(original.backfill_id, dry_run=True)
         assert rerun.is_dry_run
         assert rerun.num_partitions == 1
+
+
+# ---------------------------------------------------------------------------
+# Range ordering follows the definition, not lexicographic strings. Static
+# keys are positionally ordered; TimeWindow keys are chronologically ordered
+# via their fmt — neither is guaranteed to sort lexicographically.
+# ---------------------------------------------------------------------------
+
+
+class TestRangeDefinitionOrdering:
+    SIZES = ["small", "medium", "large"]  # NOT lexicographically sorted
+
+    def _sized_repo(self):
+        @rs.Asset(partitions_def=_static_pd(self.SIZES))
+        def sized(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        return rs.CodeRepository(
+            assets=[sized], default_executor=rs.Executor.in_process()
+        )
+
+    def test_static_range_resolves_positionally(self):
+        repo = self._sized_repo()
+        result = repo.backfill(
+            selection=["sized"],
+            partition_range=rs.PartitionKeyRange.single(
+                from_key="medium", to_key="large"
+            ),
+        )
+        assert result.num_partitions == 2
+        assert set(repo.storage.get_materialized_partitions("sized")) == {
+            rs.PartitionKey.single("medium"),
+            rs.PartitionKey.single("large"),
+        }
+
+    def test_static_range_positionally_inverted_rejected(self):
+        repo = self._sized_repo()
+        with pytest.raises(
+            ExecutionError,
+            match=re.escape("from_key 'large' is after to_key 'small'"),
+        ):
+            repo.backfill(
+                selection=["sized"],
+                partition_range=rs.PartitionKeyRange.single(
+                    from_key="large", to_key="small"
+                ),
+            )
+
+    def test_static_range_unknown_endpoint_rejected(self):
+        repo = self._sized_repo()
+        with pytest.raises(
+            ExecutionError,
+            match=re.escape("Range endpoint 'huge' is not a partition key"),
+        ):
+            repo.backfill(
+                selection=["sized"],
+                partition_range=rs.PartitionKeyRange.single(
+                    from_key="medium", to_key="huge"
+                ),
+            )
+
+    def test_custom_fmt_range_resolves_chronologically(self):
+        # %m/%d/%Y sorts "01/02/2025" before "12/30/2024" lexicographically —
+        # the range must follow the calendar instead.
+        pd = rs.PartitionsDefinition.daily(
+            start=datetime(2024, 12, 30),
+            end=datetime(2025, 1, 3),
+            fmt="%m/%d/%Y",
+        )
+
+        @rs.Asset(partitions_def=pd)
+        def asset(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+        result = repo.backfill(
+            selection=["asset"],
+            partition_range=rs.PartitionKeyRange.single(
+                from_key="12/30/2024", to_key="01/02/2025"
+            ),
+        )
+        assert result.num_partitions == 4
+        assert set(repo.storage.get_materialized_partitions("asset")) == {
+            rs.PartitionKey.single("12/30/2024"),
+            rs.PartitionKey.single("12/31/2024"),
+            rs.PartitionKey.single("01/01/2025"),
+            rs.PartitionKey.single("01/02/2025"),
+        }
+
+    def test_multi_static_dim_range_resolves_positionally(self):
+        pd = rs.PartitionsDefinition.multi(
+            {
+                "size": _static_pd(self.SIZES),
+                "region": _static_pd(["us"]),
+            }
+        )
+
+        @rs.Asset(partitions_def=pd)
+        def asset(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+        result = repo.backfill(
+            selection=["asset"],
+            partition_range=rs.PartitionKeyRange.multi({"size": ("medium", "large")}),
+        )
+        assert result.num_partitions == 2
+        assert set(repo.storage.get_materialized_partitions("asset")) == {
+            rs.PartitionKey.multi({"size": "medium", "region": "us"}),
+            rs.PartitionKey.multi({"size": "large", "region": "us"}),
+        }

@@ -6041,21 +6041,36 @@ fn test_partition_selection_complement() {
 
 #[test]
 fn test_partition_selection_difference() {
+    let universe: HashSet<PartitionKey> = ["p1", "p2", "p3"].iter().map(|s| spk(s)).collect();
     let a = PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2"), spk("p3")]));
     let b = PartitionSelection::Keys(HashSet::from([spk("p2")]));
     assert_eq!(
-        a.difference(&b),
+        a.difference(&b, &universe),
         PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p3")]))
     );
 
     assert_eq!(
-        a.difference(&PartitionSelection::All),
+        a.difference(&PartitionSelection::All, &universe),
         PartitionSelection::Empty
     );
-    assert_eq!(a.difference(&PartitionSelection::Empty), a);
+    assert_eq!(a.difference(&PartitionSelection::Empty, &universe), a);
     assert_eq!(
-        PartitionSelection::Empty.difference(&b),
+        PartitionSelection::Empty.difference(&b, &universe),
         PartitionSelection::Empty
+    );
+}
+
+/// `All - Keys` must resolve to the complement, not fall back to `All` —
+/// the fallback re-selects the very partitions the subtraction was meant to
+/// drop (e.g. `newly_requested().since_last_handled()` re-selecting handled
+/// keys).
+#[test]
+fn test_partition_selection_difference_all_minus_keys() {
+    let universe: HashSet<PartitionKey> = ["p1", "p2", "p3"].iter().map(|s| spk(s)).collect();
+    let handled = PartitionSelection::Keys(HashSet::from([spk("p2")]));
+    assert_eq!(
+        PartitionSelection::All.difference(&handled, &universe),
+        PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p3")]))
     );
 }
 

@@ -5,7 +5,7 @@
 //! via the `croner` crate, bounded by `start_date` / `end_date` / `end_offset`.
 use std::collections::HashMap;
 
-use chrono::{Local, NaiveDateTime, TimeZone};
+use chrono::{Local, NaiveDateTime, TimeZone, Utc};
 use croner::Cron;
 use ordermap::OrderSet;
 use pyo3::exceptions::PyNotImplementedError;
@@ -476,23 +476,99 @@ impl PartitionsDefinition {
             Ok(Some((window_start, window_end)))
         } else if let Some(cron_expr) = cron_schedule {
             let cron = parse_cron(cron_expr)?;
-            let start_local = naive_to_local(&window_start)?;
-            let next = cron
-                .find_next_occurrence(&start_local, false)
-                .map_err(|e| {
-                    PartitionDefinitionError::new_err(format!("Failed to find next cron tick: {e}"))
-                })?;
-            Ok(Some((window_start, next.naive_local())))
+            // Search in wall-clock-as-UTC: a gap-free, unambiguous timeline
+            // croner can't stall on (its Local search spins re-resolving the
+            // DST fall-back hour).
+            let start_utc = Utc.from_utc_datetime(&window_start);
+            let next = cron.find_next_occurrence(&start_utc, false).map_err(|e| {
+                PartitionDefinitionError::new_err(format!("Failed to find next cron tick: {e}"))
+            })?;
+            Ok(Some((window_start, next.naive_utc())))
         } else {
             Ok(None)
         }
     }
 
-    /// Check if a partition key is valid for this definition.
+    /// Shift a TimeWindow key by `offset` windows (negative = earlier) —
+    /// the engine behind `PartitionMapping.time_window(offset=..)`.
+    /// Interval defs shift by exact nanosecond arithmetic; cron defs walk
+    /// the wall-clock tick grid. Errors when the shifted window falls
+    /// outside `[start, end)`.
+    pub fn shift_time_key(&self, key: &str, offset: i64) -> PyResult<String> {
+        let Self::TimeWindow {
+            cron_schedule,
+            interval_seconds,
+            start,
+            end,
+            fmt,
+        } = self
+        else {
+            return Err(PartitionDefinitionError::new_err(
+                "time_window mapping requires a TimeWindow partition definition",
+            ));
+        };
+        let dt = parse_key_datetime(key, fmt).map_err(|e| {
+            PartitionDefinitionError::new_err(format!("Invalid time window key '{key}': {e}"))
+        })?;
+        if offset == 0 {
+            return Ok(key.to_string());
+        }
+        let shifted = if let Some(secs) = interval_seconds {
+            let interval_ns = (*secs * 1_000_000_000.0) as i64;
+            let total = interval_ns.checked_mul(offset).ok_or_else(|| {
+                PartitionDefinitionError::new_err(format!(
+                    "time_window offset {offset} overflows for interval {secs}s"
+                ))
+            })?;
+            dt + chrono::Duration::nanoseconds(total)
+        } else if let Some(expr) = cron_schedule {
+            let cron = parse_cron(expr)?;
+            let anchor = Utc.from_utc_datetime(&dt);
+            let direction = if offset > 0 {
+                croner::Direction::Forward
+            } else {
+                croner::Direction::Backward
+            };
+            let mut remaining = offset.unsigned_abs();
+            let mut shifted = None;
+            for tick in cron.iter_from(anchor, direction) {
+                if tick == anchor {
+                    continue;
+                }
+                remaining -= 1;
+                if remaining == 0 {
+                    shifted = Some(tick.naive_utc());
+                    break;
+                }
+            }
+            shifted.ok_or_else(|| {
+                PartitionDefinitionError::new_err(format!(
+                    "Cannot shift time window key '{key}' by {offset} windows"
+                ))
+            })?
+        } else {
+            return Err(PartitionDefinitionError::new_err(
+                "TimeWindow requires either cron_schedule or interval_seconds",
+            ));
+        };
+        let end_dt = time_window_end(end);
+        if shifted < *start || shifted >= end_dt {
+            return Err(PartitionDefinitionError::new_err(format!(
+                "time_window(offset={offset}) maps '{key}' outside the partition range \
+                 [{start}, {end_dt})"
+            )));
+        }
+        Ok(shifted.format(fmt).to_string())
+    }
+
+    /// Check if a partition key is valid for this definition. Empty key
+    /// vectors (constructible via `from_json` / proto, never via the Python
+    /// constructors) are invalid for every kind — without the explicit
+    /// checks they'd pass vacuously.
     pub fn validate_partition_key(&self, key: &PyPartitionKey) -> PyResult<bool> {
         match (self, key) {
             (Self::Static { keys: valid_keys }, PyPartitionKey::Single { key }) => {
-                Ok(key.iter().all(|k| valid_keys.contains(k)))
+                Ok(!key.is_empty() && key.iter().all(|k| valid_keys.contains(k)))
             }
             (
                 Self::TimeWindow {
@@ -505,9 +581,18 @@ impl PartitionsDefinition {
                 PyPartitionKey::Single { key },
             ) => validate_time_window_key(key, cron_schedule, interval_seconds, start, end, fmt),
             (Self::Multi { dimensions }, PyPartitionKey::Multi { keys }) => {
+                // Every def dimension must be present (checked below), so a
+                // length mismatch means the key carries extra dimensions the
+                // def doesn't declare — reject instead of silently ignoring.
+                if keys.len() != dimensions.len() {
+                    return Ok(false);
+                }
                 for (dim_name, dim_def) in dimensions {
                     match keys.get(dim_name) {
                         Some(vals) => {
+                            if vals.is_empty() {
+                                return Ok(false);
+                            }
                             for val in vals {
                                 let single_key = PyPartitionKey::Single {
                                     key: vec![val.clone()],
@@ -522,10 +607,15 @@ impl PartitionsDefinition {
                 }
                 Ok(true)
             }
-            // Dynamic partitions accept any single key (keys are storage-managed, not statically validated).
-            (Self::Dynamic { .. }, PyPartitionKey::Single { .. }) => Ok(true),
-            // A batched Set is valid iff every member is valid for this definition.
+            // Dynamic key *membership* is storage-managed — checked against
+            // `dynamic_partitions` at the submit boundary, not here. The def
+            // only rejects the statically-knowable invalid shape.
+            (Self::Dynamic { .. }, PyPartitionKey::Single { key }) => Ok(!key.is_empty()),
+            // A batched Set is valid iff non-empty and every member is valid.
             (_, PyPartitionKey::Set { keys }) => {
+                if keys.is_empty() {
+                    return Ok(false);
+                }
                 for member in keys {
                     if !self.validate_partition_key(member)? {
                         return Ok(false);
@@ -721,6 +811,15 @@ impl PartitionsDefinition {
                 "time_window accepts cron_schedule or interval_seconds, not both",
             ));
         }
+        if let Some(secs) = interval_seconds {
+            // Sub-nanosecond values truncate to 0ns, which would divide by
+            // zero in the key-validation modulo.
+            if !secs.is_finite() || secs <= 0.0 || (secs * 1_000_000_000.0) as i64 == 0 {
+                return Err(PartitionDefinitionError::new_err(format!(
+                    "interval_seconds must be positive and at least 1 nanosecond, got {secs}"
+                )));
+            }
+        }
         Ok(Self::TimeWindow {
             cron_schedule,
             interval_seconds,
@@ -880,12 +979,6 @@ fn parse_cron(expr: &str) -> PyResult<Cron> {
         })
 }
 
-fn naive_to_local(dt: &NaiveDateTime) -> PyResult<chrono::DateTime<Local>> {
-    Local
-        .from_local_datetime(dt)
-        .single()
-        .ok_or_else(|| PartitionDefinitionError::new_err(format!("Ambiguous local time: {dt}")))
-}
 
 /// Check if all key strings fall on valid time window boundaries within [start, end).
 fn validate_time_window_key(
@@ -898,7 +991,9 @@ fn validate_time_window_key(
 ) -> PyResult<bool> {
     let now = Local::now().naive_local();
     let end_dt = end.unwrap_or(now);
-    let cron = cron_schedule.as_deref().map(parse_cron).transpose()?;
+    if key.is_empty() {
+        return Ok(false);
+    }
     for k in key {
         let dt = match parse_key_datetime(k, fmt) {
             Ok(dt) => dt,
@@ -910,18 +1005,32 @@ fn validate_time_window_key(
         if let Some(secs) = interval_seconds {
             let from_start = dt.signed_duration_since(*start);
             let interval_ns = (*secs * 1_000_000_000.0) as i64;
+            if interval_ns <= 0 {
+                return Ok(false);
+            }
             if from_start
                 .num_nanoseconds()
                 .is_none_or(|n| n % interval_ns != 0)
             {
                 return Ok(false);
             }
-        } else if let Some(ref cron) = cron {
-            let dt_local = naive_to_local(&dt)?;
-            let matches = cron
-                .is_time_matching(&dt_local)
-                .map_err(|e| PartitionDefinitionError::new_err(format!("Cron match error: {e}")))?;
-            if !matches {
+        } else if let Some(expr) = cron_schedule {
+            // Membership must match enumeration exactly. Matching the parsed
+            // wall-clock against the cron misclassifies keys around DST
+            // transitions (gap ticks are skipped, fall-back and shifted
+            // ticks resolve to different wall-clock times), so walk the
+            // surrounding window's ticks and compare formatted keys.
+            let window_start = (dt - chrono::Duration::hours(26)).max(*start);
+            let window_end = (dt + chrono::Duration::hours(26)).min(end_dt);
+            let mut found = false;
+            for_each_cron_tick(expr, &window_start, window_end, |naive| {
+                if naive.format(fmt).to_string() == *k {
+                    found = true;
+                    return false;
+                }
+                true
+            })?;
+            if !found {
                 return Ok(false);
             }
         }
@@ -1073,9 +1182,13 @@ fn for_each_cron_tick(
     mut f: impl FnMut(NaiveDateTime) -> bool,
 ) -> PyResult<()> {
     let cron = parse_cron(cron_expr)?;
-    let start_local = naive_to_local(start)?;
-    for tick in cron.iter_from(start_local, croner::Direction::Forward) {
-        let naive = tick.naive_local();
+    // Iterate the cron over the naive wall clock interpreted as UTC. Keys
+    // are wall-clock labels: this grid has no DST gaps or duplicates, is
+    // identical on every host timezone, and croner can't stall on it (its
+    // Local iteration spins re-resolving the DST fall-back hour).
+    let start_utc = Utc.from_utc_datetime(start);
+    for tick in cron.iter_from(start_utc, croner::Direction::Forward) {
+        let naive = tick.naive_utc();
         if naive >= end_dt {
             break;
         }

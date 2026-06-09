@@ -10,12 +10,22 @@ pub fn now_ts() -> i64 {
         .as_nanos() as i64
 }
 
-/// Parse a partition key, falling back to date-only at midnight if `fmt` includes a time component.
+/// Parse a partition key against `fmt`, defaulting the time fields the
+/// format omits to zero. A plain `NaiveDateTime::parse_from_str` errors when
+/// the format lacks any time field (date-only fmts) — and a date-only
+/// fallback silently DROPS the hour for formats like hourly's
+/// `%Y-%m-%dT%H:00`, which carry an hour but no minute.
 pub fn parse_key_datetime(key: &str, fmt: &str) -> Result<NaiveDateTime, chrono::ParseError> {
-    NaiveDateTime::parse_from_str(key, fmt).or_else(|_| {
-        chrono::NaiveDate::parse_from_str(key, fmt).map(|d| {
-            d.and_hms_opt(0, 0, 0)
-                .expect("00:00:00 is a valid NaiveTime")
-        })
-    })
+    use chrono::format::{Parsed, StrftimeItems, parse};
+    let mut parsed = Parsed::new();
+    parse(&mut parsed, key, StrftimeItems::new(fmt))?;
+    if parsed.hour_div_12().is_none() && parsed.hour_mod_12().is_none() {
+        parsed.set_hour(0)?;
+    }
+    if parsed.minute().is_none() {
+        parsed.set_minute(0)?;
+    }
+    let date = parsed.to_naive_date()?;
+    let time = parsed.to_naive_time()?;
+    Ok(date.and_time(time))
 }
