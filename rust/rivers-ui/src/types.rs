@@ -1187,7 +1187,11 @@ mod conversions {
                 strategy,
                 job_name: b.job_name,
                 asset_selection: b.asset_selection,
-                total_partitions: b.partition_keys.len() as u32,
+                total_partitions: b
+                    .partition_keys
+                    .iter()
+                    .map(|pk| pk.member_count())
+                    .sum::<usize>() as u32,
                 completed_partitions: b.completed_partitions.len() as u32,
                 failed_partitions: b.failed_partitions.len() as u32,
                 canceled_partitions: b.canceled_partitions.len() as u32,

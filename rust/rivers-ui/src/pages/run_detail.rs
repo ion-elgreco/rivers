@@ -115,6 +115,11 @@ pub fn RunDetailPage() -> impl IntoView {
     let loc = use_current_location();
 
     let (refresh_tick, set_refresh_tick) = signal(0u32);
+    // Tracked run_id for reactive children (the resources above use the untracked `run_id`).
+    let run_id_memo = Memo::new(move |_| {
+        params.track();
+        run_id()
+    });
 
     let run = Resource::new(
         move || {
@@ -123,8 +128,7 @@ pub fn RunDetailPage() -> impl IntoView {
         },
         |(id, _)| get_run(id),
     );
-    // Timeline/DAG need only step events (O(steps)); materializations are
-    // paginated by the log panel + drawer.
+    // Timeline/DAG need only step events; materializations are paginated elsewhere.
     let step_events = Resource::new(
         move || {
             params.track();
@@ -146,6 +150,17 @@ pub fn RunDetailPage() -> impl IntoView {
     let locations = Resource::new(|| (), |_| list_code_locations());
 
     let (selected_step, set_selected_step) = signal(Option::<String>::None);
+    // Asset-drawer pagination lives here, not in the drawer, so a live re-mount
+    // of the drawer (the timeline Transition re-runs on each refresh tick) can't
+    // reset it. Reset only when the selected asset or the run changes.
+    let (mat_page, set_mat_page) = signal(0u64);
+    let (obs_page, set_obs_page) = signal(0u64);
+    Effect::new(move |_| {
+        selected_step.track();
+        run_id_memo.track();
+        set_mat_page.set(0);
+        set_obs_page.set(0);
+    });
     let (log_tab, set_log_tab) = signal("events".to_string());
     let (log_level, set_log_level) = signal("all".to_string());
     let (view_mode, set_view_mode) = signal("gantt".to_string());
@@ -331,7 +346,8 @@ pub fn RunDetailPage() -> impl IntoView {
             // re-mount it and reset the scroll buffer. `log_events` is reactive, so
             // stdout/stderr still update live.
             <RunLogPanel
-                run_id={run_id()}
+                run_id=run_id_memo
+                refresh_tick=refresh_tick
                 log_events=Signal::derive(move || {
                     log_events.get().and_then(|r| r.ok()).unwrap_or_default()
                 })
@@ -358,6 +374,10 @@ pub fn RunDetailPage() -> impl IntoView {
                             run_id=run_id()
                             step_events=steps
                             topology=topo
+                            mat_page=mat_page
+                            set_mat_page=set_mat_page
+                            obs_page=obs_page
+                            set_obs_page=set_obs_page
                             on_close=set_selected_step
                         />
                     })
@@ -462,6 +482,10 @@ fn RunAssetDrawer(
     run_id: String,
     step_events: Vec<StoredEvent>,
     topology: Option<crate::types::GraphTopology>,
+    mat_page: ReadSignal<u64>,
+    set_mat_page: WriteSignal<u64>,
+    obs_page: ReadSignal<u64>,
+    set_obs_page: WriteSignal<u64>,
     on_close: WriteSignal<Option<String>>,
 ) -> impl IntoView {
     // Status/timing from this asset's step events; materializations paginated below.
@@ -515,7 +539,6 @@ fn RunAssetDrawer(
         .unwrap_or_default();
 
     // Paginated materialization / observation cards; page totals drive the headers.
-    let (mat_page, set_mat_page) = signal(0u64);
     let (mat_page_size, set_mat_page_size) = signal(25u64);
     let materializations_page = {
         let run_id = run_id.clone();
@@ -526,13 +549,18 @@ fn RunAssetDrawer(
                 let run_id = run_id.clone();
                 let asset_key = asset_key.clone();
                 async move {
-                    get_run_asset_events_page(run_id, asset_key, "Materialization".to_string(), p * ps, ps)
-                        .await
+                    get_run_asset_events_page(
+                        run_id,
+                        asset_key,
+                        "Materialization".to_string(),
+                        p * ps,
+                        ps,
+                    )
+                    .await
                 }
             },
         )
     };
-    let (obs_page, set_obs_page) = signal(0u64);
     let (obs_page_size, set_obs_page_size) = signal(25u64);
     let observations_page = {
         let run_id = run_id.clone();
@@ -543,8 +571,14 @@ fn RunAssetDrawer(
                 let run_id = run_id.clone();
                 let asset_key = asset_key.clone();
                 async move {
-                    get_run_asset_events_page(run_id, asset_key, "Observation".to_string(), p * ps, ps)
-                        .await
+                    get_run_asset_events_page(
+                        run_id,
+                        asset_key,
+                        "Observation".to_string(),
+                        p * ps,
+                        ps,
+                    )
+                    .await
                 }
             },
         )
@@ -1280,7 +1314,8 @@ fn render_log_rows(data: Vec<(String, String)>, level_filter: &str) -> Vec<impl 
 
 #[component]
 fn RunLogPanel(
-    run_id: String,
+    run_id: Memo<String>,
+    refresh_tick: ReadSignal<u32>,
     log_events: Signal<Vec<StoredEvent>>,
     selected_step: ReadSignal<Option<String>>,
     on_clear: WriteSignal<Option<String>>,
@@ -1292,21 +1327,23 @@ fn RunLogPanel(
     // Server-paginated — a `single_run` run can emit 15k+ events, never all at once.
     let (ev_page, set_ev_page) = signal(0u64);
     const EV_PAGE_SIZE: u64 = 50;
-    let structured_page = {
-        let run_id = run_id.clone();
-        Resource::new(
-            move || (selected_step.get(), ev_page.get()),
-            move |(sel, p)| {
-                let run_id = run_id.clone();
-                async move {
-                    get_run_structured_events_page(run_id, sel, p * EV_PAGE_SIZE, EV_PAGE_SIZE).await
-                }
-            },
-        )
-    };
-    // Reset to page 0 when the step filter changes.
+    let structured_page = Resource::new(
+        move || {
+            (
+                run_id.get(),
+                selected_step.get(),
+                ev_page.get(),
+                refresh_tick.get(),
+            )
+        },
+        move |(rid, sel, p, _)| async move {
+            get_run_structured_events_page(rid, sel, p * EV_PAGE_SIZE, EV_PAGE_SIZE).await
+        },
+    );
+    // Reset to page 0 when the step filter or the run changes.
     Effect::new(move |_| {
         selected_step.track();
+        run_id.track();
         set_ev_page.set(0);
     });
 
@@ -1319,7 +1356,10 @@ fn RunLogPanel(
         Signal::derive(move || {
             let d = data.get();
             match selected_step.get() {
-                Some(name) => d.into_iter().filter(|(a, _)| *a == name).collect::<Vec<_>>(),
+                Some(name) => d
+                    .into_iter()
+                    .filter(|(a, _)| *a == name)
+                    .collect::<Vec<_>>(),
                 None => d,
             }
         })

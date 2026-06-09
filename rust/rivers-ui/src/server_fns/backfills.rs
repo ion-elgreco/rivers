@@ -80,7 +80,7 @@ pub async fn get_backfill_partitions(
     let rows: Vec<crate::types::BackfillPartitionCell> = record
         .partition_keys
         .iter()
-        .flat_map(|pk| pk.members())
+        .flat_map(|pk| pk.members_preview(offset as usize + limit as usize))
         .skip(offset as usize)
         .take(limit as usize)
         .map(|m| {

@@ -287,6 +287,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                                     "done" => HeatCell::Done,
                                                     "failed" => HeatCell::Failed,
                                                     "running" => HeatCell::Running,
+                                                    "canceled" => HeatCell::Canceled,
                                                     _ => HeatCell::Pending,
                                                 }).collect();
                                                 let labels: Vec<String> = rows.into_iter().map(|r| r.key).collect();

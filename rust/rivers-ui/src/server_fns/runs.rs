@@ -68,7 +68,7 @@ pub async fn get_run_events(run_id: String) -> Result<Vec<StoredEvent>, ServerFn
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
-/// Step events for a run — backs the timeline/DAG (O(steps)).
+/// Step events for a run — backs the timeline/DAG.
 #[server]
 pub async fn get_run_step_events(run_id: String) -> Result<Vec<StoredEvent>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
