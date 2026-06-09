@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 
 import rivers as rs
@@ -64,6 +66,10 @@ def test_bash_task_env():
     assert task() == "test_value"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="BashTask `pwd` returns MSYS-style paths (/c/...) on Windows",
+)
 def test_bash_task_cwd(tmp_path):
     task = rs.BashTask(name="cwd_test", command="pwd", cwd=str(tmp_path))
     result = task()

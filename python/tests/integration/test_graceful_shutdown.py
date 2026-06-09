@@ -1,7 +1,7 @@
 """Integration test for graceful shutdown.
 
 Verifies that in-flight materializations complete before the process exits
-when SIGTERM is received during execution.
+when a terminate signal is received during execution.
 
 Run with:
     pytest python/tests/integration/test_graceful_shutdown.py -v
@@ -18,6 +18,14 @@ from pathlib import Path
 FIXTURES = Path(__file__).parent / "shutdown_fixtures"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PROTO_PATH = str(REPO_ROOT / "proto")
+
+
+_NEW_PROCESS_GROUP = (
+    subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+)
+_TERMINATE_SIGNAL = (
+    signal.CTRL_BREAK_EVENT if sys.platform == "win32" else signal.SIGTERM
+)
 
 
 def _wait_for_port(port: int, timeout: float = 15.0) -> bool:
@@ -38,7 +46,29 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def _read_ready_line(proc: subprocess.Popen, timeout: float = 15.0) -> str:
+def _start_server(env, err_path: Path) -> subprocess.Popen:
+    """Start the server subprocess, sending its stderr to a file.
+
+    stderr must be a file, not a `subprocess.PIPE`. The server logs
+    continuously, and a pipe the parent doesn't drain fills its fixed OS buffer
+    (only a few KB on Windows) and then *blocks* the server's own writes — including
+    the signal handler's log line, which runs right before it cancels the drain
+    token. That wedged graceful shutdown until the parent happened to read the
+    pipe. A file has no buffer limit, so the server never blocks on logging.
+    """
+    with open(err_path, "wb") as err_f:
+        return subprocess.Popen(
+            [sys.executable, str(FIXTURES / "server_runner.py")],
+            stdout=subprocess.PIPE,
+            stderr=err_f,
+            env=env,
+            creationflags=_NEW_PROCESS_GROUP,
+        )
+
+
+def _read_ready_line(
+    proc: subprocess.Popen, err_path: Path, timeout: float = 15.0
+) -> str:
     """Read the first stdout line from a server subprocess, with diagnostics.
 
     `proc.stdout.readline()` blocks until a newline arrives or EOF (when the
@@ -51,9 +81,8 @@ def _read_ready_line(proc: subprocess.Popen, timeout: float = 15.0) -> str:
         line = proc.stdout.readline().decode().strip()
         if line:
             return line
-        # Empty line = EOF on stdout pipe = subprocess exited.
         if proc.poll() is not None:
-            stderr = proc.stderr.read().decode() if proc.stderr else ""
+            stderr = err_path.read_text(errors="replace") if err_path.exists() else ""
             raise AssertionError(
                 f"Server subprocess exited before printing READY "
                 f"(exit code {proc.returncode}).\nstderr:\n{stderr}"
@@ -82,33 +111,23 @@ def _server_env(tmp_path, pipeline_module, grpc_port, **extra):
 
 class TestGracefulShutdown:
     def test_inflight_materialization_completes_on_sigterm(self, tmp_path):
-        """Start a gRPC server, trigger a slow materialization, send SIGTERM
-        mid-flight, and verify the work completed before the process exited."""
+        """Start a gRPC server, trigger a slow materialization, send a terminate
+        signal mid-flight, and verify the work completed before the process
+        exited."""
         marker = tmp_path / "completed.marker"
+        err_path = tmp_path / "server.err"
         grpc_port = _find_free_port()
 
-        env = _server_env(
-            tmp_path,
-            "pipeline_slow",
-            grpc_port,
-            MARKER_PATH=str(marker),
-        )
-
-        server = subprocess.Popen(
-            [sys.executable, str(FIXTURES / "server_runner.py")],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-        )
+        env = _server_env(tmp_path, "pipeline_slow", grpc_port, MARKER_PATH=str(marker))
+        server = _start_server(env, err_path)
 
         trigger_proc = None
         try:
-            ready_line = _read_ready_line(server)
+            ready_line = _read_ready_line(server, err_path)
             assert ready_line.startswith("READY:"), f"Unexpected output: {ready_line}"
             actual_port = int(ready_line.split(":")[1])
             assert _wait_for_port(actual_port, timeout=10), "gRPC server did not start"
 
-            # Start the trigger in background (keeps gRPC stream alive)
             trigger_env = os.environ.copy()
             trigger_env.update(
                 {
@@ -124,75 +143,66 @@ class TestGracefulShutdown:
                 env=trigger_env,
             )
 
-            # Wait for the trigger to connect and call Materialize
             calling_line = trigger_proc.stdout.readline().decode().strip()
             assert calling_line == "CALLING", (
                 f"Unexpected trigger output: {calling_line}"
             )
 
-            # Give the asset time to start executing (it sleeps 5s)
             time.sleep(1.5)
-
-            # Send SIGTERM while the asset is mid-sleep
-            server.send_signal(signal.SIGTERM)
-
-            # Server should wait for the in-flight RPC to complete (~3.5s remaining)
-            server.wait(timeout=20)
-            stderr = server.stderr.read().decode()
-
-            trigger_proc.wait(timeout=10)
-
-            assert server.returncode == 0, (
-                f"Server exited with {server.returncode}\nstderr:\n{stderr}"
-            )
-            assert marker.exists(), (
-                f"Marker file not created — materialization was killed before completion.\n"
-                f"stderr:\n{stderr}"
-            )
-            assert "drain signal received" in stderr or "SIGTERM" in stderr, (
-                f"No drain signal in logs.\nstderr:\n{stderr}"
-            )
-            assert "shutdown complete" in stderr, (
-                f"Shutdown did not complete.\nstderr:\n{stderr}"
-            )
-
+            server.send_signal(_TERMINATE_SIGNAL)
+            try:
+                server.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait(timeout=5)
+            try:
+                trigger_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                trigger_proc.kill()
         finally:
             for p in [server, trigger_proc]:
                 if p is not None and p.poll() is None:
                     p.kill()
                     p.wait(timeout=5)
 
+        stderr = err_path.read_text(errors="replace")
+        assert server.returncode == 0, (
+            f"Server exited with {server.returncode}; marker_written={marker.exists()}\n"
+            f"stderr:\n{stderr}"
+        )
+        assert marker.exists(), (
+            f"Marker file not created — materialization was killed before completion.\n"
+            f"stderr:\n{stderr}"
+        )
+        assert "drain signal received" in stderr or "SIGTERM" in stderr, (
+            f"No drain signal in logs.\nstderr:\n{stderr}"
+        )
+        assert "shutdown complete" in stderr, (
+            f"Shutdown did not complete.\nstderr:\n{stderr}"
+        )
+
     def test_idle_server_shuts_down_cleanly(self, tmp_path):
-        """An idle server should shut down quickly on SIGTERM."""
+        """An idle server should shut down quickly on a terminate signal."""
+        err_path = tmp_path / "server.err"
         grpc_port = _find_free_port()
         env = _server_env(tmp_path, "pipeline_noop", grpc_port)
 
-        proc = subprocess.Popen(
-            [sys.executable, str(FIXTURES / "server_runner.py")],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-        )
-
+        proc = _start_server(env, err_path)
         try:
-            ready_line = _read_ready_line(proc)
+            ready_line = _read_ready_line(proc, err_path)
             assert ready_line.startswith("READY:"), f"Unexpected output: {ready_line}"
             actual_port = int(ready_line.split(":")[1])
             assert _wait_for_port(actual_port, timeout=10)
 
-            proc.send_signal(signal.SIGTERM)
-
+            proc.send_signal(_TERMINATE_SIGNAL)
             proc.wait(timeout=10)
-            stderr = proc.stderr.read().decode()
-
-            assert proc.returncode == 0, (
-                f"Exit code {proc.returncode}\nstderr:\n{stderr}"
-            )
-            assert "shutdown complete" in stderr, (
-                f"No shutdown complete in logs.\nstderr:\n{stderr}"
-            )
-
         finally:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=5)
+
+        stderr = err_path.read_text(errors="replace")
+        assert proc.returncode == 0, f"Exit code {proc.returncode}\nstderr:\n{stderr}"
+        assert "shutdown complete" in stderr, (
+            f"No shutdown complete in logs.\nstderr:\n{stderr}"
+        )

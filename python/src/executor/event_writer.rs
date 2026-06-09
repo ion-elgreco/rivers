@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-use crate::runtime::rt;
+use crate::runtime::io_rt;
 
 const BATCH_SIZE: usize = 64;
 const FLUSH_INTERVAL_MS: u64 = 200;
@@ -45,7 +45,7 @@ impl EventWriter {
         let (tx, rx) = mpsc::unbounded_channel();
         let code_location_id = storage.code_location_id().to_string();
         let backend = Arc::clone(storage.backend());
-        let handle = rt().spawn(async move {
+        let handle = io_rt().spawn(async move {
             batch_writer_loop(rx, &backend).await;
         });
         Self {
@@ -74,7 +74,7 @@ impl EventWriter {
 
     pub(crate) fn flush(self) {
         drop(self.sender);
-        if let Err(e) = rt().block_on(self.handle) {
+        if let Err(e) = io_rt().block_on(self.handle) {
             warn!("event writer task panicked: {e:?}");
         }
     }
