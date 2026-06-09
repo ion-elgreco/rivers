@@ -506,18 +506,23 @@ def test_backfill_dry_run_also_validates():
 # INVALID_ARGUMENT at the boundary instead of being silently dropped
 # (kind-less keys), collapsed (duplicate dims), or coerced (unknown strategy
 # shorthand → MultiRun fan-out).
+#
+# Only one gRPC server runs per process (`_start_grpc_server` supersedes the
+# previous one), so these use the LAST module fixture started in file order:
+# `multi_partitioned_grpc_channel`. Conversion runs before any asset/def
+# validation, so the selection content is incidental.
 # ---------------------------------------------------------------------------
 
 
-def test_grpc_unknown_strategy_shorthand_rejected(partitioned_grpc_channel):
-    channel, pb2, pb2_grpc, _, _ = partitioned_grpc_channel
+def test_grpc_unknown_strategy_shorthand_rejected(multi_partitioned_grpc_channel):
+    channel, pb2, pb2_grpc, _, _ = multi_partitioned_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)
 
     with pytest.raises(grpc.RpcError) as exc:
         stub.LaunchBackfill(
             pb2.LaunchBackfillRequest(
-                selection=["part_alpha"],
-                partition_keys=[_single_pk(pb2, "a")],
+                selection=["cell"],
+                partition_keys=[_multi_pk(pb2, color="r", size="s")],
                 strategy=pb2.BackfillStrategyProto(shorthand="Single_Run"),
             )
         )
@@ -525,31 +530,34 @@ def test_grpc_unknown_strategy_shorthand_rejected(partitioned_grpc_channel):
     assert "unknown backfill strategy" in exc.value.details()
 
 
-def test_grpc_kindless_partition_key_rejected(partitioned_grpc_channel):
-    channel, pb2, pb2_grpc, _, _ = partitioned_grpc_channel
+def test_grpc_kindless_partition_key_rejected(multi_partitioned_grpc_channel):
+    channel, pb2, pb2_grpc, _, _ = multi_partitioned_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)
 
     with pytest.raises(grpc.RpcError) as exc:
         stub.LaunchBackfill(
             pb2.LaunchBackfillRequest(
-                selection=["part_alpha"],
+                selection=["cell"],
                 # One valid key plus a kind-less one — previously the latter
                 # was silently filter_map'd away, shrinking the backfill.
-                partition_keys=[_single_pk(pb2, "a"), pb2.ProtoPartitionKey()],
+                partition_keys=[
+                    _multi_pk(pb2, color="r", size="s"),
+                    pb2.ProtoPartitionKey(),
+                ],
             )
         )
     assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert "no kind set" in exc.value.details()
 
 
-def test_grpc_empty_single_partition_key_rejected(partitioned_grpc_channel):
-    channel, pb2, pb2_grpc, _, _ = partitioned_grpc_channel
+def test_grpc_empty_single_partition_key_rejected(multi_partitioned_grpc_channel):
+    channel, pb2, pb2_grpc, _, _ = multi_partitioned_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)
 
     with pytest.raises(grpc.RpcError) as exc:
         stub.Materialize(
             pb2.MaterializeRequest(
-                selection=["part_alpha"],
+                selection=["cell"],
                 partition_key=pb2.ProtoPartitionKey(
                     single=pb2.SinglePartitionKey(keys=[])
                 ),
@@ -559,19 +567,19 @@ def test_grpc_empty_single_partition_key_rejected(partitioned_grpc_channel):
     assert "must not be empty" in exc.value.details()
 
 
-def test_grpc_duplicate_multi_dimension_rejected(partitioned_grpc_channel):
-    channel, pb2, pb2_grpc, _, _ = partitioned_grpc_channel
+def test_grpc_duplicate_multi_dimension_rejected(multi_partitioned_grpc_channel):
+    channel, pb2, pb2_grpc, _, _ = multi_partitioned_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)
 
     with pytest.raises(grpc.RpcError) as exc:
         stub.Materialize(
             pb2.MaterializeRequest(
-                selection=["part_alpha"],
+                selection=["cell"],
                 partition_key=pb2.ProtoPartitionKey(
                     multi=pb2.MultiPartitionKey(
                         dimensions=[
-                            pb2.MultiPartitionDimension(name="region", keys=["us"]),
-                            pb2.MultiPartitionDimension(name="region", keys=["eu"]),
+                            pb2.MultiPartitionDimension(name="color", keys=["r"]),
+                            pb2.MultiPartitionDimension(name="color", keys=["g"]),
                         ]
                     )
                 ),
