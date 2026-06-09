@@ -92,15 +92,24 @@ jobs:
           just wasm-test
 
   testing:
-    name: Python tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Python tests (${{ matrix.label }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     permissions:
       contents: read
+    # disable sscache for windows builds
+    env:
+      RUSTC_WRAPPER: ${{ matrix.runner != 'windows-latest' && 'sccache' || '' }}
 
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.13"]
+        include:
+          - { label: linux-glibc-x86_64, runner: ubuntu-latest, python-version: "3.10" }
+          - { label: linux-glibc-x86_64, runner: ubuntu-latest, python-version: "3.13" }
+          - { label: linux-glibc-arm64, runner: ubuntu-24.04-arm, python-version: "3.13" }
+          - { label: macos-arm64, runner: macos-15, python-version: "3.13" }
+          - { label: windows-x86_64, runner: windows-latest, python-version: "3.13" }
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

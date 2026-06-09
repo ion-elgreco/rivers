@@ -158,7 +158,11 @@ async fn execute_job_with_blank_run_id_shows_error_message() {
             .query_selector(".error-msg")
             .ok()
             .flatten()
-            .map(|el| el.text_content().unwrap_or_default().contains("returned no id"))
+            .map(|el| {
+                el.text_content()
+                    .unwrap_or_default()
+                    .contains("returned no id")
+            })
             .unwrap_or(false)
     })
     .await;

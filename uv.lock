@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -1031,19 +1031,19 @@ wheels = [
 
 [[package]]
 name = "polars-deltalake"
-version = "1.2.0"
+version = "1.2.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "polars" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/24/5a/5eaafff47c48e662fe62b592c7bb292074b839ffe5dec2734cb0ff1fa044/polars_deltalake-1.2.0-cp310-abi3-macosx_10_13_x86_64.whl", hash = "sha256:f4d43505ff737b8ddd7d1d28bae6ab72ae004f7dd15a3cfb7695a584734178fb", size = 20051134, upload-time = "2026-05-24T09:48:38.869Z" },
-    { url = "https://files.pythonhosted.org/packages/fa/40/52ecbbd5a347a355cfcab9c599dbf3e6bf313a117f6c9d8ea5dd6913b635/polars_deltalake-1.2.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:c4c38ac5919cee7fbceabaf8021cac9d1174c1568c8c417f9b8a8ad4cfe25ca6", size = 18556963, upload-time = "2026-05-24T09:48:41.878Z" },
-    { url = "https://files.pythonhosted.org/packages/9c/13/af882ae0d59c73e7cf8a41404aaf6cf7ae6be84c4454ab694897ab3f14e4/polars_deltalake-1.2.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:5dc6cf0091eecc1c184fcccd1cdd221dcceb259594c144aa0e94ecbc12f9bf80", size = 18798433, upload-time = "2026-05-24T09:48:44.592Z" },
-    { url = "https://files.pythonhosted.org/packages/3d/b5/ebc75948531414ebacb328de3faf41e0d8a9e10a5c355540df4660e61119/polars_deltalake-1.2.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:73d3e0418ecf052ce2d29e47a4ccd376f29d9d4cb7bfe189579477f1ef7cc230", size = 20175203, upload-time = "2026-05-24T09:48:47.006Z" },
-    { url = "https://files.pythonhosted.org/packages/9b/87/b9461a28716ef4d45ac7070f485d9e013981ece0b9d5dd4003c46057f73f/polars_deltalake-1.2.0-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:53857f385352282927c119d80670a547b3e2db4a1c31e02fd757ed093cc1c55c", size = 18960277, upload-time = "2026-05-24T09:48:49.586Z" },
-    { url = "https://files.pythonhosted.org/packages/9e/ca/4f2ea5693e93154701a7eca2cf0d1cc4ff1542fd8333df1d52e1f00903ea/polars_deltalake-1.2.0-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:3ec31702370bde72f9e6739c9d2d048a909f1b9d1489027c49d0afa2a9af6b21", size = 20288660, upload-time = "2026-05-24T09:48:53.122Z" },
-    { url = "https://files.pythonhosted.org/packages/3e/59/908bb2bf51baaab0c33769ec5b84fc41e9e6ea94461600c1cdcc0ac032ff/polars_deltalake-1.2.0-cp310-abi3-win_amd64.whl", hash = "sha256:868cfbbfd413c89fcc63af8d0df936f5505801e1eb7b3a3d24d7972f46413f85", size = 22229474, upload-time = "2026-05-24T09:48:56.106Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/bc/78648578c2fb08f5c4d7357a813a250c9e05d9a12e278c5aab096da2b39e/polars_deltalake-1.2.2-cp310-abi3-macosx_10_13_x86_64.whl", hash = "sha256:efdd86f7482b5a17a9ca492c61b933bd629d59c94e30125348674afc98697698", size = 20283075, upload-time = "2026-06-08T14:03:14.579Z" },
+    { url = "https://files.pythonhosted.org/packages/22/7f/29600d18ea9f905d620c50eb030b516048adb41c49b9cbdf2a9afc0bc282/polars_deltalake-1.2.2-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:a7061f2435f795ec91d7ee1ffcd8538234253848f2036dc2da25fffab958f542", size = 18679154, upload-time = "2026-06-08T14:03:17.512Z" },
+    { url = "https://files.pythonhosted.org/packages/03/d6/9dc40bafdb82c4f02b5856fe54c68ff9ca43dbe4505ea51f821431a81d12/polars_deltalake-1.2.2-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:b4dc5f67c064393a69cd10b8903f1f69997dc1c838f522932016918b0a9914dc", size = 18851527, upload-time = "2026-06-08T14:03:19.883Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/ab/40018fa1a6282bed329967b57dd24bb2b4bd7f80447cc4070f925a30b331/polars_deltalake-1.2.2-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:88a893e4de5edd8456de5a125f5155ed242e31e525385a630effb2765d1ef6cb", size = 20185661, upload-time = "2026-06-08T14:03:21.942Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/37/c285517212b40192d9874dec644417ca8460ddd78d3aba2c894d5eab7277/polars_deltalake-1.2.2-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:60ba0e61abcee99592702018557ac7c5ac980e660edcf947cf1b11cd177e5ad6", size = 19034655, upload-time = "2026-06-08T14:03:23.981Z" },
+    { url = "https://files.pythonhosted.org/packages/83/c8/cdca2b80b3461312af7d24d26297be5d8b9c175a2e24f6e861eecbe3fb0d/polars_deltalake-1.2.2-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:74d203e823b8f78b848c120055c64d4795fe357b3b821010a1cce0598aece272", size = 20421965, upload-time = "2026-06-08T14:03:26.139Z" },
+    { url = "https://files.pythonhosted.org/packages/85/8c/405f87da66b63f7a53110f5a803190f1920e93374a04e0cf587d43361b2f/polars_deltalake-1.2.2-cp310-abi3-win_amd64.whl", hash = "sha256:84d3b95b3b374929534b999f397f0a30ef2103e5c64982b28e8bbbc247bbb54f", size = 22339760, upload-time = "2026-06-08T14:03:28.561Z" },
 ]
 
 [[package]]
@@ -1570,8 +1570,8 @@ requires-dist = [
     { name = "obstore", specifier = ">=0.9.1" },
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.0" },
     { name = "pandas", marker = "extra == 'pandas'", specifier = ">=2.0.0" },
-    { name = "polars", marker = "extra == 'polars'", specifier = ">=1.41.2" },
-    { name = "polars-deltalake", marker = "extra == 'delta-polars'", specifier = ">=1.2.0" },
+    { name = "polars", marker = "extra == 'polars'", specifier = ">=1.33.1" },
+    { name = "polars-deltalake", marker = "extra == 'delta-polars'", specifier = ">=1.2.2" },
     { name = "pyarrow", marker = "extra == 'pandas'", specifier = ">=18.0.0" },
     { name = "pyarrow", marker = "extra == 'pyarrow'", specifier = ">=18.0.0" },
     { name = "pydantic", specifier = ">=2.11.9" },

@@ -29,4 +29,4 @@ def slow_asset():
     return 1
 
 
-repo = rs.CodeRepository(assets=[slow_asset])
+repo = rs.CodeRepository(assets=[slow_asset], default_executor=rs.Executor.in_process())

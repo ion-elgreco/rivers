@@ -65,13 +65,28 @@ runs:
         cache: ${{ inputs.cache }}
         # Save partial compilation
         cache-on-failure: "true"
+        rustflags: "-D warnings -C symbol-mangling-version=v0"
 
     - name: Install protoc
       shell: bash
       run: |
         set -euo pipefail
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq protobuf-compiler
+        case "$RUNNER_OS" in
+          Linux)
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq protobuf-compiler
+            ;;
+          macOS)
+            brew install protobuf
+            ;;
+          Windows)
+            choco install protoc -y --no-progress
+            ;;
+          *)
+            echo "Unsupported runner OS: $RUNNER_OS" >&2
+            exit 1
+            ;;
+        esac
 
     # wasm-bindgen-cli is used by `just wasm` / `just wasm-dev` (driven directly
     # so we can pass a custom cargo profile — wasm-pack can't)

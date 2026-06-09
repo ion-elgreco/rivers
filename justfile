@@ -35,15 +35,15 @@ wasm-dev:
 
 # Build and install rivers as editable (release WASM — use for UI work or shipping)
 develop: venv wasm
-    cd python && VIRTUAL_ENV={{ justfile_directory() }}/.venv uvx --from 'maturin[zig]' maturin develop --profile {{ profile }}
+    cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' maturin develop --profile {{ profile }}
 
 # Faster develop for non-UI work — dev-profile WASM build (preserves panic symbols, larger blob; don't use for k8s/release)
 develop-fast: venv wasm-dev
-    cd python && VIRTUAL_ENV={{ justfile_directory() }}/.venv uvx --from 'maturin[zig]' maturin develop --profile {{ profile }}
+    cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' maturin develop --profile {{ profile }}
 
 # Build and install rivers as editable (release mode, stripped WASM)
 develop-release: venv wasm
-    cd python && VIRTUAL_ENV={{ justfile_directory() }}/.venv uvx --from 'maturin[zig]' maturin develop --release
+    cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' maturin develop --release
 
 # Run Python tests
 test:
@@ -150,7 +150,7 @@ _k8s-compile: wasm _k8s-wheel
 
 # Cross-compile just the Python wheel for Linux
 _k8s-wheel:
-    cd python && CARGO_TARGET_DIR={{ justfile_directory() }}/target/maturin VIRTUAL_ENV={{ justfile_directory() }}/.venv uvx --from 'maturin[zig]' maturin build --target {{ linux_target }} --zig --out ../dist
+    cd python && CARGO_TARGET_DIR='{{ justfile_directory() }}/target/maturin' VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' maturin build --target {{ linux_target }} --zig --out ../dist
 
 # Create k3d cluster, build images, deploy with Helm
 k8s-up: k8s-build
