@@ -243,51 +243,24 @@ impl PartitionKey {
     /// Expand a possibly-batched key into its individual single-valued members
     /// (`Single`: one per value; `Multi`: the cartesian product).
     pub fn members(&self) -> Vec<PartitionKey> {
-        match self {
-            Self::Single { keys } => keys
-                .iter()
-                .map(|k| Self::Single {
-                    keys: vec![k.clone()],
-                })
-                .collect(),
-            Self::Multi { dims } => {
-                let mut sorted = dims.clone();
-                sorted.sort_by(|a, b| a.0.cmp(&b.0));
-                let mut combos: Vec<Vec<(String, Vec<String>)>> = vec![Vec::new()];
-                for (name, vals) in &sorted {
-                    let mut next = Vec::new();
-                    for combo in &combos {
-                        for v in vals {
-                            let mut c = combo.clone();
-                            c.push((name.clone(), vec![v.clone()]));
-                            next.push(c);
-                        }
-                    }
-                    combos = next;
-                }
-                combos
-                    .into_iter()
-                    .map(|dims| Self::Multi { dims })
-                    .collect()
-            }
-            Self::Set { keys } => keys.iter().flat_map(|k| k.members()).collect(),
-        }
+        // The full expansion is `members_preview` with no cap; keep the
+        // cartesian logic in one place.
+        self.members_preview(usize::MAX)
     }
 
-    /// Number of individual members this key expands to, computed *without*
-    /// materializing them — `Single`: value count; `Multi`: cartesian product of
-    /// per-dimension value counts; `Set`: sum over members.
+    /// Number of members this key expands to, without building them.
     pub fn member_count(&self) -> usize {
         match self {
             Self::Single { keys } => keys.len(),
-            Self::Multi { dims } => dims.iter().map(|(_, vs)| vs.len()).product(),
+            Self::Multi { dims } => dims
+                .iter()
+                .map(|(_, vs)| vs.len())
+                .fold(1usize, |a, n| a.saturating_mul(n)),
             Self::Set { keys } => keys.iter().map(Self::member_count).sum(),
         }
     }
 
-    /// The first `limit` members in `members()` order, without building the rest
-    /// — a cheap preview for keys that expand to thousands (e.g. `single_run`
-    /// backfills), where the UI shows a few plus a total count.
+    /// The first `limit` members in `members()` order, without building the rest.
     pub fn members_preview(&self, limit: usize) -> Vec<PartitionKey> {
         if limit == 0 {
             return Vec::new();
@@ -296,7 +269,9 @@ impl PartitionKey {
             Self::Single { keys } => keys
                 .iter()
                 .take(limit)
-                .map(|k| Self::Single { keys: vec![k.clone()] })
+                .map(|k| Self::Single {
+                    keys: vec![k.clone()],
+                })
                 .collect(),
             Self::Multi { dims } => {
                 let mut sorted = dims.clone();

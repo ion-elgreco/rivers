@@ -93,9 +93,7 @@ pub fn bundle_keys(keys: &[PartitionKey]) -> PartitionKey {
     }
 }
 
-/// Order-independent set equality, O(n) via `PartitionKey`'s `Eq`/`Hash` rather
-/// than O(n²) pairwise `contains` — a single-run group can bundle tens of
-/// thousands of keys, where the quadratic form wedges the process.
+/// Order-independent set equality.
 fn same_set(a: &[PartitionKey], b: &[PartitionKey]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -292,9 +290,7 @@ mod tests {
 
     #[test]
     fn test_bundle_large_cartesian_is_compact_multi() {
-        // Regression: a clean region×sku cartesian (3×2000) must bundle into a
-        // compact Multi, and the set-equality check must stay O(n) — the old
-        // O(n²) `contains` form wedged single-run backfills at this size.
+        // A clean region×sku cartesian must bundle into a compact Multi, not a Set.
         let mut keys = Vec::new();
         for r in ["us", "eu", "apac"] {
             for i in 0..2000 {
@@ -332,7 +328,10 @@ mod tests {
         };
         assert_eq!(key.member_count(), 15_000);
         let preview = key.members_preview(3);
-        assert_eq!(preview, key.members().into_iter().take(3).collect::<Vec<_>>());
+        assert_eq!(
+            preview,
+            key.members().into_iter().take(3).collect::<Vec<_>>()
+        );
 
         // Single and Set.
         let single = PartitionKey::Single {

@@ -49,8 +49,7 @@ struct DbEventWrite {
     input_data_versions: Vec<(String, String)>,
 }
 
-/// One `asset_partitions` row. Written via `upsert_asset_partitions` so a run
-/// materializing N partitions costs O(1) bulk statements, not O(N) writes.
+/// One `asset_partitions` row, written in bulk via `upsert_asset_partitions`.
 #[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
 struct DbAssetPartitionWrite {
     code_location_id: String,
@@ -323,6 +322,9 @@ DEFINE INDEX IF NOT EXISTS idx_events_loc_asset ON events FIELDS code_location_i
 DEFINE INDEX IF NOT EXISTS idx_events_loc_asset_part ON events FIELDS code_location_id, asset_key, partition_key;
 -- Lets get_failed_partitions skip to an asset's failures by event_type.
 DEFINE INDEX IF NOT EXISTS idx_events_loc_asset_type ON events FIELDS code_location_id, asset_key, event_type;
+-- Timestamp-ordered per-asset event pagination (asset-detail events tab) — scan
+-- in order rather than sorting every matching event, mirroring idx_events_run_ts.
+DEFINE INDEX IF NOT EXISTS idx_events_loc_asset_ts ON events FIELDS code_location_id, asset_key, timestamp, sort_order;
 
 DEFINE TABLE IF NOT EXISTS assets SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS code_location_id ON assets TYPE string DEFAULT 'default';
@@ -956,8 +958,7 @@ impl SurrealStorage {
         .await
     }
 
-    /// A run's step events (`StepStart`/`Success`/`Failure`) — O(steps), not
-    /// O(partitions). Backs the timeline/DAG without the 15k+ materialization events.
+    /// A run's step events (`StepStart`/`Success`/`Failure`) — backs the timeline/DAG.
     pub async fn get_run_step_events(&self, run_id: &str) -> Result<Vec<StoredEvent>> {
         super::retry::with_retry(&self.retry_config, || async {
             let mut result = self
@@ -1494,7 +1495,8 @@ impl SurrealStorage {
                  last_timestamp = $input.last_timestamp",
             )
             .bind(("rows", rows))
-            .await?;
+            .await?
+            .check()?;
         Ok(())
     }
 
@@ -1741,10 +1743,7 @@ impl StorageBackend for SurrealStorage {
 
         let event_ids: Vec<String> = results.iter().map(|e| record_id_str(&e.id)).collect();
 
-        // Materialization bookkeeping, collapsed from O(events) to O(assets): the
-        // old per-event code-version read + `assets` UPDATE + `asset_partitions`
-        // DELETE+CREATE flooded storage on big runs. Group by asset (latest wins),
-        // then one bulk upsert.
+        // Group materializations by asset (latest wins), then one bulk upsert.
         let mut latest_mat: std::collections::HashMap<(&str, &str), usize> =
             std::collections::HashMap::new();
         // Dedup partition rows within the batch (last write wins), keyed by the
@@ -3704,10 +3703,8 @@ mod tests {
             .expect("failed to create in-memory storage")
     }
 
-    /// The run-detail events page (`ORDER BY timestamp ... LIMIT`) must scan
-    /// `idx_events_run_ts` in timestamp order, not sort every matching event.
-    /// Guards the index that keeps large-run pagination O(page) instead of
-    /// O(run events). RocksDB (the demo backend) — kv-mem plans differently.
+    /// The run-events page must scan `idx_events_run_ts` (timestamp order), not sort.
+    /// RocksDB backend — kv-mem plans differently.
     #[tokio::test]
     async fn run_events_page_uses_ordering_index() {
         let temp = test_temp_dir::test_temp_dir!();
@@ -3758,6 +3755,62 @@ mod tests {
         assert!(
             !plan.contains("SortTopKByKey") && !plan.contains("\"operator\":\"Sort\""),
             "page should not sort — the ordering index covers it: {plan}"
+        );
+    }
+
+    /// The asset-events page (`ORDER BY timestamp ... LIMIT`) must scan
+    /// `idx_events_loc_asset_ts`, not sort every matching event. RocksDB backend.
+    #[tokio::test]
+    async fn asset_events_page_uses_ordering_index() {
+        let temp = test_temp_dir::test_temp_dir!();
+        let s = SurrealStorage::new_embedded(temp.as_path_untracked().to_str().unwrap())
+            .await
+            .unwrap();
+        let rows: Vec<DbEventWrite> = (0..2000i64)
+            .map(|i| DbEventWrite {
+                code_location_id: "default".into(),
+                event_type: if i % 3 == 0 {
+                    "Observation"
+                } else {
+                    "Materialization"
+                }
+                .into(),
+                asset_key: Some("a".into()),
+                run_id: "r".into(),
+                partition_key: None,
+                timestamp: i,
+                sort_order: 0,
+                metadata: vec![],
+                data_version: None,
+                code_version: None,
+                input_data_versions: vec![],
+            })
+            .collect();
+        s.db.query("INSERT INTO events $rows RETURN NONE")
+            .bind(("rows", rows))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let plan: Vec<serde_json::Value> =
+            s.db.query(
+                "SELECT * FROM events WHERE code_location_id = 'default' AND asset_key = 'a' \
+                 AND event_type IN ['Materialization', 'Observation'] \
+                 ORDER BY timestamp DESC, sort_order DESC, id DESC LIMIT 50 START 0 EXPLAIN",
+            )
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        let plan = serde_json::to_string(&plan).unwrap();
+        assert!(
+            plan.contains("idx_events_loc_asset_ts"),
+            "asset page should scan idx_events_loc_asset_ts: {plan}"
+        );
+        assert!(
+            !plan.contains("SortTopKByKey") && !plan.contains("\"operator\":\"Sort\""),
+            "asset page should not sort: {plan}"
         );
     }
 
@@ -7846,6 +7899,7 @@ mod tests {
             "idx_events_loc_asset",
             "idx_events_loc_asset_part",
             "idx_events_loc_asset_type",
+            "idx_events_loc_asset_ts",
         ] {
             assert!(indexes.contains_key(idx), "events missing index: {idx}");
         }
