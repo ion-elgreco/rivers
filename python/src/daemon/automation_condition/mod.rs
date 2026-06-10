@@ -35,7 +35,13 @@ mod persist;
 use engine::ConditionTickEngine;
 
 /// Build a [`PartitionInfo`] from a graph node. Returns `None` if unpartitioned.
-fn partition_info_from_node(asset_name: &str, node: &ResolvedNode) -> Option<PartitionInfo> {
+/// `node_map` supplies upstream definitions so time-window mappings carry
+/// their grid into core eval.
+fn partition_info_from_node(
+    asset_name: &str,
+    node: &ResolvedNode,
+    node_map: &HashMap<String, ResolvedNode>,
+) -> Option<PartitionInfo> {
     let def = node.partitions_def()?;
     let all_keys = def
         .get_partition_keys()
@@ -50,7 +56,7 @@ fn partition_info_from_node(asset_name: &str, node: &ResolvedNode) -> Option<Par
         PartitionsDefinition::TimeWindow { fmt, .. } => Some(fmt.clone()),
         _ => None,
     };
-    let mappings = extract_partition_mappings(asset_name, node);
+    let mappings = extract_partition_mappings(asset_name, node, node_map);
     Some(PartitionInfo {
         all_keys,
         mappings,
@@ -75,7 +81,7 @@ impl PyCodeRepository {
             if let ResolvedNode::Asset(asset_node) = node
                 && let Some(ref cond) = asset_node.automation_condition
             {
-                let partition_info = partition_info_from_node(name, node);
+                let partition_info = partition_info_from_node(name, node, &state.node_map);
                 let backfill_strategy = node.backfill_strategy().map(|s| s.to_core());
                 by_key.insert(
                     name.clone(),
@@ -130,16 +136,23 @@ impl PyCodeRepository {
     }
 }
 
-fn mapping_to_kind(m: &PartitionMapping) -> PartitionMappingKind {
+/// `upstream_def` is the definition of the side the mapping shifts within —
+/// it supplies the time grid for `TimeWindow` and per-dimension defs for
+/// nested mappings.
+fn mapping_to_kind(
+    m: &PartitionMapping,
+    upstream_def: Option<&PartitionsDefinition>,
+) -> PartitionMappingKind {
     match m {
         PartitionMapping::Identity {} => PartitionMappingKind::Identity,
         PartitionMapping::AllPartitions {} => PartitionMappingKind::AllPartitions,
         PartitionMapping::Static { mapping } => PartitionMappingKind::Static {
             mapping: mapping.clone(),
         },
-        PartitionMapping::TimeWindow { offset } => {
-            PartitionMappingKind::TimeWindow { offset: *offset }
-        }
+        PartitionMapping::TimeWindow { offset } => PartitionMappingKind::TimeWindow {
+            offset: *offset,
+            grid: upstream_def.and_then(|d| d.time_grid()),
+        },
         PartitionMapping::SpecificPartitions { partition_keys } => {
             PartitionMappingKind::SpecificPartitions {
                 keys: partition_keys.clone(),
@@ -149,9 +162,16 @@ fn mapping_to_kind(m: &PartitionMapping) -> PartitionMappingKind {
             dimension_mappings: dimension_mappings
                 .iter()
                 .map(|(up_dim, (down_dim, per_dim))| {
+                    let dim_def = upstream_def.and_then(|d| match d {
+                        PartitionsDefinition::Multi { dimensions } => dimensions
+                            .iter()
+                            .find(|(n, _)| n == up_dim)
+                            .map(|(_, dd)| dd),
+                        _ => None,
+                    });
                     (
                         up_dim.clone(),
-                        (down_dim.clone(), Box::new(mapping_to_kind(per_dim))),
+                        (down_dim.clone(), Box::new(mapping_to_kind(per_dim, dim_def))),
                     )
                 })
                 .collect(),
@@ -159,10 +179,21 @@ fn mapping_to_kind(m: &PartitionMapping) -> PartitionMappingKind {
         PartitionMapping::MultiToSingle {
             dimension_name,
             partition_mapping,
-        } => PartitionMappingKind::MultiToSingle {
-            dimension_name: dimension_name.clone(),
-            inner: Box::new(mapping_to_kind(&partition_mapping.0)),
-        },
+        } => {
+            // The inner mapping shifts within the named dimension when the
+            // upstream is Multi, else within the upstream itself.
+            let inner_def = upstream_def.and_then(|d| match d {
+                PartitionsDefinition::Multi { dimensions } => dimensions
+                    .iter()
+                    .find(|(n, _)| n == dimension_name)
+                    .map(|(_, dd)| dd),
+                _ => upstream_def,
+            });
+            PartitionMappingKind::MultiToSingle {
+                dimension_name: dimension_name.clone(),
+                inner: Box::new(mapping_to_kind(&partition_mapping.0, inner_def)),
+            }
+        }
         PartitionMapping::ForKeys { .. } => PartitionMappingKind::ForKeys,
         PartitionMapping::Subset {} => PartitionMappingKind::Subset,
     }
@@ -171,11 +202,15 @@ fn mapping_to_kind(m: &PartitionMapping) -> PartitionMappingKind {
 fn extract_partition_mappings(
     asset_name: &str,
     node: &crate::repository::resolved_node::ResolvedNode,
+    node_map: &HashMap<String, ResolvedNode>,
 ) -> HashMap<(String, String), PartitionMappingKind> {
     let mut result = HashMap::new();
     if let Some(mappings) = node.partition_mapping() {
         for (upstream_name, mapping) in &mappings {
-            let kind = mapping_to_kind(mapping);
+            let upstream_def = node_map
+                .get(upstream_name)
+                .and_then(|n| n.partitions_def());
+            let kind = mapping_to_kind(mapping, upstream_def);
             result.insert((asset_name.to_string(), upstream_name.clone()), kind);
         }
     }

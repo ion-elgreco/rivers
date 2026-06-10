@@ -489,76 +489,38 @@ impl PartitionsDefinition {
         }
     }
 
+    /// The definition's wall-clock grid, for shifting/aligning keys.
+    /// `None` for non-TimeWindow kinds.
+    pub fn time_grid(&self) -> Option<rivers_core::timegrid::TimeGrid> {
+        match self {
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => Some(rivers_core::timegrid::TimeGrid {
+                cron_schedule: cron_schedule.clone(),
+                interval_seconds: *interval_seconds,
+                start: *start,
+                end: *end,
+                fmt: fmt.clone(),
+            }),
+            _ => None,
+        }
+    }
+
     /// Shift a TimeWindow key by `offset` windows (negative = earlier) —
-    /// the engine behind `PartitionMapping.time_window(offset=..)`.
-    /// Interval defs shift by exact nanosecond arithmetic; cron defs walk
-    /// the wall-clock tick grid. Errors when the shifted window falls
-    /// outside `[start, end)`.
+    /// the engine behind `PartitionMapping.time_window(offset=..)`. Errors
+    /// when the shifted window falls outside `[start, end)`.
     pub fn shift_time_key(&self, key: &str, offset: i64) -> PyResult<String> {
-        let Self::TimeWindow {
-            cron_schedule,
-            interval_seconds,
-            start,
-            end,
-            fmt,
-        } = self
-        else {
-            return Err(PartitionDefinitionError::new_err(
+        let grid = self.time_grid().ok_or_else(|| {
+            PartitionDefinitionError::new_err(
                 "time_window mapping requires a TimeWindow partition definition",
-            ));
-        };
-        let dt = parse_key_datetime(key, fmt).map_err(|e| {
-            PartitionDefinitionError::new_err(format!("Invalid time window key '{key}': {e}"))
+            )
         })?;
-        if offset == 0 {
-            return Ok(key.to_string());
-        }
-        let shifted = if let Some(secs) = interval_seconds {
-            let interval_ns = (*secs * 1_000_000_000.0) as i64;
-            let total = interval_ns.checked_mul(offset).ok_or_else(|| {
-                PartitionDefinitionError::new_err(format!(
-                    "time_window offset {offset} overflows for interval {secs}s"
-                ))
-            })?;
-            dt + chrono::Duration::nanoseconds(total)
-        } else if let Some(expr) = cron_schedule {
-            let cron = parse_cron(expr)?;
-            let anchor = Utc.from_utc_datetime(&dt);
-            let direction = if offset > 0 {
-                croner::Direction::Forward
-            } else {
-                croner::Direction::Backward
-            };
-            let mut remaining = offset.unsigned_abs();
-            let mut shifted = None;
-            for tick in cron.iter_from(anchor, direction) {
-                if tick == anchor {
-                    continue;
-                }
-                remaining -= 1;
-                if remaining == 0 {
-                    shifted = Some(tick.naive_utc());
-                    break;
-                }
-            }
-            shifted.ok_or_else(|| {
-                PartitionDefinitionError::new_err(format!(
-                    "Cannot shift time window key '{key}' by {offset} windows"
-                ))
-            })?
-        } else {
-            return Err(PartitionDefinitionError::new_err(
-                "TimeWindow requires either cron_schedule or interval_seconds",
-            ));
-        };
-        let end_dt = time_window_end(end);
-        if shifted < *start || shifted >= end_dt {
-            return Err(PartitionDefinitionError::new_err(format!(
-                "time_window(offset={offset}) maps '{key}' outside the partition range \
-                 [{start}, {end_dt})"
-            )));
-        }
-        Ok(shifted.format(fmt).to_string())
+        grid.shift_key(key, offset)
+            .map_err(|e| PartitionDefinitionError::new_err(e.to_string()))
     }
 
     /// Check if a partition key is valid for this definition. Empty key

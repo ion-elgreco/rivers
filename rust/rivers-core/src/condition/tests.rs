@@ -6060,6 +6060,52 @@ fn test_partition_selection_difference() {
     );
 }
 
+/// `time_window(offset)` must shift in condition eval exactly as the
+/// runtime IO path does — a pass-through here fires conditions on the
+/// partition that does NOT read the updated upstream.
+#[test]
+fn test_time_window_mapping_shifts_selections_by_offset() {
+    use crate::timegrid::TimeGrid;
+    let grid = TimeGrid {
+        cron_schedule: Some("0 0 * * *".into()),
+        interval_seconds: None,
+        start: chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap().into(),
+        end: Some(chrono::NaiveDate::from_ymd_opt(2024, 2, 1).unwrap().into()),
+        fmt: "%Y-%m-%d".into(),
+    };
+    let m = PartitionMappingKind::TimeWindow {
+        offset: -1,
+        grid: Some(grid),
+    };
+
+    let d = PartitionSelection::Keys(HashSet::from([spk("2024-01-05")]));
+    // Downstream 2024-01-05 reads upstream 2024-01-04.
+    assert_eq!(
+        m.map_to_upstream(&d),
+        PartitionSelection::Keys(HashSet::from([spk("2024-01-04")]))
+    );
+    // Upstream 2024-01-05 updating affects downstream 2024-01-06.
+    assert_eq!(
+        m.map_to_downstream(&d),
+        PartitionSelection::Keys(HashSet::from([spk("2024-01-06")]))
+    );
+    // A shift outside [start, end) has no counterpart partition.
+    let first = PartitionSelection::Keys(HashSet::from([spk("2024-01-01")]));
+    assert_eq!(m.map_to_upstream(&first), PartitionSelection::Empty);
+}
+
+/// Mappings serialized before the grid existed degrade to pass-through.
+#[test]
+fn test_time_window_mapping_without_grid_passes_through() {
+    let m = PartitionMappingKind::TimeWindow {
+        offset: -1,
+        grid: None,
+    };
+    let sel = PartitionSelection::Keys(HashSet::from([spk("2024-01-05")]));
+    assert_eq!(m.map_to_upstream(&sel), sel);
+    assert_eq!(m.map_to_downstream(&sel), sel);
+}
+
 /// `All - Keys` must resolve to the complement, not fall back to `All` —
 /// the fallback re-selects the very partitions the subtraction was meant to
 /// drop (e.g. `newly_requested().since_last_handled()` re-selecting handled

@@ -143,6 +143,12 @@ pub enum PartitionMappingKind {
     },
     TimeWindow {
         offset: i64,
+        /// The upstream definition's time grid, captured at conversion so
+        /// eval can shift keys the same way the runtime does. `None` for
+        /// mappings serialized before the grid existed — degrades to
+        /// pass-through.
+        #[serde(default)]
+        grid: Option<crate::timegrid::TimeGrid>,
     },
     SpecificPartitions {
         keys: Vec<String>,
@@ -165,6 +171,43 @@ pub enum PartitionMappingKind {
     /// Subset mapping: upstream has a subset of downstream's partition keys.
     /// Non-matching downstream keys skip the upstream.
     Subset,
+}
+
+/// Shift every single-dimension key in a selection by `offset` grid windows.
+/// Keys whose shift falls outside the grid's `[start, end)` have no
+/// counterpart partition and are dropped. Without a grid (mappings
+/// serialized before it existed) the selection passes through unchanged.
+fn shift_selection(
+    sel: &PartitionSelection,
+    offset: i64,
+    grid: Option<&crate::timegrid::TimeGrid>,
+) -> PartitionSelection {
+    let Some(grid) = grid else {
+        return sel.clone();
+    };
+    if offset == 0 {
+        return sel.clone();
+    }
+    match sel {
+        PartitionSelection::All | PartitionSelection::Empty => sel.clone(),
+        PartitionSelection::Keys(keys) => {
+            let shifted: HashSet<PartitionKey> = keys
+                .iter()
+                .filter_map(|k| match k {
+                    PartitionKey::Single { keys } if keys.len() == 1 => grid
+                        .shift_key(&keys[0], offset)
+                        .ok()
+                        .map(|s| PartitionKey::Single { keys: vec![s] }),
+                    _ => None,
+                })
+                .collect();
+            if shifted.is_empty() {
+                PartitionSelection::Empty
+            } else {
+                PartitionSelection::Keys(shifted)
+            }
+        }
+    }
 }
 
 impl PartitionMappingKind {
@@ -196,7 +239,12 @@ impl PartitionMappingKind {
                     }
                 }
             },
-            Self::TimeWindow { .. } => downstream_keys.clone(), // TODO: time offset logic
+            // Downstream key K reads upstream K+offset (runtime map_key
+            // semantics) — mirror it here so conditions fire the partitions
+            // the runtime will actually load.
+            Self::TimeWindow { offset, grid } => {
+                shift_selection(downstream_keys, *offset, grid.as_ref())
+            }
             Self::SpecificPartitions { keys } => {
                 if downstream_keys.is_empty() {
                     PartitionSelection::Empty
@@ -323,7 +371,11 @@ impl PartitionMappingKind {
                     }
                 }
             },
-            Self::TimeWindow { .. } => upstream_keys.clone(), // TODO: time offset logic
+            // Inverse of map_to_upstream: the downstream that reads
+            // upstream U is U-offset.
+            Self::TimeWindow { offset, grid } => {
+                shift_selection(upstream_keys, -*offset, grid.as_ref())
+            }
             Self::SpecificPartitions { .. } => {
                 if upstream_keys.is_empty() {
                     PartitionSelection::Empty

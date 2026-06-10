@@ -10,6 +10,7 @@ pub mod run_backend;
 pub mod staleness;
 pub mod storage;
 pub mod task;
+pub mod timegrid;
 pub mod util;
 
 pub const GRAPH_TOPOLOGY_KEY_PREFIX: &str = "graph_topology:";
