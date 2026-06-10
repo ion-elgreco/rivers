@@ -35,12 +35,21 @@ impl TimeGrid {
         if offset == 0 {
             return Ok(key.to_string());
         }
+        let end_dt = self.end_bound();
+        let out_of_range = || {
+            anyhow::anyhow!(
+                "time_window(offset={offset}) maps '{key}' outside the partition range \
+                 [{}, {end_dt})",
+                self.start
+            )
+        };
         let shifted = if let Some(secs) = self.interval_seconds {
             let interval_ns = (secs * 1_000_000_000.0) as i64;
             let total = interval_ns.checked_mul(offset).ok_or_else(|| {
                 anyhow::anyhow!("time_window offset {offset} overflows for interval {secs}s")
             })?;
-            dt + chrono::Duration::nanoseconds(total)
+            dt.checked_add_signed(chrono::Duration::nanoseconds(total))
+                .ok_or_else(out_of_range)?
         } else if let Some(expr) = &self.cron_schedule {
             let cron = parse_cron(expr)?;
             let anchor = Utc.from_utc_datetime(&dt);
@@ -61,19 +70,14 @@ impl TimeGrid {
                     break;
                 }
             }
-            shifted.ok_or_else(|| {
-                anyhow::anyhow!("Cannot shift time window key '{key}' by {offset} windows")
-            })?
+            // The iterator ends at croner's internal year limits — that far
+            // out is by definition outside the partition range.
+            shifted.ok_or_else(out_of_range)?
         } else {
             bail!("TimeWindow requires either cron_schedule or interval_seconds");
         };
-        let end_dt = self.end_bound();
         if shifted < self.start || shifted >= end_dt {
-            bail!(
-                "time_window(offset={offset}) maps '{key}' outside the partition range \
-                 [{}, {end_dt})",
-                self.start
-            );
+            return Err(out_of_range());
         }
         Ok(shifted.format(&self.fmt).to_string())
     }
@@ -115,6 +119,29 @@ mod tests {
         let g = daily_jan();
         assert!(g.shift_key("2024-01-01", -1).is_err());
         assert!(g.shift_key("2024-01-31", 1).is_err());
+    }
+
+    #[test]
+    fn interval_shift_near_datetime_bounds_errors_instead_of_panicking() {
+        let g = TimeGrid {
+            cron_schedule: None,
+            interval_seconds: Some(3600.0),
+            start: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap().into(),
+            end: None,
+            fmt: "%Y-%m-%dT%H:%M:%S".into(),
+        };
+        // Parses to chrono's minimum date; one window earlier is unrepresentable.
+        assert!(g.shift_key("-262143-01-01T00:00:00", -1).is_err());
+    }
+
+    #[test]
+    fn cron_walk_exhaustion_reports_the_partition_range() {
+        let g = daily_jan();
+        let err = g.shift_key("2024-01-05", -10_000_000).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the partition range"),
+            "got: {err}"
+        );
     }
 
     #[test]
