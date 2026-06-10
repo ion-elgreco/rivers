@@ -185,6 +185,40 @@ class TestDaemonSensor:
         finally:
             daemon.stop()
 
+    def test_backfill_dispatch_failure_marks_tick_failed(self, storage):
+        """A backfill request the dispatcher rejects flows through the same
+        outcome path as run requests — Failed tick, error recorded, no ids."""
+        pd = rs.PartitionsDefinition.static_(["a", "b"])
+
+        @rs.Asset(name="part_b", partitions_def=pd)
+        def part_b() -> int:
+            return 1
+
+        @rs.Sensor(
+            asset_selection=["part_b"],
+            minimum_interval="1s",
+            default_status=rs.SensorStatus.Running,
+        )
+        def bad_backfill_sensor(context: rs.SensorEvaluationContext):
+            return rs.BackfillRequest(
+                selection=["part_b"],
+                partition_keys=[rs.PartitionKey.single("nope")],
+            )
+
+        repo = rs.CodeRepository(assets=[part_b], sensors=[bad_backfill_sensor])
+        repo.resolve(storage=storage)
+
+        daemon = AutomationDaemon(repo=repo, storage=storage)
+        daemon.start()
+        try:
+            ticks = _wait_for_ticks(storage, "bad_backfill_sensor", min_count=1)
+            tick = ticks[0]
+            assert tick.status == "Failed"
+            assert "Invalid partition_key" in (tick.error or "")
+            assert tick.backfill_ids == []
+        finally:
+            daemon.stop()
+
     def test_sensor_error_stores_failed_tick(self, storage):
         """Sensor that raises an exception stores a Failed tick."""
 

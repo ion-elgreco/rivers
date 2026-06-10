@@ -61,12 +61,24 @@ pub(crate) async fn process_tick_result(
             let backfill_ids = if backfill_requests.is_empty() {
                 vec![]
             } else {
-                let bf_outcome = backfill_dispatcher.dispatch(backfill_requests).await;
-                let (ids, errors) = log_backfill_dispatch_outcome(
+                // Same outcome shape as runs: successful non-dry-run ids +
+                // per-request errors (a dry run produces no record).
+                let bf_outcome = backfill_dispatcher.dispatch(backfill_requests).await.map(
+                    |BackfillDispatchOutcome { results, errors }| DispatchOutcome {
+                        ids: results
+                            .into_iter()
+                            .filter(|r| !r.is_dry_run && !r.backfill_id.is_empty())
+                            .map(|r| r.backfill_id)
+                            .collect(),
+                        errors,
+                    },
+                );
+                let (ids, errors) = log_dispatch_outcome(
                     bf_outcome,
                     &auto_name,
                     auto_type,
                     backfill_dispatcher.mode_label(),
+                    "backfill",
                 );
                 dispatch_errors.extend(errors);
                 ids
@@ -203,48 +215,3 @@ fn log_dispatch_outcome(
     }
 }
 
-/// Backfill counterpart of [`log_dispatch_outcome`]. The dispatcher
-/// returns rich `PyBackfillResult`s; daemon ticks only need the ids
-/// (and a successful dispatch with `is_dry_run=true` is filtered out
-/// since it produces no record).
-fn log_backfill_dispatch_outcome(
-    outcome: anyhow::Result<BackfillDispatchOutcome>,
-    auto_name: &str,
-    auto_type: &str,
-    mode_label: &'static str,
-) -> (Vec<String>, Vec<String>) {
-    match outcome {
-        Ok(BackfillDispatchOutcome { results, errors }) => {
-            for err in &errors {
-                tracing::error!(
-                    target: "rivers::executor",
-                    automation_type = auto_type,
-                    name = %auto_name,
-                    mode = mode_label,
-                    kind = "backfill",
-                    error = %err,
-                    "backfill request failed",
-                );
-            }
-            let messages = errors.iter().map(|e| e.to_string()).collect();
-            let ids = results
-                .into_iter()
-                .filter(|r| !r.is_dry_run && !r.backfill_id.is_empty())
-                .map(|r| r.backfill_id)
-                .collect();
-            (ids, messages)
-        }
-        Err(e) => {
-            tracing::error!(
-                target: "rivers::executor",
-                automation_type = auto_type,
-                name = %auto_name,
-                mode = mode_label,
-                kind = "backfill",
-                error = %e,
-                "backfill dispatch failed",
-            );
-            (vec![], vec![e.to_string()])
-        }
-    }
-}
