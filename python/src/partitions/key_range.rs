@@ -91,6 +91,21 @@ pub(crate) fn validate_single_dim_range(
                     "from_key '{from_key}' is after to_key '{to_key}'{suffix}"
                 ));
             }
+            // Endpoints must be real window starts — an off-grid endpoint is
+            // not a partition key (same contract as Static membership).
+            for k in [from_key, to_key] {
+                let single = PyPartitionKey::Single {
+                    key: vec![k.to_string()],
+                };
+                let on_grid = def
+                    .validate_partition_key(&single)
+                    .map_err(|e| e.to_string())?;
+                if !on_grid {
+                    return Err(format!(
+                        "Range endpoint '{k}' is not a partition key{suffix}"
+                    ));
+                }
+            }
             Ok(())
         }
         _ => Ok(()),

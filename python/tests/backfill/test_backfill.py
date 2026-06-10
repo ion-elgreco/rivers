@@ -690,6 +690,36 @@ class TestRangeDefinitionOrdering:
                 ),
             )
 
+    def test_time_window_range_off_grid_endpoint_rejected(self):
+        """An endpoint that parses under the fmt but isn't a window start is
+        not a partition key — same contract as Static unknown endpoints."""
+        pd = rs.PartitionsDefinition.time_window(
+            start=datetime(2024, 1, 1),
+            interval_seconds=3600,
+            end=datetime(2024, 1, 2),
+            fmt="%Y-%m-%dT%H:%M:%S",
+        )
+
+        @rs.Asset(partitions_def=pd)
+        def asset(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+        with pytest.raises(
+            ExecutionError,
+            match=re.escape(
+                "Range endpoint '2024-01-01T07:30:00' is not a partition key"
+            ),
+        ):
+            repo.backfill(
+                selection=["asset"],
+                partition_range=rs.PartitionKeyRange.single(
+                    from_key="2024-01-01T07:30:00", to_key="2024-01-01T10:00:00"
+                ),
+            )
+
     def test_custom_fmt_range_resolves_chronologically(self):
         # %m/%d/%Y sorts "01/02/2025" before "12/30/2024" lexicographically —
         # the range must follow the calendar instead.
