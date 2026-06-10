@@ -224,6 +224,7 @@ async fn submit_button_label_reflects_partition_count_under_multi_picker() {
                 },
             ],
             asset_key: None,
+            truncated: false,
         },
     );
     flush_effects().await;

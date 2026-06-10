@@ -371,9 +371,13 @@ pub enum JobPartitionPicker {
     /// `asset_key` is `Some` only for a single-Multi-asset job, enabling
     /// per-dimension paging; `None` (several Multi assets) keeps the intersected
     /// windows inline — same cross-asset guard as `SingleDimPaged`.
+    /// `truncated` is set when an inline dimension window was bounded, i.e.
+    /// shared keys beyond the windows exist but can't be shown (paged
+    /// dimensions are exempt — paging exposes every key on demand).
     Multi {
         dimensions: Vec<crate::types::PartitionDimensionInfo>,
         asset_key: Option<String>,
+        truncated: bool,
     },
 }
 
@@ -445,9 +449,22 @@ pub fn partition_picker_for_assets(
             })
             .flatten()
             .cloned();
+        // Intersecting bounded dimension windows can only see the shared keys
+        // inside them — surface that so the dialog doesn't present the lists
+        // as exhaustive. A dimension that pages (single Multi asset with a
+        // bounded window) exposes every key on demand and doesn't count.
+        let truncated = defs.iter().any(|d| {
+            d.dimensions.iter().any(|dim| {
+                let bounded =
+                    dim.keys_truncated || dim.total_count as usize > dim.keys.len();
+                let paged = asset_key.is_some() && dim.keys_truncated;
+                bounded && !paged
+            })
+        });
         return JobPartitionPicker::Multi {
             dimensions: dims,
             asset_key,
+            truncated,
         };
     }
     // Only when every partitioned asset shares one Dynamic namespace — a mixed
@@ -996,6 +1013,57 @@ mod tests {
         };
         assert_eq!(dimensions[0].keys, vec!["g", "b"]);
         assert_eq!(dimensions[1].keys, vec!["m"]);
+    }
+
+    #[test]
+    fn picker_multi_inline_windows_surface_truncation() {
+        // Several Multi assets — windows stay inline (no paging), so a
+        // bounded dimension window on either asset must flag the picker:
+        // shared keys beyond the windows exist but can't be shown.
+        let mut a = make_multi("a", &[("color", &["r", "g"]), ("size", &["s", "m"])]);
+        if let Some(pd) = a.partition_def.as_mut() {
+            pd.dimensions[1].keys_truncated = true;
+            pd.dimensions[1].total_count = 5000;
+        }
+        let b = make_multi("b", &[("color", &["r", "g"]), ("size", &["s", "m"])]);
+        let infos = make_map(vec![a, b]);
+        let picker = picker(&["a", "b"], &infos);
+        let JobPartitionPicker::Multi { truncated, asset_key, .. } = picker else {
+            panic!("expected Multi, got {picker:?}");
+        };
+        assert_eq!(asset_key, None);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn picker_multi_paged_dimension_is_not_flagged_truncated() {
+        // Single Multi asset — a bounded dimension pages on demand instead,
+        // so the picker must not warn about hidden keys.
+        let mut m = make_multi("m", &[("color", &["r", "g"]), ("size", &["s", "m"])]);
+        if let Some(pd) = m.partition_def.as_mut() {
+            pd.dimensions[1].keys_truncated = true;
+            pd.dimensions[1].total_count = 5000;
+        }
+        let infos = make_map(vec![m]);
+        let picker = picker(&["m"], &infos);
+        let JobPartitionPicker::Multi { truncated, asset_key, .. } = picker else {
+            panic!("expected Multi, got {picker:?}");
+        };
+        assert_eq!(asset_key.as_deref(), Some("m"));
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn picker_multi_unbounded_windows_not_truncated() {
+        let infos = make_map(vec![
+            make_multi("a", &[("color", &["r", "g"]), ("size", &["s", "m"])]),
+            make_multi("b", &[("color", &["r", "g"]), ("size", &["s", "m"])]),
+        ]);
+        let picker = picker(&["a", "b"], &infos);
+        let JobPartitionPicker::Multi { truncated, .. } = picker else {
+            panic!("expected Multi, got {picker:?}");
+        };
+        assert!(!truncated);
     }
 
     #[test]

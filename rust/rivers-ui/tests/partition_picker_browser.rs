@@ -49,6 +49,7 @@ fn multi_picker(dims: &[(&str, &[&str])]) -> JobPartitionPicker {
             })
             .collect(),
         asset_key: None,
+        truncated: false,
     }
 }
 

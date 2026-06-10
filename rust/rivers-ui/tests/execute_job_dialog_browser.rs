@@ -142,6 +142,7 @@ async fn submit_with_empty_multi_selection_shows_multi_dim_error() {
                 },
             ],
             asset_key: None,
+            truncated: false,
         },
     );
     flush_effects().await;
@@ -204,6 +205,7 @@ async fn run_count_label_reflects_cartesian_product_size() {
                 },
             ],
             asset_key: None,
+            truncated: false,
         },
     );
     flush_effects().await;

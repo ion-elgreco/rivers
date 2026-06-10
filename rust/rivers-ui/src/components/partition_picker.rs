@@ -168,12 +168,20 @@ pub fn PartitionPicker(
                 </div>
             }
             .into_any(),
-            JobPartitionPicker::Multi { dimensions, asset_key } => view! {
+            JobPartitionPicker::Multi { dimensions, asset_key, truncated } => view! {
                 <div class="form-group">
                     <label>"Partitions"</label>
                     <div class="exec-dialog-partition-hint">
                         "Pick at least one value per dimension. The cartesian product fires one run each."
                     </div>
+                    {truncated
+                        .then(|| {
+                            view! {
+                                <p class="exec-dialog-partition-hint">
+                                    "Dimension key lists were truncated — only shared keys from the first window are shown."
+                                </p>
+                            }
+                        })}
                     {dimensions.into_iter().map(|dim| {
                         let dim_name = dim.name.clone();
                         // Page a dimension only for a single Multi asset whose
@@ -1087,6 +1095,7 @@ mod tests {
         let picker = JobPartitionPicker::Multi {
             dimensions: vec![dim("color", &["r", "g"]), dim("size", &["s", "m"])],
             asset_key: None,
+            truncated: false,
         };
         let selected = Vec::new();
         let mut multi = HashMap::new();
@@ -1107,6 +1116,7 @@ mod tests {
         let picker = JobPartitionPicker::Multi {
             dimensions: vec![dim("color", &["r"]), dim("size", &["s", "m"])],
             asset_key: None,
+            truncated: false,
         };
         let selected = Vec::new();
         let mut multi = HashMap::new();
