@@ -963,7 +963,7 @@ mod conversions {
                 event_type: e.event_type.into(),
                 asset_key: e.asset_key,
                 run_id: e.run_id,
-                partition_key: e.partition_key.map(|pk| format!("{:?}", pk)),
+                partition_key: e.partition_key.map(partition_key_to_display),
                 timestamp: e.timestamp,
                 metadata: e
                     .metadata
@@ -1237,6 +1237,36 @@ mod conversions {
                 launched_by: rivers_core::storage::LaunchedBy::Manual,
             };
             let ui: RunRecord = core.into();
+            assert_eq!(
+                ui.partition_key.as_deref(),
+                Some("date=2024-01-01|region=us")
+            );
+        }
+
+        /// Event partition labels must use the same canonical `dim=v|dim=v`
+        /// encoding as everywhere else — `{:?}` leaks the Rust enum shape
+        /// (`Multi { dims: [...] }`) into the UI.
+        #[test]
+        fn stored_event_partition_key_uses_canonical_display() {
+            let core = rivers_core::storage::StoredEvent {
+                id: rivers_core::surrealdb::types::RecordId::new("events", "e1"),
+                event_type: rivers_core::storage::EventType::Materialization {
+                    data_version: None,
+                },
+                asset_key: Some("orders".into()),
+                run_id: "r1".into(),
+                partition_key: Some(rivers_core::storage::PartitionKey::Multi {
+                    dims: vec![
+                        ("region".into(), vec!["us".into()]),
+                        ("date".into(), vec!["2024-01-01".into()]),
+                    ],
+                }),
+                timestamp: 0,
+                metadata: vec![],
+                code_version: None,
+                input_data_versions: vec![],
+            };
+            let ui: StoredEvent = core.into();
             assert_eq!(
                 ui.partition_key.as_deref(),
                 Some("date=2024-01-01|region=us")

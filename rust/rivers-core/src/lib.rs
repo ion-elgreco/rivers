@@ -13,6 +13,10 @@ pub mod task;
 pub mod timegrid;
 pub mod util;
 
+// Storage record ids are `surrealdb::types::RecordId`; re-export the crate so
+// dependents can construct records without pinning the git dependency themselves.
+pub use surrealdb;
+
 pub const GRAPH_TOPOLOGY_KEY_PREFIX: &str = "graph_topology:";
 
 /// KV key for serialized graph topology — per-CL so the UI doesn't render
