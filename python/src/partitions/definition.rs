@@ -941,7 +941,6 @@ fn parse_cron(expr: &str) -> PyResult<Cron> {
         })
 }
 
-
 /// Check if all key strings fall on valid time window boundaries within [start, end).
 fn validate_time_window_key(
     key: &[String],

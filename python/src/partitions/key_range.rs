@@ -81,7 +81,9 @@ pub(crate) fn validate_single_dim_range(
         PartitionsDefinition::TimeWindow { fmt, .. } => {
             let parse = |k: &str| {
                 parse_key_datetime(k, fmt).map_err(|_| {
-                    format!("Range endpoint '{k}' does not match the partition format '{fmt}'{suffix}")
+                    format!(
+                        "Range endpoint '{k}' does not match the partition format '{fmt}'{suffix}"
+                    )
                 })
             };
             let from_dt = parse(from_key)?;

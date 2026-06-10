@@ -1250,9 +1250,7 @@ mod conversions {
         fn stored_event_partition_key_uses_canonical_display() {
             let core = rivers_core::storage::StoredEvent {
                 id: rivers_core::surrealdb::types::RecordId::new("events", "e1"),
-                event_type: rivers_core::storage::EventType::Materialization {
-                    data_version: None,
-                },
+                event_type: rivers_core::storage::EventType::Materialization { data_version: None },
                 asset_key: Some("orders".into()),
                 run_id: "r1".into(),
                 partition_key: Some(rivers_core::storage::PartitionKey::Multi {

@@ -2396,8 +2396,7 @@ def test_forkeys_range_inverted_rejected():
     with pytest.raises(
         PartitionValidationError,
         match=re.escape(
-            "Asset 'downstream' depends on 'upstream': "
-            "from_key 'c' is after to_key 'a'"
+            "Asset 'downstream' depends on 'upstream': from_key 'c' is after to_key 'a'"
         ),
     ):
         make_repo([upstream, downstream])

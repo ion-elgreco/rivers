@@ -824,9 +824,7 @@ class TestPerDimensionValidation:
         ):
             repo.backfill(
                 selection=["asset"],
-                partition_keys=[
-                    rs.PartitionKey.multi({"region": "us", "date": "d1"})
-                ],
+                partition_keys=[rs.PartitionKey.multi({"region": "us", "date": "d1"})],
                 strategy=rs.BackfillStrategy.per_dimension(
                     multi_run=["reigon"], single_run=["date"]
                 ),
@@ -840,9 +838,7 @@ class TestPerDimensionValidation:
         ):
             repo.backfill(
                 selection=["asset"],
-                partition_keys=[
-                    rs.PartitionKey.multi({"region": "us", "date": "d1"})
-                ],
+                partition_keys=[rs.PartitionKey.multi({"region": "us", "date": "d1"})],
                 strategy=rs.BackfillStrategy.per_dimension(
                     multi_run=["region"], single_run=["daet"]
                 ),
@@ -872,9 +868,7 @@ class TestPerDimensionValidation:
         ):
             repo.backfill(
                 selection=["asset"],
-                partition_keys=[
-                    rs.PartitionKey.multi({"region": "us", "date": "d1"})
-                ],
+                partition_keys=[rs.PartitionKey.multi({"region": "us", "date": "d1"})],
                 strategy=rs.BackfillStrategy.per_dimension(
                     multi_run=["reigon"], single_run=["date"]
                 ),

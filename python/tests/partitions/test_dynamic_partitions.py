@@ -358,9 +358,7 @@ def test_dynamic_materialize_unregistered_key_raises(storage):
             'it with add_dynamic_partitions("tenants", [...]) first.'
         ),
     ):
-        repo.materialize(
-            ["tenant_data"], partition_key=rs.PartitionKey.single("acmme")
-        )
+        repo.materialize(["tenant_data"], partition_key=rs.PartitionKey.single("acmme"))
 
     # No run/materialization recorded for the rejected key.
     assert storage.get_materialized_partitions("tenant_data") == []

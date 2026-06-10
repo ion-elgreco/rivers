@@ -463,9 +463,7 @@ def test_backfill_keys_on_unpartitioned_selection_rejected():
 
     repo = rs.CodeRepository(assets=[plain], default_executor=rs.Executor.in_process())
     with pytest.raises(ExecutionError) as exc:
-        repo.backfill(
-            selection=["plain"], partition_keys=[rs.PartitionKey.single("a")]
-        )
+        repo.backfill(selection=["plain"], partition_keys=[rs.PartitionKey.single("a")])
     assert str(exc.value) == UNPARTITIONED_BACKFILL_MSG
     assert repo.storage.get_runs(limit=10) == []
 
@@ -499,7 +497,10 @@ def test_backfill_invalid_explicit_key_raises():
     with pytest.raises(ExecutionError) as exc:
         repo.backfill(
             selection=["part"],
-            partition_keys=[rs.PartitionKey.single("a"), rs.PartitionKey.single("nope")],
+            partition_keys=[
+                rs.PartitionKey.single("a"),
+                rs.PartitionKey.single("nope"),
+            ],
         )
     assert str(exc.value) == INVALID_BACKFILL_NOPE_MSG
 

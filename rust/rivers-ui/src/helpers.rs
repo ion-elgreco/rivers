@@ -455,8 +455,7 @@ pub fn partition_picker_for_assets(
         // bounded window) exposes every key on demand and doesn't count.
         let truncated = defs.iter().any(|d| {
             d.dimensions.iter().any(|dim| {
-                let bounded =
-                    dim.keys_truncated || dim.total_count as usize > dim.keys.len();
+                let bounded = dim.keys_truncated || dim.total_count as usize > dim.keys.len();
                 let paged = asset_key.is_some() && dim.keys_truncated;
                 bounded && !paged
             })
@@ -1028,7 +1027,12 @@ mod tests {
         let b = make_multi("b", &[("color", &["r", "g"]), ("size", &["s", "m"])]);
         let infos = make_map(vec![a, b]);
         let picker = picker(&["a", "b"], &infos);
-        let JobPartitionPicker::Multi { truncated, asset_key, .. } = picker else {
+        let JobPartitionPicker::Multi {
+            truncated,
+            asset_key,
+            ..
+        } = picker
+        else {
             panic!("expected Multi, got {picker:?}");
         };
         assert_eq!(asset_key, None);
@@ -1046,7 +1050,12 @@ mod tests {
         }
         let infos = make_map(vec![m]);
         let picker = picker(&["m"], &infos);
-        let JobPartitionPicker::Multi { truncated, asset_key, .. } = picker else {
+        let JobPartitionPicker::Multi {
+            truncated,
+            asset_key,
+            ..
+        } = picker
+        else {
             panic!("expected Multi, got {picker:?}");
         };
         assert_eq!(asset_key.as_deref(), Some("m"));

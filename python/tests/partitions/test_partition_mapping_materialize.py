@@ -687,10 +687,16 @@ def test_time_window_offset_off_grid_result_rejected():
     handler = TrackingHandler()
     fmt = "%Y-%m-%dT%H:%M:%S"
     six_hourly = rs.PartitionsDefinition.time_window(
-        start=datetime(2024, 1, 1), interval_seconds=21600, end=datetime(2024, 1, 3), fmt=fmt
+        start=datetime(2024, 1, 1),
+        interval_seconds=21600,
+        end=datetime(2024, 1, 3),
+        fmt=fmt,
     )
     hourly = rs.PartitionsDefinition.time_window(
-        start=datetime(2024, 1, 1), interval_seconds=3600, end=datetime(2024, 1, 3), fmt=fmt
+        start=datetime(2024, 1, 1),
+        interval_seconds=3600,
+        end=datetime(2024, 1, 3),
+        fmt=fmt,
     )
 
     @rs.Asset(partitions_def=six_hourly, io_handler=handler)

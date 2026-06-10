@@ -171,7 +171,10 @@ fn mapping_to_kind(
                     });
                     (
                         up_dim.clone(),
-                        (down_dim.clone(), Box::new(mapping_to_kind(per_dim, dim_def))),
+                        (
+                            down_dim.clone(),
+                            Box::new(mapping_to_kind(per_dim, dim_def)),
+                        ),
                     )
                 })
                 .collect(),
@@ -207,9 +210,7 @@ fn extract_partition_mappings(
     let mut result = HashMap::new();
     if let Some(mappings) = node.partition_mapping() {
         for (upstream_name, mapping) in &mappings {
-            let upstream_def = node_map
-                .get(upstream_name)
-                .and_then(|n| n.partitions_def());
+            let upstream_def = node_map.get(upstream_name).and_then(|n| n.partitions_def());
             let kind = mapping_to_kind(mapping, upstream_def);
             result.insert((asset_name.to_string(), upstream_name.clone()), kind);
         }
