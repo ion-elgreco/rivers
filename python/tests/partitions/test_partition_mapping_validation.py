@@ -179,6 +179,117 @@ def test_time_window_mapping_upstream_not_time_window():
         make_repo([upstream, downstream])
 
 
+def _tw_edge(down_def, up_def):
+    """Upstream→downstream pair joined by time_window(offset=-1)."""
+
+    @rs.Asset(partitions_def=up_def)
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=down_def,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.time_window(offset=-1),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream
+
+    return [upstream, downstream]
+
+
+def test_time_window_mapping_fmt_mismatch_rejected():
+    """Differing key formats: downstream keys can't reliably parse under the
+    upstream fmt — the eval path would silently drop them."""
+    down = rs.PartitionsDefinition.daily(start=DAILY_START)
+    up = rs.PartitionsDefinition.daily(start=DAILY_START, fmt="%d/%m/%Y")
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': time_window mapping "
+            "requires matching key formats: downstream fmt '%Y-%m-%d' != "
+            "upstream fmt '%d/%m/%Y'"
+        ),
+    ):
+        make_repo(_tw_edge(down, up))
+
+
+def test_time_window_mapping_phase_mismatch_rejected():
+    """Same interval but offset starts: every downstream key is off the
+    upstream grid even though the cadences match."""
+    fmt = "%Y-%m-%dT%H:%M:%S"
+    up = rs.PartitionsDefinition.time_window(
+        start=datetime(2024, 1, 1), interval_seconds=3600, fmt=fmt
+    )
+    down = rs.PartitionsDefinition.time_window(
+        start=datetime(2024, 1, 1, 0, 30), interval_seconds=3600, fmt=fmt
+    )
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': time_window mapping "
+            "requires the downstream grid to be a subgrid of the upstream "
+            "grid: downstream start 2024-01-01 00:30:00 is not aligned to "
+            "the upstream grid (start 2024-01-01 00:00:00, interval 3600s)"
+        ),
+    ):
+        make_repo(_tw_edge(down, up))
+
+
+def test_time_window_mapping_mixed_grid_kinds_rejected():
+    """One cron grid, one interval grid: subgrid alignment can't be proven."""
+    fmt = "%Y-%m-%d"
+    up = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, cron_schedule="0 0 * * *", fmt=fmt
+    )
+    down = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, interval_seconds=86400, fmt=fmt
+    )
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': time_window mapping "
+            "requires both definitions on the same grid kind "
+            "(both cron or both interval)"
+        ),
+    ):
+        make_repo(_tw_edge(down, up))
+
+
+def test_time_window_mapping_differing_cron_rejected():
+    fmt = "%Y-%m-%dT%H:00"
+    up = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, cron_schedule="0 0 * * *", fmt=fmt
+    )
+    down = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, cron_schedule="0 6 * * *", fmt=fmt
+    )
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': time_window mapping "
+            "requires identical cron schedules: downstream '0 6 * * *' != "
+            "upstream '0 0 * * *'"
+        ),
+    ):
+        make_repo(_tw_edge(down, up))
+
+
+def test_time_window_mapping_differing_ranges_allowed():
+    """Same grid with different start/end ranges is fine — range edges are a
+    per-key concern, not an edge-validity one."""
+    up = rs.PartitionsDefinition.daily(
+        start=datetime(2024, 1, 1), end=datetime(2024, 12, 31)
+    )
+    down = rs.PartitionsDefinition.daily(
+        start=datetime(2024, 2, 1), end=datetime(2024, 6, 30)
+    )
+    assert make_repo(_tw_edge(down, up)) is not None
+
+
 # ---------------------------------------------------------------------------
 # Both partitioned — Static mapping
 # ---------------------------------------------------------------------------

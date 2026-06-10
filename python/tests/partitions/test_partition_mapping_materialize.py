@@ -1,10 +1,12 @@
 """Tests for partition mapping key transformation during materialization."""
 
+import re
 from datetime import datetime
 
 import pytest
 
 import rivers as rs
+from rivers.exceptions import PartitionValidationError
 
 from _helpers import TrackingHandler, make_repo
 
@@ -680,11 +682,10 @@ def test_time_window_offset_zero_is_identity():
     ]
 
 
-def test_time_window_offset_off_grid_result_rejected():
-    """A shifted key that parses under the upstream fmt but isn't on the
-    upstream grid (cross-cadence mapping) must error precisely instead of
-    silently loading a partition that doesn't exist."""
-    handler = TrackingHandler()
+def test_time_window_finer_downstream_rejected_at_resolve():
+    """An hourly downstream over a six-hourly upstream: most downstream keys
+    shift off the upstream grid, so the edge is a misconfiguration — rejected
+    at resolve time instead of failing per-partition at runtime."""
     fmt = "%Y-%m-%dT%H:%M:%S"
     six_hourly = rs.PartitionsDefinition.time_window(
         start=datetime(2024, 1, 1),
@@ -699,12 +700,59 @@ def test_time_window_offset_off_grid_result_rejected():
         fmt=fmt,
     )
 
-    @rs.Asset(partitions_def=six_hourly, io_handler=handler)
+    @rs.Asset(partitions_def=six_hourly)
     def upstream(context: rs.AssetExecutionContext) -> int:
         return 1
 
     @rs.Asset(
         partitions_def=hourly,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.time_window(offset=-1),
+            )
+        ],
+    )
+    def downstream(upstream: int) -> int:
+        return upstream
+
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': time_window mapping "
+            "requires the downstream grid to be a subgrid of the upstream "
+            "grid: downstream interval 3600s is not a multiple of upstream "
+            "interval 21600s"
+        ),
+    ):
+        make_repo([upstream, downstream])
+
+
+def test_time_window_offset_coarser_downstream_loads_shifted():
+    """A six-hourly downstream over an hourly upstream is a true subgrid —
+    every downstream key is an upstream tick, and the offset shifts on the
+    upstream (hourly) grid."""
+    handler = TrackingHandler()
+    fmt = "%Y-%m-%dT%H:%M:%S"
+    hourly = rs.PartitionsDefinition.time_window(
+        start=datetime(2024, 1, 1),
+        interval_seconds=3600,
+        end=datetime(2024, 1, 3),
+        fmt=fmt,
+    )
+    six_hourly = rs.PartitionsDefinition.time_window(
+        start=datetime(2024, 1, 1),
+        interval_seconds=21600,
+        end=datetime(2024, 1, 3),
+        fmt=fmt,
+    )
+
+    @rs.Asset(partitions_def=hourly, io_handler=handler)
+    def upstream(context: rs.AssetExecutionContext) -> int:
+        return 1
+
+    @rs.Asset(
+        partitions_def=six_hourly,
         io_handler=handler,
         deps=[
             rs.AssetDef.input(
@@ -717,19 +765,8 @@ def test_time_window_offset_off_grid_result_rejected():
         return upstream
 
     repo = make_repo([upstream, downstream])
-    # 07:00 - 1h = 06:00? No: the offset shifts on the UPSTREAM grid only for
-    # cron; for intervals it shifts by the upstream interval: 07:00 - 6h =
-    # 01:00, which is not a 6-hourly window start.
-    result = repo.materialize(
-        ["downstream"],
-        partition_key=rs.PartitionKey.single("2024-01-01T07:00:00"),
-        raise_on_error=False,
-    )
-    assert not result.success
-
-    # An aligned downstream key shifts to a real upstream window and loads.
     repo.materialize(
-        ["upstream"], partition_key=rs.PartitionKey.single("2024-01-01T06:00:00")
+        ["upstream"], partition_key=rs.PartitionKey.single("2024-01-01T11:00:00")
     )
     handler.load_input_partitions.clear()
     result = repo.materialize(
@@ -738,7 +775,7 @@ def test_time_window_offset_off_grid_result_rejected():
     )
     assert result.success
     assert [p.key for p in handler.load_input_partitions] == [
-        rs.PartitionKey.single("2024-01-01T06:00:00")
+        rs.PartitionKey.single("2024-01-01T11:00:00")
     ]
 
 
