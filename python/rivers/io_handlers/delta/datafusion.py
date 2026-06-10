@@ -9,7 +9,7 @@ from arro3.core import RecordBatchReader
 from datafusion import DataFrame, SessionContext
 from deltalake import DeltaTable
 
-from rivers.io_handlers.delta.base import DeltaTypeHandler
+from rivers.io_handlers.delta.base import ArrowDeltaTypeHandler
 
 
 def _stream_pyarrow_batches(df: DataFrame) -> Iterator[pa.RecordBatch]:
@@ -18,7 +18,7 @@ def _stream_pyarrow_batches(df: DataFrame) -> Iterator[pa.RecordBatch]:
         yield batch.to_pyarrow()
 
 
-class DataFusionTypeHandler(DeltaTypeHandler[DataFrame]):
+class DataFusionTypeHandler(ArrowDeltaTypeHandler[DataFrame]):
     """Handles datafusion ``DataFrame`` for Delta Lake IO."""
 
     @property

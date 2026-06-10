@@ -9,17 +9,20 @@ or ``polars`` to be installed. Type-specific conversion is delegated to
 from __future__ import annotations
 
 import json
-import time
-from typing import Any, Literal
+from typing import Any
 
-from deltalake import CommitProperties, DeltaTable, WriterProperties, write_deltalake
+from deltalake import CommitProperties, DeltaTable, WriterProperties
 from deltalake.exceptions import TableNotFoundError
 from pydantic_settings import SettingsConfigDict
-from pyspark.sql.dataframe import DataFrame as SparkDataFrame
 
 from rivers._core import InputContext, OutputContext
 from rivers.io_handlers.base import BaseIOHandler
-from rivers.io_handlers.delta.base import DeltaTypeHandler
+from rivers.io_handlers.delta.base import (
+    DeltaSchemaMode,
+    DeltaTypeHandler,
+    DeltaWriteMode,
+    DeltaWriteRequest,
+)
 from rivers.io_handlers.delta.config import (
     MergeConfig,
     MergeOperationsConfig,
@@ -32,9 +35,7 @@ from rivers.io_handlers.delta.config import (
     WhenNotMatchedInsert,
     WhenNotMatchedInsertAll,
 )
-from rivers.io_handlers.delta.merge import _merge_execute
 from rivers.io_handlers.delta.predicate import _build_predicate, _resolve_partition_expr
-from rivers.io_handlers.delta.pyspark import write_delta_spark
 
 __all__: list[str] = [
     "DeltaIOHandler",
@@ -77,7 +78,7 @@ def _build_type_handler_map() -> dict[type, DeltaTypeHandler]:
         ("rivers.io_handlers.delta.polars", "PolarsTypeHandler"),
         ("rivers.io_handlers.delta.datafusion", "DataFusionTypeHandler"),
         ("rivers.io_handlers.delta.pandas", "PandasTypeHandler"),
-        ("rivers.io_handlers.delta.pyspark", "PySparkTypeHandler"),
+        ("rivers.io_handlers.delta.pyspark", "PySparkDeltaTypeHandler"),
     ]:
         try:
             mod = __import__(mod_path, fromlist=[cls_name])
@@ -87,12 +88,6 @@ def _build_type_handler_map() -> dict[type, DeltaTypeHandler]:
         except ImportError:
             pass
     return handlers
-
-
-DeltaWriteMode = Literal[
-    "overwrite", "append", "error", "ignore", "merge", "create_or_replace"
-]
-DeltaSchemaMode = Literal["overwrite", "merge"]
 
 
 class DeltaIOHandler(BaseIOHandler):
@@ -160,6 +155,64 @@ class DeltaIOHandler(BaseIOHandler):
         """Compose the table URI used for ``asset_name``."""
         return f"{self.table_uri}/{asset_name}"
 
+    def _resolve_write_request(self, context: OutputContext) -> DeltaWriteRequest:
+        """Resolves the write request to be used for writing to the Delta table."""
+
+        meta = context.asset_metadata or {}
+        delta_write_mode: DeltaWriteMode = meta.get("delta/mode", self.mode)  # type: ignore[assignment]
+        schema_mode: DeltaSchemaMode | None = meta.get(
+            "delta/schema_mode", self.schema_mode
+        )  # type: ignore[assignment]
+        partition_expr = _resolve_partition_expr(meta)
+        partition_by = (
+            partition_expr.partition_columns
+            if partition_expr and context.partition
+            else None
+        )
+        table_name = meta.get("delta/root_name", context.asset_name)
+        table_uri = self._asset_uri(table_name)
+        merge_predicate_override = meta.get("delta/merge_predicate")
+        predicate: str | None = None
+        if context.partition is not None and delta_write_mode == "overwrite":
+            predicate = _build_predicate(context.partition, partition_expr)
+            try:
+                DeltaTable(table_uri, storage_options=self.storage_options)
+            except TableNotFoundError:
+                predicate = None
+
+        # Resolve table configuration (IO manager default + per-asset override)
+        table_cfg = dict(self.table_config) if self.table_config else {}
+        if "delta/table_configuration" in meta:
+            table_cfg.update(json.loads(meta["delta/table_configuration"]))
+        table_configuration = table_cfg or None
+
+        # Resolve writer/commit properties (per-asset override > handler default)
+        writer_properties = self.writer_properties
+        if "delta/writer_properties" in meta:
+            writer_properties = WriterProperties(
+                **json.loads(meta["delta/writer_properties"])
+            )
+        commit_properties = self.commit_properties
+        if "delta/commit_properties" in meta:
+            commit_properties = CommitProperties(
+                **json.loads(meta["delta/commit_properties"])
+            )
+
+        return DeltaWriteRequest(
+            table_uri=table_uri,
+            table_name=table_name,
+            delta_write_mode=delta_write_mode,
+            schema_mode=schema_mode,
+            predicate=predicate,
+            partition_by=partition_by,
+            table_configuration=table_configuration,
+            writer_properties=writer_properties,
+            commit_properties=commit_properties,
+            merge_config=self.merge_config,
+            merge_predicate_override=merge_predicate_override,
+            storage_options=self.storage_options,
+        )
+
     def handle_output(self, context: OutputContext, obj: object) -> None:
         """Write ``obj`` as a Delta commit and record table-level metadata.
 
@@ -170,139 +223,10 @@ class DeltaIOHandler(BaseIOHandler):
         executed via :func:`_merge_execute`. Always records ``delta/num_rows``,
         ``delta/size_bytes``, ``delta/version`` and the Arrow schema.
         """
-        meta = context.asset_metadata or {}
-        mode: DeltaWriteMode = meta.get("delta/mode", self.mode)  # type: ignore[assignment]
-        schema_mode: DeltaSchemaMode | None = meta.get(
-            "delta/schema_mode", self.schema_mode
-        )  # type: ignore[assignment]
-        partition_expr = _resolve_partition_expr(meta)
 
-        partition_by = (
-            partition_expr.partition_columns
-            if partition_expr and context.partition
-            else None
-        )
-        table_name = meta.get("delta/root_name", context.asset_name)
-        uri = self._asset_uri(table_name)
-
-        predicate: str | None = None
-        if context.partition is not None and mode == "overwrite":
-            predicate = _build_predicate(context.partition, partition_expr)
-            try:
-                DeltaTable(uri, storage_options=self.storage_options)
-            except TableNotFoundError:
-                predicate = None
-
+        request = self._resolve_write_request(context)
         handler = self._resolve_handler(type(obj))
-
-        # Resolve table configuration (IO manager default + per-asset override)
-        table_cfg = dict(self.table_config) if self.table_config else {}
-        if "delta/table_configuration" in meta:
-            table_cfg.update(json.loads(meta["delta/table_configuration"]))
-        table_configuration = table_cfg or None
-
-        # If obj is a spark dataframe we delegate the writing to delta-spark.
-        if isinstance(obj, SparkDataFrame):
-            return write_delta_spark(
-                context=context,
-                spark_df=obj,
-                delta_write_mode=mode,
-                meta=meta,
-                table_uri=uri,
-                predicate=predicate,
-                partition_by=partition_by,
-                schema_mode=schema_mode,
-                merge_config=self.merge_config,
-                table_config=table_configuration,
-            )
-
-        # Resolve writer/commit properties (per-asset override > handler default)
-        writer_properties = self.writer_properties
-        if "delta/writer_properties" in meta:
-            writer_properties = WriterProperties(
-                **json.loads(meta["delta/writer_properties"])
-            )
-
-        commit_properties = self.commit_properties
-        if "delta/commit_properties" in meta:
-            commit_properties = CommitProperties(
-                **json.loads(meta["delta/commit_properties"])
-            )
-
-        merge_stats: dict[str, Any] | None = None
-        start = time.monotonic()
-        data = handler.to_arrow(obj)
-        if mode == "merge":
-            merge_predicate_override = meta.get("delta/merge_predicate")
-            merge_stats = _merge_execute(
-                uri=uri,
-                data=data,
-                merge_config=self.merge_config,
-                partition_predicate=predicate,
-                merge_predicate_override=merge_predicate_override,
-                storage_options=self.storage_options,
-                writer_properties=writer_properties,
-                commit_properties=commit_properties,
-            )
-        elif mode == "create_or_replace":
-            DeltaTable.create(
-                table_uri=uri,
-                schema=data.schema,
-                mode="overwrite",
-                partition_by=partition_by,
-                configuration=table_configuration,
-                storage_options=self.storage_options,
-                commit_properties=commit_properties,
-            )
-            write_deltalake(
-                uri,
-                data,
-                mode="append",
-                storage_options=self.storage_options,
-                writer_properties=writer_properties,  # type: ignore[arg-type]
-                commit_properties=commit_properties,
-            )
-        else:
-            write_deltalake(
-                uri,
-                data,
-                mode=mode,  # type: ignore[arg-type]
-                schema_mode=schema_mode,
-                partition_by=partition_by,
-                predicate=predicate,
-                storage_options=self.storage_options,
-                configuration=table_configuration,
-                writer_properties=writer_properties,  # type: ignore[arg-type]
-                commit_properties=commit_properties,
-            )
-        duration = time.monotonic() - start
-
-        dt = DeltaTable(uri, storage_options=self.storage_options)
-        actions = dt.get_add_actions(flatten=True)
-        num_rows = sum(actions.column("num_records").to_pylist())
-        size_bytes = sum(actions.column("size_bytes").to_pylist())
-
-        # Build schema metadata from Delta table schema
-        import pyarrow as pa
-
-        from rivers import MetadataValue
-
-        arrow_schema = pa.schema(dt.schema().to_arrow())
-
-        output_meta: dict[str, Any] = {
-            "delta/table_uri": uri,
-            "delta/mode": mode,
-            "delta/num_rows": num_rows,
-            "delta/size_bytes": size_bytes,
-            "delta/write_duration_s": round(duration, 6),
-            "delta/version": dt.version(),
-            "rivers/schema": MetadataValue.schema(arrow_schema),
-        }
-        if merge_stats is not None:
-            output_meta["delta/num_output_rows"] = merge_stats.get("num_output_rows", 0)
-            output_meta["delta/merge_stats"] = json.dumps(merge_stats)
-
-        context.add_output_metadata(output_meta)
+        handler.handle_output(context=context, obj=obj, request=request)
 
     def load_input(self, context: InputContext) -> Any:
         """Read the upstream Delta table into the requested Python type.

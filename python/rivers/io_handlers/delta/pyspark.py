@@ -4,46 +4,18 @@ from __future__ import annotations
 
 import json
 import time
+import warnings
 from collections.abc import Sequence
 from typing import Any, Literal, get_args
 
-import pyarrow as pa
-from arro3.core import RecordBatchReader
 from delta import DeltaTable
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.types import (
-    BinaryType,
-    BooleanType,
-    ByteType,
-    DateType,
-    DecimalType,
-    DoubleType,
-    FloatType,
-    IntegerType,
-    LongType,
-    ShortType,
-    StringType,
-    TimestampType,
-)
+from pyspark.sql.pandas.types import to_arrow_schema
 
 from rivers._core import MetadataValue, OutputContext
+from rivers.io_handlers.delta import DeltaWriteRequest
 from rivers.io_handlers.delta.base import DeltaTypeHandler
-from rivers.io_handlers.delta.config import MergeConfig
 from rivers.io_handlers.delta.merge import _merge_execute_spark
-
-# Mapping between Arrow and Spark types.
-_SPARK_TO_ARROW_MAP = {
-    LongType: lambda _: pa.int64(),
-    IntegerType: lambda _: pa.int32(),
-    ShortType: lambda _: pa.int16(),
-    ByteType: lambda _: pa.int8(),
-    DoubleType: lambda _: pa.float64(),
-    FloatType: lambda _: pa.float32(),
-    BooleanType: lambda _: pa.bool_(),
-    StringType: lambda _: pa.string(),
-    BinaryType: lambda _: pa.binary(),
-    DateType: lambda _: pa.date32(),
-}
 
 SparkWriteMode = Literal["overwrite", "append", "error", "ignore"]
 
@@ -54,22 +26,6 @@ def _to_spark_write_mode(mode: str) -> str:
     if mode not in get_args(SparkWriteMode):
         raise ValueError(f"Spark does not support the write mode {mode}.")
     return mode
-
-
-def _spark_to_arrow_type(dt):
-    """Returns Arrow-equivalent of Spark type ``dt``."""
-
-    if isinstance(dt, DecimalType):
-        return pa.decimal128(dt.precision, dt.scale)
-
-    if isinstance(dt, TimestampType):
-        return pa.timestamp("us")
-
-    for spark_type, fn in _SPARK_TO_ARROW_MAP.items():
-        if isinstance(dt, spark_type):
-            return fn(dt)
-
-    raise TypeError(f"Unsupported Spark type: {dt}")
 
 
 def _get_or_create_spark(spark: SparkSession | None = None) -> SparkSession:
@@ -88,7 +44,7 @@ def _get_or_create_spark(spark: SparkSession | None = None) -> SparkSession:
         ImportError: When no active session exists and ``delta-spark`` is not
             installed.  Install the extra ``pip install rivers[delta-pyspark]``
             and start a session before calling the handler, or pass one
-            explicitly via ``PySparkTypeHandler(spark=...)``.
+            explicitly via ``PySparkDeltaTypeHandler(spark=...)``.
     """
     if spark is not None:
         return spark
@@ -119,88 +75,11 @@ def _get_or_create_spark(spark: SparkSession | None = None) -> SparkSession:
             "Either start and configure a SparkSession before using this handler, "
             "or install the required extra: pip install rivers[delta-pyspark]. "
             "To pass a pre-built session explicitly, construct the handler as "
-            "PySparkTypeHandler(spark=my_session)."
+            "PySparkDeltaTypeHandler(spark=my_session)."
         ) from exc
 
 
-def write_delta_spark(
-    context: OutputContext,
-    spark_df: DataFrame,
-    delta_write_mode: str,
-    meta: dict[str, str],
-    table_uri: str,
-    predicate: str | None,
-    partition_by: list[str] | None,
-    schema_mode: str | None,
-    merge_config: MergeConfig | None,
-    table_config: dict[str, str] | None,
-) -> None:
-    """Handles writes via spark session with delta-spark."""
-
-    start_time = time.monotonic()
-    spark = spark_df.sparkSession
-    merge_stats: dict[str, Any] | None = None
-
-    if delta_write_mode == "merge":
-        merge_predicate_override = meta.get("delta/merge_predicate")
-        merge_stats = _merge_execute_spark(
-            uri=table_uri,
-            sdf=spark_df,
-            merge_config=merge_config,
-            partition_predicate=predicate,
-            merge_predicate_override=merge_predicate_override,
-        )
-        num_rows = merge_stats.get("numOutputRows")
-        size_bytes = merge_stats.get("numOutputBytes")
-        version = merge_stats.get("version")
-    else:
-        spark_writer = spark_df.write.format("delta").mode(
-            _to_spark_write_mode(delta_write_mode)
-        )
-
-        if partition_by:
-            spark_writer = spark_writer.partitionBy(*partition_by)
-        if predicate and delta_write_mode == "overwrite":
-            spark_writer = spark_writer.option("replaceWhere", predicate)
-
-        if schema_mode == "merge":
-            spark_writer = spark_writer.option("mergeSchema", "true")
-        elif schema_mode == "overwrite":
-            spark_writer = spark_writer.option("overwriteSchema", "true")
-
-        if table_config:
-            for k, v in table_config.items():
-                spark_writer = spark_writer.option(k, v)
-
-        spark_writer.save(table_uri)
-
-        hist = DeltaTable.forPath(spark, table_uri).history(1).collect()[0]
-        metrics = hist.operationMetrics or {}
-        num_rows = metrics.get("numOutputRows")
-        size_bytes = metrics.get("numOutputBytes")
-        version = hist.version
-
-    duration = time.monotonic() - start_time
-    arrow_schema = pa.schema(
-        [pa.field(f.name, _spark_to_arrow_type(f.dataType)) for f in spark_df.schema]
-    )
-    output_meta: dict[str, Any] = {
-        "delta/table_uri": table_uri,
-        "delta/mode": delta_write_mode,
-        "delta/num_rows": int(num_rows) if num_rows is not None else None,
-        "delta/size_bytes": int(size_bytes) if size_bytes is not None else None,
-        "delta/write_duration_s": round(duration, 6),
-        "delta/version": version,
-        "rivers/schema": MetadataValue.schema(arrow_schema),
-    }
-    if merge_stats is not None:
-        output_meta["delta/num_output_rows"] = merge_stats.get("numOutputRows", 0)
-        output_meta["delta/merge_stats"] = json.dumps(merge_stats)
-
-    context.add_output_metadata(output_meta)
-
-
-class PySparkTypeHandler(DeltaTypeHandler[DataFrame]):
+class PySparkDeltaTypeHandler(DeltaTypeHandler[DataFrame]):
     """Handles PySpark ``DataFrame`` for Delta Lake IO.
 
     Some notes for Production use:
@@ -226,6 +105,12 @@ class PySparkTypeHandler(DeltaTypeHandler[DataFrame]):
                 :func:`_get_or_create_spark`.
         """
         self._spark = spark
+        self._reader_ignored_fields = ["storage_options"]
+        self._writer_ignored_fields = [
+            "commit_properties",
+            "writer_properties",
+            "storage_options",
+        ]
 
     def _get_spark(self) -> SparkSession:
         """Resolve the :class:`~pyspark.sql.SparkSession` for this invocation."""
@@ -236,36 +121,25 @@ class PySparkTypeHandler(DeltaTypeHandler[DataFrame]):
         """PySpark types this handler accepts as asset outputs / inputs."""
         return [DataFrame]
 
-    def to_arrow(self, obj: DataFrame) -> RecordBatchReader:
-        """Convert a PySpark ``DataFrame`` to an arro3 ``RecordBatchReader``.
+    def _warn_ignored_fields(
+        self, ignored_fields: list[str], request: dict[str, Any] | DeltaWriteRequest
+    ):
+        """Logs a warning about ignored fields by reader or writer."""
 
-        Enables Arrow-optimised ``toPandas()`` via
-        ``spark.sql.execution.arrow.pyspark.enabled`` (or silently
-        falls back to non-Arrow path when the flag cannot be set, e.g.
-        when the SparkSession configuration is read only).  Resulting pandas
-        frame is converted to :class:`~pyarrow.Table` with
-        ``preserve_index=False`` and pandas ``RangeIndex`` is not written.
+        if isinstance(request, DeltaWriteRequest):
+            request = request.__dict__
 
-        Args:
-            obj: A :class:`~pyspark.sql.DataFrame` to serialise.
+        warn_fields = []
+        for field_name in ignored_fields:
+            if request.get(field_name):
+                warn_fields.append(field_name)
 
-        Returns:
-            An arro3 :class:`~arro3.core.RecordBatchReader` wrapping the
-            Arrow representation of obj, ready for ``write_deltalake``.
-        """
-        spark = obj.sparkSession
-        try:
-            spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
-        except Exception:  # noqa: BLE001
-            # Note: Some SparkSession configurations are immutable
-            # after session creation (e.g. remote or Spark Connect sessions).
-            # Fall back to the non-Arrow toPandas path - semantically identical,
-            # just slower for wide DataFrames.
-            pass
-
-        pandas_df = obj.toPandas()
-        table = pa.Table.from_pandas(pandas_df, preserve_index=False)
-        return RecordBatchReader.from_arrow(table)  # type: ignore[arg-type]
+        if warn_fields:
+            warnings.warn(
+                f"Values set in {', '.join(warn_fields)} will be ignored, "
+                "these are not supported by the PySpark handler.",
+                UserWarning,
+            )
 
     def load_input(
         self,
@@ -301,7 +175,9 @@ class PySparkTypeHandler(DeltaTypeHandler[DataFrame]):
                 credentials via ``SparkSession`` Hadoop conf instead.
             predicate: Optional SQL ``WHERE`` expression forwarded to
                 :meth:`~pyspark.sql.DataFrame.filter`.
-            target_type: Must be :class:`pyspark.sql.DataFrame`.
+            target_type: Must be :class:`pyspark.sql.DataFrame`. Unused on the
+                Spark read path; present for interface parity with other
+                :class:`DeltaTypeHandler` implementations.
             columns: Optional column-name list forwarded to
                 :meth:`~pyspark.sql.DataFrame.select`.
             version: Optional Delta table version for time-travel reads
@@ -312,6 +188,15 @@ class PySparkTypeHandler(DeltaTypeHandler[DataFrame]):
             deferred until an action (``.collect()``, ``.toPandas()``,
             ``.count()``, …) is triggered.
         """
+
+        self._warn_ignored_fields(
+            self._reader_ignored_fields,
+            {
+                "table_name": table_name,
+                "storage_options": storage_options,
+                "target_type": target_type,
+            },
+        )
         spark = self._get_spark()
         reader = spark.read.format("delta")
 
@@ -327,3 +212,75 @@ class PySparkTypeHandler(DeltaTypeHandler[DataFrame]):
             df = df.filter(predicate)
 
         return df
+
+    def handle_output(
+        self,
+        context: OutputContext,
+        obj: object,
+        request: DeltaWriteRequest,
+    ) -> None:
+        """Handles writes via spark session with delta-spark."""
+
+        self._warn_ignored_fields(self._writer_ignored_fields, request)
+
+        if not isinstance(obj, DataFrame):
+            raise TypeError("obj must be a Spark DataFrame.")
+
+        start_time = time.monotonic()
+        spark = obj.sparkSession
+        merge_stats: dict[str, Any] | None = None
+
+        if request.delta_write_mode == "merge":
+            merge_stats = _merge_execute_spark(
+                uri=request.table_uri,
+                sdf=obj,
+                merge_config=request.merge_config,
+                partition_predicate=request.predicate,
+                merge_predicate_override=request.merge_predicate_override,
+            )
+            num_rows = merge_stats.get("numOutputRows")
+            size_bytes = merge_stats.get("numOutputBytes")
+            version = merge_stats.get("version")
+        else:
+            spark_writer = obj.write.format("delta").mode(
+                _to_spark_write_mode(request.delta_write_mode)
+            )
+
+            if request.partition_by:
+                spark_writer = spark_writer.partitionBy(*request.partition_by)
+            if request.predicate and request.delta_write_mode == "overwrite":
+                spark_writer = spark_writer.option("replaceWhere", request.predicate)
+
+            if request.schema_mode == "merge":
+                spark_writer = spark_writer.option("mergeSchema", "true")
+            elif request.schema_mode == "overwrite":
+                spark_writer = spark_writer.option("overwriteSchema", "true")
+
+            if request.table_configuration:
+                for k, v in request.table_configuration.items():
+                    spark_writer = spark_writer.option(k, v)
+
+            spark_writer.save(request.table_uri)
+
+            hist = DeltaTable.forPath(spark, request.table_uri).history(1).collect()[0]
+            metrics = hist.operationMetrics or {}
+            num_rows = metrics.get("numOutputRows")
+            size_bytes = metrics.get("numOutputBytes")
+            version = hist.version
+
+        duration = time.monotonic() - start_time
+        arrow_schema = to_arrow_schema(obj.schema)
+        output_meta: dict[str, Any] = {
+            "delta/table_uri": request.table_uri,
+            "delta/mode": request.delta_write_mode,
+            "delta/num_rows": int(num_rows) if num_rows is not None else None,
+            "delta/size_bytes": int(size_bytes) if size_bytes is not None else None,
+            "delta/write_duration_s": round(duration, 6),
+            "delta/version": version,
+            "rivers/schema": MetadataValue.schema(arrow_schema),
+        }
+        if merge_stats is not None:
+            output_meta["delta/num_output_rows"] = merge_stats.get("numOutputRows", 0)
+            output_meta["delta/merge_stats"] = json.dumps(merge_stats)
+
+        context.add_output_metadata(output_meta)

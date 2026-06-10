@@ -9,12 +9,12 @@ import pyarrow as pa
 from arro3.core import RecordBatchReader
 from deltalake import DeltaTable, QueryBuilder
 
-from rivers.io_handlers.delta.base import DeltaTypeHandler
+from rivers.io_handlers.delta.base import ArrowDeltaTypeHandler
 
 ArrowTypes = Union[pa.Table, pa.RecordBatchReader]
 
 
-class PyArrowTypeHandler(DeltaTypeHandler[ArrowTypes]):
+class PyArrowTypeHandler(ArrowDeltaTypeHandler[ArrowTypes]):
     """Handles pyarrow types for Delta Lake IO."""
 
     @property

@@ -9,10 +9,10 @@ import pyarrow as pa
 from arro3.core import RecordBatchReader
 from deltalake import DeltaTable, QueryBuilder
 
-from rivers.io_handlers.delta.base import DeltaTypeHandler
+from rivers.io_handlers.delta.base import ArrowDeltaTypeHandler
 
 
-class PandasTypeHandler(DeltaTypeHandler[pd.DataFrame]):
+class PandasTypeHandler(ArrowDeltaTypeHandler[pd.DataFrame]):
     """Handles pandas ``DataFrame`` for Delta Lake IO."""
 
     @property

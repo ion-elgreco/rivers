@@ -9,12 +9,12 @@ import polars as pl
 from arro3.core import RecordBatchReader
 from polars_deltalake import scan_delta
 
-from rivers.io_handlers.delta.base import DeltaTypeHandler
+from rivers.io_handlers.delta.base import ArrowDeltaTypeHandler
 
 PolarsTypes = Union[pl.DataFrame, pl.LazyFrame]
 
 
-class PolarsTypeHandler(DeltaTypeHandler[PolarsTypes]):
+class PolarsTypeHandler(ArrowDeltaTypeHandler[PolarsTypes]):
     """Handles polars types for Delta Lake IO."""
 
     @property

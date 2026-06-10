@@ -1,6 +1,6 @@
 """PySpark type handler tests for the Delta Lake IO handler.
 
-Tests to check exercise code paths in PySparkTypeHandler and verify that
+Tests to check exercise code paths in PySparkDeltaTypeHandler and verify that
 PySpark DataFrames integrate correctly with the DeltaIOHandler pipeline.
 
 The spark fixture is module-scoped to create a single local SparkSession with
@@ -15,8 +15,20 @@ from unittest.mock import patch
 import pyarrow as pa
 import pytest
 import rivers as rs
+from deltalake import CommitProperties, WriterProperties
 from pyspark.sql import SparkSession
 from pyspark.sql.dataframe import DataFrame as SparkDataFrame
+from rivers.io_handlers.delta.config import (
+    MergeConfig,
+    MergeOperationsConfig,
+    WhenMatchedDelete,
+    WhenMatchedUpdate,
+    WhenMatchedUpdateAll,
+    WhenNotMatchedBySourceDelete,
+    WhenNotMatchedBySourceUpdate,
+    WhenNotMatchedInsert,
+    WhenNotMatchedInsertAll,
+)
 
 from .helpers import make_daily_partition, make_multi_partition, make_partition
 
@@ -28,7 +40,7 @@ def spark() -> SparkSession:  # type: ignore[return]
     Uses ``delta.configure_spark_with_delta_pip`` to ensure the
     ``DeltaSparkSessionExtension`` and ``DeltaCatalog`` are registered before
     any test reads or writes Delta tables.  Arrow-optimised ``toPandas()`` is
-    also enabled so that ``PySparkTypeHandler.to_arrow`` exercises the fast
+    also enabled so that ``PySparkDeltaTypeHandler.to_arrow`` exercises the fast
     path during tests.
     """
     pytest.importorskip(
@@ -440,8 +452,8 @@ def test_multi_partition_pyspark(tmp_path, spark):
 
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_pyspark_handler_with_explicit_spark(tmp_path, spark):
-    """PySparkTypeHandler accepts an explicit SparkSession at construction."""
-    from rivers.io_handlers.delta.pyspark import PySparkTypeHandler
+    """PySparkDeltaTypeHandler accepts an explicit SparkSession at construction."""
+    from rivers.io_handlers.delta.pyspark import PySparkDeltaTypeHandler
 
     handler = rs.DeltaIOHandler(table_uri=str(tmp_path))
 
@@ -450,7 +462,7 @@ def test_pyspark_handler_with_explicit_spark(tmp_path, spark):
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df)
 
     # Read via a handler whose type_handler map uses an explicit session
-    explicit_handler = PySparkTypeHandler(spark=spark)
+    explicit_handler = PySparkDeltaTypeHandler(spark=spark)
     result = explicit_handler.load_input(
         table_uri=str(tmp_path / "tbl"),
         table_name="tbl",
@@ -533,6 +545,373 @@ def test_schema_mode_merge_pyspark(tmp_path, spark):
     # All three rows should be present; first two rows have null in "b"
     assert result.count() == 3
     assert "b" in result.columns
+
+
+@pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
+def test_custom_merge_when_matched_update(tmp_path, spark):
+    """schema_mode='merge' with merge_type='custom' for PySpark writes."""
+    handler, _ = _make_handler(tmp_path)
+    df_base = _pyspark_df(
+        spark,
+        {
+            "id": [1, 2, 3, 4],
+            "val": ["a", "b", "c", "d"],
+            "flag": ["keep", "keep", "keep", "keep"],
+            "status": ["old", "old", "old", "old"],
+        },
+    )
+    handler.handle_output(rs.OutputContext(asset_name="tbl"), df_base)
+
+    # when_matched_update
+    handler = rs.DeltaIOHandler(
+        table_uri=str(tmp_path),
+        mode="merge",
+        merge_config=MergeConfig(
+            predicate="target.id = source.id",
+            merge_type="custom",
+            source_alias="source",
+            target_alias="target",
+            operations=MergeOperationsConfig(
+                when_matched_update=[
+                    WhenMatchedUpdate(
+                        predicate="target.id = 1",
+                        updates={"status": "'updated_partial'"},
+                    )
+                ],
+            ),
+        ),
+    )
+    handler.handle_output(
+        rs.OutputContext(asset_name="tbl"),
+        _pyspark_df(
+            spark, {"id": [1], "val": ["a_new"], "flag": ["keep"], "status": ["s1"]}
+        ),
+    )
+
+    ctx = rs.InputContext(
+        asset_name="tbl",
+        downstream_asset="x",
+        type_hint=SparkDataFrame,
+    )
+    df = handler.load_input(ctx)
+    rows = {r["id"]: r for r in df.collect()}
+
+    assert rows[1]["status"] == "updated_partial"
+
+
+@pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
+def test_custom_merge_when_matched_update_all(tmp_path, spark):
+    """schema_mode='merge' with merge_type='custom' for PySpark writes."""
+    handler, _ = _make_handler(tmp_path)
+    df_base = _pyspark_df(
+        spark,
+        {
+            "id": [1, 2, 3, 4],
+            "val": ["a", "b", "c", "d"],
+            "flag": ["keep", "keep", "keep", "keep"],
+            "status": ["old", "old", "old", "old"],
+        },
+    )
+    handler.handle_output(rs.OutputContext(asset_name="tbl"), df_base)
+
+    # when_matched_update_all with except_cols
+    handler = rs.DeltaIOHandler(
+        table_uri=str(tmp_path),
+        mode="merge",
+        merge_config=MergeConfig(
+            predicate="target.id = source.id",
+            merge_type="custom",
+            source_alias="source",
+            target_alias="target",
+            operations=MergeOperationsConfig(
+                when_matched_update_all=[
+                    WhenMatchedUpdateAll(
+                        predicate="target.id = 2",
+                        except_cols=["flag"],
+                    )
+                ],
+            ),
+        ),
+    )
+    handler.handle_output(
+        rs.OutputContext(asset_name="tbl"),
+        _pyspark_df(
+            spark,
+            {"id": [2], "val": ["b_new"], "flag": ["SHOULD_STAY"], "status": ["s2"]},
+        ),
+    )
+
+    ctx = rs.InputContext(
+        asset_name="tbl",
+        downstream_asset="x",
+        type_hint=SparkDataFrame,
+    )
+    df = handler.load_input(ctx)
+    rows = {r["id"]: r for r in df.collect()}
+
+    assert rows[2]["flag"] == "keep"
+    assert rows[2]["val"] == "b_new"
+
+
+@pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
+def test_custom_merge_when_matched_delete(tmp_path, spark):
+    """schema_mode='merge' with merge_type='custom' for PySpark writes."""
+    handler, _ = _make_handler(tmp_path)
+    df_base = _pyspark_df(
+        spark,
+        {
+            "id": [1, 2, 3, 4],
+            "val": ["a", "b", "c", "d"],
+            "flag": ["keep", "keep", "keep", "keep"],
+            "status": ["old", "old", "old", "old"],
+        },
+    )
+    handler.handle_output(rs.OutputContext(asset_name="tbl"), df_base)
+
+    # when_matched_delete
+    handler = rs.DeltaIOHandler(
+        table_uri=str(tmp_path),
+        mode="merge",
+        merge_config=MergeConfig(
+            predicate="target.id = source.id",
+            merge_type="custom",
+            source_alias="source",
+            target_alias="target",
+            operations=MergeOperationsConfig(
+                when_matched_delete=[
+                    WhenMatchedDelete(
+                        predicate="target.id = 3",
+                    )
+                ],
+            ),
+        ),
+    )
+    handler.handle_output(
+        rs.OutputContext(asset_name="tbl"),
+        _pyspark_df(
+            spark, {"id": [3], "val": ["c_new"], "flag": ["keep"], "status": ["s3"]}
+        ),
+    )
+
+    ctx = rs.InputContext(
+        asset_name="tbl",
+        downstream_asset="x",
+        type_hint=SparkDataFrame,
+    )
+    df = handler.load_input(ctx)
+    rows = {r["id"]: r for r in df.collect()}
+
+    assert 3 not in rows
+
+
+@pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
+def test_custom_merge_when_not_matched_insert(tmp_path, spark):
+    """schema_mode='merge' with merge_type='custom' for PySpark writes."""
+    handler, _ = _make_handler(tmp_path)
+    df_base = _pyspark_df(
+        spark,
+        {
+            "id": [1, 2, 3, 4],
+            "val": ["a", "b", "c", "d"],
+            "flag": ["keep", "keep", "keep", "keep"],
+            "status": ["old", "old", "old", "old"],
+        },
+    )
+    handler.handle_output(rs.OutputContext(asset_name="tbl"), df_base)
+
+    # when_not_matched_insert
+    handler = rs.DeltaIOHandler(
+        table_uri=str(tmp_path),
+        mode="merge",
+        merge_config=MergeConfig(
+            predicate="target.id = source.id",
+            merge_type="custom",
+            source_alias="source",
+            target_alias="target",
+            operations=MergeOperationsConfig(
+                when_not_matched_insert=[
+                    WhenNotMatchedInsert(
+                        predicate="source.id = 99",
+                        updates={
+                            "id": "'99'",
+                            "val": "'insert_single'",
+                            "flag": "'x'",
+                            "status": "'s99'",
+                        },
+                    )
+                ],
+            ),
+        ),
+    )
+    handler.handle_output(
+        rs.OutputContext(asset_name="tbl"),
+        _pyspark_df(spark, {"id": [99], "val": ["x"], "flag": ["x"], "status": ["x"]}),
+    )
+
+    ctx = rs.InputContext(
+        asset_name="tbl",
+        downstream_asset="x",
+        type_hint=SparkDataFrame,
+    )
+    df = handler.load_input(ctx)
+    rows = {r["id"]: r for r in df.collect()}
+
+    assert 99 in rows
+    assert 100 not in rows
+
+
+@pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
+def test_custom_merge_when_not_matched_insert_all(tmp_path, spark):
+    """schema_mode='merge' with merge_type='custom' for PySpark writes."""
+    handler, _ = _make_handler(tmp_path)
+    df_base = _pyspark_df(
+        spark,
+        {
+            "id": [1, 2, 3, 4],
+            "val": ["a", "b", "c", "d"],
+            "flag": ["keep", "keep", "keep", "keep"],
+            "status": ["old", "old", "old", "old"],
+        },
+    )
+    handler.handle_output(rs.OutputContext(asset_name="tbl"), df_base)
+
+    # when_not_matched_insert_all
+    handler = rs.DeltaIOHandler(
+        table_uri=str(tmp_path),
+        mode="merge",
+        merge_config=MergeConfig(
+            predicate="target.id = source.id",
+            merge_type="custom",
+            source_alias="source",
+            target_alias="target",
+            operations=MergeOperationsConfig(
+                when_not_matched_insert_all=[
+                    WhenNotMatchedInsertAll(
+                        predicate="source.id = 10",
+                    )
+                ],
+            ),
+        ),
+    )
+    handler.handle_output(
+        rs.OutputContext(asset_name="tbl"),
+        _pyspark_df(
+            spark, {"id": [10], "val": ["z_new"], "flag": ["keep"], "status": ["s10"]}
+        ),
+    )
+
+    ctx = rs.InputContext(
+        asset_name="tbl",
+        downstream_asset="x",
+        type_hint=SparkDataFrame,
+    )
+    df = handler.load_input(ctx)
+    rows = {r["id"]: r for r in df.collect()}
+
+    assert 10 in rows
+    assert rows[10]["val"] == "z_new"
+    assert rows[10]["status"] == "s10"
+
+
+@pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
+def test_custom_merge_when_not_matched_by_source_delete(tmp_path, spark):
+    """schema_mode='merge' with merge_type='custom' for PySpark writes."""
+    handler, _ = _make_handler(tmp_path)
+    df_base = _pyspark_df(
+        spark,
+        {
+            "id": [1, 2, 3, 4],
+            "val": ["a", "b", "c", "d"],
+            "flag": ["keep", "keep", "keep", "keep"],
+            "status": ["old", "old", "old", "old"],
+        },
+    )
+    handler.handle_output(rs.OutputContext(asset_name="tbl"), df_base)
+
+    # when_not_matched_by_source_delete
+    handler = rs.DeltaIOHandler(
+        table_uri=str(tmp_path),
+        mode="merge",
+        merge_config=MergeConfig(
+            predicate="target.id = source.id",
+            merge_type="custom",
+            source_alias="source",
+            target_alias="target",
+            operations=MergeOperationsConfig(
+                when_not_matched_by_source_delete=[
+                    WhenNotMatchedBySourceDelete(
+                        predicate="target.id = 4",
+                    )
+                ],
+            ),
+        ),
+    )
+    handler.handle_output(
+        rs.OutputContext(asset_name="tbl"),
+        _pyspark_df(spark, {"id": [1, 2, 3, 99, 10], "val": ["x"] * 5}),
+    )
+
+    ctx = rs.InputContext(
+        asset_name="tbl",
+        downstream_asset="x",
+        type_hint=SparkDataFrame,
+    )
+    df = handler.load_input(ctx)
+    rows = {r["id"]: r for r in df.collect()}
+
+    assert 4 not in rows
+    assert list(rows.keys()) == [1, 2, 3]
+
+
+@pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
+def test_custom_merge_when_not_matched_by_source_update(tmp_path, spark):
+    """schema_mode='merge' with merge_type='custom' for PySpark writes."""
+    handler, _ = _make_handler(tmp_path)
+    df_base = _pyspark_df(
+        spark,
+        {
+            "id": [1, 2, 3, 4],
+            "val": ["a", "b", "c", "d"],
+            "flag": ["keep", "keep", "keep", "keep"],
+            "status": ["old", "old", "old", "old"],
+        },
+    )
+    handler.handle_output(rs.OutputContext(asset_name="tbl"), df_base)
+
+    # when_not_matched_by_source_update
+    handler = rs.DeltaIOHandler(
+        table_uri=str(tmp_path),
+        mode="merge",
+        merge_config=MergeConfig(
+            predicate="target.id = source.id",
+            merge_type="custom",
+            source_alias="source",
+            target_alias="target",
+            operations=MergeOperationsConfig(
+                when_not_matched_by_source_update=[
+                    WhenNotMatchedBySourceUpdate(
+                        predicate="target.id = 4",
+                        updates={"status": "'new'"},
+                    )
+                ],
+            ),
+        ),
+    )
+    handler.handle_output(
+        rs.OutputContext(asset_name="tbl"),
+        _pyspark_df(spark, {"id": [1, 2, 3, 99, 10]}),
+    )
+
+    ctx = rs.InputContext(
+        asset_name="tbl",
+        downstream_asset="x",
+        type_hint=SparkDataFrame,
+    )
+    df = handler.load_input(ctx)
+    rows = {r["id"]: r for r in df.collect()}
+
+    assert rows[4]["status"] == "new"
+    assert rows[4]["val"] == "d"
 
 
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
@@ -685,3 +1064,41 @@ def test_large_pyspark_df_round_trips(tmp_path, spark):
     )
     result = handler.load_input(ctx_in)
     assert result.count() == n
+
+
+@pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
+def test_warns_when_user_sets_unsupported_properties(tmp_path, spark):
+    wp = WriterProperties(compression="SNAPPY", max_row_group_size=100)
+    cp = CommitProperties(custom_metadata={"author": "test"})
+    storage_options = {"access_key": "test"}
+    handler, _ = _make_handler(
+        tmp_path,
+        storage_options=storage_options,
+        commit_properties=cp,
+        writer_properties=wp,
+    )
+    writer_warning_msg = (
+        "Values set in commit_properties, writer_properties, storage_options "
+        "will be ignored, these are not supported by the PySpark handler."
+    )
+    with pytest.warns(UserWarning, match=writer_warning_msg):
+        df = _pyspark_df(spark, {"a": [1, 2, 3], "b": ["x", "y", "z"]})
+
+        handler.handle_output(rs.OutputContext(asset_name="tbl"), df)
+
+    reader_warning_msg = (
+        "Values set in storage_options will be ignored, "
+        "these are not supported by the PySpark handler."
+    )
+    with pytest.warns(UserWarning, match=reader_warning_msg):
+        ctx_in = rs.InputContext(
+            asset_name="tbl",
+            downstream_asset="consumer",
+            type_hint=SparkDataFrame,
+        )
+        result = handler.load_input(ctx_in)
+        assert isinstance(result, SparkDataFrame)
+
+        result_pa = result.sort("a").toArrow()
+        expected = pa.table({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        assert result_pa.cast(expected.schema).equals(expected)

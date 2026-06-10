@@ -7,6 +7,7 @@ from typing import Any
 from delta._typing import ColumnMapping
 from delta.tables import DeltaTable as SparkDeltaTable
 from deltalake import CommitProperties, DeltaTable, WriterProperties
+from pyspark.sql import DataFrame as SparkDataFrame
 from pyspark.sql import functions as F
 
 from rivers.io_handlers.delta.config import MergeConfig
@@ -110,10 +111,26 @@ def _to_spark_column_mapping(mapping: dict[str, str]) -> ColumnMapping:
     return {col: F.expr(expr) for col, expr in mapping.items()}
 
 
+def _build_updates_mapping(
+    *,
+    sdf: SparkDataFrame,
+    source_alias: str,
+    except_cols: list[str],
+) -> ColumnMapping:
+    """Builds updates mapping to exclude columns specified by exclude_cols."""
+    return _to_spark_column_mapping(
+        {
+            col.name: f"{source_alias}.`{col.name}`"
+            for col in sdf.schema
+            if col.name not in except_cols
+        }
+    )
+
+
 def _merge_execute_spark(
     *,
     uri: str,
-    sdf,
+    sdf: SparkDataFrame,
     merge_config: MergeConfig | None,
     partition_predicate: str | None,
     merge_predicate_override: str | None = None,
@@ -183,7 +200,15 @@ def _merge_execute_spark(
                 kwargs = {}
                 if op.predicate:
                     kwargs["condition"] = op.predicate
-                merge_builder = merge_builder.whenMatchedUpdateAll(**kwargs)
+                if op.except_cols:
+                    kwargs["set"] = _build_updates_mapping(
+                        sdf=sdf,
+                        source_alias=merge_config.source_alias,
+                        except_cols=op.except_cols,
+                    )
+                    merge_builder = merge_builder.whenMatchedUpdate(**kwargs)
+                else:
+                    merge_builder = merge_builder.whenMatchedUpdateAll(**kwargs)
 
         # when matched delete
         if ops.when_matched_delete is not None:
@@ -210,7 +235,15 @@ def _merge_execute_spark(
                 kwargs = {}
                 if op.predicate:
                     kwargs["condition"] = op.predicate
-                merge_builder = merge_builder.whenNotMatchedInsertAll(**kwargs)
+                if op.except_cols:
+                    kwargs["set"] = _build_updates_mapping(
+                        sdf=sdf,
+                        source_alias=merge_config.source_alias,
+                        except_cols=op.except_cols,
+                    )
+                    merge_builder = merge_builder.whenNotMatchedInsert(**kwargs)
+                else:
+                    merge_builder = merge_builder.whenNotMatchedInsertAll(**kwargs)
 
         # when not matched by source delete
         if ops.when_not_matched_by_source_delete is not None:
