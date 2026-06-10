@@ -438,7 +438,11 @@ impl SurrealValue for PartitionKey {
                 map.insert("variant".to_string(), "Single".to_string().into_value());
                 map.insert("keys".to_string(), keys.into_value());
             }
-            Self::Multi { dims } => {
+            Self::Multi { mut dims } => {
+                // Canonical order: the UNIQUE index and equality queries
+                // compare the serialized form, which must not depend on
+                // construction order (Python builds dims from a HashMap).
+                dims.sort_by(|a, b| a.0.cmp(&b.0));
                 map.insert("variant".to_string(), "Multi".to_string().into_value());
                 map.insert("dims".to_string(), dims.into_value());
             }

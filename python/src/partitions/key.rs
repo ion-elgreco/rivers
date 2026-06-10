@@ -243,9 +243,14 @@ impl From<&PyPartitionKey> for rivers_core::storage::PartitionKey {
     fn from(pk: &PyPartitionKey) -> Self {
         match pk {
             PyPartitionKey::Single { key } => Self::Single { keys: key.clone() },
-            PyPartitionKey::Multi { keys } => Self::Multi {
-                dims: keys.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            },
+            PyPartitionKey::Multi { keys } => {
+                // HashMap iteration order is seed-dependent — sort so the
+                // converted key is deterministic.
+                let mut dims: Vec<(String, Vec<String>)> =
+                    keys.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                dims.sort_by(|a, b| a.0.cmp(&b.0));
+                Self::Multi { dims }
+            }
             PyPartitionKey::Set { keys } => Self::Set {
                 keys: keys.iter().map(|k| k.into()).collect(),
             },

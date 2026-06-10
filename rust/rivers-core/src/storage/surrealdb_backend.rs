@@ -299,6 +299,114 @@ impl DbStoredEvent {
     }
 }
 
+/// In-place migration: rewrite persisted `Multi` partition keys whose dims
+/// aren't in canonical (sorted) order. Earlier builds serialized HashMap
+/// iteration order, which defeats the `asset_partitions` UNIQUE index (one
+/// logical partition could occupy several rows) and `partition_key =`
+/// lookups on `events`. Idempotent; sorted rows are left untouched.
+async fn migrate_multi_partition_key_order(db: &Surreal<Any>) -> anyhow::Result<()> {
+    fn is_sorted(dims: &[(String, Vec<String>)]) -> bool {
+        dims.windows(2).all(|w| w[0].0 <= w[1].0)
+    }
+
+    #[derive(Debug, SurrealValue)]
+    struct PartRow {
+        id: RecordId,
+        code_location_id: String,
+        asset_key: String,
+        partition_key: PartitionKey,
+        last_event_id: Option<String>,
+        last_run_id: Option<String>,
+        last_timestamp: Option<i64>,
+    }
+    let mut result = db
+        .query("SELECT id, code_location_id, asset_key, partition_key, last_event_id, last_run_id, last_timestamp FROM asset_partitions WHERE partition_key.variant = 'Multi'")
+        .await?;
+    let rows: Vec<PartRow> = result.take(0)?;
+    // Group by logical key (PartitionKey's Eq/Hash are order-insensitive):
+    // unsorted duplicates collapse onto the newest row.
+    let mut groups: HashMap<(String, String, PartitionKey), Vec<PartRow>> = HashMap::new();
+    for row in rows {
+        groups
+            .entry((
+                row.code_location_id.clone(),
+                row.asset_key.clone(),
+                row.partition_key.clone(),
+            ))
+            .or_default()
+            .push(row);
+    }
+    let mut rewritten = 0usize;
+    for ((_, _, key), group) in groups {
+        let needs_rewrite = group.len() > 1
+            || group.iter().any(
+                |r| matches!(&r.partition_key, PartitionKey::Multi { dims } if !is_sorted(dims)),
+            );
+        if !needs_rewrite {
+            continue;
+        }
+        let latest = group
+            .iter()
+            .max_by_key(|r| r.last_timestamp.unwrap_or(i64::MIN))
+            .expect("group is non-empty");
+        let write = DbAssetPartitionWrite {
+            code_location_id: latest.code_location_id.clone(),
+            asset_key: latest.asset_key.clone(),
+            partition_key: key,
+            last_event_id: latest.last_event_id.clone().unwrap_or_default(),
+            last_run_id: latest.last_run_id.clone().unwrap_or_default(),
+            last_timestamp: latest.last_timestamp.unwrap_or_default(),
+        };
+        for row in &group {
+            db.query("DELETE $rec")
+                .bind(("rec", row.id.clone()))
+                .await?
+                .check()?;
+        }
+        db.query(
+            "INSERT INTO asset_partitions $row ON DUPLICATE KEY UPDATE last_event_id = $input.last_event_id, last_run_id = $input.last_run_id, last_timestamp = $input.last_timestamp",
+        )
+        .bind(("row", write))
+        .await?
+        .check()?;
+        rewritten += 1;
+    }
+
+    #[derive(Debug, SurrealValue)]
+    struct EventRow {
+        id: RecordId,
+        partition_key: PartitionKey,
+    }
+    let mut result = db
+        .query("SELECT id, partition_key FROM events WHERE partition_key.variant = 'Multi'")
+        .await?;
+    let events: Vec<EventRow> = result.take(0)?;
+    let mut event_rewrites = 0usize;
+    for ev in events {
+        let PartitionKey::Multi { dims } = &ev.partition_key else {
+            continue;
+        };
+        if is_sorted(dims) {
+            continue;
+        }
+        // Re-binding the same key canonicalizes: into_value sorts dims.
+        db.query("UPDATE $rec SET partition_key = $pk")
+            .bind(("rec", ev.id))
+            .bind(("pk", ev.partition_key))
+            .await?
+            .check()?;
+        event_rewrites += 1;
+    }
+    if rewritten > 0 || event_rewrites > 0 {
+        tracing::info!(
+            partitions = rewritten,
+            events = event_rewrites,
+            "migrated Multi partition keys to canonical dim order"
+        );
+    }
+    Ok(())
+}
+
 const SCHEMA: &str = "
 DEFINE TABLE IF NOT EXISTS events SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS code_location_id ON events TYPE string DEFAULT 'default';
@@ -650,6 +758,7 @@ impl SurrealStorage {
                 .await?;
             tracing::debug!("applying schema");
             db.query(SCHEMA).await?;
+            migrate_multi_partition_key_order(&db).await?;
             Ok(db)
         })
         .await?;
@@ -700,6 +809,7 @@ impl SurrealStorage {
                 .await?;
             tracing::debug!("applying schema");
             db.query(SCHEMA).await?;
+            migrate_multi_partition_key_order(&db).await?;
             Ok(db)
         })
         .await?;
@@ -780,6 +890,7 @@ impl SurrealStorage {
             db.use_ns(&namespace).use_db(&database).await?;
             tracing::debug!("applying schema");
             db.query(SCHEMA).await?;
+            migrate_multi_partition_key_order(&db).await?;
             Ok(db)
         })
         .await?;
@@ -3811,6 +3922,146 @@ mod tests {
         assert!(
             !plan.contains("SortTopKByKey") && !plan.contains("\"operator\":\"Sort\""),
             "asset page should not sort: {plan}"
+        );
+    }
+
+    /// The UNIQUE index compares the SERIALIZED partition_key, so the same
+    /// logical Multi key written with dims in a different order must
+    /// canonicalize to one row — Python builds dims from a HashMap whose
+    /// iteration order varies per instance.
+    #[tokio::test]
+    async fn test_multi_partition_key_dims_order_canonicalized() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let mk = |dims: Vec<(&str, &str)>| PartitionKey::Multi {
+            dims: dims
+                .into_iter()
+                .map(|(d, v)| (d.to_string(), vec![v.to_string()]))
+                .collect(),
+        };
+        let row = |pk: PartitionKey, event_id: &str, ts: i64| super::DbAssetPartitionWrite {
+            code_location_id: cl.to_string(),
+            asset_key: "inventory".to_string(),
+            partition_key: pk,
+            last_event_id: event_id.to_string(),
+            last_run_id: "r".to_string(),
+            last_timestamp: ts,
+        };
+
+        let date_first = mk(vec![("date", "2024-01-01"), ("region", "eu")]);
+        let region_first = mk(vec![("region", "eu"), ("date", "2024-01-01")]);
+        storage
+            .upsert_asset_partitions(vec![row(date_first.clone(), "ev1", 1)])
+            .await
+            .unwrap();
+        storage
+            .upsert_asset_partitions(vec![row(region_first, "ev2", 2)])
+            .await
+            .unwrap();
+
+        let parts = storage
+            .get_materialized_partitions(cl, "inventory")
+            .await
+            .unwrap();
+        assert_eq!(
+            parts,
+            vec![date_first],
+            "dims order must canonicalize to one row"
+        );
+        assert_eq!(
+            storage
+                .count_materialized_partitions(cl, "inventory")
+                .await
+                .unwrap(),
+            1,
+            "the count must agree with the deduped key set"
+        );
+    }
+
+    /// Rows persisted by earlier builds carry HashMap-ordered dims; the
+    /// startup migration must collapse duplicates onto the canonical form
+    /// and rewrite unsorted event keys.
+    #[tokio::test]
+    async fn test_migration_canonicalizes_legacy_multi_rows() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        // Legacy row with unsorted dims, written raw to bypass the
+        // canonicalizing serializer.
+        storage
+            .db
+            .query(
+                "CREATE asset_partitions CONTENT { code_location_id: 'default', \
+                 asset_key: 'inv', partition_key: { variant: 'Multi', dims: \
+                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
+                 last_event_id: 'e1', last_run_id: 'r1', last_timestamp: 1 }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        // The same logical partition written by a current build (sorted).
+        let sorted = PartitionKey::Multi {
+            dims: vec![
+                ("date".to_string(), vec!["2024-01-01".to_string()]),
+                ("region".to_string(), vec!["eu".to_string()]),
+            ],
+        };
+        storage
+            .upsert_asset_partitions(vec![DbAssetPartitionWrite {
+                code_location_id: cl.to_string(),
+                asset_key: "inv".to_string(),
+                partition_key: sorted.clone(),
+                last_event_id: "e2".to_string(),
+                last_run_id: "r2".to_string(),
+                last_timestamp: 2,
+            }])
+            .await
+            .unwrap();
+        // Legacy event with unsorted dims.
+        storage
+            .db
+            .query(
+                "CREATE events CONTENT { code_location_id: 'default', \
+                 event_type: 'Materialization', asset_key: 'inv', run_id: 'r1', \
+                 partition_key: { variant: 'Multi', dims: \
+                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
+                 timestamp: 1, metadata: [] }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        migrate_multi_partition_key_order(&storage.db)
+            .await
+            .unwrap();
+
+        let parts = storage
+            .get_materialized_partitions(cl, "inv")
+            .await
+            .unwrap();
+        assert_eq!(parts, vec![sorted.clone()], "one canonical row survives");
+        let ts = storage.get_partition_timestamps(cl, "inv").await.unwrap();
+        assert_eq!(ts, vec![(sorted.clone(), 2)], "newest row's values win");
+        // The event is reachable through an equality lookup with the
+        // canonical (sorted) bind.
+        let mut result = storage
+            .db
+            .query("SELECT count() AS total FROM events WHERE partition_key = $pk GROUP ALL")
+            .bind(("pk", sorted))
+            .await
+            .unwrap();
+        let total: Option<u64> = result.take((0, "total")).unwrap();
+        assert_eq!(
+            total,
+            Some(1),
+            "event key must be rewritten to canonical order"
         );
     }
 
