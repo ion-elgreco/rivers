@@ -86,7 +86,7 @@ PartitionsDefinition.hourly(
 ) -> PartitionsDefinition.TimeWindow
 ```
 
-Hourly partitions. Default format: `"%Y-%m-%d-%H:%M"`.
+Hourly partitions. Default format: `"%Y-%m-%dT%H:00"`.
 
 ### `PartitionsDefinition.time_window()`
 

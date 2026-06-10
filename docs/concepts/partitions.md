@@ -58,7 +58,7 @@ rs.PartitionsDefinition.time_window(
 )
 ```
 
-`cron_schedule` accepts 5 fields (`min hour dom mon dow`) or 6 fields with leading seconds (`sec min hour dom mon dow`). The `fmt` parameter controls the partition key format string (default: `"%Y-%m-%d"` for daily, `"%Y-%m-%d-%H:%M"` for hourly).
+`cron_schedule` accepts 5 fields (`min hour dom mon dow`) or 6 fields with leading seconds (`sec min hour dom mon dow`). The `fmt` parameter controls the partition key format string (default: `"%Y-%m-%d"` for daily, `"%Y-%m-%dT%H:00"` for hourly).
 
 `start`/`end` are tz-naive: keys are wall-clock labels on the naive timeline,
 so the grid is identical on every host timezone and DST transitions neither
