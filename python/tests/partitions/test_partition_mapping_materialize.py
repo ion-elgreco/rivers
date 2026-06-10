@@ -680,6 +680,62 @@ def test_time_window_offset_zero_is_identity():
     ]
 
 
+def test_time_window_offset_off_grid_result_rejected():
+    """A shifted key that parses under the upstream fmt but isn't on the
+    upstream grid (cross-cadence mapping) must error precisely instead of
+    silently loading a partition that doesn't exist."""
+    handler = TrackingHandler()
+    fmt = "%Y-%m-%dT%H:%M:%S"
+    six_hourly = rs.PartitionsDefinition.time_window(
+        start=datetime(2024, 1, 1), interval_seconds=21600, end=datetime(2024, 1, 3), fmt=fmt
+    )
+    hourly = rs.PartitionsDefinition.time_window(
+        start=datetime(2024, 1, 1), interval_seconds=3600, end=datetime(2024, 1, 3), fmt=fmt
+    )
+
+    @rs.Asset(partitions_def=six_hourly, io_handler=handler)
+    def upstream(context: rs.AssetExecutionContext) -> int:
+        return 1
+
+    @rs.Asset(
+        partitions_def=hourly,
+        io_handler=handler,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.time_window(offset=-1),
+            )
+        ],
+    )
+    def downstream(upstream: int) -> int:
+        return upstream
+
+    repo = make_repo([upstream, downstream])
+    # 07:00 - 1h = 06:00? No: the offset shifts on the UPSTREAM grid only for
+    # cron; for intervals it shifts by the upstream interval: 07:00 - 6h =
+    # 01:00, which is not a 6-hourly window start.
+    result = repo.materialize(
+        ["downstream"],
+        partition_key=rs.PartitionKey.single("2024-01-01T07:00:00"),
+        raise_on_error=False,
+    )
+    assert not result.success
+
+    # An aligned downstream key shifts to a real upstream window and loads.
+    repo.materialize(
+        ["upstream"], partition_key=rs.PartitionKey.single("2024-01-01T06:00:00")
+    )
+    handler.load_input_partitions.clear()
+    result = repo.materialize(
+        ["downstream"],
+        partition_key=rs.PartitionKey.single("2024-01-01T12:00:00"),
+    )
+    assert result.success
+    assert [p.key for p in handler.load_input_partitions] == [
+        rs.PartitionKey.single("2024-01-01T06:00:00")
+    ]
+
+
 def test_time_window_offset_before_start_errors():
     """offset=-1 from the first partition maps before the upstream's start —
     a precise error, not a silent identity load."""

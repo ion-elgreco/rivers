@@ -562,7 +562,21 @@ impl PartitionMapping {
                 let def =
                     upstream_def.ok_or("TimeWindow mapping requires a partitioned upstream")?;
                 let shifted = def.shift_time_key(k, *offset).map_err(|e| e.to_string())?;
-                Ok(PyPartitionKey::Single { key: vec![shifted] })
+                let shifted_key = PyPartitionKey::Single {
+                    key: vec![shifted.clone()],
+                };
+                // A cross-cadence mapping can land between upstream windows —
+                // loading a partition that doesn't exist must fail loudly.
+                if !def
+                    .validate_partition_key(&shifted_key)
+                    .map_err(|e| e.to_string())?
+                {
+                    return Err(format!(
+                        "time_window(offset={offset}) maps '{k}' to '{shifted}', \
+                         which is not a partition of the upstream definition"
+                    ));
+                }
+                Ok(shifted_key)
             }
 
             Self::Multi { dimension_mappings } => match downstream_key {
