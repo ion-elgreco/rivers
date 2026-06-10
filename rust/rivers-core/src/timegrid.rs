@@ -81,6 +81,66 @@ impl TimeGrid {
         }
         Ok(shifted.format(&self.fmt).to_string())
     }
+
+    /// Nearest valid keys around `dt` — the latest grid tick `<= dt` and the
+    /// earliest tick `> dt`, both clamped to `[start, end)`. Best-effort for
+    /// diagnostics: a side with no representable tick is `None`.
+    pub fn nearest_keys(&self, dt: NaiveDateTime) -> (Option<String>, Option<String>) {
+        let end_dt = self.end_bound();
+        let key = |t: NaiveDateTime| t.format(&self.fmt).to_string();
+        if let Some(secs) = self.interval_seconds {
+            let interval_ns = (secs * 1_000_000_000.0) as i64;
+            if interval_ns <= 0 {
+                return (None, None);
+            }
+            let tick = |idx: i64| {
+                idx.checked_mul(interval_ns).and_then(|ns| {
+                    self.start
+                        .checked_add_signed(chrono::Duration::nanoseconds(ns))
+                })
+            };
+            let prev = end_dt
+                .checked_sub_signed(chrono::Duration::nanoseconds(1))
+                .map(|last| std::cmp::min(dt, last))
+                .filter(|cap| *cap >= self.start)
+                .and_then(|cap| (cap - self.start).num_nanoseconds())
+                .map(|ns| ns.div_euclid(interval_ns))
+                .and_then(tick);
+            let next = if dt < self.start {
+                Some(self.start)
+            } else {
+                (dt - self.start)
+                    .num_nanoseconds()
+                    .and_then(|ns| ns.div_euclid(interval_ns).checked_add(1))
+                    .and_then(tick)
+            }
+            .filter(|t| *t < end_dt);
+            (prev.map(key), next.map(key))
+        } else if let Some(expr) = &self.cron_schedule {
+            let Ok(cron) = parse_cron(expr) else {
+                return (None, None);
+            };
+            // Anchors are clamped to the range so the walk finds its tick
+            // within a step or two instead of crossing dt→range tick by tick.
+            let prev = {
+                let anchor = Utc.from_utc_datetime(&std::cmp::min(dt, end_dt));
+                cron.iter_from(anchor, croner::Direction::Backward)
+                    .map(|t| t.naive_utc())
+                    .find(|t| *t <= dt && *t < end_dt)
+                    .filter(|t| *t >= self.start)
+            };
+            let next = {
+                let anchor = Utc.from_utc_datetime(&std::cmp::max(dt, self.start));
+                cron.iter_from(anchor, croner::Direction::Forward)
+                    .map(|t| t.naive_utc())
+                    .find(|t| *t > dt)
+                    .filter(|t| *t < end_dt)
+            };
+            (prev.map(key), next.map(key))
+        } else {
+            (None, None)
+        }
+    }
 }
 
 fn parse_cron(expr: &str) -> Result<croner::Cron> {
@@ -157,5 +217,58 @@ mod tests {
             g.shift_key("2024-01-01T12:00:00", -1).unwrap(),
             "2024-01-01T06:00:00"
         );
+    }
+
+    fn hourly_jan1() -> TimeGrid {
+        TimeGrid {
+            cron_schedule: None,
+            interval_seconds: Some(3600.0),
+            start: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap().into(),
+            end: Some(NaiveDate::from_ymd_opt(2024, 1, 2).unwrap().into()),
+            fmt: "%Y-%m-%dT%H:%M:%S".into(),
+        }
+    }
+
+    fn dt(s: &str) -> chrono::NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn interval_nearest_keys_brackets_off_grid_datetime() {
+        let (prev, next) = hourly_jan1().nearest_keys(dt("2024-01-01T07:30:00"));
+        assert_eq!(prev.as_deref(), Some("2024-01-01T07:00:00"));
+        assert_eq!(next.as_deref(), Some("2024-01-01T08:00:00"));
+    }
+
+    #[test]
+    fn interval_nearest_keys_clamps_to_range() {
+        let g = hourly_jan1();
+        // Before start: nothing earlier; the first key is the suggestion.
+        let (prev, next) = g.nearest_keys(dt("2023-12-30T05:00:00"));
+        assert_eq!(prev, None);
+        assert_eq!(next.as_deref(), Some("2024-01-01T00:00:00"));
+        // At/after the exclusive end: only the last key survives.
+        let (prev, next) = g.nearest_keys(dt("2024-01-02T05:00:00"));
+        assert_eq!(prev.as_deref(), Some("2024-01-01T23:00:00"));
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn cron_nearest_keys_brackets_off_grid_datetime() {
+        let g = daily_jan();
+        let (prev, next) = g.nearest_keys(dt("2024-01-05T13:30:00"));
+        assert_eq!(prev.as_deref(), Some("2024-01-05"));
+        assert_eq!(next.as_deref(), Some("2024-01-06"));
+    }
+
+    #[test]
+    fn cron_nearest_keys_clamps_to_range() {
+        let g = daily_jan();
+        let (prev, next) = g.nearest_keys(dt("2023-11-20T00:00:00"));
+        assert_eq!(prev, None);
+        assert_eq!(next.as_deref(), Some("2024-01-01"));
+        let (prev, next) = g.nearest_keys(dt("2024-03-15T00:00:00"));
+        assert_eq!(prev.as_deref(), Some("2024-01-31"));
+        assert_eq!(next, None);
     }
 }

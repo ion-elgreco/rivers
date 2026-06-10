@@ -752,7 +752,8 @@ class TestRangeDefinitionOrdering:
 
     def test_time_window_range_off_grid_endpoint_rejected(self):
         """An endpoint that parses under the fmt but isn't a window start is
-        not a partition key — same contract as Static unknown endpoints."""
+        not a partition key — same contract as Static unknown endpoints. The
+        error names the neighbouring valid keys so the typo is fixable."""
         pd = rs.PartitionsDefinition.time_window(
             start=datetime(2024, 1, 1),
             interval_seconds=3600,
@@ -770,13 +771,29 @@ class TestRangeDefinitionOrdering:
         with pytest.raises(
             ExecutionError,
             match=re.escape(
-                "Range endpoint '2024-01-01T07:30:00' is not a partition key"
+                "Range endpoint '2024-01-01T07:30:00' is not a partition key; "
+                "nearest valid keys are '2024-01-01T07:00:00' and "
+                "'2024-01-01T08:00:00'"
             ),
         ):
             repo.backfill(
                 selection=["asset"],
                 partition_range=rs.PartitionKeyRange.single(
                     from_key="2024-01-01T07:30:00", to_key="2024-01-01T10:00:00"
+                ),
+            )
+        # Out-of-range endpoint: only one side has a valid neighbour.
+        with pytest.raises(
+            ExecutionError,
+            match=re.escape(
+                "Range endpoint '2024-01-02T05:00:00' is not a partition key; "
+                "nearest valid key is '2024-01-01T23:00:00'"
+            ),
+        ):
+            repo.backfill(
+                selection=["asset"],
+                partition_range=rs.PartitionKeyRange.single(
+                    from_key="2024-01-01T10:00:00", to_key="2024-01-02T05:00:00"
                 ),
             )
 

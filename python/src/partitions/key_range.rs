@@ -92,8 +92,9 @@ pub(crate) fn validate_single_dim_range(
                 ));
             }
             // Endpoints must be real window starts — an off-grid endpoint is
-            // not a partition key (same contract as Static membership).
-            for k in [from_key, to_key] {
+            // not a partition key (same contract as Static membership). Name
+            // the neighbouring valid keys so the typo is fixable.
+            for (k, dt) in [(from_key, from_dt), (to_key, to_dt)] {
                 let single = PyPartitionKey::Single {
                     key: vec![k.to_string()],
                 };
@@ -101,8 +102,20 @@ pub(crate) fn validate_single_dim_range(
                     .validate_partition_key(&single)
                     .map_err(|e| e.to_string())?;
                 if !on_grid {
+                    let hint = def
+                        .time_grid()
+                        .map(|g| match g.nearest_keys(dt) {
+                            (Some(p), Some(n)) => {
+                                format!("; nearest valid keys are '{p}' and '{n}'")
+                            }
+                            (Some(x), None) | (None, Some(x)) => {
+                                format!("; nearest valid key is '{x}'")
+                            }
+                            (None, None) => String::new(),
+                        })
+                        .unwrap_or_default();
                     return Err(format!(
-                        "Range endpoint '{k}' is not a partition key{suffix}"
+                        "Range endpoint '{k}' is not a partition key{suffix}{hint}"
                     ));
                 }
             }
