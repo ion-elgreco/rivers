@@ -446,6 +446,45 @@ INVALID_BACKFILL_NOPE_MSG = (
     'Invalid partition_key Single { key: ["nope"] } for asset '
     "'part': not a member of its partition definition."
 )
+UNPARTITIONED_BACKFILL_MSG = (
+    "Backfill partition_keys/partition_range require a partitioned selection; "
+    "no asset in the selection is partitioned."
+)
+
+
+def test_backfill_keys_on_unpartitioned_selection_rejected():
+    """partition_keys against an unpartitioned selection would bypass every
+    def-aware check (and PerDimension grouping would silently collapse to one
+    run) — reject it outright."""
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler())
+    def plain():
+        return 1
+
+    repo = rs.CodeRepository(assets=[plain], default_executor=rs.Executor.in_process())
+    with pytest.raises(ExecutionError) as exc:
+        repo.backfill(
+            selection=["plain"], partition_keys=[rs.PartitionKey.single("a")]
+        )
+    assert str(exc.value) == UNPARTITIONED_BACKFILL_MSG
+    assert repo.storage.get_runs(limit=10) == []
+
+
+def test_per_dimension_on_unpartitioned_selection_rejected():
+    @rs.Asset(io_handler=rs.InMemoryIOHandler())
+    def plain():
+        return 1
+
+    repo = rs.CodeRepository(assets=[plain], default_executor=rs.Executor.in_process())
+    with pytest.raises(ExecutionError) as exc:
+        repo.backfill(
+            selection=["plain"],
+            partition_keys=[rs.PartitionKey.single("a")],
+            strategy=rs.BackfillStrategy.per_dimension(
+                multi_run=["x"], single_run=["y"]
+            ),
+        )
+    assert str(exc.value) == UNPARTITIONED_BACKFILL_MSG
 
 
 def test_backfill_invalid_explicit_key_raises():

@@ -3627,6 +3627,26 @@ impl PyCodeRepository {
                 (assets, Some(name))
             }
         };
+        // An empty Materialization selection means "all assets" — expand it
+        // so key/strategy validation sees the effective selection.
+        let selection: Vec<String> = if selection.is_empty() {
+            state.node_map.keys().cloned().collect()
+        } else {
+            selection
+        };
+
+        // Keys/ranges against an unpartitioned selection would bypass every
+        // def-aware check (and PerDimension grouping would silently collapse
+        // all keys into one run).
+        if (partition_keys.is_some() || partition_range.is_some())
+            && iter_partitioned_assets(&state.node_map, selection.iter().map(String::as_str))
+                .is_empty()
+        {
+            return Err(ExecutionError::new_err(
+                "Backfill partition_keys/partition_range require a partitioned selection; \
+                 no asset in the selection is partitioned.",
+            ));
+        }
 
         let resolved_keys: Vec<PyPartitionKey> = if let Some(keys) = partition_keys {
             if keys.is_empty() {
