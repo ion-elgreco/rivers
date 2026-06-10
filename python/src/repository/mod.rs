@@ -93,9 +93,10 @@ fn validate_partition_for_selection<'a>(
     for (name, pd) in &partitioned {
         if !pd.validate_partition_key(pk)? {
             return Err(ExecutionError::new_err(format!(
-                "Invalid partition_key {:?} for asset '{}': not a member of its \
+                "Invalid partition_key '{}' for asset '{}': not a member of its \
                  partition definition.",
-                pk, name
+                PartitionKey::from(pk).to_display(),
+                name
             )));
         }
     }

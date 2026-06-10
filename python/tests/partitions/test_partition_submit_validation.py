@@ -28,12 +28,12 @@ MISSING_KEY_MSG = (
 )
 
 INVALID_STATIC_GARBAGE_MSG = (
-    "Invalid partition_key Single { key: [\"garbage\"] } for asset 'part': "
+    "Invalid partition_key 'garbage' for asset 'part': "
     "not a member of its partition definition."
 )
 
 INVALID_TIMEWINDOW_MSG = (
-    "Invalid partition_key Single { key: [\"2023-12-25\"] } for asset 'part': "
+    "Invalid partition_key '2023-12-25' for asset 'part': "
     "not a member of its partition definition."
 )
 
@@ -214,7 +214,7 @@ GRPC_MISSING_KEY_MSG = _grpc_msg(
     "exclude them from selection."
 )
 GRPC_BAD_KEY_PART_ALPHA = _grpc_msg(
-    'Invalid partition_key Single { key: ["garbage"] } for asset '
+    "Invalid partition_key 'garbage' for asset "
     "'part_alpha': not a member of its partition definition."
 )
 
@@ -443,7 +443,7 @@ def test_grpc_execute_job_multi_partition_invalid_dimension_value_rejected(
 # ---------------------------------------------------------------------------
 
 INVALID_BACKFILL_NOPE_MSG = (
-    'Invalid partition_key Single { key: ["nope"] } for asset '
+    "Invalid partition_key 'nope' for asset "
     "'part': not a member of its partition definition."
 )
 UNPARTITIONED_BACKFILL_MSG = (
