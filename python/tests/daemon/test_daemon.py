@@ -152,6 +152,39 @@ class TestDaemonSensor:
         finally:
             daemon.stop()
 
+    def test_dispatch_failure_marks_tick_failed(self, storage):
+        """A run request the dispatcher rejects (invalid partition key) must
+        surface on the tick record instead of silently dropping the run."""
+        pd = rs.PartitionsDefinition.static_(["a", "b"])
+
+        @rs.Asset(name="part_a", partitions_def=pd)
+        def part_a() -> int:
+            return 1
+
+        job = rs.Job(name="part_job", assets=[part_a])
+
+        @rs.Sensor(
+            asset_selection=["part_a"],
+            minimum_interval="1s",
+            default_status=rs.SensorStatus.Running,
+        )
+        def bad_key_sensor(context: rs.SensorEvaluationContext):
+            return rs.RunRequest(job_name="part_job", partition_key="nope")
+
+        repo = rs.CodeRepository(assets=[part_a], jobs=[job], sensors=[bad_key_sensor])
+        repo.resolve(storage=storage)
+
+        daemon = AutomationDaemon(repo=repo, storage=storage)
+        daemon.start()
+        try:
+            ticks = _wait_for_ticks(storage, "bad_key_sensor", min_count=1)
+            tick = ticks[0]
+            assert tick.status == "Failed"
+            assert "Invalid partition_key" in (tick.error or "")
+            assert tick.run_ids == []
+        finally:
+            daemon.stop()
+
     def test_sensor_error_stores_failed_tick(self, storage):
         """Sensor that raises an exception stores a Failed tick."""
 
