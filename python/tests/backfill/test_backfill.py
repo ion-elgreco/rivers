@@ -851,3 +851,35 @@ class TestRangeDefinitionOrdering:
             rs.PartitionKey.multi({"size": "medium", "region": "us"}),
             rs.PartitionKey.multi({"size": "large", "region": "us"}),
         }
+
+    def test_multi_range_unknown_dimension_rejected(self):
+        """A typo'd selector dimension must error — silently ignoring it
+        treats the real dimension as omitted and expands it to ALL keys,
+        backfilling far more partitions than requested."""
+        pd = rs.PartitionsDefinition.multi(
+            {
+                "size": _static_pd(self.SIZES),
+                "region": _static_pd(["us", "eu"]),
+            }
+        )
+
+        @rs.Asset(partitions_def=pd)
+        def asset(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+        with pytest.raises(
+            ExecutionError,
+            match=re.escape(
+                "Unknown dimension 'regon' in partition range; "
+                "available dimensions: 'size', 'region'"
+            ),
+        ):
+            repo.backfill(
+                selection=["asset"],
+                partition_range=rs.PartitionKeyRange.multi(
+                    {"size": ("medium", "large"), "regon": ["us"]}
+                ),
+            )

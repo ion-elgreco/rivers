@@ -172,6 +172,26 @@ fn resolve_single_dim_range(
     }
 }
 
+/// Error for selector dimensions that don't exist on the definition —
+/// silently ignoring one would treat the real dimension as omitted and
+/// expand it to every key. `dim_defs` keeps the definition's own order.
+fn unknown_dims_message<T>(unknown: &[&String], dim_defs: &[(String, T)]) -> String {
+    let plural = if unknown.len() == 1 { "" } else { "s" };
+    let names = unknown
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let available = dim_defs
+        .iter()
+        .map(|(n, _)| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Unknown dimension{plural} {names} in partition range; available dimensions: {available}"
+    )
+}
+
 /// Per-dimension selection: either a (from, to) range or explicit key list.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DimensionSelection {
@@ -306,6 +326,17 @@ impl PyPartitionKeyRange {
                         ));
                     }
                 };
+
+                let mut unknown: Vec<&String> = dim_selections
+                    .keys()
+                    .filter(|name| !dim_defs.iter().any(|(n, _)| n == *name))
+                    .collect();
+                unknown.sort();
+                if !unknown.is_empty() {
+                    return Err(ExecutionError::new_err(unknown_dims_message(
+                        &unknown, dim_defs,
+                    )));
+                }
 
                 let mut resolved_dims: Vec<(String, Vec<String>)> = Vec::new();
                 for (dim_name, dim_def) in dim_defs {
