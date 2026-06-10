@@ -245,9 +245,9 @@ pub fn update_condition_state(
             .get_or_insert_with(PartitionState::default);
         ps.previous_selections = sub_selections.clone();
         ps.timestamps = timestamps.clone();
-        if let Some(PartitionSelection::Keys(keys)) = &result.selection {
-            ps.handled.extend(keys.iter().cloned());
-        }
+        // `handled` is extended during classification with the keys that are
+        // actually dispatched — the raw selection may contain keys the asset
+        // doesn't have, and marking those would suppress them forever.
     }
 }
 

@@ -13,6 +13,7 @@ use crate::condition::eval::evaluate_with_tree;
 use crate::condition::node::ConditionNode;
 use crate::condition::partition::{
     PartitionEvalContext, PartitionMappingKind, PartitionResolver, PartitionSelection,
+    PartitionState,
 };
 use crate::condition::state::{
     CacheSnapshot, ConditionEvalState, EvalContext, EvalNodeResult, EvalResult, RunTagSnapshot,
@@ -421,7 +422,9 @@ impl ConditionPass {
     /// resolved to all of the asset's partition keys; for an unpartitioned
     /// asset they collapse to the bulk path. Marks each materialized asset
     /// present in `cache.in_progress_assets` so subsequent ticks see it as
-    /// in-progress before the dispatch loop pushes any run ids.
+    /// in-progress before the dispatch loop pushes any run ids, and records
+    /// the surviving keys in the asset's `handled` set — only keys actually
+    /// dispatched may suppress future fires.
     fn classify_materializations(
         &mut self,
         to_materialize: Vec<ToMaterialize>,
@@ -462,6 +465,12 @@ impl ConditionPass {
                         );
                     }
                     if !surviving.is_empty() {
+                        if let Some(prev) = self.eval_state.assets.get_mut(tm.asset_key.as_str()) {
+                            prev.partition_state
+                                .get_or_insert_with(PartitionState::default)
+                                .handled
+                                .extend(surviving.iter().cloned());
+                        }
                         partitioned_mats.push((tm.asset_key, surviving));
                     }
                 }
@@ -589,6 +598,76 @@ mod tests {
             )),
         }]);
         assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn update_state_leaves_handled_to_classification() {
+        // The raw selection may name keys classification will drop (mapped
+        // keys the asset doesn't have). Marking them handled here would
+        // suppress them forever once they become real.
+        let mut state = crate::condition::state::AssetConditionState::default();
+        let timestamps: HashMap<PartitionKey, i64> = HashMap::new();
+        let ctx = StateUpdateContext {
+            target_record_timestamp: None,
+            target_data_version: None,
+            now: 1,
+            is_initial: false,
+            partition_timestamps: Some(&timestamps),
+        };
+        let result = EvalResult {
+            fired: true,
+            selection: Some(PartitionSelection::Keys(
+                [spk("2024-08-16")].into_iter().collect(),
+            )),
+            sub_selections: Some(HashMap::new()),
+            ..Default::default()
+        };
+        update_condition_state(&mut state, &ctx, &result);
+        let ps = state.partition_state.as_ref().expect("partition state");
+        assert!(
+            ps.handled.is_empty(),
+            "handled must be extended from the classified plan, not the raw selection"
+        );
+    }
+
+    #[test]
+    fn classify_marks_only_surviving_keys_handled() {
+        let mut pass = ConditionPass::new(
+            AssetConditionCache::default(),
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "down".to_string(),
+                condition: ConditionNode::InProgress,
+                partition_info: Some(PartitionInfo {
+                    all_keys: make_daily_keys(&["2024-01-01", "2024-01-02"]),
+                    mappings: HashMap::new(),
+                    time_window_fmt: None,
+                }),
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        );
+        pass.eval_state.assets.insert(
+            "down".to_string(),
+            crate::condition::state::AssetConditionState::default(),
+        );
+        pass.classify_materializations(vec![ToMaterialize {
+            asset_key: "down".to_string(),
+            selection: Some(PartitionSelection::Keys(
+                [spk("2024-01-02"), spk("2024-08-16")].into_iter().collect(),
+            )),
+        }]);
+        let handled = pass.eval_state.assets["down"]
+            .partition_state
+            .as_ref()
+            .expect("partition state")
+            .handled
+            .clone();
+        assert!(handled.contains(&spk("2024-01-02")));
+        assert!(
+            !handled.contains(&spk("2024-08-16")),
+            "dropped keys must not be marked handled"
+        );
     }
 
     #[test]
