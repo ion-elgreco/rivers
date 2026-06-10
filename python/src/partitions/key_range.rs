@@ -50,6 +50,53 @@ fn key_in_range(
     }
 }
 
+/// Validate `[from, to]` endpoints against one single-dimension definition:
+/// membership (Static) / format (TimeWindow) plus def-order. Returns a plain
+/// message so resolve-time and validate-time callers wrap it in their own
+/// error types. Dynamic defs carry no static key knowledge — nothing to check.
+pub(crate) fn validate_single_dim_range(
+    def: &PartitionsDefinition,
+    from_key: &str,
+    to_key: &str,
+    dim: Option<&str>,
+) -> Result<(), String> {
+    let suffix = dim
+        .map(|d| format!(" for dimension '{d}'"))
+        .unwrap_or_default();
+    match def {
+        PartitionsDefinition::Static { keys } => {
+            let pos = |k: &str| {
+                keys.get_index_of(k)
+                    .ok_or_else(|| format!("Range endpoint '{k}' is not a partition key{suffix}"))
+            };
+            let from_pos = pos(from_key)?;
+            let to_pos = pos(to_key)?;
+            if from_pos > to_pos {
+                return Err(format!(
+                    "from_key '{from_key}' is after to_key '{to_key}'{suffix}"
+                ));
+            }
+            Ok(())
+        }
+        PartitionsDefinition::TimeWindow { fmt, .. } => {
+            let parse = |k: &str| {
+                parse_key_datetime(k, fmt).map_err(|_| {
+                    format!("Range endpoint '{k}' does not match the partition format '{fmt}'{suffix}")
+                })
+            };
+            let from_dt = parse(from_key)?;
+            let to_dt = parse(to_key)?;
+            if from_dt > to_dt {
+                return Err(format!(
+                    "from_key '{from_key}' is after to_key '{to_key}'{suffix}"
+                ));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Resolve `[from, to]` against one single-dimension definition using its
 /// own ordering (see [`key_in_range`]). Errors on endpoints that aren't
 /// members (Static) or don't parse (TimeWindow), and on inverted ranges —
@@ -61,44 +108,18 @@ fn resolve_single_dim_range(
     to_key: &str,
     dim: Option<&str>,
 ) -> PyResult<Vec<String>> {
-    let suffix = dim
-        .map(|d| format!(" for dimension '{d}'"))
-        .unwrap_or_default();
+    validate_single_dim_range(def, from_key, to_key, dim).map_err(ExecutionError::new_err)?;
     match def {
         PartitionsDefinition::Static { keys } => {
-            let pos = |k: &str| {
-                keys.get_index_of(k).ok_or_else(|| {
-                    ExecutionError::new_err(format!(
-                        "Range endpoint '{k}' is not a partition key{suffix}"
-                    ))
-                })
-            };
-            let from_pos = pos(from_key)?;
-            let to_pos = pos(to_key)?;
-            if from_pos > to_pos {
-                return Err(ExecutionError::new_err(format!(
-                    "from_key '{from_key}' is after to_key '{to_key}'{suffix}"
-                )));
-            }
+            let from_pos = keys.get_index_of(from_key).expect("validated above");
+            let to_pos = keys.get_index_of(to_key).expect("validated above");
             Ok((from_pos..=to_pos)
                 .filter_map(|i| keys.get_at(i).cloned())
                 .collect())
         }
         PartitionsDefinition::TimeWindow { fmt, .. } => {
-            let parse = |k: &str| {
-                parse_key_datetime(k, fmt).map_err(|_| {
-                    ExecutionError::new_err(format!(
-                        "Range endpoint '{k}' does not match the partition format '{fmt}'{suffix}"
-                    ))
-                })
-            };
-            let from_dt = parse(from_key)?;
-            let to_dt = parse(to_key)?;
-            if from_dt > to_dt {
-                return Err(ExecutionError::new_err(format!(
-                    "from_key '{from_key}' is after to_key '{to_key}'{suffix}"
-                )));
-            }
+            let from_dt = parse_key_datetime(from_key, fmt).expect("validated above");
+            let to_dt = parse_key_datetime(to_key, fmt).expect("validated above");
             Ok(def
                 .enumerate_single_dim_keys()?
                 .into_iter()
@@ -195,6 +216,34 @@ impl PyPartitionKeyRange {
                 })
             }
             _ => false,
+        }
+    }
+
+    /// Validate this range's endpoints against the definition it will be
+    /// matched against — membership/format and def-order. Returns a plain
+    /// message; callers wrap it in their error type.
+    pub fn validate_against(&self, def: &PartitionsDefinition) -> Result<(), String> {
+        match &self.inner {
+            PartitionKeyRangeInner::Single { from_key, to_key } => {
+                validate_single_dim_range(def, from_key, to_key, None)
+            }
+            PartitionKeyRangeInner::Multi { dimensions } => {
+                let PartitionsDefinition::Multi {
+                    dimensions: dim_defs,
+                } = def
+                else {
+                    // Shape mismatches are reported by the mapping/def checks.
+                    return Ok(());
+                };
+                for (name, sel) in dimensions {
+                    if let DimensionSelection::Range { from_key, to_key } = sel
+                        && let Some((_, dd)) = dim_defs.iter().find(|(n, _)| n == name)
+                    {
+                        validate_single_dim_range(dd, from_key, to_key, Some(name))?;
+                    }
+                }
+                Ok(())
+            }
         }
     }
 

@@ -1006,20 +1006,28 @@ impl PartitionMapping {
             Self::AllPartitions {} => Ok(()),
             Self::ForKeys { selectors } => {
                 for s in selectors {
-                    if let PartitionKeySelector::Key(k) = s {
-                        let valid = down
-                            .validate_partition_key(k)
-                            .map_err(|e| MappingValidationError::DefinitionError(e.to_string()))?;
-                        if !valid {
-                            return Err(MappingValidationError::KeyNotInDefinition {
-                                key: format!("{k:?}"),
-                                side: Side::Downstream,
-                                mapping: "ForKeys",
-                            });
+                    match s {
+                        PartitionKeySelector::Key(k) => {
+                            let valid = down.validate_partition_key(k).map_err(|e| {
+                                MappingValidationError::DefinitionError(e.to_string())
+                            })?;
+                            if !valid {
+                                return Err(MappingValidationError::KeyNotInDefinition {
+                                    key: format!("{k:?}"),
+                                    side: Side::Downstream,
+                                    mapping: "ForKeys",
+                                });
+                            }
+                        }
+                        // An unknown or inverted range endpoint would silently
+                        // match nothing (every downstream key Skips its dep) —
+                        // surface it here instead.
+                        PartitionKeySelector::Range(range) => {
+                            range
+                                .validate_against(down)
+                                .map_err(MappingValidationError::DefinitionError)?;
                         }
                     }
-                    // Range bounds are not validated against the partition def
-                    // at resolve time — the range may intentionally cover a subset.
                 }
                 Ok(())
             }

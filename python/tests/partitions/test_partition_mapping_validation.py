@@ -1,5 +1,6 @@
 """Tests for partition mapping validation during graph resolution."""
 
+import re
 from datetime import datetime
 from typing import Any
 
@@ -2336,8 +2337,9 @@ def test_forkeys_invalid_key_rejected():
         make_repo([upstream, downstream])
 
 
-def test_forkeys_range_not_validated_against_def():
-    """ForKeys with a range selector is accepted without validating range bounds."""
+def test_forkeys_range_unknown_endpoints_rejected():
+    """Range selector endpoints must be partition keys of the downstream def
+    — an unknown endpoint would otherwise silently match nothing."""
     parts = rs.PartitionsDefinition.static_(STATIC_KEYS)
 
     @rs.Asset
@@ -2358,8 +2360,47 @@ def test_forkeys_range_not_validated_against_def():
     def downstream(upstream: Any) -> Any:
         return upstream
 
-    # Range selectors are not validated — this should succeed
-    make_repo([upstream, downstream])
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': "
+            "Range endpoint 'x' is not a partition key"
+        ),
+    ):
+        make_repo([upstream, downstream])
+
+
+def test_forkeys_range_inverted_rejected():
+    """An inverted range would silently Skip every downstream key — surface
+    the swapped endpoints at resolve time instead."""
+    parts = rs.PartitionsDefinition.static_(STATIC_KEYS)
+
+    @rs.Asset
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=parts,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.for_keys(
+                    [rs.PartitionKeyRange.single(from_key="c", to_key="a")]
+                ),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream
+
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': "
+            "from_key 'c' is after to_key 'a'"
+        ),
+    ):
+        make_repo([upstream, downstream])
 
 
 def test_forkeys_multiple_valid_keys():
