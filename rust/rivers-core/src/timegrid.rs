@@ -129,6 +129,66 @@ impl TimeGrid {
         Ok(out)
     }
 
+    /// Window starts in the half-open `[from, to)`, for arbitrary (possibly
+    /// off-grid) endpoints — an off-grid `from` snaps forward to the next
+    /// tick. Both bounds are clamped to `[start, end)`. O(result).
+    pub fn window_starts_in(&self, from: NaiveDateTime, to: NaiveDateTime) -> Result<Vec<String>> {
+        let from = from.max(self.start);
+        let to = to.min(self.end_bound());
+        let mut out = Vec::new();
+        if to <= from {
+            return Ok(out);
+        }
+        if let Some(secs) = self.interval_seconds {
+            let interval_ns = (secs * 1_000_000_000.0) as i64;
+            if interval_ns <= 0 {
+                bail!("TimeWindow interval must be positive");
+            }
+            let Some(offset_ns) = (from - self.start).num_nanoseconds() else {
+                return Ok(out);
+            };
+            let first_idx = offset_ns.div_euclid(interval_ns)
+                + if offset_ns.rem_euclid(interval_ns) == 0 {
+                    0
+                } else {
+                    1
+                };
+            let step = chrono::Duration::nanoseconds(interval_ns);
+            let mut t = match first_idx.checked_mul(interval_ns).and_then(|ns| {
+                self.start
+                    .checked_add_signed(chrono::Duration::nanoseconds(ns))
+            }) {
+                Some(t) => t,
+                None => return Ok(out),
+            };
+            while t < to {
+                out.push(t.format(&self.fmt).to_string());
+                match t.checked_add_signed(step) {
+                    Some(next) => t = next,
+                    None => break,
+                }
+            }
+        } else if let Some(expr) = &self.cron_schedule {
+            let cron = parse_cron(expr)?;
+            let anchor = from
+                .checked_sub_signed(chrono::Duration::seconds(1))
+                .unwrap_or(from);
+            for tick in cron.iter_from(Utc.from_utc_datetime(&anchor), croner::Direction::Forward) {
+                let t = cron_tick_naive(tick);
+                if t < from {
+                    continue;
+                }
+                if t >= to {
+                    break;
+                }
+                out.push(t.format(&self.fmt).to_string());
+            }
+        } else {
+            bail!("TimeWindow requires either cron_schedule or interval_seconds");
+        }
+        Ok(out)
+    }
+
     /// Nearest valid keys around `dt` — the latest grid tick `<= dt` and the
     /// earliest tick `> dt`, both clamped to `[start, end)`. Best-effort for
     /// diagnostics: a side with no representable tick is `None`.
@@ -310,6 +370,35 @@ mod tests {
             .keys_in_range(dt("2024-01-05T00:00:00"), dt("2024-01-07T00:00:00"))
             .unwrap();
         assert_eq!(keys, vec!["2024-01-05", "2024-01-06", "2024-01-07"]);
+    }
+
+    #[test]
+    fn interval_window_starts_snap_off_grid_from_forward() {
+        let g = hourly_jan1();
+        // Off-grid from snaps to the next tick; to is exclusive.
+        let keys = g
+            .window_starts_in(dt("2024-01-01T06:30:00"), dt("2024-01-01T09:00:00"))
+            .unwrap();
+        assert_eq!(keys, vec!["2024-01-01T07:00:00", "2024-01-01T08:00:00"]);
+        // On-grid from is included.
+        let keys = g
+            .window_starts_in(dt("2024-01-01T07:00:00"), dt("2024-01-01T08:00:00"))
+            .unwrap();
+        assert_eq!(keys, vec!["2024-01-01T07:00:00"]);
+    }
+
+    #[test]
+    fn cron_window_starts_half_open_and_clamped() {
+        let g = daily_jan();
+        let keys = g
+            .window_starts_in(dt("2024-01-05T12:00:00"), dt("2024-01-08T00:00:00"))
+            .unwrap();
+        assert_eq!(keys, vec!["2024-01-06", "2024-01-07"]);
+        // Clamped to [start, end): asking past the end yields nothing new.
+        let keys = g
+            .window_starts_in(dt("2024-01-31T00:00:01"), dt("2024-03-01T00:00:00"))
+            .unwrap();
+        assert!(keys.is_empty());
     }
 
     #[test]

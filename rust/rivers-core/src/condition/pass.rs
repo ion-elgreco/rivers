@@ -20,7 +20,9 @@ use crate::condition::state::{
     StateUpdateContext, update_condition_state, update_dep_baselines,
 };
 use crate::storage::{BackfillStrategy, PartitionKey, StorageBackend};
+use crate::timegrid::TimeGrid;
 use crate::util::parse_key_datetime;
+use chrono::NaiveDateTime;
 
 /// Info about an asset with an automation condition, extracted at daemon
 /// start. Pure-Rust so the per-tick evaluation loop can run inside
@@ -37,13 +39,194 @@ pub struct AssetConditionInfo {
 
 /// Partition-level info for a partitioned asset, extracted at daemon start.
 pub struct PartitionInfo {
-    /// All valid partition keys for this asset.
+    /// All valid partition keys for this asset, advanced per tick by
+    /// [`ConditionPass::refresh_partition_universes`].
     pub all_keys: HashSet<PartitionKey>,
     /// Partition mappings for upstream deps. Key = `(this_asset, upstream_asset)`.
     pub mappings: HashMap<(String, String), PartitionMappingKind>,
     /// For time-windowed partitions: the format string used to parse keys.
     /// Used by `InLatestTimeWindow` to select recent partitions per-tick.
     pub time_window_fmt: Option<String>,
+    /// How `all_keys` evolves after extraction.
+    pub universe: PartitionUniverse,
+}
+
+/// How an asset's partition universe evolves after extraction. A universe
+/// frozen at daemon start silently stops automation for open-ended time
+/// windows and never starts it for dynamic partitions.
+#[derive(Clone, Debug)]
+pub enum PartitionUniverse {
+    /// Fixed key set (Static definitions).
+    Frozen,
+    /// Window starts enter the universe as wall-clock time passes
+    /// (and stop at the grid's explicit end, when there is one).
+    TimeWindow {
+        grid: TimeGrid,
+        enumerated_to: NaiveDateTime,
+    },
+    /// Storage-managed: the key set mirrors the `dynamic_partitions`
+    /// namespace, including retirements.
+    Dynamic { namespace: String },
+    /// Cartesian product over dimensions; recomputed when any dimension's
+    /// key list changes.
+    Multi {
+        dims: Vec<(String, DimensionUniverse)>,
+    },
+}
+
+/// One dimension of a Multi universe: its current key list plus how it evolves.
+#[derive(Clone, Debug)]
+pub struct DimensionUniverse {
+    pub keys: Vec<String>,
+    pub kind: DimensionKind,
+}
+
+#[derive(Clone, Debug)]
+pub enum DimensionKind {
+    Frozen,
+    TimeWindow {
+        grid: TimeGrid,
+        enumerated_to: NaiveDateTime,
+    },
+    Dynamic {
+        namespace: String,
+    },
+}
+
+/// Advance one universe, mutating `all_keys` in place. Returns whether the
+/// key set changed. `dynamic_keys` maps namespace → currently registered
+/// keys; a namespace missing from the map (storage failure) leaves the
+/// previous set untouched — stale beats empty.
+fn refresh_universe(
+    universe: &mut PartitionUniverse,
+    all_keys: &mut HashSet<PartitionKey>,
+    now: NaiveDateTime,
+    dynamic_keys: &HashMap<String, HashSet<String>>,
+) -> bool {
+    match universe {
+        PartitionUniverse::Frozen => false,
+        PartitionUniverse::TimeWindow {
+            grid,
+            enumerated_to,
+        } => {
+            let bound = grid.end.map_or(now, |e| e.min(now));
+            if bound <= *enumerated_to {
+                return false;
+            }
+            let mut changed = false;
+            match grid.window_starts_in(*enumerated_to, bound) {
+                Ok(new_keys) => {
+                    for k in new_keys {
+                        changed |= all_keys.insert(PartitionKey::Single { keys: vec![k] });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(target: "rivers::daemon", error = %e, "time-window universe refresh failed");
+                }
+            }
+            *enumerated_to = bound;
+            changed
+        }
+        PartitionUniverse::Dynamic { namespace } => {
+            let Some(keys) = dynamic_keys.get(namespace) else {
+                return false;
+            };
+            let new_set: HashSet<PartitionKey> = keys
+                .iter()
+                .map(|k| PartitionKey::Single {
+                    keys: vec![k.clone()],
+                })
+                .collect();
+            if new_set == *all_keys {
+                return false;
+            }
+            *all_keys = new_set;
+            true
+        }
+        PartitionUniverse::Multi { dims } => {
+            let mut changed = false;
+            for (_, du) in dims.iter_mut() {
+                match &mut du.kind {
+                    DimensionKind::Frozen => {}
+                    DimensionKind::TimeWindow {
+                        grid,
+                        enumerated_to,
+                    } => {
+                        let bound = grid.end.map_or(now, |e| e.min(now));
+                        if bound <= *enumerated_to {
+                            continue;
+                        }
+                        match grid.window_starts_in(*enumerated_to, bound) {
+                            Ok(new_keys) if !new_keys.is_empty() => {
+                                du.keys.extend(new_keys);
+                                changed = true;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(target: "rivers::daemon", error = %e, "time-window dimension refresh failed");
+                            }
+                        }
+                        *enumerated_to = bound;
+                    }
+                    DimensionKind::Dynamic { namespace } => {
+                        if let Some(keys) = dynamic_keys.get(namespace)
+                            && (keys.len() != du.keys.len()
+                                || !du.keys.iter().all(|k| keys.contains(k)))
+                        {
+                            let mut sorted: Vec<String> = keys.iter().cloned().collect();
+                            sorted.sort();
+                            du.keys = sorted;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if changed {
+                *all_keys = cartesian_universe(dims);
+            }
+            changed
+        }
+    }
+}
+
+/// Cartesian product of dimension key lists as `Multi` keys (def order).
+fn cartesian_universe(dims: &[(String, DimensionUniverse)]) -> HashSet<PartitionKey> {
+    if dims.is_empty() {
+        return HashSet::new();
+    }
+    let mut combos: Vec<Vec<(String, Vec<String>)>> = vec![Vec::new()];
+    for (name, du) in dims {
+        let mut next = Vec::with_capacity(combos.len() * du.keys.len().max(1));
+        for combo in &combos {
+            for v in &du.keys {
+                let mut c = combo.clone();
+                c.push((name.clone(), vec![v.clone()]));
+                next.push(c);
+            }
+        }
+        combos = next;
+    }
+    combos
+        .into_iter()
+        .map(|dims| PartitionKey::Multi { dims })
+        .collect()
+}
+
+/// Collect the dynamic namespaces a universe depends on.
+fn universe_namespaces(universe: &PartitionUniverse, out: &mut HashSet<String>) {
+    match universe {
+        PartitionUniverse::Dynamic { namespace } => {
+            out.insert(namespace.clone());
+        }
+        PartitionUniverse::Multi { dims } => {
+            for (_, du) in dims {
+                if let DimensionKind::Dynamic { namespace } = &du.kind {
+                    out.insert(namespace.clone());
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// One row of the per-asset evaluation result list, accumulated during
@@ -161,6 +344,9 @@ pub struct ConditionPass {
     /// when storage hasn't changed but time-based conditions need re-eval.
     pub time_based_eval_set: Option<HashSet<String>>,
     pub upstream_partition_keys: HashMap<String, HashSet<PartitionKey>>,
+    /// How each `upstream_partition_keys` entry evolves. Entries for
+    /// conditioned assets are re-synced from their `PartitionInfo` instead.
+    pub upstream_universes: HashMap<String, PartitionUniverse>,
 }
 
 impl ConditionPass {
@@ -171,7 +357,7 @@ impl ConditionPass {
         cache: AssetConditionCache,
         eval_state: ConditionEvalState,
         conditions: Vec<AssetConditionInfo>,
-        upstream_partition_keys: HashMap<String, HashSet<PartitionKey>>,
+        upstream_partition_keys: HashMap<String, (HashSet<PartitionKey>, PartitionUniverse)>,
     ) -> Self {
         let conditions_by_key: HashMap<String, usize> = conditions
             .iter()
@@ -182,6 +368,12 @@ impl ConditionPass {
         let has_time_based = conditions
             .iter()
             .any(|c| c.condition.has_time_based_conditions());
+        let mut keys_map = HashMap::with_capacity(upstream_partition_keys.len());
+        let mut universes_map = HashMap::with_capacity(upstream_partition_keys.len());
+        for (k, (keys, universe)) in upstream_partition_keys {
+            keys_map.insert(k.clone(), keys);
+            universes_map.insert(k, universe);
+        }
         Self {
             cache,
             eval_state,
@@ -190,8 +382,56 @@ impl ConditionPass {
             active,
             has_time_based,
             time_based_eval_set: None,
-            upstream_partition_keys,
+            upstream_partition_keys: keys_map,
+            upstream_universes: universes_map,
         }
+    }
+
+    /// Dynamic namespaces any tracked universe depends on — the caller
+    /// fetches their current key sets and passes them to
+    /// [`refresh_partition_universes`](Self::refresh_partition_universes).
+    pub fn dynamic_universe_namespaces(&self) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for info in &self.conditions {
+            if let Some(pi) = &info.partition_info {
+                universe_namespaces(&pi.universe, &mut out);
+            }
+        }
+        for universe in self.upstream_universes.values() {
+            universe_namespaces(universe, &mut out);
+        }
+        out
+    }
+
+    /// Advance every tracked partition universe to `now`: open time grids
+    /// gain newly started windows, dynamic namespaces mirror storage, and
+    /// conditioned assets' upstream entries re-sync from their refreshed
+    /// `PartitionInfo`. Returns whether any universe changed, so the caller
+    /// can force an eval even when the storage cache reports no changes.
+    pub fn refresh_partition_universes(
+        &mut self,
+        now: NaiveDateTime,
+        dynamic_keys: &HashMap<String, HashSet<String>>,
+    ) -> bool {
+        let mut changed = false;
+        for info in &mut self.conditions {
+            if let Some(pi) = info.partition_info.as_mut() {
+                changed |= refresh_universe(&mut pi.universe, &mut pi.all_keys, now, dynamic_keys);
+            }
+        }
+        for (asset, universe) in &mut self.upstream_universes {
+            if let Some(keys) = self.upstream_partition_keys.get_mut(asset) {
+                changed |= refresh_universe(universe, keys, now, dynamic_keys);
+            }
+        }
+        for info in &self.conditions {
+            if let Some(pi) = &info.partition_info
+                && let Some(entry) = self.upstream_partition_keys.get_mut(&info.asset_key)
+            {
+                entry.clone_from(&pi.all_keys);
+            }
+        }
+        changed
     }
 
     /// Refresh `cache` from storage atomically. Returns whether anything
@@ -555,6 +795,7 @@ mod tests {
                     all_keys: make_daily_keys(&["2024-01-01", "2024-01-02"]),
                     mappings: HashMap::new(),
                     time_window_fmt: None,
+                    universe: PartitionUniverse::Frozen,
                 }),
                 backfill_strategy: None,
             }],
@@ -586,6 +827,7 @@ mod tests {
                     all_keys: make_daily_keys(&["2024-01-01", "2024-01-02"]),
                     mappings: HashMap::new(),
                     time_window_fmt: None,
+                    universe: PartitionUniverse::Frozen,
                 }),
                 backfill_strategy: None,
             }],
@@ -598,6 +840,121 @@ mod tests {
             )),
         }]);
         assert!(plan.is_empty());
+    }
+
+    fn naive(s: &str) -> NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+    }
+
+    fn hourly_grid() -> TimeGrid {
+        TimeGrid {
+            cron_schedule: None,
+            interval_seconds: Some(3600.0),
+            start: naive("2024-01-01T00:00:00"),
+            end: None,
+            fmt: "%Y-%m-%dT%H:%M:%S".into(),
+        }
+    }
+
+    #[test]
+    fn time_window_universe_gains_new_windows() {
+        let mut universe = PartitionUniverse::TimeWindow {
+            grid: hourly_grid(),
+            enumerated_to: naive("2024-01-01T01:30:00"),
+        };
+        let mut all_keys: HashSet<PartitionKey> =
+            [spk("2024-01-01T00:00:00"), spk("2024-01-01T01:00:00")]
+                .into_iter()
+                .collect();
+        refresh_universe(
+            &mut universe,
+            &mut all_keys,
+            naive("2024-01-01T03:10:00"),
+            &HashMap::new(),
+        );
+        assert!(all_keys.contains(&spk("2024-01-01T02:00:00")));
+        assert!(all_keys.contains(&spk("2024-01-01T03:00:00")));
+        assert_eq!(all_keys.len(), 4);
+        // Idempotent: a second refresh at the same now adds nothing.
+        refresh_universe(
+            &mut universe,
+            &mut all_keys,
+            naive("2024-01-01T03:10:00"),
+            &HashMap::new(),
+        );
+        assert_eq!(all_keys.len(), 4);
+    }
+
+    #[test]
+    fn dynamic_universe_mirrors_storage_including_retirement() {
+        let mut universe = PartitionUniverse::Dynamic {
+            namespace: "colors".into(),
+        };
+        let mut all_keys: HashSet<PartitionKey> = HashSet::new();
+        let now = naive("2024-01-01T00:00:00");
+        let registered: HashMap<String, HashSet<String>> = [(
+            "colors".to_string(),
+            ["red".to_string(), "blue".to_string()]
+                .into_iter()
+                .collect(),
+        )]
+        .into_iter()
+        .collect();
+        refresh_universe(&mut universe, &mut all_keys, now, &registered);
+        assert_eq!(all_keys, [spk("red"), spk("blue")].into_iter().collect());
+        // Retirement: the set mirrors storage, it doesn't only grow.
+        let shrunk: HashMap<String, HashSet<String>> = [(
+            "colors".to_string(),
+            ["blue".to_string()].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect();
+        refresh_universe(&mut universe, &mut all_keys, now, &shrunk);
+        assert_eq!(all_keys, [spk("blue")].into_iter().collect());
+        // A namespace missing from the fetch (storage failure) keeps the
+        // previous set — stale beats empty.
+        refresh_universe(&mut universe, &mut all_keys, now, &HashMap::new());
+        assert_eq!(all_keys, [spk("blue")].into_iter().collect());
+    }
+
+    #[test]
+    fn multi_universe_recomputes_cartesian_on_dimension_change() {
+        let mut universe = PartitionUniverse::Multi {
+            dims: vec![
+                (
+                    "date".to_string(),
+                    DimensionUniverse {
+                        keys: vec!["2024-01-01T00:00:00".to_string()],
+                        kind: DimensionKind::TimeWindow {
+                            grid: hourly_grid(),
+                            enumerated_to: naive("2024-01-01T00:30:00"),
+                        },
+                    },
+                ),
+                (
+                    "region".to_string(),
+                    DimensionUniverse {
+                        keys: vec!["eu".to_string(), "us".to_string()],
+                        kind: DimensionKind::Frozen,
+                    },
+                ),
+            ],
+        };
+        let mut all_keys: HashSet<PartitionKey> = HashSet::new();
+        refresh_universe(
+            &mut universe,
+            &mut all_keys,
+            naive("2024-01-01T01:10:00"),
+            &HashMap::new(),
+        );
+        assert_eq!(all_keys.len(), 4);
+        let expected = PartitionKey::Multi {
+            dims: vec![
+                ("date".to_string(), vec!["2024-01-01T01:00:00".to_string()]),
+                ("region".to_string(), vec!["eu".to_string()]),
+            ],
+        };
+        assert!(all_keys.contains(&expected));
     }
 
     #[test]
@@ -642,6 +999,7 @@ mod tests {
                     all_keys: make_daily_keys(&["2024-01-01", "2024-01-02"]),
                     mappings: HashMap::new(),
                     time_window_fmt: None,
+                    universe: PartitionUniverse::Frozen,
                 }),
                 backfill_strategy: None,
             }],

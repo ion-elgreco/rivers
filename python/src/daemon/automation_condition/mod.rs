@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use rivers_core::condition::{
-    AssetConditionCache, AssetConditionInfo, ConditionEvalState, ConditionPass, PartitionInfo,
-    PartitionMappingKind,
+    AssetConditionCache, AssetConditionInfo, ConditionEvalState, ConditionPass, DimensionKind,
+    DimensionUniverse, PartitionInfo, PartitionMappingKind, PartitionUniverse,
 };
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{PartitionKey as CorePartitionKey, ScopedStorageHandle};
@@ -43,6 +43,11 @@ fn partition_info_from_node(
     node_map: &HashMap<String, ResolvedNode>,
 ) -> Option<PartitionInfo> {
     let def = node.partitions_def()?;
+    // Captured before enumeration: a window starting between this and the
+    // enumerate call is re-added by the first refresh (extend is idempotent)
+    // rather than skipped.
+    let now = chrono::Local::now().naive_local();
+    let universe = partition_universe_for(def, now);
     let all_keys = def
         .get_partition_keys()
         .ok()
@@ -61,7 +66,51 @@ fn partition_info_from_node(
         all_keys,
         mappings,
         time_window_fmt,
+        universe,
     })
+}
+
+/// How `def`'s key universe evolves after extraction. `now` is the
+/// enumeration high-water mark for open time grids.
+fn partition_universe_for(
+    def: &PartitionsDefinition,
+    now: chrono::NaiveDateTime,
+) -> PartitionUniverse {
+    match def {
+        PartitionsDefinition::Static { .. } => PartitionUniverse::Frozen,
+        PartitionsDefinition::TimeWindow { .. } => match def.time_grid() {
+            Some(grid) => PartitionUniverse::TimeWindow {
+                grid,
+                enumerated_to: now,
+            },
+            None => PartitionUniverse::Frozen,
+        },
+        PartitionsDefinition::Dynamic { name } => PartitionUniverse::Dynamic {
+            namespace: name.clone(),
+        },
+        PartitionsDefinition::Multi { dimensions } => PartitionUniverse::Multi {
+            dims: dimensions
+                .iter()
+                .map(|(dim_name, dim_def)| {
+                    let keys = dim_def.enumerate_single_dim_keys().unwrap_or_default();
+                    let kind = match dim_def {
+                        PartitionsDefinition::TimeWindow { .. } => match dim_def.time_grid() {
+                            Some(grid) => DimensionKind::TimeWindow {
+                                grid,
+                                enumerated_to: now,
+                            },
+                            None => DimensionKind::Frozen,
+                        },
+                        PartitionsDefinition::Dynamic { name } => DimensionKind::Dynamic {
+                            namespace: name.clone(),
+                        },
+                        _ => DimensionKind::Frozen,
+                    };
+                    (dim_name.clone(), DimensionUniverse { keys, kind })
+                })
+                .collect(),
+        },
+    }
 }
 
 impl PyCodeRepository {
@@ -108,26 +157,33 @@ impl PyCodeRepository {
     pub(in crate::daemon) fn extract_upstream_partition_keys(
         &self,
         conditions: &[AssetConditionInfo],
-    ) -> HashMap<String, HashSet<CorePartitionKey>> {
+    ) -> HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)> {
         let guard = self.state.read().unwrap();
         let Some(state) = guard.as_ref() else {
             return HashMap::new();
         };
 
-        let mut map: HashMap<String, HashSet<CorePartitionKey>> = HashMap::new();
+        let mut map: HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)> =
+            HashMap::new();
         for cond in conditions {
             if let Some(ref pi) = cond.partition_info {
+                // Conditioned assets re-sync from their refreshed
+                // PartitionInfo each tick, so Frozen here is fine.
                 map.entry(cond.asset_key.clone())
-                    .or_insert_with(|| pi.all_keys.clone());
+                    .or_insert_with(|| (pi.all_keys.clone(), PartitionUniverse::Frozen));
                 for (_, upstream_key) in pi.mappings.keys() {
                     if !map.contains_key(upstream_key)
                         && let Some(node) = state.node_map.get(upstream_key)
                         && let Some(def) = node.partitions_def()
-                        && let Ok(keys) = def.get_partition_keys()
                     {
-                        let core_keys: HashSet<CorePartitionKey> =
-                            keys.iter().map(CorePartitionKey::from).collect();
-                        map.insert(upstream_key.clone(), core_keys);
+                        let now = chrono::Local::now().naive_local();
+                        let universe = partition_universe_for(def, now);
+                        let core_keys: HashSet<CorePartitionKey> = def
+                            .get_partition_keys()
+                            .ok()
+                            .map(|keys| keys.iter().map(CorePartitionKey::from).collect())
+                            .unwrap_or_default();
+                        map.insert(upstream_key.clone(), (core_keys, universe));
                     }
                 }
             }
@@ -234,8 +290,9 @@ pub(super) struct ConditionEvalLoopConfig {
     pub max_ticks_retained: Option<usize>,
     pub eval_tx: tokio::sync::mpsc::UnboundedSender<ConditionEvalWriteMsg>,
     pub max_evals_retained: Option<usize>,
-    /// Upstream partition keys, pre-extracted with GIL at daemon start.
-    pub upstream_partition_keys: HashMap<String, HashSet<CorePartitionKey>>,
+    /// Upstream partition keys (+ how each set evolves), pre-extracted with
+    /// GIL at daemon start.
+    pub upstream_partition_keys: HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)>,
 }
 
 /// Background loop that periodically evaluates automation conditions on assets.
