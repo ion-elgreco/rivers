@@ -612,6 +612,66 @@ class TestBackfillRerun:
         with pytest.raises(Exception, match="not found"):
             repo.rerun_backfill("nonexistent-id")
 
+    def test_rerun_skips_keys_removed_from_def(self, storage):
+        """Rerunning after the def shrank replays the surviving keys instead
+        of hard-erroring the whole rerun."""
+
+        def build_repo(keys):
+            @rs.Asset(
+                partitions_def=_static_pd(keys), io_handler=rs.InMemoryIOHandler()
+            )
+            def asset(context: rs.AssetExecutionContext) -> int:
+                return 1
+
+            repo = rs.CodeRepository(
+                assets=[asset], default_executor=rs.Executor.in_process()
+            )
+            repo.resolve(storage=storage)
+            return repo
+
+        original = build_repo(["a", "b", "c"]).backfill(
+            selection=["asset"],
+            partition_keys=[rs.PartitionKey.single(k) for k in ("a", "b", "c")],
+        )
+        assert original.completed == 3
+
+        redeployed = build_repo(["a", "b"])
+        rerun = redeployed.rerun_backfill(original.backfill_id)
+        assert rerun.num_partitions == 2
+        assert rerun.completed == 2
+
+        dry = redeployed.rerun_backfill(original.backfill_id, dry_run=True)
+        assert dry.is_dry_run
+        assert dry.num_partitions == 2
+
+    def test_rerun_with_no_surviving_keys_errors(self, storage):
+        def build_repo(keys):
+            @rs.Asset(
+                partitions_def=_static_pd(keys), io_handler=rs.InMemoryIOHandler()
+            )
+            def asset(context: rs.AssetExecutionContext) -> int:
+                return 1
+
+            repo = rs.CodeRepository(
+                assets=[asset], default_executor=rs.Executor.in_process()
+            )
+            repo.resolve(storage=storage)
+            return repo
+
+        original = build_repo(["a", "b"]).backfill(
+            selection=["asset"],
+            partition_keys=[rs.PartitionKey.single(k) for k in ("a", "b")],
+        )
+
+        redeployed = build_repo(["x", "y"])
+        with pytest.raises(
+            ExecutionError,
+            match=re.escape(
+                "none of its 2 partitions are valid for the current definitions"
+            ),
+        ):
+            redeployed.rerun_backfill(original.backfill_id)
+
     def test_rerun_dry_run(self, executor_env):
         executor, _ = executor_env
 
