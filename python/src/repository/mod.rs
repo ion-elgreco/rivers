@@ -198,26 +198,42 @@ fn validate_backfill_strategy(
     Ok(())
 }
 
-async fn verify_dynamic_partition_keys(
+/// Storage-backed membership check: returns the `(asset, ns, key)` triples
+/// that are NOT registered. Storage failures propagate — an unreachable
+/// store says nothing about whether a key is retired.
+async fn unregistered_dynamic_keys(
     storage: &SurrealStorage,
     code_location_id: &str,
     checks: &[DynamicKeyCheck],
-) -> PyResult<()> {
+) -> PyResult<Vec<(String, String, String)>> {
     let ctx = rivers_core::storage::CodeLocationContext::new(code_location_id);
     let scoped = storage.for_code_location(&ctx);
+    let mut missing = Vec::new();
     for (asset, ns, keys) in checks {
         for key in keys {
             let known = scoped.has_dynamic_partition(ns, key).await.map_err(|e| {
                 ExecutionError::new_err(format!("Failed to check dynamic partition '{key}': {e}"))
             })?;
             if !known {
-                return Err(ExecutionError::new_err(format!(
-                    "Invalid partition_key '{key}' for asset '{asset}': not a registered \
-                     dynamic partition key of namespace '{ns}'. Register it with \
-                     add_dynamic_partitions(\"{ns}\", [...]) first."
-                )));
+                missing.push((asset.clone(), ns.clone(), key.clone()));
             }
         }
+    }
+    Ok(missing)
+}
+
+async fn verify_dynamic_partition_keys(
+    storage: &SurrealStorage,
+    code_location_id: &str,
+    checks: &[DynamicKeyCheck],
+) -> PyResult<()> {
+    let missing = unregistered_dynamic_keys(storage, code_location_id, checks).await?;
+    if let Some((asset, ns, key)) = missing.first() {
+        return Err(ExecutionError::new_err(format!(
+            "Invalid partition_key '{key}' for asset '{asset}': not a registered \
+             dynamic partition key of namespace '{ns}'. Register it with \
+             add_dynamic_partitions(\"{ns}\", [...]) first."
+        )));
     }
     Ok(())
 }
@@ -3443,20 +3459,22 @@ impl PyCodeRepository {
                     state.code_location_id.clone(),
                 )
             };
-            let partition_keys: Vec<PyPartitionKey> = candidates
-                .into_iter()
-                .filter_map(|(key, checks)| {
-                    (checks.is_empty()
-                        || rt()
-                            .block_on(verify_dynamic_partition_keys(
-                                &storage,
-                                &code_location_id,
-                                &checks,
-                            ))
-                            .is_ok())
-                    .then_some(key)
-                })
-                .collect();
+            let mut partition_keys: Vec<PyPartitionKey> = Vec::with_capacity(candidates.len());
+            for (key, checks) in candidates {
+                // Only a genuinely unregistered key is retired — a storage
+                // failure says nothing about the key and must abort the rerun.
+                let retired = !checks.is_empty()
+                    && !rt()
+                        .block_on(unregistered_dynamic_keys(
+                            &storage,
+                            &code_location_id,
+                            &checks,
+                        ))?
+                        .is_empty();
+                if !retired {
+                    partition_keys.push(key);
+                }
+            }
             if partition_keys.len() < total {
                 tracing::warn!(
                     target: "rivers::repo",

@@ -672,6 +672,35 @@ class TestBackfillRerun:
         assert dry.is_dry_run
         assert dry.num_partitions == 2
 
+    def test_rerun_skips_retired_dynamic_keys(self, storage):
+        """A dynamic key deleted since the original backfill is skipped on
+        rerun. Only a genuinely unregistered key counts as retired — a
+        storage failure during the check aborts the rerun instead of
+        silently dropping replayable partitions."""
+
+        @rs.Asset(
+            partitions_def=rs.PartitionsDefinition.dynamic("tenants"),
+            io_handler=rs.InMemoryIOHandler(),
+        )
+        def asset(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+        repo.resolve(storage=storage)
+        storage.add_dynamic_partitions("tenants", ["acme", "globex"])
+        original = repo.backfill(
+            selection=["asset"],
+            partition_keys=[rs.PartitionKey.single(k) for k in ("acme", "globex")],
+        )
+        assert original.completed == 2
+
+        storage.delete_dynamic_partition("tenants", "globex")
+        rerun = repo.rerun_backfill(original.backfill_id)
+        assert rerun.num_partitions == 1
+        assert rerun.completed == 1
+
     def test_rerun_with_no_surviving_keys_errors(self, storage):
         def build_repo(keys):
             @rs.Asset(
