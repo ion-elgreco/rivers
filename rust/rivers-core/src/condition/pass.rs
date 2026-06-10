@@ -436,7 +436,34 @@ impl ConditionPass {
                 .or_default();
             match tm.selection {
                 Some(PartitionSelection::Keys(keys)) if !keys.is_empty() => {
-                    partitioned_mats.push((tm.asset_key, keys.into_iter().collect()));
+                    // A mapped selection can name keys this asset doesn't
+                    // have (e.g. a time_window shift when the upstream's
+                    // range extends past this asset's) — constrain to real
+                    // partitions instead of dispatching phantom ones.
+                    let total = keys.len();
+                    let surviving: Vec<PartitionKey> = match self
+                        .conditions_by_key
+                        .get(tm.asset_key.as_str())
+                        .map(|&idx| &self.conditions[idx])
+                        .and_then(|info| info.partition_info.as_ref())
+                    {
+                        Some(pi) => keys
+                            .into_iter()
+                            .filter(|k| pi.all_keys.contains(k))
+                            .collect(),
+                        None => keys.into_iter().collect(),
+                    };
+                    if surviving.len() < total {
+                        tracing::warn!(
+                            target: "rivers::daemon",
+                            asset_key = %tm.asset_key,
+                            dropped = total - surviving.len(),
+                            "condition selection named partition keys the asset does not have; dropping them"
+                        );
+                    }
+                    if !surviving.is_empty() {
+                        partitioned_mats.push((tm.asset_key, surviving));
+                    }
                 }
                 Some(PartitionSelection::All) | None => {
                     let resolved = self
@@ -501,6 +528,67 @@ mod tests {
             .and_utc()
             .timestamp_nanos_opt()
             .unwrap()
+    }
+
+    #[test]
+    fn classify_drops_mapped_keys_the_asset_does_not_have() {
+        // A mapped selection can name keys outside the asset's own range
+        // (e.g. a time_window shift when the upstream's range extends past
+        // this asset's) — those must not dispatch a materialization of a
+        // partition that doesn't exist.
+        let mut pass = ConditionPass::new(
+            AssetConditionCache::default(),
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "down".to_string(),
+                condition: ConditionNode::InProgress,
+                partition_info: Some(PartitionInfo {
+                    all_keys: make_daily_keys(&["2024-01-01", "2024-01-02"]),
+                    mappings: HashMap::new(),
+                    time_window_fmt: None,
+                }),
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        );
+        let plan = pass.classify_materializations(vec![ToMaterialize {
+            asset_key: "down".to_string(),
+            selection: Some(PartitionSelection::Keys(
+                [spk("2024-01-02"), spk("2024-08-16")].into_iter().collect(),
+            )),
+        }]);
+        assert_eq!(
+            plan.single_partition_groups,
+            HashMap::from([(spk("2024-01-02"), vec!["down".to_string()])])
+        );
+        assert!(plan.multi_partition_backfills.is_empty());
+        assert!(plan.unpartitioned.is_empty());
+    }
+
+    #[test]
+    fn classify_skips_asset_when_no_mapped_key_survives() {
+        let mut pass = ConditionPass::new(
+            AssetConditionCache::default(),
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "down".to_string(),
+                condition: ConditionNode::InProgress,
+                partition_info: Some(PartitionInfo {
+                    all_keys: make_daily_keys(&["2024-01-01", "2024-01-02"]),
+                    mappings: HashMap::new(),
+                    time_window_fmt: None,
+                }),
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        );
+        let plan = pass.classify_materializations(vec![ToMaterialize {
+            asset_key: "down".to_string(),
+            selection: Some(PartitionSelection::Keys(
+                [spk("2024-08-16")].into_iter().collect(),
+            )),
+        }]);
+        assert!(plan.is_empty());
     }
 
     #[test]
