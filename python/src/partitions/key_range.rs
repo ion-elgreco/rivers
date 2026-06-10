@@ -285,11 +285,35 @@ impl PyPartitionKeyRange {
                     // Shape mismatches are reported by the mapping/def checks.
                     return Ok(());
                 };
-                for (name, sel) in dimensions {
-                    if let DimensionSelection::Range { from_key, to_key } = sel
-                        && let Some((_, dd)) = dim_defs.iter().find(|(n, _)| n == name)
-                    {
-                        validate_single_dim_range(dd, from_key, to_key, Some(name))?;
+                // Sorted iteration: HashMap order must not pick which
+                // dimension's error surfaces.
+                let mut entries: Vec<_> = dimensions.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                for (name, sel) in entries {
+                    let Some((_, dd)) = dim_defs.iter().find(|(n, _)| n == name) else {
+                        return Err(unknown_dims_message(&[name], dim_defs));
+                    };
+                    match sel {
+                        DimensionSelection::Range { from_key, to_key } => {
+                            validate_single_dim_range(dd, from_key, to_key, Some(name))?;
+                        }
+                        DimensionSelection::Keys(keys) => {
+                            let mut sorted: Vec<&String> = keys.iter().collect();
+                            sorted.sort();
+                            for k in sorted {
+                                let single = PyPartitionKey::Single {
+                                    key: vec![k.clone()],
+                                };
+                                let valid = dd
+                                    .validate_partition_key(&single)
+                                    .map_err(|e| e.to_string())?;
+                                if !valid {
+                                    return Err(format!(
+                                        "'{k}' is not a partition key of dimension '{name}'"
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(())

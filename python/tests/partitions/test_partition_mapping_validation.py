@@ -2402,6 +2402,115 @@ def test_forkeys_range_inverted_rejected():
         make_repo([upstream, downstream])
 
 
+def _multi_parts():
+    return rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.static_(["2024-01-01", "2024-01-02"]),
+            "region": rs.PartitionsDefinition.static_(["us", "eu"]),
+        }
+    )
+
+
+def test_forkeys_multi_unknown_dimension_rejected():
+    """A multi-range selector naming a dimension the downstream doesn't have
+    can never match a key — every downstream partition would silently Skip
+    its dep. Surface the typo at resolve time."""
+    parts = _multi_parts()
+
+    @rs.Asset
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=parts,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.for_keys(
+                    [rs.PartitionKeyRange.multi({"regon": ["us"]})]
+                ),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream
+
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': "
+            "Unknown dimension 'regon' in partition range; "
+            "available dimensions: 'date', 'region'"
+        ),
+    ):
+        make_repo([upstream, downstream])
+
+
+def test_forkeys_multi_keys_selector_unknown_key_rejected():
+    """Keys sub-selectors must be validated like Range endpoints — a bogus
+    key silently matches nothing."""
+    parts = _multi_parts()
+
+    @rs.Asset
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=parts,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.for_keys(
+                    [rs.PartitionKeyRange.multi({"region": ["mars"]})]
+                ),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream
+
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': "
+            "'mars' is not a partition key of dimension 'region'"
+        ),
+    ):
+        make_repo([upstream, downstream])
+
+
+def test_forkeys_multi_valid_selectors_accepted():
+    """Valid multi selectors (Range + Keys) pass the new validation."""
+    parts = _multi_parts()
+
+    @rs.Asset
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=parts,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.for_keys(
+                    [
+                        rs.PartitionKeyRange.multi(
+                            {
+                                "date": ("2024-01-01", "2024-01-02"),
+                                "region": ["us"],
+                            }
+                        )
+                    ]
+                ),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream
+
+    make_repo([upstream, downstream])
+
+
 def test_forkeys_multiple_valid_keys():
     """ForKeys with multiple valid keys is accepted."""
     parts = rs.PartitionsDefinition.static_(STATIC_KEYS)
