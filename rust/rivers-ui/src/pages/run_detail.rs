@@ -5,6 +5,7 @@ use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 
 use crate::components::live::{LiveStatusChip, use_live_kick};
+use crate::components::pagination::{InfiniteEventList, PaginatedView};
 use crate::components::ui_kit::{Crumb, StatusChip, Topbar};
 use crate::helpers::{
     code_location_label, format_elapsed, format_relative_time, format_timestamp,
@@ -14,7 +15,10 @@ use crate::loc::{loc_path, use_current_location};
 use crate::now::use_now;
 use crate::server_fns::actions::{cancel_run, rerun_run};
 use crate::server_fns::locations::list_code_locations;
-use crate::server_fns::runs::{get_run, get_run_events};
+use crate::server_fns::runs::{
+    get_run, get_run_asset_events_page, get_run_log_events, get_run_step_events,
+    get_run_structured_events_page,
+};
 use crate::types::{EventType, RunStatus, StoredEvent};
 
 #[derive(Clone)]
@@ -111,6 +115,11 @@ pub fn RunDetailPage() -> impl IntoView {
     let loc = use_current_location();
 
     let (refresh_tick, set_refresh_tick) = signal(0u32);
+    // Tracked run_id for reactive children (the resources above use the untracked `run_id`).
+    let run_id_memo = Memo::new(move |_| {
+        params.track();
+        run_id()
+    });
 
     let run = Resource::new(
         move || {
@@ -119,12 +128,20 @@ pub fn RunDetailPage() -> impl IntoView {
         },
         |(id, _)| get_run(id),
     );
-    let events = Resource::new(
+    // Timeline/DAG need only step events; materializations are paginated elsewhere.
+    let step_events = Resource::new(
         move || {
             params.track();
             (run_id(), refresh_tick.get())
         },
-        |(id, _)| get_run_events(id),
+        |(id, _)| get_run_step_events(id),
+    );
+    let log_events = Resource::new(
+        move || {
+            params.track();
+            (run_id(), refresh_tick.get())
+        },
+        |(id, _)| get_run_log_events(id),
     );
     let topology = Resource::new(
         move || loc.get(),
@@ -133,6 +150,17 @@ pub fn RunDetailPage() -> impl IntoView {
     let locations = Resource::new(|| (), |_| list_code_locations());
 
     let (selected_step, set_selected_step) = signal(Option::<String>::None);
+    // Asset-drawer pagination lives here, not in the drawer, so a live re-mount
+    // of the drawer (the timeline Transition re-runs on each refresh tick) can't
+    // reset it. Reset only when the selected asset or the run changes.
+    let (mat_page, set_mat_page) = signal(0u64);
+    let (obs_page, set_obs_page) = signal(0u64);
+    Effect::new(move |_| {
+        selected_step.track();
+        run_id_memo.track();
+        set_mat_page.set(0);
+        set_obs_page.set(0);
+    });
     let (log_tab, set_log_tab) = signal("events".to_string());
     let (log_level, set_log_level) = signal("all".to_string());
     let (view_mode, set_view_mode) = signal("gantt".to_string());
@@ -258,7 +286,7 @@ pub fn RunDetailPage() -> impl IntoView {
                                     })}
                                     {record.partition_key.as_ref().map(|p| view! {
                                         <span class="run-trigger-meta-sep">"·"</span>
-                                        <span class="run-trigger-meta-item">"partition "<span class="run-trigger-meta-value">{p.clone()}</span></span>
+                                        <span class="run-trigger-meta-item">"partition "<span class="run-trigger-meta-value">{p.label()}</span></span>
                                     })}
                                     {(!record.tags.is_empty()).then(|| {
                                         let tag_spans = record.tags.iter().map(|(k, v)| {
@@ -295,38 +323,41 @@ pub fn RunDetailPage() -> impl IntoView {
         </Transition>
 
         <div class="tab-content">
-            <Transition fallback=move || view! { <div class="loading">"Loading events..."</div> }>
+            <Transition fallback=move || view! { <div class="loading">"Loading timeline..."</div> }>
                 {move || {
                     let run_data = run.get().and_then(|r| r.ok()).flatten();
-                    events.get().map(|result| match result {
-                        Ok(evts) => {
-                            let run_start = run_data.as_ref().map(|r| r.start_time);
-                            view! {
-                                <RunTimelinePanel
-                                    events={evts.clone()}
-                                    run_start={run_start}
-                                    node_names={run_data.as_ref().map(|r| r.node_names.clone()).unwrap_or_default()}
-                                    topology={topology.get().and_then(|r| r.ok())}
-                                    selected_step=selected_step
-                                    on_select=set_selected_step
-                                    view_mode=view_mode
-                                    set_view_mode=set_view_mode
-                                />
-                                <RunLogPanel
-                                    events={evts}
-                                    selected_step=selected_step
-                                    on_clear=set_selected_step
-                                    log_tab=log_tab
-                                    set_log_tab=set_log_tab
-                                    log_level=log_level
-                                    set_log_level=set_log_level
-                                />
-                            }.into_any()
-                        }
-                        Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    let steps = step_events.get()?.ok()?;
+                    let run_start = run_data.as_ref().map(|r| r.start_time);
+                    Some(view! {
+                        <RunTimelinePanel
+                            events={steps}
+                            run_start={run_start}
+                            node_names={run_data.as_ref().map(|r| r.node_names.clone()).unwrap_or_default()}
+                            topology={topology.get().and_then(|r| r.ok())}
+                            selected_step=selected_step
+                            on_select=set_selected_step
+                            view_mode=view_mode
+                            set_view_mode=set_view_mode
+                        />
                     })
                 }}
             </Transition>
+            // Created once (not in the resource Transition) so a live refresh can't
+            // re-mount it and reset the scroll buffer. `log_events` is reactive, so
+            // stdout/stderr still update live.
+            <RunLogPanel
+                run_id=run_id_memo
+                refresh_tick=refresh_tick
+                log_events=Signal::derive(move || {
+                    log_events.get().and_then(|r| r.ok()).unwrap_or_default()
+                })
+                selected_step=selected_step
+                on_clear=set_selected_step
+                log_tab=log_tab
+                set_log_tab=set_log_tab
+                log_level=log_level
+                set_log_level=set_log_level
+            />
         </div>
 
         </div>
@@ -335,13 +366,18 @@ pub fn RunDetailPage() -> impl IntoView {
             <Transition fallback=|| ()>
                 {move || {
                     let asset = selected_step.get()?;
-                    let evts = events.get()?.ok()?;
+                    let steps = step_events.get()?.ok()?;
                     let topo = topology.get().and_then(|r| r.ok());
                     Some(view! {
                         <RunAssetDrawer
                             asset_key=asset
-                            events=evts
+                            run_id=run_id()
+                            step_events=steps
                             topology=topo
+                            mat_page=mat_page
+                            set_mat_page=set_mat_page
+                            obs_page=obs_page
+                            set_obs_page=set_obs_page
                             on_close=set_selected_step
                         />
                     })
@@ -350,6 +386,23 @@ pub fn RunDetailPage() -> impl IntoView {
         </Show>
         </div>
     }
+}
+
+/// Flatten a run's `LogOutput` events into `(asset, line)` pairs for a metadata
+/// key (`stdout`/`stderr`/`logs`).
+fn extract_log_lines(events: &[StoredEvent], key: &str) -> Vec<(String, String)> {
+    events
+        .iter()
+        .flat_map(|e| {
+            let asset = e.asset_key.clone().unwrap_or_default();
+            e.metadata
+                .iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v.as_text())
+                .filter(|v| !v.is_empty())
+                .map(move |v| (asset.clone(), v))
+        })
+        .collect()
 }
 
 /// The `variant` label drives the per-event dot color so observations look
@@ -426,22 +479,28 @@ fn asset_chip_status(asset_events: &[StoredEvent]) -> (&'static str, &'static st
 #[component]
 fn RunAssetDrawer(
     asset_key: String,
-    events: Vec<StoredEvent>,
+    run_id: String,
+    step_events: Vec<StoredEvent>,
     topology: Option<crate::types::GraphTopology>,
+    mat_page: ReadSignal<u64>,
+    set_mat_page: WriteSignal<u64>,
+    obs_page: ReadSignal<u64>,
+    set_obs_page: WriteSignal<u64>,
     on_close: WriteSignal<Option<String>>,
 ) -> impl IntoView {
-    let asset_events: Vec<StoredEvent> = events
+    // Status/timing from this asset's step events; materializations paginated below.
+    let asset_step_events: Vec<StoredEvent> = step_events
         .iter()
         .filter(|e| e.asset_key.as_ref() == Some(&asset_key))
         .cloned()
         .collect();
 
-    let start_ns: Option<i64> = asset_events
+    let start_ns: Option<i64> = asset_step_events
         .iter()
         .filter(|e| matches!(e.event_type, EventType::StepStart))
         .map(|e| e.timestamp)
         .min();
-    let end_ns: Option<i64> = asset_events
+    let end_ns: Option<i64> = asset_step_events
         .iter()
         .filter(|e| {
             matches!(
@@ -452,7 +511,7 @@ fn RunAssetDrawer(
         .map(|e| e.timestamp)
         .max();
     let has_start = start_ns.is_some();
-    let (status_label, chip) = asset_chip_status(&asset_events);
+    let (status_label, chip) = asset_chip_status(&asset_step_events);
     let status_for_chip = chip.to_string();
     // For finished steps the duration is fixed; for running steps it ticks
     // each second by re-reading the global `now` clock.
@@ -474,31 +533,71 @@ fn RunAssetDrawer(
     let started_label = start_ns
         .map(|t| format_log_timestamp(t))
         .unwrap_or_else(|| "—".to_string());
-    let events_count = asset_events.len();
-    let n_materializations = asset_events
-        .iter()
-        .filter(|e| matches!(e.event_type, EventType::Materialization))
-        .count();
-    let n_observations = asset_events
-        .iter()
-        .filter(|e| matches!(e.event_type, EventType::Observation))
-        .count();
-
     let upstream: Vec<String> = topology
         .as_ref()
         .map(|t| t.direct_upstream(&asset_key))
         .unwrap_or_default();
 
-    let materializations: Vec<StoredEvent> = asset_events
-        .iter()
-        .filter(|e| matches!(e.event_type, EventType::Materialization))
-        .cloned()
-        .collect();
-    let observations: Vec<StoredEvent> = asset_events
-        .iter()
-        .filter(|e| matches!(e.event_type, EventType::Observation))
-        .cloned()
-        .collect();
+    // Paginated materialization / observation cards; page totals drive the headers.
+    let (mat_page_size, set_mat_page_size) = signal(25u64);
+    let materializations_page = {
+        let run_id = run_id.clone();
+        let asset_key = asset_key.clone();
+        Resource::new(
+            move || (mat_page.get(), mat_page_size.get()),
+            move |(p, ps)| {
+                let run_id = run_id.clone();
+                let asset_key = asset_key.clone();
+                async move {
+                    get_run_asset_events_page(
+                        run_id,
+                        asset_key,
+                        "Materialization".to_string(),
+                        p * ps,
+                        ps,
+                    )
+                    .await
+                }
+            },
+        )
+    };
+    let (obs_page_size, set_obs_page_size) = signal(25u64);
+    let observations_page = {
+        let run_id = run_id.clone();
+        let asset_key = asset_key.clone();
+        Resource::new(
+            move || (obs_page.get(), obs_page_size.get()),
+            move |(p, ps)| {
+                let run_id = run_id.clone();
+                let asset_key = asset_key.clone();
+                async move {
+                    get_run_asset_events_page(
+                        run_id,
+                        asset_key,
+                        "Observation".to_string(),
+                        p * ps,
+                        ps,
+                    )
+                    .await
+                }
+            },
+        )
+    };
+    let mat_total = Signal::derive(move || {
+        materializations_page
+            .get()
+            .and_then(|r| r.ok())
+            .map(|p| p.total)
+            .unwrap_or(0)
+    });
+    let obs_total = Signal::derive(move || {
+        observations_page
+            .get()
+            .and_then(|r| r.ok())
+            .map(|p| p.total)
+            .unwrap_or(0)
+    });
+    let step_count = asset_step_events.len() as u64;
 
     let (loc_ns, loc_name) = use_current_location().get();
     let asset_href = loc_path(&loc_ns, &loc_name, &format!("assets/{asset_key}"));
@@ -535,7 +634,7 @@ fn RunAssetDrawer(
                     </div>
                     <div class="run-asset-drawer-kv">
                         <div class="run-asset-drawer-kv-label">"EVENTS"</div>
-                        <div class="run-asset-drawer-kv-value">{events_count.to_string()}</div>
+                        <div class="run-asset-drawer-kv-value">{move || (mat_total.get() + obs_total.get() + step_count).to_string()}</div>
                     </div>
                     <div class="run-asset-drawer-kv">
                         <div class="run-asset-drawer-kv-label">"UPSTREAM"</div>
@@ -543,11 +642,11 @@ fn RunAssetDrawer(
                     </div>
                     <div class="run-asset-drawer-kv">
                         <div class="run-asset-drawer-kv-label">"MATERIALIZATIONS"</div>
-                        <div class="run-asset-drawer-kv-value">{n_materializations.to_string()}</div>
+                        <div class="run-asset-drawer-kv-value">{move || mat_total.get().to_string()}</div>
                     </div>
                     <div class="run-asset-drawer-kv">
                         <div class="run-asset-drawer-kv-label">"OBSERVATIONS"</div>
-                        <div class="run-asset-drawer-kv-value">{n_observations.to_string()}</div>
+                        <div class="run-asset-drawer-kv-value">{move || obs_total.get().to_string()}</div>
                     </div>
                 </div>
             </div>
@@ -569,25 +668,36 @@ fn RunAssetDrawer(
                 </div>
             })}
 
-            {(!materializations.is_empty()).then(|| {
-                let mat_views = render_event_cards(materializations, "materialization");
-                view! {
-                    <div class="run-asset-drawer-section">
-                        <div class="section-header-label" style="margin-bottom:8px">"OUTPUT · MATERIALIZATION"</div>
-                        <div class="run-asset-drawer-materializations">{mat_views}</div>
-                    </div>
-                }
-            })}
+            <div class="run-asset-drawer-section">
+                <div class="section-header-label" style="margin-bottom:8px">"OUTPUT · MATERIALIZATION"</div>
+                <PaginatedView
+                    data=materializations_page
+                    page=mat_page
+                    set_page=set_mat_page
+                    page_size=mat_page_size
+                    set_page_size=set_mat_page_size
+                    empty=move || view! { <div class="log-empty">"No materializations."</div> }
+                    render={move |rows: Vec<crate::types::StoredEvent>| view! {
+                        <div class="run-asset-drawer-materializations">{render_event_cards(rows, "materialization")}</div>
+                    }.into_any()}
+                />
+            </div>
 
-            {(!observations.is_empty()).then(|| {
-                let obs_views = render_event_cards(observations, "observation");
-                view! {
-                    <div class="run-asset-drawer-section">
-                        <div class="section-header-label" style="margin-bottom:8px">"OBSERVATION"</div>
-                        <div class="run-asset-drawer-materializations">{obs_views}</div>
-                    </div>
-                }
-            })}
+            <Show when={move || obs_total.get() > 0}>
+                <div class="run-asset-drawer-section">
+                    <div class="section-header-label" style="margin-bottom:8px">"OBSERVATION"</div>
+                    <PaginatedView
+                        data=observations_page
+                        page=obs_page
+                        set_page=set_obs_page
+                        page_size=obs_page_size
+                        set_page_size=set_obs_page_size
+                        render={move |rows: Vec<crate::types::StoredEvent>| view! {
+                            <div class="run-asset-drawer-materializations">{render_event_cards(rows, "observation")}</div>
+                        }.into_any()}
+                    />
+                </div>
+            </Show>
 
         </div>
     }
@@ -938,11 +1048,20 @@ fn event_info(evt: &StoredEvent) -> String {
             .find(|(k, _)| k == "error")
             .map(|(_, v)| v.as_text())
             .unwrap_or_else(|| "Step failed".to_string()),
-        EventType::Materialization => evt
-            .data_version
-            .as_ref()
-            .map(|v| format!("Materialized (v:{})", short_id(v, 8)))
-            .unwrap_or_else(|| "Materialized".to_string()),
+        EventType::Materialization => {
+            let mut parts = Vec::new();
+            if let Some(p) = &evt.partition_key {
+                parts.push(format!("partition {p}"));
+            }
+            if let Some(v) = &evt.data_version {
+                parts.push(format!("v:{}", short_id(v, 8)));
+            }
+            if parts.is_empty() {
+                "Materialized".to_string()
+            } else {
+                format!("Materialized ({})", parts.join(", "))
+            }
+        }
         EventType::Observation => "Observed".to_string(),
         EventType::LogOutput => {
             let parts: Vec<&str> = evt
@@ -1195,7 +1314,9 @@ fn render_log_rows(data: Vec<(String, String)>, level_filter: &str) -> Vec<impl 
 
 #[component]
 fn RunLogPanel(
-    events: Vec<StoredEvent>,
+    run_id: Memo<String>,
+    refresh_tick: ReadSignal<u32>,
+    log_events: Signal<Vec<StoredEvent>>,
     selected_step: ReadSignal<Option<String>>,
     on_clear: WriteSignal<Option<String>>,
     log_tab: ReadSignal<String>,
@@ -1203,66 +1324,49 @@ fn RunLogPanel(
     log_level: ReadSignal<String>,
     set_log_level: WriteSignal<String>,
 ) -> impl IntoView {
-    let all_structured: Vec<StoredEvent> = events
-        .iter()
-        .filter(|e| !matches!(e.event_type, EventType::LogOutput))
-        .cloned()
-        .collect();
+    // Server-paginated — a `single_run` run can emit 15k+ events, never all at once.
+    let (ev_page, set_ev_page) = signal(0u64);
+    const EV_PAGE_SIZE: u64 = 50;
+    let structured_page = Resource::new(
+        move || {
+            (
+                run_id.get(),
+                selected_step.get(),
+                ev_page.get(),
+                refresh_tick.get(),
+            )
+        },
+        move |(rid, sel, p, _)| async move {
+            get_run_structured_events_page(rid, sel, p * EV_PAGE_SIZE, EV_PAGE_SIZE).await
+        },
+    );
+    // Reset to page 0 when the step filter or the run changes.
+    Effect::new(move |_| {
+        selected_step.track();
+        run_id.track();
+        set_ev_page.set(0);
+    });
 
-    let extract_metadata = |key: &str| -> Vec<(String, String)> {
-        events
-            .iter()
-            .filter(|e| matches!(e.event_type, EventType::LogOutput))
-            .flat_map(|e| {
-                let asset = e.asset_key.clone().unwrap_or_default();
-                e.metadata
-                    .iter()
-                    .filter(|(k, _)| k == key)
-                    .map(|(_, v)| v.as_text())
-                    .filter(|v| !v.is_empty())
-                    .map(move |v| (asset.clone(), v))
-            })
-            .collect()
-    };
-    let all_stdout = extract_metadata("stdout");
-    let all_stderr = extract_metadata("stderr");
-    let all_logs = extract_metadata("logs");
+    // stdout/stderr/logs derive from the small LogOutput stream, which refreshes live.
+    let all_stdout = Signal::derive(move || extract_log_lines(&log_events.get(), "stdout"));
+    let all_stderr = Signal::derive(move || extract_log_lines(&log_events.get(), "stderr"));
+    let all_logs = Signal::derive(move || extract_log_lines(&log_events.get(), "logs"));
 
-    let make_filtered = |data: Vec<(String, String)>| {
+    let make_filtered = move |data: Signal<Vec<(String, String)>>| {
         Signal::derive(move || {
-            let sel = selected_step.get();
-            match sel {
-                Some(ref name) => data
-                    .iter()
-                    .filter(|(a, _)| a == name)
-                    .cloned()
+            let d = data.get();
+            match selected_step.get() {
+                Some(name) => d
+                    .into_iter()
+                    .filter(|(a, _)| *a == name)
                     .collect::<Vec<_>>(),
-                None => data.clone(),
+                None => d,
             }
         })
     };
-
-    let structured_events = Signal::derive({
-        let data = all_structured.clone();
-        move || {
-            let sel = selected_step.get();
-            match sel {
-                Some(ref name) => data
-                    .iter()
-                    .filter(|e| e.asset_key.as_ref() == Some(name))
-                    .cloned()
-                    .collect::<Vec<_>>(),
-                None => data.clone(),
-            }
-        }
-    });
-    let stdout_lines = make_filtered(all_stdout.clone());
-    let stderr_lines = make_filtered(all_stderr.clone());
-    let log_lines = make_filtered(all_logs.clone());
-
-    let stdout_count_all = all_stdout.len();
-    let stderr_count_all = all_stderr.len();
-    let logs_count_all = all_logs.len();
+    let stdout_lines = make_filtered(all_stdout);
+    let stderr_lines = make_filtered(all_stderr);
+    let log_lines = make_filtered(all_logs);
 
     view! {
         <div class="log-panel">
@@ -1276,31 +1380,31 @@ fn RunLogPanel(
                     <button
                         class=move || if log_tab.get() == "logs" { "log-tab log-tab--active" } else { "log-tab" }
                         on:click=move |_| set_log_tab.set("logs".to_string())
-                        disabled=move || logs_count_all == 0
+                        disabled=move || all_logs.get().is_empty()
                     >
                         "logs"
-                        {(logs_count_all > 0).then(|| view! {
-                            <span class="log-tab-badge">{logs_count_all}</span>
+                        {move || (!all_logs.get().is_empty()).then(|| view! {
+                            <span class="log-tab-badge">{all_logs.get().len()}</span>
                         })}
                     </button>
                     <button
                         class=move || if log_tab.get() == "stdout" { "log-tab log-tab--active" } else { "log-tab" }
                         on:click=move |_| set_log_tab.set("stdout".to_string())
-                        disabled=move || stdout_count_all == 0
+                        disabled=move || all_stdout.get().is_empty()
                     >
                         "stdout"
-                        {(stdout_count_all > 0).then(|| view! {
-                            <span class="log-tab-badge">{stdout_count_all}</span>
+                        {move || (!all_stdout.get().is_empty()).then(|| view! {
+                            <span class="log-tab-badge">{all_stdout.get().len()}</span>
                         })}
                     </button>
                     <button
                         class=move || if log_tab.get() == "stderr" { "log-tab log-tab--active" } else { "log-tab" }
                         on:click=move |_| set_log_tab.set("stderr".to_string())
-                        disabled=move || stderr_count_all == 0
+                        disabled=move || all_stderr.get().is_empty()
                     >
                         "stderr"
-                        {(stderr_count_all > 0).then(|| view! {
-                            <span class="log-tab-badge log-tab-badge--error">{stderr_count_all}</span>
+                        {move || (!all_stderr.get().is_empty()).then(|| view! {
+                            <span class="log-tab-badge log-tab-badge--error">{all_stderr.get().len()}</span>
                         })}
                     </button>
                 </div>
@@ -1347,43 +1451,34 @@ fn RunLogPanel(
                 </div>
             </div>
 
-            <div class="log-panel-body" style=move || if log_tab.get() == "events" { "" } else { "display:none" }>
-                {move || {
-                    let evts = structured_events.get();
-                    if evts.is_empty() {
-                        view! { <div class="log-empty">"No events recorded."</div> }.into_any()
-                    } else {
+            <div style=move || if log_tab.get() == "events" { "" } else { "display:none" }>
+                <div class="log-event-row log-event-head">
+                    <span class="log-col-time">"Time"</span>
+                    <span class="log-col-asset">"Asset"</span>
+                    <span class="log-col-type">"Event"</span>
+                    <span class="log-col-info">"Info"</span>
+                </div>
+                <InfiniteEventList
+                    data=structured_page
+                    page=ev_page
+                    set_page=set_ev_page
+                    empty=move || view! { <div class="log-empty">"No events recorded."</div> }
+                    row={move |evt: crate::types::StoredEvent| {
+                        let row_class = event_row_class(&evt);
+                        let ts = format_log_timestamp(evt.timestamp);
+                        let asset = evt.asset_key.clone().unwrap_or_default();
+                        let etype = event_type_label(&evt);
+                        let info = event_info(&evt);
                         view! {
-                            <table class="log-table">
-                                <thead>
-                                    <tr>
-                                        <th class="log-col-time">"Time"</th>
-                                        <th class="log-col-asset">"Asset"</th>
-                                        <th class="log-col-type">"Event"</th>
-                                        <th class="log-col-info">"Info"</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {evts.into_iter().map(|evt| {
-                                        let row_class = event_row_class(&evt);
-                                        let ts = format_log_timestamp(evt.timestamp);
-                                        let asset = evt.asset_key.clone().unwrap_or_default();
-                                        let etype = event_type_label(&evt);
-                                        let info = event_info(&evt);
-                                        view! {
-                                            <tr class={row_class}>
-                                                <td class="log-col-time"><code>{ts}</code></td>
-                                                <td class="log-col-asset">{asset}</td>
-                                                <td class="log-col-type"><span class="log-type-badge">{etype}</span></td>
-                                                <td class="log-col-info">{info}</td>
-                                            </tr>
-                                        }
-                                    }).collect::<Vec<_>>()}
-                                </tbody>
-                            </table>
+                            <div class=format!("log-event-row {row_class}")>
+                                <span class="log-col-time"><code>{ts}</code></span>
+                                <span class="log-col-asset">{asset}</span>
+                                <span class="log-col-type"><span class="log-type-badge">{etype}</span></span>
+                                <span class="log-col-info">{info}</span>
+                            </div>
                         }.into_any()
-                    }
-                }}
+                    }}
+                />
             </div>
 
             <div class="log-panel-body" style=move || if log_tab.get() == "logs" { "" } else { "display:none" }>

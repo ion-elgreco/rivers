@@ -386,6 +386,7 @@
 .heatmap-cell--running { background: var(--secondary); opacity: 0.75; box-shadow: 0 0 6px var(--secondary); animation: pulse-op 1.4s ease-in-out infinite; }
 .heatmap-cell--failed { background: var(--error); opacity: 1; }
 .heatmap-cell--pending { background: var(--bg-highest); opacity: 0.6; }
+.heatmap-cell--canceled { background: var(--text-muted); opacity: 0.35; }
 .heatmap-legend {
     display: flex;
     gap: 14px;
@@ -406,10 +407,17 @@
 
 /* Rivers hover-info bar: reveals when hovering a cell with labels */
 .heatmap-info {
+    /* Sticky to the viewport bottom so the hover info stays in view even when
+       the cell grid is taller than the screen (long backfills / 1k windows). */
+    position: sticky;
+    bottom: 8px;
+    z-index: 5;
     margin-top: 12px;
     padding: 8px 12px;
     background: var(--bg-highest);
+    border: 1px solid var(--border);
     border-radius: 4px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
     display: flex;
     align-items: center;
     gap: 14px;
@@ -426,6 +434,7 @@
 .heatmap-info-dot--running { background: var(--secondary); box-shadow: 0 0 6px var(--secondary); }
 .heatmap-info-dot--failed { background: var(--error); }
 .heatmap-info-dot--pending { background: var(--bg-highest); border: 1px solid var(--border); opacity: 0.6; }
+.heatmap-info-dot--canceled { background: var(--text-muted); opacity: 0.4; }
 .heatmap-info-label { color: var(--text-muted); }
 .heatmap-info-key { color: var(--text); }
 .heatmap-info-sep { color: var(--text-comment); opacity: 0.6; }

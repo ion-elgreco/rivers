@@ -6,6 +6,7 @@ use leptos_router::hooks::use_params_map;
 
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::materialize_dialog::MaterializeDialog;
+use crate::components::pagination::PaginatedView;
 use crate::components::ui_kit::{
     Crumb, EventGlyphTimeline, GlyphEvent, RecentRunsStrip, StripRun, Topbar,
 };
@@ -15,7 +16,7 @@ use crate::helpers::{
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::actions::{materialize_missing_partitions, trigger_materialize};
-use crate::server_fns::assets::{get_asset, get_asset_events, get_assets};
+use crate::server_fns::assets::{get_asset, get_asset_events, get_asset_events_page, get_assets};
 use crate::server_fns::automation::{get_condition_evals, observe_asset};
 use crate::server_fns::graph::get_graph_topology;
 use crate::server_fns::overview::{get_assets_info, get_partition_status};
@@ -78,6 +79,31 @@ pub fn AssetDetailPage() -> impl IntoView {
 
     let (active_tab, set_active_tab) = use_query_param("tab", "overview");
     let (event_filter, set_event_filter) = use_query_param("event_filter", "All");
+
+    // Paginated events for the Events tab. Keyed on the type-filter pill so
+    // `total` is the true per-filter count; page resets to 0 on change.
+    let (ev_page, set_ev_page) = signal(0u64);
+    let (ev_page_size, set_ev_page_size) = signal(25u64);
+    let events_page = Resource::new(
+        move || {
+            params.track();
+            (
+                loc.get(),
+                key(),
+                event_filter.get(),
+                ev_page.get(),
+                ev_page_size.get(),
+                refresh_tick.get(),
+            )
+        },
+        |((ns, name), key, filter, p, ps, _)| async move {
+            get_asset_events_page(ns, name, key, filter, p * ps, ps).await
+        },
+    );
+    Effect::new(move |_| {
+        event_filter.track();
+        set_ev_page.set(0);
+    });
     let (meta_expanded, set_meta_expanded) = signal(false);
 
     // Derive asset properties into signals (avoids reading Resource outside Transition)
@@ -203,12 +229,10 @@ pub fn AssetDetailPage() -> impl IntoView {
                     // than showing a misleading 0. Only count TERMINAL events
                     // (same filter as the events table body) so the badge matches
                     // what users see when they click in.
-                    let event_count: Option<usize> = events.get().and_then(|r| r.ok()).map(|v| {
-                        use crate::types::EventType::*;
-                        v.iter()
-                            .filter(|e| matches!(e.event_type, Materialization | Observation | StepFailure))
-                            .count()
-                    });
+                    // Full count for the active filter (from the paged total), not
+                    // a windowed count of the first 100 events.
+                    let event_count: Option<usize> =
+                        events_page.get().and_then(|r| r.ok()).map(|p| p.total as usize);
                     let mut tabs: Vec<(&str, &str, Option<usize>)> = vec![
                         ("overview", "Overview", None),
                         ("events", "Events", event_count),
@@ -514,28 +538,18 @@ pub fn AssetDetailPage() -> impl IntoView {
                     }
                 }
             </div>
-            <Transition fallback=move || view! { <div class="loading">"Loading events..."</div> }>
-                {move || {
-                    events.get().map(|result| match result {
-                        Ok(evts) => {
-                            let filter = event_filter.get();
-                            let filtered: Vec<_> = evts.into_iter().filter(|e| {
-                                use crate::types::EventType::*;
-                                let is_shown = matches!(e.event_type, Materialization | Observation | StepFailure);
-                                if !is_shown { return false; }
-                                match filter.as_str() {
-                                    "mat" => matches!(e.event_type, Materialization),
-                                    "fail" => matches!(e.event_type, StepFailure),
-                                    _ => true,
-                                }
-                            }).collect();
-
-                            if filtered.is_empty() {
-                                view! { <div class="empty-state">"No events matching filter."</div> }.into_any()
-                            } else {
+            <PaginatedView
+                data=events_page
+                page=ev_page
+                set_page=set_ev_page
+                page_size=ev_page_size
+                set_page_size=set_ev_page_size
+                fallback=move || view! { <div class="loading">"Loading events..."</div> }
+                empty=move || view! { <div class="empty-state">"No events for this filter."</div> }
+                render={move |rows: Vec<crate::types::StoredEvent>| {
                                 view! {
                                     <div class="events-list">
-                                        {filtered.into_iter().map(|evt| {
+                                        {rows.into_iter().map(|evt| {
                                             let evt_ts = evt.timestamp;
                                             let time_abs = crate::helpers::nanos_to_datetime(evt.timestamp)
                                                 .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -590,12 +604,8 @@ pub fn AssetDetailPage() -> impl IntoView {
                                         }).collect::<Vec<_>>()}
                                     </div>
                                 }.into_any()
-                            }
-                        }
-                        Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
-                    })
                 }}
-            </Transition>
+            />
         </div>
 
         <div class="tab-content" style=move || if active_tab.get() == "partitions" { "" } else { "display:none" }>

@@ -3,7 +3,7 @@
 use leptos::prelude::*;
 use leptos::server_fn::codec::Json;
 
-use crate::types::{RunFilter, RunRecord, RunsPage, RunsSummary, StoredEvent};
+use crate::types::{EventsPage, RunFilter, RunRecord, RunsPage, RunsSummary, StoredEvent};
 
 /// Latest runs across all code locations. `status` accepts the wire-string
 /// form of [`RunStatus`] (`"Success"`, `"Failure"`, `"Started"`,
@@ -66,6 +66,73 @@ pub async fn get_run_events(run_id: String) -> Result<Vec<StoredEvent>, ServerFn
         .await
         .map(|evts| evts.into_iter().map(Into::into).collect())
         .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// Step events for a run — backs the timeline/DAG.
+#[server]
+pub async fn get_run_step_events(run_id: String) -> Result<Vec<StoredEvent>, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    state
+        .storage
+        .get_run_step_events(&run_id)
+        .await
+        .map(|evts| evts.into_iter().map(Into::into).collect())
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// A run's `LogOutput` events (stdout/stderr/logs) — typically small.
+#[server]
+pub async fn get_run_log_events(run_id: String) -> Result<Vec<StoredEvent>, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    state
+        .storage
+        .get_run_log_events(&run_id)
+        .await
+        .map(|evts| evts.into_iter().map(Into::into).collect())
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// A page of a run's structured (non-log) events, optionally scoped to one
+/// asset (the selected step). Backs the run-detail events table.
+#[server(input = Json)]
+pub async fn get_run_structured_events_page(
+    run_id: String,
+    asset_key: Option<String>,
+    offset: u64,
+    limit: u64,
+) -> Result<EventsPage, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let (rows, total) = state
+        .storage
+        .get_run_structured_events_page(&run_id, asset_key.as_deref(), offset, limit)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(EventsPage {
+        rows: rows.into_iter().map(Into::into).collect(),
+        total,
+    })
+}
+
+/// A page of one asset's events of a single type within a run (e.g.
+/// `Materialization`). Backs the run-detail asset drawer.
+#[server(input = Json)]
+pub async fn get_run_asset_events_page(
+    run_id: String,
+    asset_key: String,
+    event_type: String,
+    offset: u64,
+    limit: u64,
+) -> Result<EventsPage, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let (rows, total) = state
+        .storage
+        .get_run_asset_events_page(&run_id, &asset_key, &event_type, offset, limit)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(EventsPage {
+        rows: rows.into_iter().map(Into::into).collect(),
+        total,
+    })
 }
 
 /// Paginated + filtered runs list. Returns the visible page of rows plus the

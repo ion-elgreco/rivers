@@ -6,6 +6,7 @@ use leptos_router::hooks::use_params_map;
 
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::TableSkeleton;
+use crate::components::pagination::PaginatedView;
 use crate::components::ui_kit::{
     AssetSummaryRow, Crumb, HeatCell, PartitionHeatmap, StatusChip, Topbar,
 };
@@ -15,7 +16,7 @@ use crate::helpers::{
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::get_assets;
-use crate::server_fns::backfills::{cancel_backfill, get_backfill};
+use crate::server_fns::backfills::{cancel_backfill, get_backfill, get_backfill_partitions};
 use crate::server_fns::locations::list_code_locations;
 use crate::server_fns::runs::get_runs_by_ids;
 
@@ -49,6 +50,23 @@ pub fn BackfillDetailPage() -> impl IntoView {
             (backfill_id(), refresh_tick.get())
         },
         |(id, _)| get_backfill(id),
+    );
+
+    // Windowed real keys + per-partition status for the heatmap, paged so a
+    // large backfill ships a bounded slice.
+    let (part_page, set_part_page) = signal(0u64);
+    let (part_page_size, set_part_page_size) = signal(1000u64);
+    let partitions = Resource::new(
+        move || {
+            params.track();
+            (
+                backfill_id(),
+                part_page.get(),
+                part_page_size.get(),
+                refresh_tick.get(),
+            )
+        },
+        |(id, p, ps, _)| async move { get_backfill_partitions(id, p * ps, ps).await },
     );
 
     let all_assets = Resource::new(
@@ -226,30 +244,11 @@ pub fn BackfillDetailPage() -> impl IntoView {
                             </div>
 
                             {
-                                let running_active = record.status == "InProgress";
+                                let done = completed as usize;
                                 let failed = record.failed_partitions as usize;
                                 let canceled = record.canceled_partitions as usize;
-                                let done = completed as usize;
                                 let total_usize = total as usize;
-                                let mut cells: Vec<HeatCell> = Vec::with_capacity(total_usize);
-                                let mut labels: Vec<String> = Vec::with_capacity(total_usize);
-                                for i in 0..total_usize {
-                                    let c = if i < done {
-                                        HeatCell::Done
-                                    } else if i < done + failed {
-                                        HeatCell::Failed
-                                    } else if i < done + failed + canceled {
-                                        HeatCell::Pending
-                                    } else if running_active && i == done + failed + canceled {
-                                        HeatCell::Running
-                                    } else {
-                                        HeatCell::Pending
-                                    };
-                                    cells.push(c);
-                                    labels.push(format!("partition #{}", i + 1));
-                                }
-                                let running_count = cells.iter().filter(|c| matches!(c, HeatCell::Running)).count();
-                                let pending_count = cells.iter().filter(|c| matches!(c, HeatCell::Pending)).count();
+                                let pending_count = total_usize.saturating_sub(done + failed + canceled);
                                 let (scheme_label, cell_word) = if total_usize <= 24 {
                                     ("HOURLY", "hour")
                                 } else if total_usize <= 96 {
@@ -267,16 +266,34 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                             </div>
                                             <div class="partition-panel-legend">
                                                 <span><span class="partition-legend-swatch partition-legend-swatch--done"></span>{format!("done · {}", done)}</span>
-                                                {(running_count > 0).then(|| view! {
-                                                    <span><span class="partition-legend-swatch partition-legend-swatch--running"></span>{format!("running · {}", running_count)}</span>
-                                                })}
                                                 {(failed > 0).then(|| view! {
                                                     <span><span class="partition-legend-swatch partition-legend-swatch--failed"></span>{format!("failed · {}", failed)}</span>
+                                                })}
+                                                {(canceled > 0).then(|| view! {
+                                                    <span><span class="partition-legend-swatch partition-legend-swatch--pending"></span>{format!("canceled · {}", canceled)}</span>
                                                 })}
                                                 <span><span class="partition-legend-swatch partition-legend-swatch--pending"></span>{format!("pending · {}", pending_count)}</span>
                                             </div>
                                         </div>
-                                        <PartitionHeatmap cells=cells labels=labels/>
+                                        <PaginatedView
+                                            data=partitions
+                                            page=part_page
+                                            set_page=set_part_page
+                                            page_size=part_page_size
+                                            set_page_size=set_part_page_size
+                                            fallback=move || view! { <div class="loading">"Loading partitions…"</div> }
+                                            render={move |rows: Vec<crate::types::BackfillPartitionCell>| {
+                                                let cells: Vec<HeatCell> = rows.iter().map(|r| match r.status.as_str() {
+                                                    "done" => HeatCell::Done,
+                                                    "failed" => HeatCell::Failed,
+                                                    "running" => HeatCell::Running,
+                                                    "canceled" => HeatCell::Canceled,
+                                                    _ => HeatCell::Pending,
+                                                }).collect();
+                                                let labels: Vec<String> = rows.into_iter().map(|r| r.key).collect();
+                                                view! { <PartitionHeatmap cells=cells labels=labels/> }.into_any()
+                                            }}
+                                        />
                                     </div>
                                 }
                             }

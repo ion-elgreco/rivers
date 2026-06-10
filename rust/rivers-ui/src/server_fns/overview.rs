@@ -153,7 +153,10 @@ pub async fn get_assets_info(
 /// materializes several at once — each one counts independently.
 #[cfg(feature = "ssr")]
 fn partition_key_members(pk: &rivers_core::storage::PartitionKey) -> Vec<String> {
-    pk.members().iter().map(|m| m.to_display()).collect()
+    pk.members()
+        .into_iter()
+        .map(crate::types::partition_key_to_display)
+        .collect()
 }
 
 /// Tri-state per-partition status (Materialized / Failed / Missing) for the

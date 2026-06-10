@@ -243,9 +243,32 @@ impl PartitionKey {
     /// Expand a possibly-batched key into its individual single-valued members
     /// (`Single`: one per value; `Multi`: the cartesian product).
     pub fn members(&self) -> Vec<PartitionKey> {
+        // The full expansion is `members_preview` with no cap; keep the
+        // cartesian logic in one place.
+        self.members_preview(usize::MAX)
+    }
+
+    /// Number of members this key expands to, without building them.
+    pub fn member_count(&self) -> usize {
+        match self {
+            Self::Single { keys } => keys.len(),
+            Self::Multi { dims } => dims
+                .iter()
+                .map(|(_, vs)| vs.len())
+                .fold(1usize, |a, n| a.saturating_mul(n)),
+            Self::Set { keys } => keys.iter().map(Self::member_count).sum(),
+        }
+    }
+
+    /// The first `limit` members in `members()` order, without building the rest.
+    pub fn members_preview(&self, limit: usize) -> Vec<PartitionKey> {
+        if limit == 0 {
+            return Vec::new();
+        }
         match self {
             Self::Single { keys } => keys
                 .iter()
+                .take(limit)
                 .map(|k| Self::Single {
                     keys: vec![k.clone()],
                 })
@@ -253,24 +276,40 @@ impl PartitionKey {
             Self::Multi { dims } => {
                 let mut sorted = dims.clone();
                 sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                // Extend the cartesian product one dimension at a time, capping
+                // at `limit` after each (`take` is lazy, so we never build the
+                // full product of a huge key).
                 let mut combos: Vec<Vec<(String, Vec<String>)>> = vec![Vec::new()];
                 for (name, vals) in &sorted {
-                    let mut next = Vec::new();
-                    for combo in &combos {
-                        for v in vals {
-                            let mut c = combo.clone();
-                            c.push((name.clone(), vec![v.clone()]));
-                            next.push(c);
-                        }
-                    }
-                    combos = next;
+                    combos = combos
+                        .into_iter()
+                        .flat_map(|combo| {
+                            vals.iter().map(move |v| {
+                                let mut c = combo.clone();
+                                c.push((name.clone(), vec![v.clone()]));
+                                c
+                            })
+                        })
+                        .take(limit)
+                        .collect();
                 }
                 combos
                     .into_iter()
                     .map(|dims| Self::Multi { dims })
                     .collect()
             }
-            Self::Set { keys } => keys.iter().flat_map(|k| k.members()).collect(),
+            Self::Set { keys } => {
+                let mut out = Vec::new();
+                for k in keys {
+                    for m in k.members_preview(limit - out.len()) {
+                        out.push(m);
+                        if out.len() >= limit {
+                            return out;
+                        }
+                    }
+                }
+                out
+            }
         }
     }
 

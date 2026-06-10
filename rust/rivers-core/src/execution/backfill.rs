@@ -93,9 +93,13 @@ pub fn bundle_keys(keys: &[PartitionKey]) -> PartitionKey {
     }
 }
 
-/// Order-independent equality of two partition-key collections.
+/// Order-independent set equality.
 fn same_set(a: &[PartitionKey], b: &[PartitionKey]) -> bool {
-    a.len() == b.len() && a.iter().all(|k| b.contains(k))
+    if a.len() != b.len() {
+        return false;
+    }
+    let b_set: std::collections::HashSet<&PartitionKey> = b.iter().collect();
+    a.iter().all(|k| b_set.contains(k))
 }
 
 fn extract_multi_run_dims(pk: &PartitionKey, multi_run: &[String]) -> Vec<(String, Vec<String>)> {
@@ -282,5 +286,63 @@ mod tests {
         };
         let back = PartitionKey::from_json(&set.to_json()).unwrap();
         assert_eq!(canon_set(&back.members()), canon_set(&set.members()));
+    }
+
+    #[test]
+    fn test_bundle_large_cartesian_is_compact_multi() {
+        // A clean region×sku cartesian must bundle into a compact Multi, not a Set.
+        let mut keys = Vec::new();
+        for r in ["us", "eu", "apac"] {
+            for i in 0..2000 {
+                keys.push(PartitionKey::Multi {
+                    dims: vec![
+                        ("region".to_string(), vec![r.to_string()]),
+                        ("sku".to_string(), vec![format!("sku{i:05}")]),
+                    ],
+                });
+            }
+        }
+        let group = &group_into_runs(&BackfillStrategy::SingleRun, &keys)[0];
+        let bundled = bundle_keys(group);
+        // Compact cartesian form, not an explicit Set.
+        assert!(matches!(bundled, PartitionKey::Multi { .. }));
+        assert_eq!(bundled.members().len(), keys.len());
+        assert_eq!(canon_set(&bundled.members()), canon_set(&keys));
+    }
+
+    #[test]
+    fn test_member_count_and_preview() {
+        // Multi cartesian: count is the product (no materialization); preview is
+        // the first N in `members()` order without building the other ~15k.
+        let key = PartitionKey::Multi {
+            dims: vec![
+                (
+                    "region".to_string(),
+                    vec!["us".into(), "eu".into(), "apac".into()],
+                ),
+                (
+                    "sku".to_string(),
+                    (0..5000).map(|i| format!("sku{i:05}")).collect(),
+                ),
+            ],
+        };
+        assert_eq!(key.member_count(), 15_000);
+        let preview = key.members_preview(3);
+        assert_eq!(
+            preview,
+            key.members().into_iter().take(3).collect::<Vec<_>>()
+        );
+
+        // Single and Set.
+        let single = PartitionKey::Single {
+            keys: vec!["a".into(), "b".into(), "c".into()],
+        };
+        assert_eq!(single.member_count(), 3);
+        assert_eq!(single.members_preview(2).len(), 2);
+        let set = PartitionKey::Set {
+            keys: vec![single_key("x"), single_key("y")],
+        };
+        assert_eq!(set.member_count(), 2);
+        assert_eq!(set.members_preview(10).len(), 2);
     }
 }

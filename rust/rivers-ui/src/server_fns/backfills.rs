@@ -3,7 +3,9 @@
 use leptos::prelude::*;
 use leptos::server_fn::codec::Json;
 
-use crate::types::{BackfillFilter, BackfillInfo, BackfillsPage, BackfillsSummary};
+use crate::types::{
+    BackfillFilter, BackfillInfo, BackfillPartitionsPage, BackfillsPage, BackfillsSummary,
+};
 
 /// Backfills owned by `(loc_ns, loc_name)`. `status` accepts the wire-string
 /// form of `BackfillStatus` (`"Requested"`, `"InProgress"`,
@@ -46,6 +48,58 @@ pub async fn get_backfill(backfill_id: String) -> Result<Option<BackfillInfo>, S
         .await
         .map(|opt| opt.map(Into::into))
         .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// A window of a backfill's partitions with real display keys + exact status
+/// (from the record's completed/failed/canceled sets), for the heatmap.
+#[server]
+pub async fn get_backfill_partitions(
+    backfill_id: String,
+    offset: u64,
+    limit: u64,
+) -> Result<BackfillPartitionsPage, ServerFnError> {
+    use rivers_core::storage::{PartitionKey, StorageBackend};
+    use std::collections::HashSet;
+    let state = expect_context::<crate::state::AppState>();
+    let record = state
+        .storage
+        .get_backfill(&backfill_id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .ok_or_else(|| ServerFnError::new("backfill not found"))?;
+
+    let completed: HashSet<&PartitionKey> = record.completed_partitions.iter().collect();
+    let failed: HashSet<&PartitionKey> = record.failed_partitions.iter().collect();
+    let canceled: HashSet<&PartitionKey> = record.canceled_partitions.iter().collect();
+
+    let total: u64 = record
+        .partition_keys
+        .iter()
+        .map(|pk| pk.member_count() as u64)
+        .sum();
+    let rows: Vec<crate::types::BackfillPartitionCell> = record
+        .partition_keys
+        .iter()
+        .flat_map(|pk| pk.members_preview(offset as usize + limit as usize))
+        .skip(offset as usize)
+        .take(limit as usize)
+        .map(|m| {
+            let status = if completed.contains(&m) {
+                "done"
+            } else if failed.contains(&m) {
+                "failed"
+            } else if canceled.contains(&m) {
+                "canceled"
+            } else {
+                "pending"
+            };
+            crate::types::BackfillPartitionCell {
+                key: crate::types::partition_key_to_display(m),
+                status: status.to_string(),
+            }
+        })
+        .collect();
+    Ok(BackfillPartitionsPage { rows, total })
 }
 
 /// Paginated + filtered backfills list. JSON codec because `BackfillFilter`

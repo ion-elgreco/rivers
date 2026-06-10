@@ -444,6 +444,7 @@ pub enum HeatCell {
     Running,
     Failed,
     Pending,
+    Canceled,
 }
 
 /// Partition / backfill heatmap — CSS-grid of status-colored cells.
@@ -481,12 +482,14 @@ pub fn PartitionHeatmap(
                 HeatCell::Running => "heatmap-cell heatmap-cell--running",
                 HeatCell::Failed => "heatmap-cell heatmap-cell--failed",
                 HeatCell::Pending => "heatmap-cell heatmap-cell--pending",
+                HeatCell::Canceled => "heatmap-cell heatmap-cell--canceled",
             };
             let status_word = match c {
                 HeatCell::Done => "done",
                 HeatCell::Running => "running",
                 HeatCell::Failed => "failed",
                 HeatCell::Pending => "pending",
+                HeatCell::Canceled => "canceled",
             };
             let style = if freshness_gradient && matches!(c, HeatCell::Done) {
                 let op = 0.4 + (i as f64 / (total.max(1)) as f64) * 0.55;
@@ -527,12 +530,14 @@ pub fn PartitionHeatmap(
                         HeatCell::Running => "running",
                         HeatCell::Failed => "failed",
                         HeatCell::Pending => "pending",
+                        HeatCell::Canceled => "canceled",
                     };
                     let cls = match c {
                         HeatCell::Done => "heatmap-info-dot--done",
                         HeatCell::Running => "heatmap-info-dot--running",
                         HeatCell::Failed => "heatmap-info-dot--failed",
                         HeatCell::Pending => "heatmap-info-dot--pending",
+                        HeatCell::Canceled => "heatmap-info-dot--canceled",
                     };
                     (key, word, cls)
                 })

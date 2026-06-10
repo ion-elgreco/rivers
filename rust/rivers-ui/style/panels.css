@@ -207,6 +207,37 @@
 
 /* Event type — only the word itself is colored, no badge background or row rail */
 .log-type-badge { background: transparent; padding: 0; }
+
+/* Infinite-scroll event list: div-rows (so keyed <For> appends preserve scroll) */
+.log-event-row {
+    display: grid;
+    grid-template-columns: 80px 150px 130px minmax(0, 1fr);
+    gap: 0.75rem;
+    padding: 0.375rem 0.75rem;
+    font-size: 0.75rem;
+    align-items: start;
+    transition: background 0.1s;
+}
+.log-event-row > * { min-width: 0; }
+.log-event-row:hover { background: var(--bg-hover); }
+.log-event-head {
+    position: sticky;
+    top: 0;
+    background: var(--bg);
+    font-weight: 600;
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    z-index: 1;
+}
+.log-event-head:hover { background: var(--bg); }
+.infinite-scroll-status {
+    padding: 0.625rem;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+}
 .log-row--success .log-type-badge { color: var(--success); }
 .log-row--error   .log-type-badge { color: var(--error); }
 .log-row--warn    .log-type-badge { color: var(--warning); }
