@@ -82,6 +82,53 @@ impl TimeGrid {
         Ok(shifted.format(&self.fmt).to_string())
     }
 
+    /// Enumerate the grid keys in `[from, to]` (inclusive) without touching
+    /// the rest of the universe — O(range), not O(universe). Callers pass
+    /// endpoints already validated as on-grid keys, so every tick between
+    /// them is inside `[start, end)` by construction.
+    pub fn keys_in_range(&self, from: NaiveDateTime, to: NaiveDateTime) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        if to < from {
+            return Ok(out);
+        }
+        if let Some(secs) = self.interval_seconds {
+            let interval_ns = (secs * 1_000_000_000.0) as i64;
+            if interval_ns <= 0 {
+                bail!("TimeWindow interval must be positive");
+            }
+            let step = chrono::Duration::nanoseconds(interval_ns);
+            let mut t = from;
+            while t <= to {
+                out.push(t.format(&self.fmt).to_string());
+                match t.checked_add_signed(step) {
+                    Some(next) => t = next,
+                    None => break,
+                }
+            }
+        } else if let Some(expr) = &self.cron_schedule {
+            let cron = parse_cron(expr)?;
+            // Anchor one second below `from` (cron's resolution) so an
+            // on-tick `from` is included — a sub-second anchor makes croner
+            // carry the fraction into every yielded tick.
+            let anchor = from
+                .checked_sub_signed(chrono::Duration::seconds(1))
+                .unwrap_or(from);
+            for tick in cron.iter_from(Utc.from_utc_datetime(&anchor), croner::Direction::Forward) {
+                let t = cron_tick_naive(tick);
+                if t < from {
+                    continue;
+                }
+                if t > to {
+                    break;
+                }
+                out.push(t.format(&self.fmt).to_string());
+            }
+        } else {
+            bail!("TimeWindow requires either cron_schedule or interval_seconds");
+        }
+        Ok(out)
+    }
+
     /// Nearest valid keys around `dt` — the latest grid tick `<= dt` and the
     /// earliest tick `> dt`, both clamped to `[start, end)`. Best-effort for
     /// diagnostics: a side with no representable tick is `None`.
@@ -125,14 +172,14 @@ impl TimeGrid {
             let prev = {
                 let anchor = Utc.from_utc_datetime(&std::cmp::min(dt, end_dt));
                 cron.iter_from(anchor, croner::Direction::Backward)
-                    .map(|t| t.naive_utc())
+                    .map(cron_tick_naive)
                     .find(|t| *t <= dt && *t < end_dt)
                     .filter(|t| *t >= self.start)
             };
             let next = {
                 let anchor = Utc.from_utc_datetime(&std::cmp::max(dt, self.start));
                 cron.iter_from(anchor, croner::Direction::Forward)
-                    .map(|t| t.naive_utc())
+                    .map(cron_tick_naive)
                     .find(|t| *t > dt)
                     .filter(|t| *t < end_dt)
             };
@@ -141,6 +188,14 @@ impl TimeGrid {
             (None, None)
         }
     }
+}
+
+/// croner carries a sub-second anchor fraction into every yielded tick;
+/// cron schedules are second-granular, so normalize to whole seconds.
+fn cron_tick_naive(tick: chrono::DateTime<Utc>) -> NaiveDateTime {
+    use chrono::Timelike;
+    let naive = tick.naive_utc();
+    naive.with_nanosecond(0).unwrap_or(naive)
 }
 
 fn parse_cron(expr: &str) -> Result<croner::Cron> {
@@ -231,6 +286,39 @@ mod tests {
 
     fn dt(s: &str) -> chrono::NaiveDateTime {
         chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn interval_keys_in_range_walks_only_the_window() {
+        let keys = hourly_jan1()
+            .keys_in_range(dt("2024-01-01T07:00:00"), dt("2024-01-01T09:00:00"))
+            .unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                "2024-01-01T07:00:00",
+                "2024-01-01T08:00:00",
+                "2024-01-01T09:00:00",
+            ]
+        );
+    }
+
+    #[test]
+    fn cron_keys_in_range_includes_on_tick_endpoints() {
+        let g = daily_jan();
+        let keys = g
+            .keys_in_range(dt("2024-01-05T00:00:00"), dt("2024-01-07T00:00:00"))
+            .unwrap();
+        assert_eq!(keys, vec!["2024-01-05", "2024-01-06", "2024-01-07"]);
+    }
+
+    #[test]
+    fn keys_in_range_inverted_is_empty() {
+        let g = hourly_jan1();
+        let keys = g
+            .keys_in_range(dt("2024-01-01T09:00:00"), dt("2024-01-01T07:00:00"))
+            .unwrap();
+        assert!(keys.is_empty());
     }
 
     #[test]

@@ -150,15 +150,12 @@ fn resolve_single_dim_range(
         PartitionsDefinition::TimeWindow { fmt, .. } => {
             let from_dt = parse_key_datetime(from_key, fmt).expect("validated above");
             let to_dt = parse_key_datetime(to_key, fmt).expect("validated above");
-            Ok(def
-                .enumerate_single_dim_keys()?
-                .into_iter()
-                .filter(|k| {
-                    parse_key_datetime(k, fmt)
-                        .map(|dt| dt >= from_dt && dt <= to_dt)
-                        .unwrap_or(false)
-                })
-                .collect())
+            // Walk only [from, to] — enumerating the whole universe and
+            // filtering is O(universe) on million-window definitions.
+            def.time_grid()
+                .expect("TimeWindow always has a grid")
+                .keys_in_range(from_dt, to_dt)
+                .map_err(|e| ExecutionError::new_err(e.to_string()))
         }
         // Dynamic (storage-backed): the def's enumerator raises the precise
         // "needs storage" error.
