@@ -3728,8 +3728,7 @@ impl PyCodeRepository {
             }
             // repo.backfill() and gRPC LaunchBackfill are boundaries — reject
             // invalid keys here like `materialize` does, instead of persisting
-            // a BackfillRecord that counts them and fails per-run later. (The
-            // range branch validates via `resolve()`.)
+            // a BackfillRecord that counts them and fails per-run later.
             for key in &keys {
                 validate_partition_for_selection(
                     state,
@@ -3756,7 +3755,18 @@ impl PyCodeRepository {
                         "partition_range specified but no partitioned assets found in selection",
                     )
                 })?;
-            range.resolve(parts_def)?
+            let resolved = range.resolve(parts_def)?;
+            // The range resolved against one def — the selection's other
+            // partitioned assets must accept each key too, same boundary
+            // contract as the explicit-keys branch.
+            for key in &resolved {
+                validate_partition_for_selection(
+                    state,
+                    selection.iter().map(String::as_str),
+                    Some(key),
+                )?;
+            }
+            resolved
         } else {
             return Err(ExecutionError::new_err(
                 "Either partition_keys or partition_range must be provided",

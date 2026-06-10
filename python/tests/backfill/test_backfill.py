@@ -127,6 +127,34 @@ class TestBackfillExplicitKeys:
 
 
 class TestBackfillPartitionRange:
+    def test_range_validates_against_every_partitioned_asset(self):
+        """The range resolves against ONE def; the other partitioned assets
+        in the selection must still accept every resolved key — reject at the
+        boundary instead of persisting a record whose runs fail per-partition."""
+
+        @rs.Asset(partitions_def=_static_pd(["a", "b", "c"]))
+        def first(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        @rs.Asset(partitions_def=_static_pd(["x", "y"]))
+        def second(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[first, second], default_executor=rs.Executor.in_process()
+        )
+        with pytest.raises(
+            ExecutionError,
+            match=re.escape(
+                "Invalid partition_key 'a' for asset 'second': "
+                "not a member of its partition definition."
+            ),
+        ):
+            repo.backfill(
+                selection=["first", "second"],
+                partition_range=rs.PartitionKeyRange.single(from_key="a", to_key="b"),
+            )
+
     def test_single_range_filters_keys(self, executor_env, is_async):
         executor, _ = executor_env
 
