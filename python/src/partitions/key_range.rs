@@ -425,14 +425,20 @@ impl PyPartitionKeyRange {
                 format!("PartitionKeyRange.single(from_key={from_key:?}, to_key={to_key:?})")
             }
             PartitionKeyRangeInner::Multi { dimensions } => {
-                let dims: Vec<String> = dimensions
-                    .iter()
+                // Sorted dims and key lists — HashMap/HashSet iteration order
+                // is seed-dependent and must not leak into the repr.
+                let mut entries: Vec<_> = dimensions.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                let dims: Vec<String> = entries
+                    .into_iter()
                     .map(|(name, sel)| match sel {
                         DimensionSelection::Range { from_key, to_key } => {
                             format!("{name:?}: ({from_key:?}, {to_key:?})")
                         }
                         DimensionSelection::Keys(keys) => {
-                            format!("{name:?}: {keys:?}")
+                            let mut sorted: Vec<&String> = keys.iter().collect();
+                            sorted.sort();
+                            format!("{name:?}: {sorted:?}")
                         }
                     })
                     .collect();

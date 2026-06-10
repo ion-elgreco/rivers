@@ -154,6 +154,13 @@ def test_multi_range_key_lists_hash_order_independent():
     assert hash(r1) == hash(r2)
 
 
+def test_multi_range_repr_deterministic():
+    """repr sorts dimensions and key lists — HashMap iteration order must
+    not leak into the string."""
+    r = rs.PartitionKeyRange.multi({"b": ("1", "2"), "a": ["y", "x"]})
+    assert repr(r) == 'PartitionKeyRange.multi({"a": ["x", "y"], "b": ("1", "2")})'
+
+
 def test_single_range_usable_as_dict_key():
     r1 = rs.PartitionKeyRange.single(from_key="2024-01-01", to_key="2024-01-31")
     r2 = rs.PartitionKeyRange.single(from_key="2024-01-01", to_key="2024-01-31")
