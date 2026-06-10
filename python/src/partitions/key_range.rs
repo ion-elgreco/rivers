@@ -150,8 +150,7 @@ fn resolve_single_dim_range(
         PartitionsDefinition::TimeWindow { fmt, .. } => {
             let from_dt = parse_key_datetime(from_key, fmt).expect("validated above");
             let to_dt = parse_key_datetime(to_key, fmt).expect("validated above");
-            // Walk only [from, to] — enumerating the whole universe and
-            // filtering is O(universe) on million-window definitions.
+            // Walk only [from, to] — avoids enumerating the full definition.
             def.time_grid()
                 .expect("TimeWindow always has a grid")
                 .keys_in_range(from_dt, to_dt)

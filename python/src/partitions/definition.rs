@@ -476,9 +476,6 @@ impl PartitionsDefinition {
             Ok(Some((window_start, window_end)))
         } else if let Some(cron_expr) = cron_schedule {
             let cron = parse_cron(cron_expr)?;
-            // Search in wall-clock-as-UTC: a gap-free, unambiguous timeline
-            // croner can't stall on (its Local search spins re-resolving the
-            // DST fall-back hour).
             let start_utc = Utc.from_utc_datetime(&window_start);
             let next = cron.find_next_occurrence(&start_utc, false).map_err(|e| {
                 PartitionDefinitionError::new_err(format!("Failed to find next cron tick: {e}"))
@@ -524,9 +521,7 @@ impl PartitionsDefinition {
     }
 
     /// Check if a partition key is valid for this definition. Empty key
-    /// vectors (constructible via `from_json` / proto, never via the Python
-    /// constructors) are invalid for every kind — without the explicit
-    /// checks they'd pass vacuously.
+    /// vectors are invalid for every kind.
     pub fn validate_partition_key(&self, key: &PyPartitionKey) -> PyResult<bool> {
         match (self, key) {
             (Self::Static { keys: valid_keys }, PyPartitionKey::Single { key }) => {
@@ -543,9 +538,8 @@ impl PartitionsDefinition {
                 PyPartitionKey::Single { key },
             ) => validate_time_window_key(key, cron_schedule, interval_seconds, start, end, fmt),
             (Self::Multi { dimensions }, PyPartitionKey::Multi { keys }) => {
-                // Every def dimension must be present (checked below), so a
-                // length mismatch means the key carries extra dimensions the
-                // def doesn't declare — reject instead of silently ignoring.
+                // Extra dimensions the def doesn't declare are rejected here;
+                // missing ones are caught by the per-dim loop below.
                 if keys.len() != dimensions.len() {
                     return Ok(false);
                 }
@@ -569,9 +563,7 @@ impl PartitionsDefinition {
                 }
                 Ok(true)
             }
-            // Dynamic key *membership* is storage-managed — checked against
-            // `dynamic_partitions` at the submit boundary, not here. The def
-            // only rejects the statically-knowable invalid shape.
+            // Dynamic membership is checked at the submit boundary against storage, not here.
             (Self::Dynamic { .. }, PyPartitionKey::Single { key }) => Ok(!key.is_empty()),
             // A batched Set is valid iff non-empty and every member is valid.
             (_, PyPartitionKey::Set { keys }) => {
@@ -976,11 +968,8 @@ fn validate_time_window_key(
                 return Ok(false);
             }
         } else if let Some(expr) = cron_schedule {
-            // Membership must match enumeration exactly. Matching the parsed
-            // wall-clock against the cron misclassifies keys around DST
-            // transitions (gap ticks are skipped, fall-back and shifted
-            // ticks resolve to different wall-clock times), so walk the
-            // surrounding window's ticks and compare formatted keys.
+            // Compare formatted keys, not parsed datetimes — cron ticks near
+            // DST transitions don't round-trip through the formatter reliably.
             let window_start = (dt - chrono::Duration::hours(26)).max(*start);
             let window_end = (dt + chrono::Duration::hours(26)).min(end_dt);
             let mut found = false;
@@ -1143,10 +1132,6 @@ fn for_each_cron_tick(
     mut f: impl FnMut(NaiveDateTime) -> bool,
 ) -> PyResult<()> {
     let cron = parse_cron(cron_expr)?;
-    // Iterate the cron over the naive wall clock interpreted as UTC. Keys
-    // are wall-clock labels: this grid has no DST gaps or duplicates, is
-    // identical on every host timezone, and croner can't stall on it (its
-    // Local iteration spins re-resolving the DST fall-back hour).
     let start_utc = Utc.from_utc_datetime(start);
     for tick in cron.iter_from(start_utc, croner::Direction::Forward) {
         let naive = tick.naive_utc();

@@ -214,4 +214,3 @@ fn log_dispatch_outcome(
         }
     }
 }
-

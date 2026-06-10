@@ -817,11 +817,8 @@ impl PartitionMapping {
                         found: up.variant_name().to_string(),
                     });
                 };
-                // The offset shifts downstream keys on the UPSTREAM grid, so
-                // every downstream key must itself be an upstream grid tick:
-                // the downstream grid must be a subgrid of the upstream one.
-                // Ranges (start/end) may differ — the runtime per-key check
-                // covers range edges.
+                // Downstream keys are shifted on the upstream grid, so the
+                // downstream grid must be a subgrid of the upstream one.
                 if down_fmt != up_fmt {
                     return Err(MappingValidationError::DefinitionError(format!(
                         "time_window mapping requires matching key formats: \
