@@ -3,7 +3,7 @@
 //! `PartitionMapping` enum with 7 variants (Identity, AllPartitions, LastPartition, etc.).
 //! `map_key()` transforms downstream partition keys to upstream keys for dependency loading.
 //! `PartitionMappingDict` accepts `str` or `AssetDef` keys from Python for per-dep overrides.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Deref;
 
 use pyo3::exceptions::PyTypeError;
@@ -894,6 +894,41 @@ impl PartitionMapping {
                              upstream; missing upstream: {}",
                             missing.join(", ")
                         )));
+                    }
+                }
+                if let (
+                    PartitionsDefinition::Multi {
+                        dimensions: down_dims,
+                    },
+                    PartitionsDefinition::Multi {
+                        dimensions: up_dims,
+                    },
+                ) = (down, up)
+                {
+                    let down_names: BTreeSet<&str> =
+                        down_dims.iter().map(|(n, _)| n.as_str()).collect();
+                    let up_names: BTreeSet<&str> =
+                        up_dims.iter().map(|(n, _)| n.as_str()).collect();
+                    if down_names != up_names {
+                        let join = |names: &BTreeSet<&str>| {
+                            names.iter().copied().collect::<Vec<_>>().join(", ")
+                        };
+                        return Err(MappingValidationError::DefinitionError(format!(
+                            "Identity mapping requires matching Multi dimensions: \
+                             downstream [{}] != upstream [{}]",
+                            join(&down_names),
+                            join(&up_names)
+                        )));
+                    }
+                    let up_map: HashMap<&str, &PartitionsDefinition> =
+                        up_dims.iter().map(|(n, d)| (n.as_str(), d)).collect();
+                    for (name, down_sub) in down_dims {
+                        Self::Identity {}
+                            .validate_partitioned_pair(down_sub, up_map[name.as_str()])
+                            .map_err(|e| MappingValidationError::InDimension {
+                                dim: name.clone(),
+                                source: Box::new(e),
+                            })?;
                     }
                 }
                 Ok(())

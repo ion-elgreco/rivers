@@ -1232,6 +1232,73 @@ def test_multi_partitions_identity():
     assert repo is not None
 
 
+def test_identity_multi_mismatched_dim_names_rejected():
+    """Identity between Multi defs with different dimension names must fail resolve."""
+    down = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.static_(["2024-01"]),
+            "country": rs.PartitionsDefinition.static_(["us", "eu"]),
+        }
+    )
+    up = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.static_(["2024-01"]),
+            "region": rs.PartitionsDefinition.static_(["us", "eu"]),
+        }
+    )
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': Identity mapping requires "
+            "matching Multi dimensions: downstream [country, date] != upstream "
+            "[date, region]"
+        ),
+    ):
+        make_repo(_identity_edge(down, up))
+
+
+def test_identity_multi_incompatible_dim_def_rejected():
+    """Identity between Multi defs recurses into each dimension's pair."""
+    down = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.static_(["2024-01"]),
+            "region": rs.PartitionsDefinition.static_(["us", "mars"]),
+        }
+    )
+    up = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.static_(["2024-01"]),
+            "region": rs.PartitionsDefinition.static_(["us", "eu"]),
+        }
+    )
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "in dimension 'region': Identity mapping requires every downstream "
+            "key to exist upstream; missing upstream: mars"
+        ),
+    ):
+        make_repo(_identity_edge(down, up))
+
+
+def test_identity_multi_cross_grid_dim_rejected():
+    """Per-dimension recursion applies grid compatibility to time dims."""
+    down = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.daily(start=DAILY_START),
+            "region": rs.PartitionsDefinition.static_(["us"]),
+        }
+    )
+    up = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.hourly(start=DAILY_START),
+            "region": rs.PartitionsDefinition.static_(["us"]),
+        }
+    )
+    with pytest.raises(PartitionValidationError, match="in dimension 'date'"):
+        make_repo(_identity_edge(down, up))
+
+
 def test_multi_partitions_explicit_identity_mapping():
     """Multi-dimensional partitions with explicit Identity mapping should work."""
     parts = rs.PartitionsDefinition.multi(
