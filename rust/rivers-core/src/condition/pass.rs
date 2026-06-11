@@ -22,7 +22,7 @@ use crate::condition::state::{
 use crate::storage::{BackfillStrategy, PartitionKey, StorageBackend};
 use crate::timegrid::TimeGrid;
 use crate::util::parse_key_datetime;
-use chrono::NaiveDateTime;
+use chrono::{NaiveDateTime, TimeZone};
 
 /// Info about an asset with an automation condition, extracted at daemon
 /// start. Pure-Rust so the per-tick evaluation loop can run inside
@@ -273,37 +273,26 @@ pub struct PassOutput {
 
 /// Compute partition keys that fall within the latest time window.
 ///
-/// For time-windowed partitions (daily, hourly, etc.), parses each partition
-/// key as a datetime using `fmt`, then selects keys whose time is within
-/// `[now_nanos - lookback_delta * 1e9, now_nanos]` (`lookback_delta` is in
-/// seconds). If `lookback_delta` is `None`, only the single latest partition
-/// is returned.
+/// Partition keys are wall-clock labels, so the comparison happens on the
+/// wall-clock timeline: `now_local` is the current local naive datetime, and
+/// keys within `[now_local - lookback_delta, now_local]` are selected
+/// (`lookback_delta` is in seconds). If `lookback_delta` is `None`, only the
+/// single latest started window is returned.
 pub fn compute_latest_time_window_keys(
     all_keys: &HashSet<PartitionKey>,
     fmt: &str,
-    now_nanos: i64,
+    now_local: NaiveDateTime,
     lookback_delta: Option<f64>,
 ) -> HashSet<PartitionKey> {
-    let parse_nanos = |s: &str| -> Option<i64> {
-        parse_key_datetime(s, fmt)
-            .ok()?
-            .and_utc()
-            .timestamp_nanos_opt()
-    };
-
-    let mut parsed: Vec<(&PartitionKey, i64)> = all_keys
+    let mut parsed: Vec<(&PartitionKey, NaiveDateTime)> = all_keys
         .iter()
         .filter_map(|pk| {
             let key_str = match pk {
                 PartitionKey::Single { keys } if !keys.is_empty() => &keys[0],
                 _ => return None,
             };
-            let nanos = parse_nanos(key_str)?;
-            if nanos <= now_nanos {
-                Some((pk, nanos))
-            } else {
-                None
-            }
+            let dt = parse_key_datetime(key_str, fmt).ok()?;
+            if dt <= now_local { Some((pk, dt)) } else { None }
         })
         .collect();
 
@@ -316,10 +305,13 @@ pub fn compute_latest_time_window_keys(
     match lookback_delta {
         Some(delta_secs) => {
             let lookback_nanos = (delta_secs * 1_000_000_000.0) as i64;
-            let cutoff = now_nanos - lookback_nanos;
+            // A lookback too large to subtract means "no cutoff".
+            let cutoff = now_local.checked_sub_signed(chrono::Duration::nanoseconds(
+                lookback_nanos,
+            ));
             parsed
                 .into_iter()
-                .filter(|(_, ts)| *ts >= cutoff)
+                .filter(|(_, dt)| cutoff.is_none_or(|c| *dt >= c))
                 .map(|(pk, _)| pk.clone())
                 .collect()
         }
@@ -487,6 +479,11 @@ impl ConditionPass {
     }
 
     fn evaluate(&self, now: i64, selective: bool) -> Vec<EvalResultRow> {
+        // Partition keys are wall-clock labels; latest-window math compares
+        // them against the local naive reading of the tick instant.
+        let now_local = chrono::Local
+            .timestamp_nanos(now)
+            .naive_local();
         let in_progress_keys: HashSet<String> =
             self.cache.in_progress_assets.keys().cloned().collect();
 
@@ -513,7 +510,7 @@ impl ConditionPass {
                 Some(compute_latest_time_window_keys(
                     &pi.all_keys,
                     fmt,
-                    now,
+                    now_local,
                     lookback,
                 ))
             });
@@ -777,13 +774,9 @@ mod tests {
         keys.iter().map(|k| spk(k)).collect()
     }
 
-    /// Helper: convert "YYYY-MM-DD HH:MM" to nanos.
-    fn to_nanos(dt_str: &str) -> i64 {
-        chrono::NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%d %H:%M")
-            .unwrap()
-            .and_utc()
-            .timestamp_nanos_opt()
-            .unwrap()
+    /// Helper: parse "YYYY-MM-DD HH:MM" as a wall-clock naive datetime.
+    fn to_wall(dt_str: &str) -> NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%d %H:%M").unwrap()
     }
 
     #[test]
@@ -1083,9 +1076,28 @@ mod tests {
     }
 
     #[test]
+    fn latest_window_tracks_wall_clock_on_non_utc_hosts() {
+        // Partition keys are wall-clock labels. On a UTC+2 host at 10:30
+        // local, now_ts() reads 08:30Z — the latest window is still the
+        // 10:00 wall-clock one, not 08:00. `evaluate` converts the tick
+        // instant to local naive before calling this, so the helper itself
+        // compares wall clock to wall clock.
+        let all_keys = make_daily_keys(&[
+            "2026-06-11T08:00",
+            "2026-06-11T09:00",
+            "2026-06-11T10:00",
+        ]);
+        let now_local = to_wall("2026-06-11 10:30");
+        let result =
+            compute_latest_time_window_keys(&all_keys, "%Y-%m-%dT%H:%M", now_local, None);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&spk("2026-06-11T10:00")));
+    }
+
+    #[test]
     fn test_compute_at_start_date_includes_current() {
         let all_keys = make_daily_keys(&["2026-03-01"]);
-        let now = to_nanos("2026-03-01 00:00");
+        let now = to_wall("2026-03-01 00:00");
         let result = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, None);
         assert_eq!(result.len(), 1);
         assert!(result.contains(&spk("2026-03-01")));
@@ -1094,7 +1106,7 @@ mod tests {
     #[test]
     fn test_compute_latest_single_partition_no_lookback() {
         let all_keys = make_daily_keys(&["2026-03-20", "2026-03-21", "2026-03-22", "2026-03-23"]);
-        let now = to_nanos("2026-03-23 01:00");
+        let now = to_wall("2026-03-23 01:00");
         let result = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, None);
         assert_eq!(result.len(), 1);
         assert!(result.contains(&spk("2026-03-23")));
@@ -1111,12 +1123,12 @@ mod tests {
             "2026-03-25",
             "2026-03-26",
         ]);
-        let now1 = to_nanos("2026-03-22 01:00");
+        let now1 = to_wall("2026-03-22 01:00");
         let r1 = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now1, None);
         assert_eq!(r1.len(), 1);
         assert!(r1.contains(&spk("2026-03-22")));
 
-        let now2 = to_nanos("2026-03-26 01:00");
+        let now2 = to_wall("2026-03-26 01:00");
         let r2 = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now2, None);
         assert_eq!(r2.len(), 1);
         assert!(r2.contains(&spk("2026-03-26")));
@@ -1133,7 +1145,7 @@ mod tests {
             "2026-03-25",
             "2026-03-26",
         ]);
-        let now = to_nanos("2026-03-26 01:00");
+        let now = to_wall("2026-03-26 01:00");
         let lookback_secs = 3.0 * 86400.0;
         let result =
             compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, Some(lookback_secs));
@@ -1155,7 +1167,7 @@ mod tests {
             "2026-03-20",
             "2026-03-21",
         ]);
-        let now = to_nanos("2026-03-21 01:00");
+        let now = to_wall("2026-03-21 01:00");
         let lookback_secs = 3.0 * 86400.0;
         let result =
             compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, Some(lookback_secs));
@@ -1168,7 +1180,7 @@ mod tests {
     #[test]
     fn test_compute_future_partitions_excluded() {
         let all_keys = make_daily_keys(&["2026-03-24", "2026-03-25", "2027-12-31"]);
-        let now = to_nanos("2026-03-25 12:00");
+        let now = to_wall("2026-03-25 12:00");
         let result = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, None);
         assert_eq!(result.len(), 1);
         assert!(result.contains(&spk("2026-03-25")));
@@ -1178,7 +1190,7 @@ mod tests {
     #[test]
     fn test_compute_empty_keys() {
         let all_keys: HashSet<PartitionKey> = HashSet::new();
-        let now = to_nanos("2026-03-25 12:00");
+        let now = to_wall("2026-03-25 12:00");
         let result = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, None);
         assert!(result.is_empty());
     }
@@ -1192,7 +1204,7 @@ mod tests {
             "2026-03-25T11:00",
             "2026-03-25T12:00",
         ]);
-        let now = to_nanos("2026-03-25 12:30");
+        let now = to_wall("2026-03-25 12:30");
         let lookback_secs = 3.0 * 3600.0;
         let result =
             compute_latest_time_window_keys(&all_keys, "%Y-%m-%dT%H:%M", now, Some(lookback_secs));
