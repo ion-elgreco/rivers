@@ -1290,7 +1290,9 @@ mod conversions {
                 launched_by: rivers_core::storage::LaunchedBy::Manual,
             };
             let ui: RunRecord = core.into();
-            let preview = ui.partition_key.expect("partitioned run keeps its partition preview");
+            let preview = ui
+                .partition_key
+                .expect("partitioned run keeps its partition preview");
             assert_eq!(preview.preview, vec!["date=2024-01-01|region=us"]);
             assert_eq!(preview.total, 1);
             assert_eq!(preview.label(), "date=2024-01-01|region=us");

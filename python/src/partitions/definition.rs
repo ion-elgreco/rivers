@@ -825,10 +825,7 @@ impl PartitionsDefinition {
             }
             // Dim names sit left of '=' in `dim=value` display segments, so
             // '=' is reserved for them on top of the value separators.
-            if let Some(ch) = ['|', ',', '=']
-                .into_iter()
-                .find(|&c| name.contains(c))
-            {
+            if let Some(ch) = ['|', ',', '='].into_iter().find(|&c| name.contains(c)) {
                 return Err(PartitionDefinitionError::new_err(format!(
                     "dimension name '{name}' contains reserved character '{ch}' \
                      (used by the canonical display form)"

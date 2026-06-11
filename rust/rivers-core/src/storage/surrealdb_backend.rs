@@ -443,9 +443,7 @@ async fn migrate_multi_partition_key_order(db: &Surreal<Any>) -> anyhow::Result<
     let events: Vec<EventRow> = result.take(0)?;
     let to_rewrite: Vec<EventRow> = events
         .into_iter()
-        .filter(
-            |ev| matches!(&ev.partition_key, PartitionKey::Multi { dims } if !is_sorted(dims)),
-        )
+        .filter(|ev| matches!(&ev.partition_key, PartitionKey::Multi { dims } if !is_sorted(dims)))
         .collect();
     let event_rewrites = to_rewrite.len();
     // Chunked multi-statement updates: one round-trip per 200 rows instead
