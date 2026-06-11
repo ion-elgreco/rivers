@@ -64,6 +64,17 @@ pub(crate) fn validate_single_dim_range(
         .map(|d| format!(" for dimension '{d}'"))
         .unwrap_or_default();
     match def {
+        // A single-dim range can never match a Multi key — reject instead of
+        // letting the selector silently match nothing at runtime.
+        PartitionsDefinition::Multi { dimensions } => Err(format!(
+            "a single-dimension range cannot select from Multi partitions{suffix}; \
+             use PartitionKeyRange.multi() with dimensions: {}",
+            dimensions
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
         PartitionsDefinition::Static { keys } => {
             let pos = |k: &str| {
                 keys.get_index_of(k)

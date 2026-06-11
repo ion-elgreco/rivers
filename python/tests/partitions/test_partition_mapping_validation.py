@@ -2762,6 +2762,45 @@ def test_forkeys_multi_keys_selector_unknown_key_rejected():
         make_repo([upstream, downstream])
 
 
+def test_forkeys_single_range_on_multi_def_rejected():
+    """A single-dim range can never match a Multi key (contains() returns
+    False for the shape) — the edge must be rejected at resolve, not left to
+    silently skip every dep load."""
+    parts = _multi_parts()
+
+    @rs.Asset
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=parts,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.for_keys(
+                    [
+                        rs.PartitionKeyRange.single(
+                            from_key="2024-01-01", to_key="2024-01-02"
+                        )
+                    ]
+                ),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream
+
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': a single-dimension "
+            "range cannot select from Multi partitions; use "
+            "PartitionKeyRange.multi() with dimensions: date, region"
+        ),
+    ):
+        make_repo([upstream, downstream])
+
+
 def test_forkeys_multi_valid_selectors_accepted():
     """Valid multi selectors (Range + Keys) pass the new validation."""
     parts = _multi_parts()
