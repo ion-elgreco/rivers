@@ -106,6 +106,9 @@ class AutomationCondition:
 
         Args:
             lookback_delta: Optional lookback in seconds from the current window.
+
+        Raises:
+            ValueError: If ``lookback_delta`` is not a positive finite number.
         """
         ...
     @staticmethod
