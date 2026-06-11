@@ -708,31 +708,115 @@ impl PartitionsDefinition {
     }
 }
 
+impl PartitionsDefinition {
+    /// Full structural validation — every rule the factory staticmethods
+    /// enforce. PyO3 generates a raw constructor per enum variant that
+    /// bypasses the factories (and the unpickle path depends on them), so
+    /// `resolve()` re-validates every asset's definition through this.
+    pub(crate) fn validate_definition(&self) -> PyResult<()> {
+        match self {
+            Self::Static { keys } => {
+                if keys.is_empty() {
+                    return Err(PartitionDefinitionError::new_err(
+                        "Static partitions must have at least one key",
+                    ));
+                }
+                for key in keys.iter() {
+                    if key.is_empty() {
+                        return Err(PartitionDefinitionError::new_err(
+                            "static partition keys must not be empty",
+                        ));
+                    }
+                    if let Some(ch) = rivers_core::storage::PartitionKey::reserved_display_char(key)
+                    {
+                        return Err(PartitionDefinitionError::new_err(format!(
+                            "partition key '{key}' contains reserved character '{ch}' \
+                             (used by the canonical display form)"
+                        )));
+                    }
+                }
+                Ok(())
+            }
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => {
+                if cron_schedule.is_none() && interval_seconds.is_none() {
+                    return Err(PartitionDefinitionError::new_err(
+                        "time_window requires either cron_schedule or interval_seconds",
+                    ));
+                }
+                if cron_schedule.is_some() && interval_seconds.is_some() {
+                    return Err(PartitionDefinitionError::new_err(
+                        "time_window accepts cron_schedule or interval_seconds, not both",
+                    ));
+                }
+                if let Some(secs) = interval_seconds {
+                    // Sub-nanosecond values truncate to 0ns, which would divide
+                    // by zero in the key-validation modulo.
+                    if !secs.is_finite() || *secs <= 0.0 || (secs * 1_000_000_000.0) as i64 == 0 {
+                        return Err(PartitionDefinitionError::new_err(format!(
+                            "interval_seconds must be positive and at least 1 nanosecond, \
+                             got {secs}"
+                        )));
+                    }
+                }
+                validate_time_window_fmt(cron_schedule, interval_seconds, start, end, fmt)
+            }
+            Self::Multi { dimensions } => {
+                if dimensions.is_empty() {
+                    return Err(PartitionDefinitionError::new_err(
+                        "Multi partitions must have at least one dimension",
+                    ));
+                }
+                for (name, def) in dimensions {
+                    if matches!(def, Self::Multi { .. }) {
+                        return Err(PartitionDefinitionError::new_err(
+                            "Multi partitions cannot contain nested Multi dimensions",
+                        ));
+                    }
+                    if name.is_empty() {
+                        return Err(PartitionDefinitionError::new_err(
+                            "Multi dimension names cannot be empty",
+                        ));
+                    }
+                    // Dim names sit left of '=' in `dim=value` display
+                    // segments, so '=' is reserved for them on top of the
+                    // value separators.
+                    if let Some(ch) = ['|', ',', '='].into_iter().find(|&c| name.contains(c)) {
+                        return Err(PartitionDefinitionError::new_err(format!(
+                            "dimension name '{name}' contains reserved character '{ch}' \
+                             (used by the canonical display form)"
+                        )));
+                    }
+                    def.validate_definition()?;
+                }
+                Ok(())
+            }
+            Self::Dynamic { name } => {
+                if name.is_empty() {
+                    return Err(PartitionDefinitionError::new_err(
+                        "Dynamic partition definition name cannot be empty",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[pymethods]
 impl PartitionsDefinition {
     #[staticmethod]
     fn static_(keys: Vec<String>) -> PyResult<Self> {
-        if keys.is_empty() {
-            return Err(PartitionDefinitionError::new_err(
-                "Static partitions must have at least one key",
-            ));
-        }
-        for key in &keys {
-            if key.is_empty() {
-                return Err(PartitionDefinitionError::new_err(
-                    "static partition keys must not be empty",
-                ));
-            }
-            if let Some(ch) = rivers_core::storage::PartitionKey::reserved_display_char(key) {
-                return Err(PartitionDefinitionError::new_err(format!(
-                    "partition key '{key}' contains reserved character '{ch}' \
-                     (used by the canonical display form)"
-                )));
-            }
-        }
-        Ok(Self::Static {
+        let def = Self::Static {
             keys: OrderedKeySet::new(keys),
-        })
+        };
+        def.validate_definition()?;
+        Ok(def)
     }
 
     #[staticmethod]
@@ -742,16 +826,15 @@ impl PartitionsDefinition {
         end: Option<NaiveDateTime>,
         fmt: Option<String>,
     ) -> PyResult<Self> {
-        let cron = Some("0 0 * * *".to_string());
-        let fmt = fmt.unwrap_or_else(|| "%Y-%m-%d".to_string());
-        validate_time_window_fmt(&cron, &None, &start, &end, &fmt)?;
-        Ok(Self::TimeWindow {
-            cron_schedule: cron,
+        let def = Self::TimeWindow {
+            cron_schedule: Some("0 0 * * *".to_string()),
             interval_seconds: None,
             start,
             end,
-            fmt,
-        })
+            fmt: fmt.unwrap_or_else(|| "%Y-%m-%d".to_string()),
+        };
+        def.validate_definition()?;
+        Ok(def)
     }
 
     #[staticmethod]
@@ -761,16 +844,15 @@ impl PartitionsDefinition {
         end: Option<NaiveDateTime>,
         fmt: Option<String>,
     ) -> PyResult<Self> {
-        let cron = Some("0 * * * *".to_string());
-        let fmt = fmt.unwrap_or_else(|| "%Y-%m-%dT%H:00".to_string());
-        validate_time_window_fmt(&cron, &None, &start, &end, &fmt)?;
-        Ok(Self::TimeWindow {
-            cron_schedule: cron,
+        let def = Self::TimeWindow {
+            cron_schedule: Some("0 * * * *".to_string()),
             interval_seconds: None,
             start,
             end,
-            fmt,
-        })
+            fmt: fmt.unwrap_or_else(|| "%Y-%m-%dT%H:00".to_string()),
+        };
+        def.validate_definition()?;
+        Ok(def)
     }
 
     #[staticmethod]
@@ -782,34 +864,15 @@ impl PartitionsDefinition {
         end: Option<NaiveDateTime>,
         fmt: Option<String>,
     ) -> PyResult<Self> {
-        if cron_schedule.is_none() && interval_seconds.is_none() {
-            return Err(PartitionDefinitionError::new_err(
-                "time_window requires either cron_schedule or interval_seconds",
-            ));
-        }
-        if cron_schedule.is_some() && interval_seconds.is_some() {
-            return Err(PartitionDefinitionError::new_err(
-                "time_window accepts cron_schedule or interval_seconds, not both",
-            ));
-        }
-        if let Some(secs) = interval_seconds {
-            // Sub-nanosecond values truncate to 0ns, which would divide by
-            // zero in the key-validation modulo.
-            if !secs.is_finite() || secs <= 0.0 || (secs * 1_000_000_000.0) as i64 == 0 {
-                return Err(PartitionDefinitionError::new_err(format!(
-                    "interval_seconds must be positive and at least 1 nanosecond, got {secs}"
-                )));
-            }
-        }
-        let fmt = fmt.unwrap_or_else(|| "%Y-%m-%dT%H:%M:%S".to_string());
-        validate_time_window_fmt(&cron_schedule, &interval_seconds, &start, &end, &fmt)?;
-        Ok(Self::TimeWindow {
+        let def = Self::TimeWindow {
             cron_schedule,
             interval_seconds,
             start,
             end,
-            fmt,
-        })
+            fmt: fmt.unwrap_or_else(|| "%Y-%m-%dT%H:%M:%S".to_string()),
+        };
+        def.validate_definition()?;
+        Ok(def)
     }
 
     #[staticmethod]
@@ -818,32 +881,11 @@ impl PartitionsDefinition {
         for (k, v) in dimensions.iter() {
             let name: String = k.extract()?;
             let def: PartitionsDefinition = v.extract()?;
-            if matches!(def, PartitionsDefinition::Multi { .. }) {
-                return Err(PartitionDefinitionError::new_err(
-                    "Multi partitions cannot contain nested Multi dimensions",
-                ));
-            }
-            if name.is_empty() {
-                return Err(PartitionDefinitionError::new_err(
-                    "Multi dimension names cannot be empty",
-                ));
-            }
-            // Dim names sit left of '=' in `dim=value` display segments, so
-            // '=' is reserved for them on top of the value separators.
-            if let Some(ch) = ['|', ',', '='].into_iter().find(|&c| name.contains(c)) {
-                return Err(PartitionDefinitionError::new_err(format!(
-                    "dimension name '{name}' contains reserved character '{ch}' \
-                     (used by the canonical display form)"
-                )));
-            }
             dims.push((name, def));
         }
-        if dims.is_empty() {
-            return Err(PartitionDefinitionError::new_err(
-                "Multi partitions must have at least one dimension",
-            ));
-        }
-        Ok(Self::Multi { dimensions: dims })
+        let def = Self::Multi { dimensions: dims };
+        def.validate_definition()?;
+        Ok(def)
     }
 
     #[staticmethod]

@@ -1168,9 +1168,25 @@ pub(crate) fn build_unresolved_graph(
 /// - If downstream is partitioned and upstream is NOT partitioned, no mapping needed (unpartitioned dep is shared)
 /// - If downstream is NOT partitioned and upstream IS partitioned, error (need AllPartitions mapping)
 fn validate_partition_mappings(
+    py: Python,
     node_map: &HashMap<String, ResolvedNode>,
     unresolved_graph: &BTreeMap<String, Vec<NodeRef>>,
 ) -> PyResult<()> {
+    // PyO3's per-variant constructors bypass the factory validation, so the
+    // resolve boundary re-checks every definition before edge validation.
+    let mut names: Vec<&String> = node_map.keys().collect();
+    names.sort_unstable();
+    for node_name in names {
+        if let Some(def) = node_map[node_name].partitions_def() {
+            def.validate_definition().map_err(|e| {
+                PartitionValidationError::new_err(format!(
+                    "Asset '{}': invalid partitions definition: {}",
+                    node_name,
+                    e.value(py)
+                ))
+            })?;
+        }
+    }
     for (node_name, deps) in unresolved_graph {
         let downstream_node = match node_map.get(node_name) {
             Some(n) => n,
@@ -2307,7 +2323,7 @@ impl PyCodeRepository {
             step_kinds,
         } = build_unresolved_graph(py, &self.raw_assets, &self.raw_tasks, resource_keys)?;
 
-        validate_partition_mappings(&node_map, &unresolved_graph)?;
+        validate_partition_mappings(py, &node_map, &unresolved_graph)?;
 
         // External assets with automation_condition must have an observe_fn.
         for node in node_map.values() {

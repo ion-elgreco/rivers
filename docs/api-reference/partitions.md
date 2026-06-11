@@ -52,6 +52,8 @@ Defines how an asset is partitioned.
 
 Partition key values may not contain `|` or `,` — those characters are reserved by the canonical display form (`dim=value|dim=value`, values joined with `,`) used everywhere keys appear as strings. Dimension names in `multi()` additionally may not contain `=`. Constructors, `fmt` rendering, and `storage.add_dynamic_partitions()` reject violations.
 
+Every definition is re-validated when the repository resolves: values built without the factory staticmethods (e.g. the raw `PartitionsDefinition.TimeWindow(...)` variant constructor) are held to the same rules before any partition keys are minted.
+
 ### `PartitionsDefinition.static_()`
 
 ```python

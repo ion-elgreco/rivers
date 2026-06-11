@@ -1207,6 +1207,72 @@ def test_task_partitioned_with_unpartitioned_upstream():
 
 
 # ---------------------------------------------------------------------------
+# Definitions are re-validated at resolve — the PyO3 per-variant constructors
+# (PartitionsDefinition.TimeWindow(...) etc.) bypass the factory staticmethods
+# and every construction-time guard with them.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_rejects_variant_constructed_def_bypassing_fmt_validation():
+    bad = rs.PartitionsDefinition.TimeWindow(
+        cron_schedule="0 * * * *",
+        interval_seconds=None,
+        start=datetime(2024, 1, 1),
+        end=None,
+        fmt="%Y-%m-%d",
+    )
+
+    @rs.Asset(partitions_def=bad)
+    def standalone() -> Any:
+        return 1
+
+    with pytest.raises(
+        PartitionValidationError, match="cannot represent the partition grid"
+    ):
+        make_repo([standalone])
+
+
+def test_resolve_rejects_variant_constructed_static_with_reserved_key():
+    bad = rs.PartitionsDefinition.Static(keys=["us|eu"])
+
+    @rs.Asset(partitions_def=bad)
+    def standalone() -> Any:
+        return 1
+
+    with pytest.raises(PartitionValidationError, match="reserved character"):
+        make_repo([standalone])
+
+
+def test_resolve_rejects_variant_constructed_multi_with_bad_dim_name():
+    bad = rs.PartitionsDefinition.Multi(
+        dimensions=[("a=b", rs.PartitionsDefinition.static_(["x"]))]
+    )
+
+    @rs.Asset(partitions_def=bad)
+    def standalone() -> Any:
+        return 1
+
+    with pytest.raises(PartitionValidationError, match="reserved character"):
+        make_repo([standalone])
+
+
+def test_factory_constructed_defs_resolve_fine():
+    """The re-validation must not reject anything the factories produce."""
+    pd = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.daily(start=DAILY_START),
+            "region": rs.PartitionsDefinition.static_(["us", "eu"]),
+        }
+    )
+
+    @rs.Asset(partitions_def=pd)
+    def standalone() -> Any:
+        return 1
+
+    assert make_repo([standalone]) is not None
+
+
+# ---------------------------------------------------------------------------
 # Multi-dimensional partitions
 # ---------------------------------------------------------------------------
 
