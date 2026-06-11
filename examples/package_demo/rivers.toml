@@ -1,4 +1,14 @@
-[rivers]
-module = "package_demo.repository"
+[rivers.module]
+path = "package_demo.repository"
 repo_var = "repo"
-port=3000
+
+[rivers.storage]
+path = ".rivers/storage/"
+
+[rivers.server]
+host = "127.0.0.1"
+port = 3000
+grpc_port = 3001
+
+[rivers.daemon]
+no_daemon = false

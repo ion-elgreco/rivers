@@ -15,7 +15,17 @@ build-backend = "uv_build"
 [tool.uv.sources]
 rivers = { workspace = true, editable = true }
 
-#[tool.rivers]
-#repository = "package_demo.repository:repo"
-#module = "package_demo.repository"
-#repo_var = "repo"
+[tool.rivers.module]
+path = "package_demo.repository"
+repo_var = "repo"
+
+[tool.rivers.storage]
+path = ".rivers/storage/"
+
+[tool.rivers.server]
+host = "127.0.0.1"
+port = 3000
+grpc_port = 3001
+
+[tool.rivers.daemon]
+no_daemon = false
