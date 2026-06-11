@@ -339,6 +339,15 @@ impl PartitionKey {
         }
     }
 
+    /// The first display-syntax separator found in `key`, if any. `|` joins
+    /// dimensions and `,` joins values in [`Self::to_display`]; a key value
+    /// containing either cannot round-trip through
+    /// [`Self::display_candidates`], so constructors and the dynamic-key
+    /// write path reject such values.
+    pub fn reserved_display_char(key: &str) -> Option<char> {
+        ['|', ','].into_iter().find(|&c| key.contains(c))
+    }
+
     /// Inverse of [`Self::to_display`] for point lookups: the candidate
     /// structured keys a display string may denote. Always includes the
     /// `Single` reading; adds a `Multi` reading when the string parses as

@@ -50,6 +50,8 @@ rs.PartitionKey.multi({"date": "2024-01-15", "region": ["us", "eu"]})
 
 Defines how an asset is partitioned.
 
+Partition key values may not contain `|` or `,` — those characters are reserved by the canonical display form (`dim=value|dim=value`, values joined with `,`) used everywhere keys appear as strings. Dimension names in `multi()` additionally may not contain `=`. Constructors, `fmt` rendering, and `storage.add_dynamic_partitions()` reject violations.
+
 ### `PartitionsDefinition.static_()`
 
 ```python

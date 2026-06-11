@@ -717,6 +717,14 @@ impl PartitionsDefinition {
                 "Static partitions must have at least one key",
             ));
         }
+        for key in &keys {
+            if let Some(ch) = rivers_core::storage::PartitionKey::reserved_display_char(key) {
+                return Err(PartitionDefinitionError::new_err(format!(
+                    "partition key '{key}' contains reserved character '{ch}' \
+                     (used by the canonical display form)"
+                )));
+            }
+        }
         Ok(Self::Static {
             keys: OrderedKeySet::new(keys),
         })
@@ -809,6 +817,22 @@ impl PartitionsDefinition {
                 return Err(PartitionDefinitionError::new_err(
                     "Multi partitions cannot contain nested Multi dimensions",
                 ));
+            }
+            if name.is_empty() {
+                return Err(PartitionDefinitionError::new_err(
+                    "Multi dimension names cannot be empty",
+                ));
+            }
+            // Dim names sit left of '=' in `dim=value` display segments, so
+            // '=' is reserved for them on top of the value separators.
+            if let Some(ch) = ['|', ',', '=']
+                .into_iter()
+                .find(|&c| name.contains(c))
+            {
+                return Err(PartitionDefinitionError::new_err(format!(
+                    "dimension name '{name}' contains reserved character '{ch}' \
+                     (used by the canonical display form)"
+                )));
             }
             dims.push((name, def));
         }
@@ -991,6 +1015,12 @@ fn validate_time_window_fmt(
     }
     for t in &ticks {
         let key = t.format(fmt).to_string();
+        if let Some(ch) = rivers_core::storage::PartitionKey::reserved_display_char(&key) {
+            return Err(PartitionDefinitionError::new_err(format!(
+                "fmt '{fmt}' produces keys containing reserved character '{ch}' \
+                 (used by the canonical display form): '{key}'"
+            )));
+        }
         match parse_key_datetime(&key, fmt) {
             Ok(parsed) if parsed == *t => {}
             Ok(parsed) => {

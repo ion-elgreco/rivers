@@ -307,7 +307,12 @@ class Storage:
     def add_dynamic_partitions(
         self, partitions_def_name: str, partition_keys: list[str]
     ) -> None:
-        """Add keys to a :class:`PartitionsDefinition.Dynamic` instance."""
+        """Add keys to a :class:`PartitionsDefinition.Dynamic` instance.
+
+        Raises:
+            StorageError: If a key is empty or contains a character reserved
+                by the canonical display form (``|`` or ``,``).
+        """
         ...
 
     def delete_dynamic_partition(

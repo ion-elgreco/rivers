@@ -306,6 +306,44 @@ def test_empty_set_key_invalid():
 
 
 # ---------------------------------------------------------------------------
+# '|' separates dimensions and ',' separates values in the canonical display
+# form (`dim=v|dim=v`); keys containing them cannot round-trip through
+# partition-string lookups, so they are rejected at construction.
+# ---------------------------------------------------------------------------
+
+
+def test_static_key_with_reserved_char_rejected():
+    for key in ("us|eu", "a,b"):
+        with pytest.raises(PartitionDefinitionError, match="reserved character"):
+            rs.PartitionsDefinition.static_([key])
+
+
+def test_multi_dim_name_with_reserved_char_rejected():
+    """Dim names also sit left of '=' in `dim=value` segments, so '=' is
+    reserved for them as well."""
+    inner = rs.PartitionsDefinition.static_(["x"])
+    for name in ("a|b", "a,b", "a=b"):
+        with pytest.raises(PartitionDefinitionError, match="reserved character"):
+            rs.PartitionsDefinition.multi({name: inner})
+
+
+def test_multi_empty_dim_name_rejected():
+    inner = rs.PartitionsDefinition.static_(["x"])
+    with pytest.raises(PartitionDefinitionError, match="cannot be empty"):
+        rs.PartitionsDefinition.multi({"": inner})
+
+
+def test_time_window_fmt_with_reserved_char_rejected():
+    """A fmt whose rendered keys contain '|' breaks display parsing."""
+    with pytest.raises(PartitionDefinitionError, match="reserved character"):
+        rs.PartitionsDefinition.time_window(
+            start=datetime.datetime(2024, 1, 1),
+            interval_seconds=3600.0,
+            fmt="%Y|%m-%dT%H:%M:%S",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Non-positive / sub-nanosecond intervals are rejected at construction —
 # interval_ns == 0 would otherwise panic on `n % 0` during key validation.
 # ---------------------------------------------------------------------------

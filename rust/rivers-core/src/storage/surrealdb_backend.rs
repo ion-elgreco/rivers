@@ -2984,6 +2984,17 @@ impl PerCodeLocationStorage for SurrealStorage {
         partitions_def_name: &str,
         partition_keys: &[String],
     ) -> Result<()> {
+        for key in partition_keys {
+            if key.is_empty() {
+                anyhow::bail!("dynamic partition keys must not be empty");
+            }
+            if let Some(ch) = PartitionKey::reserved_display_char(key) {
+                anyhow::bail!(
+                    "partition key '{key}' contains reserved character '{ch}' \
+                     (used by the canonical display form)"
+                );
+            }
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -4640,6 +4651,30 @@ mod tests {
                 .unwrap()
                 .len(),
             3
+        );
+    }
+
+    /// Dynamic keys feed the canonical display form (`dim=v|dim=v`, values
+    /// joined with ','); the storage write path is the choke point for every
+    /// transport, so reserved separator characters and empty keys must be
+    /// rejected here.
+    #[tokio::test]
+    async fn test_add_dynamic_partitions_rejects_reserved_and_empty_keys() {
+        let storage = make_storage().await;
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        for bad in ["us|eu", "a,b", ""] {
+            let result = storage
+                .add_dynamic_partitions(cl, "users", &[bad.to_string()])
+                .await;
+            assert!(result.is_err(), "key {bad:?} must be rejected");
+        }
+        assert!(
+            storage
+                .get_dynamic_partitions(cl, "users")
+                .await
+                .unwrap()
+                .is_empty(),
+            "rejected keys must not be persisted"
         );
     }
 

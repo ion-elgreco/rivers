@@ -66,6 +66,19 @@ def test_storage_idempotent_add(storage):
     assert keys == ["u1", "u2", "u3"]
 
 
+def test_storage_add_rejects_reserved_and_empty_keys(storage):
+    """Dynamic keys feed the canonical display form — '|' and ',' would make
+    stored events unreachable through partition-string lookups."""
+    from rivers.exceptions import StorageError
+
+    for key in ("us|eu", "a,b"):
+        with pytest.raises(StorageError, match="reserved character"):
+            storage.add_dynamic_partitions("users", [key])
+    with pytest.raises(StorageError, match="must not be empty"):
+        storage.add_dynamic_partitions("users", [""])
+    assert storage.get_dynamic_partitions("users") == []
+
+
 def test_storage_delete(storage):
     storage.add_dynamic_partitions("users", ["u1", "u2", "u3"])
     storage.delete_dynamic_partition("users", "u2")

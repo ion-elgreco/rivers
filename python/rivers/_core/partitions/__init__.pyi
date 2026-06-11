@@ -137,7 +137,13 @@ class PartitionsDefinition:
 
     @staticmethod
     def static_(keys: list[str]) -> PartitionsDefinition.Static:
-        """Define a static partitions set from a list of keys."""
+        """Define a static partitions set from a list of keys.
+
+        Raises:
+            PartitionDefinitionError: If ``keys`` is empty, or a key contains
+                a character reserved by the canonical display form
+                (``|`` or ``,``).
+        """
         ...
 
     @staticmethod
@@ -172,7 +178,9 @@ class PartitionsDefinition:
 
         Raises:
             PartitionDefinitionError: If ``interval_seconds`` is not positive
-                or is below one nanosecond.
+                or is below one nanosecond, or if ``fmt`` renders keys
+                containing a character reserved by the canonical display
+                form (``|`` or ``,``).
         """
         ...
 
@@ -180,7 +188,14 @@ class PartitionsDefinition:
     def multi(
         dimensions: dict[str, PartitionsDefinition],
     ) -> PartitionsDefinition.Multi:
-        """Combine multiple definitions into a multi-dimensional partition space."""
+        """Combine multiple definitions into a multi-dimensional partition space.
+
+        Raises:
+            PartitionDefinitionError: If ``dimensions`` is empty, a dimension
+                is itself Multi, or a dimension name is empty or contains a
+                character reserved by the canonical display form
+                (``|``, ``,`` or ``=``).
+        """
         ...
 
     @staticmethod
