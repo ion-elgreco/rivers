@@ -299,11 +299,65 @@ impl DbStoredEvent {
     }
 }
 
-/// In-place migration: rewrite persisted `Multi` partition keys whose dims
-/// aren't in canonical (sorted) order. Earlier builds serialized HashMap
-/// iteration order, which defeats the `asset_partitions` UNIQUE index (one
-/// logical partition could occupy several rows) and `partition_key =`
-/// lookups on `events`. Idempotent; sorted rows are left untouched.
+/// Current storage schema version. Bump when adding a migration step to
+/// [`run_migrations`].
+const SCHEMA_VERSION: u32 = 2;
+/// `kv` key holding the persisted schema version. Absent means v1 — a
+/// database from before versioning existed.
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+
+async fn stored_schema_version(db: &Surreal<Any>) -> anyhow::Result<u32> {
+    let mut result = db
+        .query("SELECT * FROM kv WHERE key = $key LIMIT 1")
+        .bind(("key", SCHEMA_VERSION_KEY.to_string()))
+        .await?;
+    let rows: Vec<DbKv> = result.take(0)?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .and_then(|kv| String::from_utf8(kv.value.to_vec()).ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1))
+}
+
+async fn set_schema_version(db: &Surreal<Any>, version: u32) -> anyhow::Result<()> {
+    db.query("DELETE FROM kv WHERE key = $key")
+        .bind(("key", SCHEMA_VERSION_KEY.to_string()))
+        .await?
+        .check()?;
+    let _: Option<DbKv> = db
+        .create("kv")
+        .content(DbKv {
+            key: SCHEMA_VERSION_KEY.to_string(),
+            value: Bytes::from(version.to_string().into_bytes()),
+        })
+        .await?;
+    Ok(())
+}
+
+/// Versioned in-place migrations, run once at every constructor. Steps
+/// between the persisted version and [`SCHEMA_VERSION`] run in order; the
+/// stamp is written only after they all succeed (each step is idempotent and
+/// crash-safe, so a partial run simply resumes on the next start). A
+/// database already at the current version skips the table scans entirely.
+async fn run_migrations(db: &Surreal<Any>) -> anyhow::Result<()> {
+    let from = stored_schema_version(db).await?;
+    if from >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    if from < 2 {
+        migrate_multi_partition_key_order(db).await?;
+    }
+    set_schema_version(db, SCHEMA_VERSION).await?;
+    tracing::info!(from, to = SCHEMA_VERSION, "storage schema migrated");
+    Ok(())
+}
+
+/// v1 → v2: rewrite persisted `Multi` partition keys whose dims aren't in
+/// canonical (sorted) order. Earlier builds serialized HashMap iteration
+/// order, which defeats the `asset_partitions` UNIQUE index (one logical
+/// partition could occupy several rows) and `partition_key =` lookups on
+/// `events`. Idempotent; sorted rows are left untouched.
 async fn migrate_multi_partition_key_order(db: &Surreal<Any>) -> anyhow::Result<()> {
     fn is_sorted(dims: &[(String, Vec<String>)]) -> bool {
         dims.windows(2).all(|w| w[0].0 <= w[1].0)
@@ -387,21 +441,26 @@ async fn migrate_multi_partition_key_order(db: &Surreal<Any>) -> anyhow::Result<
         .query("SELECT id, partition_key FROM events WHERE partition_key.variant = 'Multi'")
         .await?;
     let events: Vec<EventRow> = result.take(0)?;
-    let mut event_rewrites = 0usize;
-    for ev in events {
-        let PartitionKey::Multi { dims } = &ev.partition_key else {
-            continue;
-        };
-        if is_sorted(dims) {
-            continue;
+    let to_rewrite: Vec<EventRow> = events
+        .into_iter()
+        .filter(
+            |ev| matches!(&ev.partition_key, PartitionKey::Multi { dims } if !is_sorted(dims)),
+        )
+        .collect();
+    let event_rewrites = to_rewrite.len();
+    // Chunked multi-statement updates: one round-trip per 200 rows instead
+    // of per row. Re-binding the same key canonicalizes (into_value sorts).
+    for chunk in to_rewrite.chunks(200) {
+        let stmts: String = (0..chunk.len())
+            .map(|i| format!("UPDATE $r{i} SET partition_key = $p{i};"))
+            .collect();
+        let mut query = db.query(stmts);
+        for (i, ev) in chunk.iter().enumerate() {
+            query = query
+                .bind((format!("r{i}"), ev.id.clone()))
+                .bind((format!("p{i}"), ev.partition_key.clone()));
         }
-        // Re-binding the same key canonicalizes: into_value sorts dims.
-        db.query("UPDATE $rec SET partition_key = $pk")
-            .bind(("rec", ev.id))
-            .bind(("pk", ev.partition_key))
-            .await?
-            .check()?;
-        event_rewrites += 1;
+        query.await?.check()?;
     }
     if rewritten > 0 || event_rewrites > 0 {
         tracing::info!(
@@ -764,7 +823,7 @@ impl SurrealStorage {
                 .await?;
             tracing::debug!("applying schema");
             db.query(SCHEMA).await?;
-            migrate_multi_partition_key_order(&db).await?;
+            run_migrations(&db).await?;
             Ok(db)
         })
         .await?;
@@ -815,7 +874,7 @@ impl SurrealStorage {
                 .await?;
             tracing::debug!("applying schema");
             db.query(SCHEMA).await?;
-            migrate_multi_partition_key_order(&db).await?;
+            run_migrations(&db).await?;
             Ok(db)
         })
         .await?;
@@ -896,7 +955,7 @@ impl SurrealStorage {
             db.use_ns(&namespace).use_db(&database).await?;
             tracing::debug!("applying schema");
             db.query(SCHEMA).await?;
-            migrate_multi_partition_key_order(&db).await?;
+            run_migrations(&db).await?;
             Ok(db)
         })
         .await?;
@@ -4101,6 +4160,114 @@ mod tests {
             Some(1),
             "event key must be rewritten to canonical order"
         );
+    }
+
+    /// A fresh database is stamped with the current schema version at
+    /// construction, so it never pays the legacy table scans again.
+    #[tokio::test]
+    async fn test_fresh_database_stamped_with_current_schema_version() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        assert_eq!(
+            stored_schema_version(&storage.db).await.unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    /// A database already at the current version must not re-run migrations:
+    /// a planted unsorted row stays untouched because the v1→v2 scan is
+    /// skipped entirely.
+    #[tokio::test]
+    async fn test_migrations_skip_when_version_is_current() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        storage
+            .db
+            .query(
+                "CREATE asset_partitions CONTENT { code_location_id: 'default', \
+                 asset_key: 'inv', partition_key: { variant: 'Multi', dims: \
+                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
+                 last_event_id: 'e1', last_run_id: 'r1', last_timestamp: 1 }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        // Simulate the next startup's migration pass.
+        run_migrations(&storage.db).await.unwrap();
+
+        #[derive(Debug, SurrealValue)]
+        struct PkRow {
+            partition_key: PartitionKey,
+        }
+        let mut result = storage
+            .db
+            .query("SELECT partition_key FROM asset_partitions")
+            .await
+            .unwrap();
+        let rows: Vec<PkRow> = result.take(0).unwrap();
+        assert_eq!(rows.len(), 1);
+        let PartitionKey::Multi { dims } = &rows[0].partition_key else {
+            unreachable!()
+        };
+        assert_eq!(
+            dims[0].0, "region",
+            "a database at the current version must not be rescanned"
+        );
+    }
+
+    /// A pre-versioning database (no schema_version key) is treated as v1:
+    /// the Multi-key migration runs once, then the version is stamped.
+    #[tokio::test]
+    async fn test_legacy_database_migrates_and_stamps_version() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        // Erase the stamp to simulate a database from before versioning.
+        storage
+            .db
+            .query("DELETE FROM kv WHERE key = $key")
+            .bind(("key", SCHEMA_VERSION_KEY.to_string()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        storage
+            .db
+            .query(
+                "CREATE asset_partitions CONTENT { code_location_id: 'default', \
+                 asset_key: 'inv', partition_key: { variant: 'Multi', dims: \
+                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
+                 last_event_id: 'e1', last_run_id: 'r1', last_timestamp: 1 }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        run_migrations(&storage.db).await.unwrap();
+
+        assert_eq!(
+            stored_schema_version(&storage.db).await.unwrap(),
+            SCHEMA_VERSION
+        );
+        let sorted = PartitionKey::Multi {
+            dims: vec![
+                ("date".to_string(), vec!["2024-01-01".to_string()]),
+                ("region".to_string(), vec!["eu".to_string()]),
+            ],
+        };
+        let parts = storage
+            .get_materialized_partitions(crate::storage::DEFAULT_CODE_LOCATION_ID, "inv")
+            .await
+            .unwrap();
+        assert_eq!(parts, vec![sorted], "legacy row canonicalized exactly once");
     }
 
     /// A crash mid-migration must never lose a partition: the canonical row
