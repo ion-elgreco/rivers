@@ -169,7 +169,9 @@ def test_coarse_fmt_on_equally_coarse_grid_allowed():
         fmt="%Y-%m",
         end=datetime.datetime(2024, 4, 1),
     )
-    keys = [k.key for k in pd.get_partition_keys() if isinstance(k, rs.PartitionKey.Single)]
+    keys = [
+        k.key for k in pd.get_partition_keys() if isinstance(k, rs.PartitionKey.Single)
+    ]
     assert keys == [["2024-01"], ["2024-02"], ["2024-03"]]
 
 
