@@ -369,3 +369,17 @@ def test_time_window_sub_nanosecond_interval_rejected():
         rs.PartitionsDefinition.time_window(
             start=datetime.datetime(2024, 1, 1), interval_seconds=1e-12
         )
+
+
+def test_time_window_subsecond_cron_start_rejected():
+    """A start with sub-second precision puts every cron tick off the whole-
+    second grid; a second-grained fmt cannot round-trip those keys. The fmt
+    check walks the same grid enumerate uses, so this fails at construction
+    instead of minting keys that fail their own validation."""
+    with pytest.raises(
+        PartitionDefinitionError, match="cannot represent the partition grid"
+    ):
+        rs.PartitionsDefinition.time_window(
+            start=datetime.datetime(2024, 1, 1, microsecond=500),
+            cron_schedule="0 * * * *",
+        )

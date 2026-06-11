@@ -985,30 +985,19 @@ fn validate_time_window_fmt(
     end: &Option<NaiveDateTime>,
     fmt: &str,
 ) -> PyResult<()> {
+    // Walk the grid with the same helpers `enumerate` uses — validation must
+    // judge exactly the keys the definition will mint.
     let mut ticks: Vec<NaiveDateTime> = Vec::with_capacity(2);
     if let Some(secs) = interval_seconds {
-        ticks.push(*start);
-        let ns = (*secs * 1_000_000_000.0) as i64;
-        if let Some(t1) = start.checked_add_signed(chrono::Duration::nanoseconds(ns)) {
-            ticks.push(t1);
-        }
-    } else if let Some(expr) = cron_schedule {
-        use chrono::Timelike;
-        let cron = parse_cron(expr)?;
-        let anchor = start
-            .checked_sub_signed(chrono::Duration::seconds(1))
-            .unwrap_or(*start);
-        for tick in cron.iter_from(Utc.from_utc_datetime(&anchor), croner::Direction::Forward) {
-            let naive = tick.naive_utc();
-            let t = naive.with_nanosecond(0).unwrap_or(naive);
-            if t < *start {
-                continue;
-            }
+        for_each_interval_tick(*secs, start, NaiveDateTime::MAX, |t| {
             ticks.push(t);
-            if ticks.len() == 2 {
-                break;
-            }
-        }
+            ticks.len() < 2
+        });
+    } else if let Some(expr) = cron_schedule {
+        for_each_cron_tick(expr, start, NaiveDateTime::MAX, |t| {
+            ticks.push(t);
+            ticks.len() < 2
+        })?;
     }
     if let Some(end_dt) = end {
         ticks.retain(|t| t < end_dt);
