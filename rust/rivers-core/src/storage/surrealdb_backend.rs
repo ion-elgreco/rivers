@@ -2788,15 +2788,28 @@ impl PerCodeLocationStorage for SurrealStorage {
     ) -> Result<Option<StoredEvent>> {
         let event_type_str = "Materialization".to_string();
         let mut result = if let Some(partition_key) = partition {
-            // The display string may denote a Single or a Multi key.
-            let candidates = PartitionKey::display_candidates(partition_key);
-            self.db
-                .query("SELECT * FROM events WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key IN $candidates AND event_type = $event_type ORDER BY timestamp DESC LIMIT 1")
-                .bind(("cl", code_location_id.to_string()))
-                .bind(("asset_key", asset_key.to_string()))
-                .bind(("candidates", candidates))
-                .bind(("event_type", event_type_str))
-                .await?
+            // The display string may denote a Single or a Multi key. Both
+            // readings can have rows when the asset's def changed shape
+            // (legacy Single events vs current Multi ones) — the structured
+            // reading wins, so try candidates most-structured first instead
+            // of letting timestamps decide.
+            for cand in PartitionKey::display_candidates(partition_key)
+                .into_iter()
+                .rev()
+            {
+                let mut result = self.db
+                    .query("SELECT * FROM events WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key = $pk AND event_type = $event_type ORDER BY timestamp DESC LIMIT 1")
+                    .bind(("cl", code_location_id.to_string()))
+                    .bind(("asset_key", asset_key.to_string()))
+                    .bind(("pk", cand))
+                    .bind(("event_type", event_type_str.clone()))
+                    .await?;
+                let events: Vec<DbStoredEvent> = result.take(0)?;
+                if let Some(e) = events.into_iter().next() {
+                    return Ok(Some(e.into_stored_event()));
+                }
+            }
+            return Ok(None);
         } else {
             self.db
                 .query("SELECT * FROM events WHERE code_location_id = $cl AND asset_key = $asset_key AND event_type = $event_type ORDER BY timestamp DESC LIMIT 1")
@@ -3201,16 +3214,25 @@ impl PerCodeLocationStorage for SurrealStorage {
         partition_key: &str,
         limit: usize,
     ) -> Result<Vec<StoredEvent>> {
-        let mut result = self
-            .db
-            .query("SELECT * FROM events WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key IN $candidates ORDER BY timestamp DESC LIMIT $limit")
-            .bind(("cl", code_location_id.to_string()))
-            .bind(("asset_key", asset_key.to_string()))
-            .bind(("candidates", PartitionKey::display_candidates(partition_key)))
-            .bind(("limit", limit))
-            .await?;
-        let events: Vec<DbStoredEvent> = result.take(0)?;
-        Ok(events.into_iter().map(|e| e.into_stored_event()).collect())
+        // Most-structured reading first; see get_latest_materialization.
+        for cand in PartitionKey::display_candidates(partition_key)
+            .into_iter()
+            .rev()
+        {
+            let mut result = self
+                .db
+                .query("SELECT * FROM events WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key = $pk ORDER BY timestamp DESC LIMIT $limit")
+                .bind(("cl", code_location_id.to_string()))
+                .bind(("asset_key", asset_key.to_string()))
+                .bind(("pk", cand))
+                .bind(("limit", limit))
+                .await?;
+            let events: Vec<DbStoredEvent> = result.take(0)?;
+            if !events.is_empty() {
+                return Ok(events.into_iter().map(|e| e.into_stored_event()).collect());
+            }
+        }
+        Ok(Vec::new())
     }
 
     async fn get_materialized_partitions(
@@ -4258,6 +4280,68 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// After a def-shape change, legacy Single events whose key strings look
+    /// like Multi displays can coexist with real Multi events for the same
+    /// asset. Display lookups must prefer the structured (Multi) reading —
+    /// not whichever row happens to be newest.
+    #[tokio::test]
+    async fn test_partition_string_lookup_prefers_structured_multi() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let multi = PartitionKey::Multi {
+            dims: vec![
+                ("date".to_string(), vec!["2024-01-01".to_string()]),
+                ("region".to_string(), vec!["eu".to_string()]),
+            ],
+        };
+        let display = multi.to_display();
+
+        // Legacy event from the asset's static-keyed era — NEWER timestamp.
+        let mut old_single = make_event("inv", "r1", 200);
+        old_single.partition_key = Some(PartitionKey::Single {
+            keys: vec![display.clone()],
+        });
+        storage.store_event(&old_single).await.unwrap();
+
+        let mut multi_event = make_event("inv", "r2", 100);
+        multi_event.partition_key = Some(multi.clone());
+        storage.store_event(&multi_event).await.unwrap();
+
+        let latest = storage
+            .get_latest_materialization(cl, "inv", Some(&display))
+            .await
+            .unwrap()
+            .expect("lookup must match");
+        assert_eq!(
+            latest.run_id, "r2",
+            "the structured Multi reading wins over a newer legacy Single row"
+        );
+        let events = storage
+            .get_partition_events(cl, "inv", &display, 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "only the Multi partition's events return");
+        assert_eq!(events[0].run_id, "r2");
+
+        // The Single reading still works when no Multi rows exist.
+        let mut plain = make_event("inv2", "r3", 100);
+        plain.partition_key = Some(PartitionKey::Single {
+            keys: vec![display.clone()],
+        });
+        storage.store_event(&plain).await.unwrap();
+        assert!(
+            storage
+                .get_latest_materialization(cl, "inv2", Some(&display))
+                .await
+                .unwrap()
+                .is_some(),
+            "falls back to the Single reading"
         );
     }
 

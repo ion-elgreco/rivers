@@ -349,10 +349,11 @@ impl PartitionKey {
     }
 
     /// Inverse of [`Self::to_display`] for point lookups: the candidate
-    /// structured keys a display string may denote. Always includes the
-    /// `Single` reading; adds a `Multi` reading when the string parses as
-    /// `dim=v,v|dim=v,v`. A Static key that happens to contain `=` is
-    /// ambiguous — querying with both candidates resolves it.
+    /// structured keys a display string may denote, ordered least-structured
+    /// first. Always includes the `Single` reading; appends a `Multi` reading
+    /// when the string parses as `dim=v,v|dim=v,v`. A Static key that happens
+    /// to contain `=` is ambiguous — lookups try the candidates
+    /// most-structured first, so the `Multi` reading wins when both match.
     pub fn display_candidates(display: &str) -> Vec<PartitionKey> {
         let mut out = vec![PartitionKey::Single {
             keys: vec![display.to_string()],
