@@ -6079,19 +6079,14 @@ fn test_time_window_mapping_shifts_selections_by_offset() {
     };
 
     let d = PartitionSelection::Keys(HashSet::from([spk("2024-01-05")]));
-    // Downstream 2024-01-05 reads upstream 2024-01-04.
-    assert_eq!(
-        m.map_to_upstream(&d),
-        PartitionSelection::Keys(HashSet::from([spk("2024-01-04")]))
-    );
     // Upstream 2024-01-05 updating affects downstream 2024-01-06.
     assert_eq!(
         m.map_to_downstream(&d),
         PartitionSelection::Keys(HashSet::from([spk("2024-01-06")]))
     );
     // A shift outside [start, end) has no counterpart partition.
-    let first = PartitionSelection::Keys(HashSet::from([spk("2024-01-01")]));
-    assert_eq!(m.map_to_upstream(&first), PartitionSelection::Empty);
+    let last = PartitionSelection::Keys(HashSet::from([spk("2024-01-31")]));
+    assert_eq!(m.map_to_downstream(&last), PartitionSelection::Empty);
 }
 
 /// Mappings serialized before the grid existed degrade to pass-through.
@@ -6102,7 +6097,6 @@ fn test_time_window_mapping_without_grid_passes_through() {
         grid: None,
     };
     let sel = PartitionSelection::Keys(HashSet::from([spk("2024-01-05")]));
-    assert_eq!(m.map_to_upstream(&sel), sel);
     assert_eq!(m.map_to_downstream(&sel), sel);
 }
 
@@ -6754,7 +6748,6 @@ fn test_partitioned_all_deps_match_not_missing() {
 fn test_partition_mapping_identity() {
     let m = PartitionMappingKind::Identity;
     let sel = PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2")]));
-    assert_eq!(m.map_to_upstream(&sel), sel);
     assert_eq!(m.map_to_downstream(&sel), sel);
 }
 
@@ -6762,8 +6755,6 @@ fn test_partition_mapping_identity() {
 fn test_partition_mapping_all_partitions() {
     let m = PartitionMappingKind::AllPartitions;
     let sel = PartitionSelection::Keys(HashSet::from([spk("p1")]));
-    // map_to_upstream returns All (resolved by PartitionResolver)
-    assert_eq!(m.map_to_upstream(&sel), PartitionSelection::All);
     // map_to_downstream: any upstream change affects all downstream
     assert_eq!(m.map_to_downstream(&sel), PartitionSelection::All);
     // Empty input → Empty
@@ -6778,13 +6769,7 @@ fn test_partition_mapping_static() {
     let m = PartitionMappingKind::Static {
         mapping: HashMap::from([("d1".into(), "u1".into()), ("d2".into(), "u2".into())]),
     };
-    // Downstream d1 maps to upstream u1
-    let sel = PartitionSelection::Keys(HashSet::from([spk("d1")]));
-    assert_eq!(
-        m.map_to_upstream(&sel),
-        PartitionSelection::Keys(HashSet::from([spk("u1")]))
-    );
-    // Upstream u2 maps back to downstream d2
+    // Upstream u2 maps to downstream d2
     let sel2 = PartitionSelection::Keys(HashSet::from([spk("u2")]));
     assert_eq!(
         m.map_to_downstream(&sel2),
@@ -6797,12 +6782,6 @@ fn test_partition_mapping_specific() {
     let m = PartitionMappingKind::SpecificPartitions {
         keys: vec!["latest".into()],
     };
-    // Any downstream partition maps to "latest" upstream
-    let sel = PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2")]));
-    assert_eq!(
-        m.map_to_upstream(&sel),
-        PartitionSelection::Keys(HashSet::from([spk("latest")]))
-    );
     // Any upstream change affects all downstream
     let up = PartitionSelection::Keys(HashSet::from([spk("latest")]));
     assert_eq!(m.map_to_downstream(&up), PartitionSelection::All);
@@ -6815,25 +6794,7 @@ fn test_partition_resolver_identity_passthrough() {
         HashMap::from([("a".into(), HashSet::from([spk("p1"), spk("p2"), spk("p3")]))]),
     );
     let sel = PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2")]));
-    assert_eq!(resolver.map_upstream("b", "a", &sel), sel);
     assert_eq!(resolver.map_downstream("a", "b", &sel), sel);
-}
-
-#[test]
-fn test_partition_resolver_all_partitions() {
-    let resolver = PartitionResolver::new(
-        HashMap::from([(
-            ("b".into(), "a".into()),
-            PartitionMappingKind::AllPartitions,
-        )]),
-        HashMap::from([("a".into(), HashSet::from([spk("u1"), spk("u2"), spk("u3")]))]),
-    );
-    // Any downstream partition → all upstream partitions
-    let sel = PartitionSelection::Keys(HashSet::from([spk("p1")]));
-    assert_eq!(
-        resolver.map_upstream("b", "a", &sel),
-        PartitionSelection::Keys(HashSet::from([spk("u1"), spk("u2"), spk("u3")]))
-    );
 }
 
 #[test]
@@ -6841,7 +6802,6 @@ fn test_partition_resolver_no_mapping_is_identity() {
     // No mapping registered for edge (c, d) → identity passthrough
     let resolver = PartitionResolver::new(HashMap::new(), HashMap::new());
     let sel = PartitionSelection::Keys(HashSet::from([spk("p1")]));
-    assert_eq!(resolver.map_upstream("c", "d", &sel), sel);
     assert_eq!(resolver.map_downstream("d", "c", &sel), sel);
 }
 
@@ -6973,7 +6933,6 @@ fn test_partition_mapping_multi_identity_dims() {
         ("date", "2024-01-01"),
         ("region", "us"),
     ])]));
-    assert_eq!(m.map_to_upstream(&sel), sel);
     assert_eq!(m.map_to_downstream(&sel), sel);
 }
 
@@ -6992,22 +6951,18 @@ fn test_partition_mapping_multi_dimension_rename() {
             ),
         ]),
     };
-    let downstream = PartitionSelection::Keys(HashSet::from([mpk(&[
-        ("date", "2024-01-01"),
-        ("region", "us"),
+    let upstream = PartitionSelection::Keys(HashSet::from([mpk(&[
+        ("src_date", "2024-01-01"),
+        ("src_region", "us"),
     ])]));
-    let upstream = m.map_to_upstream(&downstream);
+    let down = m.map_to_downstream(&upstream);
     assert_eq!(
-        upstream,
+        down,
         PartitionSelection::Keys(HashSet::from([mpk(&[
-            ("src_date", "2024-01-01"),
-            ("src_region", "us")
+            ("date", "2024-01-01"),
+            ("region", "us")
         ])]))
     );
-
-    // Reverse: upstream → downstream
-    let back = m.map_to_downstream(&upstream);
-    assert_eq!(back, downstream);
 }
 
 #[test]
@@ -7033,20 +6988,6 @@ fn test_partition_mapping_multi_with_static_sub() {
             ),
         ]),
     };
-    // Downstream "north" → upstream "us"
-    let downstream = PartitionSelection::Keys(HashSet::from([mpk(&[
-        ("date", "2024-01-01"),
-        ("region", "north"),
-    ])]));
-    let upstream = m.map_to_upstream(&downstream);
-    assert_eq!(
-        upstream,
-        PartitionSelection::Keys(HashSet::from([mpk(&[
-            ("date", "2024-01-01"),
-            ("region", "us")
-        ])]))
-    );
-
     // Upstream "eu" → downstream "europe"
     let up = PartitionSelection::Keys(HashSet::from([mpk(&[
         ("date", "2024-01-01"),
@@ -7070,14 +7011,6 @@ fn test_partition_mapping_multi_empty_and_all() {
             ("d".into(), Box::new(PartitionMappingKind::Identity)),
         )]),
     };
-    assert_eq!(
-        m.map_to_upstream(&PartitionSelection::Empty),
-        PartitionSelection::Empty
-    );
-    assert_eq!(
-        m.map_to_upstream(&PartitionSelection::All),
-        PartitionSelection::All
-    );
     assert_eq!(
         m.map_to_downstream(&PartitionSelection::Empty),
         PartitionSelection::Empty
@@ -7107,7 +7040,6 @@ fn test_partition_mapping_multi_multiple_keys() {
         mpk(&[("date", "2024-01-02"), ("region", "eu")]),
     ]));
     // Identity per-dim → same keys
-    assert_eq!(m.map_to_upstream(&sel), sel);
     assert_eq!(m.map_to_downstream(&sel), sel);
 }
 
@@ -7128,23 +7060,6 @@ fn test_partition_mapping_multi_to_single_extract_dimension() {
     assert_eq!(
         downstream,
         PartitionSelection::Keys(HashSet::from([spk("2024-01-01"), spk("2024-01-02")]))
-    );
-}
-
-#[test]
-fn test_partition_mapping_multi_to_single_upstream_direction() {
-    // Downstream is single, upstream is multi.
-    // Downstream "2024-01-01" maps upstream to "2024-01-01" (identity inner).
-    let m = PartitionMappingKind::MultiToSingle {
-        dimension_name: "date".into(),
-        inner: Box::new(PartitionMappingKind::Identity),
-    };
-    let downstream = PartitionSelection::Keys(HashSet::from([spk("2024-01-01")]));
-    let upstream = m.map_to_upstream(&downstream);
-    // Returns the single-dim value (the resolver handles reconstructing the full multi key)
-    assert_eq!(
-        upstream,
-        PartitionSelection::Keys(HashSet::from([spk("2024-01-01")]))
     );
 }
 
@@ -7176,14 +7091,6 @@ fn test_partition_mapping_multi_to_single_empty_and_all() {
         dimension_name: "date".into(),
         inner: Box::new(PartitionMappingKind::Identity),
     };
-    assert_eq!(
-        m.map_to_upstream(&PartitionSelection::Empty),
-        PartitionSelection::Empty
-    );
-    assert_eq!(
-        m.map_to_upstream(&PartitionSelection::All),
-        PartitionSelection::All
-    );
     assert_eq!(
         m.map_to_downstream(&PartitionSelection::Empty),
         PartitionSelection::Empty
@@ -7227,7 +7134,6 @@ fn test_resolver_multi_mapping() {
         ("date", "2024-01-01"),
         ("region", "us"),
     ])]));
-    assert_eq!(resolver.map_upstream("down", "up", &sel), sel);
     assert_eq!(resolver.map_downstream("up", "down", &sel), sel);
 }
 

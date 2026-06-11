@@ -211,132 +211,6 @@ fn shift_selection(
 }
 
 impl PartitionMappingKind {
-    /// Map downstream partition keys to upstream partition keys.
-    pub fn map_to_upstream(&self, downstream_keys: &PartitionSelection) -> PartitionSelection {
-        match self {
-            Self::Identity => downstream_keys.clone(),
-            Self::AllPartitions => PartitionSelection::All,
-            Self::Static { mapping } => match downstream_keys {
-                PartitionSelection::Empty => PartitionSelection::Empty,
-                PartitionSelection::All => PartitionSelection::All,
-                PartitionSelection::Keys(keys) => {
-                    let mapped: HashSet<PartitionKey> = keys
-                        .iter()
-                        .filter_map(|k| {
-                            if let PartitionKey::Single { keys: kv } = k {
-                                mapping.get(kv.first()?).map(|v| PartitionKey::Single {
-                                    keys: vec![v.clone()],
-                                })
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if mapped.is_empty() {
-                        PartitionSelection::Empty
-                    } else {
-                        PartitionSelection::Keys(mapped)
-                    }
-                }
-            },
-            // Downstream key K reads upstream K+offset (runtime map_key
-            // semantics) — mirror it here so conditions fire the partitions
-            // the runtime will actually load.
-            Self::TimeWindow { offset, grid } => {
-                shift_selection(downstream_keys, *offset, grid.as_ref())
-            }
-            Self::SpecificPartitions { keys } => {
-                if downstream_keys.is_empty() {
-                    PartitionSelection::Empty
-                } else {
-                    PartitionSelection::Keys(
-                        keys.iter()
-                            .map(|k| PartitionKey::Single {
-                                keys: vec![k.clone()],
-                            })
-                            .collect(),
-                    )
-                }
-            }
-            Self::Multi { dimension_mappings } => match downstream_keys {
-                PartitionSelection::Empty => PartitionSelection::Empty,
-                PartitionSelection::All => PartitionSelection::All,
-                PartitionSelection::Keys(keys) => {
-                    let map_key_upstream = |pk: &PartitionKey| -> Option<PartitionKey> {
-                        let dims = match pk {
-                            PartitionKey::Multi { dims } => dims,
-                            _ => return None,
-                        };
-                        let downstream_dims: HashMap<&str, &[String]> = dims
-                            .iter()
-                            .map(|(d, v)| (d.as_str(), v.as_slice()))
-                            .collect();
-                        let mut upstream_dims = Vec::new();
-                        for (upstream_dim, (downstream_dim, per_dim_mapping)) in dimension_mappings
-                        {
-                            let val = downstream_dims.get(downstream_dim.as_str())?;
-                            let single_key = PartitionKey::Single { keys: val.to_vec() };
-                            let mapped = per_dim_mapping.map_to_upstream(
-                                &PartitionSelection::Keys(std::iter::once(single_key).collect()),
-                            );
-                            match mapped {
-                                PartitionSelection::Keys(ks) => {
-                                    let first = ks.into_iter().next()?;
-                                    if let PartitionKey::Single { keys: kv } = first {
-                                        upstream_dims.push((upstream_dim.clone(), kv));
-                                    } else {
-                                        return None;
-                                    }
-                                }
-                                _ => return None,
-                            }
-                        }
-                        Some(PartitionKey::Multi {
-                            dims: upstream_dims,
-                        })
-                    };
-                    let mapped: HashSet<PartitionKey> =
-                        keys.iter().filter_map(map_key_upstream).collect();
-                    if mapped.is_empty() {
-                        PartitionSelection::Empty
-                    } else {
-                        PartitionSelection::Keys(mapped)
-                    }
-                }
-            },
-            Self::MultiToSingle {
-                dimension_name: _,
-                inner,
-            } => match downstream_keys {
-                PartitionSelection::Empty => PartitionSelection::Empty,
-                PartitionSelection::All => PartitionSelection::All,
-                PartitionSelection::Keys(keys) => {
-                    let mapped: HashSet<PartitionKey> = keys
-                        .iter()
-                        .map(|k| {
-                            let inner_sel =
-                                PartitionSelection::Keys(std::iter::once(k.clone()).collect());
-                            inner.map_to_upstream(&inner_sel)
-                        })
-                        .flat_map(|sel| match sel {
-                            PartitionSelection::Keys(ks) => ks.into_iter().collect::<Vec<_>>(),
-                            PartitionSelection::All => vec![],
-                            PartitionSelection::Empty => vec![],
-                        })
-                        .collect();
-                    if mapped.is_empty() {
-                        PartitionSelection::Empty
-                    } else {
-                        PartitionSelection::Keys(mapped)
-                    }
-                }
-            },
-            Self::ForKeys => PartitionSelection::All,
-            // Non-existent keys filtered at execution time.
-            Self::Subset => downstream_keys.clone(),
-        }
-    }
-
     /// Map upstream partition keys to downstream partition keys.
     pub fn map_to_downstream(&self, upstream_keys: &PartitionSelection) -> PartitionSelection {
         match self {
@@ -371,8 +245,8 @@ impl PartitionMappingKind {
                     }
                 }
             },
-            // Inverse of map_to_upstream: the downstream that reads
-            // upstream U is U-offset.
+            // Downstream key K reads upstream K+offset, so the downstream
+            // that reads upstream U is U-offset.
             Self::TimeWindow { offset, grid } => {
                 shift_selection(upstream_keys, -*offset, grid.as_ref())
             }
@@ -491,33 +365,6 @@ impl PartitionResolver {
         Self {
             mappings,
             upstream_partition_keys,
-        }
-    }
-
-    /// Map downstream partition keys to upstream partition keys.
-    pub fn map_upstream(
-        &self,
-        downstream_asset: &str,
-        upstream_asset: &str,
-        downstream_keys: &PartitionSelection,
-    ) -> PartitionSelection {
-        let key = (downstream_asset.to_string(), upstream_asset.to_string());
-        let mapping = match self.mappings.get(&key) {
-            Some(m) => m,
-            None => return downstream_keys.clone(), // no mapping = identity
-        };
-        match mapping {
-            PartitionMappingKind::AllPartitions => {
-                if downstream_keys.is_empty() {
-                    PartitionSelection::Empty
-                } else {
-                    match self.upstream_partition_keys.get(upstream_asset) {
-                        Some(keys) => PartitionSelection::Keys(keys.clone()),
-                        None => PartitionSelection::All,
-                    }
-                }
-            }
-            _ => mapping.map_to_upstream(downstream_keys),
         }
     }
 
