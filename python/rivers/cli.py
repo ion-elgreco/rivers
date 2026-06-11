@@ -10,11 +10,13 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import tomllib
 import typer
+from pydantic import BaseModel, Field
 from pydantic_settings import (
     BaseSettings,
+    EnvSettingsSource,
     PydanticBaseSettingsSource,
+    PyprojectTomlConfigSettingsSource,
     SettingsConfigDict,
     TomlConfigSettingsSource,
 )
@@ -28,37 +30,53 @@ app.add_typer(pools_app)
 app.add_typer(queue_app)
 
 
-class RiversTomlSource(TomlConfigSettingsSource):
-    """Handles both rivers.toml ([rivers]) and pyproject.toml ([tool.rivers])."""
-
-    def _read_file(self, file_path: Path) -> dict:
-        with open(file_path, "rb") as f:
-            raw = tomllib.load(f)
-
-        if file_path.name == "pyproject.toml":
-            # `[tool.rivers]` expected for pyproject.toml files.
-            return raw.get("tool", {}).get("rivers", {})
-        else:
-            # `[rivers]` expected for rivers.toml files.
-            return raw.get("rivers", {})
-
-
-class RiversConfig(BaseSettings):
-    module: str | None = None
+class ModuleConfig(BaseModel):
+    path: str | None = None
     repo_var: str = "repo"
+
+
+class StorageConfig(BaseModel):
+    path: str = ".rivers/storage/"
+    endpoint: str | None = None
+
+
+class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 3000
     grpc_port: int = 3001
-    storage_path: str = ".rivers/storage/"
-    surreal_endpoint: str | None = None
+
+
+class DaemonConfig(BaseModel):
     no_daemon: bool = False
-    synthetic: str | None = None
+
+
+class SyntheticConfig(BaseModel):
+    size: str | None = None
+
+
+class RiversEnvSource(EnvSettingsSource):
+    def _load_env_vars(self):
+        env = super()._load_env_vars()
+        collisions = {
+            f"{self.env_prefix}{name}".lower()
+            for name in self.settings_cls.model_fields
+        }
+        return {k: v for k, v in env.items() if k.lower() not in collisions}
+
+
+class RiversConfig(BaseSettings):
+    module: ModuleConfig = Field(default_factory=ModuleConfig)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
+    server: ServerConfig = Field(default_factory=ServerConfig)
+    daemon: DaemonConfig = Field(default_factory=DaemonConfig)
+    synthetic: SyntheticConfig = Field(default_factory=SyntheticConfig)
 
     model_config = SettingsConfigDict(
         env_prefix="RIVERS_",
-        env_ignore_empty=True,
+        env_nested_delimiter="_",
+        env_nested_max_split=1,
+        pyproject_toml_table_header=("tool", "rivers"),
         extra="ignore",
-        toml_file=["rivers.toml", "pyproject.toml"],
     )
 
     @classmethod
@@ -70,18 +88,34 @@ class RiversConfig(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        sources: list[PydanticBaseSettingsSource] = [init_settings, env_settings]
+        sources: list[PydanticBaseSettingsSource] = [
+            init_settings,
+            RiversEnvSource(settings_cls),
+        ]
 
         # Using _find_toml() to recursively lookup the TOML configuration files
         # within the current code location. This makes it possible to run operations
-        # such as `rivers dev` from anywhere inside the code location.
+        # such as `rivers dev` from any project directory.
         rivers_toml = _find_toml("rivers.toml")
         pyproject_toml = _find_toml("pyproject.toml")
 
+        print(f"rivers_toml={rivers_toml}")
+        print(f"pyproject_toml={pyproject_toml}")
+
         if rivers_toml:
-            sources.append(RiversTomlSource(settings_cls, toml_file=rivers_toml))
+            sources.append(
+                TomlConfigSettingsSource(
+                    settings_cls,
+                    toml_file=rivers_toml,
+                )
+            )
         if pyproject_toml:
-            sources.append(RiversTomlSource(settings_cls, toml_file=pyproject_toml))
+            sources.append(
+                PyprojectTomlConfigSettingsSource(
+                    settings_cls,
+                    toml_file=pyproject_toml,
+                )
+            )
 
         return tuple(sources)
 
@@ -173,12 +207,12 @@ def dev(
     )
 
     os.environ["RIVERS_DEPLOYMENT"] = "dev"
-    if cfg.module:
-        os.environ["RIVERS_MODULE"] = cfg.module
-    if cfg.surreal_endpoint:
-        os.environ["RIVERS_SURREAL_ENDPOINT"] = cfg.surreal_endpoint
+    if cfg.module.path:
+        os.environ["RIVERS_MODULE"] = cfg.module.path
+    if cfg.storage.endpoint:
+        os.environ["RIVERS_SURREAL_ENDPOINT"] = cfg.storage.endpoint
 
-    if cfg.module is None:
+    if cfg.module.path is None:
         typer.echo(
             "Error: no module configured. Set 'module' in [rivers] config or pass --module",
             err=True,
@@ -188,12 +222,12 @@ def dev(
     # Import user module and resolve repository before opening storage —
     # otherwise a bad module name strands a RocksDB-locked dir on disk.
     try:
-        mod = importlib.import_module(cfg.module)
+        mod = importlib.import_module(cfg.module.path)
     except ModuleNotFoundError:
         typer.echo(f"Error: module '{module}' not found", err=True)
         raise typer.Exit(1)
 
-    repo_obj = getattr(mod, cfg.repo_var, None)
+    repo_obj = getattr(mod, cfg.module.repo_var, None)
     if repo_obj is None:
         typer.echo(f"Error: '{repo_var}' not found in module '{module}'", err=True)
         raise typer.Exit(1)
@@ -207,20 +241,27 @@ def dev(
     if surreal_endpoint:
         storage = Storage.connect(surreal_endpoint)
     else:
-        storage = Storage.embedded(cfg.storage_path)
-        atexit.register(_cleanup_storage, cfg.storage_path)
+        storage = Storage.embedded(cfg.storage.path)
+        atexit.register(_cleanup_storage, cfg.storage.path)
 
     repo_obj.resolve(storage=storage)
 
     # Start gRPC backend server (returns actual port, may differ if requested was in use)
-    actual_grpc_port = repo_obj._start_grpc_server(cfg.host, cfg.grpc_port)
+    actual_grpc_port = repo_obj._start_grpc_server(
+        cfg.server.host, cfg.server.grpc_port
+    )
 
     # Start UI server in-process (shares same storage, no lock conflict)
     grpc_url = f"http://{host}:{actual_grpc_port}"
-    repo_obj._start_ui_server(cfg.host, cfg.port, grpc_url, synthetic=cfg.synthetic)
+    repo_obj._start_ui_server(
+        cfg.server.host,
+        cfg.server.port,
+        grpc_url,
+        synthetic=cfg.synthetic.size,
+    )
 
     # Start automation daemon (schedules + sensors)
-    if not cfg.no_daemon:
+    if not cfg.daemon.no_daemon:
         from rivers._core import AutomationDaemon
 
         daemon = AutomationDaemon(repo=repo_obj, storage=storage)
