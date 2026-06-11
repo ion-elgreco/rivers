@@ -990,6 +990,17 @@ fn validate_time_window_fmt(
     end: &Option<NaiveDateTime>,
     fmt: &str,
 ) -> PyResult<()> {
+    // Cron schedules are second-granular: croner leaks a sub-second start's
+    // fraction into every tick here, while the core grid walk truncates to
+    // whole seconds — the two layers would mint different universes.
+    if cron_schedule.is_some() {
+        use chrono::Timelike;
+        if start.nanosecond() != 0 {
+            return Err(PartitionDefinitionError::new_err(format!(
+                "cron-gridded time windows require a start on a whole second, got {start}"
+            )));
+        }
+    }
     const MAX_TICKS: usize = 1024;
     let horizon = start
         .checked_add_signed(chrono::Duration::days(1461))

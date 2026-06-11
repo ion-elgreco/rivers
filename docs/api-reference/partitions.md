@@ -106,7 +106,7 @@ PartitionsDefinition.time_window(
 ) -> PartitionsDefinition.TimeWindow
 ```
 
-Custom time-window partitions. Exactly one of `cron_schedule` or `interval_seconds` is required. `cron_schedule` accepts 5 fields (`min hour dom mon dow`) or 6 fields (`sec min hour dom mon dow`) — seconds are optional.
+Custom time-window partitions. Exactly one of `cron_schedule` or `interval_seconds` is required. `cron_schedule` accepts 5 fields (`min hour dom mon dow`) or 6 fields (`sec min hour dom mon dow`) — seconds are optional. Cron grids are second-granular, so `start` must fall on a whole second (sub-second intervals remain supported via `interval_seconds`).
 
 `fmt` must be at least as fine as the grid: every window start has to format to a key that parses back to exactly that start (e.g. an hourly grid with `fmt="%Y-%m-%d"` is rejected, because 24 windows would collapse into one key). Coarse fmts like `%Y-%m` or `%Y` are fine on equally coarse grids — missing calendar fields parse back as the window start. The round-trip is checked across the grid's first four years (capped at 1024 windows), so calendar drift that spares the earliest ticks — e.g. a 31-day interval under `fmt="%Y-%m"`, whose first ticks happen to land on month starts — is still rejected at construction. This applies to `daily(fmt=...)` and `hourly(fmt=...)` overrides too.
 

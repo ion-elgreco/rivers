@@ -405,14 +405,24 @@ def test_time_window_sub_nanosecond_interval_rejected():
         )
 
 
+def test_time_window_subsecond_cron_start_rejected_despite_fraction_fmt():
+    """A fraction-preserving fmt round-trips sub-second cron ticks, so the
+    fmt check alone cannot catch them — but the condition engine's cron grid
+    walks whole seconds and would never match the minted keys. The guard must
+    be explicit, not an artifact of the fmt."""
+    with pytest.raises(PartitionDefinitionError, match="whole second"):
+        rs.PartitionsDefinition.time_window(
+            start=datetime.datetime(2024, 1, 1, microsecond=500),
+            cron_schedule="0 * * * *",
+            fmt="%Y-%m-%dT%H:%M:%S%.f",
+        )
+
+
 def test_time_window_subsecond_cron_start_rejected():
     """A start with sub-second precision puts every cron tick off the whole-
-    second grid; a second-grained fmt cannot round-trip those keys. The fmt
-    check walks the same grid enumerate uses, so this fails at construction
-    instead of minting keys that fail their own validation."""
-    with pytest.raises(
-        PartitionDefinitionError, match="cannot represent the partition grid"
-    ):
+    second grid; cron schedules are second-granular, so construction rejects
+    the start outright."""
+    with pytest.raises(PartitionDefinitionError, match="whole second"):
         rs.PartitionsDefinition.time_window(
             start=datetime.datetime(2024, 1, 1, microsecond=500),
             cron_schedule="0 * * * *",

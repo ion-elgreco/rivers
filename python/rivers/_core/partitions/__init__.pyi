@@ -188,8 +188,9 @@ class PartitionsDefinition:
 
         Raises:
             PartitionDefinitionError: If ``interval_seconds`` is not positive
-                or is below one nanosecond; if ``fmt`` cannot round-trip the
-                grid (coarser than the window spacing); or if ``fmt`` renders
+                or is below one nanosecond; if a cron-gridded ``start`` is not
+                on a whole second; if ``fmt`` cannot round-trip the grid
+                (coarser than the window spacing); or if ``fmt`` renders
                 keys containing a character reserved by the canonical display
                 form (``|`` or ``,``).
         """
