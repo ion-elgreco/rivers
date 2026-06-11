@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use rivers_core::assets::graph::NodeRef;
 use rivers_core::condition::{
     AssetConditionCache, AssetConditionInfo, ConditionEvalState, ConditionPass, DimensionKind,
     DimensionUniverse, PartitionInfo, PartitionMappingKind, PartitionUniverse,
@@ -36,11 +37,13 @@ use engine::ConditionTickEngine;
 
 /// Build a [`PartitionInfo`] from a graph node. Returns `None` if unpartitioned.
 /// `node_map` supplies upstream definitions so time-window mappings carry
-/// their grid into core eval.
+/// their grid into core eval; `deps` supplies the asset's dependency edges so
+/// unmapped partitioned deps get their default Identity mapping.
 fn partition_info_from_node(
     asset_name: &str,
     node: &ResolvedNode,
     node_map: &HashMap<String, ResolvedNode>,
+    deps: &[NodeRef],
 ) -> Option<PartitionInfo> {
     let def = node.partitions_def()?;
     // Captured before enumeration: a window starting between this and the
@@ -61,7 +64,7 @@ fn partition_info_from_node(
         PartitionsDefinition::TimeWindow { fmt, .. } => Some(fmt.clone()),
         _ => None,
     };
-    let mappings = extract_partition_mappings(asset_name, node, node_map);
+    let mappings = extract_partition_mappings(asset_name, node, node_map, deps);
     Some(PartitionInfo {
         all_keys,
         mappings,
@@ -130,7 +133,13 @@ impl PyCodeRepository {
             if let ResolvedNode::Asset(asset_node) = node
                 && let Some(ref cond) = asset_node.automation_condition
             {
-                let partition_info = partition_info_from_node(name, node, &state.node_map);
+                let deps = state
+                    .inner_repo
+                    .assets()
+                    .get(name)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let partition_info = partition_info_from_node(name, node, &state.node_map, deps);
                 let backfill_strategy = node.backfill_strategy().map(|s| s.to_core());
                 by_key.insert(
                     name.clone(),
@@ -262,6 +271,7 @@ fn extract_partition_mappings(
     asset_name: &str,
     node: &crate::repository::resolved_node::ResolvedNode,
     node_map: &HashMap<String, ResolvedNode>,
+    deps: &[NodeRef],
 ) -> HashMap<(String, String), PartitionMappingKind> {
     let mut result = HashMap::new();
     if let Some(mappings) = node.partition_mapping() {
@@ -269,6 +279,25 @@ fn extract_partition_mappings(
             let upstream_def = node_map.get(upstream_name).and_then(|n| n.partitions_def());
             let kind = mapping_to_kind(mapping, upstream_def);
             result.insert((asset_name.to_string(), upstream_name.clone()), kind);
+        }
+    }
+    // An unmapped partitioned dep defaults to Identity at resolve time; the
+    // eval context must carry that default or the dep is treated as
+    // unpartitioned and its condition truth broadcasts across the universe.
+    for dep in deps {
+        let NodeRef::ByName(upstream_name) = dep else {
+            continue;
+        };
+        let key = (asset_name.to_string(), upstream_name.clone());
+        if result.contains_key(&key) {
+            continue;
+        }
+        if node_map
+            .get(upstream_name)
+            .and_then(|n| n.partitions_def())
+            .is_some()
+        {
+            result.insert(key, PartitionMappingKind::Identity);
         }
     }
     result
