@@ -718,6 +718,11 @@ impl PartitionsDefinition {
             ));
         }
         for key in &keys {
+            if key.is_empty() {
+                return Err(PartitionDefinitionError::new_err(
+                    "static partition keys must not be empty",
+                ));
+            }
             if let Some(ch) = rivers_core::storage::PartitionKey::reserved_display_char(key) {
                 return Err(PartitionDefinitionError::new_err(format!(
                     "partition key '{key}' contains reserved character '{ch}' \

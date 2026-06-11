@@ -318,6 +318,14 @@ def test_static_key_with_reserved_char_rejected():
             rs.PartitionsDefinition.static_([key])
 
 
+def test_static_rejects_empty_string_key():
+    """Empty key strings render as nothing in the display form and are
+    unreachable via string lookups — same guard as the dynamic write path."""
+    for keys in ([""], ["a", ""]):
+        with pytest.raises(PartitionDefinitionError, match="must not be empty"):
+            rs.PartitionsDefinition.static_(keys)
+
+
 def test_multi_dim_name_with_reserved_char_rejected():
     """Dim names also sit left of '=' in `dim=value` segments, so '=' is
     reserved for them as well."""

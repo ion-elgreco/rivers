@@ -140,9 +140,9 @@ class PartitionsDefinition:
         """Define a static partitions set from a list of keys.
 
         Raises:
-            PartitionDefinitionError: If ``keys`` is empty, or a key contains
-                a character reserved by the canonical display form
-                (``|`` or ``,``).
+            PartitionDefinitionError: If ``keys`` is empty, a key is the
+                empty string, or a key contains a character reserved by the
+                canonical display form (``|`` or ``,``).
         """
         ...
 
