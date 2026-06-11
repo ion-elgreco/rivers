@@ -25,6 +25,19 @@ pub fn parse_key_datetime(key: &str, fmt: &str) -> Result<NaiveDateTime, chrono:
             // conflict with it — surface the original error instead.
             return Err(e);
         }
+        // Coarse fmts (monthly `%Y-%m`, yearly `%Y`) omit calendar fields;
+        // default them to the window start unless week/ordinal info already
+        // pins the date.
+        let has_week_info = parsed.isoweek().is_some()
+            || parsed.week_from_sun().is_some()
+            || parsed.week_from_mon().is_some()
+            || parsed.ordinal().is_some();
+        if parsed.month().is_none() && !has_week_info {
+            parsed.set_month(1)?;
+        }
+        if parsed.day().is_none() && !has_week_info && parsed.weekday().is_none() {
+            parsed.set_day(1)?;
+        }
         if parsed.hour_div_12().is_none() && parsed.hour_mod_12().is_none() {
             parsed.set_hour(0)?;
         }
@@ -63,6 +76,22 @@ mod tests {
         assert_eq!(
             parse_key_datetime("2024-11-03T05:00", "%Y-%m-%dT%H:00").unwrap(),
             dt(2024, 11, 3, 5, 0, 0)
+        );
+    }
+
+    #[test]
+    fn month_only_fmt_defaults_to_first_day() {
+        assert_eq!(
+            parse_key_datetime("2024-03", "%Y-%m").unwrap(),
+            dt(2024, 3, 1, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn year_only_fmt_defaults_to_january_first() {
+        assert_eq!(
+            parse_key_datetime("2024", "%Y").unwrap(),
+            dt(2024, 1, 1, 0, 0, 0)
         );
     }
 

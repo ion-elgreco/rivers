@@ -102,6 +102,8 @@ PartitionsDefinition.time_window(
 
 Custom time-window partitions. Exactly one of `cron_schedule` or `interval_seconds` is required. `cron_schedule` accepts 5 fields (`min hour dom mon dow`) or 6 fields (`sec min hour dom mon dow`) — seconds are optional.
 
+`fmt` must be at least as fine as the grid: every window start has to format to a key that parses back to exactly that start (e.g. an hourly grid with `fmt="%Y-%m-%d"` is rejected, because 24 windows would collapse into one key). Coarse fmts like `%Y-%m` or `%Y` are fine on equally coarse grids — missing calendar fields parse back as the window start. This applies to `daily(fmt=...)` and `hourly(fmt=...)` overrides too.
+
 **`TimeWindow` attributes:**
 
 | Attribute | Type |

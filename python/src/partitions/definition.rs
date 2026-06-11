@@ -724,26 +724,40 @@ impl PartitionsDefinition {
 
     #[staticmethod]
     #[pyo3(signature = (start, end=None, fmt=None))]
-    fn daily(start: NaiveDateTime, end: Option<NaiveDateTime>, fmt: Option<String>) -> Self {
-        Self::TimeWindow {
-            cron_schedule: Some("0 0 * * *".to_string()),
+    fn daily(
+        start: NaiveDateTime,
+        end: Option<NaiveDateTime>,
+        fmt: Option<String>,
+    ) -> PyResult<Self> {
+        let cron = Some("0 0 * * *".to_string());
+        let fmt = fmt.unwrap_or_else(|| "%Y-%m-%d".to_string());
+        validate_time_window_fmt(&cron, &None, &start, &end, &fmt)?;
+        Ok(Self::TimeWindow {
+            cron_schedule: cron,
             interval_seconds: None,
             start,
             end,
-            fmt: fmt.unwrap_or_else(|| "%Y-%m-%d".to_string()),
-        }
+            fmt,
+        })
     }
 
     #[staticmethod]
     #[pyo3(signature = (start, end=None, fmt=None))]
-    fn hourly(start: NaiveDateTime, end: Option<NaiveDateTime>, fmt: Option<String>) -> Self {
-        Self::TimeWindow {
-            cron_schedule: Some("0 * * * *".to_string()),
+    fn hourly(
+        start: NaiveDateTime,
+        end: Option<NaiveDateTime>,
+        fmt: Option<String>,
+    ) -> PyResult<Self> {
+        let cron = Some("0 * * * *".to_string());
+        let fmt = fmt.unwrap_or_else(|| "%Y-%m-%dT%H:00".to_string());
+        validate_time_window_fmt(&cron, &None, &start, &end, &fmt)?;
+        Ok(Self::TimeWindow {
+            cron_schedule: cron,
             interval_seconds: None,
             start,
             end,
-            fmt: fmt.unwrap_or_else(|| "%Y-%m-%dT%H:00".to_string()),
-        }
+            fmt,
+        })
     }
 
     #[staticmethod]
@@ -774,12 +788,14 @@ impl PartitionsDefinition {
                 )));
             }
         }
+        let fmt = fmt.unwrap_or_else(|| "%Y-%m-%dT%H:%M:%S".to_string());
+        validate_time_window_fmt(&cron_schedule, &interval_seconds, &start, &end, &fmt)?;
         Ok(Self::TimeWindow {
             cron_schedule,
             interval_seconds,
             start,
             end,
-            fmt: fmt.unwrap_or_else(|| "%Y-%m-%dT%H:%M:%S".to_string()),
+            fmt,
         })
     }
 
@@ -931,6 +947,68 @@ fn parse_cron(expr: &str) -> PyResult<Cron> {
         .map_err(|e| {
             PartitionDefinitionError::new_err(format!("Invalid cron expression '{expr}': {e}"))
         })
+}
+
+/// A TimeWindow fmt must round-trip the grid's window starts: each tick
+/// formats to a key that parses back to exactly that tick. A coarser fmt
+/// collapses neighbouring windows into the same key string (duplicate keys
+/// from enumerate, double-dispatched backfill runs); a non-parseable fmt
+/// breaks every downstream key validation. Checked on the first two ticks.
+fn validate_time_window_fmt(
+    cron_schedule: &Option<String>,
+    interval_seconds: &Option<f64>,
+    start: &NaiveDateTime,
+    end: &Option<NaiveDateTime>,
+    fmt: &str,
+) -> PyResult<()> {
+    let mut ticks: Vec<NaiveDateTime> = Vec::with_capacity(2);
+    if let Some(secs) = interval_seconds {
+        ticks.push(*start);
+        let ns = (*secs * 1_000_000_000.0) as i64;
+        if let Some(t1) = start.checked_add_signed(chrono::Duration::nanoseconds(ns)) {
+            ticks.push(t1);
+        }
+    } else if let Some(expr) = cron_schedule {
+        use chrono::Timelike;
+        let cron = parse_cron(expr)?;
+        let anchor = start
+            .checked_sub_signed(chrono::Duration::seconds(1))
+            .unwrap_or(*start);
+        for tick in cron.iter_from(Utc.from_utc_datetime(&anchor), croner::Direction::Forward) {
+            let naive = tick.naive_utc();
+            let t = naive.with_nanosecond(0).unwrap_or(naive);
+            if t < *start {
+                continue;
+            }
+            ticks.push(t);
+            if ticks.len() == 2 {
+                break;
+            }
+        }
+    }
+    if let Some(end_dt) = end {
+        ticks.retain(|t| t < end_dt);
+    }
+    for t in &ticks {
+        let key = t.format(fmt).to_string();
+        match parse_key_datetime(&key, fmt) {
+            Ok(parsed) if parsed == *t => {}
+            Ok(parsed) => {
+                return Err(PartitionDefinitionError::new_err(format!(
+                    "fmt '{fmt}' cannot represent the partition grid: window start {t} \
+                     formats to '{key}', which parses back to {parsed}; \
+                     use a format at least as fine as the grid"
+                )));
+            }
+            Err(e) => {
+                return Err(PartitionDefinitionError::new_err(format!(
+                    "fmt '{fmt}' cannot represent the partition grid: window start {t} \
+                     formats to '{key}', which does not parse back: {e}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Check if all key strings fall on valid time window boundaries within [start, end).

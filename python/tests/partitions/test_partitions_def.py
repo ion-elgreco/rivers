@@ -132,6 +132,47 @@ def test_time_window_six_field_cron():
     ]
 
 
+def test_time_window_fmt_must_roundtrip_grid():
+    """A fmt coarser than the grid collapses distinct windows into one key
+    string — enumerate yields duplicates and backfills double-dispatch."""
+    # Hourly cron with a date-only fmt: 24 windows share each key.
+    with pytest.raises(
+        PartitionDefinitionError, match="cannot represent the partition grid"
+    ):
+        rs.PartitionsDefinition.time_window(
+            datetime.datetime(2024, 1, 1),
+            cron_schedule="0 * * * *",
+            fmt="%Y-%m-%d",
+        )
+    # Sub-second interval with the second-grained default fmt.
+    with pytest.raises(
+        PartitionDefinitionError, match="cannot represent the partition grid"
+    ):
+        rs.PartitionsDefinition.time_window(
+            datetime.datetime(2024, 1, 1), interval_seconds=0.5
+        )
+
+
+def test_daily_fmt_override_must_roundtrip():
+    """daily(fmt='%Y-%m') collapses ~30 windows per key."""
+    with pytest.raises(
+        PartitionDefinitionError, match="cannot represent the partition grid"
+    ):
+        rs.PartitionsDefinition.daily(datetime.datetime(2024, 1, 1), fmt="%Y-%m")
+
+
+def test_coarse_fmt_on_equally_coarse_grid_allowed():
+    """A coarse fmt is fine when the grid is equally coarse."""
+    pd = rs.PartitionsDefinition.time_window(
+        datetime.datetime(2024, 1, 1),
+        cron_schedule="0 0 1 * *",
+        fmt="%Y-%m",
+        end=datetime.datetime(2024, 4, 1),
+    )
+    keys = [k.key for k in pd.get_partition_keys() if isinstance(k, rs.PartitionKey.Single)]
+    assert keys == [["2024-01"], ["2024-02"], ["2024-03"]]
+
+
 def test_time_window_requires_schedule_or_interval():
     """TimeWindow requires either cron_schedule or interval_seconds."""
     with pytest.raises(PartitionDefinitionError):
