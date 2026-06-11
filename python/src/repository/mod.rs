@@ -177,6 +177,26 @@ fn validate_backfill_strategy(
     else {
         return Ok(());
     };
+    // Same invariants as BackfillStrategy.per_dimension() — strategies built
+    // from the proto path skip the constructor, and an empty multi_run list
+    // would collapse the whole backfill into a single run.
+    if multi_run_dims.is_empty() {
+        return Err(ExecutionError::new_err(
+            "multi_run must contain at least one dimension",
+        ));
+    }
+    if single_run_dims.is_empty() {
+        return Err(ExecutionError::new_err(
+            "single_run must contain at least one dimension",
+        ));
+    }
+    for dim in multi_run_dims {
+        if single_run_dims.contains(dim) {
+            return Err(ExecutionError::new_err(format!(
+                "dimension '{dim}' cannot be in both multi_run and single_run"
+            )));
+        }
+    }
     let partitioned =
         iter_partitioned_assets(&state.node_map, selection.iter().map(String::as_str));
     for (asset, pd) in &partitioned {
