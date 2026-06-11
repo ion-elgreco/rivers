@@ -349,22 +349,37 @@ impl PartitionMappingKind {
     }
 }
 
-/// Resolves partition key mappings between connected assets.
-pub struct PartitionResolver {
+/// Resolves partition key mappings between connected assets. Borrows the
+/// long-lived maps — constructed per asset per tick on the hot loop.
+pub struct PartitionResolver<'a> {
     /// Per-edge mapping kind. Key = (downstream_asset, upstream_asset).
-    mappings: HashMap<(String, String), PartitionMappingKind>,
+    mappings: &'a HashMap<(String, String), PartitionMappingKind>,
     /// Upstream asset → its valid partition keys.
-    pub(crate) upstream_partition_keys: HashMap<String, HashSet<PartitionKey>>,
+    pub(crate) upstream_partition_keys: &'a HashMap<String, HashSet<PartitionKey>>,
 }
 
-impl PartitionResolver {
+impl<'a> PartitionResolver<'a> {
     pub fn new(
-        mappings: HashMap<(String, String), PartitionMappingKind>,
-        upstream_partition_keys: HashMap<String, HashSet<PartitionKey>>,
+        mappings: &'a HashMap<(String, String), PartitionMappingKind>,
+        upstream_partition_keys: &'a HashMap<String, HashSet<PartitionKey>>,
     ) -> Self {
         Self {
             mappings,
             upstream_partition_keys,
+        }
+    }
+
+    /// A resolver with no mappings and no upstream keys — identity for
+    /// every edge. Used where a context is built without dep traversal.
+    pub fn empty() -> PartitionResolver<'static> {
+        static EMPTY_MAPPINGS: std::sync::OnceLock<
+            HashMap<(String, String), PartitionMappingKind>,
+        > = std::sync::OnceLock::new();
+        static EMPTY_KEYS: std::sync::OnceLock<HashMap<String, HashSet<PartitionKey>>> =
+            std::sync::OnceLock::new();
+        PartitionResolver {
+            mappings: EMPTY_MAPPINGS.get_or_init(HashMap::new),
+            upstream_partition_keys: EMPTY_KEYS.get_or_init(HashMap::new),
         }
     }
 
@@ -398,7 +413,7 @@ pub struct PartitionEvalContext<'a> {
     /// Per-partition last materialization timestamp.
     pub timestamps: &'a HashMap<PartitionKey, i64>,
     /// Partition mapping resolver for upstream deps.
-    pub resolver: PartitionResolver,
+    pub resolver: PartitionResolver<'a>,
     /// Partition keys in the latest time window (for `InLatestTimeWindow` condition).
     /// `None` for non-time-windowed partitions (treated as all keys).
     pub latest_time_window_keys: Option<&'a HashSet<PartitionKey>>,

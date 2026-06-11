@@ -1281,7 +1281,7 @@ fn eval_partitioned_on_dep(
         in_progress: &upstream_status.in_progress,
         failed: &upstream_status.failed,
         timestamps: &upstream_status.timestamps,
-        resolver: PartitionResolver::new(HashMap::new(), HashMap::new()),
+        resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: pctx.all_partition_statuses,
     };

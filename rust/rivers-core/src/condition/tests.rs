@@ -2338,7 +2338,7 @@ fn test_last_run_includes_target_partitioned() {
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &timestamps,
-        resolver: PartitionResolver::new(HashMap::new(), HashMap::new()),
+        resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &partition_status,
     };
@@ -2441,16 +2441,15 @@ fn test_last_run_includes_target_partitioned_joint_run_suppresses_newly_updated(
     ctx.tags.partition_last_run_asset_names = &partition_asset_names;
     ctx.all_asset_states = &all_states;
 
+    let empty_mappings = HashMap::new();
+    let upstream_b = HashMap::from([("b".to_string(), all_keys.clone())]);
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
         materialized: &all_keys,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &timestamps,
-        resolver: PartitionResolver::new(
-            HashMap::new(),
-            HashMap::from([("b".to_string(), all_keys.clone())]),
-        ),
+        resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
     };
@@ -2513,16 +2512,15 @@ fn test_last_run_includes_target_partitioned_solo_run_allows_newly_updated() {
     ctx.tags.partition_last_run_asset_names = &partition_asset_names;
     ctx.all_asset_states = &all_states;
 
+    let empty_mappings = HashMap::new();
+    let upstream_b = HashMap::from([("b".to_string(), all_keys.clone())]);
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
         materialized: &all_keys,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &timestamps,
-        resolver: PartitionResolver::new(
-            HashMap::new(),
-            HashMap::from([("b".to_string(), all_keys.clone())]),
-        ),
+        resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
     };
@@ -2590,16 +2588,15 @@ fn test_last_run_includes_target_partitioned_mixed_joint_and_solo() {
     ctx.tags.partition_last_run_asset_names = &partition_asset_names;
     ctx.all_asset_states = &all_states;
 
+    let empty_mappings = HashMap::new();
+    let upstream_b = HashMap::from([("b".to_string(), all_keys.clone())]);
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
         materialized: &all_keys,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &timestamps,
-        resolver: PartitionResolver::new(
-            HashMap::new(),
-            HashMap::from([("b".to_string(), all_keys.clone())]),
-        ),
+        resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
     };
@@ -5952,7 +5949,7 @@ impl OwnedPartitionData {
             in_progress: &self.in_progress,
             failed: &self.failed,
             timestamps: &self.timestamps,
-            resolver: PartitionResolver::new(HashMap::new(), HashMap::new()),
+            resolver: PartitionResolver::empty(),
             latest_time_window_keys: None,
             all_partition_statuses: &self.all_partition_statuses,
         }
@@ -6178,7 +6175,7 @@ fn test_partitioned_in_latest_time_window_selects_recent_keys() {
         in_progress: &pdata.in_progress,
         failed: &pdata.failed,
         timestamps: &pdata.timestamps,
-        resolver: PartitionResolver::new(HashMap::new(), HashMap::new()),
+        resolver: PartitionResolver::empty(),
         latest_time_window_keys: Some(&latest),
         all_partition_statuses: &empty_partition_statuses,
     };
@@ -6210,7 +6207,7 @@ fn test_partitioned_in_latest_time_window_empty_when_no_recent() {
         in_progress: &pdata.in_progress,
         failed: &pdata.failed,
         timestamps: &pdata.timestamps,
-        resolver: PartitionResolver::new(HashMap::new(), HashMap::new()),
+        resolver: PartitionResolver::empty(),
         latest_time_window_keys: Some(&latest),
         all_partition_statuses: &empty_partition_statuses,
     };
@@ -6261,7 +6258,7 @@ fn test_partitioned_in_latest_time_window_combined_with_missing() {
         in_progress: &pdata.in_progress,
         failed: &pdata.failed,
         timestamps: &pdata.timestamps,
-        resolver: PartitionResolver::new(HashMap::new(), HashMap::new()),
+        resolver: PartitionResolver::empty(),
         latest_time_window_keys: Some(&latest),
         all_partition_statuses: &empty_partition_statuses,
     };
@@ -6591,10 +6588,8 @@ fn test_partitioned_any_deps_missing_with_identity() {
 
     let upstream_keys: HashMap<String, HashSet<PartitionKey>> =
         HashMap::from([("a".into(), HashSet::from([spk("p1"), spk("p2"), spk("p3")]))]);
-    let resolver = PartitionResolver::new(
-        HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]),
-        upstream_keys,
-    );
+    let mappings = HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]);
+    let resolver = PartitionResolver::new(&mappings, &upstream_keys);
 
     let a_state = AssetConditionState {
         ..Default::default()
@@ -6677,10 +6672,8 @@ fn test_partitioned_all_deps_match_not_missing() {
 
     let upstream_keys: HashMap<String, HashSet<PartitionKey>> =
         HashMap::from([("a".into(), HashSet::from([spk("p1"), spk("p2")]))]);
-    let resolver = PartitionResolver::new(
-        HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]),
-        upstream_keys,
-    );
+    let mappings = HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]);
+    let resolver = PartitionResolver::new(&mappings, &upstream_keys);
 
     let asset_states = HashMap::from([("a".into(), AssetConditionState::default())]);
 
@@ -6789,10 +6782,10 @@ fn test_partition_mapping_specific() {
 
 #[test]
 fn test_partition_resolver_identity_passthrough() {
-    let resolver = PartitionResolver::new(
-        HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]),
-        HashMap::from([("a".into(), HashSet::from([spk("p1"), spk("p2"), spk("p3")]))]),
-    );
+    let mappings = HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]);
+    let upstream_keys =
+        HashMap::from([("a".into(), HashSet::from([spk("p1"), spk("p2"), spk("p3")]))]);
+    let resolver = PartitionResolver::new(&mappings, &upstream_keys);
     let sel = PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2")]));
     assert_eq!(resolver.map_downstream("a", "b", &sel), sel);
 }
@@ -6800,7 +6793,7 @@ fn test_partition_resolver_identity_passthrough() {
 #[test]
 fn test_partition_resolver_no_mapping_is_identity() {
     // No mapping registered for edge (c, d) → identity passthrough
-    let resolver = PartitionResolver::new(HashMap::new(), HashMap::new());
+    let resolver = PartitionResolver::empty();
     let sel = PartitionSelection::Keys(HashSet::from([spk("p1")]));
     assert_eq!(resolver.map_downstream("d", "c", &sel), sel);
 }
@@ -6835,13 +6828,11 @@ fn test_partitioned_eager_selects_new_partition() {
         "raw".into(),
         HashSet::from([spk("p1"), spk("p2"), spk("p3")]),
     )]);
-    let resolver = PartitionResolver::new(
-        HashMap::from([(
-            ("cleaned".into(), "raw".into()),
-            PartitionMappingKind::Identity,
-        )]),
-        upstream_keys,
-    );
+    let mappings = HashMap::from([(
+        ("cleaned".into(), "raw".into()),
+        PartitionMappingKind::Identity,
+    )]);
+    let resolver = PartitionResolver::new(&mappings, &upstream_keys);
 
     let raw_state = AssetConditionState::default();
     let asset_states = HashMap::from([("raw".into(), raw_state)]);
@@ -7105,30 +7096,29 @@ fn test_partition_mapping_multi_to_single_empty_and_all() {
 
 #[test]
 fn test_resolver_multi_mapping() {
-    let resolver = PartitionResolver::new(
-        HashMap::from([(
-            ("down".into(), "up".into()),
-            PartitionMappingKind::Multi {
-                dimension_mappings: HashMap::from([
-                    (
-                        "date".into(),
-                        ("date".into(), Box::new(PartitionMappingKind::Identity)),
-                    ),
-                    (
-                        "region".into(),
-                        ("region".into(), Box::new(PartitionMappingKind::Identity)),
-                    ),
-                ]),
-            },
-        )]),
-        HashMap::from([(
-            "up".into(),
-            HashSet::from([
-                mpk(&[("date", "2024-01-01"), ("region", "us")]),
-                mpk(&[("date", "2024-01-01"), ("region", "eu")]),
+    let mappings = HashMap::from([(
+        ("down".into(), "up".into()),
+        PartitionMappingKind::Multi {
+            dimension_mappings: HashMap::from([
+                (
+                    "date".into(),
+                    ("date".into(), Box::new(PartitionMappingKind::Identity)),
+                ),
+                (
+                    "region".into(),
+                    ("region".into(), Box::new(PartitionMappingKind::Identity)),
+                ),
             ]),
-        )]),
-    );
+        },
+    )]);
+    let upstream_keys = HashMap::from([(
+        "up".to_string(),
+        HashSet::from([
+            mpk(&[("date", "2024-01-01"), ("region", "us")]),
+            mpk(&[("date", "2024-01-01"), ("region", "eu")]),
+        ]),
+    )]);
+    let resolver = PartitionResolver::new(&mappings, &upstream_keys);
 
     let sel = PartitionSelection::Keys(HashSet::from([mpk(&[
         ("date", "2024-01-01"),
@@ -7139,19 +7129,18 @@ fn test_resolver_multi_mapping() {
 
 #[test]
 fn test_resolver_multi_to_single_mapping() {
-    let resolver = PartitionResolver::new(
-        HashMap::from([(
-            ("single_down".into(), "multi_up".into()),
-            PartitionMappingKind::MultiToSingle {
-                dimension_name: "date".into(),
-                inner: Box::new(PartitionMappingKind::Identity),
-            },
-        )]),
-        HashMap::from([(
-            "multi_up".into(),
-            HashSet::from([mpk(&[("date", "2024-01-01"), ("region", "us")])]),
-        )]),
-    );
+    let mappings = HashMap::from([(
+        ("single_down".into(), "multi_up".into()),
+        PartitionMappingKind::MultiToSingle {
+            dimension_name: "date".into(),
+            inner: Box::new(PartitionMappingKind::Identity),
+        },
+    )]);
+    let upstream_keys = HashMap::from([(
+        "multi_up".to_string(),
+        HashSet::from([mpk(&[("date", "2024-01-01"), ("region", "us")])]),
+    )]);
+    let resolver = PartitionResolver::new(&mappings, &upstream_keys);
 
     let upstream = PartitionSelection::Keys(HashSet::from([mpk(&[
         ("date", "2024-01-01"),
@@ -7184,13 +7173,11 @@ fn test_partitioned_eager_partial_upstream_update() {
         "raw".into(),
         HashSet::from([spk("p1"), spk("p2"), spk("p3")]),
     )]);
-    let resolver = PartitionResolver::new(
-        HashMap::from([(
-            ("processed".into(), "raw".into()),
-            PartitionMappingKind::Identity,
-        )]),
-        upstream_keys,
-    );
+    let mappings = HashMap::from([(
+        ("processed".into(), "raw".into()),
+        PartitionMappingKind::Identity,
+    )]);
+    let resolver = PartitionResolver::new(&mappings, &upstream_keys);
 
     // raw_state has partition_state with p1, p2 already known at ts=200
     // so only p3 (newly materialized at ts=200) will be "NewlyUpdated"
@@ -7284,13 +7271,11 @@ fn test_partitioned_eager_only_fires_for_partitions_with_upstream_data() {
 
     let all_partitions = HashSet::from([spk("p1"), spk("p2"), spk("p3"), spk("p4"), spk("p5")]);
     let upstream_keys = HashMap::from([("raw".into(), all_partitions.clone())]);
-    let resolver = PartitionResolver::new(
-        HashMap::from([(
-            ("processed".into(), "raw".into()),
-            PartitionMappingKind::Identity,
-        )]),
-        upstream_keys,
-    );
+    let mappings = HashMap::from([(
+        ("processed".into(), "raw".into()),
+        PartitionMappingKind::Identity,
+    )]);
+    let resolver = PartitionResolver::new(&mappings, &upstream_keys);
 
     // Upstream "raw" only has p1, p2, p3 materialized (p4, p5 are missing)
     let partition_statuses = HashMap::from([(
@@ -7391,10 +7376,8 @@ fn test_partitioned_on_missing_only_missing_partitions() {
 
     let upstream_keys =
         HashMap::from([("a".into(), HashSet::from([spk("p1"), spk("p2"), spk("p3")]))]);
-    let resolver = PartitionResolver::new(
-        HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]),
-        upstream_keys,
-    );
+    let mappings = HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]);
+    let resolver = PartitionResolver::new(&mappings, &upstream_keys);
 
     let asset_states = HashMap::from([("a".into(), AssetConditionState::default())]);
 
@@ -7486,7 +7469,7 @@ fn test_partitioned_in_progress_excludes_from_and() {
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
-        resolver: PartitionResolver::new(HashMap::new(), HashMap::new()),
+        resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
     };
@@ -7551,7 +7534,7 @@ fn test_partitioned_code_version_changed_all_partitions() {
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
-        resolver: PartitionResolver::new(HashMap::new(), HashMap::new()),
+        resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
     };
@@ -7589,7 +7572,7 @@ fn test_partitioned_since_latch_per_partition() {
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts1,
-        resolver: PartitionResolver::new(HashMap::new(), HashMap::new()),
+        resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
     };
@@ -7639,7 +7622,7 @@ fn test_partitioned_since_latch_per_partition() {
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts2,
-        resolver: PartitionResolver::new(HashMap::new(), HashMap::new()),
+        resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
     };
@@ -7834,7 +7817,7 @@ fn test_partitioned_execution_failed_subset() {
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
-        resolver: PartitionResolver::new(HashMap::new(), HashMap::new()),
+        resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
     };
@@ -7868,7 +7851,7 @@ fn test_partitioned_complex_or_and_not() {
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
-        resolver: PartitionResolver::new(HashMap::new(), HashMap::new()),
+        resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
     };
@@ -9068,7 +9051,7 @@ fn test_partitioned_on_cron_no_deps_fires_all_partitions() {
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
-        resolver: PartitionResolver::new(HashMap::new(), HashMap::new()),
+        resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
     };
@@ -9134,7 +9117,7 @@ fn test_partitioned_on_cron_does_not_fire_without_tick() {
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
-        resolver: PartitionResolver::new(HashMap::new(), HashMap::new()),
+        resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
     };
@@ -9186,10 +9169,8 @@ fn test_partitioned_on_cron_waits_for_dep_update() {
 
     let upstream_keys: HashMap<String, HashSet<PartitionKey>> =
         HashMap::from([("a".into(), HashSet::from([spk("p1"), spk("p2")]))]);
-    let resolver = PartitionResolver::new(
-        HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]),
-        upstream_keys,
-    );
+    let mappings = HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]);
+    let resolver = PartitionResolver::new(&mappings, &upstream_keys);
 
     // a's partition timestamps haven't changed (dep not updated)
     let partition_statuses = HashMap::from([(
@@ -9275,10 +9256,8 @@ fn test_partitioned_on_cron_fires_after_dep_update() {
 
     let upstream_keys: HashMap<String, HashSet<PartitionKey>> =
         HashMap::from([("a".into(), HashSet::from([spk("p1"), spk("p2")]))]);
-    let resolver = PartitionResolver::new(
-        HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]),
-        upstream_keys,
-    );
+    let mappings = HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]);
+    let resolver = PartitionResolver::new(&mappings, &upstream_keys);
 
     // a's partitions have new timestamps (updated after cron tick)
     let partition_statuses = HashMap::from([(
@@ -9368,10 +9347,8 @@ fn test_partitioned_on_cron_partial_dep_update() {
 
     let upstream_keys: HashMap<String, HashSet<PartitionKey>> =
         HashMap::from([("a".into(), HashSet::from([spk("p1"), spk("p2")]))]);
-    let resolver = PartitionResolver::new(
-        HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]),
-        upstream_keys,
-    );
+    let mappings = HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]);
+    let resolver = PartitionResolver::new(&mappings, &upstream_keys);
 
     // Only p1 updated (ts=200), p2 not updated (ts=100, same as prev)
     let partition_statuses = HashMap::from([(
@@ -9541,11 +9518,9 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
     let timestamps = HashMap::from([(pk1.clone(), 100_i64), (pk2.clone(), 100)]);
     let upstream_keys = HashMap::from([("b".into(), HashSet::from([pk1.clone(), pk2.clone()]))]);
 
+    let mappings = HashMap::from([(("a".into(), "b".into()), PartitionMappingKind::Identity)]);
     let build_ctx = |_states: &HashMap<String, AssetConditionState>| {
-        let resolver = PartitionResolver::new(
-            HashMap::from([(("a".into(), "b".into()), PartitionMappingKind::Identity)]),
-            upstream_keys.clone(),
-        );
+        let resolver = PartitionResolver::new(&mappings, &upstream_keys);
         let prev = AssetConditionState {
             last_tick_timestamp: Some(50),
             ..Default::default()

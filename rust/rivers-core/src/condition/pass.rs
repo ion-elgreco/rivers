@@ -295,7 +295,11 @@ pub fn compute_latest_time_window_keys(
                 _ => return None,
             };
             let dt = parse_key_datetime(key_str, fmt).ok()?;
-            if dt <= now_local { Some((pk, dt)) } else { None }
+            if dt <= now_local {
+                Some((pk, dt))
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -309,9 +313,8 @@ pub fn compute_latest_time_window_keys(
         Some(delta_secs) => {
             let lookback_nanos = (delta_secs * 1_000_000_000.0) as i64;
             // A lookback too large to subtract means "no cutoff".
-            let cutoff = now_local.checked_sub_signed(chrono::Duration::nanoseconds(
-                lookback_nanos,
-            ));
+            let cutoff =
+                now_local.checked_sub_signed(chrono::Duration::nanoseconds(lookback_nanos));
             parsed
                 .into_iter()
                 .filter(|(_, dt)| cutoff.is_none_or(|c| *dt >= c))
@@ -411,19 +414,22 @@ impl ConditionPass {
         let mut changed = false;
         for info in &mut self.conditions {
             if let Some(pi) = info.partition_info.as_mut() {
-                changed |= refresh_universe(&mut pi.universe, &mut pi.all_keys, now, dynamic_keys);
+                let pi_changed =
+                    refresh_universe(&mut pi.universe, &mut pi.all_keys, now, dynamic_keys);
+                changed |= pi_changed;
+                // The conditioned asset's upstream entry mirrors its
+                // PartitionInfo; it was synced at extraction, so only a
+                // change needs a re-copy.
+                if pi_changed
+                    && let Some(entry) = self.upstream_partition_keys.get_mut(&info.asset_key)
+                {
+                    entry.clone_from(&pi.all_keys);
+                }
             }
         }
         for (asset, universe) in &mut self.upstream_universes {
             if let Some(keys) = self.upstream_partition_keys.get_mut(asset) {
                 changed |= refresh_universe(universe, keys, now, dynamic_keys);
-            }
-        }
-        for info in &self.conditions {
-            if let Some(pi) = &info.partition_info
-                && let Some(entry) = self.upstream_partition_keys.get_mut(&info.asset_key)
-            {
-                entry.clone_from(&pi.all_keys);
             }
         }
         changed
@@ -484,9 +490,7 @@ impl ConditionPass {
     fn evaluate(&self, now: i64, selective: bool) -> Vec<EvalResultRow> {
         // Partition keys are wall-clock labels; latest-window math compares
         // them against the local naive reading of the tick instant.
-        let now_local = chrono::Local
-            .timestamp_nanos(now)
-            .naive_local();
+        let now_local = chrono::Local.timestamp_nanos(now).naive_local();
         let in_progress_keys: HashSet<String> =
             self.cache.in_progress_assets.keys().cloned().collect();
 
@@ -529,8 +533,8 @@ impl ConditionPass {
                         failed: &status.failed,
                         timestamps: &status.timestamps,
                         resolver: PartitionResolver::new(
-                            pi.mappings.clone(),
-                            self.upstream_partition_keys.clone(),
+                            &pi.mappings,
+                            &self.upstream_partition_keys,
                         ),
                         latest_time_window_keys: latest_tw_keys.as_ref(),
                         all_partition_statuses: &self.cache.partition_status,
@@ -1123,7 +1127,11 @@ mod tests {
             selection: Some(PartitionSelection::All),
         }]);
         let mut backfills = plan.multi_partition_backfills;
-        assert_eq!(backfills.len(), 1, "All must dispatch the asset's partitions");
+        assert_eq!(
+            backfills.len(),
+            1,
+            "All must dispatch the asset's partitions"
+        );
         let (asset, mut keys) = backfills.pop().unwrap();
         assert_eq!(asset, "down");
         keys.sort_by_key(|k| format!("{k:?}"));
@@ -1145,14 +1153,10 @@ mod tests {
         // 10:00 wall-clock one, not 08:00. `evaluate` converts the tick
         // instant to local naive before calling this, so the helper itself
         // compares wall clock to wall clock.
-        let all_keys = make_daily_keys(&[
-            "2026-06-11T08:00",
-            "2026-06-11T09:00",
-            "2026-06-11T10:00",
-        ]);
+        let all_keys =
+            make_daily_keys(&["2026-06-11T08:00", "2026-06-11T09:00", "2026-06-11T10:00"]);
         let now_local = to_wall("2026-06-11 10:30");
-        let result =
-            compute_latest_time_window_keys(&all_keys, "%Y-%m-%dT%H:%M", now_local, None);
+        let result = compute_latest_time_window_keys(&all_keys, "%Y-%m-%dT%H:%M", now_local, None);
         assert_eq!(result.len(), 1);
         assert!(result.contains(&spk("2026-06-11T10:00")));
     }
