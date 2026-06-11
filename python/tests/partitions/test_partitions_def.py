@@ -318,6 +318,32 @@ def test_static_key_with_reserved_char_rejected():
             rs.PartitionsDefinition.static_([key])
 
 
+def test_time_window_fmt_must_round_trip_beyond_first_ticks():
+    """A month-grain fmt over a 31-day interval survives the first two ticks
+    (Jan 1, Feb 1 both land on month starts) but drifts at tick 2 (Mar 3):
+    enumerate would mint '2024-03', which the definition's own key validation
+    rejects. Construction must catch drift past the first ticks."""
+    with pytest.raises(
+        PartitionDefinitionError, match="cannot represent the partition grid"
+    ):
+        rs.PartitionsDefinition.time_window(
+            start=datetime.datetime(2024, 1, 1),
+            interval_seconds=31.0 * 86400.0,
+            fmt="%Y-%m",
+        )
+
+
+def test_time_window_interval_coarser_than_horizon_accepted():
+    """No false rejection when ticks are sparse: a day-grain fmt represents
+    whole-day interval ticks exactly, however far apart they are."""
+    pd = rs.PartitionsDefinition.time_window(
+        start=datetime.datetime(2024, 1, 1),
+        interval_seconds=400.0 * 86400.0,
+        fmt="%Y-%m-%d",
+    )
+    assert pd is not None
+
+
 def test_static_rejects_empty_string_key():
     """Empty key strings render as nothing in the display form and are
     unreachable via string lookups — same guard as the dynamic write path."""

@@ -979,7 +979,10 @@ fn parse_cron(expr: &str) -> PyResult<Cron> {
 /// formats to a key that parses back to exactly that tick. A coarser fmt
 /// collapses neighbouring windows into the same key string (duplicate keys
 /// from enumerate, double-dispatched backfill runs); a non-parseable fmt
-/// breaks every downstream key validation. Checked on the first two ticks.
+/// breaks every downstream key validation. Checked across the grid's first
+/// four years (one full leap cycle), capped at 1024 ticks — calendar drift
+/// that two ticks can't show (a month-grain fmt over a 31-day interval first
+/// diverges at tick 2) surfaces inside that horizon.
 fn validate_time_window_fmt(
     cron_schedule: &Option<String>,
     interval_seconds: &Option<f64>,
@@ -987,49 +990,57 @@ fn validate_time_window_fmt(
     end: &Option<NaiveDateTime>,
     fmt: &str,
 ) -> PyResult<()> {
+    const MAX_TICKS: usize = 1024;
+    let horizon = start
+        .checked_add_signed(chrono::Duration::days(1461))
+        .unwrap_or(NaiveDateTime::MAX);
+    let bound = match end {
+        Some(e) => (*e).min(horizon),
+        None => horizon,
+    };
     // Walk the grid with the same helpers `enumerate` uses — validation must
     // judge exactly the keys the definition will mint.
-    let mut ticks: Vec<NaiveDateTime> = Vec::with_capacity(2);
-    if let Some(secs) = interval_seconds {
-        for_each_interval_tick(*secs, start, NaiveDateTime::MAX, |t| {
-            ticks.push(t);
-            ticks.len() < 2
-        });
-    } else if let Some(expr) = cron_schedule {
-        for_each_cron_tick(expr, start, NaiveDateTime::MAX, |t| {
-            ticks.push(t);
-            ticks.len() < 2
-        })?;
-    }
-    if let Some(end_dt) = end {
-        ticks.retain(|t| t < end_dt);
-    }
-    for t in &ticks {
+    let mut checked = 0usize;
+    let mut failure: Option<PyErr> = None;
+    let mut check = |t: NaiveDateTime| -> bool {
+        checked += 1;
         let key = t.format(fmt).to_string();
         if let Some(ch) = rivers_core::storage::PartitionKey::reserved_display_char(&key) {
-            return Err(PartitionDefinitionError::new_err(format!(
+            failure = Some(PartitionDefinitionError::new_err(format!(
                 "fmt '{fmt}' produces keys containing reserved character '{ch}' \
                  (used by the canonical display form): '{key}'"
             )));
+            return false;
         }
         match parse_key_datetime(&key, fmt) {
-            Ok(parsed) if parsed == *t => {}
+            Ok(parsed) if parsed == t => {}
             Ok(parsed) => {
-                return Err(PartitionDefinitionError::new_err(format!(
+                failure = Some(PartitionDefinitionError::new_err(format!(
                     "fmt '{fmt}' cannot represent the partition grid: window start {t} \
                      formats to '{key}', which parses back to {parsed}; \
                      use a format at least as fine as the grid"
                 )));
+                return false;
             }
             Err(e) => {
-                return Err(PartitionDefinitionError::new_err(format!(
+                failure = Some(PartitionDefinitionError::new_err(format!(
                     "fmt '{fmt}' cannot represent the partition grid: window start {t} \
                      formats to '{key}', which does not parse back: {e}"
                 )));
+                return false;
             }
         }
+        checked < MAX_TICKS
+    };
+    if let Some(secs) = interval_seconds {
+        for_each_interval_tick(*secs, start, bound, &mut check);
+    } else if let Some(expr) = cron_schedule {
+        for_each_cron_tick(expr, start, bound, &mut check)?;
     }
-    Ok(())
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 /// Check if all key strings fall on valid time window boundaries within [start, end).
