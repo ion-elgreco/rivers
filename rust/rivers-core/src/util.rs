@@ -44,6 +44,9 @@ pub fn parse_key_datetime(key: &str, fmt: &str) -> Result<NaiveDateTime, chrono:
         if parsed.minute().is_none() {
             parsed.set_minute(0)?;
         }
+        if parsed.second().is_none() {
+            parsed.set_second(0)?;
+        }
         let date = parsed.to_naive_date()?;
         let time = parsed.to_naive_time()?;
         Ok(date.and_time(time))

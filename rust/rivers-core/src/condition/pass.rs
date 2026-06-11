@@ -193,26 +193,35 @@ fn refresh_universe(
 }
 
 /// Cartesian product of dimension key lists as `Multi` keys (def order).
+/// Walks an index odometer so each key is built exactly once — no
+/// intermediate combo vectors.
 fn cartesian_universe(dims: &[(String, DimensionUniverse)]) -> HashSet<PartitionKey> {
-    if dims.is_empty() {
+    if dims.is_empty() || dims.iter().any(|(_, du)| du.keys.is_empty()) {
         return HashSet::new();
     }
-    let mut combos: Vec<Vec<(String, Vec<String>)>> = vec![Vec::new()];
-    for (name, du) in dims {
-        let mut next = Vec::with_capacity(combos.len() * du.keys.len().max(1));
-        for combo in &combos {
-            for v in &du.keys {
-                let mut c = combo.clone();
-                c.push((name.clone(), vec![v.clone()]));
-                next.push(c);
+    let mut out = HashSet::new();
+    let mut idx = vec![0usize; dims.len()];
+    loop {
+        out.insert(PartitionKey::Multi {
+            dims: dims
+                .iter()
+                .zip(&idx)
+                .map(|((name, du), &i)| (name.clone(), vec![du.keys[i].clone()]))
+                .collect(),
+        });
+        let mut d = dims.len();
+        loop {
+            if d == 0 {
+                return out;
             }
+            d -= 1;
+            idx[d] += 1;
+            if idx[d] < dims[d].1.keys.len() {
+                break;
+            }
+            idx[d] = 0;
         }
-        combos = next;
     }
-    combos
-        .into_iter()
-        .map(|dims| PartitionKey::Multi { dims })
-        .collect()
 }
 
 /// Collect the dynamic namespaces a universe depends on.
