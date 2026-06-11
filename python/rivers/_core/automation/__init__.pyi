@@ -105,7 +105,9 @@ class AutomationCondition:
         """True when the partition falls within the latest time window.
 
         Args:
-            lookback_delta: Optional lookback in seconds from the current window.
+            lookback_delta: Optional lookback in seconds, measured back from
+                the latest window's start — one period reaches exactly one
+                window back, regardless of the time of day.
 
         Raises:
             ValueError: If ``lookback_delta`` is not a positive finite number.

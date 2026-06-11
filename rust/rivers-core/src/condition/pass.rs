@@ -286,10 +286,13 @@ pub struct PassOutput {
 /// Compute partition keys that fall within the latest time window.
 ///
 /// Partition keys are wall-clock labels, so the comparison happens on the
-/// wall-clock timeline: `now_local` is the current local naive datetime, and
-/// keys within `[now_local - lookback_delta, now_local]` are selected
-/// (`lookback_delta` is in seconds). If `lookback_delta` is `None`, only the
-/// single latest started window is returned.
+/// wall-clock timeline: `now_local` is the current local naive datetime. If
+/// `lookback_delta` is `None`, only the single latest started window is
+/// returned. With a lookback the cutoff anchors at that latest window's
+/// START — keys within `[latest_start - lookback_delta, latest_start]` are
+/// selected (`lookback_delta` in seconds) — so the selection never depends
+/// on how far into the current window `now` falls, and a lookback of one
+/// period reaches exactly one window back.
 pub fn compute_latest_time_window_keys(
     all_keys: &HashSet<PartitionKey>,
     fmt: &str,
@@ -320,10 +323,11 @@ pub fn compute_latest_time_window_keys(
 
     match lookback_delta {
         Some(delta_secs) => {
+            let latest_start = parsed[0].1;
             let lookback_nanos = (delta_secs * 1_000_000_000.0) as i64;
             // A lookback too large to subtract means "no cutoff".
             let cutoff =
-                now_local.checked_sub_signed(chrono::Duration::nanoseconds(lookback_nanos));
+                latest_start.checked_sub_signed(chrono::Duration::nanoseconds(lookback_nanos));
             parsed
                 .into_iter()
                 .filter(|(_, dt)| cutoff.is_none_or(|c| *dt >= c))
@@ -1225,8 +1229,9 @@ mod tests {
         let lookback_secs = 3.0 * 86400.0;
         let result =
             compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, Some(lookback_secs));
-        // cutoff = 2026-03-23 01:00. 03-23 at midnight is before cutoff, excluded.
-        assert_eq!(result.len(), 3);
+        // cutoff = latest start (03-26) - 3d = 2026-03-23 00:00, inclusive.
+        assert_eq!(result.len(), 4);
+        assert!(result.contains(&spk("2026-03-23")));
         assert!(result.contains(&spk("2026-03-24")));
         assert!(result.contains(&spk("2026-03-25")));
         assert!(result.contains(&spk("2026-03-26")));
@@ -1247,10 +1252,35 @@ mod tests {
         let lookback_secs = 3.0 * 86400.0;
         let result =
             compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, Some(lookback_secs));
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 4);
+        assert!(result.contains(&spk("2026-03-18")));
         assert!(result.contains(&spk("2026-03-19")));
         assert!(result.contains(&spk("2026-03-20")));
         assert!(result.contains(&spk("2026-03-21")));
+    }
+
+    #[test]
+    fn lookback_smaller_than_period_still_selects_latest_window() {
+        // The cutoff anchors at the latest window START, not `now`: a lookback
+        // smaller than the period must select exactly the latest window (same
+        // as lookback=None), never an empty set.
+        let all_keys = make_daily_keys(&["2026-03-24", "2026-03-25", "2026-03-26"]);
+        let now = to_wall("2026-03-26 12:00");
+        let result = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, Some(3600.0));
+        assert_eq!(result.len(), 1, "1h lookback at 12:00 must not go empty");
+        assert!(result.contains(&spk("2026-03-26")));
+    }
+
+    #[test]
+    fn lookback_of_one_period_selects_previous_window_all_day() {
+        // lookback = one period reaches exactly one window back regardless of
+        // where inside the latest window `now` falls.
+        let all_keys = make_daily_keys(&["2026-03-24", "2026-03-25", "2026-03-26"]);
+        let now = to_wall("2026-03-26 23:59");
+        let result = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, Some(86400.0));
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&spk("2026-03-25")));
+        assert!(result.contains(&spk("2026-03-26")));
     }
 
     #[test]
@@ -1284,8 +1314,9 @@ mod tests {
         let lookback_secs = 3.0 * 3600.0;
         let result =
             compute_latest_time_window_keys(&all_keys, "%Y-%m-%dT%H:%M", now, Some(lookback_secs));
-        // cutoff = 09:30; keys >= 09:30: 10:00, 11:00, 12:00.
-        assert_eq!(result.len(), 3);
+        // cutoff = latest start (12:00) - 3h = 09:00, inclusive.
+        assert_eq!(result.len(), 4);
+        assert!(result.contains(&spk("2026-03-25T09:00")));
         assert!(result.contains(&spk("2026-03-25T10:00")));
         assert!(result.contains(&spk("2026-03-25T11:00")));
         assert!(result.contains(&spk("2026-03-25T12:00")));
