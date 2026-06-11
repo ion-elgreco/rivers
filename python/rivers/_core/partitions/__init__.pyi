@@ -152,7 +152,12 @@ class PartitionsDefinition:
         end: datetime.datetime | None = None,
         fmt: str | None = None,
     ) -> PartitionsDefinition.TimeWindow:
-        """Daily time-window partitions starting at ``start``."""
+        """Daily time-window partitions starting at ``start``.
+
+        Raises:
+            PartitionDefinitionError: If a ``fmt`` override cannot round-trip
+                the daily grid (e.g. ``fmt="%Y-%m"``).
+        """
         ...
 
     @staticmethod
@@ -161,7 +166,12 @@ class PartitionsDefinition:
         end: datetime.datetime | None = None,
         fmt: str | None = None,
     ) -> PartitionsDefinition.TimeWindow:
-        """Hourly time-window partitions starting at ``start``."""
+        """Hourly time-window partitions starting at ``start``.
+
+        Raises:
+            PartitionDefinitionError: If a ``fmt`` override cannot round-trip
+                the hourly grid (e.g. ``fmt="%Y-%m-%d"``).
+        """
         ...
 
     @staticmethod
@@ -178,8 +188,9 @@ class PartitionsDefinition:
 
         Raises:
             PartitionDefinitionError: If ``interval_seconds`` is not positive
-                or is below one nanosecond, or if ``fmt`` renders keys
-                containing a character reserved by the canonical display
+                or is below one nanosecond; if ``fmt`` cannot round-trip the
+                grid (coarser than the window spacing); or if ``fmt`` renders
+                keys containing a character reserved by the canonical display
                 form (``|`` or ``,``).
         """
         ...

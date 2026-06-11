@@ -78,6 +78,8 @@ PartitionsDefinition.daily(
 
 Daily partitions. Default format: `"%Y-%m-%d"`.
 
+Raises `PartitionDefinitionError` if a `fmt` override cannot round-trip the daily grid — e.g. `daily(fmt="%Y-%m")` collapses ~30 windows into one key (see [`time_window()`](#partitionsdefinitiontime_window) for the round-trip rule).
+
 ### `PartitionsDefinition.hourly()`
 
 ```python
@@ -89,6 +91,8 @@ PartitionsDefinition.hourly(
 ```
 
 Hourly partitions. Default format: `"%Y-%m-%dT%H:00"`.
+
+Raises `PartitionDefinitionError` if a `fmt` override cannot round-trip the hourly grid, e.g. `hourly(fmt="%Y-%m-%d")`.
 
 ### `PartitionsDefinition.time_window()`
 
