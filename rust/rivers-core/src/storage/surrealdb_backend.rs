@@ -357,18 +357,24 @@ async fn migrate_multi_partition_key_order(db: &Surreal<Any>) -> anyhow::Result<
             last_run_id: latest.last_run_id.clone().unwrap_or_default(),
             last_timestamp: latest.last_timestamp.unwrap_or_default(),
         };
-        for row in &group {
-            db.query("DELETE $rec")
-                .bind(("rec", row.id.clone()))
-                .await?
-                .check()?;
-        }
+        // Write the canonical row before touching the legacy ones: a crash
+        // between the two steps leaves a recoverable duplicate for the next
+        // start to clean up, never a lost partition. A pre-existing sorted
+        // row is updated in place via the UNIQUE index.
         db.query(
             "INSERT INTO asset_partitions $row ON DUPLICATE KEY UPDATE last_event_id = $input.last_event_id, last_run_id = $input.last_run_id, last_timestamp = $input.last_timestamp",
         )
         .bind(("row", write))
         .await?
         .check()?;
+        for row in &group {
+            if matches!(&row.partition_key, PartitionKey::Multi { dims } if !is_sorted(dims)) {
+                db.query("DELETE $rec")
+                    .bind(("rec", row.id.clone()))
+                    .await?
+                    .check()?;
+            }
+        }
         rewritten += 1;
     }
 
@@ -4062,6 +4068,82 @@ mod tests {
             Some(1),
             "event key must be rewritten to canonical order"
         );
+    }
+
+    /// A crash mid-migration must never lose a partition: the canonical row
+    /// is written before any legacy row is deleted, so a pre-existing sorted
+    /// row is updated in place — its record id survives — and the stale
+    /// duplicate is only removed afterwards.
+    #[tokio::test]
+    async fn test_migration_never_deletes_the_canonical_row() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let sorted = PartitionKey::Multi {
+            dims: vec![
+                ("date".to_string(), vec!["2024-01-01".to_string()]),
+                ("region".to_string(), vec!["eu".to_string()]),
+            ],
+        };
+        storage
+            .upsert_asset_partitions(vec![DbAssetPartitionWrite {
+                code_location_id: cl.to_string(),
+                asset_key: "inv".to_string(),
+                partition_key: sorted.clone(),
+                last_event_id: "e1".to_string(),
+                last_run_id: "r1".to_string(),
+                last_timestamp: 1,
+            }])
+            .await
+            .unwrap();
+        #[derive(Debug, SurrealValue)]
+        struct IdRow {
+            id: RecordId,
+            last_event_id: String,
+            last_timestamp: i64,
+        }
+        let mut result = storage
+            .db
+            .query("SELECT id, last_event_id, last_timestamp FROM asset_partitions")
+            .await
+            .unwrap();
+        let before: Vec<IdRow> = result.take(0).unwrap();
+        assert_eq!(before.len(), 1);
+        let canonical_id = before[0].id.clone();
+        // Legacy duplicate with unsorted dims and newer values (raw CREATE
+        // bypasses the canonicalizing serializer).
+        storage
+            .db
+            .query(
+                "CREATE asset_partitions CONTENT { code_location_id: 'default', \
+                 asset_key: 'inv', partition_key: { variant: 'Multi', dims: \
+                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
+                 last_event_id: 'e9', last_run_id: 'r9', last_timestamp: 5 }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        migrate_multi_partition_key_order(&storage.db)
+            .await
+            .unwrap();
+
+        let mut result = storage
+            .db
+            .query("SELECT id, last_event_id, last_timestamp FROM asset_partitions")
+            .await
+            .unwrap();
+        let after: Vec<IdRow> = result.take(0).unwrap();
+        assert_eq!(after.len(), 1, "one canonical row survives");
+        assert_eq!(
+            after[0].id, canonical_id,
+            "the canonical row must be updated in place, never deleted"
+        );
+        assert_eq!(after[0].last_event_id, "e9", "newest row's values win");
+        assert_eq!(after[0].last_timestamp, 5);
     }
 
     /// `store_events`/`store_event` upsert `asset_partitions` via `INSERT ... ON
