@@ -2782,14 +2782,13 @@ impl PerCodeLocationStorage for SurrealStorage {
     ) -> Result<Option<StoredEvent>> {
         let event_type_str = "Materialization".to_string();
         let mut result = if let Some(partition_key) = partition {
-            let spk = PartitionKey::Single {
-                keys: vec![partition_key.to_string()],
-            };
+            // The display string may denote a Single or a Multi key.
+            let candidates = PartitionKey::display_candidates(partition_key);
             self.db
-                .query("SELECT * FROM events WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key = $partition_key AND event_type = $event_type ORDER BY timestamp DESC LIMIT 1")
+                .query("SELECT * FROM events WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key IN $candidates AND event_type = $event_type ORDER BY timestamp DESC LIMIT 1")
                 .bind(("cl", code_location_id.to_string()))
                 .bind(("asset_key", asset_key.to_string()))
-                .bind(("partition_key", spk))
+                .bind(("candidates", candidates))
                 .bind(("event_type", event_type_str))
                 .await?
         } else {
@@ -3187,10 +3186,10 @@ impl PerCodeLocationStorage for SurrealStorage {
     ) -> Result<Vec<StoredEvent>> {
         let mut result = self
             .db
-            .query("SELECT * FROM events WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key = $partition_key ORDER BY timestamp DESC LIMIT $limit")
+            .query("SELECT * FROM events WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key IN $candidates ORDER BY timestamp DESC LIMIT $limit")
             .bind(("cl", code_location_id.to_string()))
             .bind(("asset_key", asset_key.to_string()))
-            .bind(("partition_key", PartitionKey::Single { keys: vec![partition_key.to_string()] }))
+            .bind(("candidates", PartitionKey::display_candidates(partition_key)))
             .bind(("limit", limit))
             .await?;
         let events: Vec<DbStoredEvent> = result.take(0)?;
@@ -4116,6 +4115,56 @@ mod tests {
             ts,
             vec![(pk.clone(), 2)],
             "must update the existing row in place"
+        );
+    }
+
+    /// Per-partition lookups receive the display string; for Multi-partitioned
+    /// assets the persisted key is a Multi object — the lookup must still match.
+    #[tokio::test]
+    async fn test_partition_string_lookup_matches_multi_keys() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let pk = PartitionKey::Multi {
+            dims: vec![
+                ("date".to_string(), vec!["2024-01-01".to_string()]),
+                ("region".to_string(), vec!["eu".to_string()]),
+            ],
+        };
+        let mut event = make_event("inv", "r1", 100);
+        event.partition_key = Some(pk.clone());
+        storage.store_event(&event).await.unwrap();
+
+        let display = pk.to_display();
+        assert_eq!(display, "date=2024-01-01|region=eu");
+        let latest = storage
+            .get_latest_materialization(cl, "inv", Some(&display))
+            .await
+            .unwrap();
+        assert!(
+            latest.is_some(),
+            "display-form lookup must match the Multi event"
+        );
+        let events = storage
+            .get_partition_events(cl, "inv", &display, 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+
+        // Single-dim lookups keep working.
+        let mut single = make_event("inv", "r2", 200);
+        single.partition_key = Some(PartitionKey::Single {
+            keys: vec!["p1".to_string()],
+        });
+        storage.store_event(&single).await.unwrap();
+        assert!(
+            storage
+                .get_latest_materialization(cl, "inv", Some("p1"))
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 

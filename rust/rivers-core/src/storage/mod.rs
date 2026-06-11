@@ -339,6 +339,39 @@ impl PartitionKey {
         }
     }
 
+    /// Inverse of [`Self::to_display`] for point lookups: the candidate
+    /// structured keys a display string may denote. Always includes the
+    /// `Single` reading; adds a `Multi` reading when the string parses as
+    /// `dim=v,v|dim=v,v`. A Static key that happens to contain `=` is
+    /// ambiguous — querying with both candidates resolves it.
+    pub fn display_candidates(display: &str) -> Vec<PartitionKey> {
+        let mut out = vec![PartitionKey::Single {
+            keys: vec![display.to_string()],
+        }];
+        if display.contains('=') {
+            let mut dims: Vec<(String, Vec<String>)> = Vec::new();
+            let mut ok = true;
+            for part in display.split('|') {
+                match part.split_once('=') {
+                    Some((name, vals)) if !name.is_empty() => {
+                        dims.push((
+                            name.to_string(),
+                            vals.split(',').map(str::to_string).collect(),
+                        ));
+                    }
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && !dims.is_empty() {
+                out.push(PartitionKey::Multi { dims });
+            }
+        }
+        out
+    }
+
     /// Serialize to JSON for CLI args / K8s CRD fields.
     /// Single: `{"single":["2025-01-16"]}`, Multi: `{"multi":{"region":["us"],"date":["2025-03"]}}`.
     pub fn to_json(&self) -> String {
