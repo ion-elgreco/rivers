@@ -665,6 +665,17 @@ impl ConditionPass {
     /// in-progress before the dispatch loop pushes any run ids, and records
     /// the surviving keys in the asset's `handled` set — only keys actually
     /// dispatched may suppress future fires.
+    /// Record dispatched partition keys in the asset's `handled` set so
+    /// since-last-handled semantics don't re-fire them on the next tick.
+    fn mark_partitions_handled(&mut self, asset_key: &str, keys: &[PartitionKey]) {
+        if let Some(prev) = self.eval_state.assets.get_mut(asset_key) {
+            prev.partition_state
+                .get_or_insert_with(PartitionState::default)
+                .handled
+                .extend(keys.iter().cloned());
+        }
+    }
+
     fn classify_materializations(
         &mut self,
         to_materialize: Vec<ToMaterialize>,
@@ -705,12 +716,7 @@ impl ConditionPass {
                         );
                     }
                     if !surviving.is_empty() {
-                        if let Some(prev) = self.eval_state.assets.get_mut(tm.asset_key.as_str()) {
-                            prev.partition_state
-                                .get_or_insert_with(PartitionState::default)
-                                .handled
-                                .extend(surviving.iter().cloned());
-                        }
+                        self.mark_partitions_handled(&tm.asset_key, &surviving);
                         partitioned_mats.push((tm.asset_key, surviving));
                     }
                 }
@@ -723,6 +729,7 @@ impl ConditionPass {
                         .map(|pi| pi.all_keys.iter().cloned().collect::<Vec<_>>());
                     match resolved {
                         Some(all_keys) if !all_keys.is_empty() => {
+                            self.mark_partitions_handled(&tm.asset_key, &all_keys);
                             partitioned_mats.push((tm.asset_key, all_keys));
                         }
                         Some(_) => {} // partitioned asset with zero keys — drop
@@ -1026,6 +1033,53 @@ mod tests {
             !handled.contains(&spk("2024-08-16")),
             "dropped keys must not be marked handled"
         );
+    }
+
+    #[test]
+    fn classify_marks_all_selection_keys_handled() {
+        // A partitioned asset can fire with `All` — e.g. an unpartitioned
+        // upstream dep evaluates to a bool selection that widens to every
+        // partition. The dispatched keys must land in `handled` exactly like
+        // a Keys selection, or since-last-handled semantics re-fire the
+        // whole asset on every tick.
+        let mut pass = ConditionPass::new(
+            AssetConditionCache::default(),
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "down".to_string(),
+                condition: ConditionNode::InProgress,
+                partition_info: Some(PartitionInfo {
+                    all_keys: make_daily_keys(&["2024-01-01", "2024-01-02"]),
+                    mappings: HashMap::new(),
+                    time_window_fmt: None,
+                    universe: PartitionUniverse::Frozen,
+                }),
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        );
+        pass.eval_state.assets.insert(
+            "down".to_string(),
+            crate::condition::state::AssetConditionState::default(),
+        );
+        let plan = pass.classify_materializations(vec![ToMaterialize {
+            asset_key: "down".to_string(),
+            selection: Some(PartitionSelection::All),
+        }]);
+        let mut backfills = plan.multi_partition_backfills;
+        assert_eq!(backfills.len(), 1, "All must dispatch the asset's partitions");
+        let (asset, mut keys) = backfills.pop().unwrap();
+        assert_eq!(asset, "down");
+        keys.sort_by_key(|k| format!("{k:?}"));
+        assert_eq!(keys, vec![spk("2024-01-01"), spk("2024-01-02")]);
+        let handled = pass.eval_state.assets["down"]
+            .partition_state
+            .as_ref()
+            .expect("partition state")
+            .handled
+            .clone();
+        assert!(handled.contains(&spk("2024-01-01")));
+        assert!(handled.contains(&spk("2024-01-02")));
     }
 
     #[test]
