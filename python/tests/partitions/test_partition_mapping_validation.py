@@ -291,6 +291,95 @@ def test_time_window_mapping_differing_ranges_allowed():
 
 
 # ---------------------------------------------------------------------------
+# Both partitioned — Identity (default) grid compatibility
+# ---------------------------------------------------------------------------
+
+
+def _identity_edge(down_def, up_def):
+    """Upstream→downstream pair with no explicit mapping (Identity default)."""
+
+    @rs.Asset(partitions_def=up_def)
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(partitions_def=down_def)
+    def downstream(upstream: Any) -> Any:
+        return upstream
+
+    return [upstream, downstream]
+
+
+def test_identity_mapping_cross_cadence_rejected():
+    """Finer downstream over coarser upstream: most downstream keys don't
+    exist upstream — the persist-then-fail hole time_window(offset) had."""
+    fmt = "%Y-%m-%dT%H:00"
+    down = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, interval_seconds=3600, fmt=fmt
+    )
+    up = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, interval_seconds=21600, fmt=fmt
+    )
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': Identity mapping "
+            "requires the downstream grid to be a subgrid of the upstream "
+            "grid: downstream interval 3600s is not a multiple of upstream "
+            "interval 21600s"
+        ),
+    ):
+        make_repo(_identity_edge(down, up))
+
+
+def test_identity_mapping_fmt_mismatch_rejected():
+    down = rs.PartitionsDefinition.daily(start=DAILY_START)
+    up = rs.PartitionsDefinition.daily(start=DAILY_START, fmt="%d/%m/%Y")
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': Identity mapping "
+            "requires matching key formats: downstream fmt '%Y-%m-%d' != "
+            "upstream fmt '%d/%m/%Y'"
+        ),
+    ):
+        make_repo(_identity_edge(down, up))
+
+
+def test_identity_mapping_coarser_downstream_allowed():
+    """Coarser downstream over finer upstream is a valid subgrid: every
+    downstream key exists upstream."""
+    fmt = "%Y-%m-%dT%H:00"
+    down = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, interval_seconds=21600, fmt=fmt
+    )
+    up = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, interval_seconds=3600, fmt=fmt
+    )
+    assert make_repo(_identity_edge(down, up)) is not None
+
+
+def test_identity_mapping_static_disjoint_keys_rejected():
+    """A downstream static key the upstream lacks can never load its dep."""
+    down = rs.PartitionsDefinition.static_(["a", "x"])
+    up = rs.PartitionsDefinition.static_(["a", "b"])
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': Identity mapping "
+            "requires every downstream key to exist upstream; missing "
+            "upstream: x"
+        ),
+    ):
+        make_repo(_identity_edge(down, up))
+
+
+def test_identity_mapping_static_subset_allowed():
+    down = rs.PartitionsDefinition.static_(["a"])
+    up = rs.PartitionsDefinition.static_(["a", "b"])
+    assert make_repo(_identity_edge(down, up)) is not None
+
+
+# ---------------------------------------------------------------------------
 # Both partitioned — Static mapping
 # ---------------------------------------------------------------------------
 

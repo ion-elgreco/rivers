@@ -720,6 +720,83 @@ impl PartitionMapping {
     }
 }
 
+/// Require the downstream grid to be a subgrid of the upstream one (same
+/// fmt; identical cron, or interval multiple with aligned starts). Applies
+/// to any mapping that resolves downstream keys on the upstream grid —
+/// `time_window` shifts them, `Identity` loads them verbatim. Ranges
+/// (start/end) may differ; range edges are a per-key concern. No-op unless
+/// both definitions are TimeWindow.
+fn validate_time_window_grid_compat(
+    mapping: &str,
+    down: &PartitionsDefinition,
+    up: &PartitionsDefinition,
+) -> Result<(), MappingValidationError> {
+    let (
+        PartitionsDefinition::TimeWindow {
+            cron_schedule: down_cron,
+            interval_seconds: down_interval,
+            start: down_start,
+            fmt: down_fmt,
+            ..
+        },
+        PartitionsDefinition::TimeWindow {
+            cron_schedule: up_cron,
+            interval_seconds: up_interval,
+            start: up_start,
+            fmt: up_fmt,
+            ..
+        },
+    ) = (down, up)
+    else {
+        return Ok(());
+    };
+    if down_fmt != up_fmt {
+        return Err(MappingValidationError::DefinitionError(format!(
+            "{mapping} mapping requires matching key formats: \
+             downstream fmt '{down_fmt}' != upstream fmt '{up_fmt}'"
+        )));
+    }
+    match (down_cron, down_interval, up_cron, up_interval) {
+        (Some(dc), _, Some(uc), _) => {
+            if dc != uc {
+                return Err(MappingValidationError::DefinitionError(format!(
+                    "{mapping} mapping requires identical cron schedules: \
+                     downstream '{dc}' != upstream '{uc}'"
+                )));
+            }
+        }
+        (_, Some(di), _, Some(ui)) => {
+            let down_ns = (di * 1_000_000_000.0) as i64;
+            let up_ns = (ui * 1_000_000_000.0) as i64;
+            if up_ns <= 0 || down_ns <= 0 || down_ns % up_ns != 0 {
+                return Err(MappingValidationError::DefinitionError(format!(
+                    "{mapping} mapping requires the downstream grid to be a \
+                     subgrid of the upstream grid: downstream interval {di}s \
+                     is not a multiple of upstream interval {ui}s"
+                )));
+            }
+            let aligned = (*down_start - *up_start)
+                .num_nanoseconds()
+                .is_some_and(|ns| ns.rem_euclid(up_ns) == 0);
+            if !aligned {
+                return Err(MappingValidationError::DefinitionError(format!(
+                    "{mapping} mapping requires the downstream grid to be a \
+                     subgrid of the upstream grid: downstream start {down_start} \
+                     is not aligned to the upstream grid (start {up_start}, \
+                     interval {ui}s)"
+                )));
+            }
+        }
+        _ => {
+            return Err(MappingValidationError::DefinitionError(format!(
+                "{mapping} mapping requires both definitions on the same \
+                 grid kind (both cron or both interval)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl PartitionMapping {
     /// Variant name as a string (e.g. "Identity", "Multi"). Used in error messages.
     pub fn variant_name(&self) -> &'static str {
@@ -784,87 +861,49 @@ impl PartitionMapping {
                         upstream: up.variant_name().to_string(),
                     });
                 }
+                // Identity loads each downstream key verbatim from upstream,
+                // so every downstream key must exist there — same subgrid
+                // requirement as a zero-offset time_window mapping.
+                validate_time_window_grid_compat("Identity", down, up)?;
+                if let (
+                    PartitionsDefinition::Static { keys: down_keys },
+                    PartitionsDefinition::Static { keys: up_keys },
+                ) = (down, up)
+                {
+                    let mut missing: Vec<&str> = down_keys
+                        .iter()
+                        .filter(|k| !up_keys.contains(k.as_str()))
+                        .map(String::as_str)
+                        .collect();
+                    if !missing.is_empty() {
+                        missing.sort_unstable();
+                        return Err(MappingValidationError::DefinitionError(format!(
+                            "Identity mapping requires every downstream key to exist \
+                             upstream; missing upstream: {}",
+                            missing.join(", ")
+                        )));
+                    }
+                }
                 Ok(())
             }
             Self::TimeWindow { .. } => {
-                let PartitionsDefinition::TimeWindow {
-                    cron_schedule: down_cron,
-                    interval_seconds: down_interval,
-                    start: down_start,
-                    fmt: down_fmt,
-                    ..
-                } = down
-                else {
+                if !matches!(down, PartitionsDefinition::TimeWindow { .. }) {
                     return Err(MappingValidationError::RequiredDefinitionType {
                         mapping: "TimeWindow",
                         side: Side::Downstream,
                         expected: "TimeWindow",
                         found: down.variant_name().to_string(),
                     });
-                };
-                let PartitionsDefinition::TimeWindow {
-                    cron_schedule: up_cron,
-                    interval_seconds: up_interval,
-                    start: up_start,
-                    fmt: up_fmt,
-                    ..
-                } = up
-                else {
+                }
+                if !matches!(up, PartitionsDefinition::TimeWindow { .. }) {
                     return Err(MappingValidationError::RequiredDefinitionType {
                         mapping: "TimeWindow",
                         side: Side::Upstream,
                         expected: "TimeWindow",
                         found: up.variant_name().to_string(),
                     });
-                };
-                // Downstream keys are shifted on the upstream grid, so the
-                // downstream grid must be a subgrid of the upstream one.
-                if down_fmt != up_fmt {
-                    return Err(MappingValidationError::DefinitionError(format!(
-                        "time_window mapping requires matching key formats: \
-                         downstream fmt '{down_fmt}' != upstream fmt '{up_fmt}'"
-                    )));
                 }
-                match (down_cron, down_interval, up_cron, up_interval) {
-                    (Some(dc), _, Some(uc), _) => {
-                        if dc != uc {
-                            return Err(MappingValidationError::DefinitionError(format!(
-                                "time_window mapping requires identical cron schedules: \
-                                 downstream '{dc}' != upstream '{uc}'"
-                            )));
-                        }
-                    }
-                    (_, Some(di), _, Some(ui)) => {
-                        let down_ns = (di * 1_000_000_000.0) as i64;
-                        let up_ns = (ui * 1_000_000_000.0) as i64;
-                        if up_ns <= 0 || down_ns <= 0 || down_ns % up_ns != 0 {
-                            return Err(MappingValidationError::DefinitionError(format!(
-                                "time_window mapping requires the downstream grid to be a \
-                                 subgrid of the upstream grid: downstream interval {di}s \
-                                 is not a multiple of upstream interval {ui}s"
-                            )));
-                        }
-                        let aligned = (*down_start - *up_start)
-                            .num_nanoseconds()
-                            .is_some_and(|ns| ns.rem_euclid(up_ns) == 0);
-                        if !aligned {
-                            return Err(MappingValidationError::DefinitionError(format!(
-                                "time_window mapping requires the downstream grid to be a \
-                                 subgrid of the upstream grid: downstream start {down_start} \
-                                 is not aligned to the upstream grid (start {up_start}, \
-                                 interval {ui}s)"
-                            )));
-                        }
-                    }
-                    _ => {
-                        return Err(MappingValidationError::DefinitionError(
-                            "time_window mapping requires both definitions on the same \
-                             grid kind (both cron or both interval)"
-                                .to_string(),
-                        ));
-                    }
-                }
-                Ok(())
+                validate_time_window_grid_compat("time_window", down, up)
             }
             Self::Static { mapping: key_map } => {
                 let down_keys = single_dim_key_set(down)?;
