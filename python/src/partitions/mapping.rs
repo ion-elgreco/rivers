@@ -866,6 +866,18 @@ impl PartitionMapping {
                 // requirement as a zero-offset time_window mapping.
                 validate_time_window_grid_compat("Identity", down, up)?;
                 if let (
+                    PartitionsDefinition::Dynamic { name: down_name },
+                    PartitionsDefinition::Dynamic { name: up_name },
+                ) = (down, up)
+                {
+                    if down_name != up_name {
+                        return Err(MappingValidationError::DefinitionError(format!(
+                            "Identity mapping requires matching dynamic namespaces: \
+                             downstream '{down_name}' != upstream '{up_name}'"
+                        )));
+                    }
+                }
+                if let (
                     PartitionsDefinition::Static { keys: down_keys },
                     PartitionsDefinition::Static { keys: up_keys },
                 ) = (down, up)

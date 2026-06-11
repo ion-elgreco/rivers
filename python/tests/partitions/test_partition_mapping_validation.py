@@ -379,6 +379,28 @@ def test_identity_mapping_static_subset_allowed():
     assert make_repo(_identity_edge(down, up)) is not None
 
 
+def test_identity_mapping_dynamic_namespace_mismatch_rejected():
+    """Identity between different dynamic namespaces would look every
+    downstream key up in the wrong namespace — silently never matching."""
+    down = rs.PartitionsDefinition.dynamic("colors")
+    up = rs.PartitionsDefinition.dynamic("shapes")
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': Identity mapping "
+            "requires matching dynamic namespaces: downstream 'colors' != "
+            "upstream 'shapes'"
+        ),
+    ):
+        make_repo(_identity_edge(down, up))
+
+
+def test_identity_mapping_same_dynamic_namespace_allowed():
+    down = rs.PartitionsDefinition.dynamic("colors")
+    up = rs.PartitionsDefinition.dynamic("colors")
+    assert make_repo(_identity_edge(down, up)) is not None
+
+
 # ---------------------------------------------------------------------------
 # Both partitioned — Static mapping
 # ---------------------------------------------------------------------------
