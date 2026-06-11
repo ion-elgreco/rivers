@@ -119,12 +119,13 @@ fn refresh_universe(
                     for k in new_keys {
                         changed |= all_keys.insert(PartitionKey::Single { keys: vec![k] });
                     }
+                    *enumerated_to = bound;
                 }
                 Err(e) => {
+                    // Leave the watermark so the range is retried next tick.
                     tracing::warn!(target: "rivers::daemon", error = %e, "time-window universe refresh failed");
                 }
             }
-            *enumerated_to = bound;
             changed
         }
         PartitionUniverse::Dynamic { namespace } => {
@@ -157,16 +158,18 @@ fn refresh_universe(
                             continue;
                         }
                         match grid.window_starts_in(*enumerated_to, bound) {
-                            Ok(new_keys) if !new_keys.is_empty() => {
-                                du.keys.extend(new_keys);
-                                changed = true;
+                            Ok(new_keys) => {
+                                if !new_keys.is_empty() {
+                                    du.keys.extend(new_keys);
+                                    changed = true;
+                                }
+                                *enumerated_to = bound;
                             }
-                            Ok(_) => {}
                             Err(e) => {
+                                // Leave the watermark so the range is retried.
                                 tracing::warn!(target: "rivers::daemon", error = %e, "time-window dimension refresh failed");
                             }
                         }
-                        *enumerated_to = bound;
                     }
                     DimensionKind::Dynamic { namespace } => {
                         if let Some(keys) = dynamic_keys.get(namespace)
@@ -883,6 +886,66 @@ mod tests {
             &HashMap::new(),
         );
         assert_eq!(all_keys.len(), 4);
+    }
+
+    #[test]
+    fn refresh_universe_holds_watermark_on_enumeration_error() {
+        // A grid that can't enumerate must not advance `enumerated_to` past
+        // the failed range — those windows would be skipped forever once the
+        // grid recovers. Unreachable through validated constructors today;
+        // guards against a future Err source.
+        let broken = TimeGrid {
+            cron_schedule: None,
+            interval_seconds: None,
+            start: naive("2024-01-01T00:00:00"),
+            end: None,
+            fmt: "%Y-%m-%dT%H:%M:%S".into(),
+        };
+        let t0 = naive("2024-01-01T00:00:00");
+        let mut universe = PartitionUniverse::TimeWindow {
+            grid: broken.clone(),
+            enumerated_to: t0,
+        };
+        let mut all_keys: HashSet<PartitionKey> = HashSet::new();
+        let changed = refresh_universe(
+            &mut universe,
+            &mut all_keys,
+            naive("2024-01-01T05:00:00"),
+            &HashMap::new(),
+        );
+        assert!(!changed);
+        assert!(all_keys.is_empty());
+        let PartitionUniverse::TimeWindow { enumerated_to, .. } = &universe else {
+            unreachable!()
+        };
+        assert_eq!(*enumerated_to, t0, "failed ranges must be retried");
+
+        let mut multi = PartitionUniverse::Multi {
+            dims: vec![(
+                "date".to_string(),
+                DimensionUniverse {
+                    keys: vec![],
+                    kind: DimensionKind::TimeWindow {
+                        grid: broken,
+                        enumerated_to: t0,
+                    },
+                },
+            )],
+        };
+        let changed = refresh_universe(
+            &mut multi,
+            &mut all_keys,
+            naive("2024-01-01T05:00:00"),
+            &HashMap::new(),
+        );
+        assert!(!changed);
+        let PartitionUniverse::Multi { dims } = &multi else {
+            unreachable!()
+        };
+        let DimensionKind::TimeWindow { enumerated_to, .. } = &dims[0].1.kind else {
+            unreachable!()
+        };
+        assert_eq!(*enumerated_to, t0, "failed dim ranges must be retried");
     }
 
     #[test]
