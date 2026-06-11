@@ -1004,9 +1004,17 @@ impl PartitionMapping {
                         )
                     })?;
 
+                // The inner mapping's orientation follows the edge: with a
+                // Multi downstream it maps the named dim's key -> the single
+                // upstream; with a Multi upstream it maps the downstream
+                // single key -> the named dim.
+                let (inner_down, inner_up) = match multi_side {
+                    Side::Downstream => (dim_def, single_def),
+                    Side::Upstream => (single_def, dim_def),
+                };
                 partition_mapping
                     .0
-                    .validate_partitioned_pair(single_def, dim_def)
+                    .validate_partitioned_pair(inner_down, inner_up)
                     .map_err(|e| MappingValidationError::InDimension {
                         dim: dimension_name.clone(),
                         source: Box::new(e),

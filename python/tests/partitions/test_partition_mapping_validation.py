@@ -2115,6 +2115,89 @@ def test_multi_to_single_downstream_multi_upstream_single():
     make_repo([upstream, downstream])
 
 
+def test_multi_to_single_downstream_multi_inner_orientation():
+    """Downstream-Multi: the inner mapping's downstream is the named DIM and
+    its upstream is the single def — a coarser dim over a finer upstream is
+    a valid subgrid and must validate."""
+    fmt = "%Y-%m-%dT%H:00"
+    multi_parts = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.time_window(
+                start=DAILY_START, interval_seconds=21600, fmt=fmt
+            ),
+            "region": rs.PartitionsDefinition.static_(STATIC_KEYS),
+        }
+    )
+    hourly = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, interval_seconds=3600, fmt=fmt
+    )
+
+    @rs.Asset(partitions_def=hourly)
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=multi_parts,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.multi_to_single(
+                    dimension_name="date",
+                    partition_mapping=rs.PartitionMapping.time_window(offset=-1),
+                ),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream + 1
+
+    assert make_repo([upstream, downstream]) is not None
+
+
+def test_multi_to_single_downstream_multi_finer_dim_rejected():
+    """Downstream-Multi with a FINER time dim than the single upstream: the
+    inner subgrid check must reject it in the true orientation."""
+    fmt = "%Y-%m-%dT%H:00"
+    multi_parts = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.time_window(
+                start=DAILY_START, interval_seconds=3600, fmt=fmt
+            ),
+            "region": rs.PartitionsDefinition.static_(STATIC_KEYS),
+        }
+    )
+    six_hourly = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, interval_seconds=21600, fmt=fmt
+    )
+
+    @rs.Asset(partitions_def=six_hourly)
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=multi_parts,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.multi_to_single(
+                    dimension_name="date",
+                    partition_mapping=rs.PartitionMapping.time_window(offset=-1),
+                ),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream + 1
+
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "downstream interval 3600s is not a multiple of upstream interval 21600s"
+        ),
+    ):
+        make_repo([upstream, downstream])
+
+
 def test_multi_to_single_dimension_not_found():
     """MultiToSingle fails when the named dimension doesn't exist."""
     multi_parts = rs.PartitionsDefinition.multi(
