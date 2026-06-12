@@ -269,6 +269,22 @@ def test_time_window_mapping_misaligned_mixed_grid_kinds_rejected():
         make_repo(_tw_edge(down, up))
 
 
+def test_fractional_interval_downstream_on_cron_upstream_rejected():
+    """Cron grids are second-granular, so an interval grid whose ticks carry
+    sub-second fractions mints keys that can never exist upstream. croner
+    matches fractional probe times verbatim (it never inspects nanoseconds),
+    so the subgrid probe must reject them explicitly."""
+    fmt = "%Y-%m-%dT%H:%M:%S%.f"
+    up = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, cron_schedule="* * * * * *", fmt=fmt
+    )
+    down = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, interval_seconds=1.5, fmt=fmt
+    )
+    with pytest.raises(PartitionValidationError, match="is not on the upstream grid"):
+        make_repo(_identity_edge(down, up))
+
+
 def test_equivalent_cron_spellings_allowed():
     """'0 0 * * *' and its 6-field spelling '0 0 0 * * *' are one schedule;
     textual comparison must not reject them."""

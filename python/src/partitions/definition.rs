@@ -1310,6 +1310,13 @@ pub(crate) fn for_each_cron_tick(
 
 /// Whether `t` falls exactly on the cron grid (cron is second-granular).
 pub(crate) fn cron_grid_contains(cron_expr: &str, t: NaiveDateTime) -> PyResult<bool> {
+    use chrono::Timelike;
+    // croner never inspects nanoseconds and echoes a fractional `t` back
+    // verbatim from the inclusive iterator, so it would report sub-second
+    // times as on-grid.
+    if t.nanosecond() != 0 {
+        return Ok(false);
+    }
     let probe_end = t
         .checked_add_signed(chrono::Duration::seconds(1))
         .unwrap_or(NaiveDateTime::MAX);
