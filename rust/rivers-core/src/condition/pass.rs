@@ -556,6 +556,7 @@ impl ConditionPass {
                         ),
                         latest_time_window_keys: latest_tw_keys.as_ref(),
                         all_partition_statuses: &self.cache.partition_status,
+                        dep_root_floor: None,
                     })
             });
 

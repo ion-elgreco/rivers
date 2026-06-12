@@ -2341,6 +2341,7 @@ fn test_last_run_includes_target_partitioned() {
         resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &partition_status,
+        dep_root_floor: None,
     };
     ctx.partitions = Some(&pctx);
 
@@ -2452,6 +2453,7 @@ fn test_last_run_includes_target_partitioned_joint_run_suppresses_newly_updated(
         resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
     };
     ctx.partitions = Some(&pctx);
 
@@ -2533,6 +2535,7 @@ fn dep_updated_requires_dep_newer_than_target_key() {
         resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
     };
     ctx.partitions = Some(&pctx);
 
@@ -2548,6 +2551,265 @@ fn dep_updated_requires_dep_newer_than_target_key() {
                 "a dep key no newer than the root's must not count as updated"
             );
             assert_eq!(keys.len(), 1);
+        }
+        other => panic!("expected Keys selection, got {other:?}"),
+    }
+}
+
+#[test]
+fn dep_updated_floor_compares_mapped_downstream_key() {
+    // The staleness floor must compare a dep key against the root's
+    // materialization of the DOWNSTREAM key the mapping resolves it to —
+    // not the root's unrelated same-named key. With time_window(offset=-1)
+    // ("read yesterday's partition"), b@D drives a@(D+1): once a@(D+1) has
+    // landed newer than b@D, the trigger must self-suppress.
+    let a = make_materialized_record("a", 400);
+    let b = make_materialized_record("b", 300);
+    let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
+    let deps = HashMap::from([("a".to_string(), vec!["b".to_string()])]);
+
+    let grid = crate::timegrid::TimeGrid {
+        cron_schedule: None,
+        interval_seconds: Some(86400.0),
+        start: chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+        end: Some(
+            chrono::NaiveDate::from_ymd_opt(2024, 2, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+        ),
+        fmt: "%Y-%m-%d".to_string(),
+    };
+
+    let b_keys = HashSet::from([spk("2024-01-04"), spk("2024-01-05")]);
+    let a_keys = HashSet::from([spk("2024-01-05"), spk("2024-01-06")]);
+    // Root already consumed both dep updates: a@05 (from b@04) and a@06
+    // (from b@05) are newer than their driving dep keys.
+    let a_timestamps = HashMap::from([(spk("2024-01-05"), 100i64), (spk("2024-01-06"), 400)]);
+
+    let all_states = HashMap::new();
+    let b_partition_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: b_keys.clone(),
+        timestamps: HashMap::from([(spk("2024-01-04"), 50i64), (spk("2024-01-05"), 300)]),
+        ..Default::default()
+    };
+    let a_partition_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: a_keys.clone(),
+        timestamps: a_timestamps.clone(),
+        ..Default::default()
+    };
+    let partition_statuses = HashMap::from([
+        ("a".to_string(), a_partition_status),
+        ("b".to_string(), b_partition_status),
+    ]);
+    // Solo runs: no joint-run suppression in play.
+    let partition_asset_names = HashMap::from([(
+        "b".to_string(),
+        HashMap::from([
+            (spk("2024-01-04"), Arc::from(vec!["b".to_string()])),
+            (spk("2024-01-05"), Arc::from(vec!["b".to_string()])),
+        ]),
+    )]);
+
+    let mut ctx = make_ctx("a", &a, &records, &deps);
+    ctx.tags.partition_last_run_asset_names = &partition_asset_names;
+    ctx.all_asset_states = &all_states;
+
+    let mappings = HashMap::from([(
+        ("a".to_string(), "b".to_string()),
+        PartitionMappingKind::TimeWindow {
+            offset: -1,
+            grid: Some(grid),
+        },
+    )]);
+    let upstream_b = HashMap::from([("b".to_string(), b_keys.clone())]);
+    let pctx = PartitionEvalContext {
+        all_keys: &a_keys,
+        materialized: &a_keys,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &a_timestamps,
+        resolver: PartitionResolver::new(&mappings, &upstream_b),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let cond = ConditionNode::any_deps_updated();
+    let result = evaluate(&cond, &ctx);
+    assert!(
+        !result.fired,
+        "every dep key's mapped downstream key is already newer; got {:?}",
+        result.selection
+    );
+
+    // Control: the root's mapped key a@06 older than b@05 -> exactly that
+    // downstream key fires.
+    let a_timestamps_stale =
+        HashMap::from([(spk("2024-01-05"), 100i64), (spk("2024-01-06"), 200)]);
+    let statuses_stale = HashMap::from([
+        (
+            "a".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                materialized: a_keys.clone(),
+                timestamps: a_timestamps_stale.clone(),
+                ..Default::default()
+            },
+        ),
+        (
+            "b".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                materialized: b_keys.clone(),
+                timestamps: HashMap::from([(spk("2024-01-04"), 50i64), (spk("2024-01-05"), 300)]),
+                ..Default::default()
+            },
+        ),
+    ]);
+    let pctx_stale = PartitionEvalContext {
+        all_keys: &a_keys,
+        materialized: &a_keys,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &a_timestamps_stale,
+        resolver: PartitionResolver::new(&mappings, &upstream_b),
+        latest_time_window_keys: None,
+        all_partition_statuses: &statuses_stale,
+        dep_root_floor: None,
+    };
+    let mut ctx2 = make_ctx("a", &a, &records, &deps);
+    ctx2.tags.partition_last_run_asset_names = &partition_asset_names;
+    ctx2.all_asset_states = &all_states;
+    ctx2.partitions = Some(&pctx_stale);
+    let result = evaluate(&cond, &ctx2);
+    assert!(result.fired, "a@06 is older than b@05 now");
+    match result.selection {
+        Some(PartitionSelection::Keys(ref keys)) => {
+            assert_eq!(keys.len(), 1);
+            assert!(
+                keys.contains(&spk("2024-01-06")),
+                "the fire must target the mapped downstream key"
+            );
+        }
+        other => panic!("expected Keys selection, got {other:?}"),
+    }
+}
+
+#[test]
+fn dep_updated_ignores_dep_keys_outside_root_universe() {
+    // Identity dep whose upstream range is a superset of the root's
+    // (upstream daily since 2020, downstream added with start=2024): the
+    // upstream-only keys can never be dispatched downstream, so they must
+    // not count as updated — pre-fix they kept the condition permanently
+    // firing phantom selections.
+    let a = make_materialized_record("a", 100);
+    let b = make_materialized_record("b", 500);
+    let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
+    let deps = HashMap::from([("a".to_string(), vec!["b".to_string()])]);
+
+    let old = spk("2020-01-01");
+    let shared = spk("2024-06-01");
+    let b_keys = HashSet::from([old.clone(), shared.clone()]);
+    let a_keys = HashSet::from([shared.clone()]);
+    let a_timestamps = HashMap::from([(shared.clone(), 100i64)]);
+
+    let all_states = HashMap::new();
+    let b_partition_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: b_keys.clone(),
+        timestamps: HashMap::from([(old.clone(), 500i64), (shared.clone(), 100)]),
+        ..Default::default()
+    };
+    let a_partition_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: a_keys.clone(),
+        timestamps: a_timestamps.clone(),
+        ..Default::default()
+    };
+    let partition_statuses = HashMap::from([
+        ("a".to_string(), a_partition_status),
+        ("b".to_string(), b_partition_status),
+    ]);
+    let partition_asset_names = HashMap::from([(
+        "b".to_string(),
+        HashMap::from([
+            (old.clone(), Arc::from(vec!["b".to_string()])),
+            (shared.clone(), Arc::from(vec!["b".to_string()])),
+        ]),
+    )]);
+
+    let mut ctx = make_ctx("a", &a, &records, &deps);
+    ctx.tags.partition_last_run_asset_names = &partition_asset_names;
+    ctx.all_asset_states = &all_states;
+
+    let empty_mappings = HashMap::new();
+    let upstream_b = HashMap::from([("b".to_string(), b_keys.clone())]);
+    let pctx = PartitionEvalContext {
+        all_keys: &a_keys,
+        materialized: &a_keys,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &a_timestamps,
+        resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let cond = ConditionNode::any_deps_updated();
+    let result = evaluate(&cond, &ctx);
+    assert!(
+        !result.fired,
+        "an upstream-only key must not fire the condition; got {:?}",
+        result.selection
+    );
+
+    // Control: a genuine update of the shared key still fires it alone.
+    let statuses_new = HashMap::from([
+        (
+            "a".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                materialized: a_keys.clone(),
+                timestamps: a_timestamps.clone(),
+                ..Default::default()
+            },
+        ),
+        (
+            "b".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                materialized: b_keys.clone(),
+                timestamps: HashMap::from([(old.clone(), 500i64), (shared.clone(), 150)]),
+                ..Default::default()
+            },
+        ),
+    ]);
+    let pctx_new = PartitionEvalContext {
+        all_keys: &a_keys,
+        materialized: &a_keys,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &a_timestamps,
+        resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
+        latest_time_window_keys: None,
+        all_partition_statuses: &statuses_new,
+        dep_root_floor: None,
+    };
+    let mut ctx2 = make_ctx("a", &a, &records, &deps);
+    ctx2.tags.partition_last_run_asset_names = &partition_asset_names;
+    ctx2.all_asset_states = &all_states;
+    ctx2.partitions = Some(&pctx_new);
+    let result = evaluate(&cond, &ctx2);
+    assert!(result.fired);
+    match result.selection {
+        Some(PartitionSelection::Keys(ref keys)) => {
+            assert_eq!(
+                keys.len(),
+                1,
+                "only the shared key may fire, never the phantom: {keys:?}"
+            );
+            assert!(keys.contains(&shared));
         }
         other => panic!("expected Keys selection, got {other:?}"),
     }
@@ -2605,6 +2867,7 @@ fn test_last_run_includes_target_partitioned_solo_run_allows_newly_updated() {
         resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
     };
     ctx.partitions = Some(&pctx);
 
@@ -2681,6 +2944,7 @@ fn test_last_run_includes_target_partitioned_mixed_joint_and_solo() {
         resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
     };
     ctx.partitions = Some(&pctx);
 
@@ -6034,6 +6298,7 @@ impl OwnedPartitionData {
             resolver: PartitionResolver::empty(),
             latest_time_window_keys: None,
             all_partition_statuses: &self.all_partition_statuses,
+            dep_root_floor: None,
         }
     }
 }
@@ -6260,6 +6525,7 @@ fn test_partitioned_in_latest_time_window_selects_recent_keys() {
         resolver: PartitionResolver::empty(),
         latest_time_window_keys: Some(&latest),
         all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
     };
     let ctx = make_partitioned_ctx("a", &record, &records, &deps, &pctx);
     let cond = ConditionNode::InLatestTimeWindow {
@@ -6292,6 +6558,7 @@ fn test_partitioned_in_latest_time_window_empty_when_no_recent() {
         resolver: PartitionResolver::empty(),
         latest_time_window_keys: Some(&latest),
         all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
     };
     let ctx = make_partitioned_ctx("a", &record, &records, &deps, &pctx);
     let cond = ConditionNode::InLatestTimeWindow {
@@ -6343,6 +6610,7 @@ fn test_partitioned_in_latest_time_window_combined_with_missing() {
         resolver: PartitionResolver::empty(),
         latest_time_window_keys: Some(&latest),
         all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
     };
     let ctx = make_partitioned_ctx("a", &record, &records, &deps, &pctx);
     // InLatestTimeWindow & Missing — only the latest missing partitions
@@ -6703,6 +6971,7 @@ fn test_partitioned_any_deps_missing_with_identity() {
         resolver,
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
     };
 
     let ctx = EvalContext {
@@ -6784,6 +7053,7 @@ fn test_partitioned_all_deps_match_not_missing() {
         resolver,
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
     };
 
     let ctx = EvalContext {
@@ -6944,6 +7214,7 @@ fn test_partitioned_eager_selects_new_partition() {
         resolver,
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
     };
 
     let ctx = EvalContext {
@@ -7298,6 +7569,7 @@ fn test_partitioned_eager_partial_upstream_update() {
         resolver,
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
     };
 
     let ctx = EvalContext {
@@ -7384,6 +7656,7 @@ fn test_partitioned_eager_only_fires_for_partitions_with_upstream_data() {
         resolver,
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
     };
 
     let ctx = EvalContext {
@@ -7489,6 +7762,7 @@ fn test_partitioned_on_missing_only_missing_partitions() {
         resolver,
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
     };
 
     let ctx = EvalContext {
@@ -7554,6 +7828,7 @@ fn test_partitioned_in_progress_excludes_from_and() {
         resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
     };
 
     let ctx = EvalContext {
@@ -7619,6 +7894,7 @@ fn test_partitioned_code_version_changed_all_partitions() {
         resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
     };
 
     let pctx_ref = &pctx;
@@ -7657,6 +7933,7 @@ fn test_partitioned_since_latch_per_partition() {
         resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
     };
 
     let ctx1 = EvalContext {
@@ -7707,6 +7984,7 @@ fn test_partitioned_since_latch_per_partition() {
         resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
     };
 
     let prev2 = AssetConditionState {
@@ -7902,6 +8180,7 @@ fn test_partitioned_execution_failed_subset() {
         resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
     };
 
     let ctx = make_partitioned_ctx("a", &record, &records, &deps, &pctx);
@@ -7936,6 +8215,7 @@ fn test_partitioned_complex_or_and_not() {
         resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
     };
 
     let ctx = make_partitioned_ctx("a", &record, &records, &deps, &pctx);
@@ -9136,6 +9416,7 @@ fn test_partitioned_on_cron_no_deps_fires_all_partitions() {
         resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
     };
 
     let prev = AssetConditionState {
@@ -9202,6 +9483,7 @@ fn test_partitioned_on_cron_does_not_fire_without_tick() {
         resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
     };
 
     let prev = AssetConditionState {
@@ -9289,6 +9571,7 @@ fn test_partitioned_on_cron_waits_for_dep_update() {
         resolver,
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
     };
 
     let prev = AssetConditionState {
@@ -9376,6 +9659,7 @@ fn test_partitioned_on_cron_fires_after_dep_update() {
         resolver,
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
     };
 
     let prev = AssetConditionState {
@@ -9467,6 +9751,7 @@ fn test_partitioned_on_cron_partial_dep_update() {
         resolver,
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
     };
 
     let prev = AssetConditionState {
@@ -9623,6 +9908,7 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
         resolver,
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
     };
     let ctx = EvalContext {
         target_key: "a",
@@ -9671,6 +9957,7 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
         resolver: resolver2,
         latest_time_window_keys: None,
         all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
     };
     let ctx2 = EvalContext {
         target_key: "a",

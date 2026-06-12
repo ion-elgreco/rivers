@@ -886,23 +886,24 @@ fn eval_partitioned<O: PartEvalOutput>(
             // acted-on events (double fire), and a fire can baseline a key
             // that a sibling clause suppressed that tick (lost fire,
             // forever). Compare staleness instead: a dep key counts as
-            // updated while it is strictly newer than the root's own
-            // materialization of that key — the dispatched run advances the
-            // root past the dep so the trigger self-suppresses, and a missed
-            // tick simply retries. Keys the root never materialized pass;
-            // roots without partition status keep the baseline behavior.
-            let root_floor = if ctx.target_key != ctx.root_key {
-                pctx.all_partition_statuses
-                    .get(ctx.root_key)
-                    .map(|s| &s.timestamps)
-            } else {
-                None
-            };
+            // updated while it is strictly newer than the root's
+            // materialization of the downstream key(s) the partition mapping
+            // resolves it to — the dispatched run advances those keys past
+            // the dep so the trigger self-suppresses, and a missed tick
+            // simply retries. Mapped keys never materialized pass; dep keys
+            // with no counterpart in the downstream universe never count
+            // (nothing could ever be dispatched for them). The floor map is
+            // built per dep by `eval_partitioned_on_dep`; outside dep pivots
+            // (and for roots without partition status) baselines remain.
             let updated: HashSet<PartitionKey> = pctx
                 .timestamps
                 .iter()
-                .filter(|&(pk, &ts)| match root_floor {
-                    Some(floor) => floor.get(pk).is_none_or(|&root_ts| ts > root_ts),
+                .filter(|&(pk, &ts)| match pctx.dep_root_floor {
+                    Some(floor) => match floor.get(pk) {
+                        None => false,
+                        Some(None) => true,
+                        Some(Some(root_ts)) => ts > *root_ts,
+                    },
                     None => match prev_timestamps.and_then(|pt| pt.get(pk)) {
                         Some(&prev) => ts > prev,
                         None => true, // newly appeared partition
@@ -1240,6 +1241,23 @@ fn eval_partitioned_all_deps(
     result
 }
 
+/// The staleness floor across the downstream keys a dep key maps to: the
+/// minimum materialization timestamp, or `None` as soon as any of them was
+/// never materialized (an unmaterialized mapped key keeps the dep "updated").
+fn root_floor_over<'k>(
+    keys: impl Iterator<Item = &'k PartitionKey>,
+    root_timestamps: &HashMap<PartitionKey, i64>,
+) -> Option<i64> {
+    let mut floor: Option<i64> = None;
+    for k in keys {
+        match root_timestamps.get(k) {
+            None => return None,
+            Some(&ts) => floor = Some(floor.map_or(ts, |f| f.min(ts))),
+        }
+    }
+    floor
+}
+
 /// Evaluate a condition on an upstream dep in partition-aware mode.
 /// Maps partitions: downstream → upstream, evaluate, upstream → downstream.
 fn eval_partitioned_on_dep(
@@ -1292,6 +1310,42 @@ fn eval_partitioned_on_dep(
         .get(dep_key)
         .unwrap_or(&empty_status);
 
+    // Staleness floor for `NewlyUpdated`, translated into the dep's key
+    // space: for each dep key, the root's materialization state of the
+    // downstream key(s) it maps to. Built here because the mapping and both
+    // universes are only visible at the pivot boundary.
+    let dep_root_floor = pctx
+        .all_partition_statuses
+        .get(ctx.root_key)
+        .map(|root_status| {
+            upstream_status
+                .timestamps
+                .keys()
+                .filter_map(|uk| {
+                    let mapped = pctx.resolver.map_downstream(
+                        dep_key,
+                        ctx.target_key,
+                        &PartitionSelection::Keys(HashSet::from([uk.clone()])),
+                    );
+                    let floor = match &mapped {
+                        PartitionSelection::Empty => return None,
+                        PartitionSelection::All => {
+                            root_floor_over(pctx.all_keys.iter(), &root_status.timestamps)
+                        }
+                        PartitionSelection::Keys(ks) => {
+                            let in_universe: Vec<&PartitionKey> =
+                                ks.iter().filter(|k| pctx.all_keys.contains(*k)).collect();
+                            if in_universe.is_empty() {
+                                return None;
+                            }
+                            root_floor_over(in_universe.into_iter(), &root_status.timestamps)
+                        }
+                    };
+                    Some((uk.clone(), floor))
+                })
+                .collect::<HashMap<PartitionKey, Option<i64>>>()
+        });
+
     let upstream_pctx = PartitionEvalContext {
         all_keys: &upstream_all_keys,
         materialized: &upstream_status.materialized,
@@ -1301,6 +1355,7 @@ fn eval_partitioned_on_dep(
         resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: pctx.all_partition_statuses,
+        dep_root_floor: dep_root_floor.as_ref(),
     };
 
     let dep_state = ctx
