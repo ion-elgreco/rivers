@@ -344,6 +344,22 @@ def test_time_window_interval_coarser_than_horizon_accepted():
     assert pd is not None
 
 
+def test_time_window_fmt_checked_on_ticks_beyond_validation_horizon():
+    """A grid sparser than the validation horizon still mints its later
+    ticks: a 5-year interval's tick 1 (2028-12-30) renders '2028-12', which
+    parses back to 2028-12-01 and fails the definition's own key validation.
+    The first two ticks must round-trip no matter how far out they lie."""
+    with pytest.raises(
+        PartitionDefinitionError, match="cannot represent the partition grid"
+    ):
+        rs.PartitionsDefinition.time_window(
+            start=datetime.datetime(2024, 1, 1),
+            interval_seconds=5.0 * 365.0 * 86400.0,
+            end=datetime.datetime(2035, 1, 1),
+            fmt="%Y-%m",
+        )
+
+
 def test_static_rejects_empty_string_key():
     """Empty key strings render as nothing in the display form and are
     unreachable via string lookups — same guard as the dynamic write path."""
