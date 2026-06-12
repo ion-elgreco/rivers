@@ -569,6 +569,7 @@ impl ConditionPass {
                     upstream_deps: &self.cache.upstream_deps,
                     in_progress_assets: &in_progress_keys,
                     failed_assets: &self.cache.failed_assets,
+                    failed_asset_timestamps: &self.cache.failed_asset_timestamps,
                     backfill: &self.cache.backfill,
                 },
                 tags: RunTagSnapshot {

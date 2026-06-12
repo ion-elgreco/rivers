@@ -126,10 +126,14 @@ class TestLastRunIncludesTarget:
         finally:
             daemon.stop()
 
-    def test_naive_condition_fires_redundantly_after_joint_run(self, storage):
-        """Without ~last_run_includes_target, a joint run causes a redundant fire.
+    def test_naive_condition_self_suppresses_after_joint_run(self, storage):
+        """Even without ~last_run_includes_target, a joint run must not re-fire.
 
-        Uses any_deps_match(newly_updated) without the filter to show the contrast.
+        Dep-updated compares staleness against the root's own record: after a
+        joint run the dep is no newer than the root, so the naive
+        any_deps_match(newly_updated) form is self-suppressing too (the
+        filter remains for explicitness). This used to fire a redundant
+        third run under fire-time baselines.
         """
 
         @rs.Asset(name="a", io_handler=rs.InMemoryIOHandler())
@@ -178,10 +182,10 @@ class TestLastRunIncludesTarget:
             repo.materialize(selection=["a", "b"])
             assert _count_successful_runs_for(storage, "b") == 2
 
-            got_extra = _wait_for_n_runs(storage, "b", 3, timeout=10)
-            assert got_extra, (
-                f"naive eager (AnyDepsUpdated, no filter) should fire "
-                f"a redundant 3rd run, but B has "
+            got_extra = _wait_for_n_runs(storage, "b", 3, timeout=5)
+            assert not got_extra, (
+                f"a joint run must not re-trigger B (dep is not newer than "
+                f"the root), but B has "
                 f"{_count_successful_runs_for(storage, 'b')} runs"
             )
         finally:
