@@ -85,7 +85,7 @@ class TestDaemonConditionBackfill:
         daemon = AutomationDaemon(
             repo=repo,
             storage=storage,
-            condition_eval_interval="1s",
+            condition_eval_interval="3s",
         )
         daemon.start()
         try:
@@ -249,7 +249,7 @@ class TestDaemonConditionBackfill:
         daemon = AutomationDaemon(
             repo=repo,
             storage=storage,
-            condition_eval_interval="1s",
+            condition_eval_interval="3s",
         )
         daemon.start()
         try:
@@ -346,10 +346,13 @@ class TestDaemonConditionBackfill:
                     partition_key=pk,
                 )
 
+        # Dep matching is per-partition: the four upstream re-materializations
+        # below must land within one tick window or the condition legitimately
+        # fires as two separate backfills.
         daemon = AutomationDaemon(
             repo=repo,
             storage=storage,
-            condition_eval_interval="1s",
+            condition_eval_interval="3s",
         )
         daemon.start()
         try:

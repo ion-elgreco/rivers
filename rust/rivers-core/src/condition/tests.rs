@@ -2472,6 +2472,88 @@ fn test_last_run_includes_target_partitioned_joint_run_suppresses_newly_updated(
 }
 
 #[test]
+fn dep_updated_requires_dep_newer_than_target_key() {
+    // Observation baselines lag async event drains: a fire can baseline stale
+    // timestamps and the same events re-surface as "updated" a tick later
+    // (or, with no baseline at all, every key reads as newly appeared). A dep
+    // key counts as updated only while it is strictly newer than the root's
+    // own materialization of that key — the dispatched run then advances the
+    // root past the dep, making the trigger self-suppressing.
+    let a = make_materialized_record("a", 100);
+    let b = make_materialized_record("b", 100);
+    let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
+    let deps = HashMap::from([("a".to_string(), vec!["b".to_string()])]);
+
+    let pk1 = spk("2024-01-01");
+    let pk2 = spk("2024-01-02");
+    let all_keys = HashSet::from([pk1.clone(), pk2.clone()]);
+    // Root "a" materialized pk1 at 100 (same joint baseline run as the dep)
+    // and pk2 at 100.
+    let a_timestamps = HashMap::from([(pk1.clone(), 100i64), (pk2.clone(), 100)]);
+
+    // Dep "b": pk1 ts equals the root's (nothing new); pk2 genuinely newer.
+    // Its eval-state baseline is EMPTY — the drain-lag shape where every key
+    // would read as "newly appeared".
+    let all_states = HashMap::new();
+    let b_partition_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: HashSet::from([pk1.clone(), pk2.clone()]),
+        timestamps: HashMap::from([(pk1.clone(), 100i64), (pk2.clone(), 200)]),
+        ..Default::default()
+    };
+    let a_partition_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: HashSet::from([pk1.clone(), pk2.clone()]),
+        timestamps: a_timestamps.clone(),
+        ..Default::default()
+    };
+    let partition_statuses = HashMap::from([
+        ("a".to_string(), a_partition_status),
+        ("b".to_string(), b_partition_status),
+    ]);
+    // Solo runs: no joint-run suppression in play.
+    let partition_asset_names = HashMap::from([(
+        "b".to_string(),
+        HashMap::from([
+            (pk1.clone(), Arc::from(vec!["b".to_string()])),
+            (pk2.clone(), Arc::from(vec!["b".to_string()])),
+        ]),
+    )]);
+
+    let mut ctx = make_ctx("a", &a, &records, &deps);
+    ctx.tags.partition_last_run_asset_names = &partition_asset_names;
+    ctx.all_asset_states = &all_states;
+
+    let empty_mappings = HashMap::new();
+    let upstream_b = HashMap::from([("b".to_string(), all_keys.clone())]);
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &all_keys,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &a_timestamps,
+        resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let cond = ConditionNode::any_deps_updated();
+    let result = evaluate(&cond, &ctx);
+
+    assert!(result.fired, "pk2 is genuinely newer than the root");
+    match result.selection {
+        Some(PartitionSelection::Keys(ref keys)) => {
+            assert!(keys.contains(&pk2));
+            assert!(
+                !keys.contains(&pk1),
+                "a dep key no newer than the root's must not count as updated"
+            );
+            assert_eq!(keys.len(), 1);
+        }
+        other => panic!("expected Keys selection, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_last_run_includes_target_partitioned_solo_run_allows_newly_updated() {
     // Scenario: partitioned dep "b" was materialized in a solo run (not with root "a").
     // On the next tick, b:pk1 shows NewlyUpdated and should NOT be suppressed.

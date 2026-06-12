@@ -881,15 +881,32 @@ fn eval_partitioned<O: PartEvalOutput>(
                 .partition_state
                 .as_ref()
                 .map(|ps| &ps.timestamps);
+            // In a dep pivot (target ≠ root) observation baselines are
+            // unsound both ways: async event drains re-surface already-
+            // acted-on events (double fire), and a fire can baseline a key
+            // that a sibling clause suppressed that tick (lost fire,
+            // forever). Compare staleness instead: a dep key counts as
+            // updated while it is strictly newer than the root's own
+            // materialization of that key — the dispatched run advances the
+            // root past the dep so the trigger self-suppresses, and a missed
+            // tick simply retries. Keys the root never materialized pass;
+            // roots without partition status keep the baseline behavior.
+            let root_floor = if ctx.target_key != ctx.root_key {
+                pctx.all_partition_statuses
+                    .get(ctx.root_key)
+                    .map(|s| &s.timestamps)
+            } else {
+                None
+            };
             let updated: HashSet<PartitionKey> = pctx
                 .timestamps
                 .iter()
-                .filter(|&(pk, &ts)| {
-                    let prev_ts = prev_timestamps.and_then(|pt| pt.get(pk));
-                    match prev_ts {
+                .filter(|&(pk, &ts)| match root_floor {
+                    Some(floor) => floor.get(pk).is_none_or(|&root_ts| ts > root_ts),
+                    None => match prev_timestamps.and_then(|pt| pt.get(pk)) {
                         Some(&prev) => ts > prev,
                         None => true, // newly appeared partition
-                    }
+                    },
                 })
                 .map(|(pk, _)| pk.clone())
                 .collect();
