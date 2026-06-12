@@ -302,6 +302,24 @@ def test_subgrid_divergence_past_first_window_rejected():
         make_repo(_identity_edge(down, up))
 
 
+def test_subgrid_probe_respects_downstream_end():
+    """Range edges are a per-key concern: a downstream def whose explicit end
+    precedes the first off-grid tick mints only on-grid keys, so the probe
+    must not reject it for a window start it will never mint."""
+    fmt = "%Y-%m-%d"
+    # Mon 2024-01-01 .. Fri 2024-01-05 (end exclusive at Sat 2024-01-06).
+    up = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, cron_schedule="0 0 * * 1-5", fmt=fmt
+    )
+    down = rs.PartitionsDefinition.time_window(
+        start=DAILY_START,
+        end=datetime(2024, 1, 6),
+        interval_seconds=86400,
+        fmt=fmt,
+    )
+    assert make_repo(_identity_edge(down, up)) is not None
+
+
 def test_equivalent_cron_spellings_allowed():
     """'0 0 * * *' and its 6-field spelling '0 0 0 * * *' are one schedule;
     textual comparison must not reject them."""
