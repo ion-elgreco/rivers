@@ -73,6 +73,18 @@ fn partition_info_from_node(
     })
 }
 
+/// Seeding enumerates through an explicit end — future windows included — so
+/// the watermark starts past whatever the seed covered, not at `now`.
+fn seeded_watermark(
+    def: &PartitionsDefinition,
+    now: chrono::NaiveDateTime,
+) -> chrono::NaiveDateTime {
+    match def {
+        PartitionsDefinition::TimeWindow { end: Some(e), .. } => (*e).max(now),
+        _ => now,
+    }
+}
+
 /// How `def`'s key universe evolves after extraction. `now` is the
 /// enumeration high-water mark for open time grids.
 fn partition_universe_for(
@@ -84,7 +96,7 @@ fn partition_universe_for(
         PartitionsDefinition::TimeWindow { .. } => match def.time_grid() {
             Some(grid) => PartitionUniverse::TimeWindow {
                 grid,
-                enumerated_to: now,
+                enumerated_to: seeded_watermark(def, now),
             },
             None => PartitionUniverse::Frozen,
         },
@@ -100,7 +112,7 @@ fn partition_universe_for(
                         PartitionsDefinition::TimeWindow { .. } => match dim_def.time_grid() {
                             Some(grid) => DimensionKind::TimeWindow {
                                 grid,
-                                enumerated_to: now,
+                                enumerated_to: seeded_watermark(dim_def, now),
                             },
                             None => DimensionKind::Frozen,
                         },

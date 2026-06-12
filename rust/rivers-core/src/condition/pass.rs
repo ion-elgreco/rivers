@@ -159,8 +159,15 @@ fn refresh_universe(
                         }
                         match grid.window_starts_in(*enumerated_to, bound) {
                             Ok(new_keys) => {
-                                if !new_keys.is_empty() {
-                                    du.keys.extend(new_keys);
+                                // Seeding can enumerate past the watermark
+                                // (explicit future end; start/enumerate race),
+                                // so re-yielded starts must not duplicate.
+                                let fresh: Vec<String> = new_keys
+                                    .into_iter()
+                                    .filter(|k| !du.keys.contains(k))
+                                    .collect();
+                                if !fresh.is_empty() {
+                                    du.keys.extend(fresh);
                                     changed = true;
                                 }
                                 *enumerated_to = bound;
@@ -1035,6 +1042,51 @@ mod tests {
             ],
         };
         assert!(all_keys.contains(&expected));
+    }
+
+    #[test]
+    fn multi_dim_refresh_never_duplicates_seeded_window_starts() {
+        // Seeding enumerates a dim through its explicit (future) end while
+        // the watermark starts at daemon-start `now`; later refreshes re-yield
+        // already-seeded starts and must neither append duplicates nor report
+        // a spurious change.
+        let grid = TimeGrid {
+            cron_schedule: None,
+            interval_seconds: Some(3600.0),
+            start: naive("2024-01-01T00:00:00"),
+            end: Some(naive("2024-01-02T00:00:00")),
+            fmt: "%Y-%m-%dT%H:%M:%S".into(),
+        };
+        let seeded: Vec<String> = (0..24)
+            .map(|h| format!("2024-01-01T{h:02}:00:00"))
+            .collect();
+        let mut universe = PartitionUniverse::Multi {
+            dims: vec![(
+                "date".to_string(),
+                DimensionUniverse {
+                    keys: seeded.clone(),
+                    kind: DimensionKind::TimeWindow {
+                        grid,
+                        enumerated_to: naive("2024-01-01T01:30:00"),
+                    },
+                },
+            )],
+        };
+        let mut all_keys: HashSet<PartitionKey> = HashSet::new();
+        let changed = refresh_universe(
+            &mut universe,
+            &mut all_keys,
+            naive("2024-01-01T03:10:00"),
+            &HashMap::new(),
+        );
+        let PartitionUniverse::Multi { dims } = &universe else {
+            unreachable!()
+        };
+        assert!(
+            !changed,
+            "re-yielding already-seeded starts is not a change"
+        );
+        assert_eq!(dims[0].1.keys, seeded, "no duplicate dim keys");
     }
 
     #[test]
