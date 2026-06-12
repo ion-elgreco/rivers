@@ -353,6 +353,28 @@ async fn run_migrations(db: &Surreal<Any>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Upsert the heal's canonical row. The migration computes its values from a
+/// snapshot taken before the write loop, so a live materialization can land a
+/// newer canonical row in between.
+async fn upsert_canonical_partition_row(
+    db: &Surreal<Any>,
+    write: DbAssetPartitionWrite,
+) -> anyhow::Result<()> {
+    // Pointer fields only move forward: a stale snapshot must never roll
+    // back a row a live materialization just advanced. last_timestamp is
+    // compared first and assigned last so the guards all see the old value.
+    db.query(
+        "INSERT INTO asset_partitions $row ON DUPLICATE KEY UPDATE \
+         last_event_id = IF $input.last_timestamp > last_timestamp THEN $input.last_event_id ELSE last_event_id END, \
+         last_run_id = IF $input.last_timestamp > last_timestamp THEN $input.last_run_id ELSE last_run_id END, \
+         last_timestamp = IF $input.last_timestamp > last_timestamp THEN $input.last_timestamp ELSE last_timestamp END",
+    )
+    .bind(("row", write))
+    .await?
+    .check()?;
+    Ok(())
+}
+
 /// v1 → v2: rewrite persisted `Multi` partition keys whose dims aren't in
 /// canonical (sorted) order. Earlier builds serialized HashMap iteration
 /// order, which defeats the `asset_partitions` UNIQUE index (one logical
@@ -415,12 +437,7 @@ async fn migrate_multi_partition_key_order(db: &Surreal<Any>) -> anyhow::Result<
         // between the two steps leaves a recoverable duplicate for the next
         // start to clean up, never a lost partition. A pre-existing sorted
         // row is updated in place via the UNIQUE index.
-        db.query(
-            "INSERT INTO asset_partitions $row ON DUPLICATE KEY UPDATE last_event_id = $input.last_event_id, last_run_id = $input.last_run_id, last_timestamp = $input.last_timestamp",
-        )
-        .bind(("row", write))
-        .await?
-        .check()?;
+        upsert_canonical_partition_row(db, write).await?;
         for row in &group {
             if matches!(&row.partition_key, PartitionKey::Multi { dims } if !is_sorted(dims)) {
                 db.query("DELETE $rec")
@@ -4160,6 +4177,55 @@ mod tests {
             Some(1),
             "event key must be rewritten to canonical order"
         );
+    }
+
+    /// The heal's values come from a snapshot taken before its write loop, so
+    /// a live materialization can land newer pointers on the canonical row in
+    /// between — the upsert must not roll them back to snapshot values.
+    #[tokio::test]
+    async fn test_migration_upsert_never_rolls_back_newer_pointers() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let key = PartitionKey::Multi {
+            dims: vec![
+                ("date".to_string(), vec!["2024-01-01".to_string()]),
+                ("region".to_string(), vec!["eu".to_string()]),
+            ],
+        };
+        let row = |event: &str, ts: i64| DbAssetPartitionWrite {
+            code_location_id: "default".to_string(),
+            asset_key: "a".to_string(),
+            partition_key: key.clone(),
+            last_event_id: event.to_string(),
+            last_run_id: format!("run-{event}"),
+            last_timestamp: ts,
+        };
+        // The live writer's row lands first with newer pointers...
+        upsert_canonical_partition_row(&storage.db, row("ev-new", 200))
+            .await
+            .unwrap();
+        // ...then the migration applies its stale snapshot values.
+        upsert_canonical_partition_row(&storage.db, row("ev-old", 100))
+            .await
+            .unwrap();
+        #[derive(Debug, SurrealValue)]
+        struct Ptr {
+            last_event_id: String,
+            last_timestamp: i64,
+        }
+        let mut res = storage
+            .db
+            .query(
+                "SELECT last_event_id, last_timestamp FROM asset_partitions WHERE asset_key = 'a'",
+            )
+            .await
+            .unwrap();
+        let rows: Vec<Ptr> = res.take(0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_timestamp, 200, "newer pointers must survive");
+        assert_eq!(rows[0].last_event_id, "ev-new");
     }
 
     /// Two processes opening the same fresh/v1 remote database race the
