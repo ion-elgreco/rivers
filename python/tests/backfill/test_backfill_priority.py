@@ -8,8 +8,6 @@ Tests verify:
 - Daemon-triggered backfills carry priority -10
 """
 
-import time
-
 import rivers as rs
 from _polling import wait_for_backfill_runs as _wait_for_backfill_runs
 from rivers._core import AutomationDaemon
