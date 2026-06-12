@@ -768,7 +768,10 @@ impl ConditionPass {
 
         let mut single_partition_groups: HashMap<PartitionKey, Vec<String>> = HashMap::new();
         let mut multi_partition_backfills: Vec<(String, Vec<PartitionKey>)> = Vec::new();
-        for (asset_key, partition_keys) in partitioned_mats {
+        for (asset_key, mut partition_keys) in partitioned_mats {
+            // Selections come out of HashSets (per-process random order); the
+            // list persists into backfill records and drives dispatch order.
+            partition_keys.sort_by_cached_key(|k| k.to_display());
             if partition_keys.len() == 1 {
                 single_partition_groups
                     .entry(partition_keys.into_iter().next().unwrap())
@@ -1158,6 +1161,45 @@ mod tests {
             !handled.contains(&spk("2024-08-16")),
             "dropped keys must not be marked handled"
         );
+    }
+
+    #[test]
+    fn classify_orders_partition_keys_canonically() {
+        // HashSet iteration order is per-process random; the dispatched key
+        // list persists into durable backfill records and drives run order,
+        // so it must come out in canonical display order.
+        let days: Vec<String> = (1..=12).map(|d| format!("2024-01-{d:02}")).collect();
+        let day_refs: Vec<&str> = days.iter().map(String::as_str).collect();
+        let mut pass = ConditionPass::new(
+            AssetConditionCache::default(),
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "down".to_string(),
+                condition: ConditionNode::InProgress,
+                partition_info: Some(PartitionInfo {
+                    all_keys: make_daily_keys(&day_refs),
+                    mappings: HashMap::new(),
+                    time_window_fmt: None,
+                    universe: PartitionUniverse::Frozen,
+                }),
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        );
+        pass.eval_state.assets.insert(
+            "down".to_string(),
+            crate::condition::state::AssetConditionState::default(),
+        );
+        let plan = pass.classify_materializations(vec![ToMaterialize {
+            asset_key: "down".to_string(),
+            selection: Some(PartitionSelection::All),
+        }]);
+        let mut backfills = plan.multi_partition_backfills;
+        let (_, keys) = backfills.pop().unwrap();
+        let display: Vec<String> = keys.iter().map(|k| k.to_display()).collect();
+        let mut sorted = display.clone();
+        sorted.sort_unstable();
+        assert_eq!(display, sorted, "dispatched keys must be display-ordered");
     }
 
     #[test]
