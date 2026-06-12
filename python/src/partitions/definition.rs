@@ -1261,7 +1261,7 @@ fn interval_index(
 /// Always terminates at `end_dt` (the explicit `end`, or now if open-ended);
 /// uncapped, so a fine-grained def over a wide range is slow but never hides
 /// partitions.
-fn for_each_interval_tick(
+pub(crate) fn for_each_interval_tick(
     secs: f64,
     start: &NaiveDateTime,
     end_dt: NaiveDateTime,
@@ -1288,7 +1288,7 @@ fn for_each_interval_tick(
 /// Always terminates at `end_dt` (the explicit `end`, or now if open-ended);
 /// uncapped, so a fine-grained schedule over a wide range is slow but never
 /// hides partitions.
-fn for_each_cron_tick(
+pub(crate) fn for_each_cron_tick(
     cron_expr: &str,
     start: &NaiveDateTime,
     end_dt: NaiveDateTime,
@@ -1306,6 +1306,19 @@ fn for_each_cron_tick(
         }
     }
     Ok(())
+}
+
+/// Whether `t` falls exactly on the cron grid (cron is second-granular).
+pub(crate) fn cron_grid_contains(cron_expr: &str, t: NaiveDateTime) -> PyResult<bool> {
+    let probe_end = t
+        .checked_add_signed(chrono::Duration::seconds(1))
+        .unwrap_or(NaiveDateTime::MAX);
+    let mut hit = false;
+    for_each_cron_tick(cron_expr, &t, probe_end, |tick| {
+        hit = tick == t;
+        false
+    })?;
+    Ok(hit)
 }
 
 /// Compute the cartesian product of dimension keys.

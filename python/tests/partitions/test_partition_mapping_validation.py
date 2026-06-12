@@ -239,8 +239,9 @@ def test_time_window_mapping_phase_mismatch_rejected():
         make_repo(_tw_edge(down, up))
 
 
-def test_time_window_mapping_mixed_grid_kinds_rejected():
-    """One cron grid, one interval grid: subgrid alignment can't be proven."""
+def test_time_window_mapping_aligned_mixed_grid_kinds_allowed():
+    """A daily cron grid and an 86400s interval grid with the same anchor mint
+    identical keys — grid kind alone is no reason to reject the edge."""
     fmt = "%Y-%m-%d"
     up = rs.PartitionsDefinition.time_window(
         start=DAILY_START, cron_schedule="0 0 * * *", fmt=fmt
@@ -248,15 +249,34 @@ def test_time_window_mapping_mixed_grid_kinds_rejected():
     down = rs.PartitionsDefinition.time_window(
         start=DAILY_START, interval_seconds=86400, fmt=fmt
     )
+    assert make_repo(_tw_edge(down, up)) is not None
+
+
+def test_time_window_mapping_misaligned_mixed_grid_kinds_rejected():
+    """An interval grid anchored off the cron grid's ticks mints keys that
+    never exist upstream."""
+    fmt = "%Y-%m-%dT%H:%M"
+    up = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, cron_schedule="0 0 * * *", fmt=fmt
+    )
+    down = rs.PartitionsDefinition.time_window(
+        start=datetime(2024, 1, 1, 0, 30), interval_seconds=86400, fmt=fmt
+    )
     with pytest.raises(
-        PartitionValidationError,
-        match=re.escape(
-            "Asset 'downstream' depends on 'upstream': time_window mapping "
-            "requires both definitions on the same grid kind "
-            "(both cron or both interval)"
-        ),
+        PartitionValidationError, match="is not on the upstream grid"
     ):
         make_repo(_tw_edge(down, up))
+
+
+def test_equivalent_cron_spellings_allowed():
+    """'0 0 * * *' and its 6-field spelling '0 0 0 * * *' are one schedule;
+    textual comparison must not reject them."""
+    fmt = "%Y-%m-%d"
+    up = rs.PartitionsDefinition.daily(start=DAILY_START)
+    down = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, cron_schedule="0 0 0 * * *", fmt=fmt
+    )
+    assert make_repo(_identity_edge(down, up)) is not None
 
 
 def test_time_window_mapping_differing_cron_rejected():
@@ -268,12 +288,7 @@ def test_time_window_mapping_differing_cron_rejected():
         start=DAILY_START, cron_schedule="0 6 * * *", fmt=fmt
     )
     with pytest.raises(
-        PartitionValidationError,
-        match=re.escape(
-            "Asset 'downstream' depends on 'upstream': time_window mapping "
-            "requires identical cron schedules: downstream '0 6 * * *' != "
-            "upstream '0 0 * * *'"
-        ),
+        PartitionValidationError, match="is not on the upstream grid"
     ):
         make_repo(_tw_edge(down, up))
 

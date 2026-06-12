@@ -13,7 +13,9 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use crate::errors::PartitionValidationError;
 
 use super::PyPartitionKey;
-use super::definition::PartitionsDefinition;
+use super::definition::{
+    PartitionsDefinition, cron_grid_contains, for_each_cron_tick, for_each_interval_tick,
+};
 use super::key_range::PyPartitionKeyRange;
 
 /// Identifies which side of a dependency edge an error refers to.
@@ -757,15 +759,7 @@ fn validate_time_window_grid_compat(
         )));
     }
     match (down_cron, down_interval, up_cron, up_interval) {
-        (Some(dc), _, Some(uc), _) => {
-            if dc != uc {
-                return Err(MappingValidationError::DefinitionError(format!(
-                    "{mapping} mapping requires identical cron schedules: \
-                     downstream '{dc}' != upstream '{uc}'"
-                )));
-            }
-        }
-        (_, Some(di), _, Some(ui)) => {
+        (None, Some(di), None, Some(ui)) => {
             let down_ns = (di * 1_000_000_000.0) as i64;
             let up_ns = (ui * 1_000_000_000.0) as i64;
             if up_ns <= 0 || down_ns <= 0 || down_ns % up_ns != 0 {
@@ -788,10 +782,60 @@ fn validate_time_window_grid_compat(
             }
         }
         _ => {
-            return Err(MappingValidationError::DefinitionError(format!(
-                "{mapping} mapping requires both definitions on the same \
-                 grid kind (both cron or both interval)"
-            )));
+            // At least one side is a cron grid. Equivalent schedules can be
+            // spelled differently (5- vs 6-field, nicknames) and a cron grid
+            // can coincide with an interval grid, so prove the subgrid
+            // relation on the ticks themselves: every downstream window
+            // start over a bounded probe must fall on the upstream grid.
+            const PROBE_TICKS: usize = 32;
+            let horizon = down_start
+                .checked_add_signed(chrono::Duration::days(1461))
+                .unwrap_or(chrono::NaiveDateTime::MAX);
+            let mut count = 0usize;
+            let mut offgrid: Option<chrono::NaiveDateTime> = None;
+            let mut walk_err: Option<String> = None;
+            let mut visit = |t: chrono::NaiveDateTime| -> bool {
+                count += 1;
+                let on_upstream = match (up_cron, up_interval) {
+                    (Some(expr), _) => match cron_grid_contains(expr, t) {
+                        Ok(hit) => hit,
+                        Err(e) => {
+                            walk_err = Some(e.to_string());
+                            return false;
+                        }
+                    },
+                    (None, Some(ui)) => {
+                        let up_ns = (ui * 1_000_000_000.0) as i64;
+                        up_ns > 0
+                            && (t - *up_start)
+                                .num_nanoseconds()
+                                .is_some_and(|ns| ns.rem_euclid(up_ns) == 0)
+                    }
+                    (None, None) => false,
+                };
+                if !on_upstream {
+                    offgrid = Some(t);
+                    return false;
+                }
+                count < PROBE_TICKS
+            };
+            if let Some(dc) = down_cron {
+                for_each_cron_tick(dc, down_start, horizon, &mut visit)
+                    .map_err(|e| MappingValidationError::DefinitionError(e.to_string()))?;
+            } else if let Some(di) = down_interval {
+                for_each_interval_tick(*di, down_start, horizon, &mut visit);
+            }
+            if let Some(msg) = walk_err {
+                return Err(MappingValidationError::DefinitionError(msg));
+            }
+            if let Some(t) = offgrid {
+                return Err(MappingValidationError::DefinitionError(format!(
+                    "{mapping} mapping requires the downstream grid to be a \
+                     subgrid of the upstream grid: downstream window start {t} \
+                     (key '{}') is not on the upstream grid",
+                    t.format(down_fmt)
+                )));
+            }
         }
     }
     Ok(())
