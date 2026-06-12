@@ -829,10 +829,16 @@ fn validate_time_window_grid_compat(
                 return Err(MappingValidationError::DefinitionError(msg));
             }
             if let Some(t) = offgrid {
+                let upstream_grid = match (up_cron, up_interval) {
+                    (Some(expr), _) => format!("cron '{expr}'"),
+                    (None, Some(ui)) => format!("every {ui}s from {up_start}"),
+                    (None, None) => "with no schedule".to_string(),
+                };
                 return Err(MappingValidationError::DefinitionError(format!(
                     "{mapping} mapping requires the downstream grid to be a \
                      subgrid of the upstream grid: downstream window start {t} \
-                     (key '{}') is not on the upstream grid",
+                     (key '{}') is not on the upstream grid ({upstream_grid}), \
+                     so that key would never exist upstream",
                     t.format(down_fmt)
                 )));
             }

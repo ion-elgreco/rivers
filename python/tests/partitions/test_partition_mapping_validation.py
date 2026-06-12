@@ -263,7 +263,8 @@ def test_time_window_mapping_misaligned_mixed_grid_kinds_rejected():
         start=datetime(2024, 1, 1, 0, 30), interval_seconds=86400, fmt=fmt
     )
     with pytest.raises(
-        PartitionValidationError, match="is not on the upstream grid"
+        PartitionValidationError,
+        match=re.escape("is not on the upstream grid (cron '0 0 * * *')"),
     ):
         make_repo(_tw_edge(down, up))
 
