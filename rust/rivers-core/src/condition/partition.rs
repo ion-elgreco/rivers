@@ -397,6 +397,16 @@ impl<'a> PartitionResolver<'a> {
         };
         mapping.map_to_downstream(upstream_keys)
     }
+
+    /// The mapping kind for an edge, if one was declared (absent = Identity).
+    pub(crate) fn mapping_kind(
+        &self,
+        upstream_asset: &str,
+        downstream_asset: &str,
+    ) -> Option<&PartitionMappingKind> {
+        self.mappings
+            .get(&(downstream_asset.to_string(), upstream_asset.to_string()))
+    }
 }
 
 /// All partition-level data needed during condition evaluation.

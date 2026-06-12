@@ -1341,7 +1341,14 @@ fn eval_partitioned_on_dep(
     // Staleness floor for `NewlyUpdated`, translated into the dep's key
     // space: for each dep key, the root's materialization state of the
     // downstream key(s) it maps to. Built here because the mapping and both
-    // universes are only visible at the pivot boundary.
+    // universes are only visible at the pivot boundary. Identity edges (the
+    // default) skip the per-key selection round-trip — the dep key IS the
+    // downstream key.
+    let mapping_kind = pctx.resolver.mapping_kind(dep_key, ctx.target_key);
+    let is_identity = matches!(
+        mapping_kind,
+        None | Some(crate::condition::partition::PartitionMappingKind::Identity)
+    );
     let dep_root_floor = pctx
         .all_partition_statuses
         .get(ctx.root_key)
@@ -1350,6 +1357,15 @@ fn eval_partitioned_on_dep(
                 .timestamps
                 .keys()
                 .filter_map(|uk| {
+                    if is_identity {
+                        if !pctx.all_keys.contains(uk) {
+                            return None;
+                        }
+                        return Some((
+                            uk.clone(),
+                            root_floor_over(std::iter::once(uk), root_status),
+                        ));
+                    }
                     let mapped = pctx.resolver.map_downstream(
                         dep_key,
                         ctx.target_key,
