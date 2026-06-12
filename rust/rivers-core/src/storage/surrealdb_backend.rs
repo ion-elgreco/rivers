@@ -321,17 +321,17 @@ async fn stored_schema_version(db: &Surreal<Any>) -> anyhow::Result<u32> {
 }
 
 async fn set_schema_version(db: &Surreal<Any>, version: u32) -> anyhow::Result<()> {
-    db.query("DELETE FROM kv WHERE key = $key")
-        .bind(("key", SCHEMA_VERSION_KEY.to_string()))
-        .await?
-        .check()?;
-    let _: Option<DbKv> = db
-        .create("kv")
-        .content(DbKv {
-            key: SCHEMA_VERSION_KEY.to_string(),
-            value: Bytes::from(version.to_string().into_bytes()),
-        })
-        .await?;
+    // Single upsert on the unique key: concurrent first boots both converge
+    // instead of the loser aborting on idx_kv_key, and a crash can't leave
+    // the stamp deleted-but-unwritten.
+    db.query(
+        "INSERT INTO kv { key: $key, value: $value } \
+         ON DUPLICATE KEY UPDATE value = $value",
+    )
+    .bind(("key", SCHEMA_VERSION_KEY.to_string()))
+    .bind(("value", Bytes::from(version.to_string().into_bytes())))
+    .await?
+    .check()?;
     Ok(())
 }
 
@@ -4158,6 +4158,35 @@ mod tests {
             Some(1),
             "event key must be rewritten to canonical order"
         );
+    }
+
+    /// Two processes opening the same fresh/v1 remote database race the
+    /// stamp; a DELETE-then-CREATE pair aborts the loser on the kv unique
+    /// index, so the stamp must be a single upsert that both survive.
+    #[tokio::test]
+    async fn test_concurrent_schema_stamps_both_succeed() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let db_a = storage.db.clone();
+        let db_b = storage.db.clone();
+        let a = tokio::spawn(async move {
+            for _ in 0..25 {
+                set_schema_version(&db_a, 2).await?;
+            }
+            anyhow::Ok(())
+        });
+        let b = tokio::spawn(async move {
+            for _ in 0..25 {
+                set_schema_version(&db_b, 3).await?;
+            }
+            anyhow::Ok(())
+        });
+        a.await.unwrap().expect("stamp task A failed");
+        b.await.unwrap().expect("stamp task B failed");
+        let v = stored_schema_version(&storage.db).await.unwrap();
+        assert!(v == 2 || v == 3, "one of the stamps must win, got {v}");
     }
 
     /// A fresh database is stamped with the current schema version at
