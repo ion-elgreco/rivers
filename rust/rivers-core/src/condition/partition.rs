@@ -421,6 +421,13 @@ pub struct PartitionEvalContext<'a> {
     /// Used by `eval_partitioned_on_dep` to look up upstream deps' actual
     /// materialized/in-progress/failed partition sets instead of heuristics.
     pub all_partition_statuses: &'a HashMap<String, crate::condition::cache::PartitionStatusEntry>,
+    /// Staleness floor for `NewlyUpdated` in a dep pivot, keyed by UPSTREAM
+    /// key: the root's materialization state of the downstream key(s) that
+    /// upstream key maps to. Absent key = no counterpart in the downstream
+    /// universe (never counts as updated); `None` = a mapped downstream key
+    /// exists but was never materialized (counts as updated). `None` for the
+    /// whole field outside dep pivots — the self path keeps baselines.
+    pub dep_root_floor: Option<&'a HashMap<PartitionKey, Option<i64>>>,
 }
 
 /// Per-partition condition evaluation state, persisted across ticks.
