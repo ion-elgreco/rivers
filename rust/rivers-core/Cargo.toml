@@ -11,6 +11,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+ordermap = "1"
 chrono.workspace = true
 croner.workspace = true
 futures-util = { workspace = true }

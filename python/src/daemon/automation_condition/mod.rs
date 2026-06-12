@@ -107,7 +107,11 @@ fn partition_universe_for(
             dims: dimensions
                 .iter()
                 .map(|(dim_name, dim_def)| {
-                    let keys = dim_def.enumerate_single_dim_keys().unwrap_or_default();
+                    let keys = dim_def
+                        .enumerate_single_dim_keys()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect();
                     let kind = match dim_def {
                         PartitionsDefinition::TimeWindow { .. } => match dim_def.time_grid() {
                             Some(grid) => DimensionKind::TimeWindow {

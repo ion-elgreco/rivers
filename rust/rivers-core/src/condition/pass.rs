@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
+use ordermap::OrderSet;
 
 use crate::condition::cache::AssetConditionCache;
 use crate::condition::eval::evaluate_with_tree;
@@ -77,7 +78,9 @@ pub enum PartitionUniverse {
 /// One dimension of a Multi universe: its current key list plus how it evolves.
 #[derive(Clone, Debug)]
 pub struct DimensionUniverse {
-    pub keys: Vec<String>,
+    /// Dim values in definition/seed order; a set so refresh re-yields
+    /// (explicit future end, seed/watermark races) cannot duplicate.
+    pub keys: OrderSet<String>,
     pub kind: DimensionKind,
 }
 
@@ -161,14 +164,9 @@ fn refresh_universe(
                             Ok(new_keys) => {
                                 // Seeding can enumerate past the watermark
                                 // (explicit future end; start/enumerate race),
-                                // so re-yielded starts must not duplicate.
-                                let fresh: Vec<String> = new_keys
-                                    .into_iter()
-                                    .filter(|k| !du.keys.contains(k))
-                                    .collect();
-                                if !fresh.is_empty() {
-                                    du.keys.extend(fresh);
-                                    changed = true;
+                                // so re-yielded starts insert as no-ops.
+                                for k in new_keys {
+                                    changed |= du.keys.insert(k);
                                 }
                                 *enumerated_to = bound;
                             }
@@ -185,7 +183,7 @@ fn refresh_universe(
                         {
                             let mut sorted: Vec<String> = keys.iter().cloned().collect();
                             sorted.sort();
-                            du.keys = sorted;
+                            du.keys = sorted.into_iter().collect();
                             changed = true;
                         }
                     }
@@ -951,7 +949,7 @@ mod tests {
             dims: vec![(
                 "date".to_string(),
                 DimensionUniverse {
-                    keys: vec![],
+                    keys: OrderSet::new(),
                     kind: DimensionKind::TimeWindow {
                         grid: broken,
                         enumerated_to: t0,
@@ -1014,7 +1012,7 @@ mod tests {
                 (
                     "date".to_string(),
                     DimensionUniverse {
-                        keys: vec!["2024-01-01T00:00:00".to_string()],
+                        keys: ["2024-01-01T00:00:00".to_string()].into_iter().collect(),
                         kind: DimensionKind::TimeWindow {
                             grid: hourly_grid(),
                             enumerated_to: naive("2024-01-01T00:30:00"),
@@ -1024,7 +1022,7 @@ mod tests {
                 (
                     "region".to_string(),
                     DimensionUniverse {
-                        keys: vec!["eu".to_string(), "us".to_string()],
+                        keys: ["eu".to_string(), "us".to_string()].into_iter().collect(),
                         kind: DimensionKind::Frozen,
                     },
                 ),
@@ -1067,7 +1065,7 @@ mod tests {
             dims: vec![(
                 "date".to_string(),
                 DimensionUniverse {
-                    keys: seeded.clone(),
+                    keys: seeded.iter().cloned().collect(),
                     kind: DimensionKind::TimeWindow {
                         grid,
                         enumerated_to: naive("2024-01-01T01:30:00"),
@@ -1089,7 +1087,10 @@ mod tests {
             !changed,
             "re-yielding already-seeded starts is not a change"
         );
-        assert_eq!(dims[0].1.keys, seeded, "no duplicate dim keys");
+        assert!(
+            dims[0].1.keys.iter().eq(seeded.iter()),
+            "no duplicate dim keys"
+        );
     }
 
     #[test]
