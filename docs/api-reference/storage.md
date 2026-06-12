@@ -70,6 +70,8 @@ All query methods block the calling thread until the result is ready.
 | `has_dynamic_partition(name, key)` | `bool` |
 | `get_materialized_partitions(asset_key)` | `list[PartitionKey]` |
 
+Dynamic keys registered before the reserved-character guard existed (`|`/`,`) still classify, but cannot round-trip display-string paths (UI, gRPC). The storage migration records any such keys under the `reserved_dynamic_keys` entry in the `kv` table and logs a warning at startup — delete each offending key and re-register it under a clean name.
+
 ### `compute_staleness()`
 
 ```python

@@ -301,7 +301,7 @@ impl DbStoredEvent {
 
 /// Current storage schema version. Bump when adding a migration step to
 /// [`run_migrations`].
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 /// `kv` key holding the persisted schema version. Absent means v1 — a
 /// database from before versioning existed.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -335,6 +335,55 @@ async fn set_schema_version(db: &Surreal<Any>, version: u32) -> anyhow::Result<(
     Ok(())
 }
 
+/// `kv` key listing dynamic partition keys that contain display-reserved
+/// characters (registered before the reserved-char guard existed). Operator
+/// remediation: delete each and re-register it under a clean name.
+const RESERVED_DYNAMIC_KEYS_KEY: &str = "reserved_dynamic_keys";
+
+/// v2 → v3 scan: stored reserved-char dynamic keys still classify (matching
+/// is structural) but cannot round-trip any display-string path (UI, gRPC).
+/// Renaming them silently would change user-visible keys, so warn and record
+/// them in `kv` instead.
+async fn scan_reserved_char_dynamic_keys(db: &Surreal<Any>) -> anyhow::Result<()> {
+    let mut result = db
+        .query(
+            "SELECT code_location_id, partitions_def_name, partition_key, create_timestamp \
+             FROM dynamic_partitions",
+        )
+        .await?;
+    let rows: Vec<DbDynamicPartition> = result.take(0)?;
+    let offenders: Vec<String> = rows
+        .iter()
+        .filter(|r| PartitionKey::reserved_display_char(&r.partition_key).is_some())
+        .map(|r| {
+            format!(
+                "{}/{}: '{}'",
+                r.code_location_id, r.partitions_def_name, r.partition_key
+            )
+        })
+        .collect();
+    if offenders.is_empty() {
+        return Ok(());
+    }
+    for o in offenders.iter().take(20) {
+        tracing::warn!(
+            key = %o,
+            "dynamic partition key contains display-reserved characters; \
+             delete it and re-register under a clean name"
+        );
+    }
+    let body = serde_json::to_vec(&offenders[..offenders.len().min(100)])?;
+    db.query(
+        "INSERT INTO kv { key: $key, value: $value } \
+         ON DUPLICATE KEY UPDATE value = $value",
+    )
+    .bind(("key", RESERVED_DYNAMIC_KEYS_KEY.to_string()))
+    .bind(("value", Bytes::from(body)))
+    .await?
+    .check()?;
+    Ok(())
+}
+
 /// Versioned in-place migrations, run once at every constructor. Steps
 /// between the persisted version and [`SCHEMA_VERSION`] run in order; the
 /// stamp is written only after they all succeed (each step is idempotent and
@@ -347,6 +396,15 @@ async fn run_migrations(db: &Surreal<Any>) -> anyhow::Result<()> {
     }
     if from < 2 {
         migrate_multi_partition_key_order(db).await?;
+    }
+    if from < 3 {
+        if from >= 2 {
+            // Released 0.1.x wheels predate canonical-on-write Multi dims;
+            // rows they wrote into a v2-stamped database were never healed
+            // once the every-boot scan became version-gated.
+            migrate_multi_partition_key_order(db).await?;
+        }
+        scan_reserved_char_dynamic_keys(db).await?;
     }
     set_schema_version(db, SCHEMA_VERSION).await?;
     tracing::info!(from, to = SCHEMA_VERSION, "storage schema migrated");
@@ -4177,6 +4235,85 @@ mod tests {
             Some(1),
             "event key must be rewritten to canonical order"
         );
+    }
+
+    /// Released 0.1.x wheels predate canonical-on-write Multi dims; rows they
+    /// write into a v2-stamped database were never healed once the every-boot
+    /// scan became version-gated. v3 re-runs the heal once.
+    #[tokio::test]
+    async fn test_v3_reheals_rows_written_into_v2_database() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        set_schema_version(&storage.db, 2).await.unwrap();
+        storage
+            .db
+            .query(
+                "CREATE asset_partitions CONTENT { code_location_id: 'default', \
+                 asset_key: 'inv', partition_key: { variant: 'Multi', dims: \
+                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
+                 last_event_id: 'e1', last_run_id: 'r1', last_timestamp: 1 }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        run_migrations(&storage.db).await.unwrap();
+
+        assert_eq!(stored_schema_version(&storage.db).await.unwrap(), 3);
+        #[derive(Debug, SurrealValue)]
+        struct PkRow {
+            partition_key: PartitionKey,
+        }
+        let mut result = storage
+            .db
+            .query("SELECT partition_key FROM asset_partitions")
+            .await
+            .unwrap();
+        let rows: Vec<PkRow> = result.take(0).unwrap();
+        assert_eq!(rows.len(), 1);
+        let PartitionKey::Multi { dims } = &rows[0].partition_key else {
+            unreachable!()
+        };
+        assert_eq!(dims[0].0, "date", "v3 must re-heal post-v2 legacy writes");
+    }
+
+    /// Pre-guard databases can hold dynamic keys with display-reserved
+    /// characters. Renaming them silently would change user-visible keys, so
+    /// v3 records them for operator remediation instead.
+    #[tokio::test]
+    async fn test_v3_records_reserved_char_dynamic_keys() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        set_schema_version(&storage.db, 2).await.unwrap();
+        storage
+            .db
+            .query(
+                "CREATE dynamic_partitions CONTENT { code_location_id: 'default', \
+                 partitions_def_name: 'colors', partition_key: 'us|eu', \
+                 create_timestamp: 1 }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        run_migrations(&storage.db).await.unwrap();
+
+        let mut res = storage
+            .db
+            .query("SELECT * FROM kv WHERE key = $key")
+            .bind(("key", RESERVED_DYNAMIC_KEYS_KEY.to_string()))
+            .await
+            .unwrap();
+        let rows: Vec<DbKv> = res.take(0).unwrap();
+        assert_eq!(rows.len(), 1, "offending keys must be recorded in kv");
+        let body = String::from_utf8(rows[0].value.to_vec()).unwrap();
+        assert!(body.contains("colors") && body.contains("us|eu"), "{body}");
     }
 
     /// The heal's values come from a snapshot taken before its write loop, so
