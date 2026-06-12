@@ -1053,42 +1053,67 @@ fn validate_time_window_fmt(
     };
     // Walk the grid with the same helpers `enumerate` uses — validation must
     // judge exactly the keys the definition will mint.
-    let mut checked = 0usize;
-    let mut failure: Option<PyErr> = None;
-    let mut check = |t: NaiveDateTime| -> bool {
-        checked += 1;
+    fn round_trip_tick(t: NaiveDateTime, fmt: &str, failure: &mut Option<PyErr>) -> bool {
         let key = t.format(fmt).to_string();
         if let Some(ch) = rivers_core::storage::PartitionKey::reserved_display_char(&key) {
-            failure = Some(PartitionDefinitionError::new_err(format!(
+            *failure = Some(PartitionDefinitionError::new_err(format!(
                 "fmt '{fmt}' produces keys containing reserved character '{ch}' \
                  (used by the canonical display form): '{key}'"
             )));
             return false;
         }
         match parse_key_datetime(&key, fmt) {
-            Ok(parsed) if parsed == t => {}
+            Ok(parsed) if parsed == t => true,
             Ok(parsed) => {
-                failure = Some(PartitionDefinitionError::new_err(format!(
+                *failure = Some(PartitionDefinitionError::new_err(format!(
                     "fmt '{fmt}' cannot represent the partition grid: window start {t} \
                      formats to '{key}', which parses back to {parsed}; \
                      use a format at least as fine as the grid"
                 )));
-                return false;
+                false
             }
             Err(e) => {
-                failure = Some(PartitionDefinitionError::new_err(format!(
+                *failure = Some(PartitionDefinitionError::new_err(format!(
                     "fmt '{fmt}' cannot represent the partition grid: window start {t} \
                      formats to '{key}', which does not parse back: {e}"
                 )));
-                return false;
+                false
             }
         }
-        checked < MAX_TICKS
-    };
+    }
+    let mut checked = 0usize;
+    let mut failure: Option<PyErr> = None;
     if let Some(secs) = interval_seconds {
-        for_each_interval_tick(*secs, start, bound, &mut check);
+        for_each_interval_tick(*secs, start, bound, &mut |t| {
+            checked += 1;
+            round_trip_tick(t, fmt, &mut failure) && checked < MAX_TICKS
+        });
     } else if let Some(expr) = cron_schedule {
-        for_each_cron_tick(expr, start, bound, &mut check)?;
+        for_each_cron_tick(expr, start, bound, &mut |t| {
+            checked += 1;
+            round_trip_tick(t, fmt, &mut failure) && checked < MAX_TICKS
+        })?;
+    }
+    // A grid sparser than the horizon still mints its first ticks — they
+    // must round-trip no matter how far out they lie (the pre-horizon code
+    // always checked the first two).
+    if failure.is_none() && checked < 2 {
+        let true_end = match end {
+            Some(e) => *e,
+            None => NaiveDateTime::MAX,
+        };
+        let mut taken = 0usize;
+        if let Some(secs) = interval_seconds {
+            for_each_interval_tick(*secs, start, true_end, &mut |t| {
+                taken += 1;
+                round_trip_tick(t, fmt, &mut failure) && taken < 2
+            });
+        } else if let Some(expr) = cron_schedule {
+            for_each_cron_tick(expr, start, true_end, &mut |t| {
+                taken += 1;
+                round_trip_tick(t, fmt, &mut failure) && taken < 2
+            })?;
+        }
     }
     match failure {
         Some(err) => Err(err),
