@@ -288,9 +288,7 @@ def test_time_window_mapping_differing_cron_rejected():
     down = rs.PartitionsDefinition.time_window(
         start=DAILY_START, cron_schedule="0 6 * * *", fmt=fmt
     )
-    with pytest.raises(
-        PartitionValidationError, match="is not on the upstream grid"
-    ):
+    with pytest.raises(PartitionValidationError, match="is not on the upstream grid"):
         make_repo(_tw_edge(down, up))
 
 
