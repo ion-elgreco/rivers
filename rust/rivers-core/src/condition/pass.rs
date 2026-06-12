@@ -677,6 +677,17 @@ impl ConditionPass {
         to_materialize
     }
 
+    /// Record dispatched partition keys in the asset's `handled` set so
+    /// since-last-handled semantics don't re-fire them on the next tick.
+    fn mark_partitions_handled(&mut self, asset_key: &str, keys: &[PartitionKey]) {
+        if let Some(prev) = self.eval_state.assets.get_mut(asset_key) {
+            prev.partition_state
+                .get_or_insert_with(PartitionState::default)
+                .handled
+                .extend(keys.iter().cloned());
+        }
+    }
+
     /// Split the materialization list into the three dispatch shapes:
     /// * unpartitioned bulk
     /// * single-partition groups (bucketed by partition key)
@@ -689,17 +700,6 @@ impl ConditionPass {
     /// in-progress before the dispatch loop pushes any run ids, and records
     /// the surviving keys in the asset's `handled` set — only keys actually
     /// dispatched may suppress future fires.
-    /// Record dispatched partition keys in the asset's `handled` set so
-    /// since-last-handled semantics don't re-fire them on the next tick.
-    fn mark_partitions_handled(&mut self, asset_key: &str, keys: &[PartitionKey]) {
-        if let Some(prev) = self.eval_state.assets.get_mut(asset_key) {
-            prev.partition_state
-                .get_or_insert_with(PartitionState::default)
-                .handled
-                .extend(keys.iter().cloned());
-        }
-    }
-
     fn classify_materializations(
         &mut self,
         to_materialize: Vec<ToMaterialize>,
