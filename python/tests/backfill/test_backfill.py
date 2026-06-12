@@ -4,10 +4,12 @@ Covers plain @rs.Asset across executor (in_process, parallel) and sync/async.
 """
 
 import asyncio
+import re
 from datetime import datetime
 
 import pytest
 import rivers as rs
+from rivers.exceptions import ExecutionError
 
 from _helpers import daily_pd as _daily_pd
 from _helpers import static_pd as _static_pd
@@ -125,6 +127,34 @@ class TestBackfillExplicitKeys:
 
 
 class TestBackfillPartitionRange:
+    def test_range_validates_against_every_partitioned_asset(self):
+        """The range resolves against ONE def; the other partitioned assets
+        in the selection must still accept every resolved key — reject at the
+        boundary instead of persisting a record whose runs fail per-partition."""
+
+        @rs.Asset(partitions_def=_static_pd(["a", "b", "c"]))
+        def first(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        @rs.Asset(partitions_def=_static_pd(["x", "y"]))
+        def second(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[first, second], default_executor=rs.Executor.in_process()
+        )
+        with pytest.raises(
+            ExecutionError,
+            match=re.escape(
+                "Invalid partition_key 'a' for asset 'second': "
+                "not a member of its partition definition."
+            ),
+        ):
+            repo.backfill(
+                selection=["first", "second"],
+                partition_range=rs.PartitionKeyRange.single(from_key="a", to_key="b"),
+            )
+
     def test_single_range_filters_keys(self, executor_env, is_async):
         executor, _ = executor_env
 
@@ -610,6 +640,95 @@ class TestBackfillRerun:
         with pytest.raises(Exception, match="not found"):
             repo.rerun_backfill("nonexistent-id")
 
+    def test_rerun_skips_keys_removed_from_def(self, storage):
+        """Rerunning after the def shrank replays the surviving keys instead
+        of hard-erroring the whole rerun."""
+
+        def build_repo(keys):
+            @rs.Asset(
+                partitions_def=_static_pd(keys), io_handler=rs.InMemoryIOHandler()
+            )
+            def asset(context: rs.AssetExecutionContext) -> int:
+                return 1
+
+            repo = rs.CodeRepository(
+                assets=[asset], default_executor=rs.Executor.in_process()
+            )
+            repo.resolve(storage=storage)
+            return repo
+
+        original = build_repo(["a", "b", "c"]).backfill(
+            selection=["asset"],
+            partition_keys=[rs.PartitionKey.single(k) for k in ("a", "b", "c")],
+        )
+        assert original.completed == 3
+
+        redeployed = build_repo(["a", "b"])
+        rerun = redeployed.rerun_backfill(original.backfill_id)
+        assert rerun.num_partitions == 2
+        assert rerun.completed == 2
+
+        dry = redeployed.rerun_backfill(original.backfill_id, dry_run=True)
+        assert dry.is_dry_run
+        assert dry.num_partitions == 2
+
+    def test_rerun_skips_retired_dynamic_keys(self, storage):
+        """A dynamic key deleted since the original backfill is skipped on
+        rerun. Only a genuinely unregistered key counts as retired — a
+        storage failure during the check aborts the rerun instead of
+        silently dropping replayable partitions."""
+
+        @rs.Asset(
+            partitions_def=rs.PartitionsDefinition.dynamic("tenants"),
+            io_handler=rs.InMemoryIOHandler(),
+        )
+        def asset(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+        repo.resolve(storage=storage)
+        storage.add_dynamic_partitions("tenants", ["acme", "globex"])
+        original = repo.backfill(
+            selection=["asset"],
+            partition_keys=[rs.PartitionKey.single(k) for k in ("acme", "globex")],
+        )
+        assert original.completed == 2
+
+        storage.delete_dynamic_partition("tenants", "globex")
+        rerun = repo.rerun_backfill(original.backfill_id)
+        assert rerun.num_partitions == 1
+        assert rerun.completed == 1
+
+    def test_rerun_with_no_surviving_keys_errors(self, storage):
+        def build_repo(keys):
+            @rs.Asset(
+                partitions_def=_static_pd(keys), io_handler=rs.InMemoryIOHandler()
+            )
+            def asset(context: rs.AssetExecutionContext) -> int:
+                return 1
+
+            repo = rs.CodeRepository(
+                assets=[asset], default_executor=rs.Executor.in_process()
+            )
+            repo.resolve(storage=storage)
+            return repo
+
+        original = build_repo(["a", "b"]).backfill(
+            selection=["asset"],
+            partition_keys=[rs.PartitionKey.single(k) for k in ("a", "b")],
+        )
+
+        redeployed = build_repo(["x", "y"])
+        with pytest.raises(
+            ExecutionError,
+            match=re.escape(
+                "none of its 2 partitions are valid for the current definitions"
+            ),
+        ):
+            redeployed.rerun_backfill(original.backfill_id)
+
     def test_rerun_dry_run(self, executor_env):
         executor, _ = executor_env
 
@@ -627,3 +746,197 @@ class TestBackfillRerun:
         rerun = repo.rerun_backfill(original.backfill_id, dry_run=True)
         assert rerun.is_dry_run
         assert rerun.num_partitions == 1
+
+
+# ---------------------------------------------------------------------------
+# Range ordering follows the definition, not lexicographic strings. Static
+# keys are positionally ordered; TimeWindow keys are chronologically ordered
+# via their fmt — neither is guaranteed to sort lexicographically.
+# ---------------------------------------------------------------------------
+
+
+class TestRangeDefinitionOrdering:
+    SIZES = ["small", "medium", "large"]  # NOT lexicographically sorted
+
+    def _sized_repo(self):
+        @rs.Asset(partitions_def=_static_pd(self.SIZES))
+        def sized(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        return rs.CodeRepository(
+            assets=[sized], default_executor=rs.Executor.in_process()
+        )
+
+    def test_static_range_resolves_positionally(self):
+        repo = self._sized_repo()
+        result = repo.backfill(
+            selection=["sized"],
+            partition_range=rs.PartitionKeyRange.single(
+                from_key="medium", to_key="large"
+            ),
+        )
+        assert result.num_partitions == 2
+        assert set(repo.storage.get_materialized_partitions("sized")) == {
+            rs.PartitionKey.single("medium"),
+            rs.PartitionKey.single("large"),
+        }
+
+    def test_static_range_positionally_inverted_rejected(self):
+        repo = self._sized_repo()
+        with pytest.raises(
+            ExecutionError,
+            match=re.escape("from_key 'large' is after to_key 'small'"),
+        ):
+            repo.backfill(
+                selection=["sized"],
+                partition_range=rs.PartitionKeyRange.single(
+                    from_key="large", to_key="small"
+                ),
+            )
+
+    def test_static_range_unknown_endpoint_rejected(self):
+        repo = self._sized_repo()
+        with pytest.raises(
+            ExecutionError,
+            match=re.escape("Range endpoint 'huge' is not a partition key"),
+        ):
+            repo.backfill(
+                selection=["sized"],
+                partition_range=rs.PartitionKeyRange.single(
+                    from_key="medium", to_key="huge"
+                ),
+            )
+
+    def test_time_window_range_off_grid_endpoint_rejected(self):
+        """An endpoint that parses under the fmt but isn't a window start is
+        not a partition key — same contract as Static unknown endpoints. The
+        error names the neighbouring valid keys so the typo is fixable."""
+        pd = rs.PartitionsDefinition.time_window(
+            start=datetime(2024, 1, 1),
+            interval_seconds=3600,
+            end=datetime(2024, 1, 2),
+            fmt="%Y-%m-%dT%H:%M:%S",
+        )
+
+        @rs.Asset(partitions_def=pd)
+        def asset(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+        with pytest.raises(
+            ExecutionError,
+            match=re.escape(
+                "Range endpoint '2024-01-01T07:30:00' is not a partition key; "
+                "nearest valid keys are '2024-01-01T07:00:00' and "
+                "'2024-01-01T08:00:00'"
+            ),
+        ):
+            repo.backfill(
+                selection=["asset"],
+                partition_range=rs.PartitionKeyRange.single(
+                    from_key="2024-01-01T07:30:00", to_key="2024-01-01T10:00:00"
+                ),
+            )
+        # Out-of-range endpoint: only one side has a valid neighbour.
+        with pytest.raises(
+            ExecutionError,
+            match=re.escape(
+                "Range endpoint '2024-01-02T05:00:00' is not a partition key; "
+                "nearest valid key is '2024-01-01T23:00:00'"
+            ),
+        ):
+            repo.backfill(
+                selection=["asset"],
+                partition_range=rs.PartitionKeyRange.single(
+                    from_key="2024-01-01T10:00:00", to_key="2024-01-02T05:00:00"
+                ),
+            )
+
+    def test_custom_fmt_range_resolves_chronologically(self):
+        # %m/%d/%Y sorts "01/02/2025" before "12/30/2024" lexicographically —
+        # the range must follow the calendar instead.
+        pd = rs.PartitionsDefinition.daily(
+            start=datetime(2024, 12, 30),
+            end=datetime(2025, 1, 3),
+            fmt="%m/%d/%Y",
+        )
+
+        @rs.Asset(partitions_def=pd)
+        def asset(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+        result = repo.backfill(
+            selection=["asset"],
+            partition_range=rs.PartitionKeyRange.single(
+                from_key="12/30/2024", to_key="01/02/2025"
+            ),
+        )
+        assert result.num_partitions == 4
+        assert set(repo.storage.get_materialized_partitions("asset")) == {
+            rs.PartitionKey.single("12/30/2024"),
+            rs.PartitionKey.single("12/31/2024"),
+            rs.PartitionKey.single("01/01/2025"),
+            rs.PartitionKey.single("01/02/2025"),
+        }
+
+    def test_multi_static_dim_range_resolves_positionally(self):
+        pd = rs.PartitionsDefinition.multi(
+            {
+                "size": _static_pd(self.SIZES),
+                "region": _static_pd(["us"]),
+            }
+        )
+
+        @rs.Asset(partitions_def=pd)
+        def asset(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+        result = repo.backfill(
+            selection=["asset"],
+            partition_range=rs.PartitionKeyRange.multi({"size": ("medium", "large")}),
+        )
+        assert result.num_partitions == 2
+        assert set(repo.storage.get_materialized_partitions("asset")) == {
+            rs.PartitionKey.multi({"size": "medium", "region": "us"}),
+            rs.PartitionKey.multi({"size": "large", "region": "us"}),
+        }
+
+    def test_multi_range_unknown_dimension_rejected(self):
+        """A typo'd selector dimension must error — silently ignoring it
+        treats the real dimension as omitted and expands it to ALL keys,
+        backfilling far more partitions than requested."""
+        pd = rs.PartitionsDefinition.multi(
+            {
+                "size": _static_pd(self.SIZES),
+                "region": _static_pd(["us", "eu"]),
+            }
+        )
+
+        @rs.Asset(partitions_def=pd)
+        def asset(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+        with pytest.raises(
+            ExecutionError,
+            match=re.escape(
+                "Unknown dimension 'regon' in partition range; "
+                "available dimensions: 'size', 'region'"
+            ),
+        ):
+            repo.backfill(
+                selection=["asset"],
+                partition_range=rs.PartitionKeyRange.multi(
+                    {"size": ("medium", "large"), "regon": ["us"]}
+                ),
+            )

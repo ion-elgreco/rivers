@@ -5,7 +5,7 @@
 //! via the `croner` crate, bounded by `start_date` / `end_date` / `end_offset`.
 use std::collections::HashMap;
 
-use chrono::{Local, NaiveDateTime, TimeZone};
+use chrono::{Local, NaiveDateTime, TimeZone, Utc};
 use croner::Cron;
 use ordermap::OrderSet;
 use pyo3::exceptions::PyNotImplementedError;
@@ -476,23 +476,56 @@ impl PartitionsDefinition {
             Ok(Some((window_start, window_end)))
         } else if let Some(cron_expr) = cron_schedule {
             let cron = parse_cron(cron_expr)?;
-            let start_local = naive_to_local(&window_start)?;
-            let next = cron
-                .find_next_occurrence(&start_local, false)
-                .map_err(|e| {
-                    PartitionDefinitionError::new_err(format!("Failed to find next cron tick: {e}"))
-                })?;
-            Ok(Some((window_start, next.naive_local())))
+            let start_utc = Utc.from_utc_datetime(&window_start);
+            let next = cron.find_next_occurrence(&start_utc, false).map_err(|e| {
+                PartitionDefinitionError::new_err(format!("Failed to find next cron tick: {e}"))
+            })?;
+            Ok(Some((window_start, next.naive_utc())))
         } else {
             Ok(None)
         }
     }
 
-    /// Check if a partition key is valid for this definition.
+    /// The definition's wall-clock grid, for shifting/aligning keys.
+    /// `None` for non-TimeWindow kinds.
+    pub fn time_grid(&self) -> Option<rivers_core::timegrid::TimeGrid> {
+        match self {
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => Some(rivers_core::timegrid::TimeGrid {
+                cron_schedule: cron_schedule.clone(),
+                interval_seconds: *interval_seconds,
+                start: *start,
+                end: *end,
+                fmt: fmt.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Shift a TimeWindow key by `offset` windows (negative = earlier) —
+    /// the engine behind `PartitionMapping.time_window(offset=..)`. Errors
+    /// when the shifted window falls outside `[start, end)`.
+    pub fn shift_time_key(&self, key: &str, offset: i64) -> PyResult<String> {
+        let grid = self.time_grid().ok_or_else(|| {
+            PartitionDefinitionError::new_err(
+                "time_window mapping requires a TimeWindow partition definition",
+            )
+        })?;
+        grid.shift_key(key, offset)
+            .map_err(|e| PartitionDefinitionError::new_err(e.to_string()))
+    }
+
+    /// Check if a partition key is valid for this definition. Empty key
+    /// vectors are invalid for every kind.
     pub fn validate_partition_key(&self, key: &PyPartitionKey) -> PyResult<bool> {
         match (self, key) {
             (Self::Static { keys: valid_keys }, PyPartitionKey::Single { key }) => {
-                Ok(key.iter().all(|k| valid_keys.contains(k)))
+                Ok(!key.is_empty() && key.iter().all(|k| valid_keys.contains(k)))
             }
             (
                 Self::TimeWindow {
@@ -505,9 +538,17 @@ impl PartitionsDefinition {
                 PyPartitionKey::Single { key },
             ) => validate_time_window_key(key, cron_schedule, interval_seconds, start, end, fmt),
             (Self::Multi { dimensions }, PyPartitionKey::Multi { keys }) => {
+                // Extra dimensions the def doesn't declare are rejected here;
+                // missing ones are caught by the per-dim loop below.
+                if keys.len() != dimensions.len() {
+                    return Ok(false);
+                }
                 for (dim_name, dim_def) in dimensions {
                     match keys.get(dim_name) {
                         Some(vals) => {
+                            if vals.is_empty() {
+                                return Ok(false);
+                            }
                             for val in vals {
                                 let single_key = PyPartitionKey::Single {
                                     key: vec![val.clone()],
@@ -522,10 +563,13 @@ impl PartitionsDefinition {
                 }
                 Ok(true)
             }
-            // Dynamic partitions accept any single key (keys are storage-managed, not statically validated).
-            (Self::Dynamic { .. }, PyPartitionKey::Single { .. }) => Ok(true),
-            // A batched Set is valid iff every member is valid for this definition.
+            // Dynamic membership is checked at the submit boundary against storage, not here.
+            (Self::Dynamic { .. }, PyPartitionKey::Single { key }) => Ok(!key.is_empty()),
+            // A batched Set is valid iff non-empty and every member is valid.
             (_, PyPartitionKey::Set { keys }) => {
+                if keys.is_empty() {
+                    return Ok(false);
+                }
                 for member in keys {
                     if !self.validate_partition_key(member)? {
                         return Ok(false);
@@ -664,42 +708,151 @@ impl PartitionsDefinition {
     }
 }
 
+impl PartitionsDefinition {
+    /// Full structural validation — every rule the factory staticmethods
+    /// enforce. PyO3 generates a raw constructor per enum variant that
+    /// bypasses the factories (and the unpickle path depends on them), so
+    /// `resolve()` re-validates every asset's definition through this.
+    pub(crate) fn validate_definition(&self) -> PyResult<()> {
+        match self {
+            Self::Static { keys } => {
+                if keys.is_empty() {
+                    return Err(PartitionDefinitionError::new_err(
+                        "Static partitions must have at least one key",
+                    ));
+                }
+                for key in keys.iter() {
+                    if key.is_empty() {
+                        return Err(PartitionDefinitionError::new_err(
+                            "static partition keys must not be empty",
+                        ));
+                    }
+                    if let Some(ch) = rivers_core::storage::PartitionKey::reserved_display_char(key)
+                    {
+                        return Err(PartitionDefinitionError::new_err(format!(
+                            "partition key '{key}' contains reserved character '{ch}' \
+                             (used by the canonical display form)"
+                        )));
+                    }
+                }
+                Ok(())
+            }
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => {
+                if cron_schedule.is_none() && interval_seconds.is_none() {
+                    return Err(PartitionDefinitionError::new_err(
+                        "time_window requires either cron_schedule or interval_seconds",
+                    ));
+                }
+                if cron_schedule.is_some() && interval_seconds.is_some() {
+                    return Err(PartitionDefinitionError::new_err(
+                        "time_window accepts cron_schedule or interval_seconds, not both",
+                    ));
+                }
+                if let Some(secs) = interval_seconds {
+                    // Sub-nanosecond values truncate to 0ns, which would divide
+                    // by zero in the key-validation modulo.
+                    if !secs.is_finite() || *secs <= 0.0 || (secs * 1_000_000_000.0) as i64 == 0 {
+                        return Err(PartitionDefinitionError::new_err(format!(
+                            "interval_seconds must be positive and at least 1 nanosecond, \
+                             got {secs}"
+                        )));
+                    }
+                }
+                validate_time_window_fmt(cron_schedule, interval_seconds, start, end, fmt)
+            }
+            Self::Multi { dimensions } => {
+                if dimensions.is_empty() {
+                    return Err(PartitionDefinitionError::new_err(
+                        "Multi partitions must have at least one dimension",
+                    ));
+                }
+                for (name, def) in dimensions {
+                    if matches!(def, Self::Multi { .. }) {
+                        return Err(PartitionDefinitionError::new_err(
+                            "Multi partitions cannot contain nested Multi dimensions",
+                        ));
+                    }
+                    if name.is_empty() {
+                        return Err(PartitionDefinitionError::new_err(
+                            "Multi dimension names cannot be empty",
+                        ));
+                    }
+                    // Dim names sit left of '=' in `dim=value` display
+                    // segments, so '=' is reserved for them on top of the
+                    // value separators.
+                    if let Some(ch) = ['|', ',', '='].into_iter().find(|&c| name.contains(c)) {
+                        return Err(PartitionDefinitionError::new_err(format!(
+                            "dimension name '{name}' contains reserved character '{ch}' \
+                             (used by the canonical display form)"
+                        )));
+                    }
+                    def.validate_definition()?;
+                }
+                Ok(())
+            }
+            Self::Dynamic { name } => {
+                if name.is_empty() {
+                    return Err(PartitionDefinitionError::new_err(
+                        "Dynamic partition definition name cannot be empty",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[pymethods]
 impl PartitionsDefinition {
     #[staticmethod]
     fn static_(keys: Vec<String>) -> PyResult<Self> {
-        if keys.is_empty() {
-            return Err(PartitionDefinitionError::new_err(
-                "Static partitions must have at least one key",
-            ));
-        }
-        Ok(Self::Static {
+        let def = Self::Static {
             keys: OrderedKeySet::new(keys),
-        })
+        };
+        def.validate_definition()?;
+        Ok(def)
     }
 
     #[staticmethod]
     #[pyo3(signature = (start, end=None, fmt=None))]
-    fn daily(start: NaiveDateTime, end: Option<NaiveDateTime>, fmt: Option<String>) -> Self {
-        Self::TimeWindow {
+    fn daily(
+        start: NaiveDateTime,
+        end: Option<NaiveDateTime>,
+        fmt: Option<String>,
+    ) -> PyResult<Self> {
+        let def = Self::TimeWindow {
             cron_schedule: Some("0 0 * * *".to_string()),
             interval_seconds: None,
             start,
             end,
             fmt: fmt.unwrap_or_else(|| "%Y-%m-%d".to_string()),
-        }
+        };
+        def.validate_definition()?;
+        Ok(def)
     }
 
     #[staticmethod]
     #[pyo3(signature = (start, end=None, fmt=None))]
-    fn hourly(start: NaiveDateTime, end: Option<NaiveDateTime>, fmt: Option<String>) -> Self {
-        Self::TimeWindow {
+    fn hourly(
+        start: NaiveDateTime,
+        end: Option<NaiveDateTime>,
+        fmt: Option<String>,
+    ) -> PyResult<Self> {
+        let def = Self::TimeWindow {
             cron_schedule: Some("0 * * * *".to_string()),
             interval_seconds: None,
             start,
             end,
             fmt: fmt.unwrap_or_else(|| "%Y-%m-%dT%H:00".to_string()),
-        }
+        };
+        def.validate_definition()?;
+        Ok(def)
     }
 
     #[staticmethod]
@@ -711,23 +864,15 @@ impl PartitionsDefinition {
         end: Option<NaiveDateTime>,
         fmt: Option<String>,
     ) -> PyResult<Self> {
-        if cron_schedule.is_none() && interval_seconds.is_none() {
-            return Err(PartitionDefinitionError::new_err(
-                "time_window requires either cron_schedule or interval_seconds",
-            ));
-        }
-        if cron_schedule.is_some() && interval_seconds.is_some() {
-            return Err(PartitionDefinitionError::new_err(
-                "time_window accepts cron_schedule or interval_seconds, not both",
-            ));
-        }
-        Ok(Self::TimeWindow {
+        let def = Self::TimeWindow {
             cron_schedule,
             interval_seconds,
             start,
             end,
             fmt: fmt.unwrap_or_else(|| "%Y-%m-%dT%H:%M:%S".to_string()),
-        })
+        };
+        def.validate_definition()?;
+        Ok(def)
     }
 
     #[staticmethod]
@@ -736,19 +881,11 @@ impl PartitionsDefinition {
         for (k, v) in dimensions.iter() {
             let name: String = k.extract()?;
             let def: PartitionsDefinition = v.extract()?;
-            if matches!(def, PartitionsDefinition::Multi { .. }) {
-                return Err(PartitionDefinitionError::new_err(
-                    "Multi partitions cannot contain nested Multi dimensions",
-                ));
-            }
             dims.push((name, def));
         }
-        if dims.is_empty() {
-            return Err(PartitionDefinitionError::new_err(
-                "Multi partitions must have at least one dimension",
-            ));
-        }
-        Ok(Self::Multi { dimensions: dims })
+        let def = Self::Multi { dimensions: dims };
+        def.validate_definition()?;
+        Ok(def)
     }
 
     #[staticmethod]
@@ -880,11 +1017,83 @@ fn parse_cron(expr: &str) -> PyResult<Cron> {
         })
 }
 
-fn naive_to_local(dt: &NaiveDateTime) -> PyResult<chrono::DateTime<Local>> {
-    Local
-        .from_local_datetime(dt)
-        .single()
-        .ok_or_else(|| PartitionDefinitionError::new_err(format!("Ambiguous local time: {dt}")))
+/// A TimeWindow fmt must round-trip the grid's window starts: each tick
+/// formats to a key that parses back to exactly that tick. A coarser fmt
+/// collapses neighbouring windows into the same key string (duplicate keys
+/// from enumerate, double-dispatched backfill runs); a non-parseable fmt
+/// breaks every downstream key validation. Checked across the grid's first
+/// four years (one full leap cycle), capped at 1024 ticks — calendar drift
+/// that two ticks can't show (a month-grain fmt over a 31-day interval first
+/// diverges at tick 2) surfaces inside that horizon.
+fn validate_time_window_fmt(
+    cron_schedule: &Option<String>,
+    interval_seconds: &Option<f64>,
+    start: &NaiveDateTime,
+    end: &Option<NaiveDateTime>,
+    fmt: &str,
+) -> PyResult<()> {
+    // Cron schedules are second-granular: croner leaks a sub-second start's
+    // fraction into every tick here, while the core grid walk truncates to
+    // whole seconds — the two layers would mint different universes.
+    if cron_schedule.is_some() {
+        use chrono::Timelike;
+        if start.nanosecond() != 0 {
+            return Err(PartitionDefinitionError::new_err(format!(
+                "cron-gridded time windows require a start on a whole second, got {start}"
+            )));
+        }
+    }
+    const MAX_TICKS: usize = 1024;
+    let horizon = start
+        .checked_add_signed(chrono::Duration::days(1461))
+        .unwrap_or(NaiveDateTime::MAX);
+    let bound = match end {
+        Some(e) => (*e).min(horizon),
+        None => horizon,
+    };
+    // Walk the grid with the same helpers `enumerate` uses — validation must
+    // judge exactly the keys the definition will mint.
+    let mut checked = 0usize;
+    let mut failure: Option<PyErr> = None;
+    let mut check = |t: NaiveDateTime| -> bool {
+        checked += 1;
+        let key = t.format(fmt).to_string();
+        if let Some(ch) = rivers_core::storage::PartitionKey::reserved_display_char(&key) {
+            failure = Some(PartitionDefinitionError::new_err(format!(
+                "fmt '{fmt}' produces keys containing reserved character '{ch}' \
+                 (used by the canonical display form): '{key}'"
+            )));
+            return false;
+        }
+        match parse_key_datetime(&key, fmt) {
+            Ok(parsed) if parsed == t => {}
+            Ok(parsed) => {
+                failure = Some(PartitionDefinitionError::new_err(format!(
+                    "fmt '{fmt}' cannot represent the partition grid: window start {t} \
+                     formats to '{key}', which parses back to {parsed}; \
+                     use a format at least as fine as the grid"
+                )));
+                return false;
+            }
+            Err(e) => {
+                failure = Some(PartitionDefinitionError::new_err(format!(
+                    "fmt '{fmt}' cannot represent the partition grid: window start {t} \
+                     formats to '{key}', which does not parse back: {e}"
+                )));
+                return false;
+            }
+        }
+        checked < MAX_TICKS
+    };
+    if let Some(secs) = interval_seconds {
+        for_each_interval_tick(*secs, start, bound, &mut check);
+    } else if let Some(expr) = cron_schedule {
+        for_each_cron_tick(expr, start, bound, &mut check)?;
+    }
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 /// Check if all key strings fall on valid time window boundaries within [start, end).
@@ -898,7 +1107,9 @@ fn validate_time_window_key(
 ) -> PyResult<bool> {
     let now = Local::now().naive_local();
     let end_dt = end.unwrap_or(now);
-    let cron = cron_schedule.as_deref().map(parse_cron).transpose()?;
+    if key.is_empty() {
+        return Ok(false);
+    }
     for k in key {
         let dt = match parse_key_datetime(k, fmt) {
             Ok(dt) => dt,
@@ -910,18 +1121,29 @@ fn validate_time_window_key(
         if let Some(secs) = interval_seconds {
             let from_start = dt.signed_duration_since(*start);
             let interval_ns = (*secs * 1_000_000_000.0) as i64;
+            if interval_ns <= 0 {
+                return Ok(false);
+            }
             if from_start
                 .num_nanoseconds()
                 .is_none_or(|n| n % interval_ns != 0)
             {
                 return Ok(false);
             }
-        } else if let Some(ref cron) = cron {
-            let dt_local = naive_to_local(&dt)?;
-            let matches = cron
-                .is_time_matching(&dt_local)
-                .map_err(|e| PartitionDefinitionError::new_err(format!("Cron match error: {e}")))?;
-            if !matches {
+        } else if let Some(expr) = cron_schedule {
+            // Compare formatted keys, not parsed datetimes — cron ticks near
+            // DST transitions don't round-trip through the formatter reliably.
+            let window_start = (dt - chrono::Duration::hours(26)).max(*start);
+            let window_end = (dt + chrono::Duration::hours(26)).min(end_dt);
+            let mut found = false;
+            for_each_cron_tick(expr, &window_start, window_end, |naive| {
+                if naive.format(fmt).to_string() == *k {
+                    found = true;
+                    return false;
+                }
+                true
+            })?;
+            if !found {
                 return Ok(false);
             }
         }
@@ -1039,7 +1261,7 @@ fn interval_index(
 /// Always terminates at `end_dt` (the explicit `end`, or now if open-ended);
 /// uncapped, so a fine-grained def over a wide range is slow but never hides
 /// partitions.
-fn for_each_interval_tick(
+pub(crate) fn for_each_interval_tick(
     secs: f64,
     start: &NaiveDateTime,
     end_dt: NaiveDateTime,
@@ -1066,16 +1288,16 @@ fn for_each_interval_tick(
 /// Always terminates at `end_dt` (the explicit `end`, or now if open-ended);
 /// uncapped, so a fine-grained schedule over a wide range is slow but never
 /// hides partitions.
-fn for_each_cron_tick(
+pub(crate) fn for_each_cron_tick(
     cron_expr: &str,
     start: &NaiveDateTime,
     end_dt: NaiveDateTime,
     mut f: impl FnMut(NaiveDateTime) -> bool,
 ) -> PyResult<()> {
     let cron = parse_cron(cron_expr)?;
-    let start_local = naive_to_local(start)?;
-    for tick in cron.iter_from(start_local, croner::Direction::Forward) {
-        let naive = tick.naive_local();
+    let start_utc = Utc.from_utc_datetime(start);
+    for tick in cron.iter_from(start_utc, croner::Direction::Forward) {
+        let naive = tick.naive_utc();
         if naive >= end_dt {
             break;
         }
@@ -1084,6 +1306,19 @@ fn for_each_cron_tick(
         }
     }
     Ok(())
+}
+
+/// Whether `t` falls exactly on the cron grid (cron is second-granular).
+pub(crate) fn cron_grid_contains(cron_expr: &str, t: NaiveDateTime) -> PyResult<bool> {
+    let probe_end = t
+        .checked_add_signed(chrono::Duration::seconds(1))
+        .unwrap_or(NaiveDateTime::MAX);
+    let mut hit = false;
+    for_each_cron_tick(cron_expr, &t, probe_end, |tick| {
+        hit = tick == t;
+        false
+    })?;
+    Ok(hit)
 }
 
 /// Compute the cartesian product of dimension keys.

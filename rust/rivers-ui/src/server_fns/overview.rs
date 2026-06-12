@@ -153,9 +153,6 @@ pub async fn get_assets_info(
 /// materializes several at once — each one counts independently.
 #[cfg(feature = "ssr")]
 fn partition_key_members(pk: &rivers_core::storage::PartitionKey) -> Vec<String> {
-    // Each individual member, formatted to match the gRPC-windowed keys so the
-    // heatmap's `materialized_keys.contains(window_key)` lookups hit. A Multi
-    // format mismatch here is what grays out every block despite a right count.
     pk.members()
         .into_iter()
         .map(crate::types::partition_key_to_display)
@@ -525,4 +522,52 @@ pub async fn get_deployment_info(
         daemon_schedules,
         daemon_sensors,
     })
+}
+
+#[cfg(all(test, feature = "ssr"))]
+mod tests {
+    use super::partition_key_members;
+    use rivers_core::storage::PartitionKey;
+
+    /// Heatmap classification compares these member strings against the gRPC
+    /// window keys (`dim=v|dim=v`, dims sorted). Any other encoding makes
+    /// every multi-dim cell render Missing.
+    #[test]
+    fn multi_dim_member_matches_grpc_window_key_format() {
+        let pk = PartitionKey::Multi {
+            dims: vec![
+                ("region".into(), vec!["us".into()]),
+                ("date".into(), vec!["2024-01-01".into()]),
+            ],
+        };
+        assert_eq!(
+            partition_key_members(&pk),
+            vec!["date=2024-01-01|region=us"]
+        );
+    }
+
+    /// A batched Multi key counts each cartesian member independently.
+    #[test]
+    fn batched_multi_expands_to_one_member_per_combo() {
+        let pk = PartitionKey::Multi {
+            dims: vec![
+                ("date".into(), vec!["d1".into()]),
+                ("region".into(), vec!["us".into(), "eu".into()]),
+            ],
+        };
+        assert_eq!(
+            partition_key_members(&pk),
+            vec!["date=d1|region=us", "date=d1|region=eu"]
+        );
+    }
+
+    /// Single members stay bare values — they must equal the gRPC window
+    /// keys for single-dim assets, which are bare strings.
+    #[test]
+    fn single_members_stay_bare() {
+        let pk = PartitionKey::Single {
+            keys: vec!["a".into(), "b".into()],
+        };
+        assert_eq!(partition_key_members(&pk), vec!["a", "b"]);
+    }
 }

@@ -14,9 +14,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use rivers_core::assets::graph::NodeRef;
 use rivers_core::condition::{
-    AssetConditionCache, AssetConditionInfo, ConditionEvalState, ConditionPass, PartitionInfo,
-    PartitionMappingKind,
+    AssetConditionCache, AssetConditionInfo, ConditionEvalState, ConditionPass, DimensionKind,
+    DimensionUniverse, PartitionInfo, PartitionMappingKind, PartitionUniverse,
 };
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{PartitionKey as CorePartitionKey, ScopedStorageHandle};
@@ -35,8 +36,21 @@ mod persist;
 use engine::ConditionTickEngine;
 
 /// Build a [`PartitionInfo`] from a graph node. Returns `None` if unpartitioned.
-fn partition_info_from_node(asset_name: &str, node: &ResolvedNode) -> Option<PartitionInfo> {
+/// `node_map` supplies upstream definitions so time-window mappings carry
+/// their grid into core eval; `deps` supplies the asset's dependency edges so
+/// unmapped partitioned deps get their default Identity mapping.
+fn partition_info_from_node(
+    asset_name: &str,
+    node: &ResolvedNode,
+    node_map: &HashMap<String, ResolvedNode>,
+    deps: &[NodeRef],
+) -> Option<PartitionInfo> {
     let def = node.partitions_def()?;
+    // Captured before enumeration: a window starting between this and the
+    // enumerate call is re-added by the first refresh (extend is idempotent)
+    // rather than skipped.
+    let now = chrono::Local::now().naive_local();
+    let universe = partition_universe_for(def, now);
     let all_keys = def
         .get_partition_keys()
         .ok()
@@ -50,12 +64,72 @@ fn partition_info_from_node(asset_name: &str, node: &ResolvedNode) -> Option<Par
         PartitionsDefinition::TimeWindow { fmt, .. } => Some(fmt.clone()),
         _ => None,
     };
-    let mappings = extract_partition_mappings(asset_name, node);
+    let mappings = extract_partition_mappings(asset_name, node, node_map, deps);
     Some(PartitionInfo {
         all_keys,
         mappings,
         time_window_fmt,
+        universe,
     })
+}
+
+/// Seeding enumerates through an explicit end — future windows included — so
+/// the watermark starts past whatever the seed covered, not at `now`.
+fn seeded_watermark(
+    def: &PartitionsDefinition,
+    now: chrono::NaiveDateTime,
+) -> chrono::NaiveDateTime {
+    match def {
+        PartitionsDefinition::TimeWindow { end: Some(e), .. } => (*e).max(now),
+        _ => now,
+    }
+}
+
+/// How `def`'s key universe evolves after extraction. `now` is the
+/// enumeration high-water mark for open time grids.
+fn partition_universe_for(
+    def: &PartitionsDefinition,
+    now: chrono::NaiveDateTime,
+) -> PartitionUniverse {
+    match def {
+        PartitionsDefinition::Static { .. } => PartitionUniverse::Frozen,
+        PartitionsDefinition::TimeWindow { .. } => match def.time_grid() {
+            Some(grid) => PartitionUniverse::TimeWindow {
+                grid,
+                enumerated_to: seeded_watermark(def, now),
+            },
+            None => PartitionUniverse::Frozen,
+        },
+        PartitionsDefinition::Dynamic { name } => PartitionUniverse::Dynamic {
+            namespace: name.clone(),
+        },
+        PartitionsDefinition::Multi { dimensions } => PartitionUniverse::Multi {
+            dims: dimensions
+                .iter()
+                .map(|(dim_name, dim_def)| {
+                    let keys = dim_def
+                        .enumerate_single_dim_keys()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect();
+                    let kind = match dim_def {
+                        PartitionsDefinition::TimeWindow { .. } => match dim_def.time_grid() {
+                            Some(grid) => DimensionKind::TimeWindow {
+                                grid,
+                                enumerated_to: seeded_watermark(dim_def, now),
+                            },
+                            None => DimensionKind::Frozen,
+                        },
+                        PartitionsDefinition::Dynamic { name } => DimensionKind::Dynamic {
+                            namespace: name.clone(),
+                        },
+                        _ => DimensionKind::Frozen,
+                    };
+                    (dim_name.clone(), DimensionUniverse { keys, kind })
+                })
+                .collect(),
+        },
+    }
 }
 
 impl PyCodeRepository {
@@ -75,7 +149,13 @@ impl PyCodeRepository {
             if let ResolvedNode::Asset(asset_node) = node
                 && let Some(ref cond) = asset_node.automation_condition
             {
-                let partition_info = partition_info_from_node(name, node);
+                let deps = state
+                    .inner_repo
+                    .assets()
+                    .get(name)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let partition_info = partition_info_from_node(name, node, &state.node_map, deps);
                 let backfill_strategy = node.backfill_strategy().map(|s| s.to_core());
                 by_key.insert(
                     name.clone(),
@@ -102,26 +182,33 @@ impl PyCodeRepository {
     pub(in crate::daemon) fn extract_upstream_partition_keys(
         &self,
         conditions: &[AssetConditionInfo],
-    ) -> HashMap<String, HashSet<CorePartitionKey>> {
+    ) -> HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)> {
         let guard = self.state.read().unwrap();
         let Some(state) = guard.as_ref() else {
             return HashMap::new();
         };
 
-        let mut map: HashMap<String, HashSet<CorePartitionKey>> = HashMap::new();
+        let mut map: HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)> =
+            HashMap::new();
         for cond in conditions {
             if let Some(ref pi) = cond.partition_info {
+                // Conditioned assets re-sync from their refreshed
+                // PartitionInfo each tick, so Frozen here is fine.
                 map.entry(cond.asset_key.clone())
-                    .or_insert_with(|| pi.all_keys.clone());
+                    .or_insert_with(|| (pi.all_keys.clone(), PartitionUniverse::Frozen));
                 for (_, upstream_key) in pi.mappings.keys() {
                     if !map.contains_key(upstream_key)
                         && let Some(node) = state.node_map.get(upstream_key)
                         && let Some(def) = node.partitions_def()
-                        && let Ok(keys) = def.get_partition_keys()
                     {
-                        let core_keys: HashSet<CorePartitionKey> =
-                            keys.iter().map(CorePartitionKey::from).collect();
-                        map.insert(upstream_key.clone(), core_keys);
+                        let now = chrono::Local::now().naive_local();
+                        let universe = partition_universe_for(def, now);
+                        let core_keys: HashSet<CorePartitionKey> = def
+                            .get_partition_keys()
+                            .ok()
+                            .map(|keys| keys.iter().map(CorePartitionKey::from).collect())
+                            .unwrap_or_default();
+                        map.insert(upstream_key.clone(), (core_keys, universe));
                     }
                 }
             }
@@ -130,16 +217,23 @@ impl PyCodeRepository {
     }
 }
 
-fn mapping_to_kind(m: &PartitionMapping) -> PartitionMappingKind {
+/// `upstream_def` is the definition of the side the mapping shifts within —
+/// it supplies the time grid for `TimeWindow` and per-dimension defs for
+/// nested mappings.
+fn mapping_to_kind(
+    m: &PartitionMapping,
+    upstream_def: Option<&PartitionsDefinition>,
+) -> PartitionMappingKind {
     match m {
         PartitionMapping::Identity {} => PartitionMappingKind::Identity,
         PartitionMapping::AllPartitions {} => PartitionMappingKind::AllPartitions,
         PartitionMapping::Static { mapping } => PartitionMappingKind::Static {
             mapping: mapping.clone(),
         },
-        PartitionMapping::TimeWindow { offset } => {
-            PartitionMappingKind::TimeWindow { offset: *offset }
-        }
+        PartitionMapping::TimeWindow { offset } => PartitionMappingKind::TimeWindow {
+            offset: *offset,
+            grid: upstream_def.and_then(|d| d.time_grid()),
+        },
         PartitionMapping::SpecificPartitions { partition_keys } => {
             PartitionMappingKind::SpecificPartitions {
                 keys: partition_keys.clone(),
@@ -149,9 +243,19 @@ fn mapping_to_kind(m: &PartitionMapping) -> PartitionMappingKind {
             dimension_mappings: dimension_mappings
                 .iter()
                 .map(|(up_dim, (down_dim, per_dim))| {
+                    let dim_def = upstream_def.and_then(|d| match d {
+                        PartitionsDefinition::Multi { dimensions } => dimensions
+                            .iter()
+                            .find(|(n, _)| n == up_dim)
+                            .map(|(_, dd)| dd),
+                        _ => None,
+                    });
                     (
                         up_dim.clone(),
-                        (down_dim.clone(), Box::new(mapping_to_kind(per_dim))),
+                        (
+                            down_dim.clone(),
+                            Box::new(mapping_to_kind(per_dim, dim_def)),
+                        ),
                     )
                 })
                 .collect(),
@@ -159,10 +263,21 @@ fn mapping_to_kind(m: &PartitionMapping) -> PartitionMappingKind {
         PartitionMapping::MultiToSingle {
             dimension_name,
             partition_mapping,
-        } => PartitionMappingKind::MultiToSingle {
-            dimension_name: dimension_name.clone(),
-            inner: Box::new(mapping_to_kind(&partition_mapping.0)),
-        },
+        } => {
+            // The inner mapping shifts within the named dimension when the
+            // upstream is Multi, else within the upstream itself.
+            let inner_def = upstream_def.and_then(|d| match d {
+                PartitionsDefinition::Multi { dimensions } => dimensions
+                    .iter()
+                    .find(|(n, _)| n == dimension_name)
+                    .map(|(_, dd)| dd),
+                _ => upstream_def,
+            });
+            PartitionMappingKind::MultiToSingle {
+                dimension_name: dimension_name.clone(),
+                inner: Box::new(mapping_to_kind(&partition_mapping.0, inner_def)),
+            }
+        }
         PartitionMapping::ForKeys { .. } => PartitionMappingKind::ForKeys,
         PartitionMapping::Subset {} => PartitionMappingKind::Subset,
     }
@@ -171,12 +286,34 @@ fn mapping_to_kind(m: &PartitionMapping) -> PartitionMappingKind {
 fn extract_partition_mappings(
     asset_name: &str,
     node: &crate::repository::resolved_node::ResolvedNode,
+    node_map: &HashMap<String, ResolvedNode>,
+    deps: &[NodeRef],
 ) -> HashMap<(String, String), PartitionMappingKind> {
     let mut result = HashMap::new();
     if let Some(mappings) = node.partition_mapping() {
         for (upstream_name, mapping) in &mappings {
-            let kind = mapping_to_kind(mapping);
+            let upstream_def = node_map.get(upstream_name).and_then(|n| n.partitions_def());
+            let kind = mapping_to_kind(mapping, upstream_def);
             result.insert((asset_name.to_string(), upstream_name.clone()), kind);
+        }
+    }
+    // An unmapped partitioned dep defaults to Identity at resolve time; the
+    // eval context must carry that default or the dep is treated as
+    // unpartitioned and its condition truth broadcasts across the universe.
+    for dep in deps {
+        let NodeRef::ByName(upstream_name) = dep else {
+            continue;
+        };
+        let key = (asset_name.to_string(), upstream_name.clone());
+        if result.contains_key(&key) {
+            continue;
+        }
+        if node_map
+            .get(upstream_name)
+            .and_then(|n| n.partitions_def())
+            .is_some()
+        {
+            result.insert(key, PartitionMappingKind::Identity);
         }
     }
     result
@@ -198,8 +335,9 @@ pub(super) struct ConditionEvalLoopConfig {
     pub max_ticks_retained: Option<usize>,
     pub eval_tx: tokio::sync::mpsc::UnboundedSender<ConditionEvalWriteMsg>,
     pub max_evals_retained: Option<usize>,
-    /// Upstream partition keys, pre-extracted with GIL at daemon start.
-    pub upstream_partition_keys: HashMap<String, HashSet<CorePartitionKey>>,
+    /// Upstream partition keys (+ how each set evolves), pre-extracted with
+    /// GIL at daemon start.
+    pub upstream_partition_keys: HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)>,
 }
 
 /// Background loop that periodically evaluates automation conditions on assets.

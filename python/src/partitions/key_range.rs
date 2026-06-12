@@ -8,10 +8,196 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use rivers_core::util::parse_key_datetime;
+
 use crate::errors::{ExecutionError, PartitionDefinitionError};
 
 use super::PyPartitionKey;
 use super::definition::{PartitionsDefinition, cartesian_product};
+
+/// Def-aware `[from, to]` membership for one single-dimension key value:
+/// positional for Static (keys aren't necessarily lexicographic),
+/// chronological via `fmt` for TimeWindow (custom formats aren't either),
+/// plain string comparison when no definition is available.
+fn key_in_range(
+    key: &str,
+    from_key: &str,
+    to_key: &str,
+    def: Option<&PartitionsDefinition>,
+) -> bool {
+    match def {
+        Some(PartitionsDefinition::Static { keys }) => {
+            match (
+                keys.get_index_of(from_key),
+                keys.get_index_of(to_key),
+                keys.get_index_of(key),
+            ) {
+                (Some(f), Some(t), Some(p)) => p >= f && p <= t,
+                _ => false,
+            }
+        }
+        Some(PartitionsDefinition::TimeWindow { fmt, .. }) => {
+            match (
+                parse_key_datetime(key, fmt),
+                parse_key_datetime(from_key, fmt),
+                parse_key_datetime(to_key, fmt),
+            ) {
+                (Ok(k), Ok(f), Ok(t)) => k >= f && k <= t,
+                _ => false,
+            }
+        }
+        _ => key >= from_key && key <= to_key,
+    }
+}
+
+/// Validate `[from, to]` endpoints against one single-dimension definition:
+/// membership (Static) / format (TimeWindow) plus def-order. Returns a plain
+/// message so resolve-time and validate-time callers wrap it in their own
+/// error types. Dynamic defs carry no static key knowledge — nothing to check.
+pub(crate) fn validate_single_dim_range(
+    def: &PartitionsDefinition,
+    from_key: &str,
+    to_key: &str,
+    dim: Option<&str>,
+) -> Result<(), String> {
+    let suffix = dim
+        .map(|d| format!(" for dimension '{d}'"))
+        .unwrap_or_default();
+    match def {
+        // A single-dim range can never match a Multi key — reject instead of
+        // letting the selector silently match nothing at runtime.
+        PartitionsDefinition::Multi { dimensions } => Err(format!(
+            "a single-dimension range cannot select from Multi partitions{suffix}; \
+             use PartitionKeyRange.multi() with dimensions: {}",
+            dimensions
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        PartitionsDefinition::Static { keys } => {
+            let pos = |k: &str| {
+                keys.get_index_of(k)
+                    .ok_or_else(|| format!("Range endpoint '{k}' is not a partition key{suffix}"))
+            };
+            let from_pos = pos(from_key)?;
+            let to_pos = pos(to_key)?;
+            if from_pos > to_pos {
+                return Err(format!(
+                    "from_key '{from_key}' is after to_key '{to_key}'{suffix}"
+                ));
+            }
+            Ok(())
+        }
+        PartitionsDefinition::TimeWindow { fmt, .. } => {
+            let parse = |k: &str| {
+                parse_key_datetime(k, fmt).map_err(|_| {
+                    format!(
+                        "Range endpoint '{k}' does not match the partition format '{fmt}'{suffix}"
+                    )
+                })
+            };
+            let from_dt = parse(from_key)?;
+            let to_dt = parse(to_key)?;
+            if from_dt > to_dt {
+                return Err(format!(
+                    "from_key '{from_key}' is after to_key '{to_key}'{suffix}"
+                ));
+            }
+            // Endpoints must be real window starts — an off-grid endpoint is
+            // not a partition key (same contract as Static membership). Name
+            // the neighbouring valid keys so the typo is fixable.
+            for (k, dt) in [(from_key, from_dt), (to_key, to_dt)] {
+                let single = PyPartitionKey::Single {
+                    key: vec![k.to_string()],
+                };
+                let on_grid = def
+                    .validate_partition_key(&single)
+                    .map_err(|e| e.to_string())?;
+                if !on_grid {
+                    let hint = def
+                        .time_grid()
+                        .map(|g| match g.nearest_keys(dt) {
+                            (Some(p), Some(n)) => {
+                                format!("; nearest valid keys are '{p}' and '{n}'")
+                            }
+                            (Some(x), None) | (None, Some(x)) => {
+                                format!("; nearest valid key is '{x}'")
+                            }
+                            (None, None) => String::new(),
+                        })
+                        .unwrap_or_default();
+                    return Err(format!(
+                        "Range endpoint '{k}' is not a partition key{suffix}{hint}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Resolve `[from, to]` against one single-dimension definition using its
+/// own ordering (see [`key_in_range`]). Errors on endpoints that aren't
+/// members (Static) or don't parse (TimeWindow), and on inverted ranges —
+/// ordering belongs to the definition, so this is where it's checked, not
+/// in the range constructors.
+fn resolve_single_dim_range(
+    def: &PartitionsDefinition,
+    from_key: &str,
+    to_key: &str,
+    dim: Option<&str>,
+) -> PyResult<Vec<String>> {
+    validate_single_dim_range(def, from_key, to_key, dim).map_err(ExecutionError::new_err)?;
+    match def {
+        PartitionsDefinition::Static { keys } => {
+            let from_pos = keys.get_index_of(from_key).expect("validated above");
+            let to_pos = keys.get_index_of(to_key).expect("validated above");
+            Ok((from_pos..=to_pos)
+                .filter_map(|i| keys.get_at(i).cloned())
+                .collect())
+        }
+        PartitionsDefinition::TimeWindow { fmt, .. } => {
+            let from_dt = parse_key_datetime(from_key, fmt).expect("validated above");
+            let to_dt = parse_key_datetime(to_key, fmt).expect("validated above");
+            // Walk only [from, to] — avoids enumerating the full definition.
+            def.time_grid()
+                .expect("TimeWindow always has a grid")
+                .keys_in_range(from_dt, to_dt)
+                .map_err(|e| ExecutionError::new_err(e.to_string()))
+        }
+        // Dynamic (storage-backed): the def's enumerator raises the precise
+        // "needs storage" error.
+        _ => {
+            let keys = def.enumerate_single_dim_keys()?;
+            Ok(keys
+                .into_iter()
+                .filter(|k| k.as_str() >= from_key && k.as_str() <= to_key)
+                .collect())
+        }
+    }
+}
+
+/// Error for selector dimensions that don't exist on the definition —
+/// silently ignoring one would treat the real dimension as omitted and
+/// expand it to every key. `dim_defs` keeps the definition's own order.
+fn unknown_dims_message<T>(unknown: &[&String], dim_defs: &[(String, T)]) -> String {
+    let plural = if unknown.len() == 1 { "" } else { "s" };
+    let names = unknown
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let available = dim_defs
+        .iter()
+        .map(|(n, _)| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Unknown dimension{plural} {names} in partition range; available dimensions: {available}"
+    )
+}
 
 /// Per-dimension selection: either a (from, to) range or explicit key list.
 #[derive(Clone, Debug, PartialEq)]
@@ -21,10 +207,11 @@ pub enum DimensionSelection {
 }
 
 impl DimensionSelection {
-    /// Check whether a single key string falls within this selection.
-    pub fn contains_key(&self, key: &str) -> bool {
+    /// Check whether a single key string falls within this selection,
+    /// using the dimension's definition ordering when available.
+    pub fn contains_key(&self, key: &str, def: Option<&PartitionsDefinition>) -> bool {
         match self {
-            Self::Range { from_key, to_key } => key >= from_key.as_str() && key <= to_key.as_str(),
+            Self::Range { from_key, to_key } => key_in_range(key, from_key, to_key, def),
             Self::Keys(allowed) => allowed.contains(key),
         }
     }
@@ -57,13 +244,9 @@ pub(crate) enum PartitionKeyRangeInner {
 }
 
 impl PyPartitionKeyRange {
-    /// Check whether a partition key falls within this range.
-    ///
-    /// When a `PartitionsDefinition` is provided and is `Static`, uses positional
-    /// ordering (index in the definition's key list) instead of string comparison.
-    /// This is necessary because static partition keys are not necessarily
-    /// lexicographically ordered. For TimeWindow/Dynamic partitions (or when no
-    /// definition is provided), string comparison is correct.
+    /// Check whether a partition key falls within this range, using the
+    /// definition's ordering when provided (see [`key_in_range`]) — static
+    /// keys and custom time formats are not necessarily lexicographic.
     pub fn contains(&self, key: &PyPartitionKey, def: Option<&PartitionsDefinition>) -> bool {
         match (&self.inner, key) {
             (
@@ -74,50 +257,88 @@ impl PyPartitionKeyRange {
                     Some(k) => k.as_str(),
                     None => return false,
                 };
-                // Static defs: use positional ordering (keys may not be lexicographic)
-                if let Some(PartitionsDefinition::Static { keys }) = def {
-                    let from_pos = keys.get_index_of(from_key.as_str());
-                    let to_pos = keys.get_index_of(to_key.as_str());
-                    let key_pos = keys.get_index_of(k);
-                    match (from_pos, to_pos, key_pos) {
-                        (Some(f), Some(t), Some(p)) => p >= f && p <= t,
-                        _ => false,
-                    }
-                } else {
-                    // TimeWindow/Dynamic: string comparison is correct
-                    k >= from_key.as_str() && k <= to_key.as_str()
-                }
+                key_in_range(k, from_key, to_key, def)
             }
             (PartitionKeyRangeInner::Multi { dimensions }, PyPartitionKey::Multi { keys }) => {
+                let dim_defs = match def {
+                    Some(PartitionsDefinition::Multi { dimensions }) => Some(dimensions),
+                    _ => None,
+                };
                 dimensions.iter().all(|(dim_name, sel)| {
+                    let dim_def = dim_defs
+                        .and_then(|dims| dims.iter().find(|(n, _)| n == dim_name).map(|(_, d)| d));
                     keys.get(dim_name)
                         .and_then(|v| v.first())
-                        .is_some_and(|k| sel.contains_key(k))
+                        .is_some_and(|k| sel.contains_key(k, dim_def))
                 })
             }
             _ => false,
         }
     }
 
-    /// Resolve this range into concrete partition keys using the given definition.
+    /// Validate this range's endpoints against the definition it will be
+    /// matched against — membership/format and def-order. Returns a plain
+    /// message; callers wrap it in their error type.
+    pub fn validate_against(&self, def: &PartitionsDefinition) -> Result<(), String> {
+        match &self.inner {
+            PartitionKeyRangeInner::Single { from_key, to_key } => {
+                validate_single_dim_range(def, from_key, to_key, None)
+            }
+            PartitionKeyRangeInner::Multi { dimensions } => {
+                let PartitionsDefinition::Multi {
+                    dimensions: dim_defs,
+                } = def
+                else {
+                    // Shape mismatches are reported by the mapping/def checks.
+                    return Ok(());
+                };
+                // Sorted iteration: HashMap order must not pick which
+                // dimension's error surfaces.
+                let mut entries: Vec<_> = dimensions.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                for (name, sel) in entries {
+                    let Some((_, dd)) = dim_defs.iter().find(|(n, _)| n == name) else {
+                        return Err(unknown_dims_message(&[name], dim_defs));
+                    };
+                    match sel {
+                        DimensionSelection::Range { from_key, to_key } => {
+                            validate_single_dim_range(dd, from_key, to_key, Some(name))?;
+                        }
+                        DimensionSelection::Keys(keys) => {
+                            let mut sorted: Vec<&String> = keys.iter().collect();
+                            sorted.sort();
+                            for k in sorted {
+                                let single = PyPartitionKey::Single {
+                                    key: vec![k.clone()],
+                                };
+                                let valid = dd
+                                    .validate_partition_key(&single)
+                                    .map_err(|e| e.to_string())?;
+                                if !valid {
+                                    return Err(format!(
+                                        "'{k}' is not a partition key of dimension '{name}'"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Resolve this range into concrete partition keys using the given
+    /// definition's ordering (positional for Static, chronological for
+    /// TimeWindow — see [`resolve_single_dim_range`]).
     pub fn resolve(&self, parts_def: &PartitionsDefinition) -> PyResult<Vec<PyPartitionKey>> {
         match &self.inner {
             PartitionKeyRangeInner::Single { from_key, to_key } => {
-                let all_keys = parts_def.get_partition_keys()?;
-                let filtered: Vec<PyPartitionKey> = all_keys
-                    .into_iter()
-                    .filter(|pk| {
-                        if let PyPartitionKey::Single { key } = pk {
-                            if let Some(k) = key.first() {
-                                k.as_str() >= from_key.as_str() && k.as_str() <= to_key.as_str()
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    })
-                    .collect();
+                let filtered: Vec<PyPartitionKey> =
+                    resolve_single_dim_range(parts_def, from_key, to_key, None)?
+                        .into_iter()
+                        .map(|k| PyPartitionKey::Single { key: vec![k] })
+                        .collect();
                 if filtered.is_empty() {
                     return Err(ExecutionError::new_err(format!(
                         "No partition keys found in range [{from_key}, {to_key}]"
@@ -137,19 +358,28 @@ impl PyPartitionKeyRange {
                     }
                 };
 
+                let mut unknown: Vec<&String> = dim_selections
+                    .keys()
+                    .filter(|name| !dim_defs.iter().any(|(n, _)| n == *name))
+                    .collect();
+                unknown.sort();
+                if !unknown.is_empty() {
+                    return Err(ExecutionError::new_err(unknown_dims_message(
+                        &unknown, dim_defs,
+                    )));
+                }
+
                 let mut resolved_dims: Vec<(String, Vec<String>)> = Vec::new();
                 for (dim_name, dim_def) in dim_defs {
                     let dim_keys = if let Some(sel) = dim_selections.get(dim_name) {
                         match sel {
                             DimensionSelection::Range { from_key, to_key } => {
-                                let keys: Vec<String> = dim_def
-                                    .enumerate_single_dim_keys()?
-                                    .into_iter()
-                                    .filter(|k| {
-                                        k.as_str() >= from_key.as_str()
-                                            && k.as_str() <= to_key.as_str()
-                                    })
-                                    .collect();
+                                let keys = resolve_single_dim_range(
+                                    dim_def,
+                                    from_key,
+                                    to_key,
+                                    Some(dim_name),
+                                )?;
                                 if keys.is_empty() {
                                     return Err(ExecutionError::new_err(format!(
                                         "No keys in range [{from_key}, {to_key}] for dimension '{dim_name}'"
@@ -157,7 +387,19 @@ impl PyPartitionKeyRange {
                                 }
                                 keys
                             }
-                            DimensionSelection::Keys(keys) => keys.iter().cloned().collect(),
+                            DimensionSelection::Keys(keys) => {
+                                for k in keys {
+                                    let single = PyPartitionKey::Single {
+                                        key: vec![k.clone()],
+                                    };
+                                    if !dim_def.validate_partition_key(&single)? {
+                                        return Err(ExecutionError::new_err(format!(
+                                            "'{k}' is not a partition key of dimension '{dim_name}'"
+                                        )));
+                                    }
+                                }
+                                keys.iter().cloned().collect()
+                            }
                         }
                     } else {
                         // Omitted dimension: include all keys
@@ -190,19 +432,19 @@ impl PyPartitionKeyRange {
 impl PyPartitionKeyRange {
     /// Create a single-dimension range.
     ///
+    /// Endpoint ordering is checked at resolve/match time against the
+    /// partition definition (positional for Static, chronological for
+    /// TimeWindow) — lexicographic order of the raw strings is meaningless
+    /// for non-ISO formats and unordered static keys.
+    ///
     /// ```python
     /// PartitionKeyRange.single(from_key="2024-01-01", to_key="2024-03-31")
     /// ```
     #[staticmethod]
-    fn single(from_key: String, to_key: String) -> PyResult<Self> {
-        if from_key > to_key {
-            return Err(PartitionDefinitionError::new_err(format!(
-                "from_key '{from_key}' must be <= to_key '{to_key}'"
-            )));
-        }
-        Ok(Self {
+    fn single(from_key: String, to_key: String) -> Self {
+        Self {
             inner: PartitionKeyRangeInner::Single { from_key, to_key },
-        })
+        }
     }
 
     /// Create a multi-dimension range from a dict.
@@ -223,11 +465,6 @@ impl PyPartitionKeyRange {
         for (k, v) in dimensions.iter() {
             let name: String = k.extract()?;
             if let Ok((from, to)) = v.extract::<(String, String)>() {
-                if from > to {
-                    return Err(PartitionDefinitionError::new_err(format!(
-                        "from_key '{from}' must be <= to_key '{to}' for dimension '{name}'"
-                    )));
-                }
                 result.insert(
                     name,
                     DimensionSelection::Range {
@@ -265,14 +502,20 @@ impl PyPartitionKeyRange {
                 format!("PartitionKeyRange.single(from_key={from_key:?}, to_key={to_key:?})")
             }
             PartitionKeyRangeInner::Multi { dimensions } => {
-                let dims: Vec<String> = dimensions
-                    .iter()
+                // Sorted dims and key lists — HashMap/HashSet iteration order
+                // is seed-dependent and must not leak into the repr.
+                let mut entries: Vec<_> = dimensions.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                let dims: Vec<String> = entries
+                    .into_iter()
                     .map(|(name, sel)| match sel {
                         DimensionSelection::Range { from_key, to_key } => {
                             format!("{name:?}: ({from_key:?}, {to_key:?})")
                         }
                         DimensionSelection::Keys(keys) => {
-                            format!("{name:?}: {keys:?}")
+                            let mut sorted: Vec<&String> = keys.iter().collect();
+                            sorted.sort();
+                            format!("{name:?}: {sorted:?}")
                         }
                     })
                     .collect();
@@ -285,10 +528,40 @@ impl PyPartitionKeyRange {
         self == other
     }
 
+    /// Structural, order-independent hash consistent with `__eq__` — the
+    /// Multi variant's HashMap/HashSet iterate in seed-dependent order, so
+    /// contents are sorted before hashing.
     fn __hash__(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        format!("{:?}", self).hash(&mut hasher);
+        match &self.inner {
+            PartitionKeyRangeInner::Single { from_key, to_key } => {
+                0u8.hash(&mut hasher);
+                from_key.hash(&mut hasher);
+                to_key.hash(&mut hasher);
+            }
+            PartitionKeyRangeInner::Multi { dimensions } => {
+                1u8.hash(&mut hasher);
+                let mut dims: Vec<_> = dimensions.iter().collect();
+                dims.sort_by(|a, b| a.0.cmp(b.0));
+                for (name, sel) in dims {
+                    name.hash(&mut hasher);
+                    match sel {
+                        DimensionSelection::Range { from_key, to_key } => {
+                            0u8.hash(&mut hasher);
+                            from_key.hash(&mut hasher);
+                            to_key.hash(&mut hasher);
+                        }
+                        DimensionSelection::Keys(keys) => {
+                            1u8.hash(&mut hasher);
+                            let mut sorted: Vec<&String> = keys.iter().collect();
+                            sorted.sort();
+                            sorted.hash(&mut hasher);
+                        }
+                    }
+                }
+            }
+        }
         hasher.finish()
     }
 }

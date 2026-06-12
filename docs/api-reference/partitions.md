@@ -50,6 +50,10 @@ rs.PartitionKey.multi({"date": "2024-01-15", "region": ["us", "eu"]})
 
 Defines how an asset is partitioned.
 
+Partition key values may not contain `|` or `,` — those characters are reserved by the canonical display form (`dim=value|dim=value`, values joined with `,`) used everywhere keys appear as strings. Dimension names in `multi()` additionally may not contain `=`. Constructors, `fmt` rendering, and `storage.add_dynamic_partitions()` reject violations.
+
+Every definition is re-validated when the repository resolves: values built without the factory staticmethods (e.g. the raw `PartitionsDefinition.TimeWindow(...)` variant constructor) are held to the same rules before any partition keys are minted.
+
 ### `PartitionsDefinition.static_()`
 
 ```python
@@ -76,6 +80,8 @@ PartitionsDefinition.daily(
 
 Daily partitions. Default format: `"%Y-%m-%d"`.
 
+Raises `PartitionDefinitionError` if a `fmt` override cannot round-trip the daily grid — e.g. `daily(fmt="%Y-%m")` collapses ~30 windows into one key (see [`time_window()`](#partitionsdefinitiontime_window) for the round-trip rule).
+
 ### `PartitionsDefinition.hourly()`
 
 ```python
@@ -86,7 +92,9 @@ PartitionsDefinition.hourly(
 ) -> PartitionsDefinition.TimeWindow
 ```
 
-Hourly partitions. Default format: `"%Y-%m-%d-%H:%M"`.
+Hourly partitions. Default format: `"%Y-%m-%dT%H:00"`.
+
+Raises `PartitionDefinitionError` if a `fmt` override cannot round-trip the hourly grid, e.g. `hourly(fmt="%Y-%m-%d")`.
 
 ### `PartitionsDefinition.time_window()`
 
@@ -100,7 +108,9 @@ PartitionsDefinition.time_window(
 ) -> PartitionsDefinition.TimeWindow
 ```
 
-Custom time-window partitions. Exactly one of `cron_schedule` or `interval_seconds` is required. `cron_schedule` accepts 5 fields (`min hour dom mon dow`) or 6 fields (`sec min hour dom mon dow`) — seconds are optional.
+Custom time-window partitions. Exactly one of `cron_schedule` or `interval_seconds` is required. `cron_schedule` accepts 5 fields (`min hour dom mon dow`) or 6 fields (`sec min hour dom mon dow`) — seconds are optional. Cron grids are second-granular, so `start` must fall on a whole second (sub-second intervals remain supported via `interval_seconds`).
+
+`fmt` must be at least as fine as the grid: every window start has to format to a key that parses back to exactly that start (e.g. an hourly grid with `fmt="%Y-%m-%d"` is rejected, because 24 windows would collapse into one key). Coarse fmts like `%Y-%m` or `%Y` are fine on equally coarse grids — missing calendar fields parse back as the window start. The round-trip is checked across the grid's first four years (capped at 1024 windows), so calendar drift that spares the earliest ticks — e.g. a 31-day interval under `fmt="%Y-%m"`, whose first ticks happen to land on month starts — is still rejected at construction. This applies to `daily(fmt=...)` and `hourly(fmt=...)` overrides too.
 
 **`TimeWindow` attributes:**
 
@@ -195,6 +205,12 @@ Returns the half-open `(start, end)` time window for the current key, or `None` 
 
 An inclusive range of partition keys for backfills and lookups.
 
+Range endpoints follow the **partition definition's ordering**, resolved when
+the range is used: positional order for static keys (which need not be
+alphabetical) and chronological order for time windows (so custom formats
+like `%m/%d/%Y` work). Unknown endpoints and inverted ranges are rejected
+with a precise error at backfill submission.
+
 ### `PartitionKeyRange.single()`
 
 ```python
@@ -241,7 +257,10 @@ Explicit key-to-key mapping.
 PartitionMapping.time_window(offset: int) -> PartitionMapping.TimeWindow
 ```
 
-Offset by N time periods (e.g., `-1` for previous day).
+Offset by N time periods (e.g., `-1` for previous day): materializing
+`2024-01-05` with `offset=-1` loads the upstream's `2024-01-04` partition.
+Works for cron and interval windows alike; a key that shifts outside the
+upstream's `[start, end)` range fails the run with a precise error.
 
 ### `PartitionMapping.specific_partitions(partition_keys)`
 

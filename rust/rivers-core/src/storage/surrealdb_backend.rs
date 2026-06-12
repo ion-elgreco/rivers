@@ -299,6 +299,252 @@ impl DbStoredEvent {
     }
 }
 
+/// Current storage schema version. Bump when adding a migration step to
+/// [`run_migrations`].
+const SCHEMA_VERSION: u32 = 3;
+/// `kv` key holding the persisted schema version. Absent means v1 — a
+/// database from before versioning existed.
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+
+async fn stored_schema_version(db: &Surreal<Any>) -> anyhow::Result<u32> {
+    let mut result = db
+        .query("SELECT * FROM kv WHERE key = $key LIMIT 1")
+        .bind(("key", SCHEMA_VERSION_KEY.to_string()))
+        .await?;
+    let rows: Vec<DbKv> = result.take(0)?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .and_then(|kv| String::from_utf8(kv.value.to_vec()).ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1))
+}
+
+async fn set_schema_version(db: &Surreal<Any>, version: u32) -> anyhow::Result<()> {
+    // Single upsert on the unique key: concurrent first boots both converge
+    // instead of the loser aborting on idx_kv_key, and a crash can't leave
+    // the stamp deleted-but-unwritten.
+    db.query(
+        "INSERT INTO kv { key: $key, value: $value } \
+         ON DUPLICATE KEY UPDATE value = $value",
+    )
+    .bind(("key", SCHEMA_VERSION_KEY.to_string()))
+    .bind(("value", Bytes::from(version.to_string().into_bytes())))
+    .await?
+    .check()?;
+    Ok(())
+}
+
+/// `kv` key listing dynamic partition keys that contain display-reserved
+/// characters (registered before the reserved-char guard existed). Operator
+/// remediation: delete each and re-register it under a clean name.
+const RESERVED_DYNAMIC_KEYS_KEY: &str = "reserved_dynamic_keys";
+
+/// v2 → v3 scan: stored reserved-char dynamic keys still classify (matching
+/// is structural) but cannot round-trip any display-string path (UI, gRPC).
+/// Renaming them silently would change user-visible keys, so warn and record
+/// them in `kv` instead.
+async fn scan_reserved_char_dynamic_keys(db: &Surreal<Any>) -> anyhow::Result<()> {
+    let mut result = db
+        .query(
+            "SELECT code_location_id, partitions_def_name, partition_key, create_timestamp \
+             FROM dynamic_partitions",
+        )
+        .await?;
+    let rows: Vec<DbDynamicPartition> = result.take(0)?;
+    let offenders: Vec<String> = rows
+        .iter()
+        .filter(|r| PartitionKey::reserved_display_char(&r.partition_key).is_some())
+        .map(|r| {
+            format!(
+                "{}/{}: '{}'",
+                r.code_location_id, r.partitions_def_name, r.partition_key
+            )
+        })
+        .collect();
+    if offenders.is_empty() {
+        return Ok(());
+    }
+    for o in offenders.iter().take(20) {
+        tracing::warn!(
+            key = %o,
+            "dynamic partition key contains display-reserved characters; \
+             delete it and re-register under a clean name"
+        );
+    }
+    let body = serde_json::to_vec(&offenders[..offenders.len().min(100)])?;
+    db.query(
+        "INSERT INTO kv { key: $key, value: $value } \
+         ON DUPLICATE KEY UPDATE value = $value",
+    )
+    .bind(("key", RESERVED_DYNAMIC_KEYS_KEY.to_string()))
+    .bind(("value", Bytes::from(body)))
+    .await?
+    .check()?;
+    Ok(())
+}
+
+/// Versioned in-place migrations, run once at every constructor. Steps
+/// between the persisted version and [`SCHEMA_VERSION`] run in order; the
+/// stamp is written only after they all succeed (each step is idempotent and
+/// crash-safe, so a partial run simply resumes on the next start). A
+/// database already at the current version skips the table scans entirely.
+async fn run_migrations(db: &Surreal<Any>) -> anyhow::Result<()> {
+    let from = stored_schema_version(db).await?;
+    if from >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    if from < 2 {
+        migrate_multi_partition_key_order(db).await?;
+    }
+    if from < 3 {
+        if from >= 2 {
+            // Released 0.1.x wheels predate canonical-on-write Multi dims;
+            // rows they wrote into a v2-stamped database were never healed
+            // once the every-boot scan became version-gated.
+            migrate_multi_partition_key_order(db).await?;
+        }
+        scan_reserved_char_dynamic_keys(db).await?;
+    }
+    set_schema_version(db, SCHEMA_VERSION).await?;
+    tracing::info!(from, to = SCHEMA_VERSION, "storage schema migrated");
+    Ok(())
+}
+
+/// Upsert the heal's canonical row. The migration computes its values from a
+/// snapshot taken before the write loop, so a live materialization can land a
+/// newer canonical row in between.
+async fn upsert_canonical_partition_row(
+    db: &Surreal<Any>,
+    write: DbAssetPartitionWrite,
+) -> anyhow::Result<()> {
+    // Pointer fields only move forward: a stale snapshot must never roll
+    // back a row a live materialization just advanced. last_timestamp is
+    // compared first and assigned last so the guards all see the old value.
+    db.query(
+        "INSERT INTO asset_partitions $row ON DUPLICATE KEY UPDATE \
+         last_event_id = IF $input.last_timestamp > last_timestamp THEN $input.last_event_id ELSE last_event_id END, \
+         last_run_id = IF $input.last_timestamp > last_timestamp THEN $input.last_run_id ELSE last_run_id END, \
+         last_timestamp = IF $input.last_timestamp > last_timestamp THEN $input.last_timestamp ELSE last_timestamp END",
+    )
+    .bind(("row", write))
+    .await?
+    .check()?;
+    Ok(())
+}
+
+/// v1 → v2: rewrite persisted `Multi` partition keys whose dims aren't in
+/// canonical (sorted) order. Earlier builds serialized HashMap iteration
+/// order, which defeats the `asset_partitions` UNIQUE index (one logical
+/// partition could occupy several rows) and `partition_key =` lookups on
+/// `events`. Idempotent; sorted rows are left untouched.
+async fn migrate_multi_partition_key_order(db: &Surreal<Any>) -> anyhow::Result<()> {
+    fn is_sorted(dims: &[(String, Vec<String>)]) -> bool {
+        dims.windows(2).all(|w| w[0].0 <= w[1].0)
+    }
+
+    #[derive(Debug, SurrealValue)]
+    struct PartRow {
+        id: RecordId,
+        code_location_id: String,
+        asset_key: String,
+        partition_key: PartitionKey,
+        last_event_id: Option<String>,
+        last_run_id: Option<String>,
+        last_timestamp: Option<i64>,
+    }
+    let mut result = db
+        .query("SELECT id, code_location_id, asset_key, partition_key, last_event_id, last_run_id, last_timestamp FROM asset_partitions WHERE partition_key.variant = 'Multi'")
+        .await?;
+    let rows: Vec<PartRow> = result.take(0)?;
+    // Group by logical key (PartitionKey's Eq/Hash are order-insensitive):
+    // unsorted duplicates collapse onto the newest row.
+    let mut groups: HashMap<(String, String, PartitionKey), Vec<PartRow>> = HashMap::new();
+    for row in rows {
+        groups
+            .entry((
+                row.code_location_id.clone(),
+                row.asset_key.clone(),
+                row.partition_key.clone(),
+            ))
+            .or_default()
+            .push(row);
+    }
+    let mut rewritten = 0usize;
+    for ((_, _, key), group) in groups {
+        let needs_rewrite = group.len() > 1
+            || group.iter().any(
+                |r| matches!(&r.partition_key, PartitionKey::Multi { dims } if !is_sorted(dims)),
+            );
+        if !needs_rewrite {
+            continue;
+        }
+        let latest = group
+            .iter()
+            .max_by_key(|r| r.last_timestamp.unwrap_or(i64::MIN))
+            .expect("group is non-empty");
+        let write = DbAssetPartitionWrite {
+            code_location_id: latest.code_location_id.clone(),
+            asset_key: latest.asset_key.clone(),
+            partition_key: key,
+            last_event_id: latest.last_event_id.clone().unwrap_or_default(),
+            last_run_id: latest.last_run_id.clone().unwrap_or_default(),
+            last_timestamp: latest.last_timestamp.unwrap_or_default(),
+        };
+        // Write the canonical row before touching the legacy ones: a crash
+        // between the two steps leaves a recoverable duplicate for the next
+        // start to clean up, never a lost partition. A pre-existing sorted
+        // row is updated in place via the UNIQUE index.
+        upsert_canonical_partition_row(db, write).await?;
+        for row in &group {
+            if matches!(&row.partition_key, PartitionKey::Multi { dims } if !is_sorted(dims)) {
+                db.query("DELETE $rec")
+                    .bind(("rec", row.id.clone()))
+                    .await?
+                    .check()?;
+            }
+        }
+        rewritten += 1;
+    }
+
+    #[derive(Debug, SurrealValue)]
+    struct EventRow {
+        id: RecordId,
+        partition_key: PartitionKey,
+    }
+    let mut result = db
+        .query("SELECT id, partition_key FROM events WHERE partition_key.variant = 'Multi'")
+        .await?;
+    let events: Vec<EventRow> = result.take(0)?;
+    let to_rewrite: Vec<EventRow> = events
+        .into_iter()
+        .filter(|ev| matches!(&ev.partition_key, PartitionKey::Multi { dims } if !is_sorted(dims)))
+        .collect();
+    let event_rewrites = to_rewrite.len();
+    // Chunked multi-statement updates: one round-trip per 200 rows instead
+    // of per row. Re-binding the same key canonicalizes (into_value sorts).
+    for chunk in to_rewrite.chunks(200) {
+        let stmts: String = (0..chunk.len())
+            .map(|i| format!("UPDATE $r{i} SET partition_key = $p{i};"))
+            .collect();
+        let mut query = db.query(stmts);
+        for (i, ev) in chunk.iter().enumerate() {
+            query = query
+                .bind((format!("r{i}"), ev.id.clone()))
+                .bind((format!("p{i}"), ev.partition_key.clone()));
+        }
+        query.await?.check()?;
+    }
+    if rewritten > 0 || event_rewrites > 0 {
+        tracing::info!(
+            partitions = rewritten,
+            events = event_rewrites,
+            "migrated Multi partition keys to canonical dim order"
+        );
+    }
+    Ok(())
+}
+
 const SCHEMA: &str = "
 DEFINE TABLE IF NOT EXISTS events SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS code_location_id ON events TYPE string DEFAULT 'default';
@@ -449,7 +695,9 @@ DEFINE TABLE IF NOT EXISTS backfills SCHEMALESS;
 DEFINE FIELD IF NOT EXISTS backfill_id ON backfills TYPE string;
 DEFINE FIELD IF NOT EXISTS code_location_id ON backfills TYPE string DEFAULT 'default';
 DEFINE FIELD IF NOT EXISTS status ON backfills TYPE string;
-DEFINE FIELD IF NOT EXISTS strategy ON backfills TYPE object FLEXIBLE;
+-- FLEXIBLE is SCHEMAFULL-only; on this SCHEMALESS table a plain object type
+-- validates the shape without stripping nested content.
+DEFINE FIELD IF NOT EXISTS strategy ON backfills TYPE object;
 DEFINE FIELD IF NOT EXISTS failure_policy ON backfills TYPE string;
 DEFINE FIELD IF NOT EXISTS asset_selection ON backfills TYPE array<string>;
 DEFINE FIELD IF NOT EXISTS partition_keys ON backfills TYPE array;
@@ -649,7 +897,8 @@ impl SurrealStorage {
                 .use_db(DEFAULT_DATABASE)
                 .await?;
             tracing::debug!("applying schema");
-            db.query(SCHEMA).await?;
+            db.query(SCHEMA).await?.check()?;
+            run_migrations(&db).await?;
             Ok(db)
         })
         .await?;
@@ -699,7 +948,8 @@ impl SurrealStorage {
                 .use_db(DEFAULT_DATABASE)
                 .await?;
             tracing::debug!("applying schema");
-            db.query(SCHEMA).await?;
+            db.query(SCHEMA).await?.check()?;
+            run_migrations(&db).await?;
             Ok(db)
         })
         .await?;
@@ -779,7 +1029,8 @@ impl SurrealStorage {
             );
             db.use_ns(&namespace).use_db(&database).await?;
             tracing::debug!("applying schema");
-            db.query(SCHEMA).await?;
+            db.query(SCHEMA).await?.check()?;
+            run_migrations(&db).await?;
             Ok(db)
         })
         .await?;
@@ -2671,16 +2922,28 @@ impl PerCodeLocationStorage for SurrealStorage {
     ) -> Result<Option<StoredEvent>> {
         let event_type_str = "Materialization".to_string();
         let mut result = if let Some(partition_key) = partition {
-            let spk = PartitionKey::Single {
-                keys: vec![partition_key.to_string()],
-            };
-            self.db
-                .query("SELECT * FROM events WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key = $partition_key AND event_type = $event_type ORDER BY timestamp DESC LIMIT 1")
-                .bind(("cl", code_location_id.to_string()))
-                .bind(("asset_key", asset_key.to_string()))
-                .bind(("partition_key", spk))
-                .bind(("event_type", event_type_str))
-                .await?
+            // The display string may denote a Single or a Multi key. Both
+            // readings can have rows when the asset's def changed shape
+            // (legacy Single events vs current Multi ones) — the structured
+            // reading wins, so try candidates most-structured first instead
+            // of letting timestamps decide.
+            for cand in PartitionKey::display_candidates(partition_key)
+                .into_iter()
+                .rev()
+            {
+                let mut result = self.db
+                    .query("SELECT * FROM events WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key = $pk AND event_type = $event_type ORDER BY timestamp DESC LIMIT 1")
+                    .bind(("cl", code_location_id.to_string()))
+                    .bind(("asset_key", asset_key.to_string()))
+                    .bind(("pk", cand))
+                    .bind(("event_type", event_type_str.clone()))
+                    .await?;
+                let events: Vec<DbStoredEvent> = result.take(0)?;
+                if let Some(e) = events.into_iter().next() {
+                    return Ok(Some(e.into_stored_event()));
+                }
+            }
+            return Ok(None);
         } else {
             self.db
                 .query("SELECT * FROM events WHERE code_location_id = $cl AND asset_key = $asset_key AND event_type = $event_type ORDER BY timestamp DESC LIMIT 1")
@@ -2868,6 +3131,17 @@ impl PerCodeLocationStorage for SurrealStorage {
         partitions_def_name: &str,
         partition_keys: &[String],
     ) -> Result<()> {
+        for key in partition_keys {
+            if key.is_empty() {
+                anyhow::bail!("dynamic partition keys must not be empty");
+            }
+            if let Some(ch) = PartitionKey::reserved_display_char(key) {
+                anyhow::bail!(
+                    "partition key '{key}' contains reserved character '{ch}' \
+                     (used by the canonical display form)"
+                );
+            }
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3074,16 +3348,25 @@ impl PerCodeLocationStorage for SurrealStorage {
         partition_key: &str,
         limit: usize,
     ) -> Result<Vec<StoredEvent>> {
-        let mut result = self
-            .db
-            .query("SELECT * FROM events WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key = $partition_key ORDER BY timestamp DESC LIMIT $limit")
-            .bind(("cl", code_location_id.to_string()))
-            .bind(("asset_key", asset_key.to_string()))
-            .bind(("partition_key", PartitionKey::Single { keys: vec![partition_key.to_string()] }))
-            .bind(("limit", limit))
-            .await?;
-        let events: Vec<DbStoredEvent> = result.take(0)?;
-        Ok(events.into_iter().map(|e| e.into_stored_event()).collect())
+        // Most-structured reading first; see get_latest_materialization.
+        for cand in PartitionKey::display_candidates(partition_key)
+            .into_iter()
+            .rev()
+        {
+            let mut result = self
+                .db
+                .query("SELECT * FROM events WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key = $pk ORDER BY timestamp DESC LIMIT $limit")
+                .bind(("cl", code_location_id.to_string()))
+                .bind(("asset_key", asset_key.to_string()))
+                .bind(("pk", cand))
+                .bind(("limit", limit))
+                .await?;
+            let events: Vec<DbStoredEvent> = result.take(0)?;
+            if !events.is_empty() {
+                return Ok(events.into_iter().map(|e| e.into_stored_event()).collect());
+            }
+        }
+        Ok(Vec::new())
     }
 
     async fn get_materialized_partitions(
@@ -3814,6 +4097,487 @@ mod tests {
         );
     }
 
+    /// The UNIQUE index compares the SERIALIZED partition_key, so the same
+    /// logical Multi key written with dims in a different order must
+    /// canonicalize to one row — Python builds dims from a HashMap whose
+    /// iteration order varies per instance.
+    #[tokio::test]
+    async fn test_multi_partition_key_dims_order_canonicalized() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let mk = |dims: Vec<(&str, &str)>| PartitionKey::Multi {
+            dims: dims
+                .into_iter()
+                .map(|(d, v)| (d.to_string(), vec![v.to_string()]))
+                .collect(),
+        };
+        let row = |pk: PartitionKey, event_id: &str, ts: i64| super::DbAssetPartitionWrite {
+            code_location_id: cl.to_string(),
+            asset_key: "inventory".to_string(),
+            partition_key: pk,
+            last_event_id: event_id.to_string(),
+            last_run_id: "r".to_string(),
+            last_timestamp: ts,
+        };
+
+        let date_first = mk(vec![("date", "2024-01-01"), ("region", "eu")]);
+        let region_first = mk(vec![("region", "eu"), ("date", "2024-01-01")]);
+        storage
+            .upsert_asset_partitions(vec![row(date_first.clone(), "ev1", 1)])
+            .await
+            .unwrap();
+        storage
+            .upsert_asset_partitions(vec![row(region_first, "ev2", 2)])
+            .await
+            .unwrap();
+
+        let parts = storage
+            .get_materialized_partitions(cl, "inventory")
+            .await
+            .unwrap();
+        assert_eq!(
+            parts,
+            vec![date_first],
+            "dims order must canonicalize to one row"
+        );
+        assert_eq!(
+            storage
+                .count_materialized_partitions(cl, "inventory")
+                .await
+                .unwrap(),
+            1,
+            "the count must agree with the deduped key set"
+        );
+    }
+
+    /// Rows persisted by earlier builds carry HashMap-ordered dims; the
+    /// startup migration must collapse duplicates onto the canonical form
+    /// and rewrite unsorted event keys.
+    #[tokio::test]
+    async fn test_migration_canonicalizes_legacy_multi_rows() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        // Legacy row with unsorted dims, written raw to bypass the
+        // canonicalizing serializer.
+        storage
+            .db
+            .query(
+                "CREATE asset_partitions CONTENT { code_location_id: 'default', \
+                 asset_key: 'inv', partition_key: { variant: 'Multi', dims: \
+                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
+                 last_event_id: 'e1', last_run_id: 'r1', last_timestamp: 1 }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        // The same logical partition written by a current build (sorted).
+        let sorted = PartitionKey::Multi {
+            dims: vec![
+                ("date".to_string(), vec!["2024-01-01".to_string()]),
+                ("region".to_string(), vec!["eu".to_string()]),
+            ],
+        };
+        storage
+            .upsert_asset_partitions(vec![DbAssetPartitionWrite {
+                code_location_id: cl.to_string(),
+                asset_key: "inv".to_string(),
+                partition_key: sorted.clone(),
+                last_event_id: "e2".to_string(),
+                last_run_id: "r2".to_string(),
+                last_timestamp: 2,
+            }])
+            .await
+            .unwrap();
+        // Legacy event with unsorted dims.
+        storage
+            .db
+            .query(
+                "CREATE events CONTENT { code_location_id: 'default', \
+                 event_type: 'Materialization', asset_key: 'inv', run_id: 'r1', \
+                 partition_key: { variant: 'Multi', dims: \
+                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
+                 timestamp: 1, metadata: [] }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        migrate_multi_partition_key_order(&storage.db)
+            .await
+            .unwrap();
+
+        let parts = storage
+            .get_materialized_partitions(cl, "inv")
+            .await
+            .unwrap();
+        assert_eq!(parts, vec![sorted.clone()], "one canonical row survives");
+        let ts = storage.get_partition_timestamps(cl, "inv").await.unwrap();
+        assert_eq!(ts, vec![(sorted.clone(), 2)], "newest row's values win");
+        // The event is reachable through an equality lookup with the
+        // canonical (sorted) bind.
+        let mut result = storage
+            .db
+            .query("SELECT count() AS total FROM events WHERE partition_key = $pk GROUP ALL")
+            .bind(("pk", sorted))
+            .await
+            .unwrap();
+        let total: Option<u64> = result.take((0, "total")).unwrap();
+        assert_eq!(
+            total,
+            Some(1),
+            "event key must be rewritten to canonical order"
+        );
+    }
+
+    /// Released 0.1.x wheels predate canonical-on-write Multi dims; rows they
+    /// write into a v2-stamped database were never healed once the every-boot
+    /// scan became version-gated. v3 re-runs the heal once.
+    #[tokio::test]
+    async fn test_v3_reheals_rows_written_into_v2_database() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        set_schema_version(&storage.db, 2).await.unwrap();
+        storage
+            .db
+            .query(
+                "CREATE asset_partitions CONTENT { code_location_id: 'default', \
+                 asset_key: 'inv', partition_key: { variant: 'Multi', dims: \
+                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
+                 last_event_id: 'e1', last_run_id: 'r1', last_timestamp: 1 }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        run_migrations(&storage.db).await.unwrap();
+
+        assert_eq!(stored_schema_version(&storage.db).await.unwrap(), 3);
+        #[derive(Debug, SurrealValue)]
+        struct PkRow {
+            partition_key: PartitionKey,
+        }
+        let mut result = storage
+            .db
+            .query("SELECT partition_key FROM asset_partitions")
+            .await
+            .unwrap();
+        let rows: Vec<PkRow> = result.take(0).unwrap();
+        assert_eq!(rows.len(), 1);
+        let PartitionKey::Multi { dims } = &rows[0].partition_key else {
+            unreachable!()
+        };
+        assert_eq!(dims[0].0, "date", "v3 must re-heal post-v2 legacy writes");
+    }
+
+    /// Pre-guard databases can hold dynamic keys with display-reserved
+    /// characters. Renaming them silently would change user-visible keys, so
+    /// v3 records them for operator remediation instead.
+    #[tokio::test]
+    async fn test_v3_records_reserved_char_dynamic_keys() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        set_schema_version(&storage.db, 2).await.unwrap();
+        storage
+            .db
+            .query(
+                "CREATE dynamic_partitions CONTENT { code_location_id: 'default', \
+                 partitions_def_name: 'colors', partition_key: 'us|eu', \
+                 create_timestamp: 1 }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        run_migrations(&storage.db).await.unwrap();
+
+        let mut res = storage
+            .db
+            .query("SELECT * FROM kv WHERE key = $key")
+            .bind(("key", RESERVED_DYNAMIC_KEYS_KEY.to_string()))
+            .await
+            .unwrap();
+        let rows: Vec<DbKv> = res.take(0).unwrap();
+        assert_eq!(rows.len(), 1, "offending keys must be recorded in kv");
+        let body = String::from_utf8(rows[0].value.to_vec()).unwrap();
+        assert!(body.contains("colors") && body.contains("us|eu"), "{body}");
+    }
+
+    /// The heal's values come from a snapshot taken before its write loop, so
+    /// a live materialization can land newer pointers on the canonical row in
+    /// between — the upsert must not roll them back to snapshot values.
+    #[tokio::test]
+    async fn test_migration_upsert_never_rolls_back_newer_pointers() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let key = PartitionKey::Multi {
+            dims: vec![
+                ("date".to_string(), vec!["2024-01-01".to_string()]),
+                ("region".to_string(), vec!["eu".to_string()]),
+            ],
+        };
+        let row = |event: &str, ts: i64| DbAssetPartitionWrite {
+            code_location_id: "default".to_string(),
+            asset_key: "a".to_string(),
+            partition_key: key.clone(),
+            last_event_id: event.to_string(),
+            last_run_id: format!("run-{event}"),
+            last_timestamp: ts,
+        };
+        // The live writer's row lands first with newer pointers...
+        upsert_canonical_partition_row(&storage.db, row("ev-new", 200))
+            .await
+            .unwrap();
+        // ...then the migration applies its stale snapshot values.
+        upsert_canonical_partition_row(&storage.db, row("ev-old", 100))
+            .await
+            .unwrap();
+        #[derive(Debug, SurrealValue)]
+        struct Ptr {
+            last_event_id: String,
+            last_timestamp: i64,
+        }
+        let mut res = storage
+            .db
+            .query(
+                "SELECT last_event_id, last_timestamp FROM asset_partitions WHERE asset_key = 'a'",
+            )
+            .await
+            .unwrap();
+        let rows: Vec<Ptr> = res.take(0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_timestamp, 200, "newer pointers must survive");
+        assert_eq!(rows[0].last_event_id, "ev-new");
+    }
+
+    /// Two processes opening the same fresh/v1 remote database race the
+    /// stamp; a DELETE-then-CREATE pair aborts the loser on the kv unique
+    /// index, so the stamp must be a single upsert that both survive.
+    #[tokio::test]
+    async fn test_concurrent_schema_stamps_both_succeed() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let db_a = storage.db.clone();
+        let db_b = storage.db.clone();
+        let a = tokio::spawn(async move {
+            for _ in 0..25 {
+                set_schema_version(&db_a, 2).await?;
+            }
+            anyhow::Ok(())
+        });
+        let b = tokio::spawn(async move {
+            for _ in 0..25 {
+                set_schema_version(&db_b, 3).await?;
+            }
+            anyhow::Ok(())
+        });
+        a.await.unwrap().expect("stamp task A failed");
+        b.await.unwrap().expect("stamp task B failed");
+        let v = stored_schema_version(&storage.db).await.unwrap();
+        assert!(v == 2 || v == 3, "one of the stamps must win, got {v}");
+    }
+
+    /// A fresh database is stamped with the current schema version at
+    /// construction, so it never pays the legacy table scans again.
+    #[tokio::test]
+    async fn test_fresh_database_stamped_with_current_schema_version() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        assert_eq!(
+            stored_schema_version(&storage.db).await.unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    /// A database already at the current version must not re-run migrations:
+    /// a planted unsorted row stays untouched because the v1→v2 scan is
+    /// skipped entirely.
+    #[tokio::test]
+    async fn test_migrations_skip_when_version_is_current() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        storage
+            .db
+            .query(
+                "CREATE asset_partitions CONTENT { code_location_id: 'default', \
+                 asset_key: 'inv', partition_key: { variant: 'Multi', dims: \
+                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
+                 last_event_id: 'e1', last_run_id: 'r1', last_timestamp: 1 }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        // Simulate the next startup's migration pass.
+        run_migrations(&storage.db).await.unwrap();
+
+        #[derive(Debug, SurrealValue)]
+        struct PkRow {
+            partition_key: PartitionKey,
+        }
+        let mut result = storage
+            .db
+            .query("SELECT partition_key FROM asset_partitions")
+            .await
+            .unwrap();
+        let rows: Vec<PkRow> = result.take(0).unwrap();
+        assert_eq!(rows.len(), 1);
+        let PartitionKey::Multi { dims } = &rows[0].partition_key else {
+            unreachable!()
+        };
+        assert_eq!(
+            dims[0].0, "region",
+            "a database at the current version must not be rescanned"
+        );
+    }
+
+    /// A pre-versioning database (no schema_version key) is treated as v1:
+    /// the Multi-key migration runs once, then the version is stamped.
+    #[tokio::test]
+    async fn test_legacy_database_migrates_and_stamps_version() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        // Erase the stamp to simulate a database from before versioning.
+        storage
+            .db
+            .query("DELETE FROM kv WHERE key = $key")
+            .bind(("key", SCHEMA_VERSION_KEY.to_string()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        storage
+            .db
+            .query(
+                "CREATE asset_partitions CONTENT { code_location_id: 'default', \
+                 asset_key: 'inv', partition_key: { variant: 'Multi', dims: \
+                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
+                 last_event_id: 'e1', last_run_id: 'r1', last_timestamp: 1 }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        run_migrations(&storage.db).await.unwrap();
+
+        assert_eq!(
+            stored_schema_version(&storage.db).await.unwrap(),
+            SCHEMA_VERSION
+        );
+        let sorted = PartitionKey::Multi {
+            dims: vec![
+                ("date".to_string(), vec!["2024-01-01".to_string()]),
+                ("region".to_string(), vec!["eu".to_string()]),
+            ],
+        };
+        let parts = storage
+            .get_materialized_partitions(crate::storage::DEFAULT_CODE_LOCATION_ID, "inv")
+            .await
+            .unwrap();
+        assert_eq!(parts, vec![sorted], "legacy row canonicalized exactly once");
+    }
+
+    /// A crash mid-migration must never lose a partition: the canonical row
+    /// is written before any legacy row is deleted, so a pre-existing sorted
+    /// row is updated in place — its record id survives — and the stale
+    /// duplicate is only removed afterwards.
+    #[tokio::test]
+    async fn test_migration_never_deletes_the_canonical_row() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let sorted = PartitionKey::Multi {
+            dims: vec![
+                ("date".to_string(), vec!["2024-01-01".to_string()]),
+                ("region".to_string(), vec!["eu".to_string()]),
+            ],
+        };
+        storage
+            .upsert_asset_partitions(vec![DbAssetPartitionWrite {
+                code_location_id: cl.to_string(),
+                asset_key: "inv".to_string(),
+                partition_key: sorted.clone(),
+                last_event_id: "e1".to_string(),
+                last_run_id: "r1".to_string(),
+                last_timestamp: 1,
+            }])
+            .await
+            .unwrap();
+        #[derive(Debug, SurrealValue)]
+        struct IdRow {
+            id: RecordId,
+            last_event_id: String,
+            last_timestamp: i64,
+        }
+        let mut result = storage
+            .db
+            .query("SELECT id, last_event_id, last_timestamp FROM asset_partitions")
+            .await
+            .unwrap();
+        let before: Vec<IdRow> = result.take(0).unwrap();
+        assert_eq!(before.len(), 1);
+        let canonical_id = before[0].id.clone();
+        // Legacy duplicate with unsorted dims and newer values (raw CREATE
+        // bypasses the canonicalizing serializer).
+        storage
+            .db
+            .query(
+                "CREATE asset_partitions CONTENT { code_location_id: 'default', \
+                 asset_key: 'inv', partition_key: { variant: 'Multi', dims: \
+                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
+                 last_event_id: 'e9', last_run_id: 'r9', last_timestamp: 5 }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        migrate_multi_partition_key_order(&storage.db)
+            .await
+            .unwrap();
+
+        let mut result = storage
+            .db
+            .query("SELECT id, last_event_id, last_timestamp FROM asset_partitions")
+            .await
+            .unwrap();
+        let after: Vec<IdRow> = result.take(0).unwrap();
+        assert_eq!(after.len(), 1, "one canonical row survives");
+        assert_eq!(
+            after[0].id, canonical_id,
+            "the canonical row must be updated in place, never deleted"
+        );
+        assert_eq!(after[0].last_event_id, "e9", "newest row's values win");
+        assert_eq!(after[0].last_timestamp, 5);
+    }
+
     /// `store_events`/`store_event` upsert `asset_partitions` via `INSERT ... ON
     /// DUPLICATE KEY UPDATE`, which must fire on the table's UNIQUE
     /// (code_location_id, asset_key, partition_key) index — not the record id —
@@ -3865,6 +4629,118 @@ mod tests {
             ts,
             vec![(pk.clone(), 2)],
             "must update the existing row in place"
+        );
+    }
+
+    /// Per-partition lookups receive the display string; for Multi-partitioned
+    /// assets the persisted key is a Multi object — the lookup must still match.
+    #[tokio::test]
+    async fn test_partition_string_lookup_matches_multi_keys() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let pk = PartitionKey::Multi {
+            dims: vec![
+                ("date".to_string(), vec!["2024-01-01".to_string()]),
+                ("region".to_string(), vec!["eu".to_string()]),
+            ],
+        };
+        let mut event = make_event("inv", "r1", 100);
+        event.partition_key = Some(pk.clone());
+        storage.store_event(&event).await.unwrap();
+
+        let display = pk.to_display();
+        assert_eq!(display, "date=2024-01-01|region=eu");
+        let latest = storage
+            .get_latest_materialization(cl, "inv", Some(&display))
+            .await
+            .unwrap();
+        assert!(
+            latest.is_some(),
+            "display-form lookup must match the Multi event"
+        );
+        let events = storage
+            .get_partition_events(cl, "inv", &display, 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+
+        // Single-dim lookups keep working.
+        let mut single = make_event("inv", "r2", 200);
+        single.partition_key = Some(PartitionKey::Single {
+            keys: vec!["p1".to_string()],
+        });
+        storage.store_event(&single).await.unwrap();
+        assert!(
+            storage
+                .get_latest_materialization(cl, "inv", Some("p1"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// After a def-shape change, legacy Single events whose key strings look
+    /// like Multi displays can coexist with real Multi events for the same
+    /// asset. Display lookups must prefer the structured (Multi) reading —
+    /// not whichever row happens to be newest.
+    #[tokio::test]
+    async fn test_partition_string_lookup_prefers_structured_multi() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let multi = PartitionKey::Multi {
+            dims: vec![
+                ("date".to_string(), vec!["2024-01-01".to_string()]),
+                ("region".to_string(), vec!["eu".to_string()]),
+            ],
+        };
+        let display = multi.to_display();
+
+        // Legacy event from the asset's static-keyed era — NEWER timestamp.
+        let mut old_single = make_event("inv", "r1", 200);
+        old_single.partition_key = Some(PartitionKey::Single {
+            keys: vec![display.clone()],
+        });
+        storage.store_event(&old_single).await.unwrap();
+
+        let mut multi_event = make_event("inv", "r2", 100);
+        multi_event.partition_key = Some(multi.clone());
+        storage.store_event(&multi_event).await.unwrap();
+
+        let latest = storage
+            .get_latest_materialization(cl, "inv", Some(&display))
+            .await
+            .unwrap()
+            .expect("lookup must match");
+        assert_eq!(
+            latest.run_id, "r2",
+            "the structured Multi reading wins over a newer legacy Single row"
+        );
+        let events = storage
+            .get_partition_events(cl, "inv", &display, 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "only the Multi partition's events return");
+        assert_eq!(events[0].run_id, "r2");
+
+        // The Single reading still works when no Multi rows exist.
+        let mut plain = make_event("inv2", "r3", 100);
+        plain.partition_key = Some(PartitionKey::Single {
+            keys: vec![display.clone()],
+        });
+        storage.store_event(&plain).await.unwrap();
+        assert!(
+            storage
+                .get_latest_materialization(cl, "inv2", Some(&display))
+                .await
+                .unwrap()
+                .is_some(),
+            "falls back to the Single reading"
         );
     }
 
@@ -4258,6 +5134,30 @@ mod tests {
                 .unwrap()
                 .len(),
             3
+        );
+    }
+
+    /// Dynamic keys feed the canonical display form (`dim=v|dim=v`, values
+    /// joined with ','); the storage write path is the choke point for every
+    /// transport, so reserved separator characters and empty keys must be
+    /// rejected here.
+    #[tokio::test]
+    async fn test_add_dynamic_partitions_rejects_reserved_and_empty_keys() {
+        let storage = make_storage().await;
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        for bad in ["us|eu", "a,b", ""] {
+            let result = storage
+                .add_dynamic_partitions(cl, "users", &[bad.to_string()])
+                .await;
+            assert!(result.is_err(), "key {bad:?} must be rejected");
+        }
+        assert!(
+            storage
+                .get_dynamic_partitions(cl, "users")
+                .await
+                .unwrap()
+                .is_empty(),
+            "rejected keys must not be persisted"
         );
     }
 

@@ -250,6 +250,7 @@ async fn execute_job_with_multi_picker_fires_one_request_per_combination() {
             },
         ],
         asset_key: None,
+        truncated: false,
     };
     mount_to(target.clone(), move || {
         view! {

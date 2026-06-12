@@ -28,12 +28,12 @@ MISSING_KEY_MSG = (
 )
 
 INVALID_STATIC_GARBAGE_MSG = (
-    "Invalid partition_key Single { key: [\"garbage\"] } for asset 'part': "
+    "Invalid partition_key 'garbage' for asset 'part': "
     "not a member of its partition definition."
 )
 
 INVALID_TIMEWINDOW_MSG = (
-    "Invalid partition_key Single { key: [\"2023-12-25\"] } for asset 'part': "
+    "Invalid partition_key '2023-12-25' for asset 'part': "
     "not a member of its partition definition."
 )
 
@@ -214,7 +214,7 @@ GRPC_MISSING_KEY_MSG = _grpc_msg(
     "exclude them from selection."
 )
 GRPC_BAD_KEY_PART_ALPHA = _grpc_msg(
-    'Invalid partition_key Single { key: ["garbage"] } for asset '
+    "Invalid partition_key 'garbage' for asset "
     "'part_alpha': not a member of its partition definition."
 )
 
@@ -434,3 +434,196 @@ def test_grpc_execute_job_multi_partition_invalid_dimension_value_rejected(
 
     # No new run got queued.
     assert len(storage.get_runs(limit=10)) == runs_before
+
+
+# ---------------------------------------------------------------------------
+# Backfill boundary validation — explicit partition_keys must be validated
+# synchronously like `materialize` does, instead of persisting a
+# BackfillRecord that counts bogus keys and fails per-run later.
+# ---------------------------------------------------------------------------
+
+INVALID_BACKFILL_NOPE_MSG = (
+    "Invalid partition_key 'nope' for asset "
+    "'part': not a member of its partition definition."
+)
+UNPARTITIONED_BACKFILL_MSG = (
+    "Backfill partition_keys/partition_range require a partitioned selection; "
+    "no asset in the selection is partitioned."
+)
+
+
+def test_backfill_keys_on_unpartitioned_selection_rejected():
+    """partition_keys against an unpartitioned selection would bypass every
+    def-aware check (and PerDimension grouping would silently collapse to one
+    run) — reject it outright."""
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler())
+    def plain():
+        return 1
+
+    repo = rs.CodeRepository(assets=[plain], default_executor=rs.Executor.in_process())
+    with pytest.raises(ExecutionError) as exc:
+        repo.backfill(selection=["plain"], partition_keys=[rs.PartitionKey.single("a")])
+    assert str(exc.value) == UNPARTITIONED_BACKFILL_MSG
+    assert repo.storage.get_runs(limit=10) == []
+
+
+def test_per_dimension_on_unpartitioned_selection_rejected():
+    @rs.Asset(io_handler=rs.InMemoryIOHandler())
+    def plain():
+        return 1
+
+    repo = rs.CodeRepository(assets=[plain], default_executor=rs.Executor.in_process())
+    with pytest.raises(ExecutionError) as exc:
+        repo.backfill(
+            selection=["plain"],
+            partition_keys=[rs.PartitionKey.single("a")],
+            strategy=rs.BackfillStrategy.per_dimension(
+                multi_run=["x"], single_run=["y"]
+            ),
+        )
+    assert str(exc.value) == UNPARTITIONED_BACKFILL_MSG
+
+
+def test_backfill_invalid_explicit_key_raises():
+    pd = rs.PartitionsDefinition.static_(["a", "b"])
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler(), partitions_def=pd)
+    def part():
+        return 1
+
+    repo = rs.CodeRepository(assets=[part], default_executor=rs.Executor.in_process())
+
+    with pytest.raises(ExecutionError) as exc:
+        repo.backfill(
+            selection=["part"],
+            partition_keys=[
+                rs.PartitionKey.single("a"),
+                rs.PartitionKey.single("nope"),
+            ],
+        )
+    assert str(exc.value) == INVALID_BACKFILL_NOPE_MSG
+
+    # Rejected synchronously — nothing materialized, no runs created.
+    assert repo.storage.get_materialized_partitions("part") == []
+    assert repo.storage.get_runs(limit=10) == []
+
+
+def test_backfill_valid_explicit_keys_still_succeed():
+    pd = rs.PartitionsDefinition.static_(["a", "b"])
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler(), partitions_def=pd)
+    def part():
+        return 1
+
+    repo = rs.CodeRepository(assets=[part], default_executor=rs.Executor.in_process())
+    result = repo.backfill(
+        selection=["part"],
+        partition_keys=[rs.PartitionKey.single("a"), rs.PartitionKey.single("b")],
+    )
+    assert result.completed == 2
+
+
+def test_backfill_dry_run_also_validates():
+    pd = rs.PartitionsDefinition.static_(["a", "b"])
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler(), partitions_def=pd)
+    def part():
+        return 1
+
+    repo = rs.CodeRepository(assets=[part], default_executor=rs.Executor.in_process())
+    with pytest.raises(ExecutionError) as exc:
+        repo.backfill(
+            selection=["part"],
+            partition_keys=[rs.PartitionKey.single("nope")],
+            dry_run=True,
+        )
+    assert str(exc.value) == INVALID_BACKFILL_NOPE_MSG
+
+
+# ---------------------------------------------------------------------------
+# gRPC conversion strictness — malformed partition input is rejected with
+# INVALID_ARGUMENT at the boundary instead of being silently dropped
+# (kind-less keys), collapsed (duplicate dims), or coerced (unknown strategy
+# shorthand → MultiRun fan-out).
+#
+# Only one gRPC server runs per process (`_start_grpc_server` supersedes the
+# previous one), so these use the LAST module fixture started in file order:
+# `multi_partitioned_grpc_channel`. Conversion runs before any asset/def
+# validation, so the selection content is incidental.
+# ---------------------------------------------------------------------------
+
+
+def test_grpc_unknown_strategy_shorthand_rejected(multi_partitioned_grpc_channel):
+    channel, pb2, pb2_grpc, _, _ = multi_partitioned_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.LaunchBackfill(
+            pb2.LaunchBackfillRequest(
+                selection=["cell"],
+                partition_keys=[_multi_pk(pb2, color="r", size="s")],
+                strategy=pb2.BackfillStrategyProto(shorthand="Single_Run"),
+            )
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "unknown backfill strategy" in exc.value.details()
+
+
+def test_grpc_kindless_partition_key_rejected(multi_partitioned_grpc_channel):
+    channel, pb2, pb2_grpc, _, _ = multi_partitioned_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.LaunchBackfill(
+            pb2.LaunchBackfillRequest(
+                selection=["cell"],
+                # One valid key plus a kind-less one — previously the latter
+                # was silently filter_map'd away, shrinking the backfill.
+                partition_keys=[
+                    _multi_pk(pb2, color="r", size="s"),
+                    pb2.ProtoPartitionKey(),
+                ],
+            )
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "no kind set" in exc.value.details()
+
+
+def test_grpc_empty_single_partition_key_rejected(multi_partitioned_grpc_channel):
+    channel, pb2, pb2_grpc, _, _ = multi_partitioned_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.Materialize(
+            pb2.MaterializeRequest(
+                selection=["cell"],
+                partition_key=pb2.ProtoPartitionKey(
+                    single=pb2.SinglePartitionKey(keys=[])
+                ),
+            )
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "must not be empty" in exc.value.details()
+
+
+def test_grpc_duplicate_multi_dimension_rejected(multi_partitioned_grpc_channel):
+    channel, pb2, pb2_grpc, _, _ = multi_partitioned_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.Materialize(
+            pb2.MaterializeRequest(
+                selection=["cell"],
+                partition_key=pb2.ProtoPartitionKey(
+                    multi=pb2.MultiPartitionKey(
+                        dimensions=[
+                            pb2.MultiPartitionDimension(name="color", keys=["r"]),
+                            pb2.MultiPartitionDimension(name="color", keys=["g"]),
+                        ]
+                    )
+                ),
+            )
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "duplicate" in exc.value.details()

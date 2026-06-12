@@ -54,6 +54,29 @@ impl ConditionTickEngine {
             }
         };
 
+        // Advance partition universes: open time grids gain newly started
+        // windows; dynamic namespaces mirror storage (incl. retirements).
+        let mut dynamic_keys = std::collections::HashMap::new();
+        for ns in self.pass.dynamic_universe_namespaces() {
+            match self.storage.scoped().get_dynamic_partitions(&ns).await {
+                Ok(keys) => {
+                    dynamic_keys.insert(ns, keys.into_iter().collect());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "rivers::daemon",
+                        namespace = %ns,
+                        error = %e,
+                        "dynamic partition universe refresh failed"
+                    );
+                }
+            }
+        }
+        let universe_changed = self
+            .pass
+            .refresh_partition_universes(chrono::Local::now().naive_local(), &dynamic_keys);
+        let has_changes = has_changes || universe_changed;
+
         tracing::trace!(
             target: "rivers::dbg::cond",
             has_changes,

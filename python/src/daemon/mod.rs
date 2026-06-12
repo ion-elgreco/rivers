@@ -337,7 +337,13 @@ struct DaemonLoopConfig {
     schedule_infos: Vec<ScheduleInfo>,
     sensor_infos: Vec<SensorInfo>,
     asset_conditions: Vec<rivers_core::condition::AssetConditionInfo>,
-    upstream_partition_keys: HashMap<String, HashSet<rivers_core::storage::PartitionKey>>,
+    upstream_partition_keys: HashMap<
+        String,
+        (
+            HashSet<rivers_core::storage::PartitionKey>,
+            rivers_core::condition::PartitionUniverse,
+        ),
+    >,
     repo: Arc<Py<PyCodeRepository>>,
     storage: Arc<SurrealStorage>,
     cancel: CancellationToken,

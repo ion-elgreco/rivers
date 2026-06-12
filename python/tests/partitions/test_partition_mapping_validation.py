@@ -1,5 +1,6 @@
 """Tests for partition mapping validation during graph resolution."""
 
+import re
 from datetime import datetime
 from typing import Any
 
@@ -176,6 +177,242 @@ def test_time_window_mapping_upstream_not_time_window():
         match="TimeWindow mapping requires TimeWindow partitions on upstream",
     ):
         make_repo([upstream, downstream])
+
+
+def _tw_edge(down_def, up_def):
+    """Upstream→downstream pair joined by time_window(offset=-1)."""
+
+    @rs.Asset(partitions_def=up_def)
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=down_def,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.time_window(offset=-1),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream
+
+    return [upstream, downstream]
+
+
+def test_time_window_mapping_fmt_mismatch_rejected():
+    """Differing key formats: downstream keys can't reliably parse under the
+    upstream fmt — the eval path would silently drop them."""
+    down = rs.PartitionsDefinition.daily(start=DAILY_START)
+    up = rs.PartitionsDefinition.daily(start=DAILY_START, fmt="%d/%m/%Y")
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': time_window mapping "
+            "requires matching key formats: downstream fmt '%Y-%m-%d' != "
+            "upstream fmt '%d/%m/%Y'"
+        ),
+    ):
+        make_repo(_tw_edge(down, up))
+
+
+def test_time_window_mapping_phase_mismatch_rejected():
+    """Same interval but offset starts: every downstream key is off the
+    upstream grid even though the cadences match."""
+    fmt = "%Y-%m-%dT%H:%M:%S"
+    up = rs.PartitionsDefinition.time_window(
+        start=datetime(2024, 1, 1), interval_seconds=3600, fmt=fmt
+    )
+    down = rs.PartitionsDefinition.time_window(
+        start=datetime(2024, 1, 1, 0, 30), interval_seconds=3600, fmt=fmt
+    )
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': time_window mapping "
+            "requires the downstream grid to be a subgrid of the upstream "
+            "grid: downstream start 2024-01-01 00:30:00 is not aligned to "
+            "the upstream grid (start 2024-01-01 00:00:00, interval 3600s)"
+        ),
+    ):
+        make_repo(_tw_edge(down, up))
+
+
+def test_time_window_mapping_aligned_mixed_grid_kinds_allowed():
+    """A daily cron grid and an 86400s interval grid with the same anchor mint
+    identical keys — grid kind alone is no reason to reject the edge."""
+    fmt = "%Y-%m-%d"
+    up = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, cron_schedule="0 0 * * *", fmt=fmt
+    )
+    down = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, interval_seconds=86400, fmt=fmt
+    )
+    assert make_repo(_tw_edge(down, up)) is not None
+
+
+def test_time_window_mapping_misaligned_mixed_grid_kinds_rejected():
+    """An interval grid anchored off the cron grid's ticks mints keys that
+    never exist upstream."""
+    fmt = "%Y-%m-%dT%H:%M"
+    up = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, cron_schedule="0 0 * * *", fmt=fmt
+    )
+    down = rs.PartitionsDefinition.time_window(
+        start=datetime(2024, 1, 1, 0, 30), interval_seconds=86400, fmt=fmt
+    )
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape("is not on the upstream grid (cron '0 0 * * *')"),
+    ):
+        make_repo(_tw_edge(down, up))
+
+
+def test_equivalent_cron_spellings_allowed():
+    """'0 0 * * *' and its 6-field spelling '0 0 0 * * *' are one schedule;
+    textual comparison must not reject them."""
+    fmt = "%Y-%m-%d"
+    up = rs.PartitionsDefinition.daily(start=DAILY_START)
+    down = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, cron_schedule="0 0 0 * * *", fmt=fmt
+    )
+    assert make_repo(_identity_edge(down, up)) is not None
+
+
+def test_time_window_mapping_differing_cron_rejected():
+    fmt = "%Y-%m-%dT%H:00"
+    up = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, cron_schedule="0 0 * * *", fmt=fmt
+    )
+    down = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, cron_schedule="0 6 * * *", fmt=fmt
+    )
+    with pytest.raises(PartitionValidationError, match="is not on the upstream grid"):
+        make_repo(_tw_edge(down, up))
+
+
+def test_time_window_mapping_differing_ranges_allowed():
+    """Same grid with different start/end ranges is fine — range edges are a
+    per-key concern, not an edge-validity one."""
+    up = rs.PartitionsDefinition.daily(
+        start=datetime(2024, 1, 1), end=datetime(2024, 12, 31)
+    )
+    down = rs.PartitionsDefinition.daily(
+        start=datetime(2024, 2, 1), end=datetime(2024, 6, 30)
+    )
+    assert make_repo(_tw_edge(down, up)) is not None
+
+
+# ---------------------------------------------------------------------------
+# Both partitioned — Identity (default) grid compatibility
+# ---------------------------------------------------------------------------
+
+
+def _identity_edge(down_def, up_def):
+    """Upstream→downstream pair with no explicit mapping (Identity default)."""
+
+    @rs.Asset(partitions_def=up_def)
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(partitions_def=down_def)
+    def downstream(upstream: Any) -> Any:
+        return upstream
+
+    return [upstream, downstream]
+
+
+def test_identity_mapping_cross_cadence_rejected():
+    """Finer downstream over coarser upstream: most downstream keys don't
+    exist upstream — the persist-then-fail hole time_window(offset) had."""
+    fmt = "%Y-%m-%dT%H:00"
+    down = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, interval_seconds=3600, fmt=fmt
+    )
+    up = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, interval_seconds=21600, fmt=fmt
+    )
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': Identity mapping "
+            "requires the downstream grid to be a subgrid of the upstream "
+            "grid: downstream interval 3600s is not a multiple of upstream "
+            "interval 21600s"
+        ),
+    ):
+        make_repo(_identity_edge(down, up))
+
+
+def test_identity_mapping_fmt_mismatch_rejected():
+    down = rs.PartitionsDefinition.daily(start=DAILY_START)
+    up = rs.PartitionsDefinition.daily(start=DAILY_START, fmt="%d/%m/%Y")
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': Identity mapping "
+            "requires matching key formats: downstream fmt '%Y-%m-%d' != "
+            "upstream fmt '%d/%m/%Y'"
+        ),
+    ):
+        make_repo(_identity_edge(down, up))
+
+
+def test_identity_mapping_coarser_downstream_allowed():
+    """Coarser downstream over finer upstream is a valid subgrid: every
+    downstream key exists upstream."""
+    fmt = "%Y-%m-%dT%H:00"
+    down = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, interval_seconds=21600, fmt=fmt
+    )
+    up = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, interval_seconds=3600, fmt=fmt
+    )
+    assert make_repo(_identity_edge(down, up)) is not None
+
+
+def test_identity_mapping_static_disjoint_keys_rejected():
+    """A downstream static key the upstream lacks can never load its dep."""
+    down = rs.PartitionsDefinition.static_(["a", "x"])
+    up = rs.PartitionsDefinition.static_(["a", "b"])
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': Identity mapping "
+            "requires every downstream key to exist upstream; missing "
+            "upstream: x"
+        ),
+    ):
+        make_repo(_identity_edge(down, up))
+
+
+def test_identity_mapping_static_subset_allowed():
+    down = rs.PartitionsDefinition.static_(["a"])
+    up = rs.PartitionsDefinition.static_(["a", "b"])
+    assert make_repo(_identity_edge(down, up)) is not None
+
+
+def test_identity_mapping_dynamic_namespace_mismatch_rejected():
+    """Identity between different dynamic namespaces would look every
+    downstream key up in the wrong namespace — silently never matching."""
+    down = rs.PartitionsDefinition.dynamic("colors")
+    up = rs.PartitionsDefinition.dynamic("shapes")
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': Identity mapping "
+            "requires matching dynamic namespaces: downstream 'colors' != "
+            "upstream 'shapes'"
+        ),
+    ):
+        make_repo(_identity_edge(down, up))
+
+
+def test_identity_mapping_same_dynamic_namespace_allowed():
+    down = rs.PartitionsDefinition.dynamic("colors")
+    up = rs.PartitionsDefinition.dynamic("colors")
+    assert make_repo(_identity_edge(down, up)) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -984,6 +1221,72 @@ def test_task_partitioned_with_unpartitioned_upstream():
 
 
 # ---------------------------------------------------------------------------
+# Definitions are re-validated at resolve — the PyO3 per-variant constructors
+# (PartitionsDefinition.TimeWindow(...) etc.) bypass the factory staticmethods
+# and every construction-time guard with them.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_rejects_variant_constructed_def_bypassing_fmt_validation():
+    bad = rs.PartitionsDefinition.TimeWindow(
+        cron_schedule="0 * * * *",
+        interval_seconds=None,
+        start=datetime(2024, 1, 1),
+        end=None,
+        fmt="%Y-%m-%d",
+    )
+
+    @rs.Asset(partitions_def=bad)
+    def standalone() -> Any:
+        return 1
+
+    with pytest.raises(
+        PartitionValidationError, match="cannot represent the partition grid"
+    ):
+        make_repo([standalone])
+
+
+def test_resolve_rejects_variant_constructed_static_with_reserved_key():
+    bad = rs.PartitionsDefinition.Static(keys=["us|eu"])
+
+    @rs.Asset(partitions_def=bad)
+    def standalone() -> Any:
+        return 1
+
+    with pytest.raises(PartitionValidationError, match="reserved character"):
+        make_repo([standalone])
+
+
+def test_resolve_rejects_variant_constructed_multi_with_bad_dim_name():
+    bad = rs.PartitionsDefinition.Multi(
+        dimensions=[("a=b", rs.PartitionsDefinition.static_(["x"]))]
+    )
+
+    @rs.Asset(partitions_def=bad)
+    def standalone() -> Any:
+        return 1
+
+    with pytest.raises(PartitionValidationError, match="reserved character"):
+        make_repo([standalone])
+
+
+def test_factory_constructed_defs_resolve_fine():
+    """The re-validation must not reject anything the factories produce."""
+    pd = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.daily(start=DAILY_START),
+            "region": rs.PartitionsDefinition.static_(["us", "eu"]),
+        }
+    )
+
+    @rs.Asset(partitions_def=pd)
+    def standalone() -> Any:
+        return 1
+
+    assert make_repo([standalone]) is not None
+
+
+# ---------------------------------------------------------------------------
 # Multi-dimensional partitions
 # ---------------------------------------------------------------------------
 
@@ -1007,6 +1310,73 @@ def test_multi_partitions_identity():
 
     repo = make_repo([upstream, downstream])
     assert repo is not None
+
+
+def test_identity_multi_mismatched_dim_names_rejected():
+    """Identity between Multi defs with different dimension names must fail resolve."""
+    down = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.static_(["2024-01"]),
+            "country": rs.PartitionsDefinition.static_(["us", "eu"]),
+        }
+    )
+    up = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.static_(["2024-01"]),
+            "region": rs.PartitionsDefinition.static_(["us", "eu"]),
+        }
+    )
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': Identity mapping requires "
+            "matching Multi dimensions: downstream [country, date] != upstream "
+            "[date, region]"
+        ),
+    ):
+        make_repo(_identity_edge(down, up))
+
+
+def test_identity_multi_incompatible_dim_def_rejected():
+    """Identity between Multi defs recurses into each dimension's pair."""
+    down = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.static_(["2024-01"]),
+            "region": rs.PartitionsDefinition.static_(["us", "mars"]),
+        }
+    )
+    up = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.static_(["2024-01"]),
+            "region": rs.PartitionsDefinition.static_(["us", "eu"]),
+        }
+    )
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "in dimension 'region': Identity mapping requires every downstream "
+            "key to exist upstream; missing upstream: mars"
+        ),
+    ):
+        make_repo(_identity_edge(down, up))
+
+
+def test_identity_multi_cross_grid_dim_rejected():
+    """Per-dimension recursion applies grid compatibility to time dims."""
+    down = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.daily(start=DAILY_START),
+            "region": rs.PartitionsDefinition.static_(["us"]),
+        }
+    )
+    up = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.hourly(start=DAILY_START),
+            "region": rs.PartitionsDefinition.static_(["us"]),
+        }
+    )
+    with pytest.raises(PartitionValidationError, match="in dimension 'date'"):
+        make_repo(_identity_edge(down, up))
 
 
 def test_multi_partitions_explicit_identity_mapping():
@@ -1914,6 +2284,89 @@ def test_multi_to_single_downstream_multi_upstream_single():
     make_repo([upstream, downstream])
 
 
+def test_multi_to_single_downstream_multi_inner_orientation():
+    """Downstream-Multi: the inner mapping's downstream is the named DIM and
+    its upstream is the single def — a coarser dim over a finer upstream is
+    a valid subgrid and must validate."""
+    fmt = "%Y-%m-%dT%H:00"
+    multi_parts = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.time_window(
+                start=DAILY_START, interval_seconds=21600, fmt=fmt
+            ),
+            "region": rs.PartitionsDefinition.static_(STATIC_KEYS),
+        }
+    )
+    hourly = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, interval_seconds=3600, fmt=fmt
+    )
+
+    @rs.Asset(partitions_def=hourly)
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=multi_parts,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.multi_to_single(
+                    dimension_name="date",
+                    partition_mapping=rs.PartitionMapping.time_window(offset=-1),
+                ),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream + 1
+
+    assert make_repo([upstream, downstream]) is not None
+
+
+def test_multi_to_single_downstream_multi_finer_dim_rejected():
+    """Downstream-Multi with a FINER time dim than the single upstream: the
+    inner subgrid check must reject it in the true orientation."""
+    fmt = "%Y-%m-%dT%H:00"
+    multi_parts = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.time_window(
+                start=DAILY_START, interval_seconds=3600, fmt=fmt
+            ),
+            "region": rs.PartitionsDefinition.static_(STATIC_KEYS),
+        }
+    )
+    six_hourly = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, interval_seconds=21600, fmt=fmt
+    )
+
+    @rs.Asset(partitions_def=six_hourly)
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=multi_parts,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.multi_to_single(
+                    dimension_name="date",
+                    partition_mapping=rs.PartitionMapping.time_window(offset=-1),
+                ),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream + 1
+
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "downstream interval 3600s is not a multiple of upstream interval 21600s"
+        ),
+    ):
+        make_repo([upstream, downstream])
+
+
 def test_multi_to_single_dimension_not_found():
     """MultiToSingle fails when the named dimension doesn't exist."""
     multi_parts = rs.PartitionsDefinition.multi(
@@ -2336,8 +2789,9 @@ def test_forkeys_invalid_key_rejected():
         make_repo([upstream, downstream])
 
 
-def test_forkeys_range_not_validated_against_def():
-    """ForKeys with a range selector is accepted without validating range bounds."""
+def test_forkeys_range_unknown_endpoints_rejected():
+    """Range selector endpoints must be partition keys of the downstream def
+    — an unknown endpoint would otherwise silently match nothing."""
     parts = rs.PartitionsDefinition.static_(STATIC_KEYS)
 
     @rs.Asset
@@ -2358,7 +2812,193 @@ def test_forkeys_range_not_validated_against_def():
     def downstream(upstream: Any) -> Any:
         return upstream
 
-    # Range selectors are not validated — this should succeed
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': "
+            "Range endpoint 'x' is not a partition key"
+        ),
+    ):
+        make_repo([upstream, downstream])
+
+
+def test_forkeys_range_inverted_rejected():
+    """An inverted range would silently Skip every downstream key — surface
+    the swapped endpoints at resolve time instead."""
+    parts = rs.PartitionsDefinition.static_(STATIC_KEYS)
+
+    @rs.Asset
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=parts,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.for_keys(
+                    [rs.PartitionKeyRange.single(from_key="c", to_key="a")]
+                ),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream
+
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': from_key 'c' is after to_key 'a'"
+        ),
+    ):
+        make_repo([upstream, downstream])
+
+
+def _multi_parts():
+    return rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.static_(["2024-01-01", "2024-01-02"]),
+            "region": rs.PartitionsDefinition.static_(["us", "eu"]),
+        }
+    )
+
+
+def test_forkeys_multi_unknown_dimension_rejected():
+    """A multi-range selector naming a dimension the downstream doesn't have
+    can never match a key — every downstream partition would silently Skip
+    its dep. Surface the typo at resolve time."""
+    parts = _multi_parts()
+
+    @rs.Asset
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=parts,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.for_keys(
+                    [rs.PartitionKeyRange.multi({"regon": ["us"]})]
+                ),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream
+
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': "
+            "Unknown dimension 'regon' in partition range; "
+            "available dimensions: 'date', 'region'"
+        ),
+    ):
+        make_repo([upstream, downstream])
+
+
+def test_forkeys_multi_keys_selector_unknown_key_rejected():
+    """Keys sub-selectors must be validated like Range endpoints — a bogus
+    key silently matches nothing."""
+    parts = _multi_parts()
+
+    @rs.Asset
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=parts,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.for_keys(
+                    [rs.PartitionKeyRange.multi({"region": ["mars"]})]
+                ),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream
+
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': "
+            "'mars' is not a partition key of dimension 'region'"
+        ),
+    ):
+        make_repo([upstream, downstream])
+
+
+def test_forkeys_single_range_on_multi_def_rejected():
+    """A single-dim range can never match a Multi key (contains() returns
+    False for the shape) — the edge must be rejected at resolve, not left to
+    silently skip every dep load."""
+    parts = _multi_parts()
+
+    @rs.Asset
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=parts,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.for_keys(
+                    [
+                        rs.PartitionKeyRange.single(
+                            from_key="2024-01-01", to_key="2024-01-02"
+                        )
+                    ]
+                ),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream
+
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape(
+            "Asset 'downstream' depends on 'upstream': a single-dimension "
+            "range cannot select from Multi partitions; use "
+            "PartitionKeyRange.multi() with dimensions: date, region"
+        ),
+    ):
+        make_repo([upstream, downstream])
+
+
+def test_forkeys_multi_valid_selectors_accepted():
+    """Valid multi selectors (Range + Keys) pass the new validation."""
+    parts = _multi_parts()
+
+    @rs.Asset
+    def upstream() -> Any:
+        return 1
+
+    @rs.Asset(
+        partitions_def=parts,
+        deps=[
+            rs.AssetDef.input(
+                "upstream",
+                partition_mapping=rs.PartitionMapping.for_keys(
+                    [
+                        rs.PartitionKeyRange.multi(
+                            {
+                                "date": ("2024-01-01", "2024-01-02"),
+                                "region": ["us"],
+                            }
+                        )
+                    ]
+                ),
+            )
+        ],
+    )
+    def downstream(upstream: Any) -> Any:
+        return upstream
+
     make_repo([upstream, downstream])
 
 

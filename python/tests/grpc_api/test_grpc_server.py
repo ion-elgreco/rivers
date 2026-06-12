@@ -525,6 +525,91 @@ def test_launch_backfill_dry_run(backfill_grpc_channel):
     assert response.num_partitions == 1
 
 
+@pytest.fixture
+def multi_backfill_grpc_channel(grpc_stubs, storage):
+    """gRPC server with a Multi-partitioned asset for strategy validation."""
+    handler = DictIOHandler()
+    pd = rs.PartitionsDefinition.multi(
+        {
+            "date": rs.PartitionsDefinition.static_(["d1", "d2"]),
+            "region": rs.PartitionsDefinition.static_(["eu", "us"]),
+        }
+    )
+
+    @rs.Asset(io_handler=handler, partitions_def=pd)
+    def multi_asset(context: rs.AssetExecutionContext):
+        return context.partition_key
+
+    repo = rs.CodeRepository(
+        assets=[multi_asset],
+        default_executor=rs.Executor.in_process(),
+    )
+    repo.resolve(storage=storage)
+    port = repo._start_grpc_server("127.0.0.1", 0)
+
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+
+    pb2, pb2_grpc = grpc_stubs
+    yield channel, pb2, pb2_grpc
+    channel.close()
+    repo._stop_grpc_server()
+
+
+def _multi_partition_key(pb2, date: str, region: str):
+    return pb2.ProtoPartitionKey(
+        multi=pb2.MultiPartitionKey(
+            dimensions=[
+                pb2.MultiPartitionDimension(name="date", keys=[date]),
+                pb2.MultiPartitionDimension(name="region", keys=[region]),
+            ]
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "multi_run, single_run, message",
+    [
+        ([], ["region"], "multi_run must contain at least one dimension"),
+        (["date"], [], "single_run must contain at least one dimension"),
+        (
+            ["date"],
+            ["date"],
+            "dimension 'date' cannot be in both multi_run and single_run",
+        ),
+    ],
+)
+def test_launch_backfill_per_dimension_invariants_enforced(
+    multi_backfill_grpc_channel, multi_run, single_run, message
+):
+    """The proto path must enforce the same PerDimension invariants as the
+    Python constructor — an empty multi_run list otherwise collapses the
+    whole backfill into a single run."""
+    channel, pb2, pb2_grpc = multi_backfill_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    with pytest.raises(grpc.RpcError) as exc_info:
+        stub.LaunchBackfill(
+            pb2.LaunchBackfillRequest(
+                selection=["multi_asset"],
+                partition_keys=[
+                    _multi_partition_key(pb2, "d1", "eu"),
+                    _multi_partition_key(pb2, "d2", "us"),
+                ],
+                strategy=pb2.BackfillStrategyProto(
+                    per_dimension=pb2.PerDimensionStrategy(
+                        multi_run_dimensions=multi_run,
+                        single_run_dimensions=single_run,
+                    )
+                ),
+                failure_policy="continue",
+                max_concurrency=1,
+                dry_run=True,
+            )
+        )
+    assert message in exc_info.value.details()
+
+
 def test_get_backfill_status(backfill_grpc_channel):
     channel, pb2, pb2_grpc, _, _ = backfill_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)

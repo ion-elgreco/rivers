@@ -253,10 +253,12 @@ class TestDaemonBackfillPriority:
             partition_key=rs.PartitionKey.single("b"),
         )
 
+        # Per-partition dep matching: the upstream re-materializations must
+        # land within one tick window to dispatch as a single backfill.
         daemon = AutomationDaemon(
             repo=repo,
             storage=storage,
-            condition_eval_interval="1s",
+            condition_eval_interval="3s",
         )
         daemon.start()
         try:

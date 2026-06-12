@@ -132,6 +132,49 @@ def test_time_window_six_field_cron():
     ]
 
 
+def test_time_window_fmt_must_roundtrip_grid():
+    """A fmt coarser than the grid collapses distinct windows into one key
+    string — enumerate yields duplicates and backfills double-dispatch."""
+    # Hourly cron with a date-only fmt: 24 windows share each key.
+    with pytest.raises(
+        PartitionDefinitionError, match="cannot represent the partition grid"
+    ):
+        rs.PartitionsDefinition.time_window(
+            datetime.datetime(2024, 1, 1),
+            cron_schedule="0 * * * *",
+            fmt="%Y-%m-%d",
+        )
+    # Sub-second interval with the second-grained default fmt.
+    with pytest.raises(
+        PartitionDefinitionError, match="cannot represent the partition grid"
+    ):
+        rs.PartitionsDefinition.time_window(
+            datetime.datetime(2024, 1, 1), interval_seconds=0.5
+        )
+
+
+def test_daily_fmt_override_must_roundtrip():
+    """daily(fmt='%Y-%m') collapses ~30 windows per key."""
+    with pytest.raises(
+        PartitionDefinitionError, match="cannot represent the partition grid"
+    ):
+        rs.PartitionsDefinition.daily(datetime.datetime(2024, 1, 1), fmt="%Y-%m")
+
+
+def test_coarse_fmt_on_equally_coarse_grid_allowed():
+    """A coarse fmt is fine when the grid is equally coarse."""
+    pd = rs.PartitionsDefinition.time_window(
+        datetime.datetime(2024, 1, 1),
+        cron_schedule="0 0 1 * *",
+        fmt="%Y-%m",
+        end=datetime.datetime(2024, 4, 1),
+    )
+    keys = [
+        k.key for k in pd.get_partition_keys() if isinstance(k, rs.PartitionKey.Single)
+    ]
+    assert keys == [["2024-01"], ["2024-02"], ["2024-03"]]
+
+
 def test_time_window_requires_schedule_or_interval():
     """TimeWindow requires either cron_schedule or interval_seconds."""
     with pytest.raises(PartitionDefinitionError):
@@ -210,3 +253,177 @@ def test_dynamic_construction():
     """Dynamic partitions can be created with a name."""
     dyn = rs.PartitionsDefinition.dynamic("my_set")
     assert isinstance(dyn, rs.PartitionsDefinition.Dynamic)
+
+
+# ---------------------------------------------------------------------------
+# Empty keys never validate — empty vectors otherwise pass via vacuous
+# iteration (`all()` / a never-entered loop) on every kind.
+# ---------------------------------------------------------------------------
+
+
+def test_empty_single_key_invalid_for_static():
+    pd = rs.PartitionsDefinition.static_(["a", "b"])
+    pk = rs.PartitionKey.from_json('{"single":[]}')
+    assert pd.validate_partition_key(pk) is False
+
+
+def test_empty_single_key_invalid_for_timewindow():
+    pd = rs.PartitionsDefinition.daily(
+        start=datetime.datetime(2024, 1, 1), end=datetime.datetime(2024, 1, 5)
+    )
+    pk = rs.PartitionKey.from_json('{"single":[]}')
+    assert pd.validate_partition_key(pk) is False
+
+
+def test_empty_single_key_invalid_for_dynamic():
+    pd = rs.PartitionsDefinition.dynamic("users")
+    pk = rs.PartitionKey.from_json('{"single":[]}')
+    assert pd.validate_partition_key(pk) is False
+
+
+def test_empty_dim_values_invalid_for_multi():
+    pd = rs.PartitionsDefinition.multi(
+        {"region": rs.PartitionsDefinition.static_(["us"])}
+    )
+    pk = rs.PartitionKey.from_json('{"multi":{"region":[]}}')
+    assert pd.validate_partition_key(pk) is False
+
+
+def test_multi_key_with_extra_dimension_invalid():
+    """A key carrying a dimension the def doesn't declare must not validate —
+    the def-dims loop can't see extra dims."""
+    pd = rs.PartitionsDefinition.multi(
+        {"region": rs.PartitionsDefinition.static_(["us"])}
+    )
+    key = rs.PartitionKey.multi({"region": "us", "bogus": "x"})
+    assert pd.validate_partition_key(key) is False
+
+
+def test_empty_set_key_invalid():
+    pd = rs.PartitionsDefinition.static_(["a"])
+    pk = rs.PartitionKey.from_json('{"set":[]}')
+    assert pd.validate_partition_key(pk) is False
+
+
+# ---------------------------------------------------------------------------
+# '|' separates dimensions and ',' separates values in the canonical display
+# form (`dim=v|dim=v`); keys containing them cannot round-trip through
+# partition-string lookups, so they are rejected at construction.
+# ---------------------------------------------------------------------------
+
+
+def test_static_key_with_reserved_char_rejected():
+    for key in ("us|eu", "a,b"):
+        with pytest.raises(PartitionDefinitionError, match="reserved character"):
+            rs.PartitionsDefinition.static_([key])
+
+
+def test_time_window_fmt_must_round_trip_beyond_first_ticks():
+    """A month-grain fmt over a 31-day interval survives the first two ticks
+    (Jan 1, Feb 1 both land on month starts) but drifts at tick 2 (Mar 3):
+    enumerate would mint '2024-03', which the definition's own key validation
+    rejects. Construction must catch drift past the first ticks."""
+    with pytest.raises(
+        PartitionDefinitionError, match="cannot represent the partition grid"
+    ):
+        rs.PartitionsDefinition.time_window(
+            start=datetime.datetime(2024, 1, 1),
+            interval_seconds=31.0 * 86400.0,
+            fmt="%Y-%m",
+        )
+
+
+def test_time_window_interval_coarser_than_horizon_accepted():
+    """No false rejection when ticks are sparse: a day-grain fmt represents
+    whole-day interval ticks exactly, however far apart they are."""
+    pd = rs.PartitionsDefinition.time_window(
+        start=datetime.datetime(2024, 1, 1),
+        interval_seconds=400.0 * 86400.0,
+        fmt="%Y-%m-%d",
+    )
+    assert pd is not None
+
+
+def test_static_rejects_empty_string_key():
+    """Empty key strings render as nothing in the display form and are
+    unreachable via string lookups — same guard as the dynamic write path."""
+    for keys in ([""], ["a", ""]):
+        with pytest.raises(PartitionDefinitionError, match="must not be empty"):
+            rs.PartitionsDefinition.static_(keys)
+
+
+def test_multi_dim_name_with_reserved_char_rejected():
+    """Dim names also sit left of '=' in `dim=value` segments, so '=' is
+    reserved for them as well."""
+    inner = rs.PartitionsDefinition.static_(["x"])
+    for name in ("a|b", "a,b", "a=b"):
+        with pytest.raises(PartitionDefinitionError, match="reserved character"):
+            rs.PartitionsDefinition.multi({name: inner})
+
+
+def test_multi_empty_dim_name_rejected():
+    inner = rs.PartitionsDefinition.static_(["x"])
+    with pytest.raises(PartitionDefinitionError, match="cannot be empty"):
+        rs.PartitionsDefinition.multi({"": inner})
+
+
+def test_time_window_fmt_with_reserved_char_rejected():
+    """A fmt whose rendered keys contain '|' breaks display parsing."""
+    with pytest.raises(PartitionDefinitionError, match="reserved character"):
+        rs.PartitionsDefinition.time_window(
+            start=datetime.datetime(2024, 1, 1),
+            interval_seconds=3600.0,
+            fmt="%Y|%m-%dT%H:%M:%S",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Non-positive / sub-nanosecond intervals are rejected at construction —
+# interval_ns == 0 would otherwise panic on `n % 0` during key validation.
+# ---------------------------------------------------------------------------
+
+
+def test_time_window_zero_interval_rejected():
+    with pytest.raises(PartitionDefinitionError, match="interval_seconds"):
+        rs.PartitionsDefinition.time_window(
+            start=datetime.datetime(2024, 1, 1), interval_seconds=0.0
+        )
+
+
+def test_time_window_negative_interval_rejected():
+    with pytest.raises(PartitionDefinitionError, match="interval_seconds"):
+        rs.PartitionsDefinition.time_window(
+            start=datetime.datetime(2024, 1, 1), interval_seconds=-3600.0
+        )
+
+
+def test_time_window_sub_nanosecond_interval_rejected():
+    """1e-12 seconds is positive but truncates to 0 nanoseconds internally."""
+    with pytest.raises(PartitionDefinitionError, match="interval_seconds"):
+        rs.PartitionsDefinition.time_window(
+            start=datetime.datetime(2024, 1, 1), interval_seconds=1e-12
+        )
+
+
+def test_time_window_subsecond_cron_start_rejected_despite_fraction_fmt():
+    """A fraction-preserving fmt round-trips sub-second cron ticks, so the
+    fmt check alone cannot catch them — but the condition engine's cron grid
+    walks whole seconds and would never match the minted keys. The guard must
+    be explicit, not an artifact of the fmt."""
+    with pytest.raises(PartitionDefinitionError, match="whole second"):
+        rs.PartitionsDefinition.time_window(
+            start=datetime.datetime(2024, 1, 1, microsecond=500),
+            cron_schedule="0 * * * *",
+            fmt="%Y-%m-%dT%H:%M:%S%.f",
+        )
+
+
+def test_time_window_subsecond_cron_start_rejected():
+    """A start with sub-second precision puts every cron tick off the whole-
+    second grid; cron schedules are second-granular, so construction rejects
+    the start outright."""
+    with pytest.raises(PartitionDefinitionError, match="whole second"):
+        rs.PartitionsDefinition.time_window(
+            start=datetime.datetime(2024, 1, 1, microsecond=500),
+            cron_schedule="0 * * * *",
+        )

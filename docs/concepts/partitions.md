@@ -58,7 +58,11 @@ rs.PartitionsDefinition.time_window(
 )
 ```
 
-`cron_schedule` accepts 5 fields (`min hour dom mon dow`) or 6 fields with leading seconds (`sec min hour dom mon dow`). The `fmt` parameter controls the partition key format string (default: `"%Y-%m-%d"` for daily, `"%Y-%m-%d-%H:%M"` for hourly).
+`cron_schedule` accepts 5 fields (`min hour dom mon dow`) or 6 fields with leading seconds (`sec min hour dom mon dow`). The `fmt` parameter controls the partition key format string (default: `"%Y-%m-%d"` for daily, `"%Y-%m-%dT%H:00"` for hourly).
+
+`start`/`end` are tz-naive: keys are wall-clock labels on the naive timeline,
+so the grid is identical on every host timezone and DST transitions neither
+drop nor duplicate keys.
 
 ### Multi-dimensional partitions
 
@@ -92,6 +96,11 @@ repo.storage.add_dynamic_partitions("customers", ["acme", "globex"])
 ```
 
 Dynamic partitions are useful when the key set is discovered at runtime (new tenants, new files, new symbols).
+
+Keys must be registered **before** they can be materialized or backfilled —
+submitting a key that isn't in storage (a typo, or one deleted via
+`delete_dynamic_partition`) is rejected at the boundary with a precise error
+instead of recording a materialization for a partition that doesn't exist.
 
 ## Partition keys
 

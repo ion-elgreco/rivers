@@ -93,11 +93,167 @@ fn validate_partition_for_selection<'a>(
     for (name, pd) in &partitioned {
         if !pd.validate_partition_key(pk)? {
             return Err(ExecutionError::new_err(format!(
-                "Invalid partition_key {:?} for asset '{}': not a member of its \
+                "Invalid partition_key '{}' for asset '{}': not a member of its \
                  partition definition.",
-                pk, name
+                PartitionKey::from(pk).to_display(),
+                name
             )));
         }
+    }
+    Ok(())
+}
+
+/// Storage-side companion to [`validate_partition_for_selection`]: a Dynamic
+/// def can't validate membership statically (its keys live in storage), so
+/// collect the `(asset, namespace, keys)` triples to verify against
+/// `dynamic_partitions` once the state lock is released.
+type DynamicKeyCheck = (String, String, Vec<String>);
+
+fn dynamic_partition_checks<'a, I>(
+    state: &'a ResolvedState,
+    asset_names: I,
+    partition_key: Option<&PyPartitionKey>,
+) -> Vec<DynamicKeyCheck>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let Some(pk) = partition_key else {
+        return Vec::new();
+    };
+    iter_partitioned_assets(&state.node_map, asset_names)
+        .into_iter()
+        .flat_map(|(name, pd)| {
+            collect_dynamic_namespaces(pd, pk)
+                .into_iter()
+                .map(|(ns, keys)| (name.to_string(), ns, keys))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// `(namespace, key values)` pairs a key must have registered in storage to
+/// be valid for `pd` — the Dynamic def itself and any Dynamic dimension of a
+/// Multi def. Shape mismatches are already rejected by
+/// `validate_partition_key`, so unmatched shapes yield nothing here.
+fn collect_dynamic_namespaces(
+    pd: &PartitionsDefinition,
+    pk: &PyPartitionKey,
+) -> Vec<(String, Vec<String>)> {
+    match (pd, pk) {
+        (PartitionsDefinition::Dynamic { name }, PyPartitionKey::Single { key }) => {
+            vec![(name.clone(), key.clone())]
+        }
+        (PartitionsDefinition::Multi { dimensions }, PyPartitionKey::Multi { keys }) => dimensions
+            .iter()
+            .filter_map(|(dim, dim_def)| match dim_def {
+                PartitionsDefinition::Dynamic { name } => {
+                    keys.get(dim).map(|vals| (name.clone(), vals.clone()))
+                }
+                _ => None,
+            })
+            .collect(),
+        (_, PyPartitionKey::Set { keys }) => keys
+            .iter()
+            .flat_map(|k| collect_dynamic_namespaces(pd, k))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// PerDimension only groups what it can see: an unknown dimension name (or a
+/// non-Multi def, whose keys carry no dimensions at all) matches nothing, so
+/// every key would get the same empty group key and the whole backfill would
+/// silently collapse into ONE run. Reject the strategy against the
+/// selection's partition defs instead.
+fn validate_backfill_strategy(
+    strategy: &PyBackfillStrategy,
+    state: &ResolvedState,
+    selection: &[String],
+) -> PyResult<()> {
+    let PyBackfillStrategy::PerDimension {
+        multi_run_dims,
+        single_run_dims,
+    } = strategy
+    else {
+        return Ok(());
+    };
+    // Same invariants as BackfillStrategy.per_dimension() — strategies built
+    // from the proto path skip the constructor, and an empty multi_run list
+    // would collapse the whole backfill into a single run.
+    if multi_run_dims.is_empty() {
+        return Err(ExecutionError::new_err(
+            "multi_run must contain at least one dimension",
+        ));
+    }
+    if single_run_dims.is_empty() {
+        return Err(ExecutionError::new_err(
+            "single_run must contain at least one dimension",
+        ));
+    }
+    for dim in multi_run_dims {
+        if single_run_dims.contains(dim) {
+            return Err(ExecutionError::new_err(format!(
+                "dimension '{dim}' cannot be in both multi_run and single_run"
+            )));
+        }
+    }
+    let partitioned =
+        iter_partitioned_assets(&state.node_map, selection.iter().map(String::as_str));
+    for (asset, pd) in &partitioned {
+        let PartitionsDefinition::Multi { dimensions } = pd else {
+            return Err(ExecutionError::new_err(format!(
+                "BackfillStrategy.per_dimension requires Multi-partitioned assets; \
+                 asset '{asset}' is not Multi-partitioned"
+            )));
+        };
+        for dim in multi_run_dims.iter().chain(single_run_dims.iter()) {
+            if !dimensions.iter().any(|(name, _)| name == dim) {
+                return Err(ExecutionError::new_err(format!(
+                    "BackfillStrategy.per_dimension references dimension '{dim}', \
+                     which is not a dimension of asset '{asset}'"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Storage-backed membership check: returns the `(asset, ns, key)` triples
+/// that are NOT registered. Storage failures propagate — an unreachable
+/// store says nothing about whether a key is retired.
+async fn unregistered_dynamic_keys(
+    storage: &SurrealStorage,
+    code_location_id: &str,
+    checks: &[DynamicKeyCheck],
+) -> PyResult<Vec<(String, String, String)>> {
+    let ctx = rivers_core::storage::CodeLocationContext::new(code_location_id);
+    let scoped = storage.for_code_location(&ctx);
+    let mut missing = Vec::new();
+    for (asset, ns, keys) in checks {
+        for key in keys {
+            let known = scoped.has_dynamic_partition(ns, key).await.map_err(|e| {
+                ExecutionError::new_err(format!("Failed to check dynamic partition '{key}': {e}"))
+            })?;
+            if !known {
+                missing.push((asset.clone(), ns.clone(), key.clone()));
+            }
+        }
+    }
+    Ok(missing)
+}
+
+async fn verify_dynamic_partition_keys(
+    storage: &SurrealStorage,
+    code_location_id: &str,
+    checks: &[DynamicKeyCheck],
+) -> PyResult<()> {
+    let missing = unregistered_dynamic_keys(storage, code_location_id, checks).await?;
+    if let Some((asset, ns, key)) = missing.first() {
+        return Err(ExecutionError::new_err(format!(
+            "Invalid partition_key '{key}' for asset '{asset}': not a registered \
+             dynamic partition key of namespace '{ns}'. Register it with \
+             add_dynamic_partitions(\"{ns}\", [...]) first."
+        )));
     }
     Ok(())
 }
@@ -1012,9 +1168,25 @@ pub(crate) fn build_unresolved_graph(
 /// - If downstream is partitioned and upstream is NOT partitioned, no mapping needed (unpartitioned dep is shared)
 /// - If downstream is NOT partitioned and upstream IS partitioned, error (need AllPartitions mapping)
 fn validate_partition_mappings(
+    py: Python,
     node_map: &HashMap<String, ResolvedNode>,
     unresolved_graph: &BTreeMap<String, Vec<NodeRef>>,
 ) -> PyResult<()> {
+    // PyO3's per-variant constructors bypass the factory validation, so the
+    // resolve boundary re-checks every definition before edge validation.
+    let mut names: Vec<&String> = node_map.keys().collect();
+    names.sort_unstable();
+    for node_name in names {
+        if let Some(def) = node_map[node_name].partitions_def() {
+            def.validate_definition().map_err(|e| {
+                PartitionValidationError::new_err(format!(
+                    "Asset '{}': invalid partitions definition: {}",
+                    node_name,
+                    e.value(py)
+                ))
+            })?;
+        }
+    }
     for (node_name, deps) in unresolved_graph {
         let downstream_node = match node_map.get(node_name) {
             Some(n) => n,
@@ -1216,7 +1388,7 @@ impl RepoHandle {
         job_name: Option<String>,
     ) -> PyResult<PyRunHandle> {
         // Sync prep under the read lock — drop the guard before the await.
-        let (record, storage) = {
+        let (record, storage, dyn_checks) = {
             let guard = self.state.read().unwrap();
             let state = guard.as_ref().ok_or_else(|| {
                 ExecutionError::new_err("Repository not resolved — call resolve() first")
@@ -1241,6 +1413,11 @@ impl RepoHandle {
                 asset_names.iter().map(String::as_str),
                 partition_key,
             )?;
+            let dyn_checks = dynamic_partition_checks(
+                state,
+                asset_names.iter().map(String::as_str),
+                partition_key,
+            );
 
             let run_id = uuid::Uuid::new_v4().to_string();
             let now = now_ts();
@@ -1262,8 +1439,10 @@ impl RepoHandle {
                 block_reason: None,
                 launched_by,
             };
-            (record, state.storage.clone())
+            (record, state.storage.clone(), dyn_checks)
         };
+
+        verify_dynamic_partition_keys(&storage, &record.code_location_id, &dyn_checks).await?;
 
         storage
             .enqueue_run(&record)
@@ -1288,7 +1467,7 @@ impl RepoHandle {
         runs: Vec<RunSubmission>,
         launched_by: LaunchedBy,
     ) -> PyResult<Vec<String>> {
-        let (records, storage) = {
+        let (records, storage, dyn_checks) = {
             let guard = self.state.read().unwrap();
             let state = guard.as_ref().ok_or_else(|| {
                 ExecutionError::new_err("Repository not resolved — call resolve() first")
@@ -1306,6 +1485,7 @@ impl RepoHandle {
                 .collect();
 
             let mut records: Vec<RunRecord> = Vec::with_capacity(runs.len());
+            let mut dyn_checks: Vec<DynamicKeyCheck> = Vec::new();
 
             for sub in &runs {
                 let asset_names = sub.selection.clone().unwrap_or_else(|| all_names.clone());
@@ -1314,6 +1494,11 @@ impl RepoHandle {
                     asset_names.iter().map(String::as_str),
                     sub.partition_key.as_ref(),
                 )?;
+                dyn_checks.extend(dynamic_partition_checks(
+                    state,
+                    asset_names.iter().map(String::as_str),
+                    sub.partition_key.as_ref(),
+                ));
                 let run_id = uuid::Uuid::new_v4().to_string();
                 let run_tags = sub.tags.clone().unwrap_or_default();
                 let priority = priority_from_tags(&run_tags);
@@ -1334,8 +1519,12 @@ impl RepoHandle {
                     launched_by: launched_by.clone(),
                 });
             }
-            (records, state.storage.clone())
+            (records, state.storage.clone(), dyn_checks)
         };
+
+        if let Some(first) = records.first() {
+            verify_dynamic_partition_keys(&storage, &first.code_location_id, &dyn_checks).await?;
+        }
 
         storage
             .enqueue_runs(&records)
@@ -1368,7 +1557,7 @@ impl RepoHandle {
         partition_key: Option<&PyPartitionKey>,
         launched_by: LaunchedBy,
     ) -> PyResult<String> {
-        let (record, storage) = {
+        let (record, storage, dyn_checks) = {
             let guard = self.state.read().unwrap();
             let state = guard.as_ref().ok_or_else(|| {
                 ExecutionError::new_err("Repository not resolved — call resolve() first")
@@ -1385,6 +1574,11 @@ impl RepoHandle {
                 asset_names.iter().map(String::as_str),
                 partition_key,
             )?;
+            let dyn_checks = dynamic_partition_checks(
+                state,
+                asset_names.iter().map(String::as_str),
+                partition_key,
+            );
 
             let run_id = uuid::Uuid::new_v4().to_string();
             let now = now_ts();
@@ -1404,8 +1598,10 @@ impl RepoHandle {
                 block_reason: None,
                 launched_by,
             };
-            (record, state.storage.clone())
+            (record, state.storage.clone(), dyn_checks)
         };
+
+        verify_dynamic_partition_keys(&storage, &record.code_location_id, &dyn_checks).await?;
 
         storage
             .create_run(&record)
@@ -1490,20 +1686,32 @@ impl RepoHandle {
     /// (e.g. gRPC `materialize` going through
     /// `dispatch_materialization`) can fail synchronously instead of
     /// after a fire-and-forget thread swallows the error.
-    pub(crate) fn validate_partition_for_selection(
+    pub(crate) async fn validate_partition_for_selection(
         &self,
         asset_names: &[String],
         partition_key: Option<&PyPartitionKey>,
     ) -> PyResult<()> {
-        let guard = self.state.read().unwrap();
-        let state = guard.as_ref().ok_or_else(|| {
-            ExecutionError::new_err("Repository not resolved — call resolve() first")
-        })?;
-        validate_partition_for_selection(
-            state,
-            asset_names.iter().map(String::as_str),
-            partition_key,
-        )
+        let (dyn_checks, storage, code_location_id) = {
+            let guard = self.state.read().unwrap();
+            let state = guard.as_ref().ok_or_else(|| {
+                ExecutionError::new_err("Repository not resolved — call resolve() first")
+            })?;
+            validate_partition_for_selection(
+                state,
+                asset_names.iter().map(String::as_str),
+                partition_key,
+            )?;
+            (
+                dynamic_partition_checks(
+                    state,
+                    asset_names.iter().map(String::as_str),
+                    partition_key,
+                ),
+                state.storage.clone(),
+                state.code_location_id.clone(),
+            )
+        };
+        verify_dynamic_partition_keys(&storage, &code_location_id, &dyn_checks).await
     }
 
     /// Reject any name in `asset_names` that isn't a resolved node in
@@ -1976,6 +2184,18 @@ impl PyCodeRepository {
             selected_names.iter().map(String::as_str),
             partition_key.as_ref(),
         )?;
+        let dyn_checks = dynamic_partition_checks(
+            state,
+            selected_names.iter().map(String::as_str),
+            partition_key.as_ref(),
+        );
+        if !dyn_checks.is_empty() {
+            rt().block_on(verify_dynamic_partition_keys(
+                &state.storage,
+                &state.code_location_id,
+                &dyn_checks,
+            ))?;
+        }
 
         // allow_incomplete_deps keeps the permissive "load missing upstream
         // from io_handler" semantics materialize has always offered (Job's
@@ -2103,7 +2323,7 @@ impl PyCodeRepository {
             step_kinds,
         } = build_unresolved_graph(py, &self.raw_assets, &self.raw_tasks, resource_keys)?;
 
-        validate_partition_mappings(&node_map, &unresolved_graph)?;
+        validate_partition_mappings(py, &node_map, &unresolved_graph)?;
 
         // External assets with automation_condition must have an observe_fn.
         for node in node_map.values() {
@@ -3232,6 +3452,81 @@ impl PyCodeRepository {
                 .iter()
                 .map(PyPartitionKey::from)
                 .collect();
+
+            // Definitions may have evolved since the original backfill —
+            // replay the partitions that still exist instead of failing the
+            // whole rerun on the first retired key.
+            let total = partition_keys.len();
+            let (candidates, storage, code_location_id) = {
+                let guard = self.state.read().unwrap();
+                let state = guard.as_ref().expect("ensure_resolved succeeded above");
+                let selection_names: Vec<String> = match &record.job_name {
+                    Some(name) => state
+                        .jobs_info
+                        .get(name)
+                        .map(|j| j.asset_names.clone())
+                        .ok_or_else(|| {
+                            ExecutionError::new_err(format!("Job '{name}' not found"))
+                        })?,
+                    None => record.asset_selection.clone(),
+                };
+                let candidates: Vec<(PyPartitionKey, Vec<DynamicKeyCheck>)> = partition_keys
+                    .into_iter()
+                    .filter(|key| {
+                        validate_partition_for_selection(
+                            state,
+                            selection_names.iter().map(String::as_str),
+                            Some(key),
+                        )
+                        .is_ok()
+                    })
+                    .map(|key| {
+                        let checks = dynamic_partition_checks(
+                            state,
+                            selection_names.iter().map(String::as_str),
+                            Some(&key),
+                        );
+                        (key, checks)
+                    })
+                    .collect();
+                (
+                    candidates,
+                    state.storage.clone(),
+                    state.code_location_id.clone(),
+                )
+            };
+            let mut partition_keys: Vec<PyPartitionKey> = Vec::with_capacity(candidates.len());
+            for (key, checks) in candidates {
+                // Only a genuinely unregistered key is retired — a storage
+                // failure says nothing about the key and must abort the rerun.
+                let retired = !checks.is_empty()
+                    && !rt()
+                        .block_on(unregistered_dynamic_keys(
+                            &storage,
+                            &code_location_id,
+                            &checks,
+                        ))?
+                        .is_empty();
+                if !retired {
+                    partition_keys.push(key);
+                }
+            }
+            if partition_keys.len() < total {
+                tracing::warn!(
+                    target: "rivers::repo",
+                    backfill_id = %backfill_id,
+                    dropped = total - partition_keys.len(),
+                    kept = partition_keys.len(),
+                    "rerun skipping partitions no longer valid for the current definitions"
+                );
+            }
+            if partition_keys.is_empty() {
+                return Err(ExecutionError::new_err(format!(
+                    "Cannot rerun backfill '{backfill_id}': none of its {total} partitions \
+                     are valid for the current definitions"
+                )));
+            }
+
             let strategy = PyBackfillStrategy::from_core(&record.strategy);
             let failure_policy = match record.failure_policy {
                 BackfillFailurePolicy::Continue => "continue",
@@ -3460,10 +3755,40 @@ impl PyCodeRepository {
                 (assets, Some(name))
             }
         };
+        // An empty Materialization selection means "all assets" — expand it
+        // so key/strategy validation sees the effective selection.
+        let selection: Vec<String> = if selection.is_empty() {
+            state.node_map.keys().cloned().collect()
+        } else {
+            selection
+        };
+
+        // Keys/ranges against an unpartitioned selection would bypass every
+        // def-aware check (and PerDimension grouping would silently collapse
+        // all keys into one run).
+        if (partition_keys.is_some() || partition_range.is_some())
+            && iter_partitioned_assets(&state.node_map, selection.iter().map(String::as_str))
+                .is_empty()
+        {
+            return Err(ExecutionError::new_err(
+                "Backfill partition_keys/partition_range require a partitioned selection; \
+                 no asset in the selection is partitioned.",
+            ));
+        }
 
         let resolved_keys: Vec<PyPartitionKey> = if let Some(keys) = partition_keys {
             if keys.is_empty() {
                 return Err(ExecutionError::new_err("partition_keys must not be empty"));
+            }
+            // repo.backfill() and gRPC LaunchBackfill are boundaries — reject
+            // invalid keys here like `materialize` does, instead of persisting
+            // a BackfillRecord that counts them and fails per-run later.
+            for key in &keys {
+                validate_partition_for_selection(
+                    state,
+                    selection.iter().map(String::as_str),
+                    Some(key),
+                )?;
             }
             keys
         } else if let Some(range) = partition_range {
@@ -3484,12 +3809,39 @@ impl PyCodeRepository {
                         "partition_range specified but no partitioned assets found in selection",
                     )
                 })?;
-            range.resolve(parts_def)?
+            let resolved = range.resolve(parts_def)?;
+            // The range resolved against one def — the selection's other
+            // partitioned assets must accept each key too, same boundary
+            // contract as the explicit-keys branch.
+            for key in &resolved {
+                validate_partition_for_selection(
+                    state,
+                    selection.iter().map(String::as_str),
+                    Some(key),
+                )?;
+            }
+            resolved
         } else {
             return Err(ExecutionError::new_err(
                 "Either partition_keys or partition_range must be provided",
             ));
         };
+
+        let mut dyn_checks: Vec<DynamicKeyCheck> = Vec::new();
+        for key in &resolved_keys {
+            dyn_checks.extend(dynamic_partition_checks(
+                state,
+                selection.iter().map(String::as_str),
+                Some(key),
+            ));
+        }
+        if !dyn_checks.is_empty() {
+            rt().block_on(verify_dynamic_partition_keys(
+                &state.storage,
+                &state.code_location_id,
+                &dyn_checks,
+            ))?;
+        }
 
         let num_partitions = resolved_keys.len();
 
@@ -3510,6 +3862,7 @@ impl PyCodeRepository {
                 PyBackfillStrategy::MultiRun {}
             }
         };
+        validate_backfill_strategy(&resolved_strategy, state, &selection)?;
 
         let core_strategy = resolved_strategy.to_core();
         let run_groups = rivers_core::execution::backfill::group_into_runs(

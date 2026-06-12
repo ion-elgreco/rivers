@@ -33,6 +33,7 @@ fn rows(host: &HtmlElement) -> Vec<Element> {
 fn single_picker(keys: &[&str]) -> JobPartitionPicker {
     JobPartitionPicker::SingleDim {
         keys: keys.iter().map(|s| s.to_string()).collect(),
+        truncated: false,
     }
 }
 
@@ -48,6 +49,7 @@ fn multi_picker(dims: &[(&str, &[&str])]) -> JobPartitionPicker {
             })
             .collect(),
         asset_key: None,
+        truncated: false,
     }
 }
 

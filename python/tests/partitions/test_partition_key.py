@@ -130,3 +130,38 @@ def test_from_json_invalid():
 def test_from_json_missing_key():
     with pytest.raises(PartitionDefinitionError):
         rs.PartitionKey.from_json('{"unknown": [1]}')
+
+
+# ---------------------------------------------------------------------------
+# PartitionKeyRange hash/eq contract — equal ranges must hash equal
+# regardless of construction order; hashing the Debug string of a
+# HashMap-backed range breaks that (seed-dependent iteration order).
+# ---------------------------------------------------------------------------
+
+
+def test_multi_range_equal_ranges_hash_equal():
+    dims = {f"d{i}": (f"a{i}", f"b{i}") for i in range(8)}
+    r1 = rs.PartitionKeyRange.multi(dims)
+    r2 = rs.PartitionKeyRange.multi(dict(reversed(list(dims.items()))))
+    assert r1 == r2
+    assert hash(r1) == hash(r2)
+
+
+def test_multi_range_key_lists_hash_order_independent():
+    r1 = rs.PartitionKeyRange.multi({"d": ["x", "y", "z", "w", "v", "u", "t", "s"]})
+    r2 = rs.PartitionKeyRange.multi({"d": ["s", "t", "u", "v", "w", "x", "y", "z"]})
+    assert r1 == r2
+    assert hash(r1) == hash(r2)
+
+
+def test_multi_range_repr_deterministic():
+    """repr sorts dimensions and key lists — HashMap iteration order must
+    not leak into the string."""
+    r = rs.PartitionKeyRange.multi({"b": ("1", "2"), "a": ["y", "x"]})
+    assert repr(r) == 'PartitionKeyRange.multi({"a": ["x", "y"], "b": ("1", "2")})'
+
+
+def test_single_range_usable_as_dict_key():
+    r1 = rs.PartitionKeyRange.single(from_key="2024-01-01", to_key="2024-01-31")
+    r2 = rs.PartitionKeyRange.single(from_key="2024-01-01", to_key="2024-01-31")
+    assert {r1: "jan"}[r2] == "jan"

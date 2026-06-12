@@ -105,7 +105,10 @@ impl CodeLocationService for CodeLocationImpl {
         request: Request<MaterializeRequest>,
     ) -> Result<Response<MaterializeResponse>, Status> {
         let req = request.into_inner();
-        let pk = req.partition_key.and_then(proto_partition_key_to_py);
+        let pk = req
+            .partition_key
+            .map(proto_partition_key_to_py)
+            .transpose()?;
         let pk_core = pk.as_ref().map(rivers_core::storage::PartitionKey::from);
         let tags = proto_tags_to_pairs(req.tags).unwrap_or_default();
 
@@ -132,6 +135,7 @@ impl CodeLocationService for CodeLocationImpl {
         // or never-started run.
         self.handle
             .validate_partition_for_selection(&asset_selection, pk.as_ref())
+            .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         let mat_request = crate::daemon::MaterializationRequestData {
@@ -166,7 +170,10 @@ impl CodeLocationService for CodeLocationImpl {
         let run_request = crate::daemon::RunRequestData {
             run_key: None,
             tags: None,
-            partition_key: req.partition_key.and_then(proto_partition_key_to_py),
+            partition_key: req
+                .partition_key
+                .map(proto_partition_key_to_py)
+                .transpose()?,
             job_name: Some(req.job_name),
         };
 
@@ -532,13 +539,19 @@ impl CodeLocationService for CodeLocationImpl {
         request: Request<LaunchBackfillRequest>,
     ) -> Result<Response<LaunchBackfillResponse>, Status> {
         let req = request.into_inner();
-        let partition_keys = empty_to_none(req.partition_keys).map(|ks| {
-            ks.into_iter()
-                .filter_map(proto_partition_key_to_py)
-                .collect()
-        });
-        let partition_range = req.partition_range.and_then(proto_partition_range_to_py);
-        let strategy = req.strategy.and_then(proto_strategy_to_py);
+        let partition_keys = match empty_to_none(req.partition_keys) {
+            Some(ks) => Some(
+                ks.into_iter()
+                    .map(proto_partition_key_to_py)
+                    .collect::<Result<Vec<_>, Status>>()?,
+            ),
+            None => None,
+        };
+        let partition_range = req
+            .partition_range
+            .map(proto_partition_range_to_py)
+            .transpose()?;
+        let strategy = req.strategy.map(proto_strategy_to_py).transpose()?;
         let failure_policy = if req.failure_policy.is_empty() {
             None
         } else {
@@ -846,43 +859,65 @@ fn node_partition_def_info(pd: &PartitionsDefinition) -> PartitionDefInfo {
     }
 }
 
-/// Render a `PyPartitionKey` for display (and round-trip) in the UI.
-/// `Single` keys collapse to their string; `Multi` keys are encoded as
-/// `dim=val|dim=val` so the UI can split them deterministically.
+/// Render a `PyPartitionKey` for display in the UI — delegates to the
+/// canonical `PartitionKey::to_display` encoding (`dim=val|dim=val`).
 fn py_partition_key_display(pk: PyPartitionKey) -> String {
-    match pk {
-        PyPartitionKey::Single { key } => key.first().cloned().unwrap_or_default(),
-        PyPartitionKey::Multi { keys } => {
-            let mut entries: Vec<(String, Vec<String>)> = keys.into_iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            entries
-                .into_iter()
-                .map(|(d, vs)| format!("{}={}", d, vs.join(",")))
-                .collect::<Vec<_>>()
-                .join("|")
-        }
-        PyPartitionKey::Set { keys } => keys
-            .into_iter()
-            .map(py_partition_key_display)
-            .collect::<Vec<_>>()
-            .join(", "),
-    }
+    rivers_core::storage::PartitionKey::from(&pk).to_display()
 }
 
-fn proto_partition_key_to_py(pk: ProtoPartitionKey) -> Option<PyPartitionKey> {
-    match pk.kind? {
-        proto_partition_key::Kind::Single(s) => Some(PyPartitionKey::Single { key: s.keys }),
+/// gRPC is the system boundary: malformed partition keys are rejected with
+/// `InvalidArgument` instead of being silently dropped or coerced. `Single`
+/// values are sorted to match the in-process constructors, so the same
+/// logical key compares equal regardless of which side built it.
+fn proto_partition_key_to_py(pk: ProtoPartitionKey) -> Result<PyPartitionKey, Status> {
+    let kind = pk
+        .kind
+        .ok_or_else(|| Status::invalid_argument("partition_key has no kind set"))?;
+    match kind {
+        proto_partition_key::Kind::Single(s) => {
+            if s.keys.is_empty() {
+                return Err(Status::invalid_argument(
+                    "partition_key.single.keys must not be empty",
+                ));
+            }
+            let mut keys = s.keys;
+            keys.sort();
+            Ok(PyPartitionKey::Single { key: keys })
+        }
         proto_partition_key::Kind::Multi(m) => {
-            let keys: HashMap<String, Vec<String>> =
-                m.dimensions.into_iter().map(|d| (d.name, d.keys)).collect();
-            Some(PyPartitionKey::Multi { keys })
+            if m.dimensions.is_empty() {
+                return Err(Status::invalid_argument(
+                    "multi partition_key has no dimensions",
+                ));
+            }
+            let mut keys: HashMap<String, Vec<String>> = HashMap::with_capacity(m.dimensions.len());
+            for d in m.dimensions {
+                if d.keys.is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "partition_key dimension '{}' has no keys",
+                        d.name
+                    )));
+                }
+                let mut vals = d.keys;
+                vals.sort();
+                if keys.insert(d.name.clone(), vals).is_some() {
+                    return Err(Status::invalid_argument(format!(
+                        "duplicate partition_key dimension '{}'",
+                        d.name
+                    )));
+                }
+            }
+            Ok(PyPartitionKey::Multi { keys })
         }
     }
 }
 
-fn proto_partition_range_to_py(r: PartitionRange) -> Option<PyPartitionKeyRange> {
-    match r.kind? {
-        partition_range::Kind::Single(s) => Some(PyPartitionKeyRange {
+fn proto_partition_range_to_py(r: PartitionRange) -> Result<PyPartitionKeyRange, Status> {
+    let kind = r
+        .kind
+        .ok_or_else(|| Status::invalid_argument("partition_range has no kind set"))?;
+    match kind {
+        partition_range::Kind::Single(s) => Ok(PyPartitionKeyRange {
             inner: PartitionKeyRangeInner::Single {
                 from_key: s.from_key,
                 to_key: s.to_key,
@@ -891,7 +926,13 @@ fn proto_partition_range_to_py(r: PartitionRange) -> Option<PyPartitionKeyRange>
         partition_range::Kind::Multi(m) => {
             let mut dims = HashMap::new();
             for d in m.dimensions {
-                let sel = match d.selection? {
+                let selection = d.selection.ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "partition_range dimension '{}' has no selection set",
+                        d.name
+                    ))
+                })?;
+                let sel = match selection {
                     dimension_range::Selection::Range(r) => DimensionSelection::Range {
                         from_key: r.from_key,
                         to_key: r.to_key,
@@ -900,22 +941,35 @@ fn proto_partition_range_to_py(r: PartitionRange) -> Option<PyPartitionKeyRange>
                         DimensionSelection::Keys(k.keys.into_iter().collect())
                     }
                 };
-                dims.insert(d.name, sel);
+                if dims.insert(d.name.clone(), sel).is_some() {
+                    return Err(Status::invalid_argument(format!(
+                        "duplicate partition_range dimension '{}'",
+                        d.name
+                    )));
+                }
             }
-            Some(PyPartitionKeyRange {
+            Ok(PyPartitionKeyRange {
                 inner: PartitionKeyRangeInner::Multi { dimensions: dims },
             })
         }
     }
 }
 
-fn proto_strategy_to_py(s: BackfillStrategyProto) -> Option<PyBackfillStrategy> {
-    match s.kind? {
+/// Unknown shorthands are rejected — silently mapping a typo to `MultiRun`
+/// would fan a one-run backfill out into one run per partition.
+fn proto_strategy_to_py(s: BackfillStrategyProto) -> Result<PyBackfillStrategy, Status> {
+    let kind = s
+        .kind
+        .ok_or_else(|| Status::invalid_argument("backfill strategy has no kind set"))?;
+    match kind {
         backfill_strategy_proto::Kind::Shorthand(s) => match s.as_str() {
-            "single_run" => Some(PyBackfillStrategy::SingleRun {}),
-            _ => Some(PyBackfillStrategy::MultiRun {}),
+            "single_run" => Ok(PyBackfillStrategy::SingleRun {}),
+            "multi_run" => Ok(PyBackfillStrategy::MultiRun {}),
+            other => Err(Status::invalid_argument(format!(
+                "unknown backfill strategy '{other}' (expected 'single_run' or 'multi_run')"
+            ))),
         },
-        backfill_strategy_proto::Kind::PerDimension(pd) => Some(PyBackfillStrategy::PerDimension {
+        backfill_strategy_proto::Kind::PerDimension(pd) => Ok(PyBackfillStrategy::PerDimension {
             multi_run_dims: pd.multi_run_dimensions,
             single_run_dims: pd.single_run_dimensions,
         }),

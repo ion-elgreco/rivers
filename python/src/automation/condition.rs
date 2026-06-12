@@ -217,8 +217,19 @@ impl PyAutomationCondition {
     /// True when the partition is in the latest time window.
     #[staticmethod]
     #[pyo3(signature = (lookback_delta=None))]
-    fn in_latest_time_window(lookback_delta: Option<f64>) -> Self {
-        Self::new_node(ConditionNode::InLatestTimeWindow { lookback_delta })
+    fn in_latest_time_window(lookback_delta: Option<f64>) -> PyResult<Self> {
+        if let Some(delta) = lookback_delta
+            && (!delta.is_finite() || delta <= 0.0)
+        {
+            // NaN/negative silently select no windows; inf overflows the
+            // cutoff arithmetic.
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "lookback_delta must be a positive number of seconds, got {delta}"
+            )));
+        }
+        Ok(Self::new_node(ConditionNode::InLatestTimeWindow {
+            lookback_delta,
+        }))
     }
 
     /// True on the first evaluation tick after daemon startup or condition tree change.

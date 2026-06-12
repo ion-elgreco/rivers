@@ -3,7 +3,7 @@
 //! `PartitionMapping` enum with 7 variants (Identity, AllPartitions, LastPartition, etc.).
 //! `map_key()` transforms downstream partition keys to upstream keys for dependency loading.
 //! `PartitionMappingDict` accepts `str` or `AssetDef` keys from Python for per-dep overrides.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Deref;
 
 use pyo3::exceptions::PyTypeError;
@@ -13,7 +13,9 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use crate::errors::PartitionValidationError;
 
 use super::PyPartitionKey;
-use super::definition::PartitionsDefinition;
+use super::definition::{
+    PartitionsDefinition, cron_grid_contains, for_each_cron_tick, for_each_interval_tick,
+};
 use super::key_range::PyPartitionKeyRange;
 
 /// Identifies which side of a dependency edge an error refers to.
@@ -550,12 +552,33 @@ impl PartitionMapping {
             }
 
             Self::TimeWindow { offset } => {
-                // TimeWindow offset is handled at the IO level (not key transformation).
-                // The key itself stays the same — the offset shifts which time window is loaded.
-                // For now, pass through as-is.
-                // TODO: implement actual time window offset key shifting
-                let _ = offset;
-                Ok(downstream_key.clone())
+                if *offset == 0 {
+                    return Ok(downstream_key.clone());
+                }
+                let PyPartitionKey::Single { key } = downstream_key else {
+                    return Err(
+                        "TimeWindow mapping only works with Single partition keys".to_string()
+                    );
+                };
+                let k = key.first().ok_or("Empty partition key")?;
+                let def =
+                    upstream_def.ok_or("TimeWindow mapping requires a partitioned upstream")?;
+                let shifted = def.shift_time_key(k, *offset).map_err(|e| e.to_string())?;
+                let shifted_key = PyPartitionKey::Single {
+                    key: vec![shifted.clone()],
+                };
+                // A cross-cadence mapping can land between upstream windows —
+                // loading a partition that doesn't exist must fail loudly.
+                if !def
+                    .validate_partition_key(&shifted_key)
+                    .map_err(|e| e.to_string())?
+                {
+                    return Err(format!(
+                        "time_window(offset={offset}) maps '{k}' to '{shifted}', \
+                         which is not a partition of the upstream definition"
+                    ));
+                }
+                Ok(shifted_key)
             }
 
             Self::Multi { dimension_mappings } => match downstream_key {
@@ -576,7 +599,16 @@ impl PartitionMapping {
                         let single_key = PyPartitionKey::Single {
                             key: dim_values.clone(),
                         };
-                        let mapped = per_dim_mapping.map_key(&single_key, None)?;
+                        // Thread the upstream dimension's own def so nested
+                        // mappings that need it (TimeWindow offset) can shift.
+                        let dim_def = upstream_def.and_then(|d| match d {
+                            PartitionsDefinition::Multi { dimensions } => dimensions
+                                .iter()
+                                .find(|(n, _)| n == upstream_dim)
+                                .map(|(_, dd)| dd),
+                            _ => None,
+                        });
+                        let mapped = per_dim_mapping.map_key(&single_key, dim_def)?;
                         match mapped {
                             PyPartitionKey::Single { key } => {
                                 upstream_keys.insert(upstream_dim.clone(), key);
@@ -620,13 +652,6 @@ impl PartitionMapping {
                     // The named dimension gets the (mapped) single key value.
                     // Unmapped dimensions get ALL their partition keys (fan-in).
                     PyPartitionKey::Single { key } => {
-                        let single_key = PyPartitionKey::Single { key: key.clone() };
-                        let mapped_single = partition_mapping.0.map_key(&single_key, None)?;
-                        let mapped_values = match &mapped_single {
-                            PyPartitionKey::Single { key } => key.clone(),
-                            _ => return Err("Inner mapping produced a Multi key".to_string()),
-                        };
-
                         // Get the upstream Multi definition to enumerate unmapped dimensions
                         let up_def = upstream_def.ok_or(
                             "MultiToSingle (Single→Multi) requires upstream PartitionsDefinition",
@@ -639,6 +664,20 @@ impl PartitionMapping {
                                         .to_string(),
                                 ),
                             };
+
+                        let single_key = PyPartitionKey::Single { key: key.clone() };
+                        // The inner mapping maps within the named dimension —
+                        // give it that dimension's def (TimeWindow offset).
+                        let named_dim_def = dimensions
+                            .iter()
+                            .find(|(n, _)| n == dimension_name)
+                            .map(|(_, dd)| dd);
+                        let mapped_single =
+                            partition_mapping.0.map_key(&single_key, named_dim_def)?;
+                        let mapped_values = match &mapped_single {
+                            PyPartitionKey::Single { key } => key.clone(),
+                            _ => return Err("Inner mapping produced a Multi key".to_string()),
+                        };
 
                         let mut multi_keys = HashMap::new();
                         for (dim_name, dim_def) in dimensions {
@@ -670,7 +709,9 @@ impl PartitionMapping {
                         let single_key = PyPartitionKey::Single {
                             key: dim_values.clone(),
                         };
-                        partition_mapping.0.map_key(&single_key, None)
+                        // Upstream is Single here, so its whole def belongs to
+                        // the inner mapping (TimeWindow offset shifts in it).
+                        partition_mapping.0.map_key(&single_key, upstream_def)
                     }
                     PyPartitionKey::Set { .. } => {
                         Err("MultiToSingle mapping does not support batched Set keys".to_string())
@@ -679,6 +720,131 @@ impl PartitionMapping {
             }
         }
     }
+}
+
+/// Require the downstream grid to be a subgrid of the upstream one (same
+/// fmt; identical cron, or interval multiple with aligned starts). Applies
+/// to any mapping that resolves downstream keys on the upstream grid —
+/// `time_window` shifts them, `Identity` loads them verbatim. Ranges
+/// (start/end) may differ; range edges are a per-key concern. No-op unless
+/// both definitions are TimeWindow.
+fn validate_time_window_grid_compat(
+    mapping: &str,
+    down: &PartitionsDefinition,
+    up: &PartitionsDefinition,
+) -> Result<(), MappingValidationError> {
+    let (
+        PartitionsDefinition::TimeWindow {
+            cron_schedule: down_cron,
+            interval_seconds: down_interval,
+            start: down_start,
+            fmt: down_fmt,
+            ..
+        },
+        PartitionsDefinition::TimeWindow {
+            cron_schedule: up_cron,
+            interval_seconds: up_interval,
+            start: up_start,
+            fmt: up_fmt,
+            ..
+        },
+    ) = (down, up)
+    else {
+        return Ok(());
+    };
+    if down_fmt != up_fmt {
+        return Err(MappingValidationError::DefinitionError(format!(
+            "{mapping} mapping requires matching key formats: \
+             downstream fmt '{down_fmt}' != upstream fmt '{up_fmt}'"
+        )));
+    }
+    match (down_cron, down_interval, up_cron, up_interval) {
+        (None, Some(di), None, Some(ui)) => {
+            let down_ns = (di * 1_000_000_000.0) as i64;
+            let up_ns = (ui * 1_000_000_000.0) as i64;
+            if up_ns <= 0 || down_ns <= 0 || down_ns % up_ns != 0 {
+                return Err(MappingValidationError::DefinitionError(format!(
+                    "{mapping} mapping requires the downstream grid to be a \
+                     subgrid of the upstream grid: downstream interval {di}s \
+                     is not a multiple of upstream interval {ui}s"
+                )));
+            }
+            let aligned = (*down_start - *up_start)
+                .num_nanoseconds()
+                .is_some_and(|ns| ns.rem_euclid(up_ns) == 0);
+            if !aligned {
+                return Err(MappingValidationError::DefinitionError(format!(
+                    "{mapping} mapping requires the downstream grid to be a \
+                     subgrid of the upstream grid: downstream start {down_start} \
+                     is not aligned to the upstream grid (start {up_start}, \
+                     interval {ui}s)"
+                )));
+            }
+        }
+        _ => {
+            // At least one side is a cron grid. Equivalent schedules can be
+            // spelled differently (5- vs 6-field, nicknames) and a cron grid
+            // can coincide with an interval grid, so prove the subgrid
+            // relation on the ticks themselves: every downstream window
+            // start over a bounded probe must fall on the upstream grid.
+            const PROBE_TICKS: usize = 32;
+            let horizon = down_start
+                .checked_add_signed(chrono::Duration::days(1461))
+                .unwrap_or(chrono::NaiveDateTime::MAX);
+            let mut count = 0usize;
+            let mut offgrid: Option<chrono::NaiveDateTime> = None;
+            let mut walk_err: Option<String> = None;
+            let mut visit = |t: chrono::NaiveDateTime| -> bool {
+                count += 1;
+                let on_upstream = match (up_cron, up_interval) {
+                    (Some(expr), _) => match cron_grid_contains(expr, t) {
+                        Ok(hit) => hit,
+                        Err(e) => {
+                            walk_err = Some(e.to_string());
+                            return false;
+                        }
+                    },
+                    (None, Some(ui)) => {
+                        let up_ns = (ui * 1_000_000_000.0) as i64;
+                        up_ns > 0
+                            && (t - *up_start)
+                                .num_nanoseconds()
+                                .is_some_and(|ns| ns.rem_euclid(up_ns) == 0)
+                    }
+                    (None, None) => false,
+                };
+                if !on_upstream {
+                    offgrid = Some(t);
+                    return false;
+                }
+                count < PROBE_TICKS
+            };
+            if let Some(dc) = down_cron {
+                for_each_cron_tick(dc, down_start, horizon, &mut visit)
+                    .map_err(|e| MappingValidationError::DefinitionError(e.to_string()))?;
+            } else if let Some(di) = down_interval {
+                for_each_interval_tick(*di, down_start, horizon, &mut visit);
+            }
+            if let Some(msg) = walk_err {
+                return Err(MappingValidationError::DefinitionError(msg));
+            }
+            if let Some(t) = offgrid {
+                let upstream_grid = match (up_cron, up_interval) {
+                    (Some(expr), _) => format!("cron '{expr}'"),
+                    (None, Some(ui)) => format!("every {ui}s from {up_start}"),
+                    (None, None) => "with no schedule".to_string(),
+                };
+                return Err(MappingValidationError::DefinitionError(format!(
+                    "{mapping} mapping requires the downstream grid to be a \
+                     subgrid of the upstream grid: downstream window start {t} \
+                     (key '{}') is not on the upstream grid ({upstream_grid}), \
+                     so that key would never exist upstream",
+                    t.format(down_fmt)
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl PartitionMapping {
@@ -745,6 +911,76 @@ impl PartitionMapping {
                         upstream: up.variant_name().to_string(),
                     });
                 }
+                // Identity loads each downstream key verbatim from upstream,
+                // so every downstream key must exist there — same subgrid
+                // requirement as a zero-offset time_window mapping.
+                validate_time_window_grid_compat("Identity", down, up)?;
+                if let (
+                    PartitionsDefinition::Dynamic { name: down_name },
+                    PartitionsDefinition::Dynamic { name: up_name },
+                ) = (down, up)
+                {
+                    if down_name != up_name {
+                        return Err(MappingValidationError::DefinitionError(format!(
+                            "Identity mapping requires matching dynamic namespaces: \
+                             downstream '{down_name}' != upstream '{up_name}'"
+                        )));
+                    }
+                }
+                if let (
+                    PartitionsDefinition::Static { keys: down_keys },
+                    PartitionsDefinition::Static { keys: up_keys },
+                ) = (down, up)
+                {
+                    let mut missing: Vec<&str> = down_keys
+                        .iter()
+                        .filter(|k| !up_keys.contains(k.as_str()))
+                        .map(String::as_str)
+                        .collect();
+                    if !missing.is_empty() {
+                        missing.sort_unstable();
+                        return Err(MappingValidationError::DefinitionError(format!(
+                            "Identity mapping requires every downstream key to exist \
+                             upstream; missing upstream: {}",
+                            missing.join(", ")
+                        )));
+                    }
+                }
+                if let (
+                    PartitionsDefinition::Multi {
+                        dimensions: down_dims,
+                    },
+                    PartitionsDefinition::Multi {
+                        dimensions: up_dims,
+                    },
+                ) = (down, up)
+                {
+                    let down_names: BTreeSet<&str> =
+                        down_dims.iter().map(|(n, _)| n.as_str()).collect();
+                    let up_names: BTreeSet<&str> =
+                        up_dims.iter().map(|(n, _)| n.as_str()).collect();
+                    if down_names != up_names {
+                        let join = |names: &BTreeSet<&str>| {
+                            names.iter().copied().collect::<Vec<_>>().join(", ")
+                        };
+                        return Err(MappingValidationError::DefinitionError(format!(
+                            "Identity mapping requires matching Multi dimensions: \
+                             downstream [{}] != upstream [{}]",
+                            join(&down_names),
+                            join(&up_names)
+                        )));
+                    }
+                    let up_map: HashMap<&str, &PartitionsDefinition> =
+                        up_dims.iter().map(|(n, d)| (n.as_str(), d)).collect();
+                    for (name, down_sub) in down_dims {
+                        Self::Identity {}
+                            .validate_partitioned_pair(down_sub, up_map[name.as_str()])
+                            .map_err(|e| MappingValidationError::InDimension {
+                                dim: name.clone(),
+                                source: Box::new(e),
+                            })?;
+                    }
+                }
                 Ok(())
             }
             Self::TimeWindow { .. } => {
@@ -764,7 +1000,7 @@ impl PartitionMapping {
                         found: up.variant_name().to_string(),
                     });
                 }
-                Ok(())
+                validate_time_window_grid_compat("time_window", down, up)
             }
             Self::Static { mapping: key_map } => {
                 let down_keys = single_dim_key_set(down)?;
@@ -865,9 +1101,17 @@ impl PartitionMapping {
                         )
                     })?;
 
+                // The inner mapping's orientation follows the edge: with a
+                // Multi downstream it maps the named dim's key -> the single
+                // upstream; with a Multi upstream it maps the downstream
+                // single key -> the named dim.
+                let (inner_down, inner_up) = match multi_side {
+                    Side::Downstream => (dim_def, single_def),
+                    Side::Upstream => (single_def, dim_def),
+                };
                 partition_mapping
                     .0
-                    .validate_partitioned_pair(single_def, dim_def)
+                    .validate_partitioned_pair(inner_down, inner_up)
                     .map_err(|e| MappingValidationError::InDimension {
                         dim: dimension_name.clone(),
                         source: Box::new(e),
@@ -967,20 +1211,28 @@ impl PartitionMapping {
             Self::AllPartitions {} => Ok(()),
             Self::ForKeys { selectors } => {
                 for s in selectors {
-                    if let PartitionKeySelector::Key(k) = s {
-                        let valid = down
-                            .validate_partition_key(k)
-                            .map_err(|e| MappingValidationError::DefinitionError(e.to_string()))?;
-                        if !valid {
-                            return Err(MappingValidationError::KeyNotInDefinition {
-                                key: format!("{k:?}"),
-                                side: Side::Downstream,
-                                mapping: "ForKeys",
-                            });
+                    match s {
+                        PartitionKeySelector::Key(k) => {
+                            let valid = down.validate_partition_key(k).map_err(|e| {
+                                MappingValidationError::DefinitionError(e.to_string())
+                            })?;
+                            if !valid {
+                                return Err(MappingValidationError::KeyNotInDefinition {
+                                    key: format!("{k:?}"),
+                                    side: Side::Downstream,
+                                    mapping: "ForKeys",
+                                });
+                            }
+                        }
+                        // An unknown or inverted range endpoint would silently
+                        // match nothing (every downstream key Skips its dep) —
+                        // surface it here instead.
+                        PartitionKeySelector::Range(range) => {
+                            range
+                                .validate_against(down)
+                                .map_err(MappingValidationError::DefinitionError)?;
                         }
                     }
-                    // Range bounds are not validated against the partition def
-                    // at resolve time — the range may intentionally cover a subset.
                 }
                 Ok(())
             }

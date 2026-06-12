@@ -881,15 +881,32 @@ fn eval_partitioned<O: PartEvalOutput>(
                 .partition_state
                 .as_ref()
                 .map(|ps| &ps.timestamps);
+            // In a dep pivot (target ≠ root) observation baselines are
+            // unsound both ways: async event drains re-surface already-
+            // acted-on events (double fire), and a fire can baseline a key
+            // that a sibling clause suppressed that tick (lost fire,
+            // forever). Compare staleness instead: a dep key counts as
+            // updated while it is strictly newer than the root's own
+            // materialization of that key — the dispatched run advances the
+            // root past the dep so the trigger self-suppresses, and a missed
+            // tick simply retries. Keys the root never materialized pass;
+            // roots without partition status keep the baseline behavior.
+            let root_floor = if ctx.target_key != ctx.root_key {
+                pctx.all_partition_statuses
+                    .get(ctx.root_key)
+                    .map(|s| &s.timestamps)
+            } else {
+                None
+            };
             let updated: HashSet<PartitionKey> = pctx
                 .timestamps
                 .iter()
-                .filter(|&(pk, &ts)| {
-                    let prev_ts = prev_timestamps.and_then(|pt| pt.get(pk));
-                    match prev_ts {
+                .filter(|&(pk, &ts)| match root_floor {
+                    Some(floor) => floor.get(pk).is_none_or(|&root_ts| ts > root_ts),
+                    None => match prev_timestamps.and_then(|pt| pt.get(pk)) {
                         Some(&prev) => ts > prev,
                         None => true, // newly appeared partition
-                    }
+                    },
                 })
                 .map(|(pk, _)| pk.clone())
                 .collect();
@@ -1104,7 +1121,7 @@ fn eval_partitioned<O: PartEvalOutput>(
                 .cloned()
                 .unwrap_or(PartitionSelection::Empty);
             // First-tick behavior handled via InitialEvaluation composition.
-            let result = current.difference(&previous);
+            let result = current.difference(&previous, pctx.all_keys);
             sub_selections.insert(my_idx, current);
             O::composite(result, my_idx, node, total, vec![child_part])
         }
@@ -1122,7 +1139,9 @@ fn eval_partitioned<O: PartEvalOutput>(
                 .cloned()
                 .unwrap_or(PartitionSelection::Empty);
             // (prev_latched ∪ trigger) - reset
-            let result = prev_latch.union(&trigger_sel).difference(&reset_sel);
+            let result = prev_latch
+                .union(&trigger_sel)
+                .difference(&reset_sel, pctx.all_keys);
             sub_selections.insert(my_idx, result.clone());
             O::composite(result, my_idx, node, total, vec![trigger_part, reset_part])
         }
@@ -1159,7 +1178,7 @@ fn eval_partitioned<O: PartEvalOutput>(
                             } else {
                                 PartitionSelection::Keys(handled_set.clone())
                             };
-                            current.difference(&handled_sel)
+                            current.difference(&handled_sel, pctx.all_keys)
                         } else {
                             current
                         }
@@ -1279,7 +1298,7 @@ fn eval_partitioned_on_dep(
         in_progress: &upstream_status.in_progress,
         failed: &upstream_status.failed,
         timestamps: &upstream_status.timestamps,
-        resolver: PartitionResolver::new(HashMap::new(), HashMap::new()),
+        resolver: PartitionResolver::empty(),
         latest_time_window_keys: None,
         all_partition_statuses: pctx.all_partition_statuses,
     };

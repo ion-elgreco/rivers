@@ -2,6 +2,8 @@
 
 from typing import Any
 
+import pytest
+
 import rivers as rs
 
 # ---------------------------------------------------------------------------
@@ -60,6 +62,14 @@ class TestLeafConditions:
     def test_in_latest_time_window_with_lookback(self):
         cond = rs.AutomationCondition.in_latest_time_window(lookback_delta=3600.0)
         assert cond.description == "in_latest_time_window(lookback=3600)"
+
+    def test_in_latest_time_window_rejects_non_finite_or_non_positive_lookback(self):
+        """NaN/negative silently empty the window selection (the condition
+        never fires); inf overflows the cutoff arithmetic — reject at
+        construction like interval_seconds."""
+        for bad in (float("nan"), float("inf"), -3600.0, 0.0):
+            with pytest.raises(ValueError, match="lookback_delta must be"):
+                rs.AutomationCondition.in_latest_time_window(lookback_delta=bad)
 
     def test_any_deps_missing(self):
         cond = rs.AutomationCondition.any_deps_missing()

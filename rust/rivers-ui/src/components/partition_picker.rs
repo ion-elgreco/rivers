@@ -64,7 +64,7 @@ pub fn PartitionPicker(
 
     let toggle_single = move |idx: usize, shift: bool| {
         let keys = match picker.get_untracked() {
-            JobPartitionPicker::SingleDim { keys } => keys,
+            JobPartitionPicker::SingleDim { keys, .. } => keys,
             _ => return,
         };
         let next = apply_toggle(
@@ -108,7 +108,7 @@ pub fn PartitionPicker(
     view! {
         {move || match picker.get() {
             JobPartitionPicker::None => ().into_any(),
-            JobPartitionPicker::SingleDim { keys } => {
+            JobPartitionPicker::SingleDim { keys, truncated } => {
                 let keys_for_select_all = keys.clone();
                 view! {
                     <div class="form-group">
@@ -122,6 +122,14 @@ pub fn PartitionPicker(
                                 single_selected.set(keys_for_select_all.clone())
                             })
                         />
+                        {truncated
+                            .then(|| {
+                                view! {
+                                    <p class="exec-dialog-partition-hint">
+                                        "Key lists were truncated — only shared keys from the first window are shown."
+                                    </p>
+                                }
+                            })}
                     </div>
                 }
                 .into_any()
@@ -160,12 +168,20 @@ pub fn PartitionPicker(
                 </div>
             }
             .into_any(),
-            JobPartitionPicker::Multi { dimensions, asset_key } => view! {
+            JobPartitionPicker::Multi { dimensions, asset_key, truncated } => view! {
                 <div class="form-group">
                     <label>"Partitions"</label>
                     <div class="exec-dialog-partition-hint">
                         "Pick at least one value per dimension. The cartesian product fires one run each."
                     </div>
+                    {truncated
+                        .then(|| {
+                            view! {
+                                <p class="exec-dialog-partition-hint">
+                                    "Dimension key lists were truncated — only shared keys from the first window are shown."
+                                </p>
+                            }
+                        })}
                     {dimensions.into_iter().map(|dim| {
                         let dim_name = dim.name.clone();
                         // Page a dimension only for a single Multi asset whose
@@ -1061,6 +1077,7 @@ mod tests {
     fn submit_keys_single_dim_wraps_each_selected_in_single() {
         let picker = JobPartitionPicker::SingleDim {
             keys: vec!["a".into(), "b".into(), "c".into()],
+            truncated: false,
         };
         let selected = vec!["a".to_string(), "c".to_string()];
         let multi = HashMap::new();
@@ -1078,6 +1095,7 @@ mod tests {
         let picker = JobPartitionPicker::Multi {
             dimensions: vec![dim("color", &["r", "g"]), dim("size", &["s", "m"])],
             asset_key: None,
+            truncated: false,
         };
         let selected = Vec::new();
         let mut multi = HashMap::new();
@@ -1098,6 +1116,7 @@ mod tests {
         let picker = JobPartitionPicker::Multi {
             dimensions: vec![dim("color", &["r"]), dim("size", &["s", "m"])],
             asset_key: None,
+            truncated: false,
         };
         let selected = Vec::new();
         let mut multi = HashMap::new();

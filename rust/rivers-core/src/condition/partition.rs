@@ -75,18 +75,15 @@ impl PartitionSelection {
         }
     }
 
-    /// Set difference (self - other).
-    pub fn difference(&self, other: &Self) -> Self {
+    /// Set difference (self - other) — takes the universe of all valid keys
+    /// so `All - Keys` resolves to the concrete complement (mirrors
+    /// [`Self::complement`]).
+    pub fn difference(&self, other: &Self, all_keys: &HashSet<PartitionKey>) -> Self {
         match (self, other) {
             (Self::Empty, _) => Self::Empty,
             (_, Self::All) => Self::Empty,
             (x, Self::Empty) => x.clone(),
-            (Self::All, Self::Keys(_)) => {
-                // Can't resolve `All - Keys` without the universe; shouldn't
-                // arise in practice (All only appears for unpartitioned assets
-                // or universal conditions). Fall back to All.
-                Self::All
-            }
+            (Self::All, Self::Keys(_)) => other.complement(all_keys),
             (Self::Keys(a), Self::Keys(b)) => {
                 let diff: HashSet<PartitionKey> = a.difference(b).cloned().collect();
                 if diff.is_empty() {
@@ -146,6 +143,12 @@ pub enum PartitionMappingKind {
     },
     TimeWindow {
         offset: i64,
+        /// The upstream definition's time grid, captured at conversion so
+        /// eval can shift keys the same way the runtime does. `None` for
+        /// mappings serialized before the grid existed — degrades to
+        /// pass-through.
+        #[serde(default)]
+        grid: Option<crate::timegrid::TimeGrid>,
     },
     SpecificPartitions {
         keys: Vec<String>,
@@ -170,128 +173,44 @@ pub enum PartitionMappingKind {
     Subset,
 }
 
-impl PartitionMappingKind {
-    /// Map downstream partition keys to upstream partition keys.
-    pub fn map_to_upstream(&self, downstream_keys: &PartitionSelection) -> PartitionSelection {
-        match self {
-            Self::Identity => downstream_keys.clone(),
-            Self::AllPartitions => PartitionSelection::All,
-            Self::Static { mapping } => match downstream_keys {
-                PartitionSelection::Empty => PartitionSelection::Empty,
-                PartitionSelection::All => PartitionSelection::All,
-                PartitionSelection::Keys(keys) => {
-                    let mapped: HashSet<PartitionKey> = keys
-                        .iter()
-                        .filter_map(|k| {
-                            if let PartitionKey::Single { keys: kv } = k {
-                                mapping.get(kv.first()?).map(|v| PartitionKey::Single {
-                                    keys: vec![v.clone()],
-                                })
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if mapped.is_empty() {
-                        PartitionSelection::Empty
-                    } else {
-                        PartitionSelection::Keys(mapped)
-                    }
-                }
-            },
-            Self::TimeWindow { .. } => downstream_keys.clone(), // TODO: time offset logic
-            Self::SpecificPartitions { keys } => {
-                if downstream_keys.is_empty() {
-                    PartitionSelection::Empty
-                } else {
-                    PartitionSelection::Keys(
-                        keys.iter()
-                            .map(|k| PartitionKey::Single {
-                                keys: vec![k.clone()],
-                            })
-                            .collect(),
-                    )
-                }
+/// Shift every single-dimension key in a selection by `offset` grid windows.
+/// Keys whose shift falls outside the grid's `[start, end)` have no
+/// counterpart partition and are dropped. Without a grid (mappings
+/// serialized before it existed) the selection passes through unchanged.
+fn shift_selection(
+    sel: &PartitionSelection,
+    offset: i64,
+    grid: Option<&crate::timegrid::TimeGrid>,
+) -> PartitionSelection {
+    let Some(grid) = grid else {
+        return sel.clone();
+    };
+    if offset == 0 {
+        return sel.clone();
+    }
+    match sel {
+        PartitionSelection::All | PartitionSelection::Empty => sel.clone(),
+        PartitionSelection::Keys(keys) => {
+            let shifted: HashSet<PartitionKey> = keys
+                .iter()
+                .filter_map(|k| match k {
+                    PartitionKey::Single { keys } if keys.len() == 1 => grid
+                        .shift_key(&keys[0], offset)
+                        .ok()
+                        .map(|s| PartitionKey::Single { keys: vec![s] }),
+                    _ => None,
+                })
+                .collect();
+            if shifted.is_empty() {
+                PartitionSelection::Empty
+            } else {
+                PartitionSelection::Keys(shifted)
             }
-            Self::Multi { dimension_mappings } => match downstream_keys {
-                PartitionSelection::Empty => PartitionSelection::Empty,
-                PartitionSelection::All => PartitionSelection::All,
-                PartitionSelection::Keys(keys) => {
-                    let map_key_upstream = |pk: &PartitionKey| -> Option<PartitionKey> {
-                        let dims = match pk {
-                            PartitionKey::Multi { dims } => dims,
-                            _ => return None,
-                        };
-                        let downstream_dims: HashMap<&str, &[String]> = dims
-                            .iter()
-                            .map(|(d, v)| (d.as_str(), v.as_slice()))
-                            .collect();
-                        let mut upstream_dims = Vec::new();
-                        for (upstream_dim, (downstream_dim, per_dim_mapping)) in dimension_mappings
-                        {
-                            let val = downstream_dims.get(downstream_dim.as_str())?;
-                            let single_key = PartitionKey::Single { keys: val.to_vec() };
-                            let mapped = per_dim_mapping.map_to_upstream(
-                                &PartitionSelection::Keys(std::iter::once(single_key).collect()),
-                            );
-                            match mapped {
-                                PartitionSelection::Keys(ks) => {
-                                    let first = ks.into_iter().next()?;
-                                    if let PartitionKey::Single { keys: kv } = first {
-                                        upstream_dims.push((upstream_dim.clone(), kv));
-                                    } else {
-                                        return None;
-                                    }
-                                }
-                                _ => return None,
-                            }
-                        }
-                        Some(PartitionKey::Multi {
-                            dims: upstream_dims,
-                        })
-                    };
-                    let mapped: HashSet<PartitionKey> =
-                        keys.iter().filter_map(map_key_upstream).collect();
-                    if mapped.is_empty() {
-                        PartitionSelection::Empty
-                    } else {
-                        PartitionSelection::Keys(mapped)
-                    }
-                }
-            },
-            Self::MultiToSingle {
-                dimension_name: _,
-                inner,
-            } => match downstream_keys {
-                PartitionSelection::Empty => PartitionSelection::Empty,
-                PartitionSelection::All => PartitionSelection::All,
-                PartitionSelection::Keys(keys) => {
-                    let mapped: HashSet<PartitionKey> = keys
-                        .iter()
-                        .map(|k| {
-                            let inner_sel =
-                                PartitionSelection::Keys(std::iter::once(k.clone()).collect());
-                            inner.map_to_upstream(&inner_sel)
-                        })
-                        .flat_map(|sel| match sel {
-                            PartitionSelection::Keys(ks) => ks.into_iter().collect::<Vec<_>>(),
-                            PartitionSelection::All => vec![],
-                            PartitionSelection::Empty => vec![],
-                        })
-                        .collect();
-                    if mapped.is_empty() {
-                        PartitionSelection::Empty
-                    } else {
-                        PartitionSelection::Keys(mapped)
-                    }
-                }
-            },
-            Self::ForKeys => PartitionSelection::All,
-            // Non-existent keys filtered at execution time.
-            Self::Subset => downstream_keys.clone(),
         }
     }
+}
 
+impl PartitionMappingKind {
     /// Map upstream partition keys to downstream partition keys.
     pub fn map_to_downstream(&self, upstream_keys: &PartitionSelection) -> PartitionSelection {
         match self {
@@ -326,7 +245,11 @@ impl PartitionMappingKind {
                     }
                 }
             },
-            Self::TimeWindow { .. } => upstream_keys.clone(), // TODO: time offset logic
+            // Downstream key K reads upstream K+offset, so the downstream
+            // that reads upstream U is U-offset.
+            Self::TimeWindow { offset, grid } => {
+                shift_selection(upstream_keys, -*offset, grid.as_ref())
+            }
             Self::SpecificPartitions { .. } => {
                 if upstream_keys.is_empty() {
                     PartitionSelection::Empty
@@ -426,18 +349,19 @@ impl PartitionMappingKind {
     }
 }
 
-/// Resolves partition key mappings between connected assets.
-pub struct PartitionResolver {
+/// Resolves partition key mappings between connected assets. Borrows the
+/// long-lived maps — constructed per asset per tick on the hot loop.
+pub struct PartitionResolver<'a> {
     /// Per-edge mapping kind. Key = (downstream_asset, upstream_asset).
-    mappings: HashMap<(String, String), PartitionMappingKind>,
+    mappings: &'a HashMap<(String, String), PartitionMappingKind>,
     /// Upstream asset → its valid partition keys.
-    pub(crate) upstream_partition_keys: HashMap<String, HashSet<PartitionKey>>,
+    pub(crate) upstream_partition_keys: &'a HashMap<String, HashSet<PartitionKey>>,
 }
 
-impl PartitionResolver {
+impl<'a> PartitionResolver<'a> {
     pub fn new(
-        mappings: HashMap<(String, String), PartitionMappingKind>,
-        upstream_partition_keys: HashMap<String, HashSet<PartitionKey>>,
+        mappings: &'a HashMap<(String, String), PartitionMappingKind>,
+        upstream_partition_keys: &'a HashMap<String, HashSet<PartitionKey>>,
     ) -> Self {
         Self {
             mappings,
@@ -445,30 +369,17 @@ impl PartitionResolver {
         }
     }
 
-    /// Map downstream partition keys to upstream partition keys.
-    pub fn map_upstream(
-        &self,
-        downstream_asset: &str,
-        upstream_asset: &str,
-        downstream_keys: &PartitionSelection,
-    ) -> PartitionSelection {
-        let key = (downstream_asset.to_string(), upstream_asset.to_string());
-        let mapping = match self.mappings.get(&key) {
-            Some(m) => m,
-            None => return downstream_keys.clone(), // no mapping = identity
-        };
-        match mapping {
-            PartitionMappingKind::AllPartitions => {
-                if downstream_keys.is_empty() {
-                    PartitionSelection::Empty
-                } else {
-                    match self.upstream_partition_keys.get(upstream_asset) {
-                        Some(keys) => PartitionSelection::Keys(keys.clone()),
-                        None => PartitionSelection::All,
-                    }
-                }
-            }
-            _ => mapping.map_to_upstream(downstream_keys),
+    /// A resolver with no mappings and no upstream keys — identity for
+    /// every edge. Used where a context is built without dep traversal.
+    pub fn empty() -> PartitionResolver<'static> {
+        static EMPTY_MAPPINGS: std::sync::OnceLock<
+            HashMap<(String, String), PartitionMappingKind>,
+        > = std::sync::OnceLock::new();
+        static EMPTY_KEYS: std::sync::OnceLock<HashMap<String, HashSet<PartitionKey>>> =
+            std::sync::OnceLock::new();
+        PartitionResolver {
+            mappings: EMPTY_MAPPINGS.get_or_init(HashMap::new),
+            upstream_partition_keys: EMPTY_KEYS.get_or_init(HashMap::new),
         }
     }
 
@@ -502,7 +413,7 @@ pub struct PartitionEvalContext<'a> {
     /// Per-partition last materialization timestamp.
     pub timestamps: &'a HashMap<PartitionKey, i64>,
     /// Partition mapping resolver for upstream deps.
-    pub resolver: PartitionResolver,
+    pub resolver: PartitionResolver<'a>,
     /// Partition keys in the latest time window (for `InLatestTimeWindow` condition).
     /// `None` for non-time-windowed partitions (treated as all keys).
     pub latest_time_window_keys: Option<&'a HashSet<PartitionKey>>,

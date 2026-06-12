@@ -21,6 +21,12 @@ class PartitionKey:
 
         keys: dict[str, list[str]]
 
+    class Set(PartitionKey):
+        """Explicit key set bundling a sparse backfill group — internal /
+        transport form, returned by :meth:`from_json`."""
+
+        keys: list[PartitionKey]
+
     @staticmethod
     def single(key: str | list[str]) -> PartitionKey.Single:
         """Build a single-dimension key from a value or list of values."""
@@ -87,7 +93,8 @@ class PartitionKeyRange:
 
     @staticmethod
     def single(from_key: str, to_key: str) -> PartitionKeyRange:
-        """Single-dimension range from ``from_key`` to ``to_key`` (inclusive)."""
+        """Single-dimension range from ``from_key`` to ``to_key`` (inclusive),
+        ordered by the partition definition at resolve time."""
         ...
 
     @staticmethod
@@ -130,7 +137,13 @@ class PartitionsDefinition:
 
     @staticmethod
     def static_(keys: list[str]) -> PartitionsDefinition.Static:
-        """Define a static partitions set from a list of keys."""
+        """Define a static partitions set from a list of keys.
+
+        Raises:
+            PartitionDefinitionError: If ``keys`` is empty, a key is the
+                empty string, or a key contains a character reserved by the
+                canonical display form (``|`` or ``,``).
+        """
         ...
 
     @staticmethod
@@ -139,7 +152,12 @@ class PartitionsDefinition:
         end: datetime.datetime | None = None,
         fmt: str | None = None,
     ) -> PartitionsDefinition.TimeWindow:
-        """Daily time-window partitions starting at ``start``."""
+        """Daily time-window partitions starting at ``start``.
+
+        Raises:
+            PartitionDefinitionError: If a ``fmt`` override cannot round-trip
+                the daily grid (e.g. ``fmt="%Y-%m"``).
+        """
         ...
 
     @staticmethod
@@ -148,7 +166,12 @@ class PartitionsDefinition:
         end: datetime.datetime | None = None,
         fmt: str | None = None,
     ) -> PartitionsDefinition.TimeWindow:
-        """Hourly time-window partitions starting at ``start``."""
+        """Hourly time-window partitions starting at ``start``.
+
+        Raises:
+            PartitionDefinitionError: If a ``fmt`` override cannot round-trip
+                the hourly grid (e.g. ``fmt="%Y-%m-%d"``).
+        """
         ...
 
     @staticmethod
@@ -162,6 +185,14 @@ class PartitionsDefinition:
         """Custom time-window partitions defined by a cron schedule or interval.
 
         Provide exactly one of ``cron_schedule`` or ``interval_seconds``.
+
+        Raises:
+            PartitionDefinitionError: If ``interval_seconds`` is not positive
+                or is below one nanosecond; if a cron-gridded ``start`` is not
+                on a whole second; if ``fmt`` cannot round-trip the grid
+                (coarser than the window spacing); or if ``fmt`` renders
+                keys containing a character reserved by the canonical display
+                form (``|`` or ``,``).
         """
         ...
 
@@ -169,7 +200,14 @@ class PartitionsDefinition:
     def multi(
         dimensions: dict[str, PartitionsDefinition],
     ) -> PartitionsDefinition.Multi:
-        """Combine multiple definitions into a multi-dimensional partition space."""
+        """Combine multiple definitions into a multi-dimensional partition space.
+
+        Raises:
+            PartitionDefinitionError: If ``dimensions`` is empty, a dimension
+                is itself Multi, or a dimension name is empty or contains a
+                character reserved by the canonical display form
+                (``|``, ``,`` or ``=``).
+        """
         ...
 
     @staticmethod
@@ -197,7 +235,11 @@ class PartitionContext:
     def __init__(
         self, keys: list[PartitionKey], definition: PartitionsDefinition
     ) -> None:
-        """Construct a context (typically only the executor calls this)."""
+        """Construct a context (typically only the executor calls this).
+
+        Raises:
+            ValueError: If ``keys`` is empty.
+        """
         ...
 
     def time_window(self) -> tuple[datetime.datetime, datetime.datetime] | None:
@@ -263,7 +305,8 @@ class PartitionMapping:
 
     @staticmethod
     def time_window(offset: int) -> PartitionMapping.TimeWindow:
-        """Offset the downstream by ``offset`` upstream windows (negative = lag)."""
+        """Offset the downstream by ``offset`` upstream windows (negative = lag);
+        shifts outside the upstream's ``[start, end)`` range fail the run."""
         ...
 
     @staticmethod
