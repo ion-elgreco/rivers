@@ -86,8 +86,8 @@ fn mpk(dims: &[(&str, &str)]) -> PartitionKey {
     }
 }
 
-static EMPTY_REQUESTED: std::sync::LazyLock<HashSet<String>> =
-    std::sync::LazyLock::new(HashSet::new);
+static EMPTY_REQUESTED: std::sync::LazyLock<HashMap<String, PartitionSelection>> =
+    std::sync::LazyLock::new(HashMap::new);
 
 fn make_ctx<'a>(
     target_key: &'a str,
@@ -2692,6 +2692,97 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
             assert!(
                 keys.contains(&spk("2024-01-06")),
                 "the fire must target the mapped downstream key"
+            );
+        }
+        other => panic!("expected Keys selection, got {other:?}"),
+    }
+}
+
+#[test]
+fn will_be_requested_carries_the_upstream_fired_selection() {
+    // A partitioned upstream whose own condition fired for ONE key this tick
+    // must make only the mapped downstream key eligible — the old arm
+    // broadcast the whole universe (`requested_this_tick` carried bare asset
+    // names), re-introducing the per-partition-contract violation through
+    // any_deps_updated's WillBeRequested branch.
+    let down = make_materialized_record("down", 100);
+    let up = make_materialized_record("up", 100);
+    let records = HashMap::from([
+        ("down".to_string(), down.clone()),
+        ("up".to_string(), up.clone()),
+    ]);
+    let deps = HashMap::from([("down".to_string(), vec!["up".to_string()])]);
+
+    let pa = spk("a");
+    let pb = spk("b");
+    let pc = spk("c");
+    let keys = HashSet::from([pa.clone(), pb.clone(), pc.clone()]);
+    // Equal timestamps on both sides: the NewlyUpdated branch stays quiet,
+    // isolating WillBeRequested.
+    let ts: HashMap<PartitionKey, i64> =
+        keys.iter().map(|k| (k.clone(), 100i64)).collect();
+
+    let all_states = HashMap::new();
+    let partition_statuses = HashMap::from([
+        (
+            "down".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                materialized: keys.clone(),
+                timestamps: ts.clone(),
+                ..Default::default()
+            },
+        ),
+        (
+            "up".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                materialized: keys.clone(),
+                timestamps: ts.clone(),
+                ..Default::default()
+            },
+        ),
+    ]);
+    let partition_asset_names = HashMap::from([(
+        "up".to_string(),
+        keys.iter()
+            .map(|k| (k.clone(), Arc::from(vec!["up".to_string()])))
+            .collect::<HashMap<_, _>>(),
+    )]);
+
+    // Upstream's own condition fired for 'a' only, earlier this tick.
+    let requested = HashMap::from([(
+        "up".to_string(),
+        PartitionSelection::Keys(HashSet::from([pa.clone()])),
+    )]);
+
+    let mut ctx = make_ctx("down", &down, &records, &deps);
+    ctx.tags.partition_last_run_asset_names = &partition_asset_names;
+    ctx.all_asset_states = &all_states;
+    ctx.requested_this_tick = &requested;
+
+    let empty_mappings = HashMap::new();
+    let upstream_up = HashMap::from([("up".to_string(), keys.clone())]);
+    let pctx = PartitionEvalContext {
+        all_keys: &keys,
+        materialized: &keys,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &ts,
+        resolver: PartitionResolver::new(&empty_mappings, &upstream_up),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let cond = ConditionNode::any_deps_updated();
+    let result = evaluate(&cond, &ctx);
+    assert!(result.fired);
+    match result.selection {
+        Some(PartitionSelection::Keys(ref sel)) => {
+            assert_eq!(
+                sel,
+                &HashSet::from([pa.clone()]),
+                "only the upstream's fired key may cascade, not the universe"
             );
         }
         other => panic!("expected Keys selection, got {other:?}"),
@@ -9269,7 +9360,7 @@ fn test_will_be_requested_true_when_in_set() {
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
-    let requested = HashSet::from(["a".to_string()]);
+    let requested = HashMap::from([("a".to_string(), PartitionSelection::All)]);
     let ctx = EvalContext {
         target_key: "a",
         root_key: "a",
@@ -9304,7 +9395,7 @@ fn test_will_be_requested_in_dep_pivot() {
         ("downstream".to_string(), down_record.clone()),
     ]);
     let deps = HashMap::from([("downstream".to_string(), vec!["upstream".to_string()])]);
-    let requested = HashSet::from(["upstream".to_string()]);
+    let requested = HashMap::from([("upstream".to_string(), PartitionSelection::All)]);
     let ctx = EvalContext {
         target_key: "downstream",
         root_key: "downstream",
@@ -9373,7 +9464,7 @@ fn test_any_deps_updated_fires_via_will_be_requested() {
         ("downstream".to_string(), down_record.clone()),
     ]);
     let deps = HashMap::from([("downstream".to_string(), vec!["upstream".to_string()])]);
-    let requested = HashSet::from(["upstream".to_string()]);
+    let requested = HashMap::from([("upstream".to_string(), PartitionSelection::All)]);
     // upstream has prev_state with same timestamp → NewlyUpdated is false
     let up_state = AssetConditionState {
         last_materialized_timestamp: Some(100),
@@ -9417,7 +9508,7 @@ fn test_any_deps_missing_suppressed_by_will_be_requested() {
         ("downstream".to_string(), down_record.clone()),
     ]);
     let deps = HashMap::from([("downstream".to_string(), vec!["upstream".to_string()])]);
-    let requested = HashSet::from(["upstream".to_string()]);
+    let requested = HashMap::from([("upstream".to_string(), PartitionSelection::All)]);
     let ctx = EvalContext {
         target_key: "downstream",
         root_key: "downstream",
@@ -9478,7 +9569,7 @@ fn test_will_be_requested_tree_output() {
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
-    let requested = HashSet::from(["a".to_string()]);
+    let requested = HashMap::from([("a".to_string(), PartitionSelection::All)]);
     let ctx = EvalContext {
         target_key: "a",
         root_key: "a",
