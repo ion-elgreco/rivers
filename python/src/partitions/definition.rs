@@ -901,12 +901,9 @@ impl PartitionsDefinition {
 
     #[staticmethod]
     fn dynamic(name: String) -> PyResult<Self> {
-        if name.is_empty() {
-            return Err(PartitionDefinitionError::new_err(
-                "Dynamic partition definition name cannot be empty",
-            ));
-        }
-        Ok(Self::Dynamic { name })
+        let def = Self::Dynamic { name };
+        def.validate_definition()?;
+        Ok(def)
     }
 
     #[pyo3(name = "get_partition_keys")]
