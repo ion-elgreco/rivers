@@ -3484,7 +3484,7 @@ impl PerCodeLocationStorage for SurrealStorage {
         code_location_id: &str,
         asset_key: &str,
         materialized: &std::collections::HashMap<PartitionKey, i64>,
-    ) -> Result<Vec<PartitionKey>> {
+    ) -> Result<std::collections::HashMap<PartitionKey, i64>> {
         // No run-status filter: mark_partition_failed lands in a Success run (review #1).
         let mut result = self
             .db
@@ -3520,7 +3520,6 @@ impl PerCodeLocationStorage for SurrealStorage {
         Ok(latest_failure
             .into_iter()
             .filter(|(pk, ts)| materialized.get(pk).is_none_or(|&mat_ts| mat_ts < *ts))
-            .map(|(pk, _)| pk)
             .collect())
     }
 
@@ -8478,7 +8477,7 @@ mod tests {
             .unwrap();
         assert_eq!(failed.len(), 2);
         let mut pk_strs: Vec<String> = failed
-            .iter()
+            .keys()
             .map(|pk| match pk {
                 PartitionKey::Single { keys } => keys[0].clone(),
                 _ => panic!("expected Single partition key"),
@@ -8547,12 +8546,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            failed,
-            vec![PartitionKey::Single {
-                keys: vec!["b".to_string()]
-            }],
-        );
+        assert_eq!(failed.len(), 1);
+        assert!(failed.contains_key(&PartitionKey::Single {
+            keys: vec!["b".to_string()]
+        }));
     }
 
     #[tokio::test]
@@ -8618,7 +8615,8 @@ mod tests {
             .get_failed_partitions(DEFAULT_CODE_LOCATION_ID, "asset", &materialized)
             .await
             .unwrap();
-        assert_eq!(failed, vec![single("c")], "only c (latest event = failure)");
+        assert_eq!(failed.len(), 1, "only c (latest event = failure)");
+        assert!(failed.contains_key(&single("c")));
     }
 
     #[tokio::test]
@@ -8684,12 +8682,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            failed,
-            vec![PartitionKey::Single {
-                keys: vec!["b".to_string()]
-            }],
+            failed.len(),
+            1,
             "only the per-partition failure; None-keyed step-level failure must be excluded"
         );
+        assert!(failed.contains_key(&PartitionKey::Single {
+            keys: vec!["b".to_string()]
+        }));
     }
 
     #[tokio::test]
@@ -8742,7 +8741,7 @@ mod tests {
             .await
             .unwrap();
         let mut keys: Vec<String> = failed
-            .iter()
+            .keys()
             .map(|pk| match pk {
                 PartitionKey::Single { keys } => keys[0].clone(),
                 _ => panic!("expected Single after expansion"),

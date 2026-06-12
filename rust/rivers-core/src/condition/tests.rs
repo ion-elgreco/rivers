@@ -2699,6 +2699,117 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
 }
 
 #[test]
+fn dep_updated_retries_once_per_dep_update_after_failure() {
+    // A failed run never advances the root's materialization floor, so
+    // without failure awareness a deterministically failing partition is
+    // re-dispatched every tick forever. The failure timestamp must raise the
+    // floor: suppressed while the failure postdates the dep update, retried
+    // exactly when the dep lands something newer.
+    let a = make_materialized_record("a", 100);
+    let b = make_materialized_record("b", 300);
+    let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
+    let deps = HashMap::from([("a".to_string(), vec!["b".to_string()])]);
+
+    let k = spk("2024-01-01");
+    let keys = HashSet::from([k.clone()]);
+    // Root "a" never succeeded for k; its run at 400 failed.
+    let a_timestamps: HashMap<PartitionKey, i64> = HashMap::new();
+
+    let all_states = HashMap::new();
+    let b_partition_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: keys.clone(),
+        timestamps: HashMap::from([(k.clone(), 300i64)]),
+        ..Default::default()
+    };
+    let a_partition_status = crate::condition::cache::PartitionStatusEntry {
+        failed: HashSet::from([k.clone()]),
+        failed_timestamps: HashMap::from([(k.clone(), 400i64)]),
+        ..Default::default()
+    };
+    let partition_statuses = HashMap::from([
+        ("a".to_string(), a_partition_status),
+        ("b".to_string(), b_partition_status),
+    ]);
+    let partition_asset_names = HashMap::from([(
+        "b".to_string(),
+        HashMap::from([(k.clone(), Arc::from(vec!["b".to_string()]))]),
+    )]);
+
+    let mut ctx = make_ctx("a", &a, &records, &deps);
+    ctx.tags.partition_last_run_asset_names = &partition_asset_names;
+    ctx.all_asset_states = &all_states;
+
+    let empty_mappings = HashMap::new();
+    let upstream_b = HashMap::from([("b".to_string(), keys.clone())]);
+    let pctx = PartitionEvalContext {
+        all_keys: &keys,
+        materialized: &HashSet::new(),
+        in_progress: &HashSet::new(),
+        failed: &keys,
+        timestamps: &a_timestamps,
+        resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let cond = ConditionNode::any_deps_updated();
+    let result = evaluate(&cond, &ctx);
+    assert!(
+        !result.fired,
+        "the failed attempt at 400 already consumed the dep update at 300; \
+         re-firing every tick is an unbounded retry loop; got {:?}",
+        result.selection
+    );
+
+    // Control: the dep lands NEW data (500 > failure 400) -> exactly one
+    // retry becomes due again.
+    let statuses_retry = HashMap::from([
+        (
+            "a".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                failed: HashSet::from([k.clone()]),
+                failed_timestamps: HashMap::from([(k.clone(), 400i64)]),
+                ..Default::default()
+            },
+        ),
+        (
+            "b".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                materialized: keys.clone(),
+                timestamps: HashMap::from([(k.clone(), 500i64)]),
+                ..Default::default()
+            },
+        ),
+    ]);
+    let pctx_retry = PartitionEvalContext {
+        all_keys: &keys,
+        materialized: &HashSet::new(),
+        in_progress: &HashSet::new(),
+        failed: &keys,
+        timestamps: &a_timestamps,
+        resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
+        latest_time_window_keys: None,
+        all_partition_statuses: &statuses_retry,
+        dep_root_floor: None,
+    };
+    let mut ctx2 = make_ctx("a", &a, &records, &deps);
+    ctx2.tags.partition_last_run_asset_names = &partition_asset_names;
+    ctx2.all_asset_states = &all_states;
+    ctx2.partitions = Some(&pctx_retry);
+    let result = evaluate(&cond, &ctx2);
+    assert!(result.fired, "a newer dep update must retry the failed key");
+    match result.selection {
+        Some(PartitionSelection::Keys(ref sel)) => {
+            assert_eq!(sel.len(), 1);
+            assert!(sel.contains(&k));
+        }
+        other => panic!("expected Keys selection, got {other:?}"),
+    }
+}
+
+#[test]
 fn dep_updated_ignores_dep_keys_outside_root_universe() {
     // Identity dep whose upstream range is a superset of the root's
     // (upstream daily since 2020, downstream added with start=2024): the
@@ -6953,6 +7064,7 @@ fn test_partitioned_any_deps_missing_with_identity() {
             materialized: HashSet::from([spk("p1"), spk("p2"), spk("p3")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
+            failed_timestamps: HashMap::new(),
             timestamps: HashMap::from([(spk("p1"), 100), (spk("p2"), 100), (spk("p3"), 100)]),
         },
     )]);
@@ -7035,6 +7147,7 @@ fn test_partitioned_all_deps_match_not_missing() {
             materialized: HashSet::from([spk("p1"), spk("p2")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
+            failed_timestamps: HashMap::new(),
             timestamps: HashMap::from([(spk("p1"), 100), (spk("p2"), 100)]),
         },
     )]);
@@ -7196,6 +7309,7 @@ fn test_partitioned_eager_selects_new_partition() {
             materialized: HashSet::from([spk("p1"), spk("p2"), spk("p3")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
+            failed_timestamps: HashMap::new(),
             timestamps: HashMap::from([(spk("p1"), 200), (spk("p2"), 200), (spk("p3"), 200)]),
         },
     )]);
@@ -7551,6 +7665,7 @@ fn test_partitioned_eager_partial_upstream_update() {
             materialized: HashSet::from([spk("p1"), spk("p2"), spk("p3")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
+            failed_timestamps: HashMap::new(),
             timestamps: HashMap::from([(spk("p1"), 200), (spk("p2"), 200), (spk("p3"), 200)]),
         },
     )]);
@@ -7638,6 +7753,7 @@ fn test_partitioned_eager_only_fires_for_partitions_with_upstream_data() {
             materialized: HashSet::from([spk("p1"), spk("p2"), spk("p3")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
+            failed_timestamps: HashMap::new(),
             timestamps: HashMap::from([(spk("p1"), 200), (spk("p2"), 200), (spk("p3"), 200)]),
         },
     )]);
@@ -7743,6 +7859,7 @@ fn test_partitioned_on_missing_only_missing_partitions() {
             materialized: HashSet::from([spk("p1"), spk("p2"), spk("p3")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
+            failed_timestamps: HashMap::new(),
             timestamps: HashMap::from([(spk("p1"), 100), (spk("p2"), 100), (spk("p3"), 100)]),
         },
     )]);
@@ -9543,6 +9660,7 @@ fn test_partitioned_on_cron_waits_for_dep_update() {
             materialized: HashSet::from([spk("p1"), spk("p2")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
+            failed_timestamps: HashMap::new(),
             timestamps: HashMap::from([(spk("p1"), 100), (spk("p2"), 100)]),
         },
     )]);
@@ -9631,6 +9749,7 @@ fn test_partitioned_on_cron_fires_after_dep_update() {
             materialized: HashSet::from([spk("p1"), spk("p2")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
+            failed_timestamps: HashMap::new(),
             timestamps: HashMap::from([(spk("p1"), 200), (spk("p2"), 200)]),
         },
     )]);
@@ -9723,6 +9842,7 @@ fn test_partitioned_on_cron_partial_dep_update() {
             materialized: HashSet::from([spk("p1"), spk("p2")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
+            failed_timestamps: HashMap::new(),
             timestamps: HashMap::from([(spk("p1"), 200), (spk("p2"), 100)]),
         },
     )]);

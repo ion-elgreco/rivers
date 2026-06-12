@@ -1500,14 +1500,15 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
     ) -> impl Future<Output = Result<Vec<PartitionKey>>> + Send;
 
     /// Partitions whose latest `StepFailure` isn't superseded by a later
-    /// materialization. `materialized` is the caller's per-partition timestamps
-    /// (from `get_partition_timestamps`), so we don't re-read `asset_partitions`.
+    /// materialization, with that failure's timestamp. `materialized` is the
+    /// caller's per-partition timestamps (from `get_partition_timestamps`),
+    /// so we don't re-read `asset_partitions`.
     fn get_failed_partitions(
         &self,
         code_location_id: &str,
         asset_key: &str,
         materialized: &HashMap<PartitionKey, i64>,
-    ) -> impl Future<Output = Result<Vec<PartitionKey>>> + Send;
+    ) -> impl Future<Output = Result<HashMap<PartitionKey, i64>>> + Send;
 
     fn get_backfills(
         &self,
@@ -1880,7 +1881,7 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
         &self,
         asset_key: &str,
         materialized: &HashMap<PartitionKey, i64>,
-    ) -> Result<Vec<PartitionKey>> {
+    ) -> Result<HashMap<PartitionKey, i64>> {
         self.backend
             .get_failed_partitions(self.code_location_id, asset_key, materialized)
             .await

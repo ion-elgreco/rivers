@@ -1242,18 +1242,27 @@ fn eval_partitioned_all_deps(
 }
 
 /// The staleness floor across the downstream keys a dep key maps to: the
-/// minimum materialization timestamp, or `None` as soon as any of them was
-/// never materialized (an unmaterialized mapped key keeps the dep "updated").
+/// minimum per-key effective timestamp, where effective = the later of the
+/// last materialization and the last (still-current) failure — a failed
+/// attempt consumes the dep update that triggered it, or the daemon would
+/// re-dispatch a failing partition every tick. `None` as soon as any mapped
+/// key was never attempted at all (that keeps the dep "updated").
 fn root_floor_over<'k>(
     keys: impl Iterator<Item = &'k PartitionKey>,
-    root_timestamps: &HashMap<PartitionKey, i64>,
+    root_status: &crate::condition::cache::PartitionStatusEntry,
 ) -> Option<i64> {
     let mut floor: Option<i64> = None;
     for k in keys {
-        match root_timestamps.get(k) {
-            None => return None,
-            Some(&ts) => floor = Some(floor.map_or(ts, |f| f.min(ts))),
-        }
+        let effective = match (
+            root_status.timestamps.get(k),
+            root_status.failed_timestamps.get(k),
+        ) {
+            (None, None) => return None,
+            (Some(&m), None) => m,
+            (None, Some(&f)) => f,
+            (Some(&m), Some(&f)) => m.max(f),
+        };
+        floor = Some(floor.map_or(effective, |fl| fl.min(effective)));
     }
     floor
 }
@@ -1330,7 +1339,7 @@ fn eval_partitioned_on_dep(
                     let floor = match &mapped {
                         PartitionSelection::Empty => return None,
                         PartitionSelection::All => {
-                            root_floor_over(pctx.all_keys.iter(), &root_status.timestamps)
+                            root_floor_over(pctx.all_keys.iter(), root_status)
                         }
                         PartitionSelection::Keys(ks) => {
                             let in_universe: Vec<&PartitionKey> =
@@ -1338,7 +1347,7 @@ fn eval_partitioned_on_dep(
                             if in_universe.is_empty() {
                                 return None;
                             }
-                            root_floor_over(in_universe.into_iter(), &root_status.timestamps)
+                            root_floor_over(in_universe.into_iter(), root_status)
                         }
                     };
                     Some((uk.clone(), floor))

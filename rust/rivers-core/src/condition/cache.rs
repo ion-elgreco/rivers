@@ -47,6 +47,8 @@ pub struct PartitionStatusEntry {
     pub in_progress: HashSet<PartitionKey>,
     /// Which partitions failed in latest execution.
     pub failed: HashSet<PartitionKey>,
+    /// Latest failure timestamp for each currently-failed partition.
+    pub failed_timestamps: HashMap<PartitionKey, i64>,
     /// Per-partition last materialization timestamp.
     pub timestamps: HashMap<PartitionKey, i64>,
 }
@@ -297,9 +299,8 @@ impl AssetConditionCache {
             let failed = scoped
                 .get_failed_partitions(asset_key, &entry.timestamps)
                 .await?;
-            for pk in &failed {
-                entry.failed.insert(pk.clone());
-            }
+            entry.failed = failed.keys().cloned().collect();
+            entry.failed_timestamps = failed;
 
             self.partition_status.insert(asset_key.clone(), entry);
         }
@@ -648,11 +649,11 @@ impl AssetConditionCache {
                 .await?
                 .into_iter()
                 .collect();
-            entry.failed = scoped
+            let failed = scoped
                 .get_failed_partitions(asset_key, &entry.timestamps)
-                .await?
-                .into_iter()
-                .collect();
+                .await?;
+            entry.failed = failed.keys().cloned().collect();
+            entry.failed_timestamps = failed;
             out.insert(asset_key.clone(), entry);
         }
         Ok(out)
