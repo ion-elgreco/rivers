@@ -620,7 +620,9 @@ DEFINE TABLE IF NOT EXISTS backfills SCHEMALESS;
 DEFINE FIELD IF NOT EXISTS backfill_id ON backfills TYPE string;
 DEFINE FIELD IF NOT EXISTS code_location_id ON backfills TYPE string DEFAULT 'default';
 DEFINE FIELD IF NOT EXISTS status ON backfills TYPE string;
-DEFINE FIELD IF NOT EXISTS strategy ON backfills TYPE object FLEXIBLE;
+-- FLEXIBLE is SCHEMAFULL-only; on this SCHEMALESS table a plain object type
+-- validates the shape without stripping nested content.
+DEFINE FIELD IF NOT EXISTS strategy ON backfills TYPE object;
 DEFINE FIELD IF NOT EXISTS failure_policy ON backfills TYPE string;
 DEFINE FIELD IF NOT EXISTS asset_selection ON backfills TYPE array<string>;
 DEFINE FIELD IF NOT EXISTS partition_keys ON backfills TYPE array;
@@ -820,7 +822,7 @@ impl SurrealStorage {
                 .use_db(DEFAULT_DATABASE)
                 .await?;
             tracing::debug!("applying schema");
-            db.query(SCHEMA).await?;
+            db.query(SCHEMA).await?.check()?;
             run_migrations(&db).await?;
             Ok(db)
         })
@@ -871,7 +873,7 @@ impl SurrealStorage {
                 .use_db(DEFAULT_DATABASE)
                 .await?;
             tracing::debug!("applying schema");
-            db.query(SCHEMA).await?;
+            db.query(SCHEMA).await?.check()?;
             run_migrations(&db).await?;
             Ok(db)
         })
@@ -952,7 +954,7 @@ impl SurrealStorage {
             );
             db.use_ns(&namespace).use_db(&database).await?;
             tracing::debug!("applying schema");
-            db.query(SCHEMA).await?;
+            db.query(SCHEMA).await?.check()?;
             run_migrations(&db).await?;
             Ok(db)
         })
