@@ -738,8 +738,8 @@ fn validate_time_window_grid_compat(
             cron_schedule: down_cron,
             interval_seconds: down_interval,
             start: down_start,
+            end: down_end,
             fmt: down_fmt,
-            ..
         },
         PartitionsDefinition::TimeWindow {
             cron_schedule: up_cron,
@@ -791,9 +791,16 @@ fn validate_time_window_grid_compat(
             // gates (day-of-week, month ranges) diverge far past the first
             // ticks: an hourly grid meets its first Saturday at tick 121.
             const PROBE_TICKS: usize = 1024;
+            // Judge exactly the keys the definition will mint: window starts
+            // at/after the downstream's explicit end never exist downstream,
+            // so they must not fail the edge.
             let horizon = down_start
                 .checked_add_signed(chrono::Duration::days(1461))
                 .unwrap_or(chrono::NaiveDateTime::MAX);
+            let horizon = match down_end {
+                Some(e) => (*e).min(horizon),
+                None => horizon,
+            };
             let mut count = 0usize;
             let mut offgrid: Option<chrono::NaiveDateTime> = None;
             let mut walk_err: Option<String> = None;
