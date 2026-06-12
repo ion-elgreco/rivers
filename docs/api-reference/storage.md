@@ -70,7 +70,7 @@ All query methods block the calling thread until the result is ready.
 | `has_dynamic_partition(name, key)` | `bool` |
 | `get_materialized_partitions(asset_key)` | `list[PartitionKey]` |
 
-Dynamic keys registered before the reserved-character guard existed (`|`/`,`) still classify, but cannot round-trip display-string paths (UI, gRPC). The storage migration records any such keys under the `reserved_dynamic_keys` entry in the `kv` table and logs a warning at startup — delete each offending key and re-register it under a clean name.
+Dynamic keys registered before the reserved-character guard existed (`|`/`,`) still classify, but cannot round-trip display-string paths (UI, gRPC). The storage migration records all such keys under the `reserved_dynamic_keys` entry in the `kv` table; every subsequent open re-checks that record and logs a warning while any remain. Delete each offending key and re-register it under a clean name — remediated keys drop out of the record automatically, and the warning clears once it is empty.
 
 ### `compute_staleness()`
 

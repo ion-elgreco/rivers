@@ -340,10 +340,18 @@ async fn set_schema_version(db: &Surreal<Any>, version: u32) -> anyhow::Result<(
 /// remediation: delete each and re-register it under a clean name.
 const RESERVED_DYNAMIC_KEYS_KEY: &str = "reserved_dynamic_keys";
 
+/// One recorded reserved-char dynamic key, kept in `kv` until remediated.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ReservedDynamicKey {
+    code_location_id: String,
+    partitions_def_name: String,
+    partition_key: String,
+}
+
 /// v2 → v3 scan: stored reserved-char dynamic keys still classify (matching
 /// is structural) but cannot round-trip any display-string path (UI, gRPC).
-/// Renaming them silently would change user-visible keys, so warn and record
-/// them in `kv` instead.
+/// Renaming them silently would change user-visible keys, so record them in
+/// `kv`; every open re-checks the record and warns until they're gone.
 async fn scan_reserved_char_dynamic_keys(db: &Surreal<Any>) -> anyhow::Result<()> {
     let mut result = db
         .query(
@@ -352,27 +360,19 @@ async fn scan_reserved_char_dynamic_keys(db: &Surreal<Any>) -> anyhow::Result<()
         )
         .await?;
     let rows: Vec<DbDynamicPartition> = result.take(0)?;
-    let offenders: Vec<String> = rows
-        .iter()
+    let offenders: Vec<ReservedDynamicKey> = rows
+        .into_iter()
         .filter(|r| PartitionKey::reserved_display_char(&r.partition_key).is_some())
-        .map(|r| {
-            format!(
-                "{}/{}: '{}'",
-                r.code_location_id, r.partitions_def_name, r.partition_key
-            )
+        .map(|r| ReservedDynamicKey {
+            code_location_id: r.code_location_id,
+            partitions_def_name: r.partitions_def_name,
+            partition_key: r.partition_key,
         })
         .collect();
     if offenders.is_empty() {
         return Ok(());
     }
-    for o in offenders.iter().take(20) {
-        tracing::warn!(
-            key = %o,
-            "dynamic partition key contains display-reserved characters; \
-             delete it and re-register under a clean name"
-        );
-    }
-    let body = serde_json::to_vec(&offenders[..offenders.len().min(100)])?;
+    let body = serde_json::to_vec(&offenders)?;
     db.query(
         "INSERT INTO kv { key: $key, value: $value } \
          ON DUPLICATE KEY UPDATE value = $value",
@@ -382,6 +382,87 @@ async fn scan_reserved_char_dynamic_keys(db: &Surreal<Any>) -> anyhow::Result<()
     .await?
     .check()?;
     Ok(())
+}
+
+/// Re-check the recorded reserved-char dynamic keys at every open: entries
+/// the operator has remediated drop out (the record rewrites itself, and
+/// disappears once empty); the rest are warned about. Cost is proportional
+/// to the recorded list, not the table.
+async fn refresh_reserved_dynamic_keys_warning(
+    db: &Surreal<Any>,
+) -> anyhow::Result<Vec<ReservedDynamicKey>> {
+    let mut res = db
+        .query("SELECT * FROM kv WHERE key = $key")
+        .bind(("key", RESERVED_DYNAMIC_KEYS_KEY.to_string()))
+        .await?;
+    let rows: Vec<DbKv> = res.take(0)?;
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(Vec::new());
+    };
+    let recorded: Vec<ReservedDynamicKey> = match serde_json::from_slice(&row.value) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "unreadable reserved_dynamic_keys record; ignoring");
+            return Ok(Vec::new());
+        }
+    };
+    let recorded_len = recorded.len();
+    #[derive(Debug, SurrealValue)]
+    struct KeyRow {
+        partition_key: String,
+    }
+    let mut remaining: Vec<ReservedDynamicKey> = Vec::new();
+    for entry in recorded {
+        let mut res = db
+            .query(
+                "SELECT partition_key FROM dynamic_partitions \
+                 WHERE code_location_id = $cl AND partitions_def_name = $def \
+                 AND partition_key = $pk LIMIT 1",
+            )
+            .bind(("cl", entry.code_location_id.clone()))
+            .bind(("def", entry.partitions_def_name.clone()))
+            .bind(("pk", entry.partition_key.clone()))
+            .await?;
+        let hits: Vec<KeyRow> = res.take(0)?;
+        if !hits.is_empty() {
+            remaining.push(entry);
+        }
+    }
+    if remaining.is_empty() {
+        db.query("DELETE FROM kv WHERE key = $key")
+            .bind(("key", RESERVED_DYNAMIC_KEYS_KEY.to_string()))
+            .await?
+            .check()?;
+        return Ok(remaining);
+    }
+    if remaining.len() != recorded_len {
+        let body = serde_json::to_vec(&remaining)?;
+        db.query(
+            "INSERT INTO kv { key: $key, value: $value } \
+             ON DUPLICATE KEY UPDATE value = $value",
+        )
+        .bind(("key", RESERVED_DYNAMIC_KEYS_KEY.to_string()))
+        .bind(("value", Bytes::from(body)))
+        .await?
+        .check()?;
+    }
+    for e in remaining.iter().take(20) {
+        tracing::warn!(
+            code_location = %e.code_location_id,
+            partitions_def = %e.partitions_def_name,
+            key = %e.partition_key,
+            "dynamic partition key contains display-reserved characters; \
+             delete it and re-register under a clean name"
+        );
+    }
+    if remaining.len() > 20 {
+        tracing::warn!(
+            more = remaining.len() - 20,
+            "additional reserved-character dynamic keys recorded in kv \
+             'reserved_dynamic_keys'"
+        );
+    }
+    Ok(remaining)
 }
 
 /// Versioned in-place migrations, run once at every constructor. Steps
@@ -899,6 +980,7 @@ impl SurrealStorage {
             tracing::debug!("applying schema");
             db.query(SCHEMA).await?.check()?;
             run_migrations(&db).await?;
+            refresh_reserved_dynamic_keys_warning(&db).await?;
             Ok(db)
         })
         .await?;
@@ -950,6 +1032,7 @@ impl SurrealStorage {
             tracing::debug!("applying schema");
             db.query(SCHEMA).await?.check()?;
             run_migrations(&db).await?;
+            refresh_reserved_dynamic_keys_warning(&db).await?;
             Ok(db)
         })
         .await?;
@@ -1031,6 +1114,7 @@ impl SurrealStorage {
             tracing::debug!("applying schema");
             db.query(SCHEMA).await?.check()?;
             run_migrations(&db).await?;
+            refresh_reserved_dynamic_keys_warning(&db).await?;
             Ok(db)
         })
         .await?;
@@ -4313,6 +4397,60 @@ mod tests {
         assert_eq!(rows.len(), 1, "offending keys must be recorded in kv");
         let body = String::from_utf8(rows[0].value.to_vec()).unwrap();
         assert!(body.contains("colors") && body.contains("us|eu"), "{body}");
+    }
+
+    /// Every open re-checks the recorded offenders (the docs promise a
+    /// startup warning, not a one-shot migration log) and the record heals
+    /// itself once the operator deletes the offending keys.
+    #[tokio::test]
+    async fn test_reserved_dynamic_keys_record_warns_until_remediated() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        set_schema_version(&storage.db, 2).await.unwrap();
+        storage
+            .db
+            .query(
+                "CREATE dynamic_partitions CONTENT { code_location_id: 'default', \
+                 partitions_def_name: 'colors', partition_key: 'us|eu', \
+                 create_timestamp: 1 }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        run_migrations(&storage.db).await.unwrap();
+
+        // A later open (any constructor) re-surfaces the recorded offender.
+        let remaining = refresh_reserved_dynamic_keys_warning(&storage.db)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].partition_key, "us|eu");
+
+        // Remediation: the operator deletes the offending key; the next open
+        // drops it from the record and removes the empty record entirely.
+        storage
+            .db
+            .query("DELETE FROM dynamic_partitions WHERE partition_key = $pk")
+            .bind(("pk", "us|eu".to_string()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let remaining = refresh_reserved_dynamic_keys_warning(&storage.db)
+            .await
+            .unwrap();
+        assert!(remaining.is_empty(), "remediated keys must drop out");
+        let mut res = storage
+            .db
+            .query("SELECT * FROM kv WHERE key = $key")
+            .bind(("key", RESERVED_DYNAMIC_KEYS_KEY.to_string()))
+            .await
+            .unwrap();
+        let rows: Vec<DbKv> = res.take(0).unwrap();
+        assert!(rows.is_empty(), "an emptied record must be deleted");
     }
 
     /// The heal's values come from a snapshot taken before its write loop, so
