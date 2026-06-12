@@ -253,28 +253,24 @@ class TestDaemonBackfillPriority:
             partition_key=rs.PartitionKey.single("b"),
         )
 
-        # Per-partition dep matching: the upstream re-materializations must
-        # land within one tick window to dispatch as a single backfill.
+        # Burst before the daemon starts: per-partition dep matching sees
+        # both stale keys on the first tick — one backfill, no tick race.
+        repo.materialize(
+            selection=["d_up"],
+            partition_key=rs.PartitionKey.single("a"),
+        )
+        repo.materialize(
+            selection=["d_up"],
+            partition_key=rs.PartitionKey.single("b"),
+        )
+
         daemon = AutomationDaemon(
             repo=repo,
             storage=storage,
-            condition_eval_interval="3s",
+            condition_eval_interval="1s",
         )
         daemon.start()
         try:
-            # Let daemon establish baseline
-            time.sleep(2)
-
-            # Re-materialize upstream to trigger downstream backfill
-            repo.materialize(
-                selection=["d_up"],
-                partition_key=rs.PartitionKey.single("a"),
-            )
-            repo.materialize(
-                selection=["d_up"],
-                partition_key=rs.PartitionKey.single("b"),
-            )
-
             # Wait for backfill runs
             tagged_runs = _wait_for_backfill_runs(storage, timeout=20)
             assert len(tagged_runs) >= 1, (

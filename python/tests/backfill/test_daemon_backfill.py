@@ -40,7 +40,7 @@ class TestDaemonConditionBackfill:
         1. Pre-materialize both upstream partitions AND both downstream partitions
            (so the daemon cache sees them as "existed" before the upstream re-materialization)
         2. Re-materialize upstream for both partitions (makes downstream stale)
-        3. Start daemon with condition eval (1s interval)
+        3. Start daemon (1s interval) — its first tick sees both stale keys
         4. Condition detects upstream updates → fires for [a, b]
         5. Since 2 partitions fire, daemon should create a backfill
         6. Backfill runs execute (via pickup loop)
@@ -81,27 +81,25 @@ class TestDaemonConditionBackfill:
             partition_key=rs.PartitionKey.single("b"),
         )
 
-        # Start daemon FIRST so it captures the baseline state
+        # Re-materialize upstream BEFORE the daemon starts: dep matching is
+        # staleness-based, so the first tick deterministically sees both
+        # stale keys — no racing the tick boundary with a burst.
+        repo.materialize(
+            selection=["upstream"],
+            partition_key=rs.PartitionKey.single("a"),
+        )
+        repo.materialize(
+            selection=["upstream"],
+            partition_key=rs.PartitionKey.single("b"),
+        )
+
         daemon = AutomationDaemon(
             repo=repo,
             storage=storage,
-            condition_eval_interval="3s",
+            condition_eval_interval="1s",
         )
         daemon.start()
         try:
-            # Let the daemon run a baseline tick (sees everything UpToDate)
-            time.sleep(2)
-
-            # Now re-materialize upstream to make downstream stale
-            repo.materialize(
-                selection=["upstream"],
-                partition_key=rs.PartitionKey.single("a"),
-            )
-            repo.materialize(
-                selection=["upstream"],
-                partition_key=rs.PartitionKey.single("b"),
-            )
-
             # Wait for backfill-launched runs
             tagged_runs = _wait_for_backfill_runs(storage, timeout=20)
             assert len(tagged_runs) >= 1, (
@@ -246,25 +244,25 @@ class TestDaemonConditionBackfill:
             partition_key=rs.PartitionKey.single("b"),
         )
 
+        # Burst before the daemon starts: the first tick sees both stale
+        # keys at once, so the strict one-backfill asserts below are
+        # deterministic instead of racing the tick boundary.
+        repo.materialize(
+            selection=["strat_up"],
+            partition_key=rs.PartitionKey.single("a"),
+        )
+        repo.materialize(
+            selection=["strat_up"],
+            partition_key=rs.PartitionKey.single("b"),
+        )
+
         daemon = AutomationDaemon(
             repo=repo,
             storage=storage,
-            condition_eval_interval="3s",
+            condition_eval_interval="1s",
         )
         daemon.start()
         try:
-            time.sleep(2)
-
-            # Re-materialize upstream
-            repo.materialize(
-                selection=["strat_up"],
-                partition_key=rs.PartitionKey.single("a"),
-            )
-            repo.materialize(
-                selection=["strat_up"],
-                partition_key=rs.PartitionKey.single("b"),
-            )
-
             # Wait for backfill to complete
             bf = _wait_for_backfill(repo, timeout=20)
             assert bf is not None, "Backfill should have been created and completed"
@@ -346,27 +344,24 @@ class TestDaemonConditionBackfill:
                     partition_key=pk,
                 )
 
-        # Dep matching is per-partition: the four upstream re-materializations
-        # below must land within one tick window or the condition legitimately
-        # fires as two separate backfills.
+        # Dep matching is per-partition: burst all four upstream updates
+        # BEFORE the daemon starts so its first tick sees them together and
+        # dispatches a single backfill — no racing the tick boundary.
+        for region in ["us", "eu"]:
+            for date in ["d1", "d2"]:
+                pk = rs.PartitionKey.multi({"region": region, "date": date})
+                repo.materialize(
+                    selection=["pd_up"],
+                    partition_key=pk,
+                )
+
         daemon = AutomationDaemon(
             repo=repo,
             storage=storage,
-            condition_eval_interval="3s",
+            condition_eval_interval="1s",
         )
         daemon.start()
         try:
-            time.sleep(2)
-
-            # Re-materialize all upstream partitions to trigger downstream
-            for region in ["us", "eu"]:
-                for date in ["d1", "d2"]:
-                    pk = rs.PartitionKey.multi({"region": region, "date": date})
-                    repo.materialize(
-                        selection=["pd_up"],
-                        partition_key=pk,
-                    )
-
             # Wait for backfill to complete
             bf = _wait_for_backfill(repo, timeout=20)
             assert bf is not None, "Backfill should have been created and completed"
