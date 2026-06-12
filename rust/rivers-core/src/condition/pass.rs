@@ -707,10 +707,10 @@ impl ConditionPass {
         let mut partitioned_mats: Vec<(String, Vec<PartitionKey>)> = Vec::new();
 
         for tm in to_materialize {
-            self.cache
-                .in_progress_assets
-                .entry(tm.asset_key.clone())
-                .or_default();
+            // The in-progress entry gates next tick's dispatch until run ids
+            // land on it, so it may only exist for assets that actually
+            // produce a dispatch — a fully-dropped selection would leave an
+            // empty entry nothing ever clears, wedging the asset.
             match tm.selection {
                 Some(PartitionSelection::Keys(keys)) if !keys.is_empty() => {
                     // A mapped selection can name keys this asset doesn't
@@ -739,6 +739,10 @@ impl ConditionPass {
                         );
                     }
                     if !surviving.is_empty() {
+                        self.cache
+                            .in_progress_assets
+                            .entry(tm.asset_key.clone())
+                            .or_default();
                         self.mark_partitions_handled(&tm.asset_key, &surviving);
                         partitioned_mats.push((tm.asset_key, surviving));
                     }
@@ -752,14 +756,28 @@ impl ConditionPass {
                         .map(|pi| pi.all_keys.iter().cloned().collect::<Vec<_>>());
                     match resolved {
                         Some(all_keys) if !all_keys.is_empty() => {
+                            self.cache
+                                .in_progress_assets
+                                .entry(tm.asset_key.clone())
+                                .or_default();
                             self.mark_partitions_handled(&tm.asset_key, &all_keys);
                             partitioned_mats.push((tm.asset_key, all_keys));
                         }
                         Some(_) => {} // partitioned asset with zero keys — drop
-                        None => unpartitioned.push(tm.asset_key),
+                        None => {
+                            self.cache
+                                .in_progress_assets
+                                .entry(tm.asset_key.clone())
+                                .or_default();
+                            unpartitioned.push(tm.asset_key);
+                        }
                     }
                 }
                 _ => {
+                    self.cache
+                        .in_progress_assets
+                        .entry(tm.asset_key.clone())
+                        .or_default();
                     unpartitioned.push(tm.asset_key);
                 }
             }
@@ -1202,6 +1220,54 @@ mod tests {
         let mut sorted = display.clone();
         sorted.sort_unstable();
         assert_eq!(display, sorted, "dispatched keys must be display-ordered");
+    }
+
+    #[test]
+    fn classify_fully_dropped_selection_leaves_no_in_progress_entry() {
+        // A selection whose keys are all outside the asset's universe
+        // dispatches nothing — it must not pre-mark the asset in-progress.
+        // The empty entry has no clear path (no run ids ever land), so it
+        // would gate every future dispatch for the asset forever.
+        let mut pass = ConditionPass::new(
+            AssetConditionCache::default(),
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "down".to_string(),
+                condition: ConditionNode::InProgress,
+                partition_info: Some(PartitionInfo {
+                    all_keys: make_daily_keys(&["2024-01-01", "2024-01-02"]),
+                    mappings: HashMap::new(),
+                    time_window_fmt: None,
+                    universe: PartitionUniverse::Frozen,
+                }),
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        );
+        pass.eval_state.assets.insert(
+            "down".to_string(),
+            crate::condition::state::AssetConditionState::default(),
+        );
+        let plan = pass.classify_materializations(vec![ToMaterialize {
+            asset_key: "down".to_string(),
+            selection: Some(PartitionSelection::Keys(make_daily_keys(&["1999-01-01"]))),
+        }]);
+        assert!(plan.unpartitioned.is_empty());
+        assert!(plan.single_partition_groups.is_empty());
+        assert!(plan.multi_partition_backfills.is_empty());
+        assert!(
+            !pass.cache.in_progress_assets.contains_key("down"),
+            "a fully-dropped selection must not wedge the asset behind an \
+             in-progress entry nothing will ever clear"
+        );
+
+        // Control: a surviving selection still pre-marks the asset.
+        let plan = pass.classify_materializations(vec![ToMaterialize {
+            asset_key: "down".to_string(),
+            selection: Some(PartitionSelection::Keys(make_daily_keys(&["2024-01-01"]))),
+        }]);
+        assert_eq!(plan.single_partition_groups.len(), 1);
+        assert!(pass.cache.in_progress_assets.contains_key("down"));
     }
 
     #[test]
