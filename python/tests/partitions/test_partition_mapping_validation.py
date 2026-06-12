@@ -1321,6 +1321,27 @@ def test_resolve_rejects_variant_constructed_multi_with_bad_dim_name():
         make_repo([standalone])
 
 
+def test_resolve_rejects_variant_constructed_multi_with_duplicate_dim_names():
+    """The multi() factory's dict input makes duplicate names impossible, but
+    the raw variant constructor takes a list of tuples: a duplicated name
+    silently collapses the universe (the enumeration paths even disagree on
+    which dimension survives) and the minted keys fail the definition's own
+    validation."""
+    bad = rs.PartitionsDefinition.Multi(
+        dimensions=[
+            ("d", rs.PartitionsDefinition.static_(["x1", "x2"])),
+            ("d", rs.PartitionsDefinition.static_(["y1", "y2"])),
+        ]
+    )
+
+    @rs.Asset(partitions_def=bad)
+    def standalone() -> Any:
+        return 1
+
+    with pytest.raises(PartitionValidationError, match="duplicate dimension name"):
+        make_repo([standalone])
+
+
 def test_factory_constructed_defs_resolve_fine():
     """The re-validation must not reject anything the factories produce."""
     pd = rs.PartitionsDefinition.multi(
