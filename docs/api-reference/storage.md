@@ -40,6 +40,10 @@ Each parameter resolves via: explicit kwarg → `RIVERS_SURREAL_*` env var → d
 
 When `username` and `password` both resolve to non-empty values, they authenticate as a database-scoped user against `namespace` / `database` — matching a `DEFINE USER ... ON DATABASE` definition.
 
+### Schema migrations
+
+Every open runs versioned in-place migrations and stamps the schema version in the `kv` table; databases already at the current version skip the scans. Migrations are one-shot: **all processes sharing a database must run the same rivers version**. A pre-0.2 writer pointed at a migrated database re-introduces the data shapes the migration healed (unsorted multi-dimension partition keys, unguarded dynamic keys) and nothing heals them again until the next schema bump — upgrade every code location and UI/daemon process together.
+
 ### `storage.type`
 
 Returns a `StorageType` enum (`StorageType.Memory`, `StorageType.Embedded`, or `StorageType.Remote`).
