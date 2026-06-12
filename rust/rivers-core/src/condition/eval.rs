@@ -251,28 +251,44 @@ fn eval_inner<O: EvalOutput>(
             O::leaf(expr, my_idx, node)
         }
         ConditionNode::NewlyUpdated => {
+            // In a dep pivot, fire-time baselines are unsound (async event
+            // drains double-fire; global re-baselining loses fires) — same
+            // contract as the partitioned arm: a dep counts as updated while
+            // strictly newer than the root's last successful OR failed
+            // attempt, so the triggered run self-suppresses and a failed one
+            // consumes the update instead of retrying every tick.
+            if ctx.target_key != ctx.root_key {
+                let expr = match ctx.target_record.last_timestamp {
+                    None => false,
+                    Some(dep_ts) => {
+                        let root_mat = ctx
+                            .cache
+                            .records
+                            .get(ctx.root_key)
+                            .and_then(|r| r.last_timestamp);
+                        let root_failed = ctx
+                            .cache
+                            .failed_asset_timestamps
+                            .get(ctx.root_key)
+                            .copied();
+                        match (root_mat, root_failed) {
+                            (None, None) => true,
+                            (Some(m), None) => dep_ts > m,
+                            (None, Some(f)) => dep_ts > f,
+                            (Some(m), Some(f)) => dep_ts > m.max(f),
+                        }
+                    }
+                };
+                return O::leaf(expr, my_idx, node);
+            }
             let expr = match (
                 ctx.target_record.last_timestamp,
                 ctx.prev_state.last_materialized_timestamp,
             ) {
                 (Some(current), Some(prev)) => current > prev,
-                // No previous state: on initial tick, use heuristic — only
-                // fire if this asset was materialized AFTER the root asset
-                // (genuine new data from a racing sensor/schedule). On
-                // non-initial ticks, a missing prev_state means new dep
+                // No previous state: a missing prev_state means the asset
                 // appeared between ticks → treat as updated.
-                (Some(dep_ts), None) => {
-                    if ctx.is_initial {
-                        ctx.cache
-                            .records
-                            .get(ctx.root_key)
-                            .and_then(|r| r.last_timestamp)
-                            .map(|root_ts| dep_ts > root_ts)
-                            .unwrap_or(true)
-                    } else {
-                        true
-                    }
-                }
+                (Some(_), None) => true,
                 _ => false,
             };
             O::leaf(expr, my_idx, node)

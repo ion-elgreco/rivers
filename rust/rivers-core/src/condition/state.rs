@@ -75,6 +75,8 @@ pub struct CacheSnapshot<'a> {
     pub in_progress_assets: &'a HashSet<String>,
     /// Assets whose latest run failed.
     pub failed_assets: &'a HashSet<String>,
+    /// Latest failure timestamp per currently-failed asset.
+    pub failed_asset_timestamps: &'a HashMap<String, i64>,
     /// Active backfill state: asset→backfill_ids + backfill_id→partition_keys.
     pub backfill: &'a BackfillState,
 }

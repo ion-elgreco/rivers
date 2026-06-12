@@ -89,6 +89,9 @@ fn mpk(dims: &[(&str, &str)]) -> PartitionKey {
 static EMPTY_REQUESTED: std::sync::LazyLock<HashMap<String, PartitionSelection>> =
     std::sync::LazyLock::new(HashMap::new);
 
+static EMPTY_FAILED_TS: std::sync::LazyLock<HashMap<String, i64>> =
+    std::sync::LazyLock::new(HashMap::new);
+
 fn make_ctx<'a>(
     target_key: &'a str,
     target_record: &'a AssetRecord,
@@ -104,6 +107,7 @@ fn make_ctx<'a>(
             upstream_deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
@@ -151,6 +155,7 @@ fn test_in_progress() {
             upstream_deps: &deps,
             in_progress_assets: &in_progress,
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -186,6 +191,7 @@ fn test_execution_failed() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &failed,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -247,6 +253,7 @@ fn test_newly_requested_after_firing() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -286,6 +293,7 @@ fn test_newly_requested_not_fired_last_tick() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -324,6 +332,7 @@ fn test_newly_requested_never_handled() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -362,6 +371,7 @@ fn test_newly_updated() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -400,6 +410,7 @@ fn test_newly_updated_no_change() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -544,6 +555,7 @@ fn test_newly_true_does_not_refire_with_previous_true() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -656,6 +668,7 @@ fn test_data_version_changed_true_when_version_differs() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -695,6 +708,7 @@ fn test_data_version_changed_false_when_same() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -754,6 +768,7 @@ fn test_data_version_changed_false_version_disappeared() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -793,6 +808,7 @@ fn test_data_version_changed_with_tree() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -845,6 +861,7 @@ fn test_data_version_changed_state_tracking() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -878,6 +895,7 @@ fn test_data_version_changed_state_tracking() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -917,6 +935,7 @@ fn test_backfill_in_progress_true_when_in_backfill() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
         tags: RunTagSnapshot {
@@ -966,6 +985,7 @@ fn test_backfill_in_progress_only_matches_selected_assets() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
         tags: RunTagSnapshot {
@@ -992,6 +1012,7 @@ fn test_backfill_in_progress_only_matches_selected_assets() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
         tags: RunTagSnapshot {
@@ -1031,6 +1052,7 @@ fn test_backfill_in_progress_with_tree() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
         tags: RunTagSnapshot {
@@ -1073,6 +1095,7 @@ fn test_backfill_in_progress_composition_with_in_progress() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
         tags: RunTagSnapshot {
@@ -1116,6 +1139,7 @@ fn test_backfill_in_progress_dep_aggregate() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
         tags: RunTagSnapshot {
@@ -1162,6 +1186,7 @@ fn test_backfill_in_progress_partitioned_targets_subset() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
         tags: RunTagSnapshot {
@@ -1219,6 +1244,7 @@ fn test_backfill_in_progress_partitioned_empty_keys_selects_all() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
         tags: RunTagSnapshot {
@@ -1270,6 +1296,7 @@ fn test_backfill_in_progress_partitioned_disjoint_keys() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
         tags: RunTagSnapshot {
@@ -1324,6 +1351,7 @@ fn test_backfill_in_progress_multiple_backfills_union_partitions() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
         tags: RunTagSnapshot {
@@ -1386,6 +1414,7 @@ fn test_backfill_in_progress_one_backfill_empty_keys_short_circuits() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
         tags: RunTagSnapshot {
@@ -3455,6 +3484,7 @@ fn test_any_deps_in_progress() {
             upstream_deps: &deps,
             in_progress_assets: &in_progress,
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -3491,6 +3521,7 @@ fn test_any_deps_in_progress_none() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -3529,6 +3560,7 @@ fn test_any_deps_updated() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -3547,6 +3579,72 @@ fn test_any_deps_updated() {
         partitions: None,
     };
     assert!(evaluate(&ConditionNode::any_deps_updated(), &ctx).fired);
+}
+
+#[test]
+fn unpartitioned_dep_updated_compares_against_root_record() {
+    // Drain-lag double fire: the root already ran at 110 reading b@99's
+    // durably-written data; b's completion drains into the cache a tick
+    // later with a stale fire-time baseline (50). Baselines re-fire; the
+    // staleness floor must see the root is already newer and suppress.
+    let r = make_materialized_record("R", 110);
+    let b = make_materialized_record("b", 99);
+    let records = HashMap::from([("R".to_string(), r.clone()), ("b".to_string(), b.clone())]);
+    let deps = HashMap::from([("R".to_string(), vec!["b".to_string()])]);
+    let b_state = AssetConditionState {
+        last_materialized_timestamp: Some(50),
+        ..Default::default()
+    };
+    let all_states = HashMap::from([("b".to_string(), b_state)]);
+
+    let mut ctx = make_ctx("R", &r, &records, &deps);
+    ctx.all_asset_states = &all_states;
+    assert!(
+        !evaluate(&ConditionNode::any_deps_updated(), &ctx).fired,
+        "the root's run at 110 already consumed b@99"
+    );
+
+    // Control: b lands genuinely newer than the root -> fires.
+    let b_new = make_materialized_record("b", 120);
+    let records_new = HashMap::from([
+        ("R".to_string(), r.clone()),
+        ("b".to_string(), b_new.clone()),
+    ]);
+    let mut ctx2 = make_ctx("R", &r, &records_new, &deps);
+    ctx2.all_asset_states = &all_states;
+    assert!(evaluate(&ConditionNode::any_deps_updated(), &ctx2).fired);
+}
+
+#[test]
+fn unpartitioned_dep_updated_failed_root_retries_once() {
+    // A failed root run consumes the dep update that triggered it: while the
+    // failure postdates the dep, re-firing every tick is an unbounded retry
+    // loop. A newer dep update retries exactly once more.
+    let r = make_materialized_record("R", 100);
+    let b = make_materialized_record("b", 120);
+    let records = HashMap::from([("R".to_string(), r.clone()), ("b".to_string(), b.clone())]);
+    let deps = HashMap::from([("R".to_string(), vec!["b".to_string()])]);
+    let failed_ts = HashMap::from([("R".to_string(), 130i64)]);
+    let all_states = HashMap::new();
+
+    let mut ctx = make_ctx("R", &r, &records, &deps);
+    ctx.all_asset_states = &all_states;
+    ctx.cache.failed_asset_timestamps = &failed_ts;
+    assert!(
+        !evaluate(&ConditionNode::any_deps_updated(), &ctx).fired,
+        "the failed attempt at 130 already consumed b@120"
+    );
+
+    // Control: b lands after the failure -> one retry becomes due.
+    let b_new = make_materialized_record("b", 140);
+    let records_new = HashMap::from([
+        ("R".to_string(), r.clone()),
+        ("b".to_string(), b_new.clone()),
+    ]);
+    let mut ctx2 = make_ctx("R", &r, &records_new, &deps);
+    ctx2.all_asset_states = &all_states;
+    ctx2.cache.failed_asset_timestamps = &failed_ts;
+    assert!(evaluate(&ConditionNode::any_deps_updated(), &ctx2).fired);
 }
 
 #[test]
@@ -3573,6 +3671,7 @@ fn test_any_deps_updated_no_change() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -3660,6 +3759,7 @@ fn test_newly_true_transition() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -3692,6 +3792,7 @@ fn test_newly_true_transition() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -3725,6 +3826,7 @@ fn test_newly_true_transition() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -3782,6 +3884,7 @@ fn test_counter_stability_and_short_circuit() {
             upstream_deps: &deps,
             in_progress_assets: &in_progress,
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -3816,6 +3919,7 @@ fn test_counter_stability_and_short_circuit() {
             upstream_deps: &deps,
             in_progress_assets: &in_progress,
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -3875,6 +3979,7 @@ fn test_on_missing_does_not_fire_when_in_progress() {
             upstream_deps: &deps,
             in_progress_assets: &in_progress,
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -3929,6 +4034,7 @@ fn test_eager_fires_on_deps_updated() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -3974,6 +4080,7 @@ fn test_eager_does_not_fire_when_up_to_date() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4039,6 +4146,7 @@ fn test_bug_cron_tick_always_fires_on_first_eval() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4091,6 +4199,7 @@ fn test_cron_tick_fires_when_tick_passes_between_evals() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4211,6 +4320,7 @@ fn test_bug_since_last_handled_refires_after_own_materialization() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4251,6 +4361,7 @@ fn test_bug_since_last_handled_refires_after_own_materialization() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4305,6 +4416,7 @@ fn test_newly_requested_any_deps_match_cross_asset_signaling() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4357,6 +4469,7 @@ fn test_newly_requested_any_deps_match_cross_asset_signaling() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4402,6 +4515,7 @@ fn test_newly_requested_any_deps_match_cross_asset_signaling() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4456,6 +4570,7 @@ fn test_newly_requested_as_since_reset() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4498,6 +4613,7 @@ fn test_newly_requested_as_since_reset() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4554,6 +4670,7 @@ fn test_newly_requested_as_since_reset_fast_ticks() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4590,6 +4707,7 @@ fn test_newly_requested_as_since_reset_fast_ticks() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4630,6 +4748,7 @@ fn test_newly_requested_as_since_reset_fast_ticks() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4683,6 +4802,7 @@ fn test_newly_requested_in_since_last_handled() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4717,6 +4837,7 @@ fn test_newly_requested_in_since_last_handled() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4754,6 +4875,7 @@ fn test_newly_requested_in_since_last_handled() {
             upstream_deps: &deps,
             in_progress_assets: &HashSet::new(),
             failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -4946,6 +5068,7 @@ fn bench_eval(
                     upstream_deps,
                     in_progress_assets: &in_progress,
                     failed_assets: &failed,
+                    failed_asset_timestamps: &EMPTY_FAILED_TS,
                     backfill: &EMPTY_BACKFILL,
                 },
                 tags: RunTagSnapshot {
@@ -4981,6 +5104,7 @@ fn bench_eval(
                     upstream_deps,
                     in_progress_assets: &in_progress,
                     failed_assets: &failed,
+                    failed_asset_timestamps: &EMPTY_FAILED_TS,
                     backfill: &EMPTY_BACKFILL,
                 },
                 tags: RunTagSnapshot {
@@ -5306,6 +5430,7 @@ fn bench_selective_vs_full_eval() {
                         upstream_deps: &cache.upstream_deps,
                         in_progress_assets: &in_progress,
                         failed_assets: &failed,
+                        failed_asset_timestamps: &EMPTY_FAILED_TS,
                         backfill: &EMPTY_BACKFILL,
                     },
                     tags: RunTagSnapshot {
@@ -5346,6 +5471,7 @@ fn bench_selective_vs_full_eval() {
                         upstream_deps: &cache.upstream_deps,
                         in_progress_assets: &in_progress,
                         failed_assets: &failed,
+                        failed_asset_timestamps: &EMPTY_FAILED_TS,
                         backfill: &EMPTY_BACKFILL,
                     },
                     tags: RunTagSnapshot {
@@ -5571,6 +5697,7 @@ async fn bench_cache_tick<S: StorageBackend>(
                         upstream_deps: &cache.upstream_deps,
                         in_progress_assets: &in_progress,
                         failed_assets: &failed,
+                        failed_asset_timestamps: &EMPTY_FAILED_TS,
                         backfill: &EMPTY_BACKFILL,
                     },
                     tags: RunTagSnapshot {
@@ -6521,6 +6648,7 @@ fn make_partitioned_ctx<'a>(
             upstream_deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
@@ -6920,6 +7048,7 @@ fn test_partitioned_newly_updated() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -7035,6 +7164,7 @@ fn test_partitioned_newly_true() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -7083,6 +7213,7 @@ fn test_partitioned_newly_true() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -7186,6 +7317,7 @@ fn test_partitioned_any_deps_missing_with_identity() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -7269,6 +7401,7 @@ fn test_partitioned_all_deps_match_not_missing() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -7431,6 +7564,7 @@ fn test_partitioned_eager_selects_new_partition() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -7787,6 +7921,7 @@ fn test_partitioned_eager_partial_upstream_update() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -7875,6 +8010,7 @@ fn test_partitioned_eager_only_fires_for_partitions_with_upstream_data() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -7982,6 +8118,7 @@ fn test_partitioned_on_missing_only_missing_partitions() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -8048,6 +8185,7 @@ fn test_partitioned_in_progress_excludes_from_and() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -8153,6 +8291,7 @@ fn test_partitioned_since_latch_per_partition() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -8212,6 +8351,7 @@ fn test_partitioned_since_latch_per_partition() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -8261,6 +8401,7 @@ fn test_partitioned_newly_true_only_new_partitions() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -8302,6 +8443,7 @@ fn test_partitioned_newly_true_only_new_partitions() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -8341,6 +8483,7 @@ fn test_partitioned_newly_true_only_new_partitions() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -8522,6 +8665,7 @@ fn test_eager_does_not_fire_when_all_up_to_date_first_tick() {
             upstream_deps: &upstream_deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -8650,6 +8794,7 @@ fn test_eager_fires_after_upstream_observed_on_second_tick() {
             upstream_deps: &upstream_deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -8721,6 +8866,7 @@ fn test_eager_fires_after_upstream_observed_on_second_tick() {
             upstream_deps: &upstream_deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -8755,6 +8901,7 @@ fn test_eager_fires_after_upstream_observed_on_second_tick() {
             upstream_deps: &upstream_deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -8871,6 +9018,7 @@ fn test_eager_fires_after_dep_in_progress_clears() {
             upstream_deps: &upstream_deps,
             in_progress_assets: &in_progress,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -8919,6 +9067,7 @@ fn test_eager_fires_after_dep_in_progress_clears() {
             upstream_deps: &upstream_deps,
             in_progress_assets: &empty_in_progress,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: RunTagSnapshot {
@@ -9370,6 +9519,7 @@ fn test_will_be_requested_true_when_in_set() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
@@ -9405,6 +9555,7 @@ fn test_will_be_requested_in_dep_pivot() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
@@ -9438,6 +9589,7 @@ fn test_will_be_requested_not_in_dep_pivot_when_dep_not_requested() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
@@ -9483,6 +9635,7 @@ fn test_any_deps_updated_fires_via_will_be_requested() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
@@ -9518,6 +9671,7 @@ fn test_any_deps_missing_suppressed_by_will_be_requested() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
@@ -9551,6 +9705,7 @@ fn test_any_deps_missing_fires_when_dep_not_requested() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
@@ -9579,6 +9734,7 @@ fn test_will_be_requested_tree_output() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
@@ -9640,6 +9796,7 @@ fn test_partitioned_on_cron_no_deps_fires_all_partitions() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
@@ -9707,6 +9864,7 @@ fn test_partitioned_on_cron_does_not_fire_without_tick() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
@@ -9796,6 +9954,7 @@ fn test_partitioned_on_cron_waits_for_dep_update() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
@@ -9885,6 +10044,7 @@ fn test_partitioned_on_cron_fires_after_dep_update() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
@@ -9978,6 +10138,7 @@ fn test_partitioned_on_cron_partial_dep_update() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
@@ -10130,6 +10291,7 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
@@ -10179,6 +10341,7 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
             upstream_deps: &deps,
             in_progress_assets: &EMPTY_SET,
             failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),

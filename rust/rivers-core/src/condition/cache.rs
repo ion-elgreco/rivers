@@ -114,8 +114,9 @@ struct RefreshDelta {
     record_updates: Vec<AssetRecord>,
     /// In-progress changes, in apply order.
     in_progress_changes: Vec<InProgressChange>,
-    /// Asset keys to add to `failed_assets`.
-    failed_adds: HashSet<String>,
+    /// Asset keys to add to `failed_assets`, with the failing run's
+    /// end (or start) timestamp.
+    failed_adds: HashMap<String, i64>,
     /// Asset keys to remove from `failed_assets`.
     failed_removes: HashSet<String>,
     /// Tag updates: `(asset, partition_key, tags)`.
@@ -156,6 +157,8 @@ pub struct AssetConditionCache {
     pub in_progress_assets: HashMap<String, Vec<String>>,
     /// Assets whose latest run failed.
     pub failed_assets: HashSet<String>,
+    /// Latest failure timestamp per currently-failed asset.
+    pub failed_asset_timestamps: HashMap<String, i64>,
     /// Timestamp of the most recent run seen (for cursor-based queries).
     pub last_seen_run_ts: i64,
     /// Timestamp of the most recent observation event seen (cursor for external assets).
@@ -218,6 +221,7 @@ impl AssetConditionCache {
             downstream_deps: HashMap::new(),
             in_progress_assets: HashMap::new(),
             failed_assets: HashSet::new(),
+            failed_asset_timestamps: HashMap::new(),
             last_seen_run_ts: 0,
             last_observation_ts: 0,
             initialized: false,
@@ -573,9 +577,14 @@ impl AssetConditionCache {
             Some(pk) => pk.members().into_iter().map(Some).collect(),
             None => vec![None],
         };
+        let run_ts = run.end_time.unwrap_or(run.start_time);
         for asset in &run.node_names {
             if is_failure {
-                delta.failed_adds.insert(asset.clone());
+                delta
+                    .failed_adds
+                    .entry(asset.clone())
+                    .and_modify(|t| *t = (*t).max(run_ts))
+                    .or_insert(run_ts);
             } else {
                 delta.failed_removes.insert(asset.clone());
             }
@@ -768,11 +777,16 @@ impl AssetConditionCache {
             }
         }
 
-        for asset in failed_adds {
-            self.failed_assets.insert(asset);
+        for (asset, ts) in failed_adds {
+            self.failed_assets.insert(asset.clone());
+            self.failed_asset_timestamps
+                .entry(asset)
+                .and_modify(|t| *t = (*t).max(ts))
+                .or_insert(ts);
         }
         for asset in failed_removes {
             self.failed_assets.remove(asset.as_str());
+            self.failed_asset_timestamps.remove(asset.as_str());
         }
 
         for (asset, pk, tags) in run_tag_updates {
@@ -865,6 +879,7 @@ impl AssetConditionCache {
             type AssetRunRow = (
                 String,
                 RunStatus,
+                i64,
                 Option<PartitionKey>,
                 RunTags,
                 Arc<[String]>,
@@ -884,6 +899,7 @@ impl AssetConditionCache {
                             (
                                 record.asset_key.clone(),
                                 run.status.clone(),
+                                run.end_time.unwrap_or(run.start_time),
                                 pk,
                                 Arc::from(run.tags.as_slice()),
                                 Arc::from(run.node_names.as_slice()),
@@ -894,9 +910,13 @@ impl AssetConditionCache {
                 })
                 .flatten()
                 .collect();
-            for (asset_key, status, partition_key, tags, asset_names) in &asset_runs {
+            for (asset_key, status, run_ts, partition_key, tags, asset_names) in &asset_runs {
                 if *status == RunStatus::Failure {
                     self.failed_assets.insert(asset_key.clone());
+                    self.failed_asset_timestamps
+                        .entry(asset_key.clone())
+                        .and_modify(|t| *t = (*t).max(*run_ts))
+                        .or_insert(*run_ts);
                 }
                 if !tags.is_empty() {
                     self.update_run_tags(asset_key, partition_key, tags);
