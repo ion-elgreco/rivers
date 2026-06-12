@@ -513,7 +513,7 @@ impl ConditionPass {
             self.cache.in_progress_assets.keys().cloned().collect();
 
         // WillBeRequested reads this set inside dep pivots for single-tick cascading.
-        let mut requested_this_tick: HashSet<String> = HashSet::new();
+        let mut requested_this_tick: HashMap<String, PartitionSelection> = HashMap::new();
         let mut results: Vec<EvalResultRow> = Vec::new();
 
         for (idx, info) in self.conditions.iter().enumerate() {
@@ -593,7 +593,13 @@ impl ConditionPass {
             let duration_us = start.elapsed().as_micros() as u64;
 
             if eval_result.fired {
-                requested_this_tick.insert(info.asset_key.clone());
+                requested_this_tick.insert(
+                    info.asset_key.clone(),
+                    eval_result
+                        .selection
+                        .clone()
+                        .unwrap_or(PartitionSelection::All),
+                );
             }
 
             results.push(EvalResultRow {

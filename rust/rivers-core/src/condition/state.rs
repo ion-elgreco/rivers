@@ -118,9 +118,10 @@ pub struct EvalContext<'a> {
     pub prev_state: &'a AssetConditionState,
     /// All per-asset condition states (for dep lookups in AnyDepsMatch/AllDepsMatch).
     pub all_asset_states: &'a HashMap<String, AssetConditionState>,
-    /// Assets whose conditions have already fired earlier in this tick.
-    /// Populated during topological evaluation; used by `WillBeRequested`.
-    pub requested_this_tick: &'a HashSet<String>,
+    /// Fired selections of assets whose conditions already fired earlier in
+    /// this tick (own key space; `All` for unpartitioned fires). Populated
+    /// during topological evaluation; used by `WillBeRequested`.
+    pub requested_this_tick: &'a HashMap<String, PartitionSelection>,
     /// Current timestamp (nanoseconds).
     pub now: i64,
     /// Whether this is the initial evaluation (daemon just started).

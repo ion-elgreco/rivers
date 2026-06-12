@@ -350,7 +350,7 @@ fn eval_inner<O: EvalOutput>(
             // Only meaningful inside dep pivots (eval_on_dep); at the root level
             // it's always false because the root hasn't produced a result yet.
             O::leaf(
-                ctx.requested_this_tick.contains(ctx.target_key),
+                ctx.requested_this_tick.contains_key(ctx.target_key),
                 my_idx,
                 node,
             )
@@ -1021,11 +1021,14 @@ fn eval_partitioned<O: PartEvalOutput>(
         }
 
         ConditionNode::WillBeRequested => {
-            // All-or-nothing for partitioned assets.
-            let sel = if ctx.requested_this_tick.contains(ctx.target_key) {
-                PartitionSelection::Keys(pctx.all_keys.clone())
-            } else {
-                PartitionSelection::Empty
+            // The target's fired selection from earlier this tick, in its own
+            // key space — a dep pivot maps it downstream like any other
+            // selection. Unpartitioned fires arrive as `All` and widen to the
+            // full universe.
+            let sel = match ctx.requested_this_tick.get(ctx.target_key) {
+                None | Some(PartitionSelection::Empty) => PartitionSelection::Empty,
+                Some(PartitionSelection::All) => PartitionSelection::Keys(pctx.all_keys.clone()),
+                Some(s @ PartitionSelection::Keys(_)) => s.clone(),
             };
             O::leaf(sel, my_idx, node, total)
         }
