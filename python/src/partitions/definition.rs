@@ -772,6 +772,17 @@ impl PartitionsDefinition {
                         "Multi partitions must have at least one dimension",
                     ));
                 }
+                // The multi() factory's dict input can't duplicate names, but
+                // the raw variant constructor takes a list — a duplicate
+                // silently collapses the cartesian universe.
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                for (name, _) in dimensions {
+                    if !seen.insert(name.as_str()) {
+                        return Err(PartitionDefinitionError::new_err(format!(
+                            "Multi partitions: duplicate dimension name '{name}'"
+                        )));
+                    }
+                }
                 for (name, def) in dimensions {
                     if matches!(def, Self::Multi { .. }) {
                         return Err(PartitionDefinitionError::new_err(
