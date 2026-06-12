@@ -787,7 +787,10 @@ fn validate_time_window_grid_compat(
             // can coincide with an interval grid, so prove the subgrid
             // relation on the ticks themselves: every downstream window
             // start over a bounded probe must fall on the upstream grid.
-            const PROBE_TICKS: usize = 32;
+            // The budget matches validate_time_window_fmt's walk — calendar
+            // gates (day-of-week, month ranges) diverge far past the first
+            // ticks: an hourly grid meets its first Saturday at tick 121.
+            const PROBE_TICKS: usize = 1024;
             let horizon = down_start
                 .checked_add_signed(chrono::Duration::days(1461))
                 .unwrap_or(chrono::NaiveDateTime::MAX);

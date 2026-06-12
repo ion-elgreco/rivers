@@ -285,6 +285,23 @@ def test_fractional_interval_downstream_on_cron_upstream_rejected():
         make_repo(_identity_edge(down, up))
 
 
+def test_subgrid_divergence_past_first_window_rejected():
+    """An hourly grid against a weekday-only hourly upstream diverges at the
+    first Saturday — downstream tick 121. A 32-tick probe sails past
+    construction and mints 24 phantom Saturday keys a week; the probe must
+    look far enough to see one full week."""
+    fmt = "%Y-%m-%dT%H:00"
+    # 2024-01-01 is a Monday.
+    up = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, cron_schedule="0 * * * 1-5", fmt=fmt
+    )
+    down = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, cron_schedule="0 * * * *", fmt=fmt
+    )
+    with pytest.raises(PartitionValidationError, match="is not on the upstream grid"):
+        make_repo(_identity_edge(down, up))
+
+
 def test_equivalent_cron_spellings_allowed():
     """'0 0 * * *' and its 6-field spelling '0 0 0 * * *' are one schedule;
     textual comparison must not reject them."""
