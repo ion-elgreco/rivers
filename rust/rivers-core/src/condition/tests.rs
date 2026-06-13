@@ -440,6 +440,94 @@ fn test_newly_updated_no_change() {
 }
 
 #[test]
+fn test_newly_updated_self_suppressed_on_initial_tick() {
+    // A bare newly_updated() self-condition must NOT fire for an
+    // already-materialized asset on the daemon's first/restart tick, where
+    // prev_state is empty (no baseline). Pre-fix the (Some, None) self arm
+    // returned true unconditionally and re-materialized up-to-date data once
+    // per (re)start.
+    let record = make_materialized_record("a", 200);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    // Empty prev state: the daemon just (re)started — no last-tick baseline.
+    let prev = AssetConditionState::default();
+    let ctx = EvalContext {
+        target_key: "a",
+        root_key: "a",
+        target_record: &record,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &HashSet::new(),
+            failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: RunTagSnapshot {
+            last_run_tags: &EMPTY_RUN_TAGS,
+            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
+            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
+            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
+            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
+            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
+        },
+        prev_state: &prev,
+        all_asset_states: &EMPTY_ASSET_STATES,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: 1000,
+        is_initial: true,
+        partitions: None,
+        root_partition_floor: None,
+    };
+    assert!(
+        !evaluate(&ConditionNode::NewlyUpdated, &ctx).fired,
+        "already-materialized asset must not re-fire newly_updated() on the initial tick"
+    );
+}
+
+#[test]
+fn test_newly_updated_self_fires_when_appears_between_ticks() {
+    // The boundary the is_initial guard must preserve: on a NON-initial tick a
+    // missing baseline means the asset genuinely appeared between ticks → fire.
+    let record = make_materialized_record("a", 200);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let prev = AssetConditionState::default();
+    let ctx = EvalContext {
+        target_key: "a",
+        root_key: "a",
+        target_record: &record,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &HashSet::new(),
+            failed_assets: &HashSet::new(),
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: RunTagSnapshot {
+            last_run_tags: &EMPTY_RUN_TAGS,
+            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
+            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
+            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
+            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
+            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
+        },
+        prev_state: &prev,
+        all_asset_states: &EMPTY_ASSET_STATES,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: 1000,
+        is_initial: false,
+        partitions: None,
+        root_partition_floor: None,
+    };
+    assert!(
+        evaluate(&ConditionNode::NewlyUpdated, &ctx).fired,
+        "an asset appearing between non-initial ticks must fire newly_updated()"
+    );
+}
+
+#[test]
 fn test_initial_evaluation_true_on_first_tick() {
     let record = make_record("a");
     let records = HashMap::from([("a".to_string(), record.clone())]);
