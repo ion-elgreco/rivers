@@ -114,9 +114,10 @@ struct RefreshDelta {
     record_updates: Vec<AssetRecord>,
     /// In-progress changes, in apply order.
     in_progress_changes: Vec<InProgressChange>,
-    /// Asset keys to add to `failed_assets`, with the failing run's
-    /// end (or start) timestamp.
-    failed_adds: HashMap<String, i64>,
+    /// Asset keys to add to `failed_assets`, each with the failing run's
+    /// end (or start) timestamp and run id. The run id lets `apply` skip an
+    /// asset that actually materialized in the failed (joint) run.
+    failed_adds: HashMap<String, (i64, String)>,
     /// Asset keys whose success clears `failed_assets`, with the success run's
     /// timestamp — a remove only clears a failure floor older than it, so a
     /// co-batched older success can't clobber a newer failure.
@@ -585,8 +586,12 @@ impl AssetConditionCache {
                 delta
                     .failed_adds
                     .entry(asset.clone())
-                    .and_modify(|t| *t = (*t).max(run_ts))
-                    .or_insert(run_ts);
+                    .and_modify(|e| {
+                        if run_ts > e.0 {
+                            *e = (run_ts, run.run_id.clone());
+                        }
+                    })
+                    .or_insert_with(|| (run_ts, run.run_id.clone()));
             } else {
                 delta
                     .failed_removes
@@ -783,7 +788,27 @@ impl AssetConditionCache {
             }
         }
 
-        for (asset, ts) in failed_adds {
+        // record_updates are applied above, so `last_run_id` is current. A
+        // joint run can fail one step while others materialized: an asset whose
+        // latest materialization IS this run produced output, so it clears like
+        // a success instead of carrying a failure floor.
+        for (asset, (ts, run_id)) in failed_adds {
+            let materialized_here = self
+                .records
+                .get(asset.as_str())
+                .and_then(|r| r.last_run_id.as_deref())
+                == Some(run_id.as_str());
+            if materialized_here {
+                if self
+                    .failed_asset_timestamps
+                    .get(asset.as_str())
+                    .is_none_or(|&f| ts >= f)
+                {
+                    self.failed_assets.remove(asset.as_str());
+                    self.failed_asset_timestamps.remove(asset.as_str());
+                }
+                continue;
+            }
             self.failed_assets.insert(asset.clone());
             self.failed_asset_timestamps
                 .entry(asset)
@@ -1120,7 +1145,7 @@ impl AssetConditionCache {
 mod tests {
     use super::*;
 
-    fn mk_run(run_id: &str, status: RunStatus, asset: &str, ts: i64) -> RunRecord {
+    fn mk_run(run_id: &str, status: RunStatus, assets: &[&str], ts: i64) -> RunRecord {
         RunRecord {
             run_id: run_id.to_string(),
             code_location_id: crate::storage::default_code_location_id(),
@@ -1129,11 +1154,29 @@ mod tests {
             start_time: ts,
             end_time: Some(ts),
             tags: Vec::new(),
-            node_names: vec![asset.to_string()],
+            node_names: assets.iter().map(|s| s.to_string()).collect(),
             priority: 0,
             partition_key: None,
             block_reason: None,
             launched_by: crate::storage::LaunchedBy::default(),
+        }
+    }
+
+    fn rec_with_run(asset: &str, last_run_id: Option<&str>, ts: i64) -> AssetRecord {
+        AssetRecord {
+            code_location_id: crate::storage::default_code_location_id(),
+            asset_key: asset.to_string(),
+            tags: vec![],
+            kinds: vec![],
+            asset_group: None,
+            code_version: None,
+            last_event_id: None,
+            last_run_id: last_run_id.map(String::from),
+            last_timestamp: Some(ts),
+            last_data_version: None,
+            last_materialization_code_version: None,
+            last_input_data_versions: vec![],
+            pool: vec![],
         }
     }
 
@@ -1145,8 +1188,8 @@ mod tests {
         // failed_adds then all failed_removes with no chronology check.
         let mut cache = AssetConditionCache::new("default".to_string());
         let mut delta = RefreshDelta::default();
-        cache.apply_run_effects_to_delta(&mk_run("s", RunStatus::Success, "R", 100), &mut delta);
-        cache.apply_run_effects_to_delta(&mk_run("f", RunStatus::Failure, "R", 200), &mut delta);
+        cache.apply_run_effects_to_delta(&mk_run("s", RunStatus::Success, &["R"], 100), &mut delta);
+        cache.apply_run_effects_to_delta(&mk_run("f", RunStatus::Failure, &["R"], 200), &mut delta);
         cache.apply_refresh_delta(delta);
 
         assert_eq!(
@@ -1165,8 +1208,8 @@ mod tests {
         // The boundary: a Success NEWER than the failure must still clear it.
         let mut cache = AssetConditionCache::new("default".to_string());
         let mut delta = RefreshDelta::default();
-        cache.apply_run_effects_to_delta(&mk_run("f", RunStatus::Failure, "R", 100), &mut delta);
-        cache.apply_run_effects_to_delta(&mk_run("s", RunStatus::Success, "R", 200), &mut delta);
+        cache.apply_run_effects_to_delta(&mk_run("f", RunStatus::Failure, &["R"], 100), &mut delta);
+        cache.apply_run_effects_to_delta(&mk_run("s", RunStatus::Success, &["R"], 200), &mut delta);
         cache.apply_refresh_delta(delta);
 
         assert_eq!(
@@ -1175,5 +1218,39 @@ mod tests {
             "a success newer than the failure must clear the floor"
         );
         assert!(!cache.failed_assets.contains("R"));
+    }
+
+    #[test]
+    fn failure_floor_skips_assets_materialized_in_the_failed_run() {
+        // A joint run [X, Y] fails because Y's step failed, but X materialized
+        // fine. Only Y carries a failure floor — X's record
+        // points at the failing run as its latest materialization, so it must
+        // not be floored (else its dep-updated fires are wrongly suppressed).
+        let mut cache = AssetConditionCache::new("default".to_string());
+        cache
+            .records
+            .insert("X".to_string(), rec_with_run("X", Some("R"), 150));
+        cache
+            .records
+            .insert("Y".to_string(), rec_with_run("Y", Some("prev"), 50));
+
+        let mut delta = RefreshDelta::default();
+        cache.apply_run_effects_to_delta(
+            &mk_run("R", RunStatus::Failure, &["X", "Y"], 150),
+            &mut delta,
+        );
+        cache.apply_refresh_delta(delta);
+
+        assert_eq!(
+            cache.failed_asset_timestamps.get("Y"),
+            Some(&150),
+            "Y actually failed → floor at the run ts"
+        );
+        assert!(
+            !cache.failed_asset_timestamps.contains_key("X"),
+            "X materialized in the failed joint run → no failure floor"
+        );
+        assert!(!cache.failed_assets.contains("X"));
+        assert!(cache.failed_assets.contains("Y"));
     }
 }
