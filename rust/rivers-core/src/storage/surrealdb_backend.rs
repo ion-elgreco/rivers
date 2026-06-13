@@ -402,7 +402,13 @@ async fn refresh_reserved_dynamic_keys_warning(
     let recorded: Vec<ReservedDynamicKey> = match serde_json::from_slice(&row.value) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(error = %e, "unreadable reserved_dynamic_keys record; ignoring");
+            // An unreadable record would re-fail to parse on every open
+            // forever; delete it so the DB reaches a clean state.
+            tracing::warn!(error = %e, "unreadable reserved_dynamic_keys record; deleting");
+            db.query("DELETE FROM kv WHERE key = $key")
+                .bind(("key", RESERVED_DYNAMIC_KEYS_KEY.to_string()))
+                .await?
+                .check()?;
             return Ok(Vec::new());
         }
     };
@@ -4451,6 +4457,47 @@ mod tests {
             .unwrap();
         let rows: Vec<DbKv> = res.take(0).unwrap();
         assert!(rows.is_empty(), "an emptied record must be deleted");
+    }
+
+    /// A reserved_dynamic_keys record left in an older (Vec<String>)
+    /// format can't deserialize into the current struct. The Err arm must
+    /// DELETE it so it stops re-failing to parse on every open instead of
+    /// lingering corrupt forever.
+    #[tokio::test]
+    async fn unreadable_reserved_dynamic_keys_record_is_deleted() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+
+        // Old human-string format the current struct schema cannot read.
+        let legacy = vec!["default/colors: 'us|eu'".to_string()];
+        storage
+            .db
+            .query("INSERT INTO kv { key: $key, value: $value }")
+            .bind(("key", RESERVED_DYNAMIC_KEYS_KEY.to_string()))
+            .bind(("value", Bytes::from(serde_json::to_vec(&legacy).unwrap())))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let remaining = refresh_reserved_dynamic_keys_warning(&storage.db)
+            .await
+            .unwrap();
+        assert!(remaining.is_empty());
+
+        let mut res = storage
+            .db
+            .query("SELECT * FROM kv WHERE key = $key")
+            .bind(("key", RESERVED_DYNAMIC_KEYS_KEY.to_string()))
+            .await
+            .unwrap();
+        let rows: Vec<DbKv> = res.take(0).unwrap();
+        assert!(
+            rows.is_empty(),
+            "an unreadable reserved_dynamic_keys record must be deleted"
+        );
     }
 
     /// The heal's values come from a snapshot taken before its write loop, so
