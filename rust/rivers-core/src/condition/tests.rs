@@ -117,6 +117,7 @@ fn make_ctx<'a>(
         now: 1_000_000_000_000, // 1000s in nanos
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     }
 }
 
@@ -172,6 +173,7 @@ fn test_in_progress() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&ConditionNode::InProgress, &ctx).fired);
 }
@@ -208,6 +210,7 @@ fn test_execution_failed() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&ConditionNode::ExecutionFailed, &ctx).fired);
 }
@@ -270,6 +273,7 @@ fn test_newly_requested_after_firing() {
         now: 2000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&ConditionNode::NewlyRequested, &ctx).fired);
 }
@@ -310,6 +314,7 @@ fn test_newly_requested_not_fired_last_tick() {
         now: 2000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(!evaluate(&ConditionNode::NewlyRequested, &ctx).fired);
 }
@@ -349,6 +354,7 @@ fn test_newly_requested_never_handled() {
         now: 2000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(!evaluate(&ConditionNode::NewlyRequested, &ctx).fired);
 }
@@ -388,6 +394,7 @@ fn test_newly_updated() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&ConditionNode::NewlyUpdated, &ctx).fired);
 }
@@ -427,6 +434,7 @@ fn test_newly_updated_no_change() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(!evaluate(&ConditionNode::NewlyUpdated, &ctx).fired);
 }
@@ -572,6 +580,7 @@ fn test_newly_true_does_not_refire_with_previous_true() {
         now: 1000,
         is_initial: true,
         partitions: None,
+        root_partition_floor: None,
     };
     let cond = ConditionNode::NewlyTrue(Box::new(ConditionNode::Missing));
     assert!(
@@ -685,6 +694,7 @@ fn test_data_version_changed_true_when_version_differs() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&ConditionNode::DataVersionChanged, &ctx).fired);
 }
@@ -725,6 +735,7 @@ fn test_data_version_changed_false_when_same() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(!evaluate(&ConditionNode::DataVersionChanged, &ctx).fired);
 }
@@ -785,6 +796,7 @@ fn test_data_version_changed_false_version_disappeared() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(!evaluate(&ConditionNode::DataVersionChanged, &ctx).fired);
 }
@@ -825,6 +837,7 @@ fn test_data_version_changed_with_tree() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let (result, tree) = evaluate_with_tree(&ConditionNode::DataVersionChanged, &ctx);
     assert!(result.fired);
@@ -878,6 +891,7 @@ fn test_data_version_changed_state_tracking() {
         now: 3_000_000_000_000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let result2 = evaluate(&ConditionNode::DataVersionChanged, &ctx2);
     assert!(!result2.fired);
@@ -912,6 +926,7 @@ fn test_data_version_changed_state_tracking() {
         now: 4_000_000_000_000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let result3 = evaluate(&ConditionNode::DataVersionChanged, &ctx3);
     assert!(result3.fired);
@@ -952,6 +967,7 @@ fn test_backfill_in_progress_true_when_in_backfill() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&ConditionNode::BackfillInProgress, &ctx).fired);
 }
@@ -1002,6 +1018,7 @@ fn test_backfill_in_progress_only_matches_selected_assets() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let ctx_b = EvalContext {
         target_key: "b",
@@ -1029,6 +1046,7 @@ fn test_backfill_in_progress_only_matches_selected_assets() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&ConditionNode::BackfillInProgress, &ctx_a).fired);
     assert!(!evaluate(&ConditionNode::BackfillInProgress, &ctx_b).fired);
@@ -1069,6 +1087,7 @@ fn test_backfill_in_progress_with_tree() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let (result, tree) = evaluate_with_tree(&ConditionNode::BackfillInProgress, &ctx);
     assert!(result.fired);
@@ -1112,6 +1131,7 @@ fn test_backfill_in_progress_composition_with_in_progress() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let cond = ConditionNode::InProgress | ConditionNode::BackfillInProgress;
     assert!(evaluate(&cond, &ctx).fired);
@@ -1156,6 +1176,7 @@ fn test_backfill_in_progress_dep_aggregate() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let cond = ConditionNode::any_deps_match(ConditionNode::BackfillInProgress);
     assert!(evaluate(&cond, &ctx).fired);
@@ -1203,6 +1224,7 @@ fn test_backfill_in_progress_partitioned_targets_subset() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
     let result = evaluate(&ConditionNode::BackfillInProgress, &ctx);
     assert!(result.fired);
@@ -1261,6 +1283,7 @@ fn test_backfill_in_progress_partitioned_empty_keys_selects_all() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
     let result = evaluate(&ConditionNode::BackfillInProgress, &ctx);
     assert!(result.fired);
@@ -1313,6 +1336,7 @@ fn test_backfill_in_progress_partitioned_disjoint_keys() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
     let result = evaluate(&ConditionNode::BackfillInProgress, &ctx);
     assert!(!result.fired);
@@ -1368,6 +1392,7 @@ fn test_backfill_in_progress_multiple_backfills_union_partitions() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
     let result = evaluate(&ConditionNode::BackfillInProgress, &ctx);
     assert!(result.fired);
@@ -1431,6 +1456,7 @@ fn test_backfill_in_progress_one_backfill_empty_keys_short_circuits() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
     let result = evaluate(&ConditionNode::BackfillInProgress, &ctx);
     assert!(result.fired);
@@ -2586,6 +2612,86 @@ fn dep_updated_requires_dep_newer_than_target_key() {
 }
 
 #[test]
+fn partitioned_root_unpartitioned_dep_refires_stale_older_partitions() {
+    // A partitioned root reading an UNPARTITIONED dep takes the bool fallback
+    // in eval_partitioned_on_dep. The staleness floor there must be the root's
+    // OLDEST partition attempt (min across partitions), not the asset-level max
+    // — otherwise a dep update older than the newest partition floors against
+    // that newest ts and the genuinely-stale older partitions never re-fire.
+    let pk_old = spk("2024-01-01");
+    let pk_mid = spk("2024-01-02");
+    let pk_new = spk("2024-01-03");
+    let all_keys = HashSet::from([pk_old.clone(), pk_mid.clone(), pk_new.clone()]);
+
+    // Root "a": partitions materialized at 10 / 30 / 50; the asset-level record
+    // carries the MAX (50) — exactly the value the buggy floor compared against.
+    let a = make_materialized_record("a", 50);
+    // Dep "b": UNPARTITIONED, updated at 35 — newer than pk_old/pk_mid, older
+    // than pk_new.
+    let b = make_materialized_record("b", 35);
+    let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
+    let deps = HashMap::from([("a".to_string(), vec!["b".to_string()])]);
+
+    let a_timestamps = HashMap::from([
+        (pk_old.clone(), 10i64),
+        (pk_mid.clone(), 30),
+        (pk_new.clone(), 50),
+    ]);
+    let a_partition_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: all_keys.clone(),
+        timestamps: a_timestamps.clone(),
+        ..Default::default()
+    };
+    let partition_statuses = HashMap::from([("a".to_string(), a_partition_status)]);
+
+    let all_states = HashMap::new();
+    let mut ctx = make_ctx("a", &a, &records, &deps);
+    ctx.all_asset_states = &all_states;
+
+    let empty_mappings = HashMap::new();
+    // "b" absent from upstream_partition_keys → unpartitioned dep → bool fallback.
+    let no_upstream_keys = HashMap::new();
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &all_keys,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &a_timestamps,
+        resolver: PartitionResolver::new(&empty_mappings, &no_upstream_keys),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let result = evaluate(&ConditionNode::any_deps_updated(), &ctx);
+
+    let covers = |sel: &Option<PartitionSelection>, k: &PartitionKey| match sel {
+        Some(PartitionSelection::All) => true,
+        Some(PartitionSelection::Keys(ks)) => ks.contains(k),
+        _ => false,
+    };
+    // dep@35 is newer than the older partition attempts (10, 30), so the edge
+    // must fire and re-materialize those stale partitions. Pre-fix it floored
+    // against the asset-level max (50), got 35 > 50 = false, and starved them.
+    assert!(
+        result.fired,
+        "dep@35 newer than older partitions (10/30) → must re-fire, got {:?}",
+        result.selection
+    );
+    assert!(
+        covers(&result.selection, &pk_old),
+        "stale pk_old (mat@10 < dep@35) must be selected, got {:?}",
+        result.selection
+    );
+    assert!(
+        covers(&result.selection, &pk_mid),
+        "stale pk_mid (mat@30 < dep@35) must be selected, got {:?}",
+        result.selection
+    );
+}
+
+#[test]
 fn dep_updated_floor_compares_mapped_downstream_key() {
     // The staleness floor must compare a dep key against the root's
     // materialization of the DOWNSTREAM key the mapping resolves it to —
@@ -3501,6 +3607,7 @@ fn test_any_deps_in_progress() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&ConditionNode::any_deps_in_progress(), &ctx).fired);
 }
@@ -3538,6 +3645,7 @@ fn test_any_deps_in_progress_none() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(!evaluate(&ConditionNode::any_deps_in_progress(), &ctx).fired);
 }
@@ -3577,6 +3685,7 @@ fn test_any_deps_updated() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&ConditionNode::any_deps_updated(), &ctx).fired);
 }
@@ -3688,6 +3797,7 @@ fn test_any_deps_updated_no_change() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(!evaluate(&ConditionNode::any_deps_updated(), &ctx).fired);
 }
@@ -3776,6 +3886,7 @@ fn test_newly_true_transition() {
         now: 1000,
         is_initial: true,
         partitions: None,
+        root_partition_floor: None,
     };
     let cond = ConditionNode::NewlyTrue(Box::new(ConditionNode::Missing));
     assert!(evaluate(&cond, &ctx).fired);
@@ -3809,6 +3920,7 @@ fn test_newly_true_transition() {
         now: 2000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(!evaluate(&cond, &ctx2).fired);
 
@@ -3843,6 +3955,7 @@ fn test_newly_true_transition() {
         now: 3000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(!evaluate(&cond, &ctx3).fired);
 }
@@ -3901,6 +4014,7 @@ fn test_counter_stability_and_short_circuit() {
         now: 2000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let r2 = evaluate(&cond, &ctx2);
     // And(InProgress=true, NewlyTrue(Missing=true, prev=false)=true) → true
@@ -3936,6 +4050,7 @@ fn test_counter_stability_and_short_circuit() {
         now: 3000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let r3 = evaluate(&cond, &ctx3);
     // NewlyTrue(Missing=true, prev=true) → false, so And → false
@@ -3996,6 +4111,7 @@ fn test_on_missing_does_not_fire_when_in_progress() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&ConditionNode::on_missing(), &ctx).fired);
 }
@@ -4051,6 +4167,7 @@ fn test_eager_fires_on_deps_updated() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&ConditionNode::eager(), &ctx).fired);
 }
@@ -4097,6 +4214,7 @@ fn test_eager_does_not_fire_when_up_to_date() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(!evaluate(&ConditionNode::eager(), &ctx).fired);
 }
@@ -4163,6 +4281,7 @@ fn test_bug_cron_tick_always_fires_on_first_eval() {
         now: now_nanos,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
 
     assert!(
@@ -4216,6 +4335,7 @@ fn test_cron_tick_fires_when_tick_passes_between_evals() {
         now: now_nanos,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
 
     assert!(
@@ -4337,6 +4457,7 @@ fn test_bug_since_last_handled_refires_after_own_materialization() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&cond, &ctx1).fired, "Tick 1 should fire");
 
@@ -4378,6 +4499,7 @@ fn test_bug_since_last_handled_refires_after_own_materialization() {
         now: 2000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(
         !evaluate(&cond, &ctx2).fired,
@@ -4433,6 +4555,7 @@ fn test_newly_requested_any_deps_match_cross_asset_signaling() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(
         !evaluate(&cond, &ctx1).fired,
@@ -4486,6 +4609,7 @@ fn test_newly_requested_any_deps_match_cross_asset_signaling() {
         now: 2000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(
         evaluate(&cond, &ctx2).fired,
@@ -4532,6 +4656,7 @@ fn test_newly_requested_any_deps_match_cross_asset_signaling() {
         now: 3000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(
         !evaluate(&cond, &ctx3).fired,
@@ -4587,6 +4712,7 @@ fn test_newly_requested_as_since_reset() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let r1 = evaluate(&cond, &ctx1);
     assert!(r1.fired, "Tick 1: code changed → fires");
@@ -4630,6 +4756,7 @@ fn test_newly_requested_as_since_reset() {
         now: 2000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let r2 = evaluate(&cond, &ctx2);
     assert!(
@@ -4687,6 +4814,7 @@ fn test_newly_requested_as_since_reset_fast_ticks() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let r1 = evaluate(&cond, &ctx1);
     assert!(r1.fired, "Tick 1: code changed → fires");
@@ -4724,6 +4852,7 @@ fn test_newly_requested_as_since_reset_fast_ticks() {
         now: 2000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let r2 = evaluate(&cond, &ctx2);
     assert!(
@@ -4765,6 +4894,7 @@ fn test_newly_requested_as_since_reset_fast_ticks() {
         now: 3000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let r3 = evaluate(&cond, &ctx3);
     assert!(
@@ -4819,6 +4949,7 @@ fn test_newly_requested_in_since_last_handled() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&cond, &ctx1).fired, "Tick 1: should fire");
 
@@ -4854,6 +4985,7 @@ fn test_newly_requested_in_since_last_handled() {
         now: 2000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(
         !evaluate(&cond, &ctx2).fired,
@@ -4892,6 +5024,7 @@ fn test_newly_requested_in_since_last_handled() {
         now: 3000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(
         evaluate(&cond, &ctx3).fired,
@@ -5085,6 +5218,7 @@ fn bench_eval(
                 now: 999_999_999_999,
                 is_initial: false,
                 partitions: None,
+                root_partition_floor: None,
             };
             std::hint::black_box(evaluate(cond, &ctx));
         }
@@ -5121,6 +5255,7 @@ fn bench_eval(
                 now: 999_999_999_999,
                 is_initial: false,
                 partitions: None,
+                root_partition_floor: None,
             };
             std::hint::black_box(evaluate(cond, &ctx));
         }
@@ -5447,6 +5582,7 @@ fn bench_selective_vs_full_eval() {
                     now: 999_999_999_999,
                     is_initial: false,
                     partitions: None,
+                    root_partition_floor: None,
                 };
                 std::hint::black_box(evaluate(cond, &ctx));
             }
@@ -5488,6 +5624,7 @@ fn bench_selective_vs_full_eval() {
                     now: 999_999_999_999,
                     is_initial: false,
                     partitions: None,
+                    root_partition_floor: None,
                 };
                 std::hint::black_box(evaluate(cond, &ctx));
             }
@@ -5714,6 +5851,7 @@ async fn bench_cache_tick<S: StorageBackend>(
                     now: 100_000_000_000,
                     is_initial: false,
                     partitions: None,
+                    root_partition_floor: None,
                 };
                 std::hint::black_box(evaluate(cond, &ctx));
             }
@@ -6658,6 +6796,7 @@ fn make_partitioned_ctx<'a>(
         now: 1_000_000_000_000,
         is_initial: false,
         partitions: Some(pctx),
+        root_partition_floor: None,
     }
 }
 
@@ -7065,6 +7204,7 @@ fn test_partitioned_newly_updated() {
         now: 1_000_000_000_000,
         is_initial: false,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
     let result = evaluate(&ConditionNode::NewlyUpdated, &ctx);
     assert!(result.fired);
@@ -7181,6 +7321,7 @@ fn test_partitioned_newly_true() {
         now: 1_000_000_000_000,
         is_initial: true,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
     let cond = ConditionNode::NewlyTrue(Box::new(ConditionNode::Missing));
     let result = evaluate(&cond, &ctx);
@@ -7230,6 +7371,7 @@ fn test_partitioned_newly_true() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: Some(&pctx2),
+        root_partition_floor: None,
     };
     let result2 = evaluate(&cond, &ctx2);
     assert!(!result2.fired);
@@ -7334,6 +7476,7 @@ fn test_partitioned_any_deps_missing_with_identity() {
         now: 1_000_000_000_000,
         is_initial: false,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
 
     // AnyDepsMissing evaluates Missing on upstream "a" which has
@@ -7418,6 +7561,7 @@ fn test_partitioned_all_deps_match_not_missing() {
         now: 1_000_000_000_000,
         is_initial: false,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
 
     let cond = ConditionNode::all_deps_match(!ConditionNode::Missing);
@@ -7581,6 +7725,7 @@ fn test_partitioned_eager_selects_new_partition() {
         now: 1_000_000_000_000,
         is_initial: true, // first tick,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
 
     let result = evaluate(&ConditionNode::eager(), &ctx);
@@ -7938,6 +8083,7 @@ fn test_partitioned_eager_partial_upstream_update() {
         now: 1_000_000_000_000,
         is_initial: true,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
 
     let result = evaluate(&ConditionNode::eager(), &ctx);
@@ -8027,6 +8173,7 @@ fn test_partitioned_eager_only_fires_for_partitions_with_upstream_data() {
         now: 1_000_000_000_000,
         is_initial: true,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
 
     // evaluate() should use partition-aware path
@@ -8135,6 +8282,7 @@ fn test_partitioned_on_missing_only_missing_partitions() {
         now: 1_000_000_000_000,
         is_initial: true,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
 
     let result = evaluate(&ConditionNode::on_missing(), &ctx);
@@ -8202,6 +8350,7 @@ fn test_partitioned_in_progress_excludes_from_and() {
         now: 1_000_000_000_000,
         is_initial: false,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
 
     let cond = ConditionNode::And(vec![
@@ -8308,6 +8457,7 @@ fn test_partitioned_since_latch_per_partition() {
         now: 1_000_000_000_000,
         is_initial: false,
         partitions: Some(&pctx1),
+        root_partition_floor: None,
     };
     let cond = ConditionNode::Since {
         trigger: Box::new(ConditionNode::Missing),
@@ -8368,6 +8518,7 @@ fn test_partitioned_since_latch_per_partition() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: Some(&pctx2),
+        root_partition_floor: None,
     };
     let r2 = evaluate(&cond, &ctx2);
     // p2 was reset (NewlyUpdated), p3 still latched
@@ -8418,6 +8569,7 @@ fn test_partitioned_newly_true_only_new_partitions() {
         now: 1_000_000_000_000,
         is_initial: true,
         partitions: Some(&pctx1),
+        root_partition_floor: None,
     };
     let r1 = evaluate(&cond, &ctx1);
     assert_eq!(
@@ -8460,6 +8612,7 @@ fn test_partitioned_newly_true_only_new_partitions() {
         now: 2_000_000_000_000,
         is_initial: false,
         partitions: Some(&pctx2),
+        root_partition_floor: None,
     };
     let r2 = evaluate(&cond, &ctx2);
     assert_eq!(r2.selection.unwrap(), PartitionSelection::Empty);
@@ -8500,6 +8653,7 @@ fn test_partitioned_newly_true_only_new_partitions() {
         now: 3_000_000_000_000,
         is_initial: false,
         partitions: Some(&pctx3),
+        root_partition_floor: None,
     };
     let r3 = evaluate(&cond, &ctx3);
     // Only p4 is newly missing (p2,p3 were already missing last tick)
@@ -8682,6 +8836,7 @@ fn test_eager_does_not_fire_when_all_up_to_date_first_tick() {
         now: tick2_now,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
 
     let (result_b2, tree_b2) = evaluate_with_tree(&cond, &ctx_b2);
@@ -8811,6 +8966,7 @@ fn test_eager_fires_after_upstream_observed_on_second_tick() {
         now: now2,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
 
     let (result_agg2, tree_agg2) = evaluate_with_tree(&cond, &ctx_agg2);
@@ -8883,6 +9039,7 @@ fn test_eager_fires_after_upstream_observed_on_second_tick() {
         now: now2,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let (result_rep2, _) = evaluate_with_tree(&cond, &ctx_rep2);
     update_condition_state(
@@ -8918,6 +9075,7 @@ fn test_eager_fires_after_upstream_observed_on_second_tick() {
         now: now3,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
 
     let (result_rep3, tree_rep3) = evaluate_with_tree(&cond, &ctx_rep3);
@@ -9035,6 +9193,7 @@ fn test_eager_fires_after_dep_in_progress_clears() {
         now: now2,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
 
     let (result2, tree2) = evaluate_with_tree(&cond, &ctx2);
@@ -9084,6 +9243,7 @@ fn test_eager_fires_after_dep_in_progress_clears() {
         now: now3,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
 
     let (result3, tree3) = evaluate_with_tree(&cond, &ctx3);
@@ -9529,6 +9689,7 @@ fn test_will_be_requested_true_when_in_set() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&ConditionNode::WillBeRequested, &ctx).fired);
 }
@@ -9565,6 +9726,7 @@ fn test_will_be_requested_in_dep_pivot() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let cond = ConditionNode::any_deps_match(ConditionNode::WillBeRequested);
     assert!(evaluate(&cond, &ctx).fired);
@@ -9599,6 +9761,7 @@ fn test_will_be_requested_not_in_dep_pivot_when_dep_not_requested() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let cond = ConditionNode::any_deps_match(ConditionNode::WillBeRequested);
     assert!(!evaluate(&cond, &ctx).fired);
@@ -9645,6 +9808,7 @@ fn test_any_deps_updated_fires_via_will_be_requested() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&ConditionNode::any_deps_updated(), &ctx).fired);
 }
@@ -9681,6 +9845,7 @@ fn test_any_deps_missing_suppressed_by_will_be_requested() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     // Missing dep, but will be requested → should be false
     assert!(!evaluate(&ConditionNode::any_deps_missing(), &ctx).fired);
@@ -9715,6 +9880,7 @@ fn test_any_deps_missing_fires_when_dep_not_requested() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     assert!(evaluate(&ConditionNode::any_deps_missing(), &ctx).fired);
 }
@@ -9744,6 +9910,7 @@ fn test_will_be_requested_tree_output() {
         now: 1000,
         is_initial: false,
         partitions: None,
+        root_partition_floor: None,
     };
     let (result, tree) = evaluate_with_tree(&ConditionNode::WillBeRequested, &ctx);
     assert!(result.fired);
@@ -9806,6 +9973,7 @@ fn test_partitioned_on_cron_no_deps_fires_all_partitions() {
         now: now_nanos,
         is_initial: false,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
 
     let result = evaluate(&cond, &ctx);
@@ -9874,6 +10042,7 @@ fn test_partitioned_on_cron_does_not_fire_without_tick() {
         now: now_nanos,
         is_initial: false,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
 
     let result = evaluate(&cond, &ctx);
@@ -9964,6 +10133,7 @@ fn test_partitioned_on_cron_waits_for_dep_update() {
         now: now_nanos,
         is_initial: false,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
 
     let result = evaluate(&cond, &ctx);
@@ -10054,6 +10224,7 @@ fn test_partitioned_on_cron_fires_after_dep_update() {
         now: now_nanos,
         is_initial: false,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
 
     let result = evaluate(&cond, &ctx);
@@ -10148,6 +10319,7 @@ fn test_partitioned_on_cron_partial_dep_update() {
         now: now_nanos,
         is_initial: false,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
 
     let result = evaluate(&cond, &ctx);
@@ -10301,6 +10473,7 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
         now: 1000,
         is_initial: false,
         partitions: Some(&pctx),
+        root_partition_floor: None,
     };
     let cond = ConditionNode::any_deps_updated();
     let result = evaluate(&cond, &ctx);
@@ -10351,6 +10524,7 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
         now: 1000,
         is_initial: false,
         partitions: Some(&pctx2),
+        root_partition_floor: None,
     };
     let result2 = evaluate(&cond, &ctx2);
     assert!(

@@ -260,24 +260,32 @@ fn eval_inner<O: EvalOutput>(
             if ctx.target_key != ctx.root_key {
                 let expr = match ctx.target_record.last_timestamp {
                     None => false,
-                    Some(dep_ts) => {
-                        let root_mat = ctx
-                            .cache
-                            .records
-                            .get(ctx.root_key)
-                            .and_then(|r| r.last_timestamp);
-                        let root_failed = ctx
-                            .cache
-                            .failed_asset_timestamps
-                            .get(ctx.root_key)
-                            .copied();
-                        match (root_mat, root_failed) {
-                            (None, None) => true,
-                            (Some(m), None) => dep_ts > m,
-                            (None, Some(f)) => dep_ts > f,
-                            (Some(m), Some(f)) => dep_ts > m.max(f),
+                    Some(dep_ts) => match ctx.root_partition_floor {
+                        // Partitioned root over an unpartitioned dep: floor
+                        // against the OLDEST partition attempt (min), so the
+                        // edge fires while ANY partition is older than the dep
+                        // and self-suppresses once all partitions catch up.
+                        // Inner `None` = a partition was never attempted → fire.
+                        Some(floor) => floor.map(|f| dep_ts > f).unwrap_or(true),
+                        None => {
+                            let root_mat = ctx
+                                .cache
+                                .records
+                                .get(ctx.root_key)
+                                .and_then(|r| r.last_timestamp);
+                            let root_failed = ctx
+                                .cache
+                                .failed_asset_timestamps
+                                .get(ctx.root_key)
+                                .copied();
+                            match (root_mat, root_failed) {
+                                (None, None) => true,
+                                (Some(m), None) => dep_ts > m,
+                                (None, Some(f)) => dep_ts > f,
+                                (Some(m), Some(f)) => dep_ts > m.max(f),
+                            }
                         }
-                    }
+                    },
                 };
                 return O::leaf(expr, my_idx, node);
             }
@@ -824,6 +832,7 @@ fn eval_on_dep(
         now: ctx.now,
         is_initial: ctx.is_initial,
         partitions: None,
+        root_partition_floor: None,
     };
     eval_inner(condition, &dep_ctx, counter, sub_results)
 }
@@ -1309,7 +1318,14 @@ fn eval_partitioned_on_dep(
         .unwrap_or_default();
 
     if upstream_all_keys.is_empty() {
-        // Upstream is unpartitioned — fall back to bool evaluation
+        // Upstream is unpartitioned — fall back to bool evaluation, but floor
+        // the dep against the root's OLDEST partition (min), not the asset-level
+        // max, so a `NewlyUpdated` pivot fires while any root partition is
+        // staler than the dep. `None` = some partition never attempted → fire.
+        let root_floor = pctx
+            .all_partition_statuses
+            .get(ctx.root_key)
+            .and_then(|status| root_floor_over(pctx.all_keys.iter(), status));
         let dep_state = ctx
             .all_asset_states
             .get(dep_key)
@@ -1326,6 +1342,7 @@ fn eval_partitioned_on_dep(
             now: ctx.now,
             is_initial: ctx.is_initial,
             partitions: None,
+            root_partition_floor: Some(root_floor),
         };
         let mut sub_results = HashMap::new();
         let val = eval_inner(condition, &dep_ctx, counter, &mut sub_results);
@@ -1418,6 +1435,7 @@ fn eval_partitioned_on_dep(
         now: ctx.now,
         is_initial: ctx.is_initial,
         partitions: Some(&upstream_pctx),
+        root_partition_floor: None,
     };
 
     let upstream_result: PartitionSelection =

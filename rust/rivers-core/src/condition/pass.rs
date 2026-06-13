@@ -588,6 +588,7 @@ impl ConditionPass {
                 now,
                 is_initial: self.eval_state.is_initial || prev.is_initial,
                 partitions: pctx.as_ref(),
+                root_partition_floor: None,
             };
             let start = std::time::Instant::now();
             let (eval_result, tree) = evaluate_with_tree(&info.condition, &ctx);
