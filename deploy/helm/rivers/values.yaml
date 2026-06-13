@@ -143,8 +143,8 @@ operator:
       # `helm upgrade` to regenerate.
       certDays: 3650
     certManager:
-      duration: 8760h    # 1y
-      renewBefore: 720h  # re-issue 30d before expiry
+      duration: 8760h # 1y
+      renewBefore: 720h # re-issue 30d before expiry
       issuerRef:
         # Name of an existing Issuer / ClusterIssuer. Required when
         # certProvider=certManager — `helm install` fails until set.
@@ -186,6 +186,16 @@ ui:
       enabled: false
       # Required when tls.enabled=true.
       secretName: ""
+  httpRoute:
+    enabled: false
+    annotations: {}
+    parentRefs: []
+    hostnames: []
+    rules:
+      - matches:
+          - path:
+              type: PathPrefix
+              value: /
 
 executor:
   serviceAccountName: rivers-executor

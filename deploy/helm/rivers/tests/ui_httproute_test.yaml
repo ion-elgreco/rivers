@@ -1,0 +1,118 @@
+suite: UI HTTPRoute
+templates:
+  - templates/ui-httproute.yaml
+release:
+  name: rivers
+  namespace: rivers
+tests:
+  - it: omits the HTTPRoute by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: omits the HTTPRoute when ui.enabled is false even if httpRoute.enabled is true
+    set:
+      ui.enabled: false
+      ui.httpRoute.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: emits a minimal HTTPRoute with default rules when enabled
+    set:
+      ui.httpRoute.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: kind
+          value: HTTPRoute
+      - equal:
+          path: apiVersion
+          value: gateway.networking.k8s.io/v1
+      - equal:
+          path: metadata.name
+          value: rivers-ui
+      - equal:
+          path: metadata.namespace
+          value: rivers
+      - equal:
+          path: metadata.labels["app.kubernetes.io/name"]
+          value: rivers-ui
+      - equal:
+          path: metadata.labels["app.kubernetes.io/managed-by"]
+          value: Helm
+      - equal:
+          path: spec.rules[0].backendRefs[0].name
+          value: rivers-ui
+      - equal:
+          path: spec.rules[0].backendRefs[0].port
+          value: 3000
+      - equal:
+          path: spec.rules[0].backendRefs[0].weight
+          value: 1
+
+  - it: renders annotations, hostnames, and parentRefs when provided
+    set:
+      ui.httpRoute.enabled: true
+      ui.httpRoute.annotations:
+        cert-manager.io/cluster-issuer: letsencrypt-prod
+      ui.httpRoute.parentRefs:
+        - name: public
+          namespace: gateway-system
+      ui.httpRoute.hostnames:
+        - rivers.example.com
+    asserts:
+      - equal:
+          path: metadata.annotations["cert-manager.io/cluster-issuer"]
+          value: letsencrypt-prod
+      - equal:
+          path: spec.parentRefs[0].name
+          value: public
+      - equal:
+          path: spec.parentRefs[0].namespace
+          value: gateway-system
+      - equal:
+          path: spec.hostnames[0]
+          value: rivers.example.com
+
+  - it: renders multiple rules with matches and filters
+    set:
+      ui.httpRoute.enabled: true
+      ui.httpRoute.rules:
+        - matches:
+            - path:
+                type: PathPrefix
+                value: /api/rivers
+          filters:
+            - type: URLRewrite
+              urlRewrite:
+                path:
+                  type: ReplacePrefix
+                  replacePrefix: /api/v1
+        - matches:
+            - path:
+                type: PathPrefix
+                value: /
+    asserts:
+      - equal:
+          path: spec.rules[0].matches[0].path.type
+          value: PathPrefix
+      - equal:
+          path: spec.rules[0].matches[0].path.value
+          value: /api/rivers
+      - equal:
+          path: spec.rules[0].filters[0].type
+          value: URLRewrite
+      - equal:
+          path: spec.rules[1].matches[0].path.type
+          value: PathPrefix
+      - equal:
+          path: spec.rules[1].matches[0].path.value
+          value: /
+      - equal:
+          path: spec.rules[1].backendRefs[0].name
+          value: rivers-ui
+      - equal:
+          path: spec.rules[1].backendRefs[0].port
+          value: 3000
