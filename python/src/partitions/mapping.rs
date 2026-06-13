@@ -801,39 +801,76 @@ fn validate_time_window_grid_compat(
                 Some(e) => (*e).min(horizon),
                 None => horizon,
             };
-            let mut count = 0usize;
-            let mut offgrid: Option<chrono::NaiveDateTime> = None;
-            let mut walk_err: Option<String> = None;
-            let mut visit = |t: chrono::NaiveDateTime| -> bool {
-                count += 1;
-                let on_upstream = match (up_cron, up_interval) {
-                    (Some(expr), _) => match cron_grid_contains(expr, t) {
-                        Ok(hit) => hit,
-                        Err(e) => {
-                            walk_err = Some(e.to_string());
-                            return false;
-                        }
-                    },
+            // Is `t` a tick of the upstream grid? `Err` carries a cron-parse
+            // failure to surface after the walk.
+            let on_upstream = |t: chrono::NaiveDateTime| -> Result<bool, String> {
+                match (up_cron, up_interval) {
+                    (Some(expr), _) => cron_grid_contains(expr, t).map_err(|e| e.to_string()),
                     (None, Some(ui)) => {
                         let up_ns = (ui * 1_000_000_000.0) as i64;
-                        up_ns > 0
+                        Ok(up_ns > 0
                             && (t - *up_start)
                                 .num_nanoseconds()
-                                .is_some_and(|ns| ns.rem_euclid(up_ns) == 0)
+                                .is_some_and(|ns| ns.rem_euclid(up_ns) == 0))
                     }
-                    (None, None) => false,
-                };
-                if !on_upstream {
-                    offgrid = Some(t);
-                    return false;
+                    (None, None) => Ok(false),
                 }
-                count < PROBE_TICKS
             };
-            if let Some(dc) = down_cron {
-                for_each_cron_tick(dc, down_start, horizon, &mut visit)
-                    .map_err(|e| MappingValidationError::DefinitionError(e.to_string()))?;
-            } else if let Some(di) = down_interval {
-                for_each_interval_tick(*di, down_start, horizon, &mut visit);
+            let mut offgrid: Option<chrono::NaiveDateTime> = None;
+            let mut walk_err: Option<String> = None;
+            let mut count = 0usize;
+            {
+                let mut visit = |t: chrono::NaiveDateTime| -> bool {
+                    count += 1;
+                    match on_upstream(t) {
+                        Ok(true) => count < PROBE_TICKS,
+                        Ok(false) => {
+                            offgrid = Some(t);
+                            false
+                        }
+                        Err(e) => {
+                            walk_err = Some(e);
+                            false
+                        }
+                    }
+                };
+                if let Some(dc) = down_cron {
+                    for_each_cron_tick(dc, down_start, horizon, &mut visit)
+                        .map_err(|e| MappingValidationError::DefinitionError(e.to_string()))?;
+                } else if let Some(di) = down_interval {
+                    for_each_interval_tick(*di, down_start, horizon, &mut visit);
+                }
+            }
+            // A grid whose 2nd tick lies past the 1461-day horizon would be
+            // judged on tick 0 alone; always probe the first two ticks against
+            // the true end so a tick-1 divergence is caught (the same
+            // min-two-ticks guard validate_time_window_fmt applies).
+            if walk_err.is_none() && offgrid.is_none() && count < 2 {
+                let true_end = match down_end {
+                    Some(e) => *e,
+                    None => chrono::NaiveDateTime::MAX,
+                };
+                let mut taken = 0usize;
+                let mut visit2 = |t: chrono::NaiveDateTime| -> bool {
+                    taken += 1;
+                    match on_upstream(t) {
+                        Ok(true) => taken < 2,
+                        Ok(false) => {
+                            offgrid = Some(t);
+                            false
+                        }
+                        Err(e) => {
+                            walk_err = Some(e);
+                            false
+                        }
+                    }
+                };
+                if let Some(dc) = down_cron {
+                    for_each_cron_tick(dc, down_start, true_end, &mut visit2)
+                        .map_err(|e| MappingValidationError::DefinitionError(e.to_string()))?;
+                } else if let Some(di) = down_interval {
+                    for_each_interval_tick(*di, down_start, true_end, &mut visit2);
+                }
             }
             if let Some(msg) = walk_err {
                 return Err(MappingValidationError::DefinitionError(msg));

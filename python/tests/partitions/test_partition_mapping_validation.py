@@ -302,6 +302,27 @@ def test_subgrid_divergence_past_first_window_rejected():
         make_repo(_identity_edge(down, up))
 
 
+def test_subgrid_second_tick_past_probe_horizon_rejected():
+    """A sparse downstream grid whose SECOND tick lies beyond the 1461-day
+    probe horizon is otherwise validated on tick 0 alone; the probe must always
+    check the first two ticks so a tick-1 divergence is still caught."""
+    fmt = "%Y-%m-%d"
+    # Upstream fires only on Jan 1 each year.
+    up = rs.PartitionsDefinition.time_window(
+        start=DAILY_START, cron_schedule="0 0 1 1 *", fmt=fmt
+    )
+    # Downstream steps every 1500 days (>1461): tick 0 = 2024-01-01 (on the
+    # yearly grid), tick 1 = 2028-02-09 (off it) and past the probe horizon.
+    down = rs.PartitionsDefinition.time_window(
+        start=DAILY_START,
+        end=datetime(2050, 1, 1),
+        interval_seconds=1500 * 86400,
+        fmt=fmt,
+    )
+    with pytest.raises(PartitionValidationError, match="is not on the upstream grid"):
+        make_repo(_identity_edge(down, up))
+
+
 def test_subgrid_probe_respects_downstream_end():
     """Range edges are a per-key concern: a downstream def whose explicit end
     precedes the first off-grid tick mints only on-grid keys, so the probe
