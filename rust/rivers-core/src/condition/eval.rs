@@ -294,9 +294,11 @@ fn eval_inner<O: EvalOutput>(
                 ctx.prev_state.last_materialized_timestamp,
             ) {
                 (Some(current), Some(prev)) => current > prev,
-                // No previous state: a missing prev_state means the asset
-                // appeared between ticks → treat as updated.
-                (Some(_), None) => true,
+                // No previous baseline: on the initial tick the asset was
+                // already materialized before the daemon started — not a new
+                // update, so suppress (else a bare newly_updated() re-fires on
+                // every restart). Non-initial → it appeared between ticks → fire.
+                (Some(_), None) => !ctx.is_initial,
                 _ => false,
             };
             O::leaf(expr, my_idx, node)
