@@ -130,6 +130,11 @@ pub struct EvalContext<'a> {
     pub is_initial: bool,
     /// Partition-level evaluation context. None for unpartitioned assets.
     pub partitions: Option<&'a PartitionEvalContext<'a>>,
+    /// Staleness floor for a partitioned root reading an UNPARTITIONED dep (the
+    /// bool fallback in `eval_partitioned_on_dep`). `None` everywhere else (use
+    /// the asset-level records); `Some(floor)` is the root's oldest partition
+    /// attempt, inner `None` meaning some partition was never attempted → fire.
+    pub root_partition_floor: Option<Option<i64>>,
 }
 
 /// Result of evaluating a condition tree.
