@@ -502,6 +502,7 @@ impl ConditionPass {
         let results = self.evaluate(now, selective);
         let to_materialize = self.apply_results(&results, now);
         let plan = self.classify_materializations(to_materialize);
+        self.stamp_dispatched_handled(&plan, now);
         PassOutput { results, plan }
     }
 
@@ -662,9 +663,6 @@ impl ConditionPass {
         }
 
         for tm in &to_materialize {
-            if let Some(prev) = self.eval_state.assets.get_mut(&tm.asset_key) {
-                prev.last_handled_timestamp = Some(now);
-            }
             if let Some(PartitionSelection::Keys(keys)) = &tm.selection {
                 tracing::info!(
                     target: "rivers::daemon",
@@ -813,6 +811,34 @@ impl ConditionPass {
             multi_partition_backfills,
         }
     }
+
+    /// Advance the asset-level handled cursor only for assets the plan actually
+    /// dispatched — a selection `classify` trimmed to zero must not advance it,
+    /// or `NewlyRequested` reads true next tick with nothing dispatched. Mirrors
+    /// the per-partition `handled` set classify already restricts to survivors.
+    fn stamp_dispatched_handled(&mut self, plan: &MaterializationPlan, now: i64) {
+        let dispatched: HashSet<&str> = plan
+            .unpartitioned
+            .iter()
+            .map(String::as_str)
+            .chain(
+                plan.single_partition_groups
+                    .values()
+                    .flatten()
+                    .map(String::as_str),
+            )
+            .chain(
+                plan.multi_partition_backfills
+                    .iter()
+                    .map(|(asset, _)| asset.as_str()),
+            )
+            .collect();
+        for asset_key in dispatched {
+            if let Some(prev) = self.eval_state.assets.get_mut(asset_key) {
+                prev.last_handled_timestamp = Some(now);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -832,6 +858,101 @@ mod tests {
     /// Helper: parse "YYYY-MM-DD HH:MM" as a wall-clock naive datetime.
     fn to_wall(dt_str: &str) -> NaiveDateTime {
         chrono::NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%d %H:%M").unwrap()
+    }
+
+    fn test_record(key: &str) -> crate::storage::AssetRecord {
+        crate::storage::AssetRecord {
+            code_location_id: crate::storage::default_code_location_id(),
+            asset_key: key.to_string(),
+            tags: vec![],
+            kinds: vec![],
+            asset_group: None,
+            code_version: None,
+            last_event_id: None,
+            last_run_id: None,
+            last_timestamp: None,
+            last_data_version: None,
+            last_materialization_code_version: None,
+            last_input_data_versions: vec![],
+            pool: vec![],
+        }
+    }
+
+    /// Build a one-partitioned-asset pass and run a full
+    /// apply_results → classify → stamp tick with the given fired selection.
+    /// Returns the asset's handled cursor after the tick.
+    fn handled_after_fired_selection(selection: PartitionSelection) -> Option<i64> {
+        let mut cache = AssetConditionCache::default();
+        cache.records.insert("down".to_string(), test_record("down"));
+        let mut pass = ConditionPass::new(
+            cache,
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "down".to_string(),
+                condition: ConditionNode::InProgress,
+                partition_info: Some(PartitionInfo {
+                    all_keys: make_daily_keys(&["2024-01-01"]),
+                    mappings: HashMap::new(),
+                    time_window_fmt: None,
+                    universe: PartitionUniverse::Frozen,
+                }),
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        );
+        pass.eval_state.assets.insert(
+            "down".to_string(),
+            crate::condition::state::AssetConditionState::default(),
+        );
+        let row = EvalResultRow {
+            info_idx: 0,
+            result: EvalResult {
+                fired: true,
+                selection: Some(selection),
+                ..Default::default()
+            },
+            tree: EvalNodeResult::new(
+                &ConditionNode::InProgress,
+                0,
+                crate::condition::state::NodeStatus::True,
+                vec![],
+                None,
+            ),
+            duration_us: 0,
+        };
+        let to_mat = pass.apply_results(&[row], 5000);
+        let plan = pass.classify_materializations(to_mat);
+        pass.stamp_dispatched_handled(&plan, 5000);
+        pass.eval_state.assets["down"].last_handled_timestamp
+    }
+
+    #[test]
+    fn handled_cursor_skips_fully_dropped_selection() {
+        // An asset fires for a key outside its universe; classify trims the
+        // selection to zero, so nothing dispatches. The handled cursor must
+        // NOT advance — apply_results used to stamp it before classify ran, so
+        // NewlyRequested read true next tick with nothing dispatched.
+        let handled = handled_after_fired_selection(PartitionSelection::Keys(
+            [spk("2099-12-31")].into_iter().collect(),
+        ));
+        assert_eq!(
+            handled, None,
+            "a fully-dropped selection must not advance the handled cursor"
+        );
+    }
+
+    #[test]
+    fn handled_cursor_advances_for_surviving_selection() {
+        // The boundary: a selection with a real key DOES dispatch and so must
+        // advance the handled cursor.
+        let handled = handled_after_fired_selection(PartitionSelection::Keys(
+            [spk("2024-01-01")].into_iter().collect(),
+        ));
+        assert_eq!(
+            handled,
+            Some(5000),
+            "a dispatched selection must advance the handled cursor"
+        );
     }
 
     #[test]
