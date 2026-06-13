@@ -2780,6 +2780,133 @@ fn partitioned_root_unpartitioned_dep_refires_stale_older_partitions() {
 }
 
 #[test]
+fn all_partitions_dep_frontier_key_does_not_refire_whole_universe() {
+    // AllPartitions floors the dep against the MIN effective ts over the whole
+    // downstream universe. A freshly-minted, never-attempted frontier key made
+    // root_floor_over return None → the dep counted as "updated" with no
+    // upstream change and re-dispatched the entire universe. The floor must
+    // ignore never-attempted keys.
+    let d1 = spk("d1");
+    let d2 = spk("d2");
+    let d3 = spk("d3"); // freshly minted, never attempted
+    let all_keys = HashSet::from([d1.clone(), d2.clone(), d3.clone()]);
+    let u1 = spk("u1");
+    let up_keys = HashSet::from([u1.clone()]);
+
+    let a = make_materialized_record("a", 100);
+    let b = make_materialized_record("b", 90);
+    let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
+    let deps = HashMap::from([("a".to_string(), vec!["b".to_string()])]);
+
+    // Root "a": d1/d2 materialized at 100, d3 never attempted. Dep "b": u1 at
+    // 90 — older than every attempted downstream key, already consumed.
+    let a_timestamps = HashMap::from([(d1.clone(), 100i64), (d2.clone(), 100)]);
+    let a_mat = HashSet::from([d1.clone(), d2.clone()]);
+    let a_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: a_mat.clone(),
+        timestamps: a_timestamps.clone(),
+        ..Default::default()
+    };
+    let b_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: up_keys.clone(),
+        timestamps: HashMap::from([(u1.clone(), 90i64)]),
+        ..Default::default()
+    };
+    let partition_statuses =
+        HashMap::from([("a".to_string(), a_status), ("b".to_string(), b_status)]);
+
+    let all_states = HashMap::new();
+    let mut ctx = make_ctx("a", &a, &records, &deps);
+    ctx.all_asset_states = &all_states;
+
+    let mappings =
+        HashMap::from([(("a".into(), "b".into()), PartitionMappingKind::AllPartitions)]);
+    let upstream_b = HashMap::from([("b".to_string(), up_keys.clone())]);
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &a_mat,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &a_timestamps,
+        resolver: PartitionResolver::new(&mappings, &upstream_b),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let result = evaluate(&ConditionNode::any_deps_updated(), &ctx);
+
+    // Dep u1@90 is older than every attempted downstream key (100); the new
+    // frontier key d3 must not drag the floor to None and broadcast All.
+    assert!(
+        !result.fired,
+        "a never-attempted frontier key must not refire the universe with no \
+         upstream change, got {:?}",
+        result.selection
+    );
+}
+
+#[test]
+fn all_partitions_dep_genuine_update_still_fires() {
+    // The boundary the floor must preserve: when an upstream key IS newer than
+    // an attempted downstream key, the AllPartitions edge must still fire.
+    let d1 = spk("d1");
+    let d2 = spk("d2");
+    let d3 = spk("d3"); // never attempted
+    let all_keys = HashSet::from([d1.clone(), d2.clone(), d3.clone()]);
+    let u1 = spk("u1");
+    let up_keys = HashSet::from([u1.clone()]);
+
+    let a = make_materialized_record("a", 100);
+    let b = make_materialized_record("b", 150);
+    let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
+    let deps = HashMap::from([("a".to_string(), vec!["b".to_string()])]);
+
+    let a_timestamps = HashMap::from([(d1.clone(), 100i64), (d2.clone(), 100)]);
+    let a_mat = HashSet::from([d1.clone(), d2.clone()]);
+    let a_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: a_mat.clone(),
+        timestamps: a_timestamps.clone(),
+        ..Default::default()
+    };
+    let b_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: up_keys.clone(),
+        timestamps: HashMap::from([(u1.clone(), 150i64)]),
+        ..Default::default()
+    };
+    let partition_statuses =
+        HashMap::from([("a".to_string(), a_status), ("b".to_string(), b_status)]);
+
+    let all_states = HashMap::new();
+    let mut ctx = make_ctx("a", &a, &records, &deps);
+    ctx.all_asset_states = &all_states;
+
+    let mappings =
+        HashMap::from([(("a".into(), "b".into()), PartitionMappingKind::AllPartitions)]);
+    let upstream_b = HashMap::from([("b".to_string(), up_keys.clone())]);
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &a_mat,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &a_timestamps,
+        resolver: PartitionResolver::new(&mappings, &upstream_b),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let result = evaluate(&ConditionNode::any_deps_updated(), &ctx);
+    assert!(
+        result.fired,
+        "upstream u1@150 newer than attempted downstream (100) must fire, got {:?}",
+        result.selection
+    );
+}
+
+#[test]
 fn dep_updated_floor_compares_mapped_downstream_key() {
     // The staleness floor must compare a dep key against the root's
     // materialization of the DOWNSTREAM key the mapping resolves it to —

@@ -1297,6 +1297,31 @@ fn root_floor_over<'k>(
     floor
 }
 
+/// Like `root_floor_over` but for fan-out (`AllPartitions`) edges: floor only
+/// over keys actually attempted, ignoring never-attempted ones instead of
+/// collapsing to `None`. A freshly-minted frontier key must not drag the floor
+/// to `None` and rebroadcast the whole universe on a stale dep. `None` only when
+/// nothing was ever attempted.
+fn root_floor_over_attempted<'k>(
+    keys: impl Iterator<Item = &'k PartitionKey>,
+    root_status: &crate::condition::cache::PartitionStatusEntry,
+) -> Option<i64> {
+    let mut floor: Option<i64> = None;
+    for k in keys {
+        let effective = match (
+            root_status.timestamps.get(k),
+            root_status.failed_timestamps.get(k),
+        ) {
+            (None, None) => continue,
+            (Some(&m), None) => m,
+            (None, Some(&f)) => f,
+            (Some(&m), Some(&f)) => m.max(f),
+        };
+        floor = Some(floor.map_or(effective, |fl| fl.min(effective)));
+    }
+    floor
+}
+
 /// Evaluate a condition on an upstream dep in partition-aware mode.
 /// Maps partitions: downstream → upstream, evaluate, upstream → downstream.
 fn eval_partitioned_on_dep(
@@ -1393,7 +1418,14 @@ fn eval_partitioned_on_dep(
                     let floor = match &mapped {
                         PartitionSelection::Empty => return None,
                         PartitionSelection::All => {
-                            root_floor_over(pctx.all_keys.iter(), root_status)
+                            // Fan-out: uk feeds the whole downstream universe.
+                            // Floor over attempted keys only; a never-attempted
+                            // key would force None (→ "updated") and rebroadcast
+                            // All. Nothing attempted → uk not due.
+                            match root_floor_over_attempted(pctx.all_keys.iter(), root_status) {
+                                Some(f) => Some(f),
+                                None => return None,
+                            }
                         }
                         PartitionSelection::Keys(ks) => {
                             let in_universe: Vec<&PartitionKey> =
