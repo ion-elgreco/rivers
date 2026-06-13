@@ -117,8 +117,10 @@ struct RefreshDelta {
     /// Asset keys to add to `failed_assets`, with the failing run's
     /// end (or start) timestamp.
     failed_adds: HashMap<String, i64>,
-    /// Asset keys to remove from `failed_assets`.
-    failed_removes: HashSet<String>,
+    /// Asset keys whose success clears `failed_assets`, with the success run's
+    /// timestamp — a remove only clears a failure floor older than it, so a
+    /// co-batched older success can't clobber a newer failure.
+    failed_removes: HashMap<String, i64>,
     /// Tag updates: `(asset, partition_key, tags)`.
     run_tag_updates: Vec<RunTagUpdate>,
     /// Tick tag updates: `(asset, partition_key, tags)`.
@@ -586,7 +588,11 @@ impl AssetConditionCache {
                     .and_modify(|t| *t = (*t).max(run_ts))
                     .or_insert(run_ts);
             } else {
-                delta.failed_removes.insert(asset.clone());
+                delta
+                    .failed_removes
+                    .entry(asset.clone())
+                    .and_modify(|t| *t = (*t).max(run_ts))
+                    .or_insert(run_ts);
             }
             for partition_key in &run_partitions {
                 if !run_tags.is_empty() {
@@ -784,9 +790,18 @@ impl AssetConditionCache {
                 .and_modify(|t| *t = (*t).max(ts))
                 .or_insert(ts);
         }
-        for asset in failed_removes {
-            self.failed_assets.remove(asset.as_str());
-            self.failed_asset_timestamps.remove(asset.as_str());
+        // A success clears the floor only if it is at least as new as the
+        // recorded failure — an older co-batched success must not clobber a
+        // newer failure.
+        for (asset, success_ts) in failed_removes {
+            let outranked_by_failure = self
+                .failed_asset_timestamps
+                .get(asset.as_str())
+                .is_some_and(|&fail_ts| success_ts < fail_ts);
+            if !outranked_by_failure {
+                self.failed_assets.remove(asset.as_str());
+                self.failed_asset_timestamps.remove(asset.as_str());
+            }
         }
 
         for (asset, pk, tags) in run_tag_updates {
@@ -1098,5 +1113,67 @@ impl AssetConditionCache {
             }
         }
         result.into_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_run(run_id: &str, status: RunStatus, asset: &str, ts: i64) -> RunRecord {
+        RunRecord {
+            run_id: run_id.to_string(),
+            code_location_id: crate::storage::default_code_location_id(),
+            job_name: None,
+            status,
+            start_time: ts,
+            end_time: Some(ts),
+            tags: Vec::new(),
+            node_names: vec![asset.to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: crate::storage::LaunchedBy::default(),
+        }
+    }
+
+    #[test]
+    fn failure_floor_survives_co_batched_older_success() {
+        // A refresh batch carrying a Success@100 and a chronologically newer
+        // Failure@200 for the same unpartitioned asset must NOT let the
+        // success clear the newer failure's floor — apply applied all
+        // failed_adds then all failed_removes with no chronology check.
+        let mut cache = AssetConditionCache::new("default".to_string());
+        let mut delta = RefreshDelta::default();
+        cache.apply_run_effects_to_delta(&mk_run("s", RunStatus::Success, "R", 100), &mut delta);
+        cache.apply_run_effects_to_delta(&mk_run("f", RunStatus::Failure, "R", 200), &mut delta);
+        cache.apply_refresh_delta(delta);
+
+        assert_eq!(
+            cache.failed_asset_timestamps.get("R"),
+            Some(&200),
+            "newer failure floor must survive an older co-batched success"
+        );
+        assert!(
+            cache.failed_assets.contains("R"),
+            "asset must remain in failed_assets"
+        );
+    }
+
+    #[test]
+    fn newer_success_clears_failure_floor() {
+        // The boundary: a Success NEWER than the failure must still clear it.
+        let mut cache = AssetConditionCache::new("default".to_string());
+        let mut delta = RefreshDelta::default();
+        cache.apply_run_effects_to_delta(&mk_run("f", RunStatus::Failure, "R", 100), &mut delta);
+        cache.apply_run_effects_to_delta(&mk_run("s", RunStatus::Success, "R", 200), &mut delta);
+        cache.apply_refresh_delta(delta);
+
+        assert_eq!(
+            cache.failed_asset_timestamps.get("R"),
+            None,
+            "a success newer than the failure must clear the floor"
+        );
+        assert!(!cache.failed_assets.contains("R"));
     }
 }
