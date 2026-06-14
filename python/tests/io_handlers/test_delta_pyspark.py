@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from unittest.mock import patch
 
+import pandas as pd
 import pyarrow as pa
 import pytest
 import rivers as rs
@@ -29,6 +30,7 @@ from rivers.io_handlers.delta.config import (
     WhenNotMatchedInsert,
     WhenNotMatchedInsertAll,
 )
+from rivers.io_handlers.delta.pyspark import PySparkDeltaTypeHandler
 
 from .helpers import make_daily_partition, make_multi_partition, make_partition
 
@@ -79,14 +81,15 @@ def spark() -> SparkSession:  # type: ignore[return]
     session.stop()
 
 
-def _make_handler(tmp_path, **kwargs) -> tuple[rs.DeltaIOHandler, str]:
+def _make_handler(tmp_path, spark=None, **kwargs) -> tuple[rs.DeltaIOHandler, str]:
     uri = str(tmp_path)
-    return rs.DeltaIOHandler(table_uri=uri, **kwargs), uri
+    return rs.DeltaIOHandler(
+        table_uri=uri, user_config={"spark_session": spark}, **kwargs
+    ), uri
 
 
 def _pyspark_df(spark: SparkSession, data: dict) -> SparkDataFrame:  # type: ignore[return]
     """Construct a PySpark DataFrame from a column-oriented dict via pandas."""
-    import pandas as pd
 
     return spark.createDataFrame(pd.DataFrame(data))
 
@@ -99,7 +102,7 @@ def _collect_sorted(df: SparkDataFrame, sort_col: str) -> dict:
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_round_trip_pyspark(tmp_path, spark):
     """Write a PySpark DataFrame, read back as PySpark DataFrame."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     df = _pyspark_df(spark, {"a": [1, 2, 3], "b": ["x", "y", "z"]})
 
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df)
@@ -118,7 +121,7 @@ def test_round_trip_pyspark(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_write_pyspark_read_pyarrow(tmp_path, spark):
     """A PySpark output is readable back via the PyArrow type handler."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     df = _pyspark_df(spark, {"a": [1, 2], "b": ["x", "y"]})
 
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df)
@@ -136,7 +139,7 @@ def test_write_pyspark_read_pyarrow(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_write_pyarrow_read_pyspark(tmp_path, spark):
     """A PyArrow Table output is readable back via the PySpark type handler."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     table = pa.table({"a": [1, 2, 3], "b": ["x", "y", "z"]})
 
     handler.handle_output(rs.OutputContext(asset_name="tbl"), table)
@@ -157,7 +160,7 @@ def test_write_pyspark_read_polars(tmp_path, spark):
     """A PySpark output is readable back via the Polars type handler."""
     import polars as pl
 
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     df = _pyspark_df(spark, {"a": [10, 20, 30], "b": ["p", "q", "r"]})
 
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df)
@@ -179,7 +182,7 @@ def test_write_pyspark_read_polars(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_append_mode_pyspark(tmp_path, spark):
     """Append mode accumulates rows across PySpark writes."""
-    handler, _ = _make_handler(tmp_path, mode="append")
+    handler, _ = _make_handler(tmp_path, spark, mode="append")
     df = _pyspark_df(spark, {"a": [1, 2]})
 
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df)
@@ -195,7 +198,7 @@ def test_append_mode_pyspark(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_single_partition_isolation_pyspark(tmp_path, spark):
     """Two partitions written via PySpark do not cross-contaminate on read."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     p_a = make_partition("2024-01-01")
     p_b = make_partition("2024-01-02")
     meta = {"delta/partition_expr": "date"}
@@ -234,7 +237,7 @@ def test_single_partition_isolation_pyspark(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_partition_overwrite_pyspark(tmp_path, spark):
     """Re-writing a partition via PySpark replaces its data."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     p = make_partition("2024-01-01")
     meta = {"delta/partition_expr": "date"}
 
@@ -261,7 +264,7 @@ def test_partition_overwrite_pyspark(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_daily_partition_isolation_pyspark(tmp_path, spark):
     """Daily time-window partitions written via PySpark read back correctly."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     p_a = make_daily_partition("2024-01-01")
     p_b = make_daily_partition("2024-01-02")
     meta = {"delta/partition_expr": "date"}
@@ -289,7 +292,7 @@ def test_daily_partition_isolation_pyspark(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_column_selection_pyspark(tmp_path, spark):
     """``delta/columns`` metadata projects only the selected columns."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     df = _pyspark_df(spark, {"a": [1, 2], "b": ["x", "y"], "c": [3.0, 4.0]})
 
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df)
@@ -311,7 +314,7 @@ def test_column_selection_pyspark(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_table_versioning_pyspark(tmp_path, spark):
     """``delta/version`` time-travels the PySpark reader to a prior commit."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
 
     handler.handle_output(
         rs.OutputContext(asset_name="tbl"),
@@ -345,7 +348,7 @@ def test_null_values_preserved_pyspark(tmp_path, spark):
     """Null values in a PySpark DataFrame round-trip through Delta correctly."""
     import pandas as pd
 
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     df = spark.createDataFrame(
         pd.DataFrame({"id": [1, 2, 3], "val": [10.0, None, 30.0]})
     )
@@ -367,7 +370,7 @@ def test_null_values_preserved_pyspark(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_output_metadata_pyspark(tmp_path, spark):
     """Output metadata is populated correctly after a PySpark write."""
-    handler, uri = _make_handler(tmp_path)
+    handler, uri = _make_handler(tmp_path, spark)
     df = _pyspark_df(spark, {"a": [1, 2]})
 
     ctx = rs.OutputContext(asset_name="tbl")
@@ -391,7 +394,7 @@ def test_output_metadata_pyspark(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_creates_delta_log_pyspark(tmp_path, spark):
     """Delta log directory exists on disk after a PySpark write."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     df = _pyspark_df(spark, {"x": [1]})
 
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df)
@@ -402,7 +405,7 @@ def test_creates_delta_log_pyspark(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_root_name_override_pyspark(tmp_path, spark):
     """``delta/root_name`` metadata overrides the asset name in the table path."""
-    handler, uri = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     df = _pyspark_df(spark, {"a": [1, 2, 3]})
 
     ctx_out = rs.OutputContext(
@@ -430,7 +433,7 @@ def test_multi_partition_pyspark(tmp_path, spark):
     """Multi-dimension partition read/write with PySpark DataFrames."""
     import json
 
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     p = make_multi_partition({"region": "us", "env": "prod"})
     meta = {"delta/partition_expr": json.dumps({"region": "region", "env": "env"})}
 
@@ -452,17 +455,16 @@ def test_multi_partition_pyspark(tmp_path, spark):
 
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_pyspark_handler_with_explicit_spark(tmp_path, spark):
-    """PySparkDeltaTypeHandler accepts an explicit SparkSession at construction."""
-    from rivers.io_handlers.delta.pyspark import PySparkDeltaTypeHandler
+    """Explicit PySparkDeltaTypeHandler initialized by user."""
 
-    handler = rs.DeltaIOHandler(table_uri=str(tmp_path))
+    handler, _ = _make_handler(tmp_path)
 
     # Write via the shared handler (uses getActiveSession internally)
     df = _pyspark_df(spark, {"a": [7, 8, 9]})
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df)
 
     # Read via a handler whose type_handler map uses an explicit session
-    explicit_handler = PySparkDeltaTypeHandler(spark=spark)
+    explicit_handler = PySparkDeltaTypeHandler(spark_session=spark)
     result = explicit_handler.load_input(
         table_uri=str(tmp_path / "tbl"),
         table_name="tbl",
@@ -475,24 +477,52 @@ def test_pyspark_handler_with_explicit_spark(tmp_path, spark):
 
 
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
-def test_get_or_create_spark_returns_supplied_session(spark):
-    """_get_or_create_spark returns the caller-supplied session unchanged."""
-    from rivers.io_handlers.delta.pyspark import _get_or_create_spark
+def test_handler_fallback_to_active_session_with_warn(tmp_path, spark):
+    """handler should fallback to active spark session when
+    no spark session is supplied by user in DeltaIOHandler."""
 
-    result = _get_or_create_spark(spark=spark)
-    assert result is spark
+    handler, _ = _make_handler(tmp_path)
+    df = _pyspark_df(spark, {"a": [7, 8, 9]})
+    handler.handle_output(rs.OutputContext(asset_name="tbl"), df)
+
+    # With _user_spark_session being None, load_input raises a warning.
+    ctx_in = rs.InputContext(
+        asset_name="tbl", downstream_asset="x", type_hint=SparkDataFrame
+    )
+    with pytest.warns(UserWarning, match="No spark session set by user"):
+        result = handler.load_input(ctx_in)
+    assert isinstance(result, SparkDataFrame)
+
+    # Spark session must match the active spark session even though its not passed,
+    # since _get_or_create_spark uses the active session when available.
+    assert (
+        result.sparkSession.sparkContext.applicationId
+        == spark.sparkContext.applicationId
+    )
 
 
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
-def test_get_or_create_spark_returns_active_session(spark):
-    """_get_or_create_spark discovers the active session when none is supplied."""
-    from rivers.io_handlers.delta.pyspark import _get_or_create_spark
+def test_handler_using_user_spark_correctly(tmp_path, spark, recwarn):
+    """handler should should correctly use user spark session
+    (supplied by user in DeltaIOHandler)."""
 
-    # The session-scoped fixture has already activated this session.
-    result = _get_or_create_spark(spark=None)
-    assert result is not None
-    # Must return the same underlying JVM session context.
-    assert result.sparkContext.applicationId == spark.sparkContext.applicationId
+    handler, _ = _make_handler(tmp_path, spark)
+    df = _pyspark_df(spark, {"a": [7, 8, 9]})
+    handler.handle_output(rs.OutputContext(asset_name="tbl"), df)
+
+    ctx_in = rs.InputContext(
+        asset_name="tbl", downstream_asset="x", type_hint=SparkDataFrame
+    )
+
+    # No user warnings from load_input since the user spark session
+    # is set in user_config already.
+    result = handler.load_input(ctx_in)
+    assert isinstance(result, SparkDataFrame)
+    assert not any(issubclass(w.category, UserWarning) for w in recwarn)
+    assert (
+        result.sparkSession.sparkContext.applicationId
+        == spark.sparkContext.applicationId
+    )
 
 
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
@@ -519,22 +549,22 @@ def test_get_or_create_spark_no_active_no_delta_raises(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", _block_delta)
 
     with pytest.raises(ImportError, match=r"pip install rivers\[delta-pyspark\]"):
-        pyspark_module._get_or_create_spark(spark=None)
+        pyspark_module.PySparkDeltaTypeHandler(
+            spark_session=None
+        )._get_or_create_spark_session()
 
 
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_schema_mode_merge_pyspark(tmp_path, spark):
     """schema_mode='merge' adds new columns on subsequent PySpark writes."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
 
     # First write — schema {a: int}
     df_1 = _pyspark_df(spark, {"a": [1, 2]})
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df_1)
 
     # Second write — schema {a: int, b: str} with schema_mode="merge" and mode="append"
-    merge_handler = rs.DeltaIOHandler(
-        table_uri=str(tmp_path), schema_mode="merge", mode="append"
-    )
+    merge_handler, _ = _make_handler(tmp_path, schema_mode="merge", mode="append")
     df_2 = _pyspark_df(spark, {"a": [3], "b": ["new"]})
     merge_handler.handle_output(rs.OutputContext(asset_name="tbl"), df_2)
 
@@ -550,7 +580,7 @@ def test_schema_mode_merge_pyspark(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_matched_update(tmp_path, spark):
     """schema_mode='merge' with merge_type='custom' for PySpark writes."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     df_base = _pyspark_df(
         spark,
         {
@@ -563,8 +593,9 @@ def test_custom_merge_when_matched_update(tmp_path, spark):
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df_base)
 
     # when_matched_update
-    handler = rs.DeltaIOHandler(
-        table_uri=str(tmp_path),
+    handler, _ = _make_handler(
+        tmp_path=tmp_path,
+        spark=spark,
         mode="merge",
         merge_config=MergeConfig(
             predicate="target.id = source.id",
@@ -602,7 +633,7 @@ def test_custom_merge_when_matched_update(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_matched_update_all(tmp_path, spark):
     """schema_mode='merge' with merge_type='custom' for PySpark writes."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     df_base = _pyspark_df(
         spark,
         {
@@ -615,8 +646,9 @@ def test_custom_merge_when_matched_update_all(tmp_path, spark):
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df_base)
 
     # when_matched_update_all with except_cols
-    handler = rs.DeltaIOHandler(
-        table_uri=str(tmp_path),
+    handler, _ = _make_handler(
+        tmp_path=tmp_path,
+        spark=spark,
         mode="merge",
         merge_config=MergeConfig(
             predicate="target.id = source.id",
@@ -656,7 +688,7 @@ def test_custom_merge_when_matched_update_all(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_matched_delete(tmp_path, spark):
     """schema_mode='merge' with merge_type='custom' for PySpark writes."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     df_base = _pyspark_df(
         spark,
         {
@@ -669,8 +701,9 @@ def test_custom_merge_when_matched_delete(tmp_path, spark):
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df_base)
 
     # when_matched_delete
-    handler = rs.DeltaIOHandler(
-        table_uri=str(tmp_path),
+    handler, _ = _make_handler(
+        tmp_path=tmp_path,
+        spark=spark,
         mode="merge",
         merge_config=MergeConfig(
             predicate="target.id = source.id",
@@ -707,7 +740,7 @@ def test_custom_merge_when_matched_delete(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_not_matched_insert(tmp_path, spark):
     """schema_mode='merge' with merge_type='custom' for PySpark writes."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     df_base = _pyspark_df(
         spark,
         {
@@ -720,8 +753,9 @@ def test_custom_merge_when_not_matched_insert(tmp_path, spark):
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df_base)
 
     # when_not_matched_insert
-    handler = rs.DeltaIOHandler(
-        table_uri=str(tmp_path),
+    handler, _ = _make_handler(
+        tmp_path=tmp_path,
+        spark=spark,
         mode="merge",
         merge_config=MergeConfig(
             predicate="target.id = source.id",
@@ -763,7 +797,7 @@ def test_custom_merge_when_not_matched_insert(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_not_matched_insert_all(tmp_path, spark):
     """schema_mode='merge' with merge_type='custom' for PySpark writes."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     df_base = _pyspark_df(
         spark,
         {
@@ -776,8 +810,9 @@ def test_custom_merge_when_not_matched_insert_all(tmp_path, spark):
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df_base)
 
     # when_not_matched_insert_all
-    handler = rs.DeltaIOHandler(
-        table_uri=str(tmp_path),
+    handler, _ = _make_handler(
+        tmp_path=tmp_path,
+        spark=spark,
         mode="merge",
         merge_config=MergeConfig(
             predicate="target.id = source.id",
@@ -816,7 +851,7 @@ def test_custom_merge_when_not_matched_insert_all(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_not_matched_by_source_delete(tmp_path, spark):
     """schema_mode='merge' with merge_type='custom' for PySpark writes."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     df_base = _pyspark_df(
         spark,
         {
@@ -829,8 +864,9 @@ def test_custom_merge_when_not_matched_by_source_delete(tmp_path, spark):
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df_base)
 
     # when_not_matched_by_source_delete
-    handler = rs.DeltaIOHandler(
-        table_uri=str(tmp_path),
+    handler, _ = _make_handler(
+        tmp_path=tmp_path,
+        spark=spark,
         mode="merge",
         merge_config=MergeConfig(
             predicate="target.id = source.id",
@@ -866,7 +902,7 @@ def test_custom_merge_when_not_matched_by_source_delete(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_not_matched_by_source_update(tmp_path, spark):
     """schema_mode='merge' with merge_type='custom' for PySpark writes."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     df_base = _pyspark_df(
         spark,
         {
@@ -879,8 +915,9 @@ def test_custom_merge_when_not_matched_by_source_update(tmp_path, spark):
     handler.handle_output(rs.OutputContext(asset_name="tbl"), df_base)
 
     # when_not_matched_by_source_update
-    handler = rs.DeltaIOHandler(
-        table_uri=str(tmp_path),
+    handler, _ = _make_handler(
+        tmp_path=tmp_path,
+        spark=spark,
         mode="merge",
         merge_config=MergeConfig(
             predicate="target.id = source.id",
@@ -917,11 +954,13 @@ def test_custom_merge_when_not_matched_by_source_update(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_missing_pyspark_output_error(tmp_path, spark):
     """Writing a PySpark DataFrame without the handler suggests rivers[pyspark]."""
-    handler = rs.DeltaIOHandler(table_uri=str(tmp_path))
+    handler, _ = _make_handler(tmp_path)
     df = _pyspark_df(spark, {"a": [1]})
     ctx = rs.OutputContext(asset_name="tbl")
 
-    with patch.object(type(handler), "type_handlers", staticmethod(lambda: {})):
+    with patch.object(
+        type(handler), "type_handlers", staticmethod(lambda *args, **kwargs: {})
+    ):
         with pytest.raises(TypeError, match=r"pip install rivers\[pyspark\]"):
             handler.handle_output(ctx, df)
 
@@ -930,7 +969,7 @@ def test_missing_pyspark_output_error(tmp_path, spark):
 def test_missing_pyspark_input_error(tmp_path, spark):
     """Loading as PySpark DataFrame without the handler suggests rivers[pyspark]."""
     # Write first so the table exists
-    handler = rs.DeltaIOHandler(table_uri=str(tmp_path))
+    handler, _ = _make_handler(tmp_path)
     handler.handle_output(
         rs.OutputContext(asset_name="tbl"),
         _pyspark_df(spark, {"a": [1]}),
@@ -940,7 +979,9 @@ def test_missing_pyspark_input_error(tmp_path, spark):
         asset_name="tbl", downstream_asset="x", type_hint=SparkDataFrame
     )
 
-    with patch.object(type(handler), "type_handlers", staticmethod(lambda: {})):
+    with patch.object(
+        type(handler), "type_handlers", staticmethod(lambda *args, **kwargs: {})
+    ):
         with pytest.raises(TypeError, match=r"pip install rivers\[pyspark\]"):
             handler.load_input(ctx_in)
 
@@ -950,15 +991,13 @@ def test_merge_upsert_pyspark(tmp_path, spark):
     """Merge mode upsert via PySpark source updates existing rows and inserts new ones."""
     from rivers.io_handlers.delta import MergeConfig
 
-    init_handler, _ = _make_handler(tmp_path)
+    init_handler, _ = _make_handler(tmp_path, spark)
     initial = pa.table({"id": [1, 2], "val": [10, 20]})
     init_handler.handle_output(rs.OutputContext(asset_name="tbl"), initial)
 
     # Merge source is a PySpark DataFrame
     mc = MergeConfig(merge_type="upsert", predicate="s.id = t.id")
-    merge_handler = rs.DeltaIOHandler(
-        table_uri=str(tmp_path), mode="merge", merge_config=mc
-    )
+    merge_handler, _ = _make_handler(tmp_path, mode="merge", merge_config=mc)
     source_df = _pyspark_df(spark, {"id": [2, 3], "val": [99, 30]})
     merge_handler.handle_output(rs.OutputContext(asset_name="tbl"), source_df)
 
@@ -973,16 +1012,14 @@ def test_merge_deduplicate_insert_pyspark(tmp_path, spark):
     """Merge deduplicate_insert via PySpark only inserts non-matching rows."""
     from rivers.io_handlers.delta import MergeConfig
 
-    init_handler, _ = _make_handler(tmp_path)
+    init_handler, _ = _make_handler(tmp_path, spark)
     init_handler.handle_output(
         rs.OutputContext(asset_name="tbl"),
         pa.table({"id": [1, 2], "val": [10, 20]}),
     )
 
     mc = MergeConfig(merge_type="deduplicate_insert", predicate="s.id = t.id")
-    merge_handler = rs.DeltaIOHandler(
-        table_uri=str(tmp_path), mode="merge", merge_config=mc
-    )
+    merge_handler, _ = _make_handler(tmp_path, spark, mode="merge", merge_config=mc)
     source_df = _pyspark_df(spark, {"id": [2, 3], "val": [99, 30]})
     merge_handler.handle_output(rs.OutputContext(asset_name="tbl"), source_df)
 
@@ -996,7 +1033,7 @@ def test_merge_deduplicate_insert_pyspark(tmp_path, spark):
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_backfill_overwrite_pyspark(tmp_path, spark):
     """Overwriting a subset of partitions via PySpark leaves untouched ones intact."""
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     meta = {"delta/partition_expr": "key"}
     pd_def = rs.PartitionsDefinition.static_(["a", "b", "c"])
 
@@ -1054,7 +1091,7 @@ def test_large_pyspark_df_round_trips(tmp_path, spark):
     import pandas as pd
 
     n = 10_000
-    handler, _ = _make_handler(tmp_path)
+    handler, _ = _make_handler(tmp_path, spark)
     df = spark.createDataFrame(pd.DataFrame({"i": range(n)}))
 
     handler.handle_output(rs.OutputContext(asset_name="big"), df)
@@ -1073,6 +1110,7 @@ def test_warns_when_user_sets_unsupported_properties(tmp_path, spark):
     storage_options = {"access_key": "test"}
     handler, _ = _make_handler(
         tmp_path,
+        spark,
         storage_options=storage_options,
         commit_properties=cp,
         writer_properties=wp,

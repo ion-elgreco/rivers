@@ -11,8 +11,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from deltalake import CommitProperties, DeltaTable, WriterProperties
-from deltalake.exceptions import TableNotFoundError
+from deltalake import CommitProperties, WriterProperties
 from pydantic_settings import SettingsConfigDict
 
 from rivers._core import InputContext, OutputContext
@@ -65,7 +64,9 @@ _MODULE_TO_EXTRA: dict[str, str] = {
 }
 
 
-def _build_type_handler_map() -> dict[type, DeltaTypeHandler]:
+def _build_type_handler_map(
+    user_config: dict[str, Any] | None,
+) -> dict[type, DeltaTypeHandler]:
     """Best-effort discovery of installed type handlers (pyarrow, polars, pandas, pyspark).
 
     Returns a mapping from supported Python type to its handler. Missing optional
@@ -73,16 +74,23 @@ def _build_type_handler_map() -> dict[type, DeltaTypeHandler]:
     backing library can be imported.
     """
     handlers: dict[type, DeltaTypeHandler] = {}
-    for mod_path, cls_name in [
-        ("rivers.io_handlers.delta.pyarrow", "PyArrowTypeHandler"),
-        ("rivers.io_handlers.delta.polars", "PolarsTypeHandler"),
-        ("rivers.io_handlers.delta.datafusion", "DataFusionTypeHandler"),
-        ("rivers.io_handlers.delta.pandas", "PandasTypeHandler"),
-        ("rivers.io_handlers.delta.pyspark", "PySparkDeltaTypeHandler"),
+    for mod_path, cls_name, cls_params in [
+        ("rivers.io_handlers.delta.pyarrow", "PyArrowTypeHandler", []),
+        ("rivers.io_handlers.delta.polars", "PolarsTypeHandler", []),
+        ("rivers.io_handlers.delta.datafusion", "DataFusionTypeHandler", []),
+        ("rivers.io_handlers.delta.pandas", "PandasTypeHandler", []),
+        (
+            "rivers.io_handlers.delta.pyspark",
+            "PySparkDeltaTypeHandler",
+            ["spark_session"],
+        ),
     ]:
         try:
             mod = __import__(mod_path, fromlist=[cls_name])
-            h = getattr(mod, cls_name)()
+            kwargs = {}
+            if user_config:
+                kwargs = {param: user_config.get(param) for param in cls_params}
+            h = getattr(mod, cls_name)(**kwargs)
             for t in h.supported_types:
                 handlers[t] = h
         except ImportError:
@@ -112,11 +120,14 @@ class DeltaIOHandler(BaseIOHandler):
     commit_properties: CommitProperties | None = None
     table_config: dict[str, str] | None = None
     merge_config: MergeConfig | None = None
+    user_config: dict[str, Any] | None = None
 
     @staticmethod
-    def type_handlers() -> dict[type, DeltaTypeHandler]:
+    def type_handlers(
+        user_config: dict[str, Any] | None = None,
+    ) -> dict[type, DeltaTypeHandler]:
         """Return the currently registered ``{type: DeltaTypeHandler}`` map."""
-        return _build_type_handler_map()
+        return _build_type_handler_map(user_config)
 
     def _resolve_handler(self, target_type: type) -> DeltaTypeHandler:
         """Look up the type handler for ``target_type`` or raise ``TypeError``.
@@ -125,6 +136,7 @@ class DeltaIOHandler(BaseIOHandler):
         type is requested but its handler library is not installed.
         """
 
+        type_handlers = self.type_handlers(self.user_config)
         handler = None
         # Spark 4.0+ introduced a split between the public DataFrame API
         # (``pyspark.sql.dataframe.DataFrame``) and the underlying classic
@@ -133,7 +145,7 @@ class DeltaIOHandler(BaseIOHandler):
         # resolve to the classic implementation while handlers are registered
         # against the public API class. Using ``issubclass()`` is therefore a
         # more robust check instead of exact class comparison.
-        for type, type_handler in self.type_handlers().items():
+        for type, type_handler in type_handlers.items():
             if issubclass(target_type, type):
                 handler = type_handler
                 break
@@ -148,7 +160,7 @@ class DeltaIOHandler(BaseIOHandler):
             )
         raise TypeError(
             f"No type handler found for {target_type!r}. "
-            f"Supported types: {list(self.type_handlers())}"
+            f"Supported types: {list(type_handlers)}"
         )
 
     def _asset_uri(self, asset_name: str) -> str:
@@ -175,10 +187,6 @@ class DeltaIOHandler(BaseIOHandler):
         predicate: str | None = None
         if context.partition is not None and delta_write_mode == "overwrite":
             predicate = _build_predicate(context.partition, partition_expr)
-            try:
-                DeltaTable(table_uri, storage_options=self.storage_options)
-            except TableNotFoundError:
-                predicate = None
 
         # Resolve table configuration (IO manager default + per-asset override)
         table_cfg = dict(self.table_config) if self.table_config else {}
@@ -259,7 +267,7 @@ class DeltaIOHandler(BaseIOHandler):
         if context.type_hint is None:
             raise TypeError(
                 "No type_hint provided on InputContext. "
-                f"Supported types: {list(self.type_handlers())}"
+                f"Supported types: {list(self.type_handlers(self.user_config))}"
             )
         handler = self._resolve_handler(context.type_hint)
         return handler.load_input(

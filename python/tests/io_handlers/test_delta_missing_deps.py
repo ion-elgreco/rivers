@@ -21,7 +21,9 @@ def test_missing_pyarrow_output_error(tmp_path):
     table = pa.table({"a": [1]})
     ctx = rs.OutputContext(asset_name="tbl")
 
-    with patch.object(type(handler), "type_handlers", staticmethod(lambda: {})):
+    with patch.object(
+        type(handler), "type_handlers", staticmethod(lambda *args, **kwargs: {})
+    ):
         with pytest.raises(TypeError, match=r"pip install rivers\[pyarrow\]"):
             handler.handle_output(ctx, table)
 
@@ -33,7 +35,9 @@ def test_missing_pyarrow_input_error(tmp_path):
     handler = _handler_without_extras(tmp_path)
     ctx = rs.InputContext(asset_name="tbl", downstream_asset="x", type_hint=pa.Table)
 
-    with patch.object(type(handler), "type_handlers", staticmethod(lambda: {})):
+    with patch.object(
+        type(handler), "type_handlers", staticmethod(lambda *args, **kwargs: {})
+    ):
         with pytest.raises(TypeError, match=r"pip install rivers\[pyarrow\]"):
             handler.load_input(ctx)
 
@@ -46,7 +50,9 @@ def test_missing_polars_output_error(tmp_path):
     df = pl.DataFrame({"a": [1]})
     ctx = rs.OutputContext(asset_name="tbl")
 
-    with patch.object(type(handler), "type_handlers", staticmethod(lambda: {})):
+    with patch.object(
+        type(handler), "type_handlers", staticmethod(lambda *args, **kwargs: {})
+    ):
         with pytest.raises(TypeError, match=r"pip install rivers\[polars\]"):
             handler.handle_output(ctx, df)
 
@@ -60,7 +66,9 @@ def test_missing_polars_input_error(tmp_path):
         asset_name="tbl", downstream_asset="x", type_hint=pl.DataFrame
     )
 
-    with patch.object(type(handler), "type_handlers", staticmethod(lambda: {})):
+    with patch.object(
+        type(handler), "type_handlers", staticmethod(lambda *args, **kwargs: {})
+    ):
         with pytest.raises(TypeError, match=r"pip install rivers\[polars\]"):
             handler.load_input(ctx)
 
@@ -74,7 +82,9 @@ def test_missing_polars_lazyframe_error(tmp_path):
         asset_name="tbl", downstream_asset="x", type_hint=pl.LazyFrame
     )
 
-    with patch.object(type(handler), "type_handlers", staticmethod(lambda: {})):
+    with patch.object(
+        type(handler), "type_handlers", staticmethod(lambda *args, **kwargs: {})
+    ):
         with pytest.raises(TypeError, match=r"pip install rivers\[polars\]"):
             handler.load_input(ctx)
 
@@ -87,7 +97,9 @@ def test_missing_pandas_output_error(tmp_path):
     df = pd.DataFrame({"a": [1]})
     ctx = rs.OutputContext(asset_name="tbl")
 
-    with patch.object(type(handler), "type_handlers", staticmethod(lambda: {})):
+    with patch.object(
+        type(handler), "type_handlers", staticmethod(lambda *args, **kwargs: {})
+    ):
         with pytest.raises(TypeError, match=r"pip install rivers\[pandas\]"):
             handler.handle_output(ctx, df)
 
@@ -101,7 +113,9 @@ def test_missing_pandas_input_error(tmp_path):
         asset_name="tbl", downstream_asset="x", type_hint=pd.DataFrame
     )
 
-    with patch.object(type(handler), "type_handlers", staticmethod(lambda: {})):
+    with patch.object(
+        type(handler), "type_handlers", staticmethod(lambda *args, **kwargs: {})
+    ):
         with pytest.raises(TypeError, match=r"pip install rivers\[pandas\]"):
             handler.load_input(ctx)
 
@@ -115,7 +129,9 @@ def test_missing_pyarrow_recordbatchreader_error(tmp_path):
         asset_name="tbl", downstream_asset="x", type_hint=pa.RecordBatchReader
     )
 
-    with patch.object(type(handler), "type_handlers", staticmethod(lambda: {})):
+    with patch.object(
+        type(handler), "type_handlers", staticmethod(lambda *args, **kwargs: {})
+    ):
         with pytest.raises(TypeError, match=r"pip install rivers\[pyarrow\]"):
             handler.load_input(ctx)
 
@@ -125,6 +141,8 @@ def test_unknown_type_generic_error(tmp_path):
     handler = _handler_without_extras(tmp_path)
     ctx = rs.OutputContext(asset_name="tbl")
 
-    with patch.object(type(handler), "type_handlers", staticmethod(lambda: {})):
+    with patch.object(
+        type(handler), "type_handlers", staticmethod(lambda *args, **kwargs: {})
+    ):
         with pytest.raises(TypeError, match="No type handler found"):
             handler.handle_output(ctx, {"not": "a table"})
