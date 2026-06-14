@@ -97,6 +97,14 @@ enum InProgressChange {
     AssetClear(String),
 }
 
+/// A pending `failed_adds` entry: the failing run's end (or start) timestamp
+/// and id. The id lets `apply` skip an asset that actually materialized in a
+/// failed joint run (its record's `last_run_id` matches this run).
+struct FailedRun {
+    ts: i64,
+    run_id: String,
+}
+
 /// Description of every mutation a single steady-state refresh wants to make
 /// to the cache. Built fallibly by `fetch_refresh_delta` (any storage error
 /// → drop the partial delta, cache untouched). Replayed infallibly by
@@ -114,10 +122,9 @@ struct RefreshDelta {
     record_updates: Vec<AssetRecord>,
     /// In-progress changes, in apply order.
     in_progress_changes: Vec<InProgressChange>,
-    /// Asset keys to add to `failed_assets`, each with the failing run's
-    /// end (or start) timestamp and run id. The run id lets `apply` skip an
-    /// asset that actually materialized in the failed (joint) run.
-    failed_adds: HashMap<String, (i64, String)>,
+    /// Asset keys to add to `failed_assets`, each with the [`FailedRun`] that
+    /// floored them.
+    failed_adds: HashMap<String, FailedRun>,
     /// Asset keys whose success clears `failed_assets`, with the success run's
     /// timestamp — a remove only clears a failure floor older than it, so a
     /// co-batched older success can't clobber a newer failure.
@@ -587,11 +594,15 @@ impl AssetConditionCache {
                     .failed_adds
                     .entry(asset.clone())
                     .and_modify(|e| {
-                        if run_ts > e.0 {
-                            *e = (run_ts, run.run_id.clone());
+                        if run_ts > e.ts {
+                            e.run_id = run.run_id.clone();
+                            e.ts = run_ts;
                         }
                     })
-                    .or_insert_with(|| (run_ts, run.run_id.clone()));
+                    .or_insert_with(|| FailedRun {
+                        ts: run_ts,
+                        run_id: run.run_id.clone(),
+                    });
             } else {
                 delta
                     .failed_removes
@@ -792,7 +803,7 @@ impl AssetConditionCache {
         // joint run can fail one step while others materialized: an asset whose
         // latest materialization IS this run produced output, so it clears like
         // a success instead of carrying a failure floor.
-        for (asset, (ts, run_id)) in failed_adds {
+        for (asset, FailedRun { ts, run_id }) in failed_adds {
             let materialized_here = self
                 .records
                 .get(asset.as_str())
