@@ -32,6 +32,12 @@ def resolved_tmp_path(tmp_path, monkeypatch):
     resolved = tmp_path.resolve()
     monkeypatch.chdir(resolved)
 
+    # Initialize an empty pyproject.toml to ignore warning:
+    # UserWarning: Config key `pyproject_toml_table_header` is set
+    # in model_config but will be ignored because no
+    # PyprojectTomlConfigSettingsSource source is configured.
+    (resolved / "pyproject.toml").write_text("[tool]\n")
+
     original_find_toml = _find_toml
     monkeypatch.setattr(
         "rivers._cli.config._find_toml",

@@ -1,9 +1,7 @@
 """CLI tests for configuration strategies."""
 
-import os
 from pathlib import Path
 
-import pytest
 from rivers._cli.config import (
     DaemonConfig,
     ModuleConfig,
