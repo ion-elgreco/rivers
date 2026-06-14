@@ -261,12 +261,11 @@ fn eval_inner<O: EvalOutput>(
                 let expr = match ctx.target_record.last_timestamp {
                     None => false,
                     Some(dep_ts) => match ctx.root_partition_floor {
-                        // Partitioned root over an unpartitioned dep: floor
-                        // against the OLDEST partition attempt (min), so the
+                        // Partitioned root over an unpartitioned dep: the floor
+                        // is the root's OLDEST partition attempt (min), so the
                         // edge fires while ANY partition is older than the dep
                         // and self-suppresses once all partitions catch up.
-                        // Inner `None` = a partition was never attempted → fire.
-                        Some(floor) => floor.map(|f| dep_ts > f).unwrap_or(true),
+                        Some(floor) => dep_newer_than_floor(dep_ts, floor),
                         None => {
                             let root_mat = ctx
                                 .cache
@@ -928,8 +927,7 @@ fn eval_partitioned<O: PartEvalOutput>(
                 .filter(|&(pk, &ts)| match pctx.dep_root_floor {
                     Some(floor) => match floor.get(pk) {
                         None => false,
-                        Some(None) => true,
-                        Some(Some(root_ts)) => ts > *root_ts,
+                        Some(&inner) => dep_newer_than_floor(ts, inner),
                     },
                     None => match prev_timestamps.and_then(|pt| pt.get(pk)) {
                         Some(&prev) => ts > prev,
@@ -1269,6 +1267,15 @@ fn eval_partitioned_all_deps(
         }
     }
     result
+}
+
+/// Whether a dep at `dep_ts` counts as newly-updated against a downstream
+/// key's effective staleness `floor`: fire when the key was never attempted
+/// (`None`) or the dep is strictly newer than the floor. Shared by the scalar
+/// (unpartitioned-dep) and per-key (partitioned-dep) `NewlyUpdated` arms so the
+/// "never attempted ⇒ updated" rule lives in one place.
+fn dep_newer_than_floor(dep_ts: i64, floor: Option<i64>) -> bool {
+    floor.is_none_or(|f| dep_ts > f)
 }
 
 /// The staleness floor across the downstream keys a dep key maps to: the
