@@ -80,9 +80,6 @@ class RiversConfig(BaseSettings):
         rivers_toml = _find_toml("rivers.toml")
         pyproject_toml = _find_toml("pyproject.toml")
 
-        print(f"rivers_toml={rivers_toml}")
-        print(f"pyproject_toml={pyproject_toml}")
-
         if rivers_toml:
             sources.append(
                 TomlConfigSettingsSource(

@@ -12,8 +12,8 @@ from pathlib import Path
 
 import typer
 
-from rivers._cli.config import RiversConfig
 from rivers._core.storage import Storage
+from rivers.cli.config import RiversConfig
 
 app = typer.Typer(name="rivers", help="rivers orchestration CLI")
 pools_app = typer.Typer(name="pools", help="Inspect and manage concurrency pools")
