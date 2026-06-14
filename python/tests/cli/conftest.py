@@ -3,7 +3,7 @@
 import os
 
 import pytest
-from rivers._cli.config import _find_toml
+from rivers.cli.config import _find_toml
 
 
 @pytest.fixture(autouse=True)
@@ -40,7 +40,7 @@ def resolved_tmp_path(tmp_path, monkeypatch):
 
     original_find_toml = _find_toml
     monkeypatch.setattr(
-        "rivers._cli.config._find_toml",
+        "rivers.cli.config._find_toml",
         lambda filename: original_find_toml(filename, start_path=resolved),
     )
 

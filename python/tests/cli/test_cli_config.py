@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from rivers._cli.config import (
+from rivers.cli.config import (
     DaemonConfig,
     ModuleConfig,
     RiversConfig,
