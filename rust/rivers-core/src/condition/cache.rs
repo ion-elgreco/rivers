@@ -85,15 +85,18 @@ pub struct PendingRun {
 /// minutes.
 pub const DEFAULT_PENDING_GRACE_NANOS: i64 = 60 * 1_000_000_000;
 
-/// One mutation to `in_progress_assets`. Stored in order so the apply phase
-/// can replay e.g. "push run R1 to asset A, then clear A entirely" exactly
-/// the way the in-place refresh did before the Plan/Apply split.
+/// One mutation to `in_progress_assets`, applied in order.
 enum InProgressChange {
     Push {
         asset_key: String,
         run_id: String,
     },
-    /// Remove all run_ids for this asset.
+    /// Drop one completed run, removing the asset entry when its last run
+    /// clears. Run completions use this so a backfill's still-running
+    /// partitions stay gated when a sibling finishes.
+    ClearRun { asset_key: String, run_id: String },
+    /// Drop all of an asset's runs. Only the external-observation path
+    /// (no owning run_id) uses this.
     AssetClear(String),
 }
 
@@ -413,10 +416,35 @@ impl AssetConditionCache {
                 }
             }
             for key in &completed_keys {
-                delta
-                    .in_progress_changes
-                    .push(InProgressChange::AssetClear(key.clone()));
                 invalidated_keys.push(key.clone());
+            }
+
+            // Clear per run, not per asset. A backfill registers one run per
+            // partition; evicting the whole asset when the first finishes
+            // reopens the dispatch gate for its still-running siblings and
+            // re-fires them as duplicate runs. Re-read the completed assets'
+            // runs and clear only the terminal ones — in-flight runs stay.
+            let clearable: Vec<String> = completed_keys
+                .iter()
+                .filter_map(|k| self.in_progress_assets.get(k))
+                .flatten()
+                .cloned()
+                .collect();
+            if !clearable.is_empty() {
+                let tracked_runs = storage.get_runs_by_ids(&clearable, None).await?;
+                for run in &tracked_runs {
+                    if matches!(run.status, RunStatus::Started | RunStatus::NotStarted) {
+                        continue;
+                    }
+                    for asset in &run.node_names {
+                        if self.in_progress_assets.contains_key(asset) {
+                            delta.in_progress_changes.push(InProgressChange::ClearRun {
+                                asset_key: asset.clone(),
+                                run_id: run.run_id.clone(),
+                            });
+                        }
+                    }
+                }
             }
 
             // `get_runs_since` uses `>`, so a run only ever seen as Started
@@ -460,17 +488,19 @@ impl AssetConditionCache {
                     }
                     RunStatus::Success | RunStatus::Failure => {
                         for asset in &run.node_names {
-                            delta
-                                .in_progress_changes
-                                .push(InProgressChange::AssetClear(asset.clone()));
+                            delta.in_progress_changes.push(InProgressChange::ClearRun {
+                                asset_key: asset.clone(),
+                                run_id: run.run_id.clone(),
+                            });
                         }
                         self.apply_run_effects_to_delta(run, &mut delta);
                     }
                     RunStatus::Canceled => {
                         for asset in &run.node_names {
-                            delta
-                                .in_progress_changes
-                                .push(InProgressChange::AssetClear(asset.clone()));
+                            delta.in_progress_changes.push(InProgressChange::ClearRun {
+                                asset_key: asset.clone(),
+                                run_id: run.run_id.clone(),
+                            });
                         }
                     }
                     RunStatus::Queued => {
@@ -577,8 +607,8 @@ impl AssetConditionCache {
 
     /// Plan-phase helper: append the run-derived mutations (failure flag,
     /// run/tick tag updates, asset_names updates) for a completed
-    /// Success/Failure run into `delta`. Caller is responsible for emitting
-    /// any `InProgressChange::AssetClear` separately.
+    /// Success/Failure run into `delta`. Caller is responsible for emitting the
+    /// matching `InProgressChange::ClearRun` separately.
     fn apply_run_effects_to_delta(&self, run: &RunRecord, delta: &mut RefreshDelta) {
         let run_asset_names: Arc<[String]> = Arc::from(run.node_names.as_slice());
         let run_tags: Arc<[(String, String)]> = Arc::from(run.tags.as_slice());
@@ -781,10 +811,8 @@ impl AssetConditionCache {
             self.records.insert(record.asset_key.clone(), record);
         }
 
-        // Apply in-progress changes IN ORDER — the per-run loop in fetch
-        // emits e.g. Push then AssetClear when the same asset has both a
-        // newly-Started run and a freshly-completed older run; iterating in
-        // order preserves the pre-refactor semantics.
+        // Apply in order: fetch can emit Push then ClearRun for one asset (a
+        // newly-Started run alongside a freshly-completed one); order keeps both.
         for change in in_progress_changes {
             match change {
                 InProgressChange::Push { asset_key, run_id } => {
@@ -792,6 +820,14 @@ impl AssetConditionCache {
                         .entry(asset_key)
                         .or_default()
                         .push(run_id);
+                }
+                InProgressChange::ClearRun { asset_key, run_id } => {
+                    if let Some(run_ids) = self.in_progress_assets.get_mut(&asset_key) {
+                        run_ids.retain(|id| id != &run_id);
+                        if run_ids.is_empty() {
+                            self.in_progress_assets.remove(&asset_key);
+                        }
+                    }
                 }
                 InProgressChange::AssetClear(asset_key) => {
                     self.in_progress_assets.remove(asset_key.as_str());

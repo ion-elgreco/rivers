@@ -6474,6 +6474,111 @@ async fn test_cache_detects_in_progress_completion_as_change() {
 }
 
 #[tokio::test]
+async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completion() {
+    // Regression: a backfill registers one run per partition, all on the same
+    // asset. When the first run completes, refresh must clear only that run —
+    // wiping the whole asset reopens the dispatch gate for the still-running
+    // siblings, re-firing them as duplicate runs (the flaky "expected 3, got 4
+    // successful runs").
+
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, PartitionKey, RunRecord, RunStatus,
+        StorageBackend,
+    };
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+
+    // Downstream asset with a baseline materialization.
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[make_materialized_record("dst", 1000)])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        cache.in_progress_assets.is_empty(),
+        "baseline: nothing in flight"
+    );
+
+    // Backfill dispatch: one Started run per partition (a, b, c), all on `dst`.
+    let part = |k: &str| PartitionKey::Single {
+        keys: vec![k.to_string()],
+    };
+    let mk_run = |id: &str, k: &str| RunRecord {
+        run_id: id.to_string(),
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        job_name: Some("backfill".to_string()),
+        status: RunStatus::Started,
+        start_time: 2000,
+        end_time: None,
+        tags: vec![],
+        node_names: vec!["dst".to_string()],
+        priority: 0,
+        partition_key: Some(part(k)),
+        block_reason: None,
+        launched_by: LaunchedBy::Manual,
+    };
+    storage
+        .create_runs(&[mk_run("run_a", "a"), mk_run("run_b", "b"), mk_run("run_c", "c")])
+        .await
+        .unwrap();
+
+    // Tick 1: all three observed Started → tracked under `dst`.
+    cache.refresh(&storage, 0).await.unwrap();
+    let tracked = cache
+        .in_progress_assets
+        .get("dst")
+        .expect("dst should be in-progress after dispatch");
+    assert_eq!(tracked.len(), 3, "all three backfill runs are tracked");
+
+    // Partition a finishes: its run flips to Success and its materialization
+    // lands (advancing `dst`'s asset-record timestamp).
+    storage
+        .update_run_status("run_a", RunStatus::Success, Some(3000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[EventRecord {
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            event_type: EventType::Materialization {
+                data_version: Some("dv_a".to_string()),
+            },
+            asset_key: Some("dst".to_string()),
+            run_id: "run_a".to_string(),
+            partition_key: Some(part("a")),
+            timestamp: 3000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        }])
+        .await
+        .unwrap();
+
+    // Tick 2: a's completion is detected. Only run_a may clear — b and c are
+    // still running, so `dst` must stay gated against re-dispatch.
+    cache.refresh(&storage, 0).await.unwrap();
+    let tracked = cache
+        .in_progress_assets
+        .get("dst")
+        .expect("dst must stay in-progress while runs b and c are still running");
+    assert!(
+        !tracked.contains(&"run_a".to_string()),
+        "the completed run a should be cleared"
+    );
+    assert!(
+        tracked.contains(&"run_b".to_string()),
+        "still-running run b must stay tracked"
+    );
+    assert!(
+        tracked.contains(&"run_c".to_string()),
+        "still-running run c must stay tracked"
+    );
+}
+
+#[tokio::test]
 async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged() {
     // Root cause of flaky test_schedule_chain_three_layers.
     //
