@@ -141,7 +141,7 @@ rivers queue why RUN_ID          # explain why a queued run is blocked
 
 ## `db migrate` — storage schema migration
 
-Brings a database up to the running rivers build's schema version, running any data-heal steps under a cross-process lease. Idempotent. Run it after upgrading rivers when a code location or the UI reports that the database needs migration; see [Storage › Schema versioning & migration](storage.md#schema-versioning-migration).
+Brings a database up to the running rivers build's schema version, applying any pending migrations under a cross-process lease. Idempotent. Run it after upgrading rivers when a code location or the UI reports that the database needs migration; see [Storage › Schema versioning & migration](storage.md#schema-versioning-migration).
 
 ```bash
 rivers db migrate                                          # embedded (default .rivers/storage/)

@@ -1,22 +1,138 @@
-//! Schema versioning and migration: stamps, the capability floor guard, the
-//! cross-process lease, and the data-heal steps. The only place schema is applied.
-
-use std::collections::HashMap;
+//! Schema versioning and migration: refinery applies the ordered SurrealQL
+//! migrations and records them; each migration writes its compat metadata into
+//! `migration_meta`; the capability floor guard and cross-process lease wrap it.
 
 use anyhow::Context;
+use refinery_core::traits::r#async::{AsyncMigrate, AsyncQuery, AsyncTransaction};
+use refinery_core::{Migration, Target};
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
-use surrealdb::types::{Bytes, RecordId, SurrealValue};
+use surrealdb::types::SurrealValue;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
-use super::{
-    BASE_SCHEMA, DbAssetPartitionWrite, DbDynamicPartition, DbKv, PartitionKey, now_nanos,
-};
+use super::now_nanos;
 
-/// Max schema version this build understands. The schema is the fold of
-/// [`MIGRATION_STEPS`] (base is step `to: 1`); change it only by adding a step.
-const SCHEMA_VERSION: u32 = 3;
-/// `kv` key holding the combined [`SchemaStamps`] record
-const SCHEMA_STAMPS_KEY: &str = "schema_stamps";
+/// refinery's history table — one checksummed row per applied migration.
+const REFINERY_HISTORY_TABLE: &str = "refinery_schema_history";
+
+/// A refinery backend over a SurrealDB connection: `migrate()` drives
+/// `execute`/`query`; we translate the history SQL to SurrealQL (dialect overrides).
+struct SurrealMigrate {
+    db: Surreal<Any>,
+}
+
+#[async_trait::async_trait]
+impl AsyncTransaction for SurrealMigrate {
+    type Error = surrealdb::Error;
+
+    async fn execute<'a, T: Iterator<Item = &'a str> + Send>(
+        &mut self,
+        queries: T,
+    ) -> Result<usize, Self::Error> {
+        // refinery hands us a migration's SQL + its history INSERT; one
+        // transaction so a history row never lands without its migration applied.
+        let stmts: Vec<&str> = queries
+            .map(|q| q.trim().trim_end_matches(';').trim())
+            .filter(|q| !q.is_empty())
+            .collect();
+        let count = stmts.len();
+        let batch = format!(
+            "BEGIN TRANSACTION;\n{};\nCOMMIT TRANSACTION;",
+            stmts.join(";\n")
+        );
+        self.db.query(batch).await?.check()?;
+        Ok(count)
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncQuery<Vec<Migration>> for SurrealMigrate {
+    async fn query(&mut self, query: &str) -> Result<Vec<Migration>, Self::Error> {
+        #[derive(SurrealValue)]
+        struct HistRow {
+            version: i64,
+            name: String,
+            applied_on: String,
+            checksum: String,
+        }
+        let rows: Vec<HistRow> = self.db.query(query).await?.take(0)?;
+        let applied = rows
+            .into_iter()
+            .map(|r| {
+                // applied_on/checksum were written by refinery in RFC3339/u64 form.
+                let applied_on =
+                    OffsetDateTime::parse(&r.applied_on, &Rfc3339).expect("applied_on is RFC3339");
+                Migration::applied(
+                    r.version as i32,
+                    r.name,
+                    applied_on,
+                    r.checksum.parse::<u64>().expect("checksum is a u64"),
+                )
+            })
+            .collect();
+        Ok(applied)
+    }
+}
+
+impl AsyncMigrate for SurrealMigrate {
+    // SurrealQL dialect: `DEFINE TABLE`, not `CREATE TABLE`.
+    fn assert_migrations_table_query(table: &str) -> String {
+        format!(
+            "DEFINE TABLE IF NOT EXISTS {table} SCHEMAFULL; \
+             DEFINE FIELD IF NOT EXISTS version ON {table} TYPE int; \
+             DEFINE FIELD IF NOT EXISTS name ON {table} TYPE string; \
+             DEFINE FIELD IF NOT EXISTS applied_on ON {table} TYPE string; \
+             DEFINE FIELD IF NOT EXISTS checksum ON {table} TYPE string; \
+             DEFINE INDEX IF NOT EXISTS idx_{table}_version ON {table} FIELDS version UNIQUE;"
+        )
+    }
+
+    // SurrealQL has no `MAX()` subquery; order + limit instead.
+    fn get_last_applied_migration_query(table: &str) -> String {
+        format!(
+            "SELECT version, name, applied_on, checksum FROM {table} ORDER BY version DESC LIMIT 1"
+        )
+    }
+
+    fn get_applied_migrations_query(table: &str) -> String {
+        format!("SELECT version, name, applied_on, checksum FROM {table} ORDER BY version ASC")
+    }
+}
+
+/// Highest embedded migration version. Bump by adding a `Vn__*.surql` + an
+/// [`embedded_migrations`] entry; a test pins this to that max.
+const SCHEMA_VERSION: u32 = 1;
+
+/// One compat row per migration (the floors it set), folded by the open guard.
+const MIGRATION_META_TABLE: &str = "migration_meta";
+
+/// The migrations embedded in this build, applied in order; refinery checksums each.
+fn embedded_migrations() -> Vec<Migration> {
+    vec![
+        Migration::unapplied("V1__base", include_str!("migrations/V1__base.surql"))
+            .expect("V1__base migration name is well-formed"),
+    ]
+}
+
+/// Apply all pending migrations via refinery (idempotent — applied ones are
+/// skipped; an edited applied one aborts on a checksum mismatch).
+async fn apply_migrations(db: &Surreal<Any>) -> anyhow::Result<()> {
+    let migrations = embedded_migrations();
+    let mut backend = SurrealMigrate { db: db.clone() };
+    backend
+        .migrate(
+            &migrations,
+            true,  // abort_divergent: an edited applied migration is an error
+            false, // abort_missing: tolerate a DB carrying migrations we don't embed
+            false, // grouped: one transaction per migration
+            Target::Latest,
+            REFINERY_HISTORY_TABLE,
+        )
+        .await
+        .context("applying storage migrations")?;
+    Ok(())
+}
 
 /// What a caller intends to do — selects which floor [`check_compatibility`] enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,122 +145,46 @@ pub enum Capability {
     Migrate,
 }
 
-/// How far back a build may be and still use a database with this step applied.
+/// The compat triple the open guard checks: the applied version and its floors,
+/// read from the latest `migration_meta` row (floors are cumulative — they only rise).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StepClass {
-    /// Adds only optional/defaulted schema or records. Raises neither floor.
-    Additive,
-    /// An old writer re-introduces a healed shape. Raises `min_writer`.
-    WriteBreaking,
-    /// Reshapes rows past an old reader. Raises both floors (`min_writer >= min_reader`).
-    #[allow(dead_code)] // no read-breaking step exists yet; the guard handles it
-    ReadBreaking,
-}
-
-/// A step's async body, boxed as a function pointer (async fns aren't `fn` items).
-type MigrationFut<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>;
-
-/// One migration step: the version it brings the DB *to*, its [`StepClass`], and
-/// its idempotent `run`.
-struct MigrationStep {
-    to: u32,
-    class: StepClass,
-    run: for<'a> fn(&'a Surreal<Any>) -> MigrationFut<'a>,
-}
-
-const MIGRATION_STEPS: &[MigrationStep] = &[
-    // v0 -> v1: build the base schema (all tables + indexes); every store starts
-    // unstamped at v0 and runs it. Additive — the baseline raises no floor.
-    MigrationStep {
-        to: 1,
-        class: StepClass::Additive,
-        run: |db| Box::pin(apply_base_schema(db)),
-    },
-    // v1 -> v2: canonicalize Multi partition-key dim order. Old readers parse
-    // sorted keys fine; an old writer re-introduces unsorted keys.
-    MigrationStep {
-        to: 2,
-        class: StepClass::WriteBreaking,
-        run: |db| Box::pin(migrate_multi_partition_key_order(db)),
-    },
-    // v2 -> v3: record (not rewrite) dynamic keys with reserved chars.
-    MigrationStep {
-        to: 3,
-        class: StepClass::Additive,
-        run: |db| Box::pin(scan_reserved_char_dynamic_keys(db)),
-    },
-];
-
-/// Reader/writer floors for a database at `version`, folding each step's [`StepClass`].
-fn floors_for_version(version: u32) -> (u32, u32) {
-    let mut min_reader = 1;
-    let mut min_writer = 1;
-    for step in MIGRATION_STEPS.iter().filter(|s| s.to <= version) {
-        match step.class {
-            StepClass::Additive => {}
-            StepClass::WriteBreaking => min_writer = min_writer.max(step.to),
-            StepClass::ReadBreaking => {
-                min_reader = min_reader.max(step.to);
-                min_writer = min_writer.max(step.to);
-            }
-        }
-    }
-    (min_reader, min_writer)
-}
-
-/// The three stamps, stored as one `kv` record so the guard reads a consistent
-/// triple. `version` is what's applied; floors come from [`floors_for_version`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SchemaStamps {
     version: u32,
     min_reader: u32,
     min_writer: u32,
 }
 
-impl SchemaStamps {
-    /// Stamps for a database at `version` (floors derived from the ledger).
-    fn for_version(version: u32) -> Self {
-        let (min_reader, min_writer) = floors_for_version(version);
-        Self {
-            version,
-            min_reader,
-            min_writer,
-        }
-    }
-
-    /// Stamps for a database at the schema this build understands.
-    fn current() -> Self {
-        Self::for_version(SCHEMA_VERSION)
-    }
-}
-
-/// Read the stamps, or `None` if uninitialized — an undefined `kv` table errors
-/// (not empties), and that maps to `None` (the open path then inits or refuses).
+/// Read the compat stamps — the latest applied migration's `migration_meta` row,
+/// whose floors are the current contract (each migration records the cumulative
+/// floors). `None` if uninitialized: an undefined `migration_meta` table errors
+/// (not empties), and that maps to `None` so the open path inits.
 async fn read_schema_stamps(db: &Surreal<Any>) -> anyhow::Result<Option<SchemaStamps>> {
-    let mut response = match db
-        .query("SELECT * FROM kv WHERE key = $key LIMIT 1")
-        .bind(("key", SCHEMA_STAMPS_KEY.to_string()))
-        .await
-    {
+    #[derive(SurrealValue)]
+    struct Row {
+        version: i64,
+        min_reader: i64,
+        min_writer: i64,
+    }
+    let query = format!(
+        "SELECT version, min_reader, min_writer \
+         FROM {MIGRATION_META_TABLE} ORDER BY version DESC LIMIT 1"
+    );
+    let mut response = match db.query(query).await {
         Ok(response) => response,
         Err(err) if is_undefined_table_error(&err) => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    let rows: Vec<DbKv> = match response.take(0) {
+    let rows: Vec<Row> = match response.take(0) {
         Ok(rows) => rows,
         Err(err) if is_undefined_table_error(&err) => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    match rows.into_iter().next() {
-        // Fail closed on an unparsable stamp: never silently re-init over a
-        // store whose version we cannot read.
-        Some(kv) => Ok(Some(serde_json::from_slice(&kv.value).context(
-            "schema stamp is corrupt or was written by an incompatible build; \
-             refusing to open the store",
-        )?)),
-        None => Ok(None),
-    }
+    // No rows ⇒ defined but empty ⇒ uninitialized.
+    Ok(rows.into_iter().next().map(|r| SchemaStamps {
+        version: r.version as u32,
+        min_reader: r.min_reader as u32,
+        min_writer: r.min_writer as u32,
+    }))
 }
 
 /// True if `err` is specifically "table not defined" (how a fresh store presents).
@@ -163,20 +203,6 @@ fn is_undefined_table_error(err: &surrealdb::Error) -> bool {
     msg.contains("table") && msg.contains("does not exist")
 }
 
-/// Persist the stamps as one atomic upsert on the unique `key` index — no torn triple.
-async fn write_schema_stamps(db: &Surreal<Any>, stamps: SchemaStamps) -> anyhow::Result<()> {
-    let body = serde_json::to_vec(&stamps)?;
-    db.query(
-        "INSERT INTO kv { key: $key, value: $value } \
-         ON DUPLICATE KEY UPDATE value = $value",
-    )
-    .bind(("key", SCHEMA_STAMPS_KEY.to_string()))
-    .bind(("value", Bytes::from(body)))
-    .await?
-    .check()?;
-    Ok(())
-}
-
 /// Primitives needed before any stamp or lease: the `kv` and `migration_lock`
 /// tables. Applied before the base schema; their only definition site.
 const BOOTSTRAP_SCHEMA: &str = "\
@@ -192,13 +218,6 @@ DEFINE FIELD IF NOT EXISTS expires_at ON migration_lock TYPE int;";
 /// path only, never a normal connect.
 pub(super) async fn ensure_bootstrap(db: &Surreal<Any>) -> anyhow::Result<()> {
     db.query(BOOTSTRAP_SCHEMA).await?.check()?;
-    Ok(())
-}
-
-/// v0 → v1: apply [`BASE_SCHEMA`], the first step, so a fresh DB is built by the
-/// chain. Idempotent (`DEFINE ... IF NOT EXISTS`).
-async fn apply_base_schema(db: &Surreal<Any>) -> anyhow::Result<()> {
-    db.query(BASE_SCHEMA).await?.check()?;
     Ok(())
 }
 
@@ -382,9 +401,9 @@ where
     }
 }
 
-/// Initialize or upgrade a store to [`SCHEMA_VERSION`] and stamp it — backs both
-/// first-opener init and `rivers db migrate`. Idempotent, refuses a downgrade,
-/// and serializes openers through the lease.
+/// Initialize or upgrade a store to [`SCHEMA_VERSION`] — backs first-opener init
+/// and `rivers db migrate`. refinery applies the pending migrations (idempotent);
+/// the lease serializes openers and a downgrade is refused before locking.
 async fn migrate_to_current(db: &Surreal<Any>) -> anyhow::Result<()> {
     ensure_bootstrap(db).await?;
     let mut waited = false;
@@ -399,7 +418,7 @@ async fn migrate_to_current(db: &Surreal<Any>) -> anyhow::Result<()> {
         }
         match try_acquire_migration_lease(db).await? {
             Some(holder) => {
-                let result = migrate_under_lease(db, &holder).await;
+                let result = with_lease_renewal(db, &holder, apply_migrations(db)).await;
                 // Release on every outcome so a transient failure doesn't wedge
                 // the next opener; a crash is handled by the lease TTL instead.
                 if let Err(err) = release_migration_lease(db, &holder).await {
@@ -420,447 +439,144 @@ async fn migrate_to_current(db: &Surreal<Any>) -> anyhow::Result<()> {
     }
 }
 
-/// The migration body, under the lease. Re-reads the version (a prior holder may
-/// have finished), then runs the pending steps and stamps — under lease renewal.
-async fn migrate_under_lease(db: &Surreal<Any>, holder: &str) -> anyhow::Result<()> {
-    let from = match read_schema_stamps(db).await? {
-        Some(stamps) => {
-            check_compatibility(stamps, Capability::Migrate, SCHEMA_VERSION)?;
-            stamps.version
-        }
-        // Unstamped means a fresh store (version 0): the chain builds it from
-        // empty. Pre-versioning stores are not supported.
-        None => 0,
-    };
-    // Raced: a prior holder migrated between our fast-path check and acquire.
-    if from >= SCHEMA_VERSION {
-        return Ok(());
-    }
-    with_lease_renewal(db, holder, async {
-        run_migration_steps(db, from).await?;
-        write_schema_stamps(db, SchemaStamps::current()).await
-    })
-    .await?;
-    tracing::info!(from, to = SCHEMA_VERSION, "storage schema migrated");
-    Ok(())
-}
-
-/// `kv` key listing dynamic partition keys with display-reserved characters,
-/// for operator remediation (delete and re-register under a clean name).
-const RESERVED_DYNAMIC_KEYS_KEY: &str = "reserved_dynamic_keys";
-
-/// One recorded reserved-char dynamic key, kept in `kv` for operator inspection.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct ReservedDynamicKey {
-    code_location_id: String,
-    partitions_def_name: String,
-    partition_key: String,
-}
-
-/// v2 → v3: reserved-char dynamic keys can't round-trip the display path (UI, gRPC).
-/// Renaming would change user-visible keys, so warn and record them for the operator.
-async fn scan_reserved_char_dynamic_keys(db: &Surreal<Any>) -> anyhow::Result<()> {
-    let mut result = db
-        .query(
-            "SELECT code_location_id, partitions_def_name, partition_key, create_timestamp \
-             FROM dynamic_partitions",
-        )
-        .await?;
-    let rows: Vec<DbDynamicPartition> = result.take(0)?;
-    let offenders: Vec<ReservedDynamicKey> = rows
-        .into_iter()
-        .filter(|r| PartitionKey::reserved_display_char(&r.partition_key).is_some())
-        .map(|r| ReservedDynamicKey {
-            code_location_id: r.code_location_id,
-            partitions_def_name: r.partitions_def_name,
-            partition_key: r.partition_key,
-        })
-        .collect();
-    if offenders.is_empty() {
-        return Ok(());
-    }
-    for e in offenders.iter().take(20) {
-        tracing::warn!(
-            code_location = %e.code_location_id,
-            partitions_def = %e.partitions_def_name,
-            key = %e.partition_key,
-            "dynamic partition key contains display-reserved characters; \
-             delete it and re-register under a clean name"
-        );
-    }
-    if offenders.len() > 20 {
-        tracing::warn!(
-            more = offenders.len() - 20,
-            "additional reserved-character dynamic keys recorded in kv \
-             'reserved_dynamic_keys'"
-        );
-    }
-    let body = serde_json::to_vec(&offenders)?;
-    db.query(
-        "INSERT INTO kv { key: $key, value: $value } \
-         ON DUPLICATE KEY UPDATE value = $value",
-    )
-    .bind(("key", RESERVED_DYNAMIC_KEYS_KEY.to_string()))
-    .bind(("value", Bytes::from(body)))
-    .await?
-    .check()?;
-    Ok(())
-}
-
-/// Run every [`MIGRATION_STEPS`] entry past `from`, in order — base step (`to: 1`)
-/// included, so `from = 0` builds from empty. Idempotent; the caller stamps.
-pub(super) async fn run_migration_steps(db: &Surreal<Any>, from: u32) -> anyhow::Result<()> {
-    for step in MIGRATION_STEPS.iter().filter(|s| s.to > from) {
-        (step.run)(db).await?;
-    }
-    Ok(())
-}
-
-/// Upsert the heal's canonical row. Values come from a pre-loop snapshot, so a
-/// live materialization may land newer pointers in between (guarded below).
-async fn upsert_canonical_partition_row(
-    db: &Surreal<Any>,
-    write: DbAssetPartitionWrite,
-) -> anyhow::Result<()> {
-    // Pointer fields only move forward: a stale snapshot must never roll
-    // back a row a live materialization just advanced. last_timestamp is
-    // compared first and assigned last so the guards all see the old value.
-    db.query(
-        "INSERT INTO asset_partitions $row ON DUPLICATE KEY UPDATE \
-         last_event_id = IF $input.last_timestamp > last_timestamp THEN $input.last_event_id ELSE last_event_id END, \
-         last_run_id = IF $input.last_timestamp > last_timestamp THEN $input.last_run_id ELSE last_run_id END, \
-         last_timestamp = IF $input.last_timestamp > last_timestamp THEN $input.last_timestamp ELSE last_timestamp END",
-    )
-    .bind(("row", write))
-    .await?
-    .check()?;
-    Ok(())
-}
-
-/// v1 → v2: re-sort persisted `Multi` partition-key dims. Earlier HashMap order
-/// defeated the `asset_partitions` UNIQUE index and `events` key lookups. Idempotent.
-async fn migrate_multi_partition_key_order(db: &Surreal<Any>) -> anyhow::Result<()> {
-    fn is_sorted(dims: &[(String, Vec<String>)]) -> bool {
-        dims.windows(2).all(|w| w[0].0 <= w[1].0)
-    }
-
-    #[derive(Debug, SurrealValue)]
-    struct PartRow {
-        id: RecordId,
-        code_location_id: String,
-        asset_key: String,
-        partition_key: PartitionKey,
-        last_event_id: Option<String>,
-        last_run_id: Option<String>,
-        last_timestamp: Option<i64>,
-    }
-    let mut result = db
-        .query("SELECT id, code_location_id, asset_key, partition_key, last_event_id, last_run_id, last_timestamp FROM asset_partitions WHERE partition_key.variant = 'Multi'")
-        .await?;
-    let rows: Vec<PartRow> = result.take(0)?;
-    // Group by logical key (PartitionKey's Eq/Hash are order-insensitive):
-    // unsorted duplicates collapse onto the newest row.
-    let mut groups: HashMap<(String, String, PartitionKey), Vec<PartRow>> = HashMap::new();
-    for row in rows {
-        groups
-            .entry((
-                row.code_location_id.clone(),
-                row.asset_key.clone(),
-                row.partition_key.clone(),
-            ))
-            .or_default()
-            .push(row);
-    }
-    let mut rewritten = 0usize;
-    for ((_, _, key), group) in groups {
-        let needs_rewrite = group.len() > 1
-            || group.iter().any(
-                |r| matches!(&r.partition_key, PartitionKey::Multi { dims } if !is_sorted(dims)),
-            );
-        if !needs_rewrite {
-            continue;
-        }
-        let latest = group
-            .iter()
-            .max_by_key(|r| r.last_timestamp.unwrap_or(i64::MIN))
-            .expect("group is non-empty");
-        let write = DbAssetPartitionWrite {
-            code_location_id: latest.code_location_id.clone(),
-            asset_key: latest.asset_key.clone(),
-            partition_key: key,
-            last_event_id: latest.last_event_id.clone().unwrap_or_default(),
-            last_run_id: latest.last_run_id.clone().unwrap_or_default(),
-            last_timestamp: latest.last_timestamp.unwrap_or_default(),
-        };
-        // Canonical row first, then delete the legacy ones: a crash between
-        // leaves a recoverable duplicate, never a lost partition.
-        upsert_canonical_partition_row(db, write).await?;
-        for row in &group {
-            if matches!(&row.partition_key, PartitionKey::Multi { dims } if !is_sorted(dims)) {
-                db.query("DELETE $rec")
-                    .bind(("rec", row.id.clone()))
-                    .await?
-                    .check()?;
-            }
-        }
-        rewritten += 1;
-    }
-
-    #[derive(Debug, SurrealValue)]
-    struct EventRow {
-        id: RecordId,
-        partition_key: PartitionKey,
-    }
-    let mut result = db
-        .query("SELECT id, partition_key FROM events WHERE partition_key.variant = 'Multi'")
-        .await?;
-    let events: Vec<EventRow> = result.take(0)?;
-    let to_rewrite: Vec<EventRow> = events
-        .into_iter()
-        .filter(|ev| matches!(&ev.partition_key, PartitionKey::Multi { dims } if !is_sorted(dims)))
-        .collect();
-    let event_rewrites = to_rewrite.len();
-    // Chunked multi-statement updates: one round-trip per 200 rows instead
-    // of per row. Re-binding the same key canonicalizes (into_value sorts).
-    for chunk in to_rewrite.chunks(200) {
-        let stmts: String = (0..chunk.len())
-            .map(|i| format!("UPDATE $r{i} SET partition_key = $p{i};"))
-            .collect();
-        let mut query = db.query(stmts);
-        for (i, ev) in chunk.iter().enumerate() {
-            query = query
-                .bind((format!("r{i}"), ev.id.clone()))
-                .bind((format!("p{i}"), ev.partition_key.clone()));
-        }
-        query.await?.check()?;
-    }
-    if rewritten > 0 || event_rewrites > 0 {
-        tracing::info!(
-            partitions = rewritten,
-            events = event_rewrites,
-            "migrated Multi partition keys to canonical dim order"
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::*;
     use super::*;
 
-    /// Legacy HashMap-ordered dims must collapse onto the canonical form, and
-    /// unsorted event keys get rewritten.
-    #[tokio::test]
-    async fn test_migration_canonicalizes_legacy_multi_rows() {
-        let temp_dir = test_temp_dir::test_temp_dir!();
-        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-            .await
-            .expect("failed to create rocksdb storage");
-        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
-        // Legacy row with unsorted dims, written raw to bypass the
-        // canonicalizing serializer.
-        storage
-            .db
-            .query(
-                "CREATE asset_partitions CONTENT { code_location_id: 'default', \
-                 asset_key: 'inv', partition_key: { variant: 'Multi', dims: \
-                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
-                 last_event_id: 'e1', last_run_id: 'r1', last_timestamp: 1 }",
-            )
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        // The same logical partition written by a current build (sorted).
-        let sorted = PartitionKey::Multi {
-            dims: vec![
-                ("date".to_string(), vec!["2024-01-01".to_string()]),
-                ("region".to_string(), vec!["eu".to_string()]),
-            ],
-        };
-        storage
-            .upsert_asset_partitions(vec![DbAssetPartitionWrite {
-                code_location_id: cl.to_string(),
-                asset_key: "inv".to_string(),
-                partition_key: sorted.clone(),
-                last_event_id: "e2".to_string(),
-                last_run_id: "r2".to_string(),
-                last_timestamp: 2,
-            }])
+    async fn count_rows(db: &Surreal<Any>, table: &str) -> u64 {
+        let mut r = db
+            .query(format!("SELECT count() AS n FROM {table} GROUP ALL"))
             .await
             .unwrap();
-        // Legacy event with unsorted dims.
-        storage
-            .db
-            .query(
-                "CREATE events CONTENT { code_location_id: 'default', \
-                 event_type: 'Materialization', asset_key: 'inv', run_id: 'r1', \
-                 partition_key: { variant: 'Multi', dims: \
-                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
-                 timestamp: 1, metadata: [] }",
-            )
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
+        let n: Option<u64> = r.take((0, "n")).unwrap();
+        n.unwrap_or(0)
+    }
 
-        migrate_multi_partition_key_order(&storage.db)
-            .await
-            .unwrap();
+    /// Plant a `migration_meta` row so the open guard reads the given stamps. The
+    /// fold takes the max, so values dominating any existing row set the result.
+    async fn plant_stamps(db: &Surreal<Any>, version: u32, min_reader: u32, min_writer: u32) {
+        db.query(format!(
+            "UPSERT migration_meta:{version} CONTENT \
+             {{ version: {version}, class: 'planted', min_reader: {min_reader}, min_writer: {min_writer} }}"
+        ))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    }
 
-        let parts = storage
-            .get_materialized_partitions(cl, "inv")
-            .await
-            .unwrap();
-        assert_eq!(parts, vec![sorted.clone()], "one canonical row survives");
-        let ts = storage.get_partition_timestamps(cl, "inv").await.unwrap();
-        assert_eq!(ts, vec![(sorted.clone(), 2)], "newest row's values win");
-        // The event is reachable through an equality lookup with the
-        // canonical (sorted) bind.
-        let mut result = storage
-            .db
-            .query("SELECT count() AS total FROM events WHERE partition_key = $pk GROUP ALL")
-            .bind(("pk", sorted))
-            .await
-            .unwrap();
-        let total: Option<u64> = result.take((0, "total")).unwrap();
+    /// `SCHEMA_VERSION` must equal the highest embedded migration — the guard
+    /// compares the DB's applied version against it.
+    #[test]
+    fn test_schema_version_matches_embedded() {
+        let max = embedded_migrations()
+            .iter()
+            .map(|m| m.version() as u64)
+            .max()
+            .expect("at least one migration");
         assert_eq!(
-            total,
-            Some(1),
-            "event key must be rewritten to canonical order"
+            max, SCHEMA_VERSION as u64,
+            "SCHEMA_VERSION must track the highest embedded migration"
         );
     }
 
-    /// Reserved-char dynamic keys can't be silently renamed, so v3 records them
-    /// for operator remediation.
+    /// The refinery backend applies a migration end-to-end through refinery's
+    /// real `migrate()` loop: schema lands, refinery records it, the
+    /// `migration_meta` floor row is written, and a re-run is idempotent.
     #[tokio::test]
-    async fn test_v3_records_reserved_char_dynamic_keys() {
-        let temp_dir = test_temp_dir::test_temp_dir!();
-        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-            .await
-            .expect("failed to create rocksdb storage");
-        write_schema_stamps(&storage.db, SchemaStamps::for_version(2))
+    async fn test_refinery_backend_applies_and_is_idempotent() {
+        let db = any::connect("mem://").await.unwrap();
+        db.use_ns(DEFAULT_NAMESPACE)
+            .use_db(DEFAULT_DATABASE)
             .await
             .unwrap();
-        storage
-            .db
-            .query(
-                "CREATE dynamic_partitions CONTENT { code_location_id: 'default', \
-                 partitions_def_name: 'colors', partition_key: 'us|eu', \
-                 create_timestamp: 1 }",
+
+        const V1: &str = "\
+            DEFINE TABLE probe_assets SCHEMAFULL; \
+            DEFINE FIELD name ON probe_assets TYPE string; \
+            DEFINE TABLE migration_meta SCHEMAFULL; \
+            DEFINE FIELD version ON migration_meta TYPE int; \
+            DEFINE FIELD class ON migration_meta TYPE string; \
+            DEFINE FIELD min_reader ON migration_meta TYPE int; \
+            DEFINE FIELD min_writer ON migration_meta TYPE int; \
+            UPSERT migration_meta:1 CONTENT { version: 1, class: 'additive', min_reader: 1, min_writer: 1 };";
+
+        let migrations = vec![Migration::unapplied("V1__base", V1).unwrap()];
+        let mut backend = SurrealMigrate { db: db.clone() };
+
+        backend
+            .migrate(
+                &migrations,
+                true,
+                false,
+                false,
+                Target::Latest,
+                REFINERY_HISTORY_TABLE,
             )
             .await
-            .unwrap()
-            .check()
-            .unwrap();
+            .expect("first migrate");
 
-        migrate_to_current(&storage.db).await.unwrap();
-
-        let mut res = storage
-            .db
-            .query("SELECT * FROM kv WHERE key = $key")
-            .bind(("key", RESERVED_DYNAMIC_KEYS_KEY.to_string()))
-            .await
-            .unwrap();
-        let rows: Vec<DbKv> = res.take(0).unwrap();
-        assert_eq!(rows.len(), 1, "offending keys must be recorded in kv");
-        let body = String::from_utf8(rows[0].value.to_vec()).unwrap();
-        assert!(body.contains("colors") && body.contains("us|eu"), "{body}");
-    }
-
-    /// A live materialization can land newer pointers between the heal's snapshot
-    /// and its write, so the upsert must not roll them back.
-    #[tokio::test]
-    async fn test_migration_upsert_never_rolls_back_newer_pointers() {
-        let temp_dir = test_temp_dir::test_temp_dir!();
-        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-            .await
-            .expect("failed to create rocksdb storage");
-        let key = PartitionKey::Multi {
-            dims: vec![
-                ("date".to_string(), vec!["2024-01-01".to_string()]),
-                ("region".to_string(), vec!["eu".to_string()]),
-            ],
-        };
-        let row = |event: &str, ts: i64| DbAssetPartitionWrite {
-            code_location_id: "default".to_string(),
-            asset_key: "a".to_string(),
-            partition_key: key.clone(),
-            last_event_id: event.to_string(),
-            last_run_id: format!("run-{event}"),
-            last_timestamp: ts,
-        };
-        // The live writer's row lands first with newer pointers...
-        upsert_canonical_partition_row(&storage.db, row("ev-new", 200))
-            .await
-            .unwrap();
-        // ...then the migration applies its stale snapshot values.
-        upsert_canonical_partition_row(&storage.db, row("ev-old", 100))
-            .await
-            .unwrap();
-        #[derive(Debug, SurrealValue)]
-        struct Ptr {
-            last_event_id: String,
-            last_timestamp: i64,
-        }
-        let mut res = storage
-            .db
-            .query(
-                "SELECT last_event_id, last_timestamp FROM asset_partitions WHERE asset_key = 'a'",
-            )
-            .await
-            .unwrap();
-        let rows: Vec<Ptr> = res.take(0).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].last_timestamp, 200, "newer pointers must survive");
-        assert_eq!(rows[0].last_event_id, "ev-new");
-    }
-
-    /// Concurrent stamp writers converge on one record (atomic upsert on the kv
-    /// unique index). Both tasks share one connection — the lease test covers
-    /// cross-opener serialization.
-    #[tokio::test]
-    async fn test_concurrent_schema_stamps_both_succeed() {
-        let temp_dir = test_temp_dir::test_temp_dir!();
-        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-            .await
-            .expect("failed to create rocksdb storage");
-        let db_a = storage.db.clone();
-        let db_b = storage.db.clone();
-        let a = tokio::spawn(async move {
-            for _ in 0..25 {
-                write_schema_stamps(&db_a, SchemaStamps::for_version(2)).await?;
-            }
-            anyhow::Ok(())
-        });
-        let b = tokio::spawn(async move {
-            for _ in 0..25 {
-                write_schema_stamps(&db_b, SchemaStamps::for_version(3)).await?;
-            }
-            anyhow::Ok(())
-        });
-        a.await.unwrap().expect("stamp task A failed");
-        b.await.unwrap().expect("stamp task B failed");
-        let state = read_schema_stamps(&storage.db).await.unwrap();
-        assert!(
-            matches!(state, Some(s) if s.version == 2 || s.version == 3),
-            "one of the stamps must win, got {state:?}"
+        assert_eq!(
+            count_rows(&db, REFINERY_HISTORY_TABLE).await,
+            1,
+            "one history row"
         );
-        // The upsert converged on exactly one record — no duplicate stamp rows.
-        let mut count = storage
-            .db
-            .query("SELECT count() AS n FROM kv WHERE key = $key GROUP ALL")
-            .bind(("key", SCHEMA_STAMPS_KEY.to_string()))
+        assert_eq!(
+            count_rows(&db, "probe_assets").await,
+            0,
+            "schema defined (empty)"
+        );
+        assert_eq!(count_rows(&db, "migration_meta").await, 1, "one floor row");
+
+        backend
+            .migrate(
+                &migrations,
+                true,
+                false,
+                false,
+                Target::Latest,
+                REFINERY_HISTORY_TABLE,
+            )
             .await
-            .unwrap();
-        let n: Option<u64> = count.take((0, "n")).unwrap();
-        assert_eq!(n, Some(1), "exactly one stamp record must survive");
+            .expect("second migrate");
+        assert_eq!(
+            count_rows(&db, REFINERY_HISTORY_TABLE).await,
+            1,
+            "idempotent: still one history row"
+        );
     }
 
-    /// The lease serializes openers: a second acquire returns `None`, releasing
-    /// hands it on, and renewal only works for the current holder. Exercised at
-    /// the lease primitives (RocksDB allows one handle per path per process).
+    /// Editing an already-applied migration is caught by refinery's checksum
+    /// (the frozen-baseline guard — a different V1 body diverges).
+    #[tokio::test]
+    async fn test_edited_migration_is_refused_as_divergent() {
+        let db = any::connect("mem://").await.unwrap();
+        db.use_ns(DEFAULT_NAMESPACE)
+            .use_db(DEFAULT_DATABASE)
+            .await
+            .unwrap();
+        apply_migrations(&db).await.expect("apply real V1");
+
+        // Same version + name, different body → different checksum → divergent.
+        let edited =
+            vec![Migration::unapplied("V1__base", "DEFINE TABLE tampered SCHEMAFULL;").unwrap()];
+        let mut backend = SurrealMigrate { db: db.clone() };
+        let res = backend
+            .migrate(
+                &edited,
+                true,
+                false,
+                false,
+                Target::Latest,
+                REFINERY_HISTORY_TABLE,
+            )
+            .await;
+        assert!(res.is_err(), "an edited applied migration must be refused");
+    }
+
+    /// The cross-process lease serializes openers: a second acquire returns
+    /// `None`, releasing hands it on, and renewal only works for the holder.
     #[tokio::test]
     async fn test_migration_lease_serializes_and_hands_off() {
         let temp_dir = test_temp_dir::test_temp_dir!();
@@ -869,23 +585,19 @@ mod tests {
             .expect("failed to create rocksdb storage");
         let db = &storage.db;
 
-        // First acquire wins; the lease is now held and unexpired.
         let holder = try_acquire_migration_lease(db)
             .await
             .unwrap()
             .expect("first acquire must win");
-        // A second opener cannot take the held lease.
         assert!(
             try_acquire_migration_lease(db).await.unwrap().is_none(),
             "a held, unexpired lease must block a second acquire"
         );
-        // The holder can renew; a token we don't hold cannot.
         renew_migration_lease(db, &holder).await.unwrap();
         assert!(
             renew_migration_lease(db, "not-the-holder").await.is_err(),
             "renewing a lease we do not hold must fail"
         );
-        // Releasing hands the lease to the next caller, with a fresh token.
         release_migration_lease(db, &holder).await.unwrap();
         let next = try_acquire_migration_lease(db)
             .await
@@ -894,23 +606,47 @@ mod tests {
         assert_ne!(next, holder, "each acquire mints a fresh holder token");
     }
 
-    /// A fresh database is stamped with the current schema version at
-    /// construction, so it never pays the legacy table scans again.
-    #[tokio::test]
-    async fn test_fresh_database_stamped_with_current_schema_version() {
-        let temp_dir = test_temp_dir::test_temp_dir!();
-        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-            .await
-            .expect("failed to create rocksdb storage");
-        assert!(matches!(
-            read_schema_stamps(&storage.db).await.unwrap(),
-            Some(s) if s == SchemaStamps::current()
-        ));
+    /// The open-time floor guard, exhaustively. `build` is a literal here, so the
+    /// matrix is independent of `SCHEMA_VERSION`.
+    #[test]
+    fn test_check_compatibility_matrix() {
+        let s = |version, min_reader, min_writer| SchemaStamps {
+            version,
+            min_reader,
+            min_writer,
+        };
+        use Capability::{Migrate, Read, ReadWrite};
+        assert!(check_compatibility(s(3, 1, 2), ReadWrite, 3).is_ok());
+        assert!(check_compatibility(s(3, 1, 2), Read, 3).is_ok());
+        assert!(check_compatibility(s(5, 1, 5), Read, 3).is_ok());
+        assert!(check_compatibility(s(5, 1, 5), ReadWrite, 3).is_err());
+        assert!(check_compatibility(s(5, 4, 5), Read, 3).is_err());
+        assert!(check_compatibility(s(2, 1, 2), ReadWrite, 3).is_err());
+        assert!(check_compatibility(s(2, 1, 2), Read, 3).is_err());
+        assert!(check_compatibility(s(2, 1, 2), Migrate, 3).is_ok());
+        assert!(check_compatibility(s(3, 1, 2), Migrate, 3).is_ok());
+        assert!(check_compatibility(s(5, 1, 5), Migrate, 3).is_err());
     }
 
-    /// On a brand-new store the `kv` table is undefined; `read_schema_stamps` must
-    /// map that to `None` (not a hard error) so the first opener can bootstrap.
-    /// Exercised on a raw connection, exactly how a fresh store presents.
+    /// A build newer than the database surfaces the typed `SchemaMigrationNeeded`
+    /// (the contract the PyO3 boundary downcasts) and names the fix.
+    #[test]
+    fn test_behind_build_surfaces_typed_error() {
+        let stamps = SchemaStamps {
+            version: 1,
+            min_reader: 1,
+            min_writer: 1,
+        };
+        let err = check_compatibility(stamps, Capability::ReadWrite, 2).unwrap_err();
+        assert!(
+            err.downcast_ref::<SchemaMigrationNeeded>().is_some(),
+            "{err}"
+        );
+        assert!(err.to_string().contains("rivers db migrate"), "{err}");
+    }
+
+    /// On a brand-new store `migration_meta` is undefined; `read_schema_stamps`
+    /// maps that to `None` (uninitialized) so the first opener can bootstrap.
     #[tokio::test]
     async fn test_read_stamps_on_undefined_table_is_none() {
         let db = any::connect("mem://").await.unwrap();
@@ -921,148 +657,66 @@ mod tests {
         let stamps = read_schema_stamps(&db).await.unwrap();
         assert!(
             stamps.is_none(),
-            "an undefined kv table must read as uninitialized, got {stamps:?}"
+            "an undefined migration_meta table reads as uninitialized, got {stamps:?}"
         );
     }
 
-    /// A fresh store is built entirely by replaying the chain from v0 (the base
-    /// schema is step `to: 1`). Running it on a bootstrap-only store must define
-    /// every domain table; the later heal steps are no-ops on the empty store.
+    /// Stamps come from the *latest* migration's row, not a per-column max — so a
+    /// higher floor on an older row never leaks into the current contract.
     #[tokio::test]
-    async fn test_fresh_store_built_entirely_by_migrations() {
+    async fn test_read_stamps_uses_latest_row_not_column_max() {
         let db = any::connect("mem://").await.unwrap();
         db.use_ns(DEFAULT_NAMESPACE)
             .use_db(DEFAULT_DATABASE)
             .await
             .unwrap();
-        ensure_bootstrap(&db).await.unwrap();
-        run_migration_steps(&db, 0).await.unwrap();
-        for table in [
-            "events",
-            "assets",
-            "asset_partitions",
-            "runs",
-            "dynamic_partitions",
-            "ticks",
-        ] {
-            // A defined table yields rows (here, none); an undefined table
-            // errors — so a clean empty read proves step `to: 1` created it.
-            let mut r = db
-                .query(format!("SELECT * FROM {table} LIMIT 1"))
-                .await
-                .unwrap_or_else(|e| panic!("table `{table}` is not defined: {e}"));
-            let rows: Vec<serde_json::Value> = r
-                .take(0)
-                .unwrap_or_else(|e| panic!("table `{table}` is not defined: {e}"));
-            assert!(rows.is_empty(), "fresh store table `{table}` must be empty");
-        }
-    }
-
-    /// The ledger must be one step per version from v1 to [`SCHEMA_VERSION`],
-    /// sorted and contiguous — else heals run out of order or a floor goes stale.
-    #[test]
-    fn test_migration_ledger_is_well_formed() {
-        let tos: Vec<u32> = MIGRATION_STEPS.iter().map(|s| s.to).collect();
+        db.query(
+            "DEFINE TABLE migration_meta SCHEMAFULL; \
+             DEFINE FIELD version ON migration_meta TYPE int; \
+             DEFINE FIELD class ON migration_meta TYPE string; \
+             DEFINE FIELD min_reader ON migration_meta TYPE int; \
+             DEFINE FIELD min_writer ON migration_meta TYPE int; \
+             UPSERT migration_meta:1 CONTENT { version: 1, class: 'x', min_reader: 1, min_writer: 9 }; \
+             UPSERT migration_meta:2 CONTENT { version: 2, class: 'x', min_reader: 1, min_writer: 2 };",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+        let s = read_schema_stamps(&db).await.unwrap().unwrap();
         assert_eq!(
-            tos,
-            (1..=SCHEMA_VERSION).collect::<Vec<_>>(),
-            "MIGRATION_STEPS must hold exactly one entry per version in 1..=SCHEMA_VERSION \
-             (the base schema is `to: 1`), sorted and contiguous (the last reaching \
-             SCHEMA_VERSION); got {tos:?}"
+            (s.version, s.min_reader, s.min_writer),
+            (2, 1, 2),
+            "stamps must be the latest (v2) row, not a per-column max (which would give min_writer 9)"
         );
     }
 
-    /// FNV-1a over `bytes` — a stable hash for pinning [`BASE_SCHEMA`]
-    /// (`DefaultHasher` is not stable across releases, so roll our own).
-    const fn fnv1a(bytes: &[u8]) -> u64 {
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut i = 0;
-        while i < bytes.len() {
-            hash ^= bytes[i] as u64;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            i += 1;
-        }
-        hash
-    }
-
-    /// [`BASE_SCHEMA`] is the frozen v1 baseline: a schema change is a new
-    /// [`MIGRATION_STEPS`] entry, never an edit here — else a stamped database
-    /// (which never re-applies the baseline) would diverge from a fresh one.
-    #[test]
-    fn test_base_schema_is_frozen() {
-        const FROZEN: u64 = 0xf87c_b994_c069_9f60;
-        assert_eq!(
-            fnv1a(BASE_SCHEMA.as_bytes()),
-            FROZEN,
-            "BASE_SCHEMA changed — do not edit the v1 baseline. Add a MIGRATION_STEPS \
-             entry that issues the DDL and bump SCHEMA_VERSION instead. If you are \
-             deliberately re-baselining v1 (no released database has it yet), update \
-             FROZEN to {:#018x}.",
-            fnv1a(BASE_SCHEMA.as_bytes())
+    /// An uninitialized store is built by the first opener (the read-only UI
+    /// included): `ensure_compatible` runs the migrations and the guard reads current.
+    #[tokio::test]
+    async fn test_uninitialized_store_is_initialized_by_a_reader() {
+        let db = any::connect("mem://").await.unwrap();
+        db.use_ns(DEFAULT_NAMESPACE)
+            .use_db(DEFAULT_DATABASE)
+            .await
+            .unwrap();
+        ensure_compatible(&db, Capability::Read).await.unwrap();
+        let stamps = read_schema_stamps(&db).await.unwrap();
+        assert!(
+            matches!(stamps, Some(s) if s.version == SCHEMA_VERSION),
+            "first-opener init must reach the current version, got {stamps:?}"
         );
     }
 
-    /// Floors fold the per-step classes: the v1→v2 write-breaking step lifts
-    /// `min_writer`; the v2→v3 additive step lifts neither.
-    #[test]
-    fn test_floors_for_version() {
-        assert_eq!(floors_for_version(0), (1, 1), "no steps applied yet");
-        assert_eq!(
-            floors_for_version(1),
-            (1, 1),
-            "v0->v1 base schema is additive"
-        );
-        assert_eq!(floors_for_version(2), (1, 2), "v1->v2 is write-breaking");
-        assert_eq!(floors_for_version(3), (1, 2), "v2->v3 is additive");
-    }
-
-    /// The open-time range check, exhaustively. `build` is fixed in production;
-    /// here we sweep it against planted stamps to cover every branch.
-    #[test]
-    fn test_check_compatibility_matrix() {
-        let s = |version, min_reader, min_writer| SchemaStamps {
-            version,
-            min_reader,
-            min_writer,
-        };
-        use Capability::{Migrate, Read, ReadWrite};
-        // At the database's own version: always fine.
-        assert!(check_compatibility(s(3, 1, 2), ReadWrite, 3).is_ok());
-        assert!(check_compatibility(s(3, 1, 2), Read, 3).is_ok());
-        // Database ahead: a reader below min_writer but at/above min_reader is
-        // fine; a writer below min_writer is refused (the reader/writer split).
-        assert!(check_compatibility(s(5, 1, 5), Read, 3).is_ok());
-        assert!(check_compatibility(s(5, 1, 5), ReadWrite, 3).is_err());
-        // Build too old to even read.
-        assert!(check_compatibility(s(5, 4, 5), Read, 3).is_err());
-        // Build newer than the database → needs migration, for any non-migrate
-        // capability (never silently proceed against an un-migrated schema).
-        assert!(check_compatibility(s(2, 1, 2), ReadWrite, 3).is_err());
-        assert!(check_compatibility(s(2, 1, 2), Read, 3).is_err());
-        // Migrate: ahead-or-equal proceeds; a downgrade is refused.
-        assert!(check_compatibility(s(2, 1, 2), Migrate, 3).is_ok());
-        assert!(check_compatibility(s(3, 1, 2), Migrate, 3).is_ok());
-        assert!(check_compatibility(s(5, 1, 5), Migrate, 3).is_err());
-    }
-
-    /// Reader/writer split: a DB far ahead for writers refuses an old `ReadWrite`
-    /// opener but keeps an old read-only one (the UI) running.
+    /// Reader/writer split: a DB whose writer floor is far ahead refuses an old
+    /// `ReadWrite` opener but keeps an old read-only one (the UI) running.
     #[tokio::test]
     async fn test_open_allows_old_reader_but_refuses_old_writer() {
         let temp_dir = test_temp_dir::test_temp_dir!();
         let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
             .await
             .expect("failed to create rocksdb storage");
-        write_schema_stamps(
-            &storage.db,
-            SchemaStamps {
-                version: SCHEMA_VERSION + 2,
-                min_reader: 1,
-                min_writer: SCHEMA_VERSION + 2,
-            },
-        )
-        .await
-        .unwrap();
+        plant_stamps(&storage.db, SCHEMA_VERSION + 2, 1, SCHEMA_VERSION + 2).await;
         assert!(
             ensure_compatible(&storage.db, Capability::Read)
                 .await
@@ -1077,194 +731,22 @@ mod tests {
         );
     }
 
-    /// A build newer than the database refuses to open it (rather than silently
-    /// migrating, as the old open path did) and names the fix.
-    #[tokio::test]
-    async fn test_open_refuses_when_database_is_behind_build() {
-        let temp_dir = test_temp_dir::test_temp_dir!();
-        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-            .await
-            .expect("failed to create rocksdb storage");
-        write_schema_stamps(&storage.db, SchemaStamps::for_version(SCHEMA_VERSION - 1))
-            .await
-            .unwrap();
-        let err = ensure_compatible(&storage.db, Capability::ReadWrite)
-            .await
-            .unwrap_err();
-        // The typed error is the contract the PyO3 boundary downcasts to map to
-        // `SchemaMigrationNeededError` (which the `rivers dev` prompt catches).
-        assert!(
-            err.downcast_ref::<SchemaMigrationNeeded>().is_some(),
-            "a behind-build open must surface the typed SchemaMigrationNeeded: {err}"
-        );
-        assert!(err.to_string().contains("rivers db migrate"), "{err}");
-    }
-
-    /// An uninitialized store is bootstrapped by the first opener, the read-only
-    /// UI included.
-    #[tokio::test]
-    async fn test_uninitialized_store_is_initialized_by_a_reader() {
-        let temp_dir = test_temp_dir::test_temp_dir!();
-        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-            .await
-            .expect("failed to create rocksdb storage");
-        // Wipe the stamp the init wrote — back to an uninitialized store.
-        storage
-            .db
-            .query("DELETE FROM kv")
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        // A read-only opener initializes it in place — no waiting, no error.
-        ensure_compatible(&storage.db, Capability::Read)
-            .await
-            .unwrap();
-        assert!(matches!(
-            read_schema_stamps(&storage.db).await.unwrap(),
-            Some(s) if s == SchemaStamps::current()
-        ));
-    }
-
-    /// Explicit migrate is idempotent and refuses a downgrade.
+    /// Explicit migrate is idempotent and refuses a downgrade (DB ahead of build).
     #[tokio::test]
     async fn test_migrate_is_idempotent_and_refuses_downgrade() {
         let temp_dir = test_temp_dir::test_temp_dir!();
         let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
             .await
             .expect("failed to create rocksdb storage");
-        // A second migrate on an already-current database is a no-op.
         migrate_to_current(&storage.db).await.unwrap();
         assert!(matches!(
             read_schema_stamps(&storage.db).await.unwrap(),
-            Some(s) if s == SchemaStamps::current()
+            Some(s) if s.version == SCHEMA_VERSION
         ));
-        // A database newer than this build must never be migrated (downgrade).
-        write_schema_stamps(&storage.db, SchemaStamps::for_version(SCHEMA_VERSION + 1))
-            .await
-            .unwrap();
+        plant_stamps(&storage.db, SCHEMA_VERSION + 1, 1, 1).await;
         assert!(
             migrate_to_current(&storage.db).await.is_err(),
             "downgrade must be refused"
         );
-    }
-
-    /// A database already at the current version must not re-run migrations:
-    /// a planted unsorted row stays untouched.
-    #[tokio::test]
-    async fn test_migrations_skip_when_version_is_current() {
-        let temp_dir = test_temp_dir::test_temp_dir!();
-        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-            .await
-            .expect("failed to create rocksdb storage");
-        storage
-            .db
-            .query(
-                "CREATE asset_partitions CONTENT { code_location_id: 'default', \
-                 asset_key: 'inv', partition_key: { variant: 'Multi', dims: \
-                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
-                 last_event_id: 'e1', last_run_id: 'r1', last_timestamp: 1 }",
-            )
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-
-        // An explicit migrate on an already-current database is a no-op.
-        migrate_to_current(&storage.db).await.unwrap();
-
-        #[derive(Debug, SurrealValue)]
-        struct PkRow {
-            partition_key: PartitionKey,
-        }
-        let mut result = storage
-            .db
-            .query("SELECT partition_key FROM asset_partitions")
-            .await
-            .unwrap();
-        let rows: Vec<PkRow> = result.take(0).unwrap();
-        assert_eq!(rows.len(), 1);
-        let PartitionKey::Multi { dims } = &rows[0].partition_key else {
-            unreachable!()
-        };
-        assert_eq!(
-            dims[0].0, "region",
-            "a database at the current version must not be rescanned"
-        );
-    }
-
-    /// A crash mid-migration must never lose a partition: the canonical row is
-    /// written before any legacy row is deleted, so a sorted row is updated in
-    /// place (its id survives) and the duplicate is removed afterwards.
-    #[tokio::test]
-    async fn test_migration_never_deletes_the_canonical_row() {
-        let temp_dir = test_temp_dir::test_temp_dir!();
-        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-            .await
-            .expect("failed to create rocksdb storage");
-        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
-        let sorted = PartitionKey::Multi {
-            dims: vec![
-                ("date".to_string(), vec!["2024-01-01".to_string()]),
-                ("region".to_string(), vec!["eu".to_string()]),
-            ],
-        };
-        storage
-            .upsert_asset_partitions(vec![DbAssetPartitionWrite {
-                code_location_id: cl.to_string(),
-                asset_key: "inv".to_string(),
-                partition_key: sorted.clone(),
-                last_event_id: "e1".to_string(),
-                last_run_id: "r1".to_string(),
-                last_timestamp: 1,
-            }])
-            .await
-            .unwrap();
-        #[derive(Debug, SurrealValue)]
-        struct IdRow {
-            id: RecordId,
-            last_event_id: String,
-            last_timestamp: i64,
-        }
-        let mut result = storage
-            .db
-            .query("SELECT id, last_event_id, last_timestamp FROM asset_partitions")
-            .await
-            .unwrap();
-        let before: Vec<IdRow> = result.take(0).unwrap();
-        assert_eq!(before.len(), 1);
-        let canonical_id = before[0].id.clone();
-        // Legacy duplicate with unsorted dims and newer values (raw CREATE
-        // bypasses the canonicalizing serializer).
-        storage
-            .db
-            .query(
-                "CREATE asset_partitions CONTENT { code_location_id: 'default', \
-                 asset_key: 'inv', partition_key: { variant: 'Multi', dims: \
-                 [['region', ['eu']], ['date', ['2024-01-01']]] }, \
-                 last_event_id: 'e9', last_run_id: 'r9', last_timestamp: 5 }",
-            )
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-
-        migrate_multi_partition_key_order(&storage.db)
-            .await
-            .unwrap();
-
-        let mut result = storage
-            .db
-            .query("SELECT id, last_event_id, last_timestamp FROM asset_partitions")
-            .await
-            .unwrap();
-        let after: Vec<IdRow> = result.take(0).unwrap();
-        assert_eq!(after.len(), 1, "one canonical row survives");
-        assert_eq!(
-            after[0].id, canonical_id,
-            "the canonical row must be updated in place, never deleted"
-        );
-        assert_eq!(after[0].last_event_id, "e9", "newest row's values win");
-        assert_eq!(after[0].last_timestamp, 5);
     }
 }
