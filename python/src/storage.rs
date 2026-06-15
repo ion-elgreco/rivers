@@ -340,7 +340,56 @@ impl From<StoredTick> for PyStoredTick {
 }
 
 fn to_py_err(e: anyhow::Error) -> PyErr {
+    // The "database is behind this build" case gets a distinct exception (a
+    // StorageError subclass) so the `rivers dev` prompt can offer the migration
+    // by type rather than by message text. anyhow searches the chain.
+    if let Some(m) =
+        e.downcast_ref::<rivers_core::storage::surrealdb_backend::SchemaMigrationNeeded>()
+    {
+        return crate::errors::SchemaMigrationNeededError::new_err(m.to_string());
+    }
     StorageError::new_err(format!("{e}"))
+}
+
+/// Resolve a remote connect config from kwargs → `RIVERS_SURREAL_*` env → default,
+/// returning the config and whether it carries credentials. Pure (no Python, no
+/// I/O), so callers run it inside `py.detach`. Shared by `connect` / `migrate_remote`.
+fn resolve_remote_config(
+    endpoint: String,
+    username: Option<String>,
+    password: Option<String>,
+    namespace: Option<String>,
+    database: Option<String>,
+) -> (
+    rivers_core::storage::surrealdb_backend::SurrealConnectConfig,
+    bool,
+) {
+    use rivers_core::storage::surrealdb_backend::{
+        DEFAULT_DATABASE, DEFAULT_NAMESPACE, SurrealConnectConfig,
+    };
+    // Empty strings count as unset so `username=""` doesn't shadow a populated env var.
+    fn resolve(kwarg: Option<String>, env_name: &str) -> Option<String> {
+        kwarg
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var(env_name).ok().filter(|s| !s.is_empty()))
+    }
+    let namespace = resolve(namespace, rivers_k8s::env::ENV_SURREAL_NAMESPACE)
+        .unwrap_or_else(|| DEFAULT_NAMESPACE.to_string());
+    let database = resolve(database, rivers_k8s::env::ENV_SURREAL_DATABASE)
+        .unwrap_or_else(|| DEFAULT_DATABASE.to_string());
+    let username = resolve(username, rivers_k8s::env::ENV_SURREAL_USERNAME);
+    let password = resolve(password, rivers_k8s::env::ENV_SURREAL_PASSWORD);
+    let mut config = SurrealConnectConfig {
+        endpoint,
+        namespace,
+        database,
+        credentials: None,
+    };
+    if let (Some(u), Some(p)) = (username, password) {
+        config = config.with_credentials(u, p);
+    }
+    let authenticated = config.credentials.is_some();
+    (config, authenticated)
 }
 
 fn parse_run_status(s: &str) -> PyResult<RunStatus> {
@@ -728,40 +777,13 @@ impl PyStorage {
         namespace: Option<String>,
         database: Option<String>,
     ) -> PyResult<Self> {
-        use rivers_core::storage::surrealdb_backend::{
-            DEFAULT_DATABASE, DEFAULT_NAMESPACE, SurrealConnectConfig,
-        };
-
-        // Empty strings count as unset so a missing `Storage.connect(... username="")`
-        // doesn't shadow a populated env var.
-        fn resolve(kwarg: Option<String>, env_name: &str) -> Option<String> {
-            kwarg
-                .filter(|s| !s.is_empty())
-                .or_else(|| std::env::var(env_name).ok().filter(|s| !s.is_empty()))
-        }
-
-        // Whole body runs detached: env-var resolution + config building
-        // touch nothing Python, and the GIL must stay released across
-        // `block_on` to avoid the daemon-task deadlock (see `Self::embedded`).
+        // Whole body runs detached: env-var resolution + config building touch
+        // nothing Python, and the GIL must stay released across `block_on` to
+        // avoid the daemon-task deadlock (see `Self::embedded`).
         let endpoint_owned = endpoint.to_string();
         let (storage, authenticated) = py.detach(|| -> PyResult<_> {
-            let namespace = resolve(namespace, rivers_k8s::env::ENV_SURREAL_NAMESPACE)
-                .unwrap_or_else(|| DEFAULT_NAMESPACE.to_string());
-            let database = resolve(database, rivers_k8s::env::ENV_SURREAL_DATABASE)
-                .unwrap_or_else(|| DEFAULT_DATABASE.to_string());
-            let username = resolve(username, rivers_k8s::env::ENV_SURREAL_USERNAME);
-            let password = resolve(password, rivers_k8s::env::ENV_SURREAL_PASSWORD);
-
-            let mut config = SurrealConnectConfig {
-                endpoint: endpoint_owned,
-                namespace,
-                database,
-                credentials: None,
-            };
-            if let (Some(u), Some(p)) = (username, password) {
-                config = config.with_credentials(u, p);
-            }
-            let authenticated = config.credentials.is_some();
+            let (config, authenticated) =
+                resolve_remote_config(endpoint_owned, username, password, namespace, database);
             let storage = io_rt()
                 .block_on(SurrealStorage::connect(config))
                 .map_err(to_py_err)?;
@@ -775,6 +797,55 @@ impl PyStorage {
             "storage ready"
         );
         Ok(Self::from_storage(storage, PyStorageType::Remote))
+    }
+
+    /// Apply pending storage schema migrations to an embedded database, bringing
+    /// it to this build's schema version. Backs `rivers db migrate`;
+    /// idempotent. The migrating connection is opened and dropped immediately.
+    #[staticmethod]
+    fn migrate_embedded(py: Python<'_>, path: &str) -> PyResult<()> {
+        use rivers_core::storage::surrealdb_backend::Capability;
+        std::fs::create_dir_all(path)
+            .map_err(|e| StorageError::new_err(format!("Failed to create storage dir: {e}")))?;
+        py.detach(|| {
+            io_rt()
+                .block_on(SurrealStorage::new_embedded_with_capability(
+                    path,
+                    Capability::Migrate,
+                ))
+                .map_err(to_py_err)
+        })?;
+        tracing::info!(target: "rivers::storage", backend = "embedded", path = %path, "storage schema migrated");
+        Ok(())
+    }
+
+    /// Remote counterpart of [`migrate_embedded`](Self::migrate_embedded); same
+    /// field resolution as [`connect`](Self::connect).
+    #[staticmethod]
+    #[pyo3(signature = (endpoint, *, username=None, password=None, namespace=None, database=None))]
+    fn migrate_remote(
+        py: Python<'_>,
+        endpoint: &str,
+        username: Option<String>,
+        password: Option<String>,
+        namespace: Option<String>,
+        database: Option<String>,
+    ) -> PyResult<()> {
+        use rivers_core::storage::surrealdb_backend::Capability;
+        let endpoint_owned = endpoint.to_string();
+        let authenticated = py.detach(|| -> PyResult<_> {
+            let (config, authenticated) =
+                resolve_remote_config(endpoint_owned, username, password, namespace, database);
+            io_rt()
+                .block_on(SurrealStorage::connect_with_capability(
+                    config,
+                    Capability::Migrate,
+                ))
+                .map_err(to_py_err)?;
+            Ok(authenticated)
+        })?;
+        tracing::info!(target: "rivers::storage", backend = "remote", endpoint = %endpoint, authenticated, "storage schema migrated");
+        Ok(())
     }
 
     #[pyo3(signature = (asset_key, limit=100))]

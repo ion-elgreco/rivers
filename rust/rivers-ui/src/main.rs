@@ -8,7 +8,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::Parser;
 use rivers_core::assets::graph::GraphTopology;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::surrealdb_backend::{Capability, SurrealStorage};
 use rivers_ui::code_location_registry::Registry;
 use rivers_ui::synthetic::{generate_synthetic_graph, parse_node_count};
 use std::sync::Arc;
@@ -76,7 +76,10 @@ async fn main() {
         let mut config = rivers_k8s::env::detect_surreal_connect_config();
         config.endpoint = endpoint.clone();
         let authenticated = config.credentials.is_some();
-        let storage = SurrealStorage::connect(config)
+        // The production UI is a read-only storage consumer; writes go through
+        // gRPC to code locations. Open `Read` so a write-breaking migration for
+        // newer writers does not lock the UI out.
+        let storage = SurrealStorage::connect_with_capability(config, Capability::Read)
             .await
             .expect("Failed to connect to remote SurrealDB");
         tracing::info!(
@@ -88,9 +91,10 @@ async fn main() {
         );
         storage
     } else {
-        let storage = SurrealStorage::new_embedded(&args.storage_path)
-            .await
-            .expect("Failed to open embedded storage");
+        let storage =
+            SurrealStorage::new_embedded_with_capability(&args.storage_path, Capability::Read)
+                .await
+                .expect("Failed to open embedded storage");
         tracing::info!(
             target: "rivers::storage",
             backend = "embedded",

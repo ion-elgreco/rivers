@@ -5649,6 +5649,7 @@ dependencies = [
  "test-temp-dir",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
