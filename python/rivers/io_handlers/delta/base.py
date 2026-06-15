@@ -138,12 +138,9 @@ class ArrowDeltaTypeHandler(DeltaTypeHandler, ABC, Generic[T]):
         num_rows = sum(actions.column("num_records").to_pylist())
         size_bytes = sum(actions.column("size_bytes").to_pylist())
 
-        # Build schema metadata from Delta table schema
-        import pyarrow as pa
-
         from rivers import MetadataValue
 
-        arrow_schema = pa.schema(dt.schema().to_arrow())
+        arrow_schema = dt.schema().to_arrow()
 
         output_meta: dict[str, Any] = {
             "delta/table_uri": request.table_uri,
