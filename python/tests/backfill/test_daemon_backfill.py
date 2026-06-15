@@ -454,9 +454,16 @@ class TestDaemonConditionBackfill:
             dst_runs = [r for r in storage.get_runs(limit=100) if "dst" in r.node_names]
             successful = [r for r in dst_runs if r.status == "Success"]
 
-            # Should be exactly 3, not 5
+            # Exactly partitions a, b, c materialize downstream, once each:
+            # !AnyDepsMissing excludes d/e (no upstream `src`), and a finished
+            # backfill partition must not re-fire its still-running siblings.
+            assert len(dst_runs) == 3, (
+                f"expected exactly 3 downstream runs (one per upstream partition), "
+                f"got {len(dst_runs)}: "
+                f"{[(r.partition_key.key[0], r.status) for r in dst_runs]}"
+            )
             assert len(successful) == 3, (
-                f"Expected 3 successful downstream runs (matching upstream), "
+                f"expected 3 successful downstream runs (matching upstream), "
                 f"got {len(successful)} successful out of {len(dst_runs)} total"
             )
         finally:
