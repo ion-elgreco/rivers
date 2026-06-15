@@ -137,7 +137,7 @@ async fn read_schema_stamps(db: &Surreal<Any>) -> anyhow::Result<Option<SchemaSt
         Err(err) => return Err(err.into()),
     };
     match rows.into_iter().next() {
-        // Fail closed on an unparseable stamp: never silently re-init over a
+        // Fail closed on an unparsable stamp: never silently re-init over a
         // store whose version we cannot read.
         Some(kv) => Ok(Some(serde_json::from_slice(&kv.value).context(
             "schema stamp is corrupt or was written by an incompatible build; \
