@@ -15,6 +15,8 @@ use super::now_nanos;
 
 /// refinery's history table — one checksummed row per applied migration.
 const REFINERY_HISTORY_TABLE: &str = "refinery_schema_history";
+/// refinery's history columns (fixed by its `Migration` model).
+const HISTORY_COLS: &str = "version, name, applied_on, checksum";
 
 /// A refinery backend over a SurrealDB connection: `migrate()` drives
 /// `execute`/`query`; we translate the history SQL to SurrealQL (dialect overrides).
@@ -90,13 +92,11 @@ impl AsyncMigrate for SurrealMigrate {
 
     // SurrealQL has no `MAX()` subquery; order + limit instead.
     fn get_last_applied_migration_query(table: &str) -> String {
-        format!(
-            "SELECT version, name, applied_on, checksum FROM {table} ORDER BY version DESC LIMIT 1"
-        )
+        format!("SELECT {HISTORY_COLS} FROM {table} ORDER BY version DESC LIMIT 1")
     }
 
     fn get_applied_migrations_query(table: &str) -> String {
-        format!("SELECT version, name, applied_on, checksum FROM {table} ORDER BY version ASC")
+        format!("SELECT {HISTORY_COLS} FROM {table} ORDER BY version ASC")
     }
 }
 
