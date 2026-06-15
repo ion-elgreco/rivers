@@ -331,15 +331,15 @@ wheels = [
 
 [[package]]
 name = "delta-spark"
-version = "4.2.0"
+version = "4.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "importlib-metadata" },
     { name = "pyspark" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/37/e4/dcf0afa219bc454d5edab65a4defd4dc90e196fdb8c6fb5156ec6d7fc468/delta_spark-4.2.0.tar.gz", hash = "sha256:198079cf74ee40788895a73111900095ebaed2c631205315868b4406c521e0d5", size = 45896, upload-time = "2026-04-10T23:31:30.102Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/2f/09/d394015eb956c4475f6a949fb5fccedf7af19f97e981acbc81629e868a5e/delta_spark-4.1.0.tar.gz", hash = "sha256:98f73c2744f972919e0472974467f85d157810b617341ebf586374d91b8eadc7", size = 36808, upload-time = "2026-02-20T18:37:59.8Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0a/86/766c7cb36a5209c09222be74bad9c047da22690c8e562fab4be29b6a5776/delta_spark-4.2.0-py3-none-any.whl", hash = "sha256:46327eaeb50915aec3b66bb4ab8fb8db7f90774f2a3bb65bb859333cedc6ef8f", size = 53929, upload-time = "2026-04-10T23:31:28.884Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/03/2e440efd4a49c8ecfbcb665dea7db94583cf33a365d8480e47fb0aa0dc39/delta_spark-4.1.0-py3-none-any.whl", hash = "sha256:d80f6ebca542df48f257f2535f9c8c21bbfda65771b6ec21be843c0087e1dece", size = 43877, upload-time = "2026-02-20T18:37:58.15Z" },
 ]
 
 [[package]]
@@ -1373,12 +1373,12 @@ wheels = [
 
 [[package]]
 name = "pyspark"
-version = "4.1.1"
+version = "4.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "py4j" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/19/bf/58ee13add151469c25825b7125bbf62c3bdcec05eec4d458fcb5c5516066/pyspark-4.1.1.tar.gz", hash = "sha256:77f78984aa84fbe865c717dd37b49913b4e5c97d76ef6824f932f1aefa6621ec", size = 455359625, upload-time = "2026-01-09T09:38:38.28Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5e/71/4dd20c69332a2a4bf7ece8a655c9da98e4bd9b6bcea235349c1a00399d57/pyspark-4.1.2.tar.gz", hash = "sha256:fa5d6159f700d0990a07f4f62df1b7449401dccee9cd7d5d6df8957530841602", size = 455428043, upload-time = "2026-05-21T14:49:21.785Z" }
 
 [[package]]
 name = "pytest"
@@ -1641,7 +1641,7 @@ requires-dist = [
     { name = "pyarrow", marker = "extra == 'pyarrow'", specifier = ">=18.0.0" },
     { name = "pydantic", specifier = ">=2.11.9" },
     { name = "pydantic-settings", specifier = ">=2.0" },
-    { name = "pyspark", marker = "extra == 'pyspark'", specifier = ">=3.3.0" },
+    { name = "pyspark", marker = "extra == 'pyspark'", specifier = ">=4.1.2" },
     { name = "rivers", extras = ["datafusion"], marker = "extra == 'delta-datafusion'" },
     { name = "rivers", extras = ["delta"], marker = "extra == 'delta-datafusion'" },
     { name = "rivers", extras = ["delta"], marker = "extra == 'delta-pandas'" },
