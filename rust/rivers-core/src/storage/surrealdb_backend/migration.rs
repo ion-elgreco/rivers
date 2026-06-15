@@ -203,21 +203,17 @@ fn is_undefined_table_error(err: &surrealdb::Error) -> bool {
     msg.contains("table") && msg.contains("does not exist")
 }
 
-/// Primitives needed before any stamp or lease: the `kv` and `migration_lock`
-/// tables. Applied before the base schema; their only definition site.
-const BOOTSTRAP_SCHEMA: &str = "\
-DEFINE TABLE IF NOT EXISTS kv SCHEMAFULL; \
-DEFINE FIELD IF NOT EXISTS key ON kv TYPE string; \
-DEFINE FIELD IF NOT EXISTS value ON kv TYPE bytes; \
-DEFINE INDEX IF NOT EXISTS idx_kv_key ON kv FIELDS key UNIQUE; \
+/// The `migration_lock` table the lease needs *before* any migration runs — the
+/// lease serializes who applies migrations, so its own table can't be one
+const MIGRATION_LOCK_SCHEMA: &str = "\
 DEFINE TABLE IF NOT EXISTS migration_lock SCHEMAFULL; \
 DEFINE FIELD IF NOT EXISTS holder ON migration_lock TYPE string; \
 DEFINE FIELD IF NOT EXISTS expires_at ON migration_lock TYPE int;";
 
-/// Define the bootstrap primitives ([`BOOTSTRAP_SCHEMA`]). Idempotent; init/migrate
-/// path only, never a normal connect.
-pub(super) async fn ensure_bootstrap(db: &Surreal<Any>) -> anyhow::Result<()> {
-    db.query(BOOTSTRAP_SCHEMA).await?.check()?;
+/// Define the `migration_lock` table ([`MIGRATION_LOCK_SCHEMA`]) before the lease
+/// is taken. Idempotent; init/migrate path only, never a normal connect.
+async fn ensure_lock_table(db: &Surreal<Any>) -> anyhow::Result<()> {
+    db.query(MIGRATION_LOCK_SCHEMA).await?.check()?;
     Ok(())
 }
 
@@ -405,7 +401,7 @@ where
 /// and `rivers db migrate`. refinery applies the pending migrations (idempotent);
 /// the lease serializes openers and a downgrade is refused before locking.
 async fn migrate_to_current(db: &Surreal<Any>) -> anyhow::Result<()> {
-    ensure_bootstrap(db).await?;
+    ensure_lock_table(db).await?;
     let mut waited = false;
     loop {
         // Fast path: already current → nothing to do, no lease needed. A

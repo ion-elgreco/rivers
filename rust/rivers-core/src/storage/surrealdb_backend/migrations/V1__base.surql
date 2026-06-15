@@ -87,9 +87,11 @@ DEFINE INDEX IF NOT EXISTS idx_runs_loc_status ON runs FIELDS code_location_id, 
 -- or idx_runs_start_time + filter — both scale poorly as the per-CL run table grows.
 DEFINE INDEX IF NOT EXISTS idx_runs_loc_time ON runs FIELDS code_location_id, start_time;
 
--- The `kv` and `migration_lock` tables live in BOOTSTRAP_SCHEMA (applied first
--- so the stamp and lease have a home); defined there, not here, so each table
--- has exactly one definition site.
+-- General-purpose key/value store (graph topology, etc.)
+DEFINE TABLE IF NOT EXISTS kv SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS key ON kv TYPE string;
+DEFINE FIELD IF NOT EXISTS value ON kv TYPE bytes;
+DEFINE INDEX IF NOT EXISTS idx_kv_key ON kv FIELDS key UNIQUE;
 
 DEFINE TABLE IF NOT EXISTS dynamic_partitions SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS code_location_id ON dynamic_partitions TYPE string DEFAULT 'default';
