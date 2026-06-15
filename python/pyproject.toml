@@ -48,6 +48,8 @@ markers = [
 
 [tool.pyright]
 exclude = ["**/tests"]
+reportUnusedFunction = "warning"
+reportUnusedVariable = "warning"
 
 [build-system]
 requires = ["maturin>=1,<2"]
