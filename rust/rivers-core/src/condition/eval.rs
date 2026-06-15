@@ -272,11 +272,8 @@ fn eval_inner<O: EvalOutput>(
                                 .records
                                 .get(ctx.root_key)
                                 .and_then(|r| r.last_timestamp);
-                            let root_failed = ctx
-                                .cache
-                                .failed_asset_timestamps
-                                .get(ctx.root_key)
-                                .copied();
+                            let root_failed =
+                                ctx.cache.failed_asset_timestamps.get(ctx.root_key).copied();
                             match (root_mat, root_failed) {
                                 (None, None) => true,
                                 (Some(m), None) => dep_ts > m,

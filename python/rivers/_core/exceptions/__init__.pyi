@@ -42,5 +42,12 @@ class SensorDefinitionError(Exception):
 class StorageError(Exception):
     """Raised on storage backend failures (connection, transaction, serialization)."""
 
+class SchemaMigrationNeededError(StorageError):
+    """Raised when opening a database whose schema is behind this rivers build.
+
+    A subclass of :class:`StorageError`. ``rivers db migrate`` brings the
+    database forward; ``rivers dev`` catches this to offer the migration.
+    """
+
 class TaskDefinitionError(Exception):
     """Raised when a ``Task`` / ``BashTask`` definition is invalid."""

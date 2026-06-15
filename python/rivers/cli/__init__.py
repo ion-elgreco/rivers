@@ -14,12 +14,15 @@ import typer
 
 from rivers._core.storage import Storage
 from rivers.cli.config import RiversConfig
+from rivers.exceptions import SchemaMigrationNeededError
 
 app = typer.Typer(name="rivers", help="rivers orchestration CLI")
 pools_app = typer.Typer(name="pools", help="Inspect and manage concurrency pools")
 queue_app = typer.Typer(name="queue", help="Inspect and manage the run queue")
+db_app = typer.Typer(name="db", help="Storage schema management")
 app.add_typer(pools_app)
 app.add_typer(queue_app)
+app.add_typer(db_app)
 
 
 def _parse_partition_key(raw: str | None):
@@ -51,6 +54,22 @@ def _create_storage(memory: bool, storage_path: str) -> Storage:
     storage = Storage.embedded(storage_path)
     atexit.register(_cleanup_storage, storage_path)
     return storage
+
+
+def _open_or_prompt_migrate(open_fn, migrate_fn) -> Storage:
+    """Open storage; if the database is behind this build's schema, offer to
+    migrate it (``rivers dev`` is interactive). Any other error propagates, as
+    does a declined prompt. ``serve`` deliberately does not prompt — a cloud
+    deployment migrates via an explicit ``rivers db migrate`` init step.
+    """
+    try:
+        return open_fn()
+    except SchemaMigrationNeededError as exc:
+        typer.echo(f"Storage schema is behind this rivers build:\n  {exc}", err=True)
+        if not typer.confirm("Run the migration now?", default=False):
+            raise
+        migrate_fn()
+        return open_fn()
 
 
 @app.command()
@@ -131,10 +150,18 @@ def dev(
         typer.echo(f"Error: '{repo_var}' is not a CodeRepository", err=True)
         raise typer.Exit(1)
 
-    if surreal_endpoint:
-        storage = Storage.connect(surreal_endpoint)
+    storage_endpoint = cfg.storage.endpoint
+
+    if storage_endpoint is not None:
+        storage = _open_or_prompt_migrate(
+            lambda: Storage.connect(storage_endpoint),
+            lambda: Storage.migrate_remote(storage_endpoint),
+        )
     else:
-        storage = Storage.embedded(cfg.storage.path)
+        storage = _open_or_prompt_migrate(
+            lambda: Storage.embedded(cfg.storage.path),
+            lambda: Storage.migrate_embedded(cfg.storage.path),
+        )
         atexit.register(_cleanup_storage, cfg.storage.path)
 
     repo_obj.resolve(storage=storage)
@@ -720,6 +747,35 @@ def queue_why(
         typer.echo("Block reason: waiting for capacity (no specific block recorded)")
     if run.tags:
         typer.echo(f"Tags:         {', '.join(f'{k}={v}' for k, v in run.tags)}")
+
+
+# ── Database commands ──
+
+
+@db_app.command("migrate")
+def db_migrate(
+    storage_path: str = typer.Option(
+        ".rivers/storage/", help="Path for embedded storage"
+    ),
+    surreal_endpoint: str | None = typer.Option(
+        None,
+        envvar="RIVERS_SURREAL_ENDPOINT",
+        help="Remote SurrealDB endpoint (overrides --storage-path)",
+    ),
+) -> None:
+    """Apply pending storage schema migrations.
+
+    Brings the database up to this rivers build's schema version, running any
+    data-heal steps under a cross-process lease. Idempotent — a no-op when the
+    database is already current. Run this after upgrading rivers when a code
+    location or the UI reports that the database needs migration.
+    """
+    target = surreal_endpoint or storage_path
+    if surreal_endpoint:
+        Storage.migrate_remote(surreal_endpoint)
+    else:
+        Storage.migrate_embedded(storage_path)
+    typer.echo(f"Storage schema is up to date ({target}).")
 
 
 def main() -> None:

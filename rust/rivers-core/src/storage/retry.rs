@@ -28,6 +28,10 @@ impl Default for StorageRetryConfig {
 /// onto `Internal` with no dedicated variant. `NotFound(Session)` covers a
 /// startup race in the local engine's `router_loop` where the first route
 /// request can land before `SessionId::Initial` is registered.
+///
+/// The RocksDB `LOCK` file is also transient: dropping an embedded handle frees
+/// the lock asynchronously (~tens of ms), so an immediate reopen of the same path
+/// briefly sees a stale lock that a backoff retry clears.
 pub fn is_transient_surrealdb_error(e: &surrealdb::Error) -> bool {
     use surrealdb::types::{ErrorDetails, NotFoundError, QueryError};
     match e.details() {
@@ -35,7 +39,11 @@ pub fn is_transient_surrealdb_error(e: &surrealdb::Error) -> bool {
         ErrorDetails::NotFound(Some(NotFoundError::Session { .. })) => true,
         ErrorDetails::Internal => {
             let s = e.message();
-            s.contains("onflict") || s.contains("Busy") || s.contains("Try again")
+            s.contains("onflict")
+                || s.contains("Busy")
+                || s.contains("Try again")
+                || s.contains("lock hold by current process")
+                || s.contains("No locks available")
         }
         _ => false,
     }

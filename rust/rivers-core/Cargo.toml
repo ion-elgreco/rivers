@@ -19,7 +19,8 @@ petgraph.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 surrealdb = { version = "3.1.0-alpha", default-features = false, features = ["kv-rocksdb", "kv-mem", "protocol-ws", "rustls"] }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+uuid.workspace = true
 siphasher = "1"
 tracing.workspace = true
 
