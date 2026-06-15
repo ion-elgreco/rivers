@@ -49,6 +49,10 @@ develop-release: venv wasm
 test:
     uv run --no-sync pytest python/
 
+# Run Python tests (excluding spark tests)
+test-dev:
+    uv run --no-sync pytest -m "not spark_test" python/
+
 # Run all Rust workspace tests.
 # - `wasm-dev` is a prerequisite so rivers-ui's `include_bytes!("../pkg/...")`
 #   can resolve when the crate is built with `ssr`.

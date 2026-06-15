@@ -119,3 +119,11 @@ def grpc_stubs(tmp_path_factory):
     del sys.modules["rivers_pb2"]
 
     return pb2, pb2_grpc
+
+
+def pytest_runtest_setup(item):
+    if item.get_closest_marker("spark_test"):
+        if sys.platform == "win32":
+            pytest.skip(
+                "Skipping PySpark test on Windows since it requires winutils for Hadoop."
+            )

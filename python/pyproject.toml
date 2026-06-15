@@ -42,6 +42,9 @@ norecursedirs = ["tests/integration/kubernetes"]
 # method can't interrupt code blocked inside a C extension.
 timeout = 60
 timeout_method = "thread"
+markers = [
+    "spark_test: marks tests that Spark instance (deselect with '-m \"not spark_test\"')"
+]
 
 [tool.pyright]
 exclude = ["**/tests"]

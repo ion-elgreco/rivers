@@ -65,7 +65,7 @@ _MODULE_TO_EXTRA: dict[str, str] = {
 
 
 def _build_type_handler_map(
-    user_config: dict[str, Any] | None,
+    handler_config: dict[str, Any] | None,
 ) -> dict[type, DeltaTypeHandler]:
     """Best-effort discovery of installed type handlers (pyarrow, polars, pandas, pyspark).
 
@@ -88,8 +88,8 @@ def _build_type_handler_map(
         try:
             mod = __import__(mod_path, fromlist=[cls_name])
             kwargs = {}
-            if user_config:
-                kwargs = {param: user_config.get(param) for param in cls_params}
+            if handler_config:
+                kwargs = {param: handler_config.get(param) for param in cls_params}
             h = getattr(mod, cls_name)(**kwargs)
             for t in h.supported_types:
                 handlers[t] = h
@@ -120,14 +120,14 @@ class DeltaIOHandler(BaseIOHandler):
     commit_properties: CommitProperties | None = None
     table_config: dict[str, str] | None = None
     merge_config: MergeConfig | None = None
-    user_config: dict[str, Any] | None = None
+    handler_config: dict[str, Any] | None = None
 
     @staticmethod
     def type_handlers(
-        user_config: dict[str, Any] | None = None,
+        handler_config: dict[str, Any] | None = None,
     ) -> dict[type, DeltaTypeHandler]:
         """Return the currently registered ``{type: DeltaTypeHandler}`` map."""
-        return _build_type_handler_map(user_config)
+        return _build_type_handler_map(handler_config)
 
     def _resolve_handler(self, target_type: type) -> DeltaTypeHandler:
         """Look up the type handler for ``target_type`` or raise ``TypeError``.
@@ -136,7 +136,7 @@ class DeltaIOHandler(BaseIOHandler):
         type is requested but its handler library is not installed.
         """
 
-        type_handlers = self.type_handlers(self.user_config)
+        type_handlers = self.type_handlers(self.handler_config)
         handler = None
         # Spark 4.0+ introduced a split between the public DataFrame API
         # (``pyspark.sql.dataframe.DataFrame``) and the underlying classic
@@ -267,7 +267,7 @@ class DeltaIOHandler(BaseIOHandler):
         if context.type_hint is None:
             raise TypeError(
                 "No type_hint provided on InputContext. "
-                f"Supported types: {list(self.type_handlers(self.user_config))}"
+                f"Supported types: {list(self.type_handlers(self.handler_config))}"
             )
         handler = self._resolve_handler(context.type_hint)
         return handler.load_input(

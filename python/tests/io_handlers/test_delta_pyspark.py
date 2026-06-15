@@ -66,6 +66,8 @@ def spark() -> SparkSession:  # type: ignore[return]
         .config("spark.ui.enabled", "false")
         .config("spark.ui.showConsoleProgress", "false")
         .config("spark.network.timeout", "300s")
+        .config("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.RawLocalFileSystem")
+        .config("spark.hadoop.fs.file.impl.disable.cache", "true")
         .config(
             "spark.driver.extraJavaOptions",
             "-Divy.connection.timeout=300000 -Divy.read.timeout=300000",
@@ -84,7 +86,7 @@ def spark() -> SparkSession:  # type: ignore[return]
 def _make_handler(tmp_path, spark=None, **kwargs) -> tuple[rs.DeltaIOHandler, str]:
     uri = str(tmp_path)
     return rs.DeltaIOHandler(
-        table_uri=uri, user_config={"spark_session": spark}, **kwargs
+        table_uri=uri, handler_config={"spark_session": spark}, **kwargs
     ), uri
 
 
@@ -99,6 +101,7 @@ def _collect_sorted(df: SparkDataFrame, sort_col: str) -> dict:
     return df.sort(sort_col).toPandas().to_dict(orient="list")
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_round_trip_pyspark(tmp_path, spark):
     """Write a PySpark DataFrame, read back as PySpark DataFrame."""
@@ -118,6 +121,7 @@ def test_round_trip_pyspark(tmp_path, spark):
     assert result_pa.cast(expected.schema).equals(expected)
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_write_pyspark_read_pyarrow(tmp_path, spark):
     """A PySpark output is readable back via the PyArrow type handler."""
@@ -136,6 +140,7 @@ def test_write_pyspark_read_pyarrow(tmp_path, spark):
     assert result.cast(expected.schema).sort_by("a").equals(expected)
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_write_pyarrow_read_pyspark(tmp_path, spark):
     """A PyArrow Table output is readable back via the PySpark type handler."""
@@ -155,6 +160,7 @@ def test_write_pyarrow_read_pyspark(tmp_path, spark):
     assert result_dict["b"] == ["x", "y", "z"]
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_write_pyspark_read_polars(tmp_path, spark):
     """A PySpark output is readable back via the Polars type handler."""
@@ -179,6 +185,7 @@ def test_write_pyspark_read_polars(tmp_path, spark):
     )
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_append_mode_pyspark(tmp_path, spark):
     """Append mode accumulates rows across PySpark writes."""
@@ -195,6 +202,7 @@ def test_append_mode_pyspark(tmp_path, spark):
     assert result.count() == 4
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_single_partition_isolation_pyspark(tmp_path, spark):
     """Two partitions written via PySpark do not cross-contaminate on read."""
@@ -234,6 +242,7 @@ def test_single_partition_isolation_pyspark(tmp_path, spark):
     assert result_b.toPandas()["val"].tolist() == [20]
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_partition_overwrite_pyspark(tmp_path, spark):
     """Re-writing a partition via PySpark replaces its data."""
@@ -261,6 +270,7 @@ def test_partition_overwrite_pyspark(tmp_path, spark):
     assert result.toPandas()["val"].tolist() == [99]
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_daily_partition_isolation_pyspark(tmp_path, spark):
     """Daily time-window partitions written via PySpark read back correctly."""
@@ -289,6 +299,7 @@ def test_daily_partition_isolation_pyspark(tmp_path, spark):
     assert result_a.toPandas()["val"].tolist() == [10]
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_column_selection_pyspark(tmp_path, spark):
     """``delta/columns`` metadata projects only the selected columns."""
@@ -311,6 +322,7 @@ def test_column_selection_pyspark(tmp_path, spark):
     assert collected["c"].tolist() == [3.0, 4.0]
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_table_versioning_pyspark(tmp_path, spark):
     """``delta/version`` time-travels the PySpark reader to a prior commit."""
@@ -343,6 +355,7 @@ def test_table_versioning_pyspark(tmp_path, spark):
     assert result_latest.toPandas()["a"].tolist() == [2]
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_null_values_preserved_pyspark(tmp_path, spark):
     """Null values in a PySpark DataFrame round-trip through Delta correctly."""
@@ -367,6 +380,7 @@ def test_null_values_preserved_pyspark(tmp_path, spark):
     assert math.isnan(collected["val"].iloc[1]) or collected["val"].isna().iloc[1]
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_output_metadata_pyspark(tmp_path, spark):
     """Output metadata is populated correctly after a PySpark write."""
@@ -391,6 +405,7 @@ def test_output_metadata_pyspark(tmp_path, spark):
     assert "a" in schema.names
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_creates_delta_log_pyspark(tmp_path, spark):
     """Delta log directory exists on disk after a PySpark write."""
@@ -402,6 +417,7 @@ def test_creates_delta_log_pyspark(tmp_path, spark):
     assert (tmp_path / "tbl" / "_delta_log").is_dir()
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_root_name_override_pyspark(tmp_path, spark):
     """``delta/root_name`` metadata overrides the asset name in the table path."""
@@ -428,6 +444,7 @@ def test_root_name_override_pyspark(tmp_path, spark):
     assert result.toPandas()["a"].tolist() == [1, 2, 3]
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_multi_partition_pyspark(tmp_path, spark):
     """Multi-dimension partition read/write with PySpark DataFrames."""
@@ -453,6 +470,7 @@ def test_multi_partition_pyspark(tmp_path, spark):
     assert result.toPandas()["val"].tolist() == [42]
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_pyspark_handler_with_explicit_spark(tmp_path, spark):
     """Explicit PySparkDeltaTypeHandler initialized by user."""
@@ -476,6 +494,7 @@ def test_pyspark_handler_with_explicit_spark(tmp_path, spark):
     assert result.count() == 3
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_handler_fallback_to_active_session_with_warn(tmp_path, spark):
     """handler should fallback to active spark session when
@@ -501,6 +520,7 @@ def test_handler_fallback_to_active_session_with_warn(tmp_path, spark):
     )
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_handler_using_user_spark_correctly(tmp_path, spark, recwarn):
     """handler should should correctly use user spark session
@@ -515,7 +535,7 @@ def test_handler_using_user_spark_correctly(tmp_path, spark, recwarn):
     )
 
     # No user warnings from load_input since the user spark session
-    # is set in user_config already.
+    # is set in handler_config already.
     result = handler.load_input(ctx_in)
     assert isinstance(result, SparkDataFrame)
     assert not any(issubclass(w.category, UserWarning) for w in recwarn)
@@ -525,6 +545,7 @@ def test_handler_using_user_spark_correctly(tmp_path, spark, recwarn):
     )
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_get_or_create_spark_no_active_no_delta_raises(monkeypatch):
     """_get_or_create_spark raises ImportError when no active session and no delta-spark."""
@@ -554,6 +575,7 @@ def test_get_or_create_spark_no_active_no_delta_raises(monkeypatch):
         )._get_or_create_spark_session()
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_schema_mode_merge_pyspark(tmp_path, spark):
     """schema_mode='merge' adds new columns on subsequent PySpark writes."""
@@ -577,6 +599,7 @@ def test_schema_mode_merge_pyspark(tmp_path, spark):
     assert "b" in result.columns
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_matched_update(tmp_path, spark):
     """schema_mode='merge' with merge_type='custom' for PySpark writes."""
@@ -630,6 +653,7 @@ def test_custom_merge_when_matched_update(tmp_path, spark):
     assert rows[1]["status"] == "updated_partial"
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_matched_update_all(tmp_path, spark):
     """schema_mode='merge' with merge_type='custom' for PySpark writes."""
@@ -685,6 +709,7 @@ def test_custom_merge_when_matched_update_all(tmp_path, spark):
     assert rows[2]["val"] == "b_new"
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_matched_delete(tmp_path, spark):
     """schema_mode='merge' with merge_type='custom' for PySpark writes."""
@@ -737,6 +762,7 @@ def test_custom_merge_when_matched_delete(tmp_path, spark):
     assert 3 not in rows
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_not_matched_insert(tmp_path, spark):
     """schema_mode='merge' with merge_type='custom' for PySpark writes."""
@@ -794,6 +820,7 @@ def test_custom_merge_when_not_matched_insert(tmp_path, spark):
     assert 100 not in rows
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_not_matched_insert_all(tmp_path, spark):
     """schema_mode='merge' with merge_type='custom' for PySpark writes."""
@@ -848,6 +875,7 @@ def test_custom_merge_when_not_matched_insert_all(tmp_path, spark):
     assert rows[10]["status"] == "s10"
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_not_matched_by_source_delete(tmp_path, spark):
     """schema_mode='merge' with merge_type='custom' for PySpark writes."""
@@ -899,6 +927,7 @@ def test_custom_merge_when_not_matched_by_source_delete(tmp_path, spark):
     assert list(rows.keys()) == [1, 2, 3]
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_not_matched_by_source_update(tmp_path, spark):
     """schema_mode='merge' with merge_type='custom' for PySpark writes."""
@@ -951,6 +980,7 @@ def test_custom_merge_when_not_matched_by_source_update(tmp_path, spark):
     assert rows[4]["val"] == "d"
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_missing_pyspark_output_error(tmp_path, spark):
     """Writing a PySpark DataFrame without the handler suggests rivers[pyspark]."""
@@ -965,6 +995,7 @@ def test_missing_pyspark_output_error(tmp_path, spark):
             handler.handle_output(ctx, df)
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_missing_pyspark_input_error(tmp_path, spark):
     """Loading as PySpark DataFrame without the handler suggests rivers[pyspark]."""
@@ -986,6 +1017,7 @@ def test_missing_pyspark_input_error(tmp_path, spark):
             handler.load_input(ctx_in)
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_merge_upsert_pyspark(tmp_path, spark):
     """Merge mode upsert via PySpark source updates existing rows and inserts new ones."""
@@ -1007,6 +1039,7 @@ def test_merge_upsert_pyspark(tmp_path, spark):
     assert result.sort_by("id").cast(expected.schema).equals(expected)
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_merge_deduplicate_insert_pyspark(tmp_path, spark):
     """Merge deduplicate_insert via PySpark only inserts non-matching rows."""
@@ -1030,6 +1063,7 @@ def test_merge_deduplicate_insert_pyspark(tmp_path, spark):
     assert result.sort_by("id").cast(expected.schema).equals(expected)
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_backfill_overwrite_pyspark(tmp_path, spark):
     """Overwriting a subset of partitions via PySpark leaves untouched ones intact."""
@@ -1085,6 +1119,7 @@ def test_backfill_overwrite_pyspark(tmp_path, spark):
     assert results["c"] == 1, "partition 'c' should NOT have been overwritten"
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_large_pyspark_df_round_trips(tmp_path, spark):
     """PySpark DataFrame with many rows round-trips all rows through Arrow."""
@@ -1103,6 +1138,7 @@ def test_large_pyspark_df_round_trips(tmp_path, spark):
     assert result.count() == n
 
 
+@pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_warns_when_user_sets_unsupported_properties(tmp_path, spark):
     wp = WriterProperties(compression="SNAPPY", max_row_group_size=100)

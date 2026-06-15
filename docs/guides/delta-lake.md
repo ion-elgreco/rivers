@@ -12,6 +12,7 @@ pip install rivers[pyarrow]
 pip install rivers[polars]
 pip install rivers[pandas]
 pip install rivers[datafusion]
+pip install rivers[pyspark]
 ```
 
 ## Basic usage
@@ -31,18 +32,43 @@ def users() -> pl.DataFrame:
     })
 ```
 
-The handler creates a Delta table at `/data/delta/users/`.
+### Usage with Spark
+
+```python
+import pandas as pd
+from pyspark.sql.dataframe import DataFrame as SparkDataFrame
+import rivers as rs
+from rivers.io_handlers.delta import DeltaIOHandler
+
+spark_session = ... # your spark session initialization
+io = DeltaIOHandler(
+    table_uri="/data/delta",
+    handler_config={"spark_session": spark_session}
+)
+
+@rs.Asset(io_handler=io)
+def users() -> SparkDataFrame:
+    return spark.createDataFrame(
+        pd.DataFrame({
+            "id": [1, 2, 3],
+            "name": ["Alice", "Bob", "Carol"],
+        })
+    )
+```
+
+In above cases, the handler creates a Delta table at `/data/delta/users/`.
 
 ## Supported types
 
-| Type | Extra |
-|------|-------|
-| `pyarrow.Table` | `rivers[pyarrow]` |
-| `pyarrow.RecordBatchReader` | `rivers[pyarrow]` |
-| `polars.DataFrame` | `rivers[polars]` |
-| `polars.LazyFrame` | `rivers[polars]` |
-| `pandas.DataFrame` | `rivers[pandas]` |
-| `datafusion.DataFrame` | `rivers[datafusion]` |
+| Type | Extra | IO Type |
+|------|-------|---------|
+| `pyarrow.Table` | `rivers[pyarrow]` | Arrow |
+| `pyarrow.RecordBatchReader` | `rivers[pyarrow]` | Arrow |
+| `polars.DataFrame` | `rivers[polars]` | Arrow |
+| `polars.LazyFrame` | `rivers[polars]` | Arrow |
+| `pandas.DataFrame` | `rivers[pandas]` | Arrow |
+| `datafusion.DataFrame` | `rivers[datafusion]` | Arrow |
+| `pyspark.sql.DataFrame` | `rivers[pyspark]` | Spark |
 
 The type is detected automatically from the object passed to `handle_output`, and `load_input` uses the `type_hint` from the downstream parameter annotation.
 
@@ -73,6 +99,8 @@ def events() -> pl.DataFrame:
     ...
 ```
 
+### Arrow type handlers
+
 | Mode | Behavior |
 |------|----------|
 | `overwrite` | Replace the table (or partition) |
@@ -81,6 +109,24 @@ def events() -> pl.DataFrame:
 | `ignore` | Skip write if table exists |
 | `merge` | MERGE INTO (see below) |
 | `create_or_replace` | Drop and recreate schema, then append |
+
+### Spark type handlers
+
+#### Supported table write modes
+
+| Mode | Behavior |
+|------|----------|
+| `overwrite` | Replace the table (or partition) |
+| `append` | Add rows to existing table |
+| `error` | Fail if table exists |
+| `ignore` | Skip write if table exists |
+
+#### Support schema modes
+
+| Mode | Behavior |
+|------|----------|
+| `overwrite` | Replace the table (or partition) |
+| `merge` | MERGE INTO (see below) |
 
 ## Partitioned writes
 
@@ -166,6 +212,27 @@ io = DeltaIOHandler(
         "aws_secret_access_key": "...",
     },
 )
+```
+
+## Handler configuration
+
+Handler configuration allows you to pass custom handler properties
+like a `SparkSession` object when using a Spark type handler.
+
+### Example reading `my_table` in a cloud blob storage with Spark
+
+```python
+spark_session = ... # your spark session initialized with cloud credentials
+io_spark = DeltaIOHandler(
+    table_uri="/cloud/path/to/my_table",
+    handler_config={"spark_session": spark_session}
+)
+ctx = rs.InputContext(
+    asset_name="tbl",
+    downstream_asset="consumer",
+    type_hint=pyspark.sql.DataFrame,
+)
+spark_df = handler.load_input(ctx)
 ```
 
 ## Table configuration

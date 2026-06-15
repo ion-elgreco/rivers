@@ -25,6 +25,7 @@ io = DeltaIOHandler(
 | `commit_properties` | `CommitProperties \| None` | `None` | Delta commit settings. |
 | `table_config` | `dict[str, str] \| None` | `None` | Delta table properties. |
 | `merge_config` | `MergeConfig \| None` | `None` | Merge configuration (required when `mode="merge"`). |
+| `handler_config` | `dict[str, Any] \| None` | `None` | Useful to pass handler-related custom config (e.g. a pre-initialized `SparkSession` object) |
 
 **Asset metadata overrides:**
 
@@ -58,7 +59,7 @@ These metadata keys override handler defaults per-asset:
 
 ## `DeltaTypeHandler`
 
-Abstract base for adding type support to `DeltaIOHandler`.
+Parent abstract base for adding type support to `DeltaIOHandler`.
 
 ```python
 from rivers.io_handlers.delta.base import DeltaTypeHandler
@@ -68,11 +69,53 @@ class MyTypeHandler(DeltaTypeHandler[MyType]):
     def supported_types(self) -> Sequence[type[MyType]]:
         return [MyType]
 
-    def to_arrow(self, obj: MyType) -> RecordBatchReader:
+    def load_input(self, table_uri, storage_options, predicate,
+                   target_type, columns=None, version=None) -> MyType:
+        ...
+
+    def handle_output(self, context: OutputContext,
+                    obj: T, request: DeltaWriteRequest):
+        ...
+```
+
+**Abstract members:**
+
+| Member | Description |
+|--------|-------------|
+| `supported_types` | Property returning list of types this handler supports. |
+| `load_input(...)` | Load data from a Delta table. |
+| `handle_output(...)` | Write data to a Delta table. |
+
+**Built-in type handler subclasses:**
+
+| Type Handler Class | Description |
+|--------|-------------|
+| `ArrowDeltaTypeHandler` | For Arrow-based type support. |
+| `PySparkDeltaTypeHandler` | For Spark-based types support. |
+
+## `ArrowDeltaTypeHandler`
+
+`DeltaTypeHandler`-based abstract handler class for adding
+Arrow-based type support to `DeltaIOHandler`. Writes with
+`handle_output` are pre-implemented using `deltalake (delta-rs)`.
+
+```python
+from rivers.io_handlers.delta.base import ArrowDeltaTypeHandler
+
+class MyTypeHandler(ArrowDeltaTypeHandler[MyType]):
+    @property
+    def supported_types(self) -> Sequence[type[MyType]]:
+        return [MyType]
+
+    def to_arrow(self, obj: T) -> RecordBatchReader:
         ...
 
     def load_input(self, table_uri, storage_options, predicate,
                    target_type, columns=None, version=None) -> MyType:
+        ...
+
+    def handle_output(self, context: OutputContext,
+                    obj: T, request: DeltaWriteRequest):
         ...
 ```
 
@@ -92,6 +135,29 @@ class MyTypeHandler(DeltaTypeHandler[MyType]):
 | `PolarsTypeHandler` | `rivers.io_handlers.delta.polars` | `polars.DataFrame`, `polars.LazyFrame` |
 | `PandasTypeHandler` | `rivers.io_handlers.delta.pandas` | `pandas.DataFrame` |
 | `DataFusionTypeHandler` | `rivers.io_handlers.delta.datafusion` | `datafusion.DataFrame` |
+
+## `PySparkDeltaTypeHandler`
+
+`DeltaTypeHandler`-based handler class for adding
+Spark-based type support to `DeltaIOHandler`. Reads with `load_input`
+and writes with `handle_output`, both are implemented with Spark.
+
+```python
+from rivers.io_handlers.delta.pyspark import PySparkDeltaTypeHandler
+
+class MyTypeHandler(ArrowDeltaTypeHandler[MyType]):
+    @property
+    def supported_types(self) -> Sequence[type[MyType]]:
+        return [MyType]
+
+    def load_input(self, table_uri, storage_options, predicate,
+                   target_type, columns=None, version=None) -> MyType:
+        ...
+
+    def handle_output(self, context: OutputContext,
+                    obj: T, request: DeltaWriteRequest):
+        ...
+```
 
 ---
 
