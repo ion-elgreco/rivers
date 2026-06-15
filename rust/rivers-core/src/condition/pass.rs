@@ -883,7 +883,9 @@ mod tests {
     /// Returns the asset's handled cursor after the tick.
     fn handled_after_fired_selection(selection: PartitionSelection) -> Option<i64> {
         let mut cache = AssetConditionCache::default();
-        cache.records.insert("down".to_string(), test_record("down"));
+        cache
+            .records
+            .insert("down".to_string(), test_record("down"));
         let mut pass = ConditionPass::new(
             cache,
             ConditionEvalState::default(),

@@ -2819,8 +2819,10 @@ fn all_partitions_dep_frontier_key_does_not_refire_whole_universe() {
     let mut ctx = make_ctx("a", &a, &records, &deps);
     ctx.all_asset_states = &all_states;
 
-    let mappings =
-        HashMap::from([(("a".into(), "b".into()), PartitionMappingKind::AllPartitions)]);
+    let mappings = HashMap::from([(
+        ("a".into(), "b".into()),
+        PartitionMappingKind::AllPartitions,
+    )]);
     let upstream_b = HashMap::from([("b".to_string(), up_keys.clone())]);
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
@@ -2882,8 +2884,10 @@ fn all_partitions_dep_genuine_update_still_fires() {
     let mut ctx = make_ctx("a", &a, &records, &deps);
     ctx.all_asset_states = &all_states;
 
-    let mappings =
-        HashMap::from([(("a".into(), "b".into()), PartitionMappingKind::AllPartitions)]);
+    let mappings = HashMap::from([(
+        ("a".into(), "b".into()),
+        PartitionMappingKind::AllPartitions,
+    )]);
     let upstream_b = HashMap::from([("b".to_string(), up_keys.clone())]);
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
@@ -2999,8 +3003,7 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
 
     // Control: the root's mapped key a@06 older than b@05 -> exactly that
     // downstream key fires.
-    let a_timestamps_stale =
-        HashMap::from([(spk("2024-01-05"), 100i64), (spk("2024-01-06"), 200)]);
+    let a_timestamps_stale = HashMap::from([(spk("2024-01-05"), 100i64), (spk("2024-01-06"), 200)]);
     let statuses_stale = HashMap::from([
         (
             "a".to_string(),
@@ -3069,8 +3072,7 @@ fn will_be_requested_carries_the_upstream_fired_selection() {
     let keys = HashSet::from([pa.clone(), pb.clone(), pc.clone()]);
     // Equal timestamps on both sides: the NewlyUpdated branch stays quiet,
     // isolating WillBeRequested.
-    let ts: HashMap<PartitionKey, i64> =
-        keys.iter().map(|k| (k.clone(), 100i64)).collect();
+    let ts: HashMap<PartitionKey, i64> = keys.iter().map(|k| (k.clone(), 100i64)).collect();
 
     let all_states = HashMap::new();
     let partition_statuses = HashMap::from([

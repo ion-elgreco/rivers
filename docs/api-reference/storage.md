@@ -40,9 +40,42 @@ Each parameter resolves via: explicit kwarg → `RIVERS_SURREAL_*` env var → d
 
 When `username` and `password` both resolve to non-empty values, they authenticate as a database-scoped user against `namespace` / `database` — matching a `DEFINE USER ... ON DATABASE` definition.
 
-### Schema migrations
+## Schema versioning & migration
 
-Every open runs versioned in-place migrations and stamps the schema version in the `kv` table; databases already at the current version skip the scans. Migrations are one-shot: **all processes sharing a database must run the same rivers version**. A pre-0.2 writer pointed at a migrated database re-introduces the data shapes the migration healed (unsorted multi-dimension partition keys, unguarded dynamic keys) and nothing heals them again until the next schema bump — upgrade every code location and UI/daemon process together.
+Each persistent database carries a **schema stamp** — the schema version it was last migrated to, plus a `min_reader` and `min_writer` floor (the oldest rivers build allowed to read, and to write, that version). Opening a store checks this stamp against the build's schema version and **refuses an incompatible open instead of silently migrating**.
+
+**The open contract** (`floor ≤ build ≤ version`):
+
+| Situation | Read open (UI) | Read/write open (code locations, daemon) |
+|-----------|----------------|-------------------------------------------|
+| Build at the database's version | proceeds | proceeds |
+| Build newer than the database | refused — run `rivers db migrate` | refused — run `rivers db migrate` |
+| Database ahead, build ≥ its floor | proceeds (reader/writer split) | proceeds |
+| Build below the relevant floor | refused — upgrade rivers | refused — upgrade rivers |
+
+The reader/writer split lets a write-breaking migration for newer writers run **without locking out an older read-only UI**: a `Read` open is gated by `min_reader`, a read/write open by `min_writer` (and `min_writer ≥ min_reader` always holds).
+
+An **uninitialized** store (no stamp) is bootstrapped by whichever process opens it first — the UI included — so a fresh deployment shows an empty UI without waiting for a code location.
+
+### `rivers db migrate`
+
+Applies pending schema migrations, bringing the database to the running build's schema version. Idempotent (a no-op when already current), and serialized across processes by a short-lived lease so two openers can't migrate the same store at once. Run it after upgrading rivers when a code location or the UI reports that the database needs migration.
+
+```bash
+rivers db migrate                              # embedded (--storage-path, default .rivers/storage/)
+rivers db migrate --surreal-endpoint ws://surrealdb:8000   # remote
+```
+
+In K8s, run it as an explicit init/job step before rolling out upgraded code locations. `rivers dev` instead offers to migrate interactively when it finds the database behind the build.
+
+### `Storage.migrate_embedded(path)` / `Storage.migrate_remote(endpoint, ...)`
+
+The programmatic form of `rivers db migrate` — open-migrate-close. `migrate_remote` takes the same `username` / `password` / `namespace` / `database` resolution as `Storage.connect`.
+
+```python
+rs.Storage.migrate_embedded(".rivers/storage")
+rs.Storage.migrate_remote("ws://surrealdb.rivers.svc.cluster.local:8000")
+```
 
 ### `storage.type`
 
@@ -74,7 +107,7 @@ All query methods block the calling thread until the result is ready.
 | `has_dynamic_partition(name, key)` | `bool` |
 | `get_materialized_partitions(asset_key)` | `list[PartitionKey]` |
 
-Dynamic keys registered before the reserved-character guard existed (`|`/`,`) still classify, but cannot round-trip display-string paths (UI, gRPC). The storage migration records all such keys under the `reserved_dynamic_keys` entry in the `kv` table; every subsequent open re-checks that record and logs a warning while any remain. Delete each offending key and re-register it under a clean name — remediated keys drop out of the record automatically, and the warning clears once it is empty.
+Dynamic keys registered before the reserved-character guard existed (`|`/`,`) still classify, but cannot round-trip display-string paths (UI, gRPC). The storage migration logs a warning for all such keys and records them under the `reserved_dynamic_keys` entry in the `kv` table. Delete each offending key and re-register it under a clean name.
 
 ### `compute_staleness()`
 

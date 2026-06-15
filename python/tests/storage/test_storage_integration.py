@@ -315,6 +315,39 @@ def test_cli_materialize_memory_missing_module():
     assert result.exit_code != 0
 
 
+def test_migrate_embedded_initializes_store(tmp_path: Path):
+    """``Storage.migrate_embedded`` brings up a fresh embedded store.
+
+    Each test opens a unique path exactly once: reopening the same RocksDB path
+    in-process is flaky (the router task releases the file lock asynchronously),
+    so migration correctness — idempotence, downgrade refusal, the lease — is
+    covered by the rivers-core tests; this confirms the Python binding is wired.
+    """
+    path = str(tmp_path / "db")
+    rs.Storage.migrate_embedded(path)
+    assert Path(path).exists()
+
+
+def test_cli_db_migrate_embedded(tmp_path: Path):
+    """``rivers db migrate`` initializes an embedded store and reports success."""
+    path = str(tmp_path / "db")
+    result = runner.invoke(app, ["db", "migrate", "--storage-path", path])
+    assert result.exit_code == 0, result.output
+    assert "up to date" in result.output
+    assert Path(path).exists()
+
+
+def test_schema_migration_needed_error_is_a_storage_error():
+    """The behind-build open raises a typed `SchemaMigrationNeededError`
+    (caught by `rivers dev`); it subclasses `StorageError` so existing
+    `except StorageError` handlers still catch it. The actual behind-build
+    trigger is covered by the rivers-core open tests.
+    """
+    from rivers.exceptions import SchemaMigrationNeededError, StorageError
+
+    assert issubclass(SchemaMigrationNeededError, StorageError)
+
+
 # --- Asset catalog tests ---
 
 

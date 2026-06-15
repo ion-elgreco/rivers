@@ -138,3 +138,15 @@ rivers queue list                # queued runs sorted by priority + start time
 rivers queue cancel RUN_ID       # cancel a not-yet-started run
 rivers queue why RUN_ID          # explain why a queued run is blocked
 ```
+
+## `db migrate` — storage schema migration
+
+Brings a database up to the running rivers build's schema version, running any data-heal steps under a cross-process lease. Idempotent. Run it after upgrading rivers when a code location or the UI reports that the database needs migration; see [Storage › Schema versioning & migration](storage.md#schema-versioning-migration).
+
+```bash
+rivers db migrate                                          # embedded (default .rivers/storage/)
+rivers db migrate --storage-path /data/rivers              # embedded, explicit path
+rivers db migrate --surreal-endpoint ws://surrealdb:8000   # remote (or RIVERS_SURREAL_ENDPOINT)
+```
+
+In Kubernetes, run this as an init/job step before rolling out upgraded code locations. `rivers dev` offers to run it interactively when it finds the database behind the build.

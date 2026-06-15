@@ -239,6 +239,32 @@ class Storage:
         """
         ...
 
+    @staticmethod
+    def migrate_embedded(path: str) -> None:
+        """Apply pending storage schema migrations to an embedded database at
+        ``path``, bringing it to this build's schema version.
+
+        Idempotent — a no-op when already current. Runs any data-heal steps
+        under a cross-process lease. Backs ``rivers db migrate``.
+        """
+        ...
+
+    @staticmethod
+    def migrate_remote(
+        endpoint: str,
+        *,
+        username: str | None = None,
+        password: str | None = None,
+        namespace: str | None = None,
+        database: str | None = None,
+    ) -> None:
+        """Remote counterpart of :meth:`migrate_embedded`.
+
+        Same field resolution as :meth:`connect` (kwarg → ``RIVERS_SURREAL_*``
+        env → default).
+        """
+        ...
+
     def get_events_for_asset(
         self, asset_key: str, limit: int = 100
     ) -> list[StoredEvent]:

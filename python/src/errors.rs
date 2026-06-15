@@ -32,6 +32,9 @@ create_exception!(
 );
 create_exception!(rivers, SensorDefinitionError, pyo3::exceptions::PyException);
 create_exception!(rivers, StorageError, pyo3::exceptions::PyException);
+// Subclass of StorageError so `except StorageError` still catches it; the
+// `rivers dev` prompt catches this specific type to offer `rivers db migrate`.
+create_exception!(rivers, SchemaMigrationNeededError, StorageError);
 create_exception!(rivers, TaskDefinitionError, pyo3::exceptions::PyException);
 
 pub fn register_exceptions(parent_module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -79,6 +82,10 @@ pub fn register_exceptions(parent_module: &Bound<'_, PyModule>) -> PyResult<()> 
         py.get_type::<SensorDefinitionError>(),
     )?;
     child.add("StorageError", py.get_type::<StorageError>())?;
+    child.add(
+        "SchemaMigrationNeededError",
+        py.get_type::<SchemaMigrationNeededError>(),
+    )?;
     child.add("TaskDefinitionError", py.get_type::<TaskDefinitionError>())?;
 
     parent_module.add_submodule(&child)?;
