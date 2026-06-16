@@ -73,7 +73,9 @@ pub struct BackfillState {
 /// detect that case and self-recover after a grace period.
 #[derive(Clone, Debug)]
 pub struct PendingRun {
-    pub asset_key: String,
+    /// Every asset the run dispatched. A single run_id can materialize many
+    /// assets (a joint run); all of them must be untracked if it goes phantom.
+    pub asset_keys: Vec<String>,
     /// Wall-clock nanos at which dispatch registered this run_id.
     pub first_seen_ts: i64,
 }
@@ -149,8 +151,9 @@ struct RefreshDelta {
     /// Run_ids confirmed by storage (remove from `pending_runs`).
     confirmed_pending: Vec<String>,
     /// Phantom run_ids past their grace period: drop from `pending_runs`
-    /// AND from `in_progress_assets[asset_key]`.
-    evicted_pending: Vec<(String, String)>,
+    /// AND from `in_progress_assets` for every asset the run covered.
+    /// `(run_id, asset_keys)`.
+    evicted_pending: Vec<(String, Vec<String>)>,
 }
 
 /// Cached state for condition evaluation, minimizing storage queries.
@@ -274,13 +277,14 @@ impl AssetConditionCache {
         partition_key: Option<PartitionKey>,
     ) {
         self.track_in_progress_run(asset_key.clone(), run_id.clone(), partition_key);
-        self.pending_runs.insert(
-            run_id,
-            PendingRun {
-                asset_key,
+        self.pending_runs
+            .entry(run_id)
+            .or_insert_with(|| PendingRun {
+                asset_keys: Vec::new(),
                 first_seen_ts: now,
-            },
-        );
+            })
+            .asset_keys
+            .push(asset_key);
     }
 
     /// In-flight partitions for `asset` from the cache's own tracking — the
@@ -598,7 +602,7 @@ impl AssetConditionCache {
             if (now - pending.first_seen_ts) > self.pending_grace_nanos {
                 delta
                     .evicted_pending
-                    .push((pending.asset_key.clone(), run_id.clone()));
+                    .push((run_id.clone(), pending.asset_keys.clone()));
             }
         }
         if !delta.evicted_pending.is_empty() {
@@ -950,13 +954,15 @@ impl AssetConditionCache {
             self.pending_runs.remove(&run_id);
         }
 
-        for (asset_key, run_id) in evicted_pending {
+        for (run_id, asset_keys) in evicted_pending {
             self.pending_runs.remove(&run_id);
-            self.untrack_in_progress_run(&asset_key, &run_id);
+            for asset_key in &asset_keys {
+                self.untrack_in_progress_run(asset_key, &run_id);
+            }
             tracing::warn!(
                 target: "rivers::daemon",
-                asset_key = %asset_key,
                 run_id = %run_id,
+                assets = asset_keys.len(),
                 "evicting phantom run_id from cache after grace period"
             );
         }
