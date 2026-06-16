@@ -1291,6 +1291,44 @@ mod tests {
     }
 
     #[test]
+    fn update_state_resets_handled_each_tick() {
+        // `handled` is the since-last-handled debounce window: it must hold only
+        // the most recent tick's dispatched keys, not accumulate across ticks.
+        // Otherwise a partition handled long ago stays in the set and is wrongly
+        // subtracted whenever any other partition is handled the previous tick.
+        // update_condition_state resets it; classification repopulates with this
+        // tick's dispatched keys.
+        let mut state = crate::condition::state::AssetConditionState {
+            partition_state: Some(crate::condition::partition::PartitionState {
+                handled: [spk("2024-01-01")].into_iter().collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let timestamps: HashMap<PartitionKey, i64> = HashMap::new();
+        let ctx = StateUpdateContext {
+            target_record_timestamp: None,
+            target_data_version: None,
+            now: 2,
+            is_initial: false,
+            partition_timestamps: Some(&timestamps),
+        };
+        let result = EvalResult {
+            fired: false,
+            selection: Some(PartitionSelection::Empty),
+            sub_selections: Some(HashMap::new()),
+            ..Default::default()
+        };
+        update_condition_state(&mut state, &ctx, &result);
+        let ps = state.partition_state.as_ref().expect("partition state");
+        assert!(
+            ps.handled.is_empty(),
+            "stale handled keys from a prior tick must be reset, got {:?}",
+            ps.handled
+        );
+    }
+
+    #[test]
     fn classify_marks_only_surviving_keys_handled() {
         let mut pass = ConditionPass::new(
             AssetConditionCache::default(),

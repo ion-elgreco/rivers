@@ -253,9 +253,13 @@ pub fn update_condition_state(
             .get_or_insert_with(PartitionState::default);
         ps.previous_selections = sub_selections.clone();
         ps.timestamps = timestamps.clone();
-        // `handled` is extended during classification with the keys that are
-        // actually dispatched — the raw selection may contain keys the asset
-        // doesn't have, and marking those would suppress them forever.
+        // `handled` is the since-last-handled debounce window: reset it each
+        // tick so classification can repopulate it with only the keys actually
+        // dispatched this tick. It must not be populated from the raw selection
+        // (which may name keys the asset doesn't have), and it must not
+        // accumulate across ticks — otherwise a partition handled long ago is
+        // wrongly suppressed once any sibling partition is handled.
+        ps.handled.clear();
     }
 }
 
