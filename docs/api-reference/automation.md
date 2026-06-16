@@ -25,9 +25,15 @@ def fill_gaps() -> int:
 
 | Method | Description |
 |--------|-------------|
-| `AutomationCondition.eager()` | Materialize whenever any dependency is updated. Excludes failed partitions/assets, so they aren't auto-retried until re-run. |
-| `AutomationCondition.on_cron(cron_schedule, timezone=None)` | Materialize on a cron schedule. |
+| `AutomationCondition.eager()` | Materialize whenever any dependency is updated. Skips anything already in flight (a run *or* an active backfill). Excludes failed partitions/assets, so they aren't auto-retried until re-run. |
+| `AutomationCondition.on_cron(cron_schedule, timezone=None)` | Materialize on a cron schedule. Won't start a new run while the previous one is still in flight. |
 | `AutomationCondition.on_missing()` | Materialize only when the asset has never been materialized; leaves failed partitions alone. |
+
+!!! note "Conditions are the only dispatch gate"
+    The daemon dispatches whatever a condition fires — there's no separate
+    "already running" check. The presets above include `~in_flight()`; **a custom
+    condition that can fire repeatedly should add `& ~AutomationCondition.in_flight()`**
+    to avoid re-dispatching work that's still running.
 
 ---
 
@@ -48,6 +54,7 @@ Fine-grained conditions for building custom rules. All are static methods on `Au
 | `.in_latest_time_window(lookback_delta=None)` | Partition falls within the latest time window (`lookback_delta` in seconds, measured back from the latest window's start; must be positive and finite or `ValueError` is raised). |
 | `.initial_evaluation()` | First evaluation tick after daemon startup or a condition tree change. |
 | `.backfill_in_progress()` | Asset is part of an active backfill. |
+| `.in_flight()` | Asset is being materialized by anything — a run (`in_progress()`) **or** an active backfill (`backfill_in_progress()`). Negate it as a re-dispatch guard. |
 | `.will_be_requested()` | Asset's condition already fired earlier this tick (same-tick cascading). |
 | `.last_run_includes_target()` | The dep's latest run also included the root asset being evaluated. |
 | `.last_executed_with_tags(tag_keys=None, tag_values=None)` | Latest run that materialized this asset had matching tags. |

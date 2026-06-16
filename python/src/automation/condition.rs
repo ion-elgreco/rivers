@@ -250,6 +250,18 @@ impl PyAutomationCondition {
         Self::new_node(ConditionNode::BackfillInProgress)
     }
 
+    /// True while being materialized by anything — a run (`in_progress`) or an
+    /// active backfill (`backfill_in_progress`). Negate it
+    /// (`~AutomationCondition.in_flight()`) in custom conditions to avoid
+    /// re-dispatching running work; the presets already do.
+    #[staticmethod]
+    fn in_flight() -> Self {
+        Self {
+            node: ConditionNode::in_flight(),
+            label: Some("in_flight".to_string()),
+        }
+    }
+
     /// True when the latest run that materialized this asset/partition had matching tags.
     /// `tag_keys` checks key presence (any value), `tag_values` checks exact key-value pairs.
     #[staticmethod]

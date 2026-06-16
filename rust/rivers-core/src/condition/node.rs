@@ -139,7 +139,7 @@ impl ConditionNode {
     ///     ])),
     ///     Not(AnyDepsMissing),
     ///     Not(AnyDepsInProgress),
-    ///     Not(InProgress),
+    ///     Not(in_flight),             // = Not(InProgress | BackfillInProgress)
     ///     Not(ExecutionFailed),
     /// ])
     /// ```
@@ -150,6 +150,12 @@ impl ConditionNode {
     /// hack needed. Users can compose `InitialEvaluation` explicitly for custom
     /// first-tick behavior.
     ///
+    /// `Not(in_flight)` excludes partitions already being materialized by a run
+    /// *or* an active backfill, and is the *only* dispatch gate (`apply_results`
+    /// dispatches whatever fires). The backfill arm matters: a backfill registers
+    /// its per-partition runs lazily, so a not-yet-started partition is still
+    /// owned by it and must not be re-fired (root floor `None`) as a duplicate.
+    ///
     /// `Not(ExecutionFailed)` excludes failed partitions/assets, so they aren't
     /// auto-retried every tick until re-run.
     ///
@@ -158,7 +164,7 @@ impl ConditionNode {
             .since_last_handled()
             & !ConditionNode::any_deps_missing()
             & !ConditionNode::any_deps_in_progress()
-            & !ConditionNode::InProgress
+            & !ConditionNode::in_flight()
             & !ConditionNode::ExecutionFailed
     }
 
@@ -194,6 +200,13 @@ impl ConditionNode {
         }
     }
 
+    /// Composite: being materialized by *anything* — a run (`InProgress`) or an
+    /// active backfill (`BackfillInProgress`). Presets negate this as their sole
+    /// re-dispatch guard; the two leaves stay separate for composing either alone.
+    pub fn in_flight() -> Self {
+        ConditionNode::InProgress | ConditionNode::BackfillInProgress
+    }
+
     /// Composite: true if all deps have been updated since the last cron tick.
     ///
     /// ```text
@@ -222,12 +235,16 @@ impl ConditionNode {
     /// And([
     ///     SinceLastHandled(CronTickPassed),
     ///     all_deps_updated_since_cron(schedule, tz),
+    ///     Not(in_flight),
     /// ])
     /// ```
     ///
     /// Waits for a cron tick, then fires once all deps have been updated since
     /// that tick. Users can compose with `InLatestTimeWindow` or `.without()`
     /// to customize partition filtering.
+    ///
+    /// `Not(in_flight)` keeps a cron tick from overlapping a materialization
+    /// still in flight (cron interval shorter than the run)
     pub fn on_cron(cron_schedule: String, timezone: Option<String>) -> Self {
         ConditionNode::CronTickPassed {
             cron_schedule: cron_schedule.clone(),
@@ -235,6 +252,7 @@ impl ConditionNode {
         }
         .since_last_handled()
             & ConditionNode::all_deps_updated_since_cron(cron_schedule, timezone)
+            & !ConditionNode::in_flight()
     }
 
     /// On-missing preset. Fires when an asset becomes missing and has no

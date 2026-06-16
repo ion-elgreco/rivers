@@ -126,6 +126,15 @@ class AutomationCondition:
         """True when the asset is part of an active backfill."""
         ...
     @staticmethod
+    def in_flight() -> AutomationCondition:
+        """True while being materialized by anything — a run (``in_progress``) or
+        an active backfill (``backfill_in_progress``).
+
+        Negate it (``~AutomationCondition.in_flight()``) in custom conditions to
+        avoid re-dispatching running work; the presets already include it.
+        """
+        ...
+    @staticmethod
     def last_executed_with_tags(
         *,
         tag_keys: list[str] | None = None,

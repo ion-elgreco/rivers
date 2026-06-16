@@ -51,7 +51,7 @@ impl ConditionTickEngine {
             for asset in &plan.unpartitioned {
                 self.pass
                     .cache
-                    .register_dispatched_run(asset.clone(), run_id.clone(), now);
+                    .register_dispatched_run(asset.clone(), run_id.clone(), now, None);
             }
             handle.register_run(run_id.clone());
             run_requests.push(MaterializationRequestData {
@@ -66,9 +66,12 @@ impl ConditionTickEngine {
         for (pk, assets) in plan.single_partition_groups {
             let run_id = uuid::Uuid::new_v4().to_string();
             for asset in &assets {
-                self.pass
-                    .cache
-                    .register_dispatched_run(asset.clone(), run_id.clone(), now);
+                self.pass.cache.register_dispatched_run(
+                    asset.clone(),
+                    run_id.clone(),
+                    now,
+                    Some(pk.clone()),
+                );
             }
             handle.register_run(run_id.clone());
             run_requests.push(MaterializationRequestData {

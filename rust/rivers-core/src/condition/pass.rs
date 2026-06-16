@@ -541,6 +541,22 @@ impl ConditionPass {
                 ))
             });
 
+            // `!InProgress` view = storage's in-progress ∪ the cache's just-
+            // dispatched runs (which lag storage). Allocate the union only when
+            // there are pending partitions; otherwise borrow storage's set.
+            let pending = self.cache.in_progress_partition_keys(&info.asset_key);
+            let merged_in_progress: Option<HashSet<PartitionKey>> = if pending.is_empty() {
+                None
+            } else {
+                self.cache
+                    .partition_status
+                    .get(&info.asset_key)
+                    .map(|status| {
+                        let mut s = status.in_progress.clone();
+                        s.extend(pending);
+                        s
+                    })
+            };
             let pctx = info.partition_info.as_ref().and_then(|pi| {
                 self.cache
                     .partition_status
@@ -548,7 +564,7 @@ impl ConditionPass {
                     .map(|status| PartitionEvalContext {
                         all_keys: &pi.all_keys,
                         materialized: &status.materialized,
-                        in_progress: &status.in_progress,
+                        in_progress: merged_in_progress.as_ref().unwrap_or(&status.in_progress),
                         failed: &status.failed,
                         timestamps: &status.timestamps,
                         resolver: PartitionResolver::new(
@@ -654,7 +670,8 @@ impl ConditionPass {
                 );
             }
 
-            if row.result.fired && !self.cache.in_progress_assets.contains_key(&info.asset_key) {
+            // The condition tree is the sole dispatch gate
+            if row.result.fired {
                 to_materialize.push(ToMaterialize {
                     asset_key: info.asset_key.clone(),
                     selection: row.result.selection.clone(),
@@ -1399,6 +1416,196 @@ mod tests {
         }]);
         assert_eq!(plan.single_partition_groups.len(), 1);
         assert!(pass.cache.in_progress_assets.contains_key("down"));
+    }
+
+    #[test]
+    fn eager_does_not_fire_for_a_partition_an_active_backfill_covers() {
+        // Regression for the flaky `test_eager_only_fires_for_partitions_with_
+        // upstream_data` ("expected 3 downstream runs, got 4").
+        //
+        // A backfill runs its partitions sequentially and registers sub-runs
+        // lazily, so between partitions `c` has no run yet but is still owned by
+        // the backfill, `in_progress_assets` is empty, and `any_deps_updated`
+        // keeps firing it (root floor `None`). `eager()`'s `!in_flight()` covers c
+        // via `BackfillInProgress`, so it isn't re-selected. Pre-fix it dispatched
+        // a second time.
+        let keys = |ks: &[&str]| ks.iter().map(|k| spk(k)).collect::<HashSet<_>>();
+
+        let mut cache = AssetConditionCache::default();
+        cache.records.insert("src".to_string(), test_record("src"));
+        cache.records.insert("dst".to_string(), test_record("dst"));
+        cache
+            .upstream_deps
+            .insert("dst".to_string(), vec!["src".to_string()]);
+
+        // Upstream fully materialized; downstream has a, b but not c.
+        cache.partition_status.insert(
+            "src".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                materialized: keys(&["a", "b", "c"]),
+                timestamps: HashMap::from([(spk("a"), 100i64), (spk("b"), 100), (spk("c"), 100)]),
+                ..Default::default()
+            },
+        );
+        cache.partition_status.insert(
+            "dst".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                materialized: keys(&["a", "b"]),
+                // a, b newer than their upstream → up to date, won't re-fire.
+                timestamps: HashMap::from([(spk("a"), 200i64), (spk("b"), 200)]),
+                ..Default::default()
+            },
+        );
+
+        // An active backfill covers {a,b,c}, but no sub-run is tracked yet (the
+        // gap between sequentially executed partitions).
+        cache
+            .backfill
+            .assets
+            .insert("dst".to_string(), vec!["bf1".to_string()]);
+        cache
+            .backfill
+            .partition_keys
+            .insert("bf1".to_string(), vec![spk("a"), spk("b"), spk("c")]);
+        assert!(
+            cache.in_progress_assets.is_empty(),
+            "precondition: the gap tick has no tracked sub-run"
+        );
+
+        let mut pass = ConditionPass::new(
+            cache,
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "dst".to_string(),
+                condition: ConditionNode::eager(),
+                partition_info: Some(PartitionInfo {
+                    all_keys: keys(&["a", "b", "c", "d", "e"]),
+                    mappings: HashMap::from([(
+                        ("dst".to_string(), "src".to_string()),
+                        PartitionMappingKind::Identity,
+                    )]),
+                    time_window_fmt: None,
+                    universe: PartitionUniverse::Frozen,
+                }),
+                backfill_strategy: None,
+            }],
+            HashMap::from([(
+                "src".to_string(),
+                (keys(&["a", "b", "c", "d", "e"]), PartitionUniverse::Frozen),
+            )]),
+        );
+        pass.eval_state.assets.insert(
+            "dst".to_string(),
+            crate::condition::state::AssetConditionState::default(),
+        );
+
+        let out = pass.run(1000, false);
+
+        // `BackfillInProgress` reports c as covered, so `!in_flight()` removes it
+        // from the fired selection — eager does not select c.
+        let sel = &out.results[0].result.selection;
+        let selects_c = matches!(sel, Some(PartitionSelection::Keys(ks)) if ks.contains(&spk("c")));
+        assert!(
+            !selects_c,
+            "eager must not select a partition an active backfill already covers; got {sel:?}"
+        );
+
+        // ...and therefore nothing dispatches. Pre-fix, the asset-level
+        // `in_progress_assets`-only gate let c through a second time.
+        assert!(
+            out.plan.is_empty(),
+            "nothing may dispatch for a backfill-covered partition; plan dispatched \
+             unpartitioned={:?} single={:?} backfills={:?}",
+            out.plan.unpartitioned,
+            out.plan.single_partition_groups,
+            out.plan.multi_partition_backfills,
+        );
+    }
+
+    #[test]
+    fn eager_does_not_redispatch_a_just_dispatched_partition_before_storage_catches_up() {
+        // Dispatch is purely `if fired`, so the condition must see a run the
+        // daemon dispatched this/last tick before it shows up in storage's
+        // `get_in_progress_partitions` (StepStart-based, so it lags). The cache's
+        // `in_progress_assets` (run_id → partition key) feeds `pctx.in_progress`
+        // so `!InProgress` covers c; without it, gate removal would re-dispatch c.
+        let keys = |ks: &[&str]| ks.iter().map(|k| spk(k)).collect::<HashSet<_>>();
+
+        let mut cache = AssetConditionCache::default();
+        cache.records.insert("src".to_string(), test_record("src"));
+        cache.records.insert("dst".to_string(), test_record("dst"));
+        cache
+            .upstream_deps
+            .insert("dst".to_string(), vec!["src".to_string()]);
+        cache.partition_status.insert(
+            "src".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                materialized: keys(&["a", "b", "c"]),
+                timestamps: HashMap::from([(spk("a"), 100i64), (spk("b"), 100), (spk("c"), 100)]),
+                ..Default::default()
+            },
+        );
+        cache.partition_status.insert(
+            "dst".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                // dst/c missing; storage `in_progress` still empty.
+                materialized: keys(&["a", "b"]),
+                timestamps: HashMap::from([(spk("a"), 200i64), (spk("b"), 200)]),
+                ..Default::default()
+            },
+        );
+
+        // The daemon dispatched a single-partition run for c this tick. Its run is
+        // NOT yet observable in storage, but `register_dispatched_run` recorded
+        // the partition it targets.
+        cache.register_dispatched_run("dst".into(), "run_c".into(), 1000, Some(spk("c")));
+        assert!(
+            cache.partition_status["dst"].in_progress.is_empty(),
+            "precondition: storage's get_in_progress_partitions hasn't caught up"
+        );
+
+        let mut pass = ConditionPass::new(
+            cache,
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "dst".to_string(),
+                condition: ConditionNode::eager(),
+                partition_info: Some(PartitionInfo {
+                    all_keys: keys(&["a", "b", "c", "d", "e"]),
+                    mappings: HashMap::from([(
+                        ("dst".to_string(), "src".to_string()),
+                        PartitionMappingKind::Identity,
+                    )]),
+                    time_window_fmt: None,
+                    universe: PartitionUniverse::Frozen,
+                }),
+                backfill_strategy: None,
+            }],
+            HashMap::from([(
+                "src".to_string(),
+                (keys(&["a", "b", "c", "d", "e"]), PartitionUniverse::Frozen),
+            )]),
+        );
+        pass.eval_state.assets.insert(
+            "dst".to_string(),
+            crate::condition::state::AssetConditionState::default(),
+        );
+
+        let out = pass.run(1000, false);
+
+        // `!InProgress` (storage ∪ the cache's pending dispatches) covers c, so
+        // eager does not select it and nothing re-dispatches.
+        let sel = &out.results[0].result.selection;
+        let selects_c = matches!(sel, Some(PartitionSelection::Keys(ks)) if ks.contains(&spk("c")));
+        assert!(
+            !selects_c,
+            "eager must not re-dispatch a partition whose run was just dispatched; got {sel:?}"
+        );
+        assert!(
+            out.plan.is_empty(),
+            "nothing may dispatch; got single={:?}",
+            out.plan.single_partition_groups
+        );
     }
 
     #[test]
