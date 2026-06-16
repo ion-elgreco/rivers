@@ -59,7 +59,10 @@ impl PartitionSelection {
             Self::All => Self::Empty,
             Self::Empty => {
                 if all_keys.is_empty() {
-                    Self::All
+                    // No partitions exist → the complement is also nothing.
+                    // Returning `All` here would falsely report a partitionless
+                    // asset as firing for a Not(...) clause.
+                    Self::Empty
                 } else {
                     Self::Keys(all_keys.clone())
                 }
