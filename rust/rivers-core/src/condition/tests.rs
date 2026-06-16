@@ -3688,26 +3688,33 @@ fn test_bitor_flattens_nested_or() {
 #[test]
 fn test_without_removes_matching_child() {
     // eager = SinceLastHandled(...) & !any_deps_missing & !any_deps_in_progress
-    //         & !InProgress & !ExecutionFailed
+    //         & !in_flight & !ExecutionFailed
     let eager = ConditionNode::eager();
     let result = eager.without("any_deps_in_progress");
     let expected = (ConditionNode::Missing.newly_true() | ConditionNode::any_deps_updated())
         .since_last_handled()
         & !ConditionNode::any_deps_missing()
-        & !ConditionNode::InProgress
+        & !ConditionNode::in_flight()
         & !ConditionNode::ExecutionFailed;
     assert_eq!(result, expected);
 }
 
 #[test]
 fn test_without_removes_only_exact_match() {
-    // "in_progress" should only remove Not(InProgress), not Not(any_deps_in_progress)
+    // `without` matches top-level And children. eager's in-progress guard is now
+    // nested inside `Not(in_flight())`, so "in_progress" no longer names a
+    // top-level clause (no-op); a still-top-level one ("any_deps_missing") strips.
     let eager = ConditionNode::eager();
-    let result = eager.without("in_progress");
+    assert_eq!(
+        eager.without("in_progress"),
+        eager,
+        "in_progress is nested under in_flight, not a top-level clause"
+    );
+    let result = eager.without("any_deps_missing");
     let expected = (ConditionNode::Missing.newly_true() | ConditionNode::any_deps_updated())
         .since_last_handled()
-        & !ConditionNode::any_deps_missing()
         & !ConditionNode::any_deps_in_progress()
+        & !ConditionNode::in_flight()
         & !ConditionNode::ExecutionFailed;
     assert_eq!(result, expected);
 }
@@ -3726,7 +3733,7 @@ fn test_replace_swaps_matching_node() {
         .since_last_handled()
         & !ConditionNode::any_deps_missing()
         & !ConditionNode::any_deps_in_progress()
-        & !ConditionNode::InProgress
+        & !ConditionNode::in_flight()
         & !ConditionNode::ExecutionFailed;
     assert_eq!(result, expected);
 }
@@ -3753,12 +3760,14 @@ fn test_replace_by_node_structural_match() {
         &ConditionNode::any_deps_in_progress(),
         &ConditionNode::InProgress,
     );
-    // Not(any_deps_in_progress) becomes Not(InProgress)
+    // Not(any_deps_in_progress) becomes Not(InProgress). The InProgress inside
+    // Not(in_flight()) isn't a structural any_deps_in_progress match, so the
+    // in-flight guard is untouched.
     let expected = (ConditionNode::Missing.newly_true() | ConditionNode::any_deps_updated())
         .since_last_handled()
         & !ConditionNode::any_deps_missing()
         & !ConditionNode::InProgress
-        & !ConditionNode::InProgress
+        & !ConditionNode::in_flight()
         & !ConditionNode::ExecutionFailed;
     assert_eq!(result, expected);
 }
@@ -6525,7 +6534,11 @@ async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completio
         launched_by: LaunchedBy::Manual,
     };
     storage
-        .create_runs(&[mk_run("run_a", "a"), mk_run("run_b", "b"), mk_run("run_c", "c")])
+        .create_runs(&[
+            mk_run("run_a", "a"),
+            mk_run("run_b", "b"),
+            mk_run("run_c", "c"),
+        ])
         .await
         .unwrap();
 
@@ -6567,15 +6580,15 @@ async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completio
         .get("dst")
         .expect("dst must stay in-progress while runs b and c are still running");
     assert!(
-        !tracked.contains(&"run_a".to_string()),
+        !tracked.contains_key("run_a"),
         "the completed run a should be cleared"
     );
     assert!(
-        tracked.contains(&"run_b".to_string()),
+        tracked.contains_key("run_b"),
         "still-running run b must stay tracked"
     );
     assert!(
-        tracked.contains(&"run_c".to_string()),
+        tracked.contains_key("run_c"),
         "still-running run c must stay tracked"
     );
 }
@@ -10881,11 +10894,14 @@ async fn pending_test_setup() -> (
 #[tokio::test]
 async fn test_register_dispatched_run_populates_pending_and_in_progress() {
     let (_storage, mut cache) = pending_test_setup().await;
-    cache.register_dispatched_run("a".into(), "run-1".into(), 1_000_000);
+    cache.register_dispatched_run("a".into(), "run-1".into(), 1_000_000, None);
     assert_eq!(
-        cache.in_progress_assets.get("a").map(|v| v.as_slice()),
-        Some(["run-1".to_string()].as_slice()),
-        "in_progress_assets should hold the run_id"
+        cache.in_progress_assets.get("a"),
+        Some(&HashMap::from([(
+            "run-1".to_string(),
+            None::<PartitionKey>
+        )])),
+        "in_progress_assets should hold the run_id with no partition key"
     );
     assert!(
         cache.pending_runs.contains_key("run-1"),
@@ -10901,7 +10917,7 @@ async fn test_register_dispatched_run_populates_pending_and_in_progress() {
 #[tokio::test]
 async fn test_pending_run_confirmed_by_storage_clears_pending() {
     let (storage, mut cache) = pending_test_setup().await;
-    cache.register_dispatched_run("a".into(), "run-1".into(), 1_000_000);
+    cache.register_dispatched_run("a".into(), "run-1".into(), 1_000_000, None);
 
     // Storage now reports the run as Started — phantom is no longer phantom.
     storage
@@ -10939,7 +10955,7 @@ async fn test_pending_run_confirmed_by_storage_clears_pending() {
 async fn test_pending_run_evicted_after_grace() {
     let (storage, mut cache) = pending_test_setup().await;
     cache.pending_grace_nanos = 10_000; // 10 microseconds, easy to exceed
-    cache.register_dispatched_run("a".into(), "phantom-run".into(), 1_000_000);
+    cache.register_dispatched_run("a".into(), "phantom-run".into(), 1_000_000, None);
 
     // Refresh well past the grace window with NO matching run in storage.
     cache.refresh(&storage, 1_000_000 + 100_000).await.unwrap();
@@ -10958,7 +10974,7 @@ async fn test_pending_run_evicted_after_grace() {
 async fn test_pending_run_not_evicted_within_grace() {
     let (storage, mut cache) = pending_test_setup().await;
     cache.pending_grace_nanos = 1_000_000_000; // 1 second
-    cache.register_dispatched_run("a".into(), "pending-run".into(), 1_000_000);
+    cache.register_dispatched_run("a".into(), "pending-run".into(), 1_000_000, None);
 
     // Refresh well within the grace window — no eviction yet.
     cache.refresh(&storage, 1_000_000 + 500).await.unwrap();
@@ -10970,7 +10986,7 @@ async fn test_pending_run_not_evicted_within_grace() {
         cache
             .in_progress_assets
             .get("a")
-            .is_some_and(|v| v.contains(&"pending-run".to_string())),
+            .is_some_and(|v| v.contains_key("pending-run")),
         "in_progress entry within grace should remain"
     );
 }
@@ -10982,8 +10998,8 @@ async fn test_pending_eviction_only_drops_phantom_run_id_not_other_runs() {
     // eviction must drop only the phantom, leaving the real run untouched.
     let (storage, mut cache) = pending_test_setup().await;
     cache.pending_grace_nanos = 10_000;
-    cache.register_dispatched_run("a".into(), "phantom-run".into(), 1_000_000);
-    cache.register_dispatched_run("a".into(), "real-run".into(), 1_000_000);
+    cache.register_dispatched_run("a".into(), "phantom-run".into(), 1_000_000, None);
+    cache.register_dispatched_run("a".into(), "real-run".into(), 1_000_000, None);
 
     // Confirm `real-run` via storage.
     storage
@@ -11020,11 +11036,11 @@ async fn test_pending_eviction_only_drops_phantom_run_id_not_other_runs() {
         .cloned()
         .unwrap_or_default();
     assert!(
-        in_progress.contains(&"real-run".to_string()),
+        in_progress.contains_key("real-run"),
         "real-run survives in in_progress_assets"
     );
     assert!(
-        !in_progress.contains(&"phantom-run".to_string()),
+        !in_progress.contains_key("phantom-run"),
         "phantom-run evicted from in_progress_assets"
     );
 }
@@ -11035,7 +11051,7 @@ async fn test_pending_eviction_reports_changed_so_eval_runs() {
     // re-evaluates conditions on the asset that just unblocked.
     let (storage, mut cache) = pending_test_setup().await;
     cache.pending_grace_nanos = 10_000;
-    cache.register_dispatched_run("a".into(), "phantom-run".into(), 1_000_000);
+    cache.register_dispatched_run("a".into(), "phantom-run".into(), 1_000_000, None);
 
     let changed = cache.refresh(&storage, 1_000_000 + 100_000).await.unwrap();
     assert!(
@@ -11130,7 +11146,7 @@ async fn test_cursor_backoff_doesnt_duplicate_in_progress_entries() {
         .cloned()
         .unwrap_or_default();
     assert_eq!(
-        entries.iter().filter(|id| id.as_str() == "r1").count(),
+        entries.keys().filter(|id| id.as_str() == "r1").count(),
         1,
         "run_id should appear exactly once in in_progress_assets despite \
          both initial_load and the cursor-rewound refresh observing the run"
@@ -11261,8 +11277,8 @@ async fn test_mixed_status_order_started_after_success_lands_in_progress() {
         .cloned()
         .unwrap_or_default();
     assert_eq!(
-        ids.as_slice(),
-        &["new-started".to_string()],
+        ids.keys().cloned().collect::<Vec<_>>(),
+        vec!["new-started".to_string()],
         "newer Started run must leave 'a' in-progress after older Success \
          run cleared it; if iteration order flipped, 'a' would incorrectly \
          be reported as not-in-progress"

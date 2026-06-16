@@ -62,9 +62,9 @@ def hourly_aggregate(raw_events: list) -> int:
     return len(raw_events)
 ```
 
-`eager()` is the most common preset — "materialize when any dep updates, skip while a dep is in progress, and don't refire while already running." Other presets:
+`eager()` is the most common preset — "materialize when any dep updates, skip while a dep is in progress, and don't refire while already in flight (a run *or* an active backfill)." Other presets:
 
-- `on_cron("0 * * * *")` — fire on a cron schedule, but only after every dep has updated since the last cron tick.
+- `on_cron("0 * * * *")` — fire on a cron schedule, but only after every dep has updated since the last cron tick. Won't overlap a run that's still in flight.
 - `on_missing()` — fire once when the asset becomes missing, then stop.
 
 You can also build conditions from leaf primitives (`missing()`, `code_version_changed()`, `any_deps_updated()`, etc.) using `&` / `|` / `~`. See the [Automation API reference](../api-reference/automation.md) for the full operator catalog.

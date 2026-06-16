@@ -55,7 +55,7 @@ pub struct PartitionStatusEntry {
 
 /// Backfill tracking state — which assets are in active backfills and which
 /// partitions they target. Passed as a unit to the evaluator via `EvalContext`.
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 pub struct BackfillState {
     /// Maps asset_key → backfill_ids for targeted completion detection.
     pub assets: HashMap<String, Vec<String>>,
@@ -90,6 +90,7 @@ enum InProgressChange {
     Push {
         asset_key: String,
         run_id: String,
+        partition_key: Option<PartitionKey>,
     },
     /// Drop one completed run, removing the asset entry when its last run
     /// clears. Run completions use this so a backfill's still-running
@@ -166,8 +167,11 @@ pub struct AssetConditionCache {
     pub upstream_deps: HashMap<String, Vec<String>>,
     /// Downstream deps per asset (for invalidation).
     pub downstream_deps: HashMap<String, Vec<String>>,
-    /// Assets currently in in-progress runs. Maps asset_key → run_ids.
-    pub in_progress_assets: HashMap<String, Vec<String>>,
+    /// In-progress runs per asset: asset_key → (run_id → its partition key, if
+    /// any). The partition keys cover the dispatch→storage window that
+    /// `get_in_progress_partitions` (StepStart-event based) misses, feeding the
+    /// partitioned `InProgress` condition via `in_progress_partition_keys`.
+    pub in_progress_assets: HashMap<String, HashMap<String, Option<PartitionKey>>>,
     /// Assets whose latest run failed.
     pub failed_assets: HashSet<String>,
     /// Latest failure timestamp per currently-failed asset.
@@ -262,11 +266,14 @@ impl AssetConditionCache {
     /// `in_progress_assets[asset_key]` — recovering automatically from
     /// dispatch-time phantom IDs (storage write failed or OS thread
     /// panicked before recording the run).
-    pub fn register_dispatched_run(&mut self, asset_key: String, run_id: String, now: i64) {
-        self.in_progress_assets
-            .entry(asset_key.clone())
-            .or_default()
-            .push(run_id.clone());
+    pub fn register_dispatched_run(
+        &mut self,
+        asset_key: String,
+        run_id: String,
+        now: i64,
+        partition_key: Option<PartitionKey>,
+    ) {
+        self.track_in_progress_run(asset_key.clone(), run_id.clone(), partition_key);
         self.pending_runs.insert(
             run_id,
             PendingRun {
@@ -274,6 +281,40 @@ impl AssetConditionCache {
                 first_seen_ts: now,
             },
         );
+    }
+
+    /// In-flight partitions for `asset` from the cache's own tracking — the
+    /// known partition keys of its in-progress runs (see `in_progress_assets`).
+    pub fn in_progress_partition_keys(&self, asset: &str) -> HashSet<PartitionKey> {
+        self.in_progress_assets
+            .get(asset)
+            .map(|runs| runs.values().flatten().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Record an in-progress run — the one mutation path for register / `Push` /
+    /// `initial_load`.
+    fn track_in_progress_run(
+        &mut self,
+        asset_key: String,
+        run_id: String,
+        partition_key: Option<PartitionKey>,
+    ) {
+        self.in_progress_assets
+            .entry(asset_key)
+            .or_default()
+            .insert(run_id, partition_key);
+    }
+
+    /// Drop a run (removing the asset once empty) — the one path for run
+    /// completion (`ClearRun`) and phantom eviction.
+    fn untrack_in_progress_run(&mut self, asset_key: &str, run_id: &str) {
+        if let Some(runs) = self.in_progress_assets.get_mut(asset_key) {
+            runs.remove(run_id);
+            if runs.is_empty() {
+                self.in_progress_assets.remove(asset_key);
+            }
+        }
     }
 
     /// Code-location identity this cache is bound to.
@@ -403,16 +444,18 @@ impl AssetConditionCache {
                     }
                     completed_keys.push(record.asset_key.clone());
                     delta.record_updates.push(record);
-                } else if let Some(run_ids) = self.in_progress_assets.get(&record.asset_key)
-                    && storage
-                        .has_step_completed(&record.asset_key, run_ids)
-                        .await?
-                {
+                } else if let Some(runs) = self.in_progress_assets.get(&record.asset_key) {
                     // ts unchanged but step events say it finished — fall
                     // back to the in_progress map for the run_id since
                     // `record.last_run_id` may still point at the previous run.
-                    completed_keys.push(record.asset_key.clone());
-                    completed_run_ids.extend(run_ids.iter().cloned());
+                    let run_ids: Vec<String> = runs.keys().cloned().collect();
+                    if storage
+                        .has_step_completed(&record.asset_key, &run_ids)
+                        .await?
+                    {
+                        completed_keys.push(record.asset_key.clone());
+                        completed_run_ids.extend(run_ids);
+                    }
                 }
             }
             for key in &completed_keys {
@@ -427,8 +470,7 @@ impl AssetConditionCache {
             let clearable: Vec<String> = completed_keys
                 .iter()
                 .filter_map(|k| self.in_progress_assets.get(k))
-                .flatten()
-                .cloned()
+                .flat_map(|runs| runs.keys().cloned())
                 .collect();
             if !clearable.is_empty() {
                 let tracked_runs = storage.get_runs_by_ids(&clearable, None).await?;
@@ -483,6 +525,7 @@ impl AssetConditionCache {
                             delta.in_progress_changes.push(InProgressChange::Push {
                                 asset_key: asset.clone(),
                                 run_id: run.run_id.clone(),
+                                partition_key: run.partition_key.clone(),
                             });
                         }
                     }
@@ -515,9 +558,9 @@ impl AssetConditionCache {
             }
         }
 
-        // Only fetch downstream records / partition status / backfill state
-        // when something actually completed; Started-only ticks deliberately
-        // keep the previous record state (see filter above).
+        // Only fetch downstream records / partition status when something
+        // actually completed; Started-only ticks deliberately keep the previous
+        // record state (see filter above).
         if !invalidated_keys.is_empty() {
             delta.changed = true;
             let downstream_records = self
@@ -528,8 +571,16 @@ impl AssetConditionCache {
             delta.partition_status = self
                 .fetch_partition_status_for_invalidated(storage, &invalidated_keys)
                 .await?;
+        }
 
-            delta.backfill = Some(self.fetch_updated_backfill_state(storage).await?);
+        // Refresh backfill state every tick: with `!in_flight()` the sole dispatch
+        // gate now, `BackfillInProgress` must stay current even on no-completion
+        // ticks (sub-runs register lazily). Mark the tick changed only when it
+        // actually moves, so idle ticks still skip.
+        let new_backfill = self.fetch_updated_backfill_state(storage).await?;
+        if new_backfill != self.backfill {
+            delta.changed = true;
+            delta.backfill = Some(new_backfill);
         }
 
         self.fetch_refresh_observations_delta(storage, &mut delta)
@@ -815,19 +866,13 @@ impl AssetConditionCache {
         // newly-Started run alongside a freshly-completed one); order keeps both.
         for change in in_progress_changes {
             match change {
-                InProgressChange::Push { asset_key, run_id } => {
-                    self.in_progress_assets
-                        .entry(asset_key)
-                        .or_default()
-                        .push(run_id);
-                }
+                InProgressChange::Push {
+                    asset_key,
+                    run_id,
+                    partition_key,
+                } => self.track_in_progress_run(asset_key, run_id, partition_key),
                 InProgressChange::ClearRun { asset_key, run_id } => {
-                    if let Some(run_ids) = self.in_progress_assets.get_mut(&asset_key) {
-                        run_ids.retain(|id| id != &run_id);
-                        if run_ids.is_empty() {
-                            self.in_progress_assets.remove(&asset_key);
-                        }
-                    }
+                    self.untrack_in_progress_run(&asset_key, &run_id)
                 }
                 InProgressChange::AssetClear(asset_key) => {
                     self.in_progress_assets.remove(asset_key.as_str());
@@ -907,12 +952,7 @@ impl AssetConditionCache {
 
         for (asset_key, run_id) in evicted_pending {
             self.pending_runs.remove(&run_id);
-            if let Some(run_ids) = self.in_progress_assets.get_mut(&asset_key) {
-                run_ids.retain(|id| id != &run_id);
-                if run_ids.is_empty() {
-                    self.in_progress_assets.remove(&asset_key);
-                }
-            }
+            self.untrack_in_progress_run(&asset_key, &run_id);
             tracing::warn!(
                 target: "rivers::daemon",
                 asset_key = %asset_key,
@@ -947,10 +987,11 @@ impl AssetConditionCache {
             .await?;
         for run in &started_runs {
             for asset in &run.node_names {
-                self.in_progress_assets
-                    .entry(asset.clone())
-                    .or_default()
-                    .push(run.run_id.clone());
+                self.track_in_progress_run(
+                    asset.clone(),
+                    run.run_id.clone(),
+                    run.partition_key.clone(),
+                );
             }
         }
 
