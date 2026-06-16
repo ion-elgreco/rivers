@@ -928,7 +928,11 @@ fn eval_partitioned<O: PartEvalOutput>(
                     },
                     None => match prev_timestamps.and_then(|pt| pt.get(pk)) {
                         Some(&prev) => ts > prev,
-                        None => true, // newly appeared partition
+                        // No baseline: on the initial tick the partition was
+                        // already materialized before the daemon started — not a
+                        // new update, so suppress (mirror of the unpartitioned
+                        // arm). Non-initial → it appeared between ticks → fire.
+                        None => !ctx.is_initial,
                     },
                 })
                 .map(|(pk, _)| pk.clone())

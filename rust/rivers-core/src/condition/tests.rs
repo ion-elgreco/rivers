@@ -7556,6 +7556,58 @@ fn test_partitioned_newly_updated() {
 }
 
 #[test]
+fn test_partitioned_newly_updated_suppressed_on_initial_tick() {
+    // On the very first tick (is_initial=true), partitions already materialized
+    // before the daemon started have no previous baseline and must NOT count as
+    // newly updated — mirror of the unpartitioned guard. Otherwise a bare
+    // newly_updated() re-fires every materialized partition on every restart.
+    let record = make_materialized_record("a", 200);
+    let records = HashMap::from([("a".into(), record.clone())]);
+    let deps = HashMap::new();
+    let pdata =
+        OwnedPartitionData::new(&["p1", "p2"], &["p1", "p2"], &[("p1", 100), ("p2", 200)]);
+    let prev = AssetConditionState::default(); // no partition_state → no baselines
+    let pctx = pdata.as_eval_ctx();
+    let mut ctx = EvalContext {
+        target_key: "a",
+        root_key: "a",
+        target_record: &record,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &EMPTY_SET,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &prev,
+        all_asset_states: &EMPTY_ASSET_STATES,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: 1_000_000_000_000,
+        is_initial: true,
+        partitions: Some(&pctx),
+        root_partition_floor: None,
+    };
+
+    let result = evaluate(&ConditionNode::NewlyUpdated, &ctx);
+    assert!(
+        !result.fired,
+        "initial tick: pre-existing partitions must not be newly updated, got {:?}",
+        result.selection
+    );
+
+    // Boundary: on a non-initial tick the same baseline-less partitions are
+    // genuinely new (appeared between ticks) and DO fire.
+    ctx.is_initial = false;
+    let result2 = evaluate(&ConditionNode::NewlyUpdated, &ctx);
+    assert!(
+        result2.fired,
+        "non-initial tick: baseline-less partitions appeared between ticks and should fire"
+    );
+}
+
+#[test]
 fn test_partitioned_and() {
     // And(Missing, Not(InProgress))
     // 3 partitions: p1 materialized, p2 missing, p3 missing+in_progress
