@@ -291,6 +291,44 @@ class TestCronValidation:
 
 
 # ---------------------------------------------------------------------------
+# without()
+# ---------------------------------------------------------------------------
+
+
+class TestWithout:
+    def test_without_negated_guard_by_object(self):
+        # The And child is Not(any_deps_in_progress); pass it as it appears (~X).
+        ac = rs.AutomationCondition
+        n = len(ac.eager().children)
+        pruned = ac.eager().without(~ac.any_deps_in_progress())
+        descs = " ".join(c.description for c in pruned.children)
+        assert "any_deps_in_progress" not in descs
+        assert len(pruned.children) == n - 1
+
+    def test_without_negated_guard_by_description_string(self):
+        ac = rs.AutomationCondition
+        pruned = ac.eager().without("~any_deps_in_progress")
+        descs = " ".join(c.description for c in pruned.children)
+        assert "any_deps_in_progress" not in descs
+
+    def test_without_bare_does_not_match_negated_guard(self):
+        # X and ~X are opposites: passing the bare form must NOT drop Not(X).
+        ac = rs.AutomationCondition
+        n = len(ac.eager().children)
+        for arg in (ac.any_deps_in_progress(), "any_deps_in_progress"):
+            pruned = ac.eager().without(arg)
+            assert len(pruned.children) == n, f"{arg!r} must not match the Not(...) guard"
+
+    def test_without_bare_operand_structural(self):
+        # A non-negated operand is removed by passing it as-is (structural ==).
+        ac = rs.AutomationCondition
+        cond = ac.any_deps_match(ac.missing()) & ac.in_progress()
+        assert len(cond.children) == 2
+        pruned = cond.without(ac.any_deps_match(ac.missing()))
+        assert [c.description for c in pruned.children] == ["in_progress"]
+
+
+# ---------------------------------------------------------------------------
 # Asset integration
 # ---------------------------------------------------------------------------
 

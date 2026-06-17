@@ -406,17 +406,10 @@ impl ConditionNode {
         }
     }
 
-    /// Remove children from an `And` node whose effective label matches.
-    /// For `Not(X)`, the effective label is X's label (unwraps one layer of Not).
-    pub fn without(&self, label: &str) -> ConditionNode {
+    pub fn without_matching(&self, pred: &dyn Fn(&ConditionNode) -> bool) -> ConditionNode {
         match self {
             ConditionNode::And(children) => {
-                let filtered: Vec<_> = children
-                    .iter()
-                    .filter(|c| c.effective_label() != label)
-                    .cloned()
-                    .collect();
-                ConditionNode::And(filtered)
+                ConditionNode::And(children.iter().filter(|&c| !pred(c)).cloned().collect())
             }
             other => other.clone(),
         }
@@ -441,15 +434,6 @@ impl ConditionNode {
             | ConditionNode::AllDepsMatch { condition, .. }
             | ConditionNode::AssetMatches { condition, .. } => condition.contains_label(label),
             _ => false,
-        }
-    }
-
-    /// The label used for matching in `without()`. Unwraps `Not` to get the
-    /// inner node's label, since And children are typically `Not(condition)`.
-    pub fn effective_label(&self) -> String {
-        match self {
-            ConditionNode::Not(inner) => inner.node_label(),
-            other => other.node_label(),
         }
     }
 

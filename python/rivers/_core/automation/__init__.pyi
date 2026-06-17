@@ -9,8 +9,8 @@ class AutomationCondition:
         # Eager: materialize when deps update or asset is missing
         AutomationCondition.eager()
 
-        # Custom: fire on cron, but skip if any dep is in progress
-        AutomationCondition.on_cron("0 * * * *").without("any_deps_in_progress")
+        # Custom: eager, but fire even while a dep is in progress
+        AutomationCondition.eager().without(~AutomationCondition.any_deps_in_progress())
 
         # Check a specific asset's state
         AutomationCondition.newly_updated().on_selected("upstream_feed")
@@ -304,17 +304,20 @@ class AutomationCondition:
         self,
         condition: str | AutomationCondition,
     ) -> AutomationCondition:
-        """Remove a child from an And condition.
+        """Remove an operand from an And condition.
 
-        Matches by effective label — for ``~cond`` children, matches against
-        the inner condition's label.
+        An operand is matched structurally: pass it exactly as it appears, so
+        ``~cond`` removes a ``Not(cond)`` guard. A string is matched against an
+        operand's full description, e.g. ``"~any_deps_missing"``.
 
         Args:
-            condition: A label string or condition identifying the child to remove.
+            condition: The operand to remove — a condition (``~X`` to drop a
+                negated guard) or its description string.
 
         Example::
 
-            AutomationCondition.eager().without("any_deps_in_progress")
+            AutomationCondition.eager().without(~AutomationCondition.any_deps_missing())
+            AutomationCondition.eager().without("~any_deps_in_progress")
         """
         ...
     def with_label(self, label: str) -> AutomationCondition:

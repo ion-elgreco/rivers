@@ -409,16 +409,20 @@ impl PyAutomationCondition {
         })
     }
 
-    /// Remove a child from an And condition by label or condition.
+    /// Remove an operand from an `And` condition.
+    ///
+    /// A condition object is matched structurally`.
+    /// A string is matched against an operand's full description, e.g.
+    /// `"~any_deps_missing"`.
     fn without(&self, condition: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let label = if let Ok(s) = condition.extract::<String>() {
-            s
+        let node = if let Ok(s) = condition.extract::<String>() {
+            self.node.without_matching(&|child| description(child) == s)
         } else {
-            let cond = condition.extract::<PyAutomationCondition>()?;
-            cond.label.unwrap_or_else(|| description(&cond.node))
+            let target = condition.extract::<PyAutomationCondition>()?.node;
+            self.node.without_matching(&|child| *child == target)
         };
         Ok(Self {
-            node: self.node.without(&label),
+            node,
             label: self.label.clone(),
         })
     }
