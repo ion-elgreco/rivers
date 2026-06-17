@@ -402,7 +402,11 @@ impl PyAutomationCondition {
             s
         } else {
             let cond = condition.extract::<PyAutomationCondition>()?;
-            cond.label.unwrap_or_else(|| description(&cond.node))
+            // Match the key `ConditionNode::without` actually compares against:
+            // the node's non-recursive effective label (unwrapping one Not). The
+            // wrapper `label` is the recursive `description()` (set by new_node),
+            // which never equals an And child's effective label.
+            cond.node.effective_label()
         };
         Ok(Self {
             node: self.node.without(&label),

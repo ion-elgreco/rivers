@@ -270,6 +270,34 @@ class TestRepr:
 
 
 # ---------------------------------------------------------------------------
+# without()
+# ---------------------------------------------------------------------------
+
+
+class TestWithout:
+    def test_without_by_label_string(self):
+        # Removing a labeled child by its string label (the documented path).
+        cond = rs.AutomationCondition.eager().without("any_deps_in_progress")
+        descs = " ".join(c.description for c in cond.children)
+        assert "any_deps_in_progress" not in descs
+
+    def test_without_removes_labelless_composite_child(self):
+        # A label-less composite passed to without() must be matched by its
+        # effective label (the non-recursive node label), not its recursive
+        # description — which never equals an And child's label, so the child
+        # would silently survive.
+        ac = rs.AutomationCondition
+        cond = ac.any_deps_match(ac.missing()) & ac.in_progress()
+        assert len(cond.children) == 2
+        pruned = cond.without(ac.any_deps_match(ac.missing()))
+        assert len(pruned.children) == 1, (
+            "without() should drop the dep-match child; got "
+            f"{[c.description for c in pruned.children]}"
+        )
+        assert pruned.children[0].description == "in_progress"
+
+
+# ---------------------------------------------------------------------------
 # Asset integration
 # ---------------------------------------------------------------------------
 
