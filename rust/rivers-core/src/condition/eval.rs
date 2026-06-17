@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use crate::storage::PartitionKey;
 
 use super::node::ConditionNode;
-use super::partition::{PartitionEvalContext, PartitionResolver, PartitionSelection};
+use super::partition::{PartitionEvalContext, PartitionResolver, PartitionSelection, PartitionState};
 use super::state::{AssetConditionState, EvalContext, EvalNodeResult, EvalResult, NodeStatus};
 
 // These traits abstract over "bool only" vs "bool + tree" output modes,
@@ -181,8 +181,15 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
     if let Some(pctx) = ctx.partitions {
         let mut counter = 0u32;
         let mut sub_selections = HashMap::new();
-        let selection: PartitionSelection =
-            eval_partitioned(node, ctx, pctx, &mut counter, &mut sub_selections);
+        let mut dep_selections = HashMap::new();
+        let selection: PartitionSelection = eval_partitioned(
+            node,
+            ctx,
+            pctx,
+            &mut counter,
+            &mut sub_selections,
+            &mut dep_selections,
+        );
         let fired = !selection.is_empty();
         tracing::debug!(
             target: "rivers::condition",
@@ -195,11 +202,14 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
             sub_results: HashMap::new(),
             selection: Some(selection),
             sub_selections: Some(sub_selections),
+            dep_sub_results: HashMap::new(),
+            dep_sub_selections: Some(dep_selections),
         }
     } else {
         let mut counter = 0u32;
         let mut sub_results = HashMap::new();
-        let fired: bool = eval_inner(node, ctx, &mut counter, &mut sub_results);
+        let mut dep_results = HashMap::new();
+        let fired: bool = eval_inner(node, ctx, &mut counter, &mut sub_results, &mut dep_results);
         tracing::debug!(
             target: "rivers::condition",
             asset_key = %ctx.target_key,
@@ -211,6 +221,8 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
             sub_results,
             selection: None,
             sub_selections: None,
+            dep_sub_results: dep_results,
+            dep_sub_selections: None,
         }
     }
 }
@@ -226,6 +238,7 @@ fn eval_inner<O: EvalOutput>(
     ctx: &EvalContext,
     counter: &mut u32,
     sub_results: &mut HashMap<u32, bool>,
+    dep_results: &mut HashMap<String, HashMap<u32, bool>>,
 ) -> O {
     let my_idx = *counter;
     *counter += 1;
@@ -405,7 +418,7 @@ fn eval_inner<O: EvalOutput>(
                 .map(|deps| {
                     deps.iter().any(|dep| {
                         *counter = base;
-                        eval_on_dep(dep, condition, ctx, counter, sub_results)
+                        eval_on_dep(dep, condition, ctx, counter, dep_results)
                     })
                 })
                 .unwrap_or(false);
@@ -422,7 +435,7 @@ fn eval_inner<O: EvalOutput>(
                 .map(|deps| {
                     deps.iter().all(|dep| {
                         *counter = base;
-                        eval_on_dep(dep, condition, ctx, counter, sub_results)
+                        eval_on_dep(dep, condition, ctx, counter, dep_results)
                     })
                 })
                 .unwrap_or(true);
@@ -434,7 +447,7 @@ fn eval_inner<O: EvalOutput>(
             let base = *counter;
             let val = keys.iter().any(|key| {
                 *counter = base;
-                eval_on_dep(key, condition, ctx, counter, sub_results)
+                eval_on_dep(key, condition, ctx, counter, dep_results)
             });
             finalize_dep_counter(counter, base, condition);
             O::leaf(val, my_idx, node)
@@ -453,7 +466,7 @@ fn eval_inner<O: EvalOutput>(
             };
             for child in children {
                 if result {
-                    let out = eval_inner::<O>(child, ctx, counter, sub_results);
+                    let out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
                     result = out.val();
                     if O::COLLECTS_CHILDREN {
                         child_outs.push(out);
@@ -476,7 +489,7 @@ fn eval_inner<O: EvalOutput>(
             };
             for child in children {
                 if !result {
-                    let out = eval_inner::<O>(child, ctx, counter, sub_results);
+                    let out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
                     result = out.val();
                     if O::COLLECTS_CHILDREN {
                         child_outs.push(out);
@@ -491,7 +504,7 @@ fn eval_inner<O: EvalOutput>(
         }
 
         ConditionNode::Not(child) => {
-            let child_out = eval_inner::<O>(child, ctx, counter, sub_results);
+            let child_out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
             let val = !child_out.val();
             if O::COLLECTS_CHILDREN {
                 O::composite(val, my_idx, node, vec![child_out])
@@ -502,7 +515,7 @@ fn eval_inner<O: EvalOutput>(
 
         // State-tracking operators — the only ones that read/write sub_results.
         ConditionNode::NewlyTrue(child) => {
-            let child_out = eval_inner::<O>(child, ctx, counter, sub_results);
+            let child_out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
             let current = child_out.val();
             let previous = ctx
                 .prev_state
@@ -523,8 +536,8 @@ fn eval_inner<O: EvalOutput>(
         }
 
         ConditionNode::Since { trigger, reset } => {
-            let trigger_out = eval_inner::<O>(trigger, ctx, counter, sub_results);
-            let reset_out = eval_inner::<O>(reset, ctx, counter, sub_results);
+            let trigger_out = eval_inner::<O>(trigger, ctx, counter, sub_results, dep_results);
+            let reset_out = eval_inner::<O>(reset, ctx, counter, sub_results, dep_results);
             let trigger_val = trigger_out.val();
             let reset_val = reset_out.val();
             let prev_latch = ctx
@@ -547,7 +560,7 @@ fn eval_inner<O: EvalOutput>(
         }
 
         ConditionNode::SinceLastHandled(child) => {
-            let child_out = eval_inner::<O>(child, ctx, counter, sub_results);
+            let child_out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
             let current = child_out.val();
             let result = if !current {
                 false
@@ -623,8 +636,15 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
     if let Some(pctx) = ctx.partitions {
         let mut counter = 0u32;
         let mut sub_selections = HashMap::new();
-        let (selection, tree): (PartitionSelection, EvalNodeResult) =
-            eval_partitioned(node, ctx, pctx, &mut counter, &mut sub_selections);
+        let mut dep_selections = HashMap::new();
+        let (selection, tree): (PartitionSelection, EvalNodeResult) = eval_partitioned(
+            node,
+            ctx,
+            pctx,
+            &mut counter,
+            &mut sub_selections,
+            &mut dep_selections,
+        );
         let fired = !selection.is_empty();
         (
             EvalResult {
@@ -632,13 +652,17 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
                 sub_results: HashMap::new(),
                 selection: Some(selection),
                 sub_selections: Some(sub_selections),
+                dep_sub_results: HashMap::new(),
+                dep_sub_selections: Some(dep_selections),
             },
             tree,
         )
     } else {
         let mut counter = 0u32;
         let mut sub_results = HashMap::new();
-        let tree = eval_inner::<EvalNodeResult>(node, ctx, &mut counter, &mut sub_results);
+        let mut dep_results = HashMap::new();
+        let tree =
+            eval_inner::<EvalNodeResult>(node, ctx, &mut counter, &mut sub_results, &mut dep_results);
         let fired = tree.status == NodeStatus::True;
         (
             EvalResult {
@@ -646,6 +670,8 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
                 sub_results,
                 selection: None,
                 sub_selections: None,
+                dep_sub_results: dep_results,
+                dep_sub_selections: None,
             },
             tree,
         )
@@ -836,12 +862,17 @@ static EMPTY_CONDITION_STATE: std::sync::LazyLock<AssetConditionState> =
 
 /// Evaluate a condition as if `dep_key` were the target asset.
 /// Creates a temporary EvalContext pointing to the dep's record.
+///
+/// Stateful operators (`Since`/`NewlyTrue`) inside the condition latch under the
+/// ROOT's state, keyed by dep: their previous values are read from
+/// `ctx.prev_state.dep_previous_results[dep_key]` and this tick's are collected
+/// into `dep_results[dep_key]`. Factual leaves keep reading the dep's own state.
 fn eval_on_dep(
     dep_key: &str,
     condition: &ConditionNode,
     ctx: &EvalContext,
     counter: &mut u32,
-    sub_results: &mut HashMap<u32, bool>,
+    dep_results: &mut HashMap<String, HashMap<u32, bool>>,
 ) -> bool {
     let dep_record = match ctx.cache.records.get(dep_key) {
         Some(r) => r,
@@ -851,13 +882,20 @@ fn eval_on_dep(
         .all_asset_states
         .get(dep_key)
         .unwrap_or(&EMPTY_CONDITION_STATE);
+    let mut synthetic = dep_state.clone();
+    synthetic.previous_results = ctx
+        .prev_state
+        .dep_previous_results
+        .get(dep_key)
+        .cloned()
+        .unwrap_or_default();
     let dep_ctx = EvalContext {
         target_key: dep_key,
         root_key: ctx.root_key,
         target_record: dep_record,
         cache: ctx.cache,
         tags: ctx.tags,
-        prev_state: dep_state,
+        prev_state: &synthetic,
         all_asset_states: ctx.all_asset_states,
         requested_this_tick: ctx.requested_this_tick,
         now: ctx.now,
@@ -865,7 +903,12 @@ fn eval_on_dep(
         partitions: None,
         root_partition_floor: None,
     };
-    eval_inner(condition, &dep_ctx, counter, sub_results)
+    let mut local = HashMap::new();
+    let val = eval_inner(condition, &dep_ctx, counter, &mut local, dep_results);
+    if !local.is_empty() {
+        dep_results.insert(dep_key.to_string(), local);
+    }
+    val
 }
 
 /// Recursive partition-aware evaluator. Returns an `O` indicating which
@@ -880,6 +923,7 @@ fn eval_partitioned<O: PartEvalOutput>(
     pctx: &PartitionEvalContext,
     counter: &mut u32,
     sub_selections: &mut HashMap<u32, PartitionSelection>,
+    dep_selections: &mut HashMap<String, HashMap<u32, PartitionSelection>>,
 ) -> O {
     let my_idx = *counter;
     *counter += 1;
@@ -1112,12 +1156,12 @@ fn eval_partitioned<O: PartEvalOutput>(
         ),
 
         ConditionNode::AnyDepsMatch { condition, .. } => {
-            let sel = eval_partitioned_any_deps(ctx, pctx, condition, counter, sub_selections);
+            let sel = eval_partitioned_any_deps(ctx, pctx, condition, counter, dep_selections);
             O::leaf(sel, my_idx, node, total)
         }
 
         ConditionNode::AllDepsMatch { condition, .. } => {
-            let sel = eval_partitioned_all_deps(ctx, pctx, condition, counter, sub_selections);
+            let sel = eval_partitioned_all_deps(ctx, pctx, condition, counter, dep_selections);
             O::leaf(sel, my_idx, node, total)
         }
 
@@ -1127,7 +1171,7 @@ fn eval_partitioned<O: PartEvalOutput>(
             for key in keys {
                 *counter = base;
                 let key_sel =
-                    eval_partitioned_on_dep(key, condition, ctx, pctx, counter, sub_selections);
+                    eval_partitioned_on_dep(key, condition, ctx, pctx, counter, dep_selections);
                 sel = sel.union(&key_sel);
             }
             finalize_dep_counter(counter, base, condition);
@@ -1142,7 +1186,7 @@ fn eval_partitioned<O: PartEvalOutput>(
                     child_parts.push(O::skipped_child(child, counter));
                 } else {
                     let child_out =
-                        eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections);
+                        eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
                     let (child_sel, child_part) = O::into_parts(child_out);
                     result = result.intersect(&child_sel);
                     child_parts.push(child_part);
@@ -1159,7 +1203,7 @@ fn eval_partitioned<O: PartEvalOutput>(
                     child_parts.push(O::skipped_child(child, counter));
                 } else {
                     let child_out =
-                        eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections);
+                        eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
                     let (child_sel, child_part) = O::into_parts(child_out);
                     result = result.union(&child_sel);
                     child_parts.push(child_part);
@@ -1169,14 +1213,14 @@ fn eval_partitioned<O: PartEvalOutput>(
         }
 
         ConditionNode::Not(child) => {
-            let child_out = eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections);
+            let child_out = eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
             let (child_sel, child_part) = O::into_parts(child_out);
             let result = child_sel.complement(pctx.all_keys);
             O::composite(result, my_idx, node, total, vec![child_part])
         }
 
         ConditionNode::NewlyTrue(child) => {
-            let child_out = eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections);
+            let child_out = eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
             let (current, child_part) = O::into_parts(child_out);
             let previous = ctx
                 .prev_state
@@ -1192,8 +1236,10 @@ fn eval_partitioned<O: PartEvalOutput>(
         }
 
         ConditionNode::Since { trigger, reset } => {
-            let trigger_out = eval_partitioned::<O>(trigger, ctx, pctx, counter, sub_selections);
-            let reset_out = eval_partitioned::<O>(reset, ctx, pctx, counter, sub_selections);
+            let trigger_out =
+                eval_partitioned::<O>(trigger, ctx, pctx, counter, sub_selections, dep_selections);
+            let reset_out =
+                eval_partitioned::<O>(reset, ctx, pctx, counter, sub_selections, dep_selections);
             let (trigger_sel, trigger_part) = O::into_parts(trigger_out);
             let (reset_sel, reset_part) = O::into_parts(reset_out);
             let prev_latch = ctx
@@ -1212,7 +1258,7 @@ fn eval_partitioned<O: PartEvalOutput>(
         }
 
         ConditionNode::SinceLastHandled(child) => {
-            let child_out = eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections);
+            let child_out = eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
             let (current, child_part) = O::into_parts(child_out);
             let result = if current.is_empty() {
                 PartitionSelection::Empty
@@ -1262,7 +1308,7 @@ fn eval_partitioned_any_deps(
     pctx: &PartitionEvalContext,
     condition: &ConditionNode,
     counter: &mut u32,
-    sub_selections: &mut HashMap<u32, PartitionSelection>,
+    dep_selections: &mut HashMap<String, HashMap<u32, PartitionSelection>>,
 ) -> PartitionSelection {
     let base = *counter;
     let mut result = PartitionSelection::Empty;
@@ -1270,7 +1316,7 @@ fn eval_partitioned_any_deps(
         for dep in deps {
             *counter = base;
             let dep_sel =
-                eval_partitioned_on_dep(dep, condition, ctx, pctx, counter, sub_selections);
+                eval_partitioned_on_dep(dep, condition, ctx, pctx, counter, dep_selections);
             result = result.union(&dep_sel);
         }
     }
@@ -1285,7 +1331,7 @@ fn eval_partitioned_all_deps(
     pctx: &PartitionEvalContext,
     condition: &ConditionNode,
     counter: &mut u32,
-    sub_selections: &mut HashMap<u32, PartitionSelection>,
+    dep_selections: &mut HashMap<String, HashMap<u32, PartitionSelection>>,
 ) -> PartitionSelection {
     let base = *counter;
     let result = match ctx.cache.upstream_deps.get(ctx.target_key) {
@@ -1294,7 +1340,7 @@ fn eval_partitioned_all_deps(
             for dep in deps {
                 *counter = base;
                 let dep_sel =
-                    eval_partitioned_on_dep(dep, condition, ctx, pctx, counter, sub_selections);
+                    eval_partitioned_on_dep(dep, condition, ctx, pctx, counter, dep_selections);
                 result = result.intersect(&dep_sel);
                 if result.is_empty() {
                     break;
@@ -1377,12 +1423,21 @@ fn eval_partitioned_on_dep(
     ctx: &EvalContext,
     pctx: &PartitionEvalContext,
     counter: &mut u32,
-    sub_selections: &mut HashMap<u32, PartitionSelection>,
+    dep_selections: &mut HashMap<String, HashMap<u32, PartitionSelection>>,
 ) -> PartitionSelection {
     let dep_record = match ctx.cache.records.get(dep_key) {
         Some(r) => r,
         None => return PartitionSelection::Empty,
     };
+
+    // Per-dep latch lives under the root's partition state, keyed by dep.
+    let prev_dep_sel: HashMap<u32, PartitionSelection> = ctx
+        .prev_state
+        .partition_state
+        .as_ref()
+        .and_then(|ps| ps.dep_previous_selections.get(dep_key))
+        .cloned()
+        .unwrap_or_default();
 
     let upstream_all_keys: HashSet<PartitionKey> = pctx
         .resolver
@@ -1404,13 +1459,19 @@ fn eval_partitioned_on_dep(
             .all_asset_states
             .get(dep_key)
             .unwrap_or(&EMPTY_CONDITION_STATE);
+        // Recover the bool view of the per-dep latch (non-empty selection == true).
+        let mut synthetic = dep_state.clone();
+        synthetic.previous_results = prev_dep_sel
+            .iter()
+            .map(|(idx, sel)| (*idx, !sel.is_empty()))
+            .collect();
         let dep_ctx = EvalContext {
             target_key: dep_key,
             root_key: ctx.root_key,
             target_record: dep_record,
             cache: ctx.cache,
             tags: ctx.tags,
-            prev_state: dep_state,
+            prev_state: &synthetic,
             all_asset_states: ctx.all_asset_states,
             requested_this_tick: ctx.requested_this_tick,
             now: ctx.now,
@@ -1418,8 +1479,18 @@ fn eval_partitioned_on_dep(
             partitions: None,
             root_partition_floor: Some(root_floor),
         };
-        let mut sub_results = HashMap::new();
-        let val = eval_inner(condition, &dep_ctx, counter, &mut sub_results);
+        let mut local = HashMap::new();
+        let mut nested = HashMap::new();
+        let val = eval_inner(condition, &dep_ctx, counter, &mut local, &mut nested);
+        if !local.is_empty() {
+            dep_selections.insert(
+                dep_key.to_string(),
+                local
+                    .into_iter()
+                    .map(|(idx, b)| (idx, PartitionSelection::from_bool(b)))
+                    .collect(),
+            );
+        }
         return PartitionSelection::from_bool(val);
     }
 
@@ -1504,13 +1575,25 @@ fn eval_partitioned_on_dep(
         .all_asset_states
         .get(dep_key)
         .unwrap_or(&EMPTY_CONDITION_STATE);
+    // Latch state (previous_selections) comes from the root's per-dep map, in the
+    // dep's key space; everything else (timestamps, handled) stays the dep's own.
+    let mut synthetic = dep_state.clone();
+    match synthetic.partition_state.as_mut() {
+        Some(ps) => ps.previous_selections = prev_dep_sel,
+        None => {
+            synthetic.partition_state = Some(PartitionState {
+                previous_selections: prev_dep_sel,
+                ..Default::default()
+            })
+        }
+    }
     let dep_ctx = EvalContext {
         target_key: dep_key,
         root_key: ctx.root_key,
         target_record: dep_record,
         cache: ctx.cache,
         tags: ctx.tags,
-        prev_state: dep_state,
+        prev_state: &synthetic,
         all_asset_states: ctx.all_asset_states,
         requested_this_tick: ctx.requested_this_tick,
         now: ctx.now,
@@ -1519,8 +1602,13 @@ fn eval_partitioned_on_dep(
         root_partition_floor: None,
     };
 
+    let mut local = HashMap::new();
+    let mut nested = HashMap::new();
     let upstream_result: PartitionSelection =
-        eval_partitioned(condition, &dep_ctx, &upstream_pctx, counter, sub_selections);
+        eval_partitioned(condition, &dep_ctx, &upstream_pctx, counter, &mut local, &mut nested);
+    if !local.is_empty() {
+        dep_selections.insert(dep_key.to_string(), local);
+    }
 
     // Map result back to downstream partition space.
     pctx.resolver

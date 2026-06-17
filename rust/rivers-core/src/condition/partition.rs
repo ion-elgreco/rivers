@@ -449,4 +449,9 @@ pub struct PartitionState {
     pub timestamps: HashMap<PartitionKey, i64>,
     /// Partitions that have been handled (materialization triggered) since last reset.
     pub handled: HashSet<PartitionKey>,
+    /// Previous tick's selections for stateful operators evaluated INSIDE a
+    /// dep-aggregate, keyed by dep asset key then node index (in the dep's
+    /// partition key space). The partitioned twin of `dep_previous_results`.
+    #[serde(default)]
+    pub dep_previous_selections: HashMap<String, HashMap<u32, PartitionSelection>>,
 }

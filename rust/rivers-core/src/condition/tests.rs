@@ -2568,6 +2568,7 @@ fn test_last_run_includes_target_partitioned_joint_run_suppresses_newly_updated(
             previous_selections: HashMap::new(),
             timestamps: HashMap::from([(pk1.clone(), 100i64), (pk2.clone(), 100)]),
             handled: HashSet::new(),
+            dep_previous_selections: HashMap::new(),
         }),
         ..Default::default()
     };
@@ -3394,6 +3395,7 @@ fn test_last_run_includes_target_partitioned_solo_run_allows_newly_updated() {
             previous_selections: HashMap::new(),
             timestamps: HashMap::from([(pk1.clone(), 100i64)]),
             handled: HashSet::new(),
+            dep_previous_selections: HashMap::new(),
         }),
         ..Default::default()
     };
@@ -3471,6 +3473,7 @@ fn test_last_run_includes_target_partitioned_mixed_joint_and_solo() {
             previous_selections: HashMap::new(),
             timestamps: HashMap::from([(pk1.clone(), 100i64), (pk2.clone(), 100)]),
             handled: HashSet::new(),
+            dep_previous_selections: HashMap::new(),
         }),
         ..Default::default()
     };
@@ -6180,6 +6183,7 @@ fn test_invalidation_on_tree_change() {
             "asset_a".into(),
             AssetConditionState {
                 previous_results: HashMap::from([(0, true), (1, false), (2, true)]),
+                dep_previous_results: HashMap::new(),
                 last_handled_timestamp: Some(5000),
                 last_materialized_timestamp: Some(3000),
                 last_data_version: None,
@@ -6230,6 +6234,7 @@ fn test_invalidation_noop_on_unchanged_tree() {
 
     let original_state = AssetConditionState {
         previous_results: HashMap::from([(0, true), (1, false)]),
+        dep_previous_results: HashMap::new(),
         last_handled_timestamp: Some(5000),
         last_materialized_timestamp: Some(3000),
         last_data_version: None,
@@ -8448,6 +8453,7 @@ fn test_partitioned_eager_partial_upstream_update() {
             previous_selections: HashMap::new(),
             timestamps: HashMap::from([(spk("p1"), 200), (spk("p2"), 200)]),
             handled: HashSet::new(),
+            dep_previous_selections: HashMap::new(),
         }),
         ..Default::default()
     };
@@ -9957,6 +9963,8 @@ fn test_evaluate_full_result_missing() {
         sub_results: HashMap::new(),
         selection: None,
         sub_selections: None,
+        dep_sub_results: HashMap::new(),
+        dep_sub_selections: None,
     };
     assert_eq!(result, expected);
 }
@@ -9990,6 +9998,8 @@ fn test_evaluate_full_result_not_fired() {
         sub_results: HashMap::new(),
         selection: None,
         sub_selections: None,
+        dep_sub_results: HashMap::new(),
+        dep_sub_selections: None,
     };
     assert_eq!(result, expected);
 }
@@ -10051,6 +10061,8 @@ fn test_update_condition_state_basic() {
         sub_results: HashMap::from([(0, true), (1, false)]),
         selection: None,
         sub_selections: None,
+        dep_sub_results: HashMap::new(),
+        dep_sub_selections: None,
     };
     let ctx = StateUpdateContext {
         target_record_timestamp: record.last_timestamp,
@@ -10063,6 +10075,7 @@ fn test_update_condition_state_basic() {
 
     let expected = AssetConditionState {
         previous_results: HashMap::from([(0, true), (1, false)]),
+        dep_previous_results: HashMap::new(),
         last_handled_timestamp: None,
         last_materialized_timestamp: Some(500),
         last_data_version: Some("dv_a".to_string()),
@@ -11521,5 +11534,154 @@ fn test_all_deps_aggregate_index_stable_with_zero_deps() {
     assert_eq!(
         keys0, keys1,
         "NewlyTrue index drifted: {keys0:?} (0 deps) vs {keys1:?} (1 dep)"
+    );
+}
+
+/// `on_cron` expands to `AllDepsMatch(Since(NewlyUpdated, reset) | ...)`: the SR
+/// latch lives INSIDE the dep-aggregate, so each dep's "updated since reset"
+/// state must persist per-dep across ticks. Without per-dep state the latch
+/// writes root state but reads dep state, never round-trips, and the aggregate
+/// stops firing the moment the trigger goes false.
+#[test]
+fn test_dep_aggregate_since_latch_persists_per_dep() {
+    let tree = ConditionNode::all_deps_match(
+        ConditionNode::NewlyUpdated.since(ConditionNode::ExecutionFailed),
+    );
+
+    // dep "a" materialized at 100, with no latch state of its own.
+    let a_state = AssetConditionState {
+        last_materialized_timestamp: Some(100),
+        ..Default::default()
+    };
+    let all_states = HashMap::from([("a".to_string(), a_state)]);
+    let deps = HashMap::from([("r".to_string(), vec!["a".to_string()])]);
+    let a = make_materialized_record("a", 100);
+
+    // ── Tick 1: root unmaterialized → NewlyUpdated(a) true → latch sets true ──
+    let r1 = make_record("r");
+    let records1 = HashMap::from([("r".to_string(), r1.clone()), ("a".to_string(), a.clone())]);
+    let mut ctx1 = make_ctx("r", &r1, &records1, &deps);
+    ctx1.all_asset_states = &all_states;
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: a is newly updated, latch fires");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext::from_eval_context(&ctx1),
+        &result1,
+    );
+
+    // ── Tick 2: root now materialized newer than a → NewlyUpdated(a) false and
+    //    reset (ExecutionFailed) false → the latch must STAY true from tick 1 ──
+    let r2 = make_materialized_record("r", 200);
+    let records2 = HashMap::from([("r".to_string(), r2.clone()), ("a".to_string(), a.clone())]);
+    let mut ctx2 = make_ctx("r", &r2, &records2, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.all_asset_states = &all_states;
+    ctx2.now = 2000;
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        result2.fired,
+        "tick 2: the per-dep latch set on tick 1 must persist so the aggregate keeps firing"
+    );
+}
+
+/// Partitioned twin of the per-dep latch test: each dep's `Since` latch must
+/// persist per-partition under the ROOT's partition state across ticks. Tick 1
+/// latches via the trigger; tick 2 (trigger now false, reset false) must keep
+/// firing from the persisted latch.
+#[test]
+fn test_dep_aggregate_partitioned_since_latch_persists_per_dep() {
+    let tree = ConditionNode::all_deps_match(
+        ConditionNode::NewlyUpdated.since(ConditionNode::ExecutionFailed),
+    );
+
+    let a = make_materialized_record("a", 200);
+    let b = make_materialized_record("b", 100);
+    let records = HashMap::from([("a".into(), a.clone()), ("b".into(), b.clone())]);
+    let deps = HashMap::from([("b".into(), vec!["a".into()])]);
+
+    let upstream_keys: HashMap<String, HashSet<PartitionKey>> =
+        HashMap::from([("a".into(), HashSet::from([spk("p1"), spk("p2")]))]);
+    let mappings = HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]);
+    let all_keys = HashSet::from([spk("p1"), spk("p2")]);
+
+    // dep "a" materialized @200 on both ticks; "a" itself failing never (reset off).
+    let a_status = || crate::condition::cache::PartitionStatusEntry {
+        materialized: HashSet::from([spk("p1"), spk("p2")]),
+        in_progress: HashSet::new(),
+        failed: HashSet::new(),
+        failed_timestamps: HashMap::new(),
+        timestamps: HashMap::from([(spk("p1"), 200), (spk("p2"), 200)]),
+    };
+
+    // ── Tick 1: root "b" never materialized → floor None → NewlyUpdated(a) fires,
+    //    latch sets true for both partitions ──
+    let statuses1 = HashMap::from([("a".to_string(), a_status())]);
+    let empty_ts: HashMap<PartitionKey, i64> = HashMap::new();
+    let empty_set: HashSet<PartitionKey> = HashSet::new();
+    let pctx1 = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &empty_set,
+        in_progress: &empty_set,
+        failed: &empty_set,
+        timestamps: &empty_ts,
+        resolver: PartitionResolver::new(&mappings, &upstream_keys),
+        latest_time_window_keys: None,
+        all_partition_statuses: &statuses1,
+        dep_root_floor: None,
+    };
+    let prev1 = AssetConditionState::default();
+    let mut ctx1 = make_ctx("b", &b, &records, &deps);
+    ctx1.prev_state = &prev1;
+    ctx1.partitions = Some(&pctx1);
+    ctx1.now = 1000;
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: deps updated since reset → latch fires");
+
+    let mut state_b = AssetConditionState::default();
+    update_condition_state(
+        &mut state_b,
+        &StateUpdateContext::from_eval_context(&ctx1),
+        &result1,
+    );
+
+    // ── Tick 2: root "b" materialized @300 (newer than a's 200) → NewlyUpdated(a)
+    //    false, reset false → the per-partition latch must persist ──
+    let b_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: HashSet::from([spk("p1"), spk("p2")]),
+        in_progress: HashSet::new(),
+        failed: HashSet::new(),
+        failed_timestamps: HashMap::new(),
+        timestamps: HashMap::from([(spk("p1"), 300), (spk("p2"), 300)]),
+    };
+    let statuses2 = HashMap::from([("a".to_string(), a_status()), ("b".to_string(), b_status)]);
+    let b_ts = HashMap::from([(spk("p1"), 300i64), (spk("p2"), 300)]);
+    let mat2 = HashSet::from([spk("p1"), spk("p2")]);
+    let pctx2 = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &mat2,
+        in_progress: &empty_set,
+        failed: &empty_set,
+        timestamps: &b_ts,
+        resolver: PartitionResolver::new(&mappings, &upstream_keys),
+        latest_time_window_keys: None,
+        all_partition_statuses: &statuses2,
+        dep_root_floor: None,
+    };
+    let mut ctx2 = make_ctx("b", &b, &records, &deps);
+    ctx2.prev_state = &state_b;
+    ctx2.partitions = Some(&pctx2);
+    ctx2.now = 2000;
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        result2.fired,
+        "tick 2: per-partition dep latch must persist so the aggregate keeps firing"
+    );
+    assert_eq!(
+        result2.selection.unwrap(),
+        PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2")])),
+        "both partitions stay latched"
     );
 }
