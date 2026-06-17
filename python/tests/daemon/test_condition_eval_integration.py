@@ -1359,15 +1359,12 @@ class TestPartitionedNewlyUpdatedRefire:
 
 class TestDepAggregateCounterStability:
     def test_no_spurious_refire_when_dep_count_changes(self, storage):
-        """A stateful node placed AFTER a dep-aggregate must keep a stable node
-        index when the asset's dep COUNT changes (the condition tree — and thus
-        its fingerprint — is unchanged, so the persisted latch is NOT reset).
-
-        Before the deterministic-counter fix, an evaluated dep-aggregate consumed
-        ``num_deps * count_nodes(condition)`` node-index slots, so dropping an
-        upstream dependency shifted the trailing ``newly_true``'s index. It then read its
-        latch from the wrong key and spuriously re-fired after a redeploy that
-        removed a dependency.
+        """A stateful node after a dep-aggregate must keep a stable index when
+        the dep count changes (same condition tree → fingerprint unchanged → the
+        latch is not reset). Before the deterministic-counter fix the aggregate
+        consumed one index slot per dep, so dropping an upstream shifted the
+        trailing ``newly_true``, which then read its latch from the wrong key and
+        spuriously re-fired.
         """
         # `any_deps_match(execution_failed)` is false (no dep failed) so `.any()`
         # scans ALL deps — its slot count grows with the dep count. The trailing
@@ -1440,4 +1437,73 @@ class TestDepAggregateCounterStability:
         assert after == baseline, (
             "dropping an upstream dep shifted the trailing newly_true's node "
             f"index and spuriously re-fired r: {baseline} -> {after} runs"
+        )
+
+
+class TestDepAggregateLatchPersistence:
+    def test_since_latch_inside_aggregate_persists_across_restart(self, storage):
+        """A ``Since`` latch INSIDE ``all_deps_match`` (the shape ``on_cron``
+        uses) must persist per-dep across ticks/restarts.
+
+        With no firing reset, once ``a`` is newly-updated the latch stays true and
+        the aggregate keeps firing. After ``r`` materializes, ``newly_updated(a)``
+        goes false (its floor caught up), so only the persisted latch keeps it
+        firing. Without per-dep persistence the latch is written to the root's
+        state but read from the dep's — it never round-trips, so ``r`` stops.
+        """
+        cond = rs.AutomationCondition.all_deps_match(
+            rs.AutomationCondition.newly_updated().since(
+                rs.AutomationCondition.execution_failed()
+            )
+        )
+
+        @rs.Asset(name="a", io_handler=rs.InMemoryIOHandler())
+        def a() -> int:
+            return 1
+
+        @rs.Asset(
+            name="r", io_handler=rs.InMemoryIOHandler(), automation_condition=cond
+        )
+        def r(a: int) -> int:
+            return a
+
+        repo = rs.CodeRepository(
+            assets=[a, r], default_executor=rs.Executor.in_process()
+        )
+        repo.resolve(storage=storage)
+        # a is updated, r is not → newly_updated(a) fires in the dep pivot.
+        repo.materialize(selection=["a"])
+
+        # Run 1: latch sets true, r materializes; after r's floor catches up the
+        # trigger is false but the latch holds, so r keeps firing.
+        daemon1 = AutomationDaemon(
+            repo=repo, storage=storage, condition_eval_interval="300ms"
+        )
+        daemon1.start()
+        try:
+            time.sleep(3.0)
+        finally:
+            daemon1.stop()
+        assert storage.get_latest_materialization("r", None) is not None, (
+            "run 1: r should have materialized once its dep was newly updated"
+        )
+
+        baseline = len(storage.get_runs(limit=500))
+
+        # Run 2 (restart): a is unchanged and r is materialized, so the
+        # newly_updated(a) trigger is false. Only the persisted per-dep latch can
+        # keep the aggregate firing.
+        daemon2 = AutomationDaemon(
+            repo=repo, storage=storage, condition_eval_interval="300ms"
+        )
+        daemon2.start()
+        try:
+            time.sleep(3.0)
+        finally:
+            daemon2.stop()
+
+        after = len(storage.get_runs(limit=500))
+        assert after > baseline, (
+            "the Since latch inside all_deps_match did not persist per-dep: r "
+            f"stopped firing after its trigger went false ({baseline} -> {after} runs)"
         )

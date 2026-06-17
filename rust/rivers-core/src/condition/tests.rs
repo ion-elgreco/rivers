@@ -11688,3 +11688,79 @@ fn test_dep_aggregate_partitioned_since_latch_persists_per_dep() {
         "both partitions stay latched"
     );
 }
+
+/// A stateful op nested two dep-hops deep (`r → x → y`, latch on grandparent
+/// `y`) must persist under the root's per-dep state — the read comes from the
+/// ROOT's dep map, not the intermediate dep's own state.
+#[test]
+fn test_nested_dep_aggregate_since_latch_persists() {
+    let tree = ConditionNode::any_deps_match(ConditionNode::any_deps_match(
+        ConditionNode::NewlyUpdated.since(ConditionNode::ExecutionFailed),
+    ));
+
+    let x = make_materialized_record("x", 100);
+    let y = make_materialized_record("y", 100);
+    let deps = HashMap::from([
+        ("r".to_string(), vec!["x".to_string()]),
+        ("x".to_string(), vec!["y".to_string()]),
+    ]);
+    // x and y carry no latch state of their own.
+    let all_states = HashMap::from([
+        (
+            "x".to_string(),
+            AssetConditionState {
+                last_materialized_timestamp: Some(100),
+                ..Default::default()
+            },
+        ),
+        (
+            "y".to_string(),
+            AssetConditionState {
+                last_materialized_timestamp: Some(100),
+                ..Default::default()
+            },
+        ),
+    ]);
+
+    // ── Tick 1: root unmaterialized → NewlyUpdated(y) true → latch sets true ──
+    let r1 = make_record("r");
+    let records1 = HashMap::from([
+        ("r".to_string(), r1.clone()),
+        ("x".to_string(), x.clone()),
+        ("y".to_string(), y.clone()),
+    ]);
+    let mut ctx1 = make_ctx("r", &r1, &records1, &deps);
+    ctx1.all_asset_states = &all_states;
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(
+        result1.fired,
+        "tick 1: grandparent y is newly updated, latch fires"
+    );
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext::from_eval_context(&ctx1),
+        &result1,
+    );
+
+    // ── Tick 2: root materialized newer than y → NewlyUpdated(y) false, reset
+    //    false → the latch on the grandparent must persist (read from the ROOT's
+    //    per-dep state keyed by y, even though y is reached via a nested
+    //    dep-aggregate) ──
+    let r2 = make_materialized_record("r", 200);
+    let records2 = HashMap::from([
+        ("r".to_string(), r2.clone()),
+        ("x".to_string(), x.clone()),
+        ("y".to_string(), y.clone()),
+    ]);
+    let mut ctx2 = make_ctx("r", &r2, &records2, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.all_asset_states = &all_states;
+    ctx2.now = 2000;
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        result2.fired,
+        "tick 2: a latch nested two dep-hops deep must persist under the root's state"
+    );
+}
