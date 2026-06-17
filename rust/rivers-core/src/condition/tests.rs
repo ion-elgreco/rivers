@@ -11444,3 +11444,82 @@ async fn test_cursor_backoff_lets_init_racing_run_be_observed_terminal() {
          is observed; without the cursor backoff + ASC ordering this fails"
     );
 }
+
+/// A dep-aggregate must consume a deterministic number of node-index slots,
+/// independent of how many deps it has. Otherwise a stateful node placed after
+/// it (here `NewlyTrue`) lands at a different `sub_results` index when the dep
+/// count changes — and since adding/removing a dep does NOT change the condition
+/// tree fingerprint, the persisted latch is read from the wrong key next tick.
+#[test]
+fn test_any_deps_aggregate_index_stable_across_dep_count() {
+    // `Or` (not `And`): the aggregate is false here, so a parent `And` would
+    // short-circuit and skip `NewlyTrue`; `Or` keeps evaluating, so the trailing
+    // stateful node still runs and records its index.
+    let tree = ConditionNode::Or(vec![
+        ConditionNode::any_deps_match(ConditionNode::NewlyUpdated),
+        ConditionNode::NewlyTrue(Box::new(ConditionNode::Missing)),
+    ]);
+
+    // Root materialized newer than its deps so `NewlyUpdated` is false for every
+    // dep — this forces `.any()` to scan ALL deps (no short-circuit), exposing the
+    // per-dep counter growth.
+    let d = make_materialized_record("d", 200);
+    let a = make_materialized_record("a", 100);
+    let b = make_materialized_record("b", 100);
+
+    // Two deps.
+    let records2 = HashMap::from([
+        ("d".to_string(), d.clone()),
+        ("a".to_string(), a.clone()),
+        ("b".to_string(), b.clone()),
+    ]);
+    let deps2 = HashMap::from([("d".to_string(), vec!["a".to_string(), "b".to_string()])]);
+    let ctx2 = make_ctx("d", &d, &records2, &deps2);
+    let mut keys2: Vec<u32> = evaluate(&tree, &ctx2).sub_results.into_keys().collect();
+    keys2.sort_unstable();
+
+    // One dep.
+    let records1 = HashMap::from([("d".to_string(), d.clone()), ("a".to_string(), a.clone())]);
+    let deps1 = HashMap::from([("d".to_string(), vec!["a".to_string()])]);
+    let ctx1 = make_ctx("d", &d, &records1, &deps1);
+    let mut keys1: Vec<u32> = evaluate(&tree, &ctx1).sub_results.into_keys().collect();
+    keys1.sort_unstable();
+
+    assert_eq!(
+        keys1, keys2,
+        "NewlyTrue index drifted with dep count: {keys1:?} (1 dep) vs {keys2:?} (2 deps)"
+    );
+}
+
+/// A dep-aggregate with zero deps must still advance the counter past its inner
+/// condition, matching the non-empty case. Otherwise a trailing stateful node
+/// shifts index the moment the asset gains its first dep.
+#[test]
+fn test_all_deps_aggregate_index_stable_with_zero_deps() {
+    let tree = ConditionNode::And(vec![
+        ConditionNode::all_deps_match(ConditionNode::NewlyUpdated),
+        ConditionNode::NewlyTrue(Box::new(ConditionNode::Missing)),
+    ]);
+
+    let d = make_record("d");
+    let a = make_materialized_record("a", 100);
+
+    // Zero deps.
+    let records0 = HashMap::from([("d".to_string(), d.clone())]);
+    let deps0 = HashMap::new();
+    let ctx0 = make_ctx("d", &d, &records0, &deps0);
+    let mut keys0: Vec<u32> = evaluate(&tree, &ctx0).sub_results.into_keys().collect();
+    keys0.sort_unstable();
+
+    // One dep.
+    let records1 = HashMap::from([("d".to_string(), d.clone()), ("a".to_string(), a.clone())]);
+    let deps1 = HashMap::from([("d".to_string(), vec!["a".to_string()])]);
+    let ctx1 = make_ctx("d", &d, &records1, &deps1);
+    let mut keys1: Vec<u32> = evaluate(&tree, &ctx1).sub_results.into_keys().collect();
+    keys1.sort_unstable();
+
+    assert_eq!(
+        keys0, keys1,
+        "NewlyTrue index drifted: {keys0:?} (0 deps) vs {keys1:?} (1 dep)"
+    );
+}

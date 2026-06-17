@@ -397,35 +397,46 @@ fn eval_inner<O: EvalOutput>(
         ),
 
         ConditionNode::AnyDepsMatch { condition, .. } => {
+            let base = *counter;
             let val = ctx
                 .cache
                 .upstream_deps
                 .get(ctx.target_key)
                 .map(|deps| {
-                    deps.iter()
-                        .any(|dep| eval_on_dep(dep, condition, ctx, counter, sub_results))
+                    deps.iter().any(|dep| {
+                        *counter = base;
+                        eval_on_dep(dep, condition, ctx, counter, sub_results)
+                    })
                 })
                 .unwrap_or(false);
+            finalize_dep_counter(counter, base, condition);
             O::leaf(val, my_idx, node)
         }
 
         ConditionNode::AllDepsMatch { condition, .. } => {
+            let base = *counter;
             let val = ctx
                 .cache
                 .upstream_deps
                 .get(ctx.target_key)
                 .map(|deps| {
-                    deps.iter()
-                        .all(|dep| eval_on_dep(dep, condition, ctx, counter, sub_results))
+                    deps.iter().all(|dep| {
+                        *counter = base;
+                        eval_on_dep(dep, condition, ctx, counter, sub_results)
+                    })
                 })
                 .unwrap_or(true);
+            finalize_dep_counter(counter, base, condition);
             O::leaf(val, my_idx, node)
         }
 
         ConditionNode::AssetMatches { keys, condition } => {
-            let val = keys
-                .iter()
-                .any(|key| eval_on_dep(key, condition, ctx, counter, sub_results));
+            let base = *counter;
+            let val = keys.iter().any(|key| {
+                *counter = base;
+                eval_on_dep(key, condition, ctx, counter, sub_results)
+            });
+            finalize_dep_counter(counter, base, condition);
             O::leaf(val, my_idx, node)
         }
 
@@ -589,6 +600,17 @@ fn count_nodes(node: &ConditionNode, counter: &mut u32) {
         }
         _ => {}
     }
+}
+
+/// Advance `counter` to `base + count_nodes(condition)`, the deterministic number
+/// of node-index slots a dep-aggregate consumes. Each dep is evaluated with the
+/// counter reset to `base` (so all deps share one index range); this call then
+/// lands the counter past the condition exactly once — independent of dep count
+/// or short-circuiting — so stateful nodes after the aggregate keep stable
+/// indices and the skip path (`count_nodes`) agrees with the eval path.
+fn finalize_dep_counter(counter: &mut u32, base: u32, condition: &ConditionNode) {
+    *counter = base;
+    count_nodes(condition, counter);
 }
 
 /// Evaluate a `ConditionNode` tree and return both the compact result (for
@@ -1100,12 +1122,15 @@ fn eval_partitioned<O: PartEvalOutput>(
         }
 
         ConditionNode::AssetMatches { keys, condition } => {
+            let base = *counter;
             let mut sel = PartitionSelection::Empty;
             for key in keys {
+                *counter = base;
                 let key_sel =
                     eval_partitioned_on_dep(key, condition, ctx, pctx, counter, sub_selections);
                 sel = sel.union(&key_sel);
             }
+            finalize_dep_counter(counter, base, condition);
             O::leaf(sel, my_idx, node, total)
         }
 
@@ -1239,16 +1264,17 @@ fn eval_partitioned_any_deps(
     counter: &mut u32,
     sub_selections: &mut HashMap<u32, PartitionSelection>,
 ) -> PartitionSelection {
-    let deps = match ctx.cache.upstream_deps.get(ctx.target_key) {
-        Some(deps) => deps,
-        None => return PartitionSelection::Empty,
-    };
-
+    let base = *counter;
     let mut result = PartitionSelection::Empty;
-    for dep in deps {
-        let dep_sel = eval_partitioned_on_dep(dep, condition, ctx, pctx, counter, sub_selections);
-        result = result.union(&dep_sel);
+    if let Some(deps) = ctx.cache.upstream_deps.get(ctx.target_key) {
+        for dep in deps {
+            *counter = base;
+            let dep_sel =
+                eval_partitioned_on_dep(dep, condition, ctx, pctx, counter, sub_selections);
+            result = result.union(&dep_sel);
+        }
     }
+    finalize_dep_counter(counter, base, condition);
     result
 }
 
@@ -1261,22 +1287,25 @@ fn eval_partitioned_all_deps(
     counter: &mut u32,
     sub_selections: &mut HashMap<u32, PartitionSelection>,
 ) -> PartitionSelection {
-    let deps = match ctx.cache.upstream_deps.get(ctx.target_key) {
-        Some(deps) => deps,
-        None => return PartitionSelection::Keys(pctx.all_keys.clone()), // vacuous truth
-    };
-    if deps.is_empty() {
-        return PartitionSelection::Keys(pctx.all_keys.clone());
-    }
-
-    let mut result = PartitionSelection::Keys(pctx.all_keys.clone());
-    for dep in deps {
-        let dep_sel = eval_partitioned_on_dep(dep, condition, ctx, pctx, counter, sub_selections);
-        result = result.intersect(&dep_sel);
-        if result.is_empty() {
-            break;
+    let base = *counter;
+    let result = match ctx.cache.upstream_deps.get(ctx.target_key) {
+        Some(deps) if !deps.is_empty() => {
+            let mut result = PartitionSelection::Keys(pctx.all_keys.clone());
+            for dep in deps {
+                *counter = base;
+                let dep_sel =
+                    eval_partitioned_on_dep(dep, condition, ctx, pctx, counter, sub_selections);
+                result = result.intersect(&dep_sel);
+                if result.is_empty() {
+                    break;
+                }
+            }
+            result
         }
-    }
+        // No deps → vacuous truth.
+        _ => PartitionSelection::Keys(pctx.all_keys.clone()),
+    };
+    finalize_dep_counter(counter, base, condition);
     result
 }
 
