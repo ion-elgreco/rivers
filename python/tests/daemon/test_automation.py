@@ -317,7 +317,9 @@ class TestWithout:
         n = len(ac.eager().children)
         for arg in (ac.any_deps_in_progress(), "any_deps_in_progress"):
             pruned = ac.eager().without(arg)
-            assert len(pruned.children) == n, f"{arg!r} must not match the Not(...) guard"
+            assert len(pruned.children) == n, (
+                f"{arg!r} must not match the Not(...) guard"
+            )
 
     def test_without_bare_operand_structural(self):
         # A non-negated operand is removed by passing it as-is (structural ==).

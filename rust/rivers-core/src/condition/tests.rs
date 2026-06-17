@@ -3686,11 +3686,13 @@ fn test_bitor_flattens_nested_or() {
 }
 
 #[test]
-fn test_without_removes_matching_child() {
+fn test_without_matching_removes_matching_child() {
     // eager = SinceLastHandled(...) & !any_deps_missing & !any_deps_in_progress
     //         & !in_flight & !ExecutionFailed
+    // The in-progress guard is the operand `Not(any_deps_in_progress())`; match it
+    // structurally to strip it.
     let eager = ConditionNode::eager();
-    let result = eager.without("any_deps_in_progress");
+    let result = eager.without_matching(&|c| *c == !ConditionNode::any_deps_in_progress());
     let expected = (ConditionNode::Missing.newly_true() | ConditionNode::any_deps_updated())
         .since_last_handled()
         & !ConditionNode::any_deps_missing()
@@ -3700,17 +3702,17 @@ fn test_without_removes_matching_child() {
 }
 
 #[test]
-fn test_without_removes_only_exact_match() {
-    // `without` matches top-level And children. eager's in-progress guard is now
-    // nested inside `Not(in_flight())`, so "in_progress" no longer names a
-    // top-level clause (no-op); a still-top-level one ("any_deps_missing") strips.
+fn test_without_matching_removes_only_exact_operand() {
+    // Operands are matched structurally. The bare form `any_deps_missing()` does
+    // NOT match the `Not(any_deps_missing())` guard (no-op); the exact negated
+    // operand strips it.
     let eager = ConditionNode::eager();
     assert_eq!(
-        eager.without("in_progress"),
+        eager.without_matching(&|c| *c == ConditionNode::any_deps_missing()),
         eager,
-        "in_progress is nested under in_flight, not a top-level clause"
+        "bare any_deps_missing must not match the Not(...) guard"
     );
-    let result = eager.without("any_deps_missing");
+    let result = eager.without_matching(&|c| *c == !ConditionNode::any_deps_missing());
     let expected = (ConditionNode::Missing.newly_true() | ConditionNode::any_deps_updated())
         .since_last_handled()
         & !ConditionNode::any_deps_in_progress()
@@ -3720,9 +3722,12 @@ fn test_without_removes_only_exact_match() {
 }
 
 #[test]
-fn test_without_on_non_and_is_identity() {
+fn test_without_matching_on_non_and_is_identity() {
     let leaf = ConditionNode::Missing;
-    assert_eq!(leaf.without("in_progress"), ConditionNode::Missing);
+    assert_eq!(
+        leaf.without_matching(&|c| *c == ConditionNode::InProgress),
+        ConditionNode::Missing
+    );
 }
 
 #[test]
