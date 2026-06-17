@@ -3,6 +3,13 @@ use pyo3::prelude::*;
 
 pub use rivers_core::condition::ConditionNode;
 
+/// Reject an invalid cron schedule at construction, not at eval time.
+fn validate_cron_schedule(schedule: &str) -> PyResult<()> {
+    rivers_core::condition::validate_cron(schedule).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid cron schedule {schedule:?}: {e}"))
+    })
+}
+
 /// Human-readable description of a condition node (for Python display).
 pub(crate) fn description(node: &ConditionNode) -> String {
     match node {
@@ -147,16 +154,17 @@ impl PyAutomationCondition {
     /// Cron-based automation: run on cron ticks.
     #[staticmethod]
     #[pyo3(signature = (cron_schedule, timezone=None))]
-    fn on_cron(cron_schedule: String, timezone: Option<String>) -> Self {
+    fn on_cron(cron_schedule: String, timezone: Option<String>) -> PyResult<Self> {
+        validate_cron_schedule(&cron_schedule)?;
         let label = if let Some(ref tz) = timezone {
             format!("on_cron('{}', tz='{}')", cron_schedule, tz)
         } else {
             format!("on_cron('{}')", cron_schedule)
         };
-        Self {
+        Ok(Self {
             node: ConditionNode::on_cron(cron_schedule, timezone),
             label: Some(label),
-        }
+        })
     }
 
     /// Only run when asset becomes missing; skips failed partitions.
@@ -207,11 +215,12 @@ impl PyAutomationCondition {
     /// True when a cron tick just passed.
     #[staticmethod]
     #[pyo3(signature = (cron_schedule, timezone=None))]
-    fn cron_tick_passed(cron_schedule: String, timezone: Option<String>) -> Self {
-        Self::new_node(ConditionNode::CronTickPassed {
+    fn cron_tick_passed(cron_schedule: String, timezone: Option<String>) -> PyResult<Self> {
+        validate_cron_schedule(&cron_schedule)?;
+        Ok(Self::new_node(ConditionNode::CronTickPassed {
             cron_schedule,
             timezone,
-        })
+        }))
     }
 
     /// True when the partition is in the latest time window.
@@ -348,11 +357,15 @@ impl PyAutomationCondition {
     /// True when all deps have been updated since the last tick of the given cron schedule.
     #[staticmethod]
     #[pyo3(signature = (cron_schedule, timezone=None))]
-    fn all_deps_updated_since_cron(cron_schedule: String, timezone: Option<String>) -> Self {
-        Self::new_node(ConditionNode::all_deps_updated_since_cron(
+    fn all_deps_updated_since_cron(
+        cron_schedule: String,
+        timezone: Option<String>,
+    ) -> PyResult<Self> {
+        validate_cron_schedule(&cron_schedule)?;
+        Ok(Self::new_node(ConditionNode::all_deps_updated_since_cron(
             cron_schedule,
             timezone,
-        ))
+        )))
     }
 
     /// Evaluate this condition on specific named assets (true if any match).

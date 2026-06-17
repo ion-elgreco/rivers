@@ -270,6 +270,27 @@ class TestRepr:
 
 
 # ---------------------------------------------------------------------------
+# Cron validation
+# ---------------------------------------------------------------------------
+
+
+class TestCronValidation:
+    def test_cron_tick_passed_rejects_invalid_schedule(self):
+        with pytest.raises(ValueError):
+            rs.AutomationCondition.cron_tick_passed("this is not a cron")
+
+    def test_on_cron_rejects_invalid_schedule(self):
+        with pytest.raises(ValueError):
+            rs.AutomationCondition.on_cron("totally bogus")
+
+    def test_valid_schedules_accepted(self):
+        # Standard 5-field and 6-field (optional seconds) both parse.
+        rs.AutomationCondition.cron_tick_passed("0 0 * * *")
+        rs.AutomationCondition.on_cron("*/15 * * * *")
+        rs.AutomationCondition.on_cron("0 0 0 * * *")
+
+
+# ---------------------------------------------------------------------------
 # Asset integration
 # ---------------------------------------------------------------------------
 
