@@ -996,7 +996,7 @@ pub(crate) async fn start_grpc_server(
     };
 
     tracing::trace!(target: "rivers::dbg::grpc", host = %host, port, "start_grpc_server: ENTER, finding port");
-    let listener = crate::net::find_available_port(&host, port, port + 99).await?;
+    let listener = crate::net::find_available_port(&host, port, port.saturating_add(99)).await?;
     let actual_addr = listener.local_addr()?;
     tracing::trace!(target: "rivers::dbg::grpc", %actual_addr, "start_grpc_server: bound, sending port");
     let _ = port_tx.send(actual_addr.port());
