@@ -1292,3 +1292,66 @@ class TestSameTickCascading:
                 )
         finally:
             daemon.stop()
+
+
+class TestPartitionedNewlyUpdatedRefire:
+    def test_no_refire_of_preexisting_partition_on_fresh_start(self, storage):
+        """A partitioned ``newly_updated()`` condition must not re-dispatch a
+        partition that was already materialized before the condition daemon's
+        evaluation state existed.
+
+        A prior run (backfill/manual) materializes the partition, then the daemon
+        starts with a fresh evaluation state — a restart or redeploy. On that
+        initial tick the partition has a materialization timestamp but no
+        previous baseline; without the ``is_initial`` guard it is misread as
+        "newly updated" and re-dispatched every tick.
+        """
+        pd = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+        @rs.Asset(
+            name="a",
+            io_handler=rs.InMemoryIOHandler(),
+            partitions_def=pd,
+            automation_condition=rs.AutomationCondition.newly_updated(),
+        )
+        def a() -> str:
+            return "x"
+
+        repo = rs.CodeRepository(
+            assets=[a],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo.resolve(storage=storage)
+
+        pk = rs.PartitionKey.single("p1")
+
+        # A prior run materialized p1 before the condition daemon ever evaluated.
+        repo.materialize(selection=["a"], partition_key=pk)
+        assert storage.get_latest_materialization("a", "p1") is not None, (
+            "precondition: p1 must be materialized before the daemon starts"
+        )
+
+        def _p1_runs():
+            return [r for r in storage.get_runs(limit=500) if r.partition_key == pk]
+
+        baseline = len(_p1_runs())
+
+        # Start the condition daemon with a fresh evaluation state (the restart).
+        daemon = AutomationDaemon(
+            repo=repo,
+            storage=storage,
+            condition_eval_interval="300ms",
+        )
+        daemon.start()
+        try:
+            # Several initial ticks — long enough for the buggy path to
+            # re-dispatch (and the in-process run to land).
+            time.sleep(4.0)
+        finally:
+            daemon.stop()
+
+        after = len(_p1_runs())
+        assert after == baseline, (
+            "condition daemon re-dispatched an already-materialized partition on "
+            f"a fresh start: {baseline} -> {after} runs for p1"
+        )

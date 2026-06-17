@@ -939,7 +939,10 @@ fn eval_partitioned<O: PartEvalOutput>(
                     },
                     None => match prev_timestamps.and_then(|pt| pt.get(pk)) {
                         Some(&prev) => ts > prev,
-                        None => true, // newly appeared partition
+                        // No baseline on the initial tick = materialized before
+                        // startup, not new (suppress); later = appeared between
+                        // ticks (fire). Mirrors the unpartitioned arm.
+                        None => !ctx.is_initial,
                     },
                 })
                 .map(|(pk, _)| pk.clone())
