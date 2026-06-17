@@ -122,6 +122,10 @@ def init(
         prompt="Project name",
         help="The name of the project",
     ),
+    dataset_name: str = typer.Option(
+        "my_dataset",
+        help="Name of dataset to scaffold",
+    ),
     description: str = typer.Option(
         "",
         help="A short description of the project",
@@ -163,6 +167,7 @@ def init(
         target_dir,
         project_name=project_slug,
         package_name=package_name,
+        dataset_name=dataset_name,
         description=description,
         python_version=python_version,
         authors_line=authors_line,

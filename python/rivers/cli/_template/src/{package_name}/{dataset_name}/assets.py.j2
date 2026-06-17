@@ -1,0 +1,7 @@
+import rivers as rs
+
+
+@rs.Asset(group="{{ dataset_name }}")
+def my_asset(context: rs.AssetExecutionContext) -> dict[str, int]:
+    context.add_output_metadata({"rows": 1000})
+    return {"users": 100, "events": 5000}
