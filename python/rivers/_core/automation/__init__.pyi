@@ -50,6 +50,9 @@ class AutomationCondition:
         Args:
             cron_schedule: Cron expression (e.g. ``"0 * * * *"``).
             timezone: Optional timezone name (e.g. ``"US/Eastern"``).
+
+        Raises:
+            ValueError: If ``cron_schedule`` is not a valid cron expression.
         """
         ...
     @staticmethod
@@ -96,6 +99,9 @@ class AutomationCondition:
         Args:
             cron_schedule: Cron expression.
             timezone: Optional timezone name.
+
+        Raises:
+            ValueError: If ``cron_schedule`` is not a valid cron expression.
         """
         ...
     @staticmethod
@@ -239,6 +245,9 @@ class AutomationCondition:
         Args:
             cron_schedule: Cron expression.
             timezone: Optional timezone name.
+
+        Raises:
+            ValueError: If ``cron_schedule`` is not a valid cron expression.
         """
         ...
     def on_selected(
