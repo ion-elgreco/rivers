@@ -754,6 +754,20 @@ fn eval_new_update_tags_partitioned(
 /// Check if a cron tick occurred between `prev_nanos` and `now_nanos`.
 /// Caches parsed cron expressions in a thread-local to avoid re-parsing
 /// the same schedule string on every eval.
+/// Parse a cron schedule (seconds optional) — the one place the syntax is defined.
+fn build_cron(schedule: &str) -> Result<croner::Cron, String> {
+    croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Optional)
+        .build()
+        .parse(schedule)
+        .map_err(|e| e.to_string())
+}
+
+/// Validate a cron schedule at construction so bad input is rejected up front.
+pub fn validate_cron(schedule: &str) -> Result<(), String> {
+    build_cron(schedule).map(|_| ())
+}
+
 fn cron_tick_between(cron_schedule: &str, prev_nanos: i64, now_nanos: i64) -> bool {
     use std::cell::RefCell;
 
@@ -767,11 +781,8 @@ fn cron_tick_between(cron_schedule: &str, prev_nanos: i64, now_nanos: i64) -> bo
     CRON_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let cron = cache.entry(cron_schedule.to_string()).or_insert_with(|| {
-            croner::parser::CronParser::builder()
-                .seconds(croner::parser::Seconds::Optional)
-                .build()
-                .parse(cron_schedule)
-                .expect("invalid cron schedule")
+            // Validated at construction, so a parse error here is a bug.
+            build_cron(cron_schedule).expect("cron schedule validated at construction")
         });
         let prev_dt = chrono::DateTime::from_timestamp(prev_secs, 0);
         let now_dt = chrono::DateTime::from_timestamp(now_secs, 0);
