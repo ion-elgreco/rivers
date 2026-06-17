@@ -11638,7 +11638,10 @@ fn test_dep_aggregate_partitioned_since_latch_persists_per_dep() {
     ctx1.partitions = Some(&pctx1);
     ctx1.now = 1000;
     let result1 = evaluate(&tree, &ctx1);
-    assert!(result1.fired, "tick 1: deps updated since reset → latch fires");
+    assert!(
+        result1.fired,
+        "tick 1: deps updated since reset → latch fires"
+    );
 
     let mut state_b = AssetConditionState::default();
     update_condition_state(
