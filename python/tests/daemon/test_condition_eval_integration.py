@@ -1355,3 +1355,89 @@ class TestPartitionedNewlyUpdatedRefire:
             "condition daemon re-dispatched an already-materialized partition on "
             f"a fresh start: {baseline} -> {after} runs for p1"
         )
+
+
+class TestDepAggregateCounterStability:
+    def test_no_spurious_refire_when_dep_count_changes(self, storage):
+        """A stateful node placed AFTER a dep-aggregate must keep a stable node
+        index when the asset's dep COUNT changes (the condition tree — and thus
+        its fingerprint — is unchanged, so the persisted latch is NOT reset).
+
+        Before the deterministic-counter fix, an evaluated dep-aggregate consumed
+        ``num_deps * count_nodes(condition)`` node-index slots, so dropping an
+        upstream dependency shifted the trailing ``newly_true``'s index. It then read its
+        latch from the wrong key and spuriously re-fired after a redeploy that
+        removed a dependency.
+        """
+        # `any_deps_match(execution_failed)` is false (no dep failed) so `.any()`
+        # scans ALL deps — its slot count grows with the dep count. The trailing
+        # `newly_true(~execution_failed)` latches true once r materializes and
+        # must then stay suppressed.
+        agg = rs.AutomationCondition.any_deps_match(
+            rs.AutomationCondition.execution_failed()
+        )
+        latch = (~rs.AutomationCondition.execution_failed()).newly_true()
+        cond = agg | latch
+
+        @rs.Asset(name="a", io_handler=rs.InMemoryIOHandler())
+        def a() -> int:
+            return 1
+
+        @rs.Asset(name="b", io_handler=rs.InMemoryIOHandler())
+        def b() -> int:
+            return 2
+
+        @rs.Asset(
+            name="r", io_handler=rs.InMemoryIOHandler(), automation_condition=cond
+        )
+        def r(a: int, b: int) -> int:
+            return a + b
+
+        repo1 = rs.CodeRepository(
+            assets=[a, b, r], default_executor=rs.Executor.in_process()
+        )
+        repo1.resolve(storage=storage)
+        repo1.materialize(selection=["a", "b"])  # so r can load its deps when it fires
+
+        # Run 1: r has TWO deps. `newly_true` fires once (rising edge), r
+        # materializes, then the latch suppresses further fires.
+        daemon1 = AutomationDaemon(
+            repo=repo1, storage=storage, condition_eval_interval="300ms"
+        )
+        daemon1.start()
+        try:
+            time.sleep(3.0)
+        finally:
+            daemon1.stop()
+
+        baseline = len(storage.get_runs(limit=500))
+
+        # Redeploy: r now depends on ONE dep (same condition object → same
+        # fingerprint → the persisted latch survives). Only the dep count changed.
+        @rs.Asset(
+            name="r", io_handler=rs.InMemoryIOHandler(), automation_condition=cond
+        )
+        def r_one_dep(a: int) -> int:
+            return a
+
+        repo2 = rs.CodeRepository(
+            assets=[a, r_one_dep], default_executor=rs.Executor.in_process()
+        )
+        repo2.resolve(storage=storage)
+
+        # Run 2: with the fix, r's `newly_true` keeps the same node index, reads
+        # its latch correctly, and stays suppressed → no new runs.
+        daemon2 = AutomationDaemon(
+            repo=repo2, storage=storage, condition_eval_interval="300ms"
+        )
+        daemon2.start()
+        try:
+            time.sleep(3.0)
+        finally:
+            daemon2.stop()
+
+        after = len(storage.get_runs(limit=500))
+        assert after == baseline, (
+            "dropping an upstream dep shifted the trailing newly_true's node "
+            f"index and spuriously re-fired r: {baseline} -> {after} runs"
+        )
