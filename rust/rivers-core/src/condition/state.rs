@@ -16,6 +16,12 @@ pub struct AssetConditionState {
     /// Previous tick's evaluation results keyed by node index (u32).
     /// Used by `NewlyTrue` and `Since` to detect transitions.
     pub previous_results: HashMap<u32, bool>,
+    /// Previous tick's results for stateful operators evaluated INSIDE a
+    /// dep-aggregate, keyed by dep asset key then node index. Separate from
+    /// `previous_results` because all deps share one node-index range, so each
+    /// dep needs its own latch slot (e.g. `on_cron`'s per-dep "since cron tick").
+    #[serde(default)]
+    pub dep_previous_results: HashMap<String, HashMap<u32, bool>>,
     /// Timestamp of the last tick where this asset's condition was "handled"
     /// (i.e., a materialization was requested by the condition system).
     pub last_handled_timestamp: Option<i64>,
@@ -46,6 +52,7 @@ impl AssetConditionState {
     /// Preserves `last_materialized_timestamp` (factual, not tree-dependent).
     pub fn reset_for_new_tree(&mut self, new_fingerprint: String) {
         self.previous_results.clear();
+        self.dep_previous_results.clear();
         self.last_handled_timestamp = None;
         self.last_tick_timestamp = None;
         self.condition_fingerprint = new_fingerprint;
@@ -154,6 +161,12 @@ pub struct EvalResult {
     /// Per-node partition selections for state tracking operators.
     /// Used for partitioned assets. `None` for unpartitioned assets.
     pub sub_selections: Option<HashMap<u32, PartitionSelection>>,
+    /// Per-dep results for stateful operators inside dep-aggregates
+    /// (unpartitioned). Merged into `AssetConditionState.dep_previous_results`.
+    pub dep_sub_results: HashMap<String, HashMap<u32, bool>>,
+    /// Per-dep partition selections inside dep-aggregates (partitioned).
+    /// Merged into `PartitionState.dep_previous_selections`. `None` if unpartitioned.
+    pub dep_sub_selections: Option<HashMap<String, HashMap<u32, PartitionSelection>>>,
 }
 
 /// Status of a single node's evaluation in the tree.
@@ -243,6 +256,7 @@ pub fn update_condition_state(
     state.last_data_version = ctx.target_data_version.cloned();
     state.last_tick_timestamp = Some(ctx.now);
     state.previous_results = result.sub_results.clone();
+    state.dep_previous_results = result.dep_sub_results.clone();
 
     // Update partition state if partition-aware evaluation was used
     if let (Some(timestamps), Some(sub_selections)) =
@@ -252,6 +266,9 @@ pub fn update_condition_state(
             .partition_state
             .get_or_insert_with(PartitionState::default);
         ps.previous_selections = sub_selections.clone();
+        if let Some(dep_sub_selections) = &result.dep_sub_selections {
+            ps.dep_previous_selections = dep_sub_selections.clone();
+        }
         ps.timestamps = timestamps.clone();
         // `handled` is a per-tick debounce window, not cumulative: reset it so
         // classification repopulates it with only this tick's dispatched keys.
