@@ -59,7 +59,7 @@ impl PartitionSelection {
             Self::All => Self::Empty,
             Self::Empty => {
                 if all_keys.is_empty() {
-                    Self::All
+                    Self::Empty
                 } else {
                     Self::Keys(all_keys.clone())
                 }

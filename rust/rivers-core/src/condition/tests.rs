@@ -7188,6 +7188,21 @@ fn test_partition_selection_complement() {
 }
 
 #[test]
+fn test_partition_selection_complement_empty_universe() {
+    // With no partitions, the complement of anything is nothing — not `All`,
+    // which would falsely report a partitionless asset as firing.
+    let empty: HashSet<PartitionKey> = HashSet::new();
+    assert_eq!(
+        PartitionSelection::Empty.complement(&empty),
+        PartitionSelection::Empty
+    );
+    assert_eq!(
+        PartitionSelection::All.complement(&empty),
+        PartitionSelection::Empty
+    );
+}
+
+#[test]
 fn test_partition_selection_difference() {
     let universe: HashSet<PartitionKey> = ["p1", "p2", "p3"].iter().map(|s| spk(s)).collect();
     let a = PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2"), spk("p3")]));
@@ -7668,6 +7683,25 @@ fn test_partitioned_not() {
     assert_eq!(
         result.selection.unwrap(),
         PartitionSelection::Keys(HashSet::from([spk("p1")]))
+    );
+}
+
+#[test]
+fn test_partitioned_not_over_empty_universe_does_not_fire() {
+    // A partitioned asset with an empty universe (e.g. dynamic, no keys yet)
+    // must not report fired for a Not(...) clause.
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".into(), record.clone())]);
+    let deps = HashMap::new();
+    let pdata = OwnedPartitionData::new(&[], &[], &[]); // empty universe
+    let pctx = pdata.as_eval_ctx();
+    let ctx = make_partitioned_ctx("a", &record, &records, &deps, &pctx);
+    let cond = ConditionNode::Not(Box::new(ConditionNode::Missing));
+    let result = evaluate(&cond, &ctx);
+    assert!(
+        !result.fired,
+        "Not(...) over an empty partition universe must not fire, got {:?}",
+        result.selection
     );
 }
 
