@@ -10998,8 +10998,8 @@ async fn test_register_dispatched_run_populates_pending_and_in_progress() {
         "pending_runs should hold the run_id"
     );
     assert_eq!(
-        cache.pending_runs.get("run-1").unwrap().asset_key,
-        "a",
+        cache.pending_runs.get("run-1").unwrap().asset_keys,
+        vec!["a".to_string()],
         "pending entry should track the asset"
     );
 }
@@ -11057,6 +11057,30 @@ async fn test_pending_run_evicted_after_grace() {
     assert!(
         !cache.in_progress_assets.contains_key("a"),
         "phantom past grace should also be removed from in_progress_assets so the asset can re-fire"
+    );
+}
+
+#[tokio::test]
+async fn test_pending_eviction_untracks_all_assets_of_a_multi_asset_run() {
+    // A phantom joint run must untrack every asset it covered, not just the last.
+    let (storage, mut cache) = pending_test_setup().await;
+    cache.pending_grace_nanos = 10_000;
+    cache.register_dispatched_run("a".into(), "joint-run".into(), 1_000_000, None);
+    cache.register_dispatched_run("b".into(), "joint-run".into(), 1_000_000, None);
+
+    cache.refresh(&storage, 1_000_000 + 100_000).await.unwrap();
+
+    assert!(
+        !cache.pending_runs.contains_key("joint-run"),
+        "phantom joint run should be removed from pending_runs"
+    );
+    assert!(
+        !cache.in_progress_assets.contains_key("a"),
+        "asset a (registered first) must be untracked on phantom eviction"
+    );
+    assert!(
+        !cache.in_progress_assets.contains_key("b"),
+        "asset b (registered second) must be untracked on phantom eviction"
     );
 }
 
