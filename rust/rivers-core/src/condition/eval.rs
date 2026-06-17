@@ -10,6 +10,29 @@ use super::partition::{
 };
 use super::state::{AssetConditionState, EvalContext, EvalNodeResult, EvalResult, NodeStatus};
 
+/// Per-dep latch state for stateful ops inside dep-aggregates, keyed by dep then
+/// node index. `prev` (root's last tick) is threaded unchanged into nested
+/// pivots so a latch resolves against the root; `acc` collects this tick's.
+struct DepScope<'a, V> {
+    prev: &'a HashMap<String, HashMap<u32, V>>,
+    acc: &'a mut HashMap<String, HashMap<u32, V>>,
+}
+
+static EMPTY_DEP_SELECTIONS: std::sync::LazyLock<
+    HashMap<String, HashMap<u32, PartitionSelection>>,
+> = std::sync::LazyLock::new(HashMap::new);
+
+/// Root's previous-tick per-dep partition latches (empty when unpartitioned).
+fn root_dep_selections<'a>(
+    ctx: &'a EvalContext,
+) -> &'a HashMap<String, HashMap<u32, PartitionSelection>> {
+    ctx.prev_state
+        .partition_state
+        .as_ref()
+        .map(|ps| &ps.dep_previous_selections)
+        .unwrap_or(&EMPTY_DEP_SELECTIONS)
+}
+
 // These traits abstract over "bool only" vs "bool + tree" output modes,
 // allowing a single generic evaluator to replace the duplicated _with_tree variants.
 
@@ -184,13 +207,17 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
         let mut counter = 0u32;
         let mut sub_selections = HashMap::new();
         let mut dep_selections = HashMap::new();
+        let mut dep_scope = DepScope {
+            prev: root_dep_selections(ctx),
+            acc: &mut dep_selections,
+        };
         let selection: PartitionSelection = eval_partitioned(
             node,
             ctx,
             pctx,
             &mut counter,
             &mut sub_selections,
-            &mut dep_selections,
+            &mut dep_scope,
         );
         let fired = !selection.is_empty();
         tracing::debug!(
@@ -211,7 +238,11 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
         let mut counter = 0u32;
         let mut sub_results = HashMap::new();
         let mut dep_results = HashMap::new();
-        let fired: bool = eval_inner(node, ctx, &mut counter, &mut sub_results, &mut dep_results);
+        let mut dep_scope = DepScope {
+            prev: &ctx.prev_state.dep_previous_results,
+            acc: &mut dep_results,
+        };
+        let fired: bool = eval_inner(node, ctx, &mut counter, &mut sub_results, &mut dep_scope);
         tracing::debug!(
             target: "rivers::condition",
             asset_key = %ctx.target_key,
@@ -240,7 +271,7 @@ fn eval_inner<O: EvalOutput>(
     ctx: &EvalContext,
     counter: &mut u32,
     sub_results: &mut HashMap<u32, bool>,
-    dep_results: &mut HashMap<String, HashMap<u32, bool>>,
+    dep_results: &mut DepScope<bool>,
 ) -> O {
     let my_idx = *counter;
     *counter += 1;
@@ -639,13 +670,17 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
         let mut counter = 0u32;
         let mut sub_selections = HashMap::new();
         let mut dep_selections = HashMap::new();
+        let mut dep_scope = DepScope {
+            prev: root_dep_selections(ctx),
+            acc: &mut dep_selections,
+        };
         let (selection, tree): (PartitionSelection, EvalNodeResult) = eval_partitioned(
             node,
             ctx,
             pctx,
             &mut counter,
             &mut sub_selections,
-            &mut dep_selections,
+            &mut dep_scope,
         );
         let fired = !selection.is_empty();
         (
@@ -663,13 +698,12 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
         let mut counter = 0u32;
         let mut sub_results = HashMap::new();
         let mut dep_results = HashMap::new();
-        let tree = eval_inner::<EvalNodeResult>(
-            node,
-            ctx,
-            &mut counter,
-            &mut sub_results,
-            &mut dep_results,
-        );
+        let mut dep_scope = DepScope {
+            prev: &ctx.prev_state.dep_previous_results,
+            acc: &mut dep_results,
+        };
+        let tree =
+            eval_inner::<EvalNodeResult>(node, ctx, &mut counter, &mut sub_results, &mut dep_scope);
         let fired = tree.status == NodeStatus::True;
         (
             EvalResult {
@@ -867,19 +901,18 @@ fn run_tags_match(
 static EMPTY_CONDITION_STATE: std::sync::LazyLock<AssetConditionState> =
     std::sync::LazyLock::new(AssetConditionState::default);
 
-/// Evaluate a condition as if `dep_key` were the target asset.
-/// Creates a temporary EvalContext pointing to the dep's record.
+/// Evaluate `condition` as if `dep_key` were the target asset.
 ///
-/// Stateful operators (`Since`/`NewlyTrue`) inside the condition latch under the
-/// ROOT's state, keyed by dep: their previous values are read from
-/// `ctx.prev_state.dep_previous_results[dep_key]` and this tick's are collected
-/// into `dep_results[dep_key]`. Factual leaves keep reading the dep's own state.
+/// Stateful ops (`Since`/`NewlyTrue`) latch under the ROOT's state keyed by dep
+/// (read `dep_results.prev`, write `dep_results.acc`); the scope threads into
+/// nested pivots so a multi-hop latch still resolves against the root. Factual
+/// leaves read the dep's own state.
 fn eval_on_dep(
     dep_key: &str,
     condition: &ConditionNode,
     ctx: &EvalContext,
     counter: &mut u32,
-    dep_results: &mut HashMap<String, HashMap<u32, bool>>,
+    dep_results: &mut DepScope<bool>,
 ) -> bool {
     let dep_record = match ctx.cache.records.get(dep_key) {
         Some(r) => r,
@@ -890,12 +923,7 @@ fn eval_on_dep(
         .get(dep_key)
         .unwrap_or(&EMPTY_CONDITION_STATE);
     let mut synthetic = dep_state.clone();
-    synthetic.previous_results = ctx
-        .prev_state
-        .dep_previous_results
-        .get(dep_key)
-        .cloned()
-        .unwrap_or_default();
+    synthetic.previous_results = dep_results.prev.get(dep_key).cloned().unwrap_or_default();
     let dep_ctx = EvalContext {
         target_key: dep_key,
         root_key: ctx.root_key,
@@ -913,7 +941,7 @@ fn eval_on_dep(
     let mut local = HashMap::new();
     let val = eval_inner(condition, &dep_ctx, counter, &mut local, dep_results);
     if !local.is_empty() {
-        dep_results.insert(dep_key.to_string(), local);
+        dep_results.acc.insert(dep_key.to_string(), local);
     }
     val
 }
@@ -930,7 +958,7 @@ fn eval_partitioned<O: PartEvalOutput>(
     pctx: &PartitionEvalContext,
     counter: &mut u32,
     sub_selections: &mut HashMap<u32, PartitionSelection>,
-    dep_selections: &mut HashMap<String, HashMap<u32, PartitionSelection>>,
+    dep_selections: &mut DepScope<PartitionSelection>,
 ) -> O {
     let my_idx = *counter;
     *counter += 1;
@@ -1330,7 +1358,7 @@ fn eval_partitioned_any_deps(
     pctx: &PartitionEvalContext,
     condition: &ConditionNode,
     counter: &mut u32,
-    dep_selections: &mut HashMap<String, HashMap<u32, PartitionSelection>>,
+    dep_selections: &mut DepScope<PartitionSelection>,
 ) -> PartitionSelection {
     let base = *counter;
     let mut result = PartitionSelection::Empty;
@@ -1353,7 +1381,7 @@ fn eval_partitioned_all_deps(
     pctx: &PartitionEvalContext,
     condition: &ConditionNode,
     counter: &mut u32,
-    dep_selections: &mut HashMap<String, HashMap<u32, PartitionSelection>>,
+    dep_selections: &mut DepScope<PartitionSelection>,
 ) -> PartitionSelection {
     let base = *counter;
     let result = match ctx.cache.upstream_deps.get(ctx.target_key) {
@@ -1445,7 +1473,7 @@ fn eval_partitioned_on_dep(
     ctx: &EvalContext,
     pctx: &PartitionEvalContext,
     counter: &mut u32,
-    dep_selections: &mut HashMap<String, HashMap<u32, PartitionSelection>>,
+    dep_selections: &mut DepScope<PartitionSelection>,
 ) -> PartitionSelection {
     let dep_record = match ctx.cache.records.get(dep_key) {
         Some(r) => r,
@@ -1453,11 +1481,9 @@ fn eval_partitioned_on_dep(
     };
 
     // Per-dep latch lives under the root's partition state, keyed by dep.
-    let prev_dep_sel: HashMap<u32, PartitionSelection> = ctx
-        .prev_state
-        .partition_state
-        .as_ref()
-        .and_then(|ps| ps.dep_previous_selections.get(dep_key))
+    let prev_dep_sel: HashMap<u32, PartitionSelection> = dep_selections
+        .prev
+        .get(dep_key)
         .cloned()
         .unwrap_or_default();
 
@@ -1502,10 +1528,18 @@ fn eval_partitioned_on_dep(
             root_partition_floor: Some(root_floor),
         };
         let mut local = HashMap::new();
-        let mut nested = HashMap::new();
-        let val = eval_inner(condition, &dep_ctx, counter, &mut local, &mut nested);
+        // Unpartitioned upstream → bool eval; the dep's own latch round-trips via
+        // `local`. A dep-aggregate nested inside the fallback isn't carried (would
+        // need bool<->selection bridging — a rare corner).
+        let nested_prev = HashMap::new();
+        let mut nested_acc = HashMap::new();
+        let mut bool_scope = DepScope {
+            prev: &nested_prev,
+            acc: &mut nested_acc,
+        };
+        let val = eval_inner(condition, &dep_ctx, counter, &mut local, &mut bool_scope);
         if !local.is_empty() {
-            dep_selections.insert(
+            dep_selections.acc.insert(
                 dep_key.to_string(),
                 local
                     .into_iter()
@@ -1625,17 +1659,16 @@ fn eval_partitioned_on_dep(
     };
 
     let mut local = HashMap::new();
-    let mut nested = HashMap::new();
     let upstream_result: PartitionSelection = eval_partitioned(
         condition,
         &dep_ctx,
         &upstream_pctx,
         counter,
         &mut local,
-        &mut nested,
+        dep_selections,
     );
     if !local.is_empty() {
-        dep_selections.insert(dep_key.to_string(), local);
+        dep_selections.acc.insert(dep_key.to_string(), local);
     }
 
     // Map result back to downstream partition space.
