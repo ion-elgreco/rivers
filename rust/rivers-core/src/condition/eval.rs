@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use crate::storage::PartitionKey;
 
 use super::node::ConditionNode;
-use super::partition::{PartitionEvalContext, PartitionResolver, PartitionSelection, PartitionState};
+use super::partition::{
+    PartitionEvalContext, PartitionResolver, PartitionSelection, PartitionState,
+};
 use super::state::{AssetConditionState, EvalContext, EvalNodeResult, EvalResult, NodeStatus};
 
 // These traits abstract over "bool only" vs "bool + tree" output modes,
@@ -661,8 +663,13 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
         let mut counter = 0u32;
         let mut sub_results = HashMap::new();
         let mut dep_results = HashMap::new();
-        let tree =
-            eval_inner::<EvalNodeResult>(node, ctx, &mut counter, &mut sub_results, &mut dep_results);
+        let tree = eval_inner::<EvalNodeResult>(
+            node,
+            ctx,
+            &mut counter,
+            &mut sub_results,
+            &mut dep_results,
+        );
         let fired = tree.status == NodeStatus::True;
         (
             EvalResult {
@@ -1185,8 +1192,14 @@ fn eval_partitioned<O: PartEvalOutput>(
                 if result.is_empty() {
                     child_parts.push(O::skipped_child(child, counter));
                 } else {
-                    let child_out =
-                        eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
+                    let child_out = eval_partitioned::<O>(
+                        child,
+                        ctx,
+                        pctx,
+                        counter,
+                        sub_selections,
+                        dep_selections,
+                    );
                     let (child_sel, child_part) = O::into_parts(child_out);
                     result = result.intersect(&child_sel);
                     child_parts.push(child_part);
@@ -1202,8 +1215,14 @@ fn eval_partitioned<O: PartEvalOutput>(
                 if result.is_all() {
                     child_parts.push(O::skipped_child(child, counter));
                 } else {
-                    let child_out =
-                        eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
+                    let child_out = eval_partitioned::<O>(
+                        child,
+                        ctx,
+                        pctx,
+                        counter,
+                        sub_selections,
+                        dep_selections,
+                    );
                     let (child_sel, child_part) = O::into_parts(child_out);
                     result = result.union(&child_sel);
                     child_parts.push(child_part);
@@ -1213,14 +1232,16 @@ fn eval_partitioned<O: PartEvalOutput>(
         }
 
         ConditionNode::Not(child) => {
-            let child_out = eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
+            let child_out =
+                eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
             let (child_sel, child_part) = O::into_parts(child_out);
             let result = child_sel.complement(pctx.all_keys);
             O::composite(result, my_idx, node, total, vec![child_part])
         }
 
         ConditionNode::NewlyTrue(child) => {
-            let child_out = eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
+            let child_out =
+                eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
             let (current, child_part) = O::into_parts(child_out);
             let previous = ctx
                 .prev_state
@@ -1258,7 +1279,8 @@ fn eval_partitioned<O: PartEvalOutput>(
         }
 
         ConditionNode::SinceLastHandled(child) => {
-            let child_out = eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
+            let child_out =
+                eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
             let (current, child_part) = O::into_parts(child_out);
             let result = if current.is_empty() {
                 PartitionSelection::Empty
@@ -1604,8 +1626,14 @@ fn eval_partitioned_on_dep(
 
     let mut local = HashMap::new();
     let mut nested = HashMap::new();
-    let upstream_result: PartitionSelection =
-        eval_partitioned(condition, &dep_ctx, &upstream_pctx, counter, &mut local, &mut nested);
+    let upstream_result: PartitionSelection = eval_partitioned(
+        condition,
+        &dep_ctx,
+        &upstream_pctx,
+        counter,
+        &mut local,
+        &mut nested,
+    );
     if !local.is_empty() {
         dep_selections.insert(dep_key.to_string(), local);
     }
