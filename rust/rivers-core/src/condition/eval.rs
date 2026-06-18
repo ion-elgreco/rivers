@@ -5,22 +5,31 @@ use std::collections::{HashMap, HashSet};
 use crate::storage::PartitionKey;
 
 use super::node::ConditionNode;
-use super::partition::{
-    PartitionEvalContext, PartitionResolver, PartitionSelection, PartitionState,
-};
+use super::partition::{PartitionEvalContext, PartitionResolver, PartitionSelection};
 use super::state::{AssetConditionState, EvalContext, EvalNodeResult, EvalResult, NodeStatus};
 
 /// Per-dep latch state for stateful ops inside dep-aggregates, keyed by dep then
 /// node index. `prev` (root's last tick) is threaded unchanged into nested
 /// pivots so a latch resolves against the root; `acc` collects this tick's.
+///
+/// `cur_prev` is the pivoted dep's latch (`Some` in a pivot, `None` at the root),
+/// set/restored by the pivot so stateful ops read it instead of `prev_state` —
+/// letting the pivot borrow the dep's state rather than clone it.
 struct DepScope<'a, V> {
     prev: &'a HashMap<String, HashMap<u32, V>>,
     acc: &'a mut HashMap<String, HashMap<u32, V>>,
+    cur_prev: Option<&'a HashMap<u32, V>>,
 }
 
 static EMPTY_DEP_SELECTIONS: std::sync::LazyLock<
     HashMap<String, HashMap<u32, PartitionSelection>>,
 > = std::sync::LazyLock::new(HashMap::new);
+
+/// Empty per-dep latch maps for pivots into a dep with no persisted latch yet.
+static EMPTY_BOOL_LATCH: std::sync::LazyLock<HashMap<u32, bool>> =
+    std::sync::LazyLock::new(HashMap::new);
+static EMPTY_SELECTION_LATCH: std::sync::LazyLock<HashMap<u32, PartitionSelection>> =
+    std::sync::LazyLock::new(HashMap::new);
 
 /// Root's previous-tick per-dep partition latches (empty when unpartitioned).
 fn root_dep_selections<'a>(
@@ -31,6 +40,25 @@ fn root_dep_selections<'a>(
         .as_ref()
         .map(|ps| &ps.dep_previous_selections)
         .unwrap_or(&EMPTY_DEP_SELECTIONS)
+}
+
+/// Previous-tick selection for stateful node `my_idx`: the per-dep latch when
+/// pivoting into a dep (`cur_prev`), otherwise the asset's own state.
+fn prev_partition_latch(
+    dep_selections: &DepScope<PartitionSelection>,
+    ctx: &EvalContext,
+    my_idx: u32,
+) -> PartitionSelection {
+    match dep_selections.cur_prev {
+        Some(map) => map.get(&my_idx).cloned(),
+        None => ctx
+            .prev_state
+            .partition_state
+            .as_ref()
+            .and_then(|ps| ps.previous_selections.get(&my_idx))
+            .cloned(),
+    }
+    .unwrap_or(PartitionSelection::Empty)
 }
 
 // These traits abstract over "bool only" vs "bool + tree" output modes,
@@ -210,6 +238,7 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
         let mut dep_scope = DepScope {
             prev: root_dep_selections(ctx),
             acc: &mut dep_selections,
+            cur_prev: None,
         };
         let selection: PartitionSelection = eval_partitioned(
             node,
@@ -241,6 +270,7 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
         let mut dep_scope = DepScope {
             prev: &ctx.prev_state.dep_previous_results,
             acc: &mut dep_results,
+            cur_prev: None,
         };
         let fired: bool = eval_inner(node, ctx, &mut counter, &mut sub_results, &mut dep_scope);
         tracing::debug!(
@@ -574,9 +604,9 @@ fn eval_inner<O: EvalOutput>(
         ConditionNode::NewlyTrue(child) => {
             let child_out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
             let current = child_out.val();
-            let previous = ctx
-                .prev_state
-                .previous_results
+            let previous = dep_results
+                .cur_prev
+                .unwrap_or(&ctx.prev_state.previous_results)
                 .get(&my_idx)
                 .copied()
                 .unwrap_or(false);
@@ -597,9 +627,9 @@ fn eval_inner<O: EvalOutput>(
             let reset_out = eval_inner::<O>(reset, ctx, counter, sub_results, dep_results);
             let trigger_val = trigger_out.val();
             let reset_val = reset_out.val();
-            let prev_latch = ctx
-                .prev_state
-                .previous_results
+            let prev_latch = dep_results
+                .cur_prev
+                .unwrap_or(&ctx.prev_state.previous_results)
                 .get(&my_idx)
                 .copied()
                 .unwrap_or(false);
@@ -697,6 +727,7 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
         let mut dep_scope = DepScope {
             prev: root_dep_selections(ctx),
             acc: &mut dep_selections,
+            cur_prev: None,
         };
         let (selection, tree): (PartitionSelection, EvalNodeResult) = eval_partitioned(
             node,
@@ -725,6 +756,7 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
         let mut dep_scope = DepScope {
             prev: &ctx.prev_state.dep_previous_results,
             acc: &mut dep_results,
+            cur_prev: None,
         };
         let tree =
             eval_inner::<EvalNodeResult>(node, ctx, &mut counter, &mut sub_results, &mut dep_scope);
@@ -946,15 +978,13 @@ fn eval_on_dep(
         .all_asset_states
         .get(dep_key)
         .unwrap_or(&EMPTY_CONDITION_STATE);
-    let mut synthetic = dep_state.clone();
-    synthetic.previous_results = dep_results.prev.get(dep_key).cloned().unwrap_or_default();
     let dep_ctx = EvalContext {
         target_key: dep_key,
         root_key: ctx.root_key,
         target_record: dep_record,
         cache: ctx.cache,
         tags: ctx.tags,
-        prev_state: &synthetic,
+        prev_state: dep_state,
         all_asset_states: ctx.all_asset_states,
         requested_this_tick: ctx.requested_this_tick,
         now: ctx.now,
@@ -963,7 +993,12 @@ fn eval_on_dep(
         root_partition_floor: None,
     };
     let mut local = HashMap::new();
+    // Stateful ops read the root's per-dep latch, not the dep's own results.
+    let saved = dep_results.cur_prev;
+    let latch = dep_results.prev.get(dep_key).unwrap_or(&EMPTY_BOOL_LATCH);
+    dep_results.cur_prev = Some(latch);
     let val = eval_inner(condition, &dep_ctx, counter, &mut local, dep_results);
+    dep_results.cur_prev = saved;
     if !local.is_empty() {
         // Merge, don't replace: a sibling aggregate may already have written this
         // dep's slots (at different node indices) earlier in the tick.
@@ -1301,13 +1336,7 @@ fn eval_partitioned<O: PartEvalOutput>(
             let child_out =
                 eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
             let (current, child_part) = O::into_parts(child_out);
-            let previous = ctx
-                .prev_state
-                .partition_state
-                .as_ref()
-                .and_then(|ps| ps.previous_selections.get(&my_idx))
-                .cloned()
-                .unwrap_or(PartitionSelection::Empty);
+            let previous = prev_partition_latch(dep_selections, ctx, my_idx);
             // First-tick behavior handled via InitialEvaluation composition.
             let result = current.difference(&previous, pctx.all_keys);
             sub_selections.insert(my_idx, current);
@@ -1321,13 +1350,7 @@ fn eval_partitioned<O: PartEvalOutput>(
                 eval_partitioned::<O>(reset, ctx, pctx, counter, sub_selections, dep_selections);
             let (trigger_sel, trigger_part) = O::into_parts(trigger_out);
             let (reset_sel, reset_part) = O::into_parts(reset_out);
-            let prev_latch = ctx
-                .prev_state
-                .partition_state
-                .as_ref()
-                .and_then(|ps| ps.previous_selections.get(&my_idx))
-                .cloned()
-                .unwrap_or(PartitionSelection::Empty);
+            let prev_latch = prev_partition_latch(dep_selections, ctx, my_idx);
             // (prev_latched ∪ trigger) - reset
             let result = prev_latch
                 .union(&trigger_sel)
@@ -1513,12 +1536,9 @@ fn eval_partitioned_on_dep(
         None => return PartitionSelection::Empty,
     };
 
-    // Per-dep latch lives under the root's partition state, keyed by dep.
-    let prev_dep_sel: HashMap<u32, PartitionSelection> = dep_selections
-        .prev
-        .get(dep_key)
-        .cloned()
-        .unwrap_or_default();
+    // Per-dep latch lives under the root's partition state, keyed by dep. Borrowed
+    // (not cloned): threaded into the dep eval via `cur_prev`/`bool_latch` below.
+    let prev_dep_sel: Option<&HashMap<u32, PartitionSelection>> = dep_selections.prev.get(dep_key);
 
     let upstream_all_keys: HashSet<PartitionKey> = pctx
         .resolver
@@ -1540,19 +1560,13 @@ fn eval_partitioned_on_dep(
             .all_asset_states
             .get(dep_key)
             .unwrap_or(&EMPTY_CONDITION_STATE);
-        // Recover the bool view of the per-dep latch (non-empty selection == true).
-        let mut synthetic = dep_state.clone();
-        synthetic.previous_results = prev_dep_sel
-            .iter()
-            .map(|(idx, sel)| (*idx, !sel.is_empty()))
-            .collect();
         let dep_ctx = EvalContext {
             target_key: dep_key,
             root_key: ctx.root_key,
             target_record: dep_record,
             cache: ctx.cache,
             tags: ctx.tags,
-            prev_state: &synthetic,
+            prev_state: dep_state,
             all_asset_states: ctx.all_asset_states,
             requested_this_tick: ctx.requested_this_tick,
             now: ctx.now,
@@ -1560,6 +1574,10 @@ fn eval_partitioned_on_dep(
             partitions: None,
             root_partition_floor: Some(root_floor),
         };
+        // Bool view of the per-dep latch (non-empty selection == true).
+        let bool_latch: HashMap<u32, bool> = prev_dep_sel
+            .map(|m| m.iter().map(|(idx, sel)| (*idx, !sel.is_empty())).collect())
+            .unwrap_or_default();
         let mut local = HashMap::new();
         // Unpartitioned upstream → bool eval; the dep's own latch round-trips via
         // `local`. A dep-aggregate nested inside the fallback isn't carried (would
@@ -1569,6 +1587,7 @@ fn eval_partitioned_on_dep(
         let mut bool_scope = DepScope {
             prev: &nested_prev,
             acc: &mut nested_acc,
+            cur_prev: Some(&bool_latch),
         };
         let val = eval_inner(condition, &dep_ctx, counter, &mut local, &mut bool_scope);
         if !local.is_empty() {
@@ -1666,25 +1685,14 @@ fn eval_partitioned_on_dep(
         .all_asset_states
         .get(dep_key)
         .unwrap_or(&EMPTY_CONDITION_STATE);
-    // Latch state (previous_selections) comes from the root's per-dep map, in the
-    // dep's key space; everything else (timestamps, handled) stays the dep's own.
-    let mut synthetic = dep_state.clone();
-    match synthetic.partition_state.as_mut() {
-        Some(ps) => ps.previous_selections = prev_dep_sel,
-        None => {
-            synthetic.partition_state = Some(PartitionState {
-                previous_selections: prev_dep_sel,
-                ..Default::default()
-            })
-        }
-    }
+    // Borrow the dep's real state; the latch is overridden via `cur_prev` below.
     let dep_ctx = EvalContext {
         target_key: dep_key,
         root_key: ctx.root_key,
         target_record: dep_record,
         cache: ctx.cache,
         tags: ctx.tags,
-        prev_state: &synthetic,
+        prev_state: dep_state,
         all_asset_states: ctx.all_asset_states,
         requested_this_tick: ctx.requested_this_tick,
         now: ctx.now,
@@ -1694,6 +1702,8 @@ fn eval_partitioned_on_dep(
     };
 
     let mut local = HashMap::new();
+    let saved = dep_selections.cur_prev;
+    dep_selections.cur_prev = Some(prev_dep_sel.unwrap_or(&EMPTY_SELECTION_LATCH));
     let upstream_result: PartitionSelection = eval_partitioned(
         condition,
         &dep_ctx,
@@ -1702,6 +1712,7 @@ fn eval_partitioned_on_dep(
         &mut local,
         dep_selections,
     );
+    dep_selections.cur_prev = saved;
     if !local.is_empty() {
         dep_selections
             .acc
