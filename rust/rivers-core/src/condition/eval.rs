@@ -42,6 +42,18 @@ fn root_dep_selections<'a>(
         .unwrap_or(&EMPTY_DEP_SELECTIONS)
 }
 
+/// Merge (not replace) a dep's stateful-node results into the per-dep accumulator,
+/// so two sibling aggregates over the same dep don't clobber each other.
+fn collect_dep_latch<V>(
+    acc: &mut HashMap<String, HashMap<u32, V>>,
+    dep_key: &str,
+    local: HashMap<u32, V>,
+) {
+    if !local.is_empty() {
+        acc.entry(dep_key.to_string()).or_default().extend(local);
+    }
+}
+
 /// Previous-tick selection for stateful node `my_idx`: the per-dep latch when
 /// pivoting into a dep (`cur_prev`), otherwise the asset's own state.
 fn prev_partition_latch(
@@ -999,15 +1011,7 @@ fn eval_on_dep(
     dep_results.cur_prev = Some(latch);
     let val = eval_inner(condition, &dep_ctx, counter, &mut local, dep_results);
     dep_results.cur_prev = saved;
-    if !local.is_empty() {
-        // Merge, don't replace: a sibling aggregate may already have written this
-        // dep's slots (at different node indices) earlier in the tick.
-        dep_results
-            .acc
-            .entry(dep_key.to_string())
-            .or_default()
-            .extend(local);
-    }
+    collect_dep_latch(dep_results.acc, dep_key, local);
     val
 }
 
@@ -1590,17 +1594,14 @@ fn eval_partitioned_on_dep(
             cur_prev: Some(&bool_latch),
         };
         let val = eval_inner(condition, &dep_ctx, counter, &mut local, &mut bool_scope);
-        if !local.is_empty() {
-            dep_selections
-                .acc
-                .entry(dep_key.to_string())
-                .or_default()
-                .extend(
-                    local
-                        .into_iter()
-                        .map(|(idx, b)| (idx, PartitionSelection::from_bool(b))),
-                );
-        }
+        collect_dep_latch(
+            dep_selections.acc,
+            dep_key,
+            local
+                .into_iter()
+                .map(|(idx, b)| (idx, PartitionSelection::from_bool(b)))
+                .collect(),
+        );
         return PartitionSelection::from_bool(val);
     }
 
@@ -1713,13 +1714,7 @@ fn eval_partitioned_on_dep(
         dep_selections,
     );
     dep_selections.cur_prev = saved;
-    if !local.is_empty() {
-        dep_selections
-            .acc
-            .entry(dep_key.to_string())
-            .or_default()
-            .extend(local);
-    }
+    collect_dep_latch(dep_selections.acc, dep_key, local);
 
     // Map result back to downstream partition space.
     pctx.resolver
