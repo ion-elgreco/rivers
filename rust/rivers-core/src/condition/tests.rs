@@ -11847,3 +11847,56 @@ fn test_dep_aggregate_short_circuit_preserves_skipped_dep_latch() {
          short-circuited the aggregate"
     );
 }
+
+/// Two sibling dep-aggregates that pivot on the SAME dep must not clobber each
+/// other's per-dep latch. Each aggregate's stateful node gets a distinct node
+/// index, so the per-dep maps should MERGE — but a plain `acc.insert(dep, ..)`
+/// replaces the whole entry, dropping the first aggregate's latch.
+#[test]
+fn test_sibling_dep_aggregates_do_not_clobber_shared_dep_latch() {
+    // `And` so BOTH aggregates are evaluated on tick 1 (with `Or` the first
+    // truthy one would short-circuit the second, and no clobber would occur).
+    // Both pivot dep `a`; Agg1's Since lands at idx 2, Agg2's at idx 6, so the
+    // per-dep map needs both keys — a wholesale insert keeps only Agg2's.
+    let agg = || {
+        ConditionNode::any_deps_match(
+            ConditionNode::InProgress.since(ConditionNode::ExecutionFailed),
+        )
+    };
+    let tree = ConditionNode::And(vec![agg(), agg()]);
+    let deps = HashMap::from([("r".to_string(), vec!["a".to_string()])]);
+
+    let only_a = HashSet::from(["a".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+    let r = make_record("r");
+    let a = make_materialized_record("a", 100);
+    let records = HashMap::from([("r".to_string(), r.clone()), ("a".to_string(), a.clone())]);
+
+    // ── Tick 1: a in-progress → both aggregates' Since latch true. Both write
+    //    the shared dep's per-dep map; the second must not drop the first ──
+    let mut ctx1 = make_ctx("r", &r, &records, &deps);
+    ctx1.cache.in_progress_assets = &only_a;
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: a in-progress → both latches set");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext::from_eval_context(&ctx1),
+        &result1,
+    );
+
+    // ── Tick 2: a no longer in-progress, never failed → both Since triggers are
+    //    false, so both aggregates fire only from their persisted latch. With the
+    //    clobber bug Agg1's latch (idx 2) was overwritten, so `And` short-circuits
+    //    false at Agg1 ──
+    let mut ctx2 = make_ctx("r", &r, &records, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.cache.in_progress_assets = &none;
+    ctx2.now = 2000;
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        result2.fired,
+        "tick 2: both sibling aggregates' latches on the shared dep must persist"
+    );
+}

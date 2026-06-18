@@ -1602,3 +1602,70 @@ class TestDepAggregateShortCircuitLatch:
             "a short-circuiting the aggregate (after its failure) dropped b's "
             f"persisted latch, so r stopped firing ({baseline} -> {after} runs)"
         )
+
+
+class TestSiblingDepAggregateLatch:
+    def test_sibling_aggregates_do_not_clobber_shared_dep_latch(self, storage):
+        """Two dep-aggregates over the same dep, combined with ``&``, each keep an
+        independent ``Since`` latch. After ``r`` materializes both ``newly_updated``
+        triggers go false, so each aggregate fires only from its persisted latch.
+        If the second aggregate's per-dep write clobbered the first's, the ``&``
+        goes false and ``r`` stops firing.
+        """
+
+        def leg():
+            return rs.AutomationCondition.any_deps_match(
+                rs.AutomationCondition.newly_updated().since(
+                    rs.AutomationCondition.execution_failed()
+                )
+            )
+
+        cond = leg() & leg()  # And([agg, agg]); both pivot the same dep
+
+        @rs.Asset(name="a", io_handler=rs.InMemoryIOHandler())
+        def a() -> int:
+            return 1
+
+        @rs.Asset(
+            name="r", io_handler=rs.InMemoryIOHandler(), automation_condition=cond
+        )
+        def r(a: int) -> int:
+            return a
+
+        repo = rs.CodeRepository(
+            assets=[a, r], default_executor=rs.Executor.in_process()
+        )
+        repo.resolve(storage=storage)
+        repo.materialize(selection=["a"])  # newly_updated(a) → both legs latch
+
+        # Run 1: both legs latch; r fires. After r materializes, both triggers go
+        # false and only the persisted latches keep it firing.
+        daemon1 = AutomationDaemon(
+            repo=repo, storage=storage, condition_eval_interval="300ms"
+        )
+        daemon1.start()
+        try:
+            time.sleep(3.0)
+        finally:
+            daemon1.stop()
+        assert storage.get_latest_materialization("r", None) is not None, (
+            "run 1: r should materialize once a is newly updated"
+        )
+        baseline = len(storage.get_runs(limit=500))
+
+        # Run 2 (restart): newly_updated(a) is false (r is newer). Each `&` leg can
+        # only fire from its persisted per-dep latch; if one was clobbered the
+        # conjunction goes false and r stops.
+        daemon2 = AutomationDaemon(
+            repo=repo, storage=storage, condition_eval_interval="300ms"
+        )
+        daemon2.start()
+        try:
+            time.sleep(3.0)
+        finally:
+            daemon2.stop()
+        after = len(storage.get_runs(limit=500))
+        assert after > baseline, (
+            "a sibling aggregate clobbered the other's per-dep latch: r stopped "
+            f"firing after both triggers went false ({baseline} -> {after} runs)"
+        )

@@ -965,7 +965,13 @@ fn eval_on_dep(
     let mut local = HashMap::new();
     let val = eval_inner(condition, &dep_ctx, counter, &mut local, dep_results);
     if !local.is_empty() {
-        dep_results.acc.insert(dep_key.to_string(), local);
+        // Merge, don't replace: a sibling aggregate may already have written this
+        // dep's slots (at different node indices) earlier in the tick.
+        dep_results
+            .acc
+            .entry(dep_key.to_string())
+            .or_default()
+            .extend(local);
     }
     val
 }
@@ -1566,13 +1572,15 @@ fn eval_partitioned_on_dep(
         };
         let val = eval_inner(condition, &dep_ctx, counter, &mut local, &mut bool_scope);
         if !local.is_empty() {
-            dep_selections.acc.insert(
-                dep_key.to_string(),
-                local
-                    .into_iter()
-                    .map(|(idx, b)| (idx, PartitionSelection::from_bool(b)))
-                    .collect(),
-            );
+            dep_selections
+                .acc
+                .entry(dep_key.to_string())
+                .or_default()
+                .extend(
+                    local
+                        .into_iter()
+                        .map(|(idx, b)| (idx, PartitionSelection::from_bool(b))),
+                );
         }
         return PartitionSelection::from_bool(val);
     }
@@ -1695,7 +1703,11 @@ fn eval_partitioned_on_dep(
         dep_selections,
     );
     if !local.is_empty() {
-        dep_selections.acc.insert(dep_key.to_string(), local);
+        dep_selections
+            .acc
+            .entry(dep_key.to_string())
+            .or_default()
+            .extend(local);
     }
 
     // Map result back to downstream partition space.
