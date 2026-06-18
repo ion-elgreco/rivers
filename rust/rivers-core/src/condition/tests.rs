@@ -11764,3 +11764,86 @@ fn test_nested_dep_aggregate_since_latch_persists() {
         "tick 2: a latch nested two dep-hops deep must persist under the root's state"
     );
 }
+
+/// A dep-aggregate with a STATEFUL inner condition must evaluate every dep even
+/// when an earlier dep makes the aggregate short-circuit. Otherwise the skipped
+/// dep is absent from `dep_sub_results`, and `update_condition_state` (full
+/// replace) drops its persisted latch — so a dep loses its memory the moment a
+/// sibling short-circuits the aggregate. Multi-dep `on_cron` relies on each
+/// dep's "updated since reset" latch being independent.
+#[test]
+fn test_dep_aggregate_short_circuit_preserves_skipped_dep_latch() {
+    // `.all()` short-circuits on the first false dep; `a` is first.
+    let tree = ConditionNode::all_deps_match(
+        ConditionNode::InProgress.since(ConditionNode::ExecutionFailed),
+    );
+    let deps = HashMap::from([("r".to_string(), vec!["a".to_string(), "b".to_string()])]);
+
+    let both = HashSet::from(["a".to_string(), "b".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+    let only_a = HashSet::from(["a".to_string()]);
+
+    let r = make_record("r");
+    let a = make_materialized_record("a", 100);
+    let b = make_materialized_record("b", 100);
+    let records = HashMap::from([
+        ("r".to_string(), r.clone()),
+        ("a".to_string(), a.clone()),
+        ("b".to_string(), b.clone()),
+    ]);
+
+    // ── Tick 1: a and b both in-progress → both deps' Since latch true ──
+    let mut ctx1 = make_ctx("r", &r, &records, &deps);
+    ctx1.cache.in_progress_assets = &both;
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: both deps in-progress → latch fires");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext::from_eval_context(&ctx1),
+        &result1,
+    );
+
+    // ── Tick 2: a FAILED → its reset fires → Since(a) false, so `.all()`
+    //    short-circuits at a and would skip b. b did not fail and is still
+    //    latched; its latch must survive the skipped tick ──
+    let mut ctx2 = make_ctx("r", &r, &records, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.cache.failed_assets = &only_a;
+    ctx2.cache.in_progress_assets = &none;
+    ctx2.now = 2000;
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        !result2.fired,
+        "tick 2: a's latch reset by its failure → aggregate false this tick"
+    );
+
+    // Built manually (not `from_eval_context`) so it doesn't transitively borrow
+    // `state_r` through `ctx2`, which would block the `&mut state_r` below.
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext {
+            target_record_timestamp: r.last_timestamp,
+            target_data_version: r.last_data_version.as_ref(),
+            now: 2000,
+            is_initial: false,
+            partition_timestamps: None,
+        },
+        &result2,
+    );
+
+    // ── Tick 3: a in-progress again (re-latches), b neither in-progress nor
+    //    failed → b can only fire from its persisted latch. With the bug b's
+    //    latch was dropped on tick 2 (skipped), so the aggregate stays false ──
+    let mut ctx3 = make_ctx("r", &r, &records, &deps);
+    ctx3.prev_state = &state_r;
+    ctx3.cache.in_progress_assets = &only_a;
+    ctx3.now = 3000;
+    let result3 = evaluate(&tree, &ctx3);
+    assert!(
+        result3.fired,
+        "tick 3: b's per-dep latch must persist across the tick where a \
+         short-circuited the aggregate"
+    );
+}

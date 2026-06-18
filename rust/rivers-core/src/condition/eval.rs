@@ -444,15 +444,24 @@ fn eval_inner<O: EvalOutput>(
 
         ConditionNode::AnyDepsMatch { condition, .. } => {
             let base = *counter;
+            // Stateful inner: visit every dep, else a short-circuited dep loses its latch.
+            let eval_all = condition.has_stateful_nodes();
             let val = ctx
                 .cache
                 .upstream_deps
                 .get(ctx.target_key)
                 .map(|deps| {
-                    deps.iter().any(|dep| {
+                    let mut any = false;
+                    for dep in deps {
                         *counter = base;
-                        eval_on_dep(dep, condition, ctx, counter, dep_results)
-                    })
+                        if eval_on_dep(dep, condition, ctx, counter, dep_results) {
+                            any = true;
+                            if !eval_all {
+                                break;
+                            }
+                        }
+                    }
+                    any
                 })
                 .unwrap_or(false);
             finalize_dep_counter(counter, base, condition);
@@ -461,15 +470,23 @@ fn eval_inner<O: EvalOutput>(
 
         ConditionNode::AllDepsMatch { condition, .. } => {
             let base = *counter;
+            let eval_all = condition.has_stateful_nodes();
             let val = ctx
                 .cache
                 .upstream_deps
                 .get(ctx.target_key)
                 .map(|deps| {
-                    deps.iter().all(|dep| {
+                    let mut all = true;
+                    for dep in deps {
                         *counter = base;
-                        eval_on_dep(dep, condition, ctx, counter, dep_results)
-                    })
+                        if !eval_on_dep(dep, condition, ctx, counter, dep_results) {
+                            all = false;
+                            if !eval_all {
+                                break;
+                            }
+                        }
+                    }
+                    all
                 })
                 .unwrap_or(true);
             finalize_dep_counter(counter, base, condition);
@@ -478,10 +495,17 @@ fn eval_inner<O: EvalOutput>(
 
         ConditionNode::AssetMatches { keys, condition } => {
             let base = *counter;
-            let val = keys.iter().any(|key| {
+            let eval_all = condition.has_stateful_nodes();
+            let mut val = false;
+            for key in keys {
                 *counter = base;
-                eval_on_dep(key, condition, ctx, counter, dep_results)
-            });
+                if eval_on_dep(key, condition, ctx, counter, dep_results) {
+                    val = true;
+                    if !eval_all {
+                        break;
+                    }
+                }
+            }
             finalize_dep_counter(counter, base, condition);
             O::leaf(val, my_idx, node)
         }
@@ -1384,6 +1408,9 @@ fn eval_partitioned_all_deps(
     dep_selections: &mut DepScope<PartitionSelection>,
 ) -> PartitionSelection {
     let base = *counter;
+    // Stateful inner: visit every dep, else a dep skipped by the empty-intersection
+    // break loses its latch.
+    let eval_all = condition.has_stateful_nodes();
     let result = match ctx.cache.upstream_deps.get(ctx.target_key) {
         Some(deps) if !deps.is_empty() => {
             let mut result = PartitionSelection::Keys(pctx.all_keys.clone());
@@ -1392,7 +1419,7 @@ fn eval_partitioned_all_deps(
                 let dep_sel =
                     eval_partitioned_on_dep(dep, condition, ctx, pctx, counter, dep_selections);
                 result = result.intersect(&dep_sel);
-                if result.is_empty() {
+                if result.is_empty() && !eval_all {
                     break;
                 }
             }

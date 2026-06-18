@@ -1507,3 +1507,98 @@ class TestDepAggregateLatchPersistence:
             "the Since latch inside all_deps_match did not persist per-dep: r "
             f"stopped firing after its trigger went false ({baseline} -> {after} runs)"
         )
+
+
+class TestDepAggregateShortCircuitLatch:
+    def test_short_circuit_dep_does_not_drop_sibling_latch(self, storage):
+        """In ``all_deps_match(newly_updated().since(execution_failed()))`` over
+        two deps, a dep whose value goes false must not drop a *later* dep's
+        latch. ``.all()`` short-circuits on the first false dep, and a stateful
+        aggregate must still evaluate the rest so each dep keeps its latch.
+
+        Dep ``a`` (sorts first, so it is evaluated first) fails — its
+        ``.since(execution_failed)`` resets, short-circuiting the aggregate. Dep
+        ``b`` did not fail; its latch must survive so that once ``a`` recovers the
+        aggregate fires again. With the bug ``b``'s latch is dropped the moment
+        ``a`` short-circuits, so ``r`` never fires again.
+        """
+        fail = {"on": False}
+        cond = rs.AutomationCondition.all_deps_match(
+            rs.AutomationCondition.newly_updated().since(
+                rs.AutomationCondition.execution_failed()
+            )
+        )
+
+        @rs.Asset(name="a", io_handler=rs.InMemoryIOHandler())
+        def a() -> int:
+            if fail["on"]:
+                raise RuntimeError("induced failure to reset a's latch")
+            return 1
+
+        @rs.Asset(name="b", io_handler=rs.InMemoryIOHandler())
+        def b() -> int:
+            return 2
+
+        @rs.Asset(
+            name="r", io_handler=rs.InMemoryIOHandler(), automation_condition=cond
+        )
+        def r(a: int, b: int) -> int:
+            return a + b
+
+        repo = rs.CodeRepository(
+            assets=[a, b, r], default_executor=rs.Executor.in_process()
+        )
+        repo.resolve(storage=storage)
+        repo.materialize(selection=["a", "b"])  # both deps updated → both latches
+
+        # Phase A: both deps newly-updated → both Since latches set; r fires.
+        d1 = AutomationDaemon(
+            repo=repo, storage=storage, condition_eval_interval="300ms"
+        )
+        d1.start()
+        try:
+            time.sleep(3.0)
+        finally:
+            d1.stop()
+        assert storage.get_latest_materialization("r", None) is not None, (
+            "phase A: r should materialize once both deps are newly updated"
+        )
+
+        # Phase B: a fails → its reset fires → on the next tick `.all()`
+        # short-circuits at a and would skip b.
+        fail["on"] = True
+        repo.materialize(selection=["a"], raise_on_error=False)
+
+        # Phase C: daemon evaluates with a failed → aggregate false (r does not
+        # fire), but b's latch must survive the skipped tick.
+        d2 = AutomationDaemon(
+            repo=repo, storage=storage, condition_eval_interval="300ms"
+        )
+        d2.start()
+        try:
+            time.sleep(3.0)
+        finally:
+            d2.stop()
+
+        # Phase D: a recovers (re-materialized newer than r) → newly_updated(a)
+        # true again, execution_failed(a) false.
+        fail["on"] = False
+        repo.materialize(selection=["a"])
+
+        # Phase E: a satisfies the aggregate again; b can only contribute via its
+        # persisted latch (newly_updated(b) is false — b is older than r). With
+        # the bug b's latch was dropped in phase C, so r never fires again.
+        baseline = len(storage.get_runs(limit=500))
+        d3 = AutomationDaemon(
+            repo=repo, storage=storage, condition_eval_interval="300ms"
+        )
+        d3.start()
+        try:
+            time.sleep(3.0)
+        finally:
+            d3.stop()
+        after = len(storage.get_runs(limit=500))
+        assert after > baseline, (
+            "a short-circuiting the aggregate (after its failure) dropped b's "
+            f"persisted latch, so r stopped firing ({baseline} -> {after} runs)"
+        )
