@@ -570,6 +570,13 @@ fn eval_inner<O: EvalOutput>(
                     if O::COLLECTS_CHILDREN {
                         child_outs.push(out);
                     }
+                } else if child.has_stateful_nodes() {
+                    // Short-circuited, but evaluate to persist the child's latch
+                    // (its value is ignored — the And stays false).
+                    let out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
+                    if O::COLLECTS_CHILDREN {
+                        child_outs.push(out);
+                    }
                 } else if O::COLLECTS_CHILDREN {
                     child_outs.push(O::skipped(child, counter));
                 } else {
@@ -590,6 +597,13 @@ fn eval_inner<O: EvalOutput>(
                 if !result {
                     let out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
                     result = out.val();
+                    if O::COLLECTS_CHILDREN {
+                        child_outs.push(out);
+                    }
+                } else if child.has_stateful_nodes() {
+                    // Short-circuited, but evaluate to persist the child's latch
+                    // (its value is ignored — the Or stays true).
+                    let out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
                     if O::COLLECTS_CHILDREN {
                         child_outs.push(out);
                     }
@@ -1286,7 +1300,7 @@ fn eval_partitioned<O: PartEvalOutput>(
             let mut result = PartitionSelection::Keys(pctx.all_keys.clone());
             let mut child_parts = Vec::with_capacity(children.len());
             for child in children {
-                if result.is_empty() {
+                if result.is_empty() && !child.has_stateful_nodes() {
                     child_parts.push(O::skipped_child(child, counter));
                 } else {
                     let child_out = eval_partitioned::<O>(
@@ -1298,7 +1312,11 @@ fn eval_partitioned<O: PartEvalOutput>(
                         dep_selections,
                     );
                     let (child_sel, child_part) = O::into_parts(child_out);
-                    result = result.intersect(&child_sel);
+                    // Once empty the And stays empty; a stateful child is still
+                    // evaluated above to persist its latch.
+                    if !result.is_empty() {
+                        result = result.intersect(&child_sel);
+                    }
                     child_parts.push(child_part);
                 }
             }
@@ -1309,7 +1327,7 @@ fn eval_partitioned<O: PartEvalOutput>(
             let mut result = PartitionSelection::Empty;
             let mut child_parts = Vec::with_capacity(children.len());
             for child in children {
-                if result.is_all() {
+                if result.is_all() && !child.has_stateful_nodes() {
                     child_parts.push(O::skipped_child(child, counter));
                 } else {
                     let child_out = eval_partitioned::<O>(
@@ -1321,7 +1339,11 @@ fn eval_partitioned<O: PartEvalOutput>(
                         dep_selections,
                     );
                     let (child_sel, child_part) = O::into_parts(child_out);
-                    result = result.union(&child_sel);
+                    // Once all the Or stays all; a stateful child is still
+                    // evaluated above to persist its latch.
+                    if !result.is_all() {
+                        result = result.union(&child_sel);
+                    }
                     child_parts.push(child_part);
                 }
             }

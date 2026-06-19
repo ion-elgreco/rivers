@@ -4213,9 +4213,12 @@ fn test_counter_stability_and_short_circuit() {
     let ctx1 = make_ctx("a", &record, &records, &deps);
     let r1 = evaluate(&cond, &ctx1);
     assert!(!r1.fired);
-    // NewlyTrue's index should be 2 (And=0, InProgress=1, NewlyTrue=2, Missing=3)
-    // Since And short-circuited, NewlyTrue wasn't evaluated, so no sub_results entry
-    assert!(r1.sub_results.is_empty());
+    // NewlyTrue's index is 2 (And=0, InProgress=1, NewlyTrue=2, Missing=3). Even
+    // though the And short-circuited, the stateful child is still evaluated so its
+    // latch survives; Missing is true (record unmaterialized) → it records
+    // `current=true` at the stable index 2.
+    assert_eq!(r1.sub_results.get(&2), Some(&true));
+    assert_eq!(r1.sub_results.len(), 1);
 
     // Tick 2: Make InProgress=true so And doesn't short-circuit.
     // NewlyTrue(Missing) should fire (inner=true, previous=false).
@@ -11992,5 +11995,141 @@ fn test_nested_dep_aggregate_under_unpartitioned_dep_persists_latch() {
         result2.fired,
         "tick 2: a dep-aggregate nested inside the unpartitioned-dep fallback \
          must persist its per-dep latch"
+    );
+}
+
+/// A stateful child (Since/NewlyTrue) skipped by an `And`/`Or` short-circuit
+/// must keep its latch. `update_condition_state` full-replaces previous_results,
+/// so a skipped stateful node that isn't re-written loses its latch — the same
+/// class fixed for dep-aggregates, but And/Or were missed.
+#[test]
+fn test_and_short_circuit_preserves_stateful_child_latch() {
+    // And([gate, trigger.since(reset)]); when `gate` is false the And
+    // short-circuits and the stateful child is skipped.
+    let tree = ConditionNode::And(vec![
+        ConditionNode::InProgress,
+        ConditionNode::ExecutionFailed.since(ConditionNode::Missing),
+    ]);
+    let deps = HashMap::new();
+    let r = make_materialized_record("r", 100); // materialized → Missing (reset) false
+    let records = HashMap::from([("r".to_string(), r.clone())]);
+    let only_r = HashSet::from(["r".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+
+    // ── Tick 1: gate (InProgress) true AND trigger (ExecutionFailed) true →
+    //    Since latches true, And fires ──
+    let mut ctx1 = make_ctx("r", &r, &records, &deps);
+    ctx1.cache.in_progress_assets = &only_r;
+    ctx1.cache.failed_assets = &only_r;
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: gate + trigger true → And fires");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext::from_eval_context(&ctx1),
+        &result1,
+    );
+
+    // ── Tick 2: gate false → And short-circuits and the Since is skipped.
+    //    trigger also false this tick ──
+    let mut ctx2 = make_ctx("r", &r, &records, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.cache.in_progress_assets = &none;
+    ctx2.cache.failed_assets = &none;
+    ctx2.now = 2000;
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(!result2.fired, "tick 2: gate false → And false");
+
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext {
+            target_record_timestamp: r.last_timestamp,
+            target_data_version: r.last_data_version.as_ref(),
+            now: 2000,
+            is_initial: false,
+            partition_timestamps: None,
+        },
+        &result2,
+    );
+
+    // ── Tick 3: gate true again, trigger false → the Since can fire only from
+    //    its persisted latch. Pre-fix the latch was dropped on tick 2 ──
+    let mut ctx3 = make_ctx("r", &r, &records, &deps);
+    ctx3.prev_state = &state_r;
+    ctx3.cache.in_progress_assets = &only_r;
+    ctx3.cache.failed_assets = &none;
+    ctx3.now = 3000;
+    let result3 = evaluate(&tree, &ctx3);
+    assert!(
+        result3.fired,
+        "tick 3: a stateful child's latch must persist across a tick where \
+         And short-circuited and skipped it"
+    );
+}
+
+/// The `Or` counterpart: a stateful child skipped because an earlier child made
+/// the Or already-true must still keep its latch.
+#[test]
+fn test_or_short_circuit_preserves_stateful_child_latch() {
+    // Or([gate, trigger.since(reset)]); when `gate` is true the Or short-circuits
+    // and the stateful child is skipped.
+    let tree = ConditionNode::Or(vec![
+        ConditionNode::InProgress,
+        ConditionNode::ExecutionFailed.since(ConditionNode::Missing),
+    ]);
+    let deps = HashMap::new();
+    let r = make_materialized_record("r", 100); // materialized → Missing (reset) false
+    let records = HashMap::from([("r".to_string(), r.clone())]);
+    let only_r = HashSet::from(["r".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+
+    // ── Tick 1: gate false, trigger true → Or evaluates the Since (latches true) ──
+    let mut ctx1 = make_ctx("r", &r, &records, &deps);
+    ctx1.cache.in_progress_assets = &none;
+    ctx1.cache.failed_assets = &only_r;
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: trigger true → Or fires");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext::from_eval_context(&ctx1),
+        &result1,
+    );
+
+    // ── Tick 2: gate true → Or short-circuits and skips the Since. trigger false ──
+    let mut ctx2 = make_ctx("r", &r, &records, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.cache.in_progress_assets = &only_r;
+    ctx2.cache.failed_assets = &none;
+    ctx2.now = 2000;
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(result2.fired, "tick 2: gate true → Or fires (from gate)");
+
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext {
+            target_record_timestamp: r.last_timestamp,
+            target_data_version: r.last_data_version.as_ref(),
+            now: 2000,
+            is_initial: false,
+            partition_timestamps: None,
+        },
+        &result2,
+    );
+
+    // ── Tick 3: gate false, trigger false → Or fires only if the Since latch
+    //    persisted across the skipped tick ──
+    let mut ctx3 = make_ctx("r", &r, &records, &deps);
+    ctx3.prev_state = &state_r;
+    ctx3.cache.in_progress_assets = &none;
+    ctx3.cache.failed_assets = &none;
+    ctx3.now = 3000;
+    let result3 = evaluate(&tree, &ctx3);
+    assert!(
+        result3.fired,
+        "tick 3: a stateful child's latch must persist across a tick where \
+         Or short-circuited and skipped it"
     );
 }
