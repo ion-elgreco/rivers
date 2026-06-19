@@ -11900,3 +11900,97 @@ fn test_sibling_dep_aggregates_do_not_clobber_shared_dep_latch() {
         "tick 2: both sibling aggregates' latches on the shared dep must persist"
     );
 }
+
+/// A dep-aggregate NESTED inside the unpartitioned-upstream bool fallback of a
+/// partitioned root must persist its per-dep latch. Pre-fix that nested latch
+/// landed in a throwaway `nested_acc` (discarded every tick), so the inner
+/// `Since` could never hold across ticks.
+#[test]
+fn test_nested_dep_aggregate_under_unpartitioned_dep_persists_latch() {
+    // Partitioned root `r` ← UNPARTITIONED dep `b` ← `b`'s upstream `c`.
+    // Condition: any_deps_match(any_deps_match(InProgress.since(ExecutionFailed))).
+    // Outer aggregate pivots to `b` (unpartitioned → bool fallback); the inner
+    // aggregate pivots to `c`, whose Since latch is the state under test.
+    let tree = ConditionNode::any_deps_match(ConditionNode::any_deps_match(
+        ConditionNode::InProgress.since(ConditionNode::ExecutionFailed),
+    ));
+    let p1 = spk("p1");
+    let all_keys = HashSet::from([p1.clone()]);
+
+    let r = make_record("r");
+    let b = make_materialized_record("b", 100);
+    let c = make_materialized_record("c", 100);
+    let records = HashMap::from([
+        ("r".to_string(), r.clone()),
+        ("b".to_string(), b.clone()),
+        ("c".to_string(), c.clone()),
+    ]);
+    let deps = HashMap::from([
+        ("r".to_string(), vec!["b".to_string()]),
+        ("b".to_string(), vec!["c".to_string()]),
+    ]);
+
+    let only_c = HashSet::from(["c".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+
+    let r_timestamps = HashMap::from([(p1.clone(), 50i64)]);
+    let r_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: all_keys.clone(),
+        timestamps: r_timestamps.clone(),
+        ..Default::default()
+    };
+    let partition_statuses = HashMap::from([("r".to_string(), r_status)]);
+    let empty_mappings = HashMap::new();
+    // `b` absent from upstream_partition_keys → unpartitioned dep → bool fallback.
+    let no_upstream_keys = HashMap::new();
+    let empty_pk: HashSet<PartitionKey> = HashSet::new();
+
+    let make_pctx = || PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &all_keys,
+        in_progress: &empty_pk,
+        failed: &empty_pk,
+        timestamps: &r_timestamps,
+        resolver: PartitionResolver::new(&empty_mappings, &no_upstream_keys),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+
+    // ── Tick 1: c in-progress → inner Since latches true for c ──
+    let mut ctx1 = make_ctx("r", &r, &records, &deps);
+    ctx1.cache.in_progress_assets = &only_c;
+    let pctx1 = make_pctx();
+    ctx1.partitions = Some(&pctx1);
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: c in-progress → nested Since fires");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext {
+            target_record_timestamp: r.last_timestamp,
+            target_data_version: r.last_data_version.as_ref(),
+            now: 1000,
+            is_initial: false,
+            partition_timestamps: Some(&r_timestamps),
+        },
+        &result1,
+    );
+
+    // ── Tick 2: c no longer in-progress and never failed → the inner Since can
+    //    fire only from its persisted latch. Pre-fix the nested latch was
+    //    dropped, so the aggregate stays false ──
+    let mut ctx2 = make_ctx("r", &r, &records, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.cache.in_progress_assets = &none;
+    ctx2.now = 2000;
+    let pctx2 = make_pctx();
+    ctx2.partitions = Some(&pctx2);
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        result2.fired,
+        "tick 2: a dep-aggregate nested inside the unpartitioned-dep fallback \
+         must persist its per-dep latch"
+    );
+}

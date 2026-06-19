@@ -1584,9 +1584,19 @@ fn eval_partitioned_on_dep(
             .unwrap_or_default();
         let mut local = HashMap::new();
         // Unpartitioned upstream → bool eval; the dep's own latch round-trips via
-        // `local`. A dep-aggregate nested inside the fallback isn't carried (would
-        // need bool<->selection bridging — a rare corner).
-        let nested_prev = HashMap::new();
+        // `local`. A dep-aggregate nested inside the fallback keeps its own per-dep
+        // latches in `nested_acc`, bridged to/from selection space (non-empty == true)
+        // so they persist across ticks like the partitioned path.
+        let nested_prev: HashMap<String, HashMap<u32, bool>> = dep_selections
+            .prev
+            .iter()
+            .map(|(k, m)| {
+                (
+                    k.clone(),
+                    m.iter().map(|(idx, sel)| (*idx, !sel.is_empty())).collect(),
+                )
+            })
+            .collect();
         let mut nested_acc = HashMap::new();
         let mut bool_scope = DepScope {
             prev: &nested_prev,
@@ -1602,6 +1612,16 @@ fn eval_partitioned_on_dep(
                 .map(|(idx, b)| (idx, PartitionSelection::from_bool(b)))
                 .collect(),
         );
+        for (nested_key, idx_map) in nested_acc {
+            collect_dep_latch(
+                dep_selections.acc,
+                &nested_key,
+                idx_map
+                    .into_iter()
+                    .map(|(idx, b)| (idx, PartitionSelection::from_bool(b)))
+                    .collect(),
+            );
+        }
         return PartitionSelection::from_bool(val);
     }
 
