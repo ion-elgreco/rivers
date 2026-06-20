@@ -12689,6 +12689,44 @@ fn test_condition_eval_state_schema_version_stamps_and_migrates() {
     );
 }
 
+/// When an asset flips from partitioned to unpartitioned while keeping the same
+/// condition tree, the fingerprint is unchanged (it ignores the partition def)
+/// so `reset_for_new_tree` never runs. `update_condition_state` must itself drop
+/// the stale `partition_state` on an unpartitioned eval, else it lingers forever
+/// and is resurrected if the asset is later re-partitioned with the same tree.
+#[test]
+fn test_update_condition_state_clears_stale_partition_state_when_unpartitioned() {
+    let pk = PartitionKey::Single {
+        keys: vec!["2024-01-01".to_string()],
+    };
+    let mut state = AssetConditionState {
+        partition_state: Some(PartitionState {
+            timestamps: HashMap::from([(pk, 100i64)]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    // An unpartitioned evaluation result: `sub_selections` is None.
+    let result = EvalResult {
+        fired: false,
+        ..Default::default()
+    };
+    let ctx = StateUpdateContext {
+        target_record_timestamp: Some(200),
+        target_data_version: None,
+        now: 300,
+        is_initial: false,
+        partition_timestamps: None,
+    };
+    update_condition_state(&mut state, &ctx, &result);
+
+    assert!(
+        state.partition_state.is_none(),
+        "stale partition_state must be cleared on an unpartitioned eval"
+    );
+}
+
 /// `ConditionEvalState` is persisted via `serde_json`, which cannot use a
 /// `PartitionKey` (an object-serializing enum) as a JSON map key. `PartitionState`
 /// timestamps are keyed by `PartitionKey`, so any partitioned automation
