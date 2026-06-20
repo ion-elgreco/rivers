@@ -8492,6 +8492,29 @@ fn test_partition_mapping_static() {
 }
 
 #[test]
+fn test_partition_mapping_static_identity_fallback() {
+    // Partial Static map: d1 is explicit, d2 is unmapped. The runtime
+    // (mapping.rs map_key) reads upstream d2 for the unmapped downstream d2 via
+    // identity, so an upstream d2 update must trigger downstream d2 — the
+    // condition-eval reverse map previously dropped it (missed materialization).
+    let m = PartitionMappingKind::Static {
+        mapping: HashMap::from([("d1".to_string(), "u1".to_string())]),
+    };
+    assert_eq!(
+        m.map_to_downstream(&PartitionSelection::Keys(HashSet::from([spk("d2")]))),
+        PartitionSelection::Keys(HashSet::from([spk("d2")])),
+        "unmapped upstream d2 must identity-map to downstream d2"
+    );
+    // Explicit reverse mapping still works and does NOT also pass the upstream
+    // target u1 through as a downstream key.
+    assert_eq!(
+        m.map_to_downstream(&PartitionSelection::Keys(HashSet::from([spk("u1")]))),
+        PartitionSelection::Keys(HashSet::from([spk("d1")])),
+        "explicit u1 -> d1; the upstream target u1 is not identity-passed"
+    );
+}
+
+#[test]
 fn test_partition_mapping_specific() {
     let m = PartitionMappingKind::SpecificPartitions {
         keys: vec!["latest".into()],

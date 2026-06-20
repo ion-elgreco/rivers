@@ -227,7 +227,7 @@ impl PartitionMappingKind {
                 PartitionSelection::All => PartitionSelection::All,
                 PartitionSelection::Keys(keys) => {
                     // Reverse lookup: mapping is downstream → upstream.
-                    let mapped: HashSet<PartitionKey> = mapping
+                    let mut mapped: HashSet<PartitionKey> = mapping
                         .iter()
                         .filter(|(_, v)| {
                             keys.contains(&PartitionKey::Single {
@@ -238,6 +238,23 @@ impl PartitionMappingKind {
                             keys: vec![k.clone()],
                         })
                         .collect();
+                    // Unmapped downstream keys use identity (mapping.rs map_key:
+                    // a downstream key absent from the map reads the same-named
+                    // upstream key). So an upstream key that is neither an
+                    // explicit downstream mapping key nor an explicit upstream
+                    // target also triggers its same-named downstream partition;
+                    // emit it so a partial Static map doesn't drop that
+                    // materialization (a spurious key is filtered later against
+                    // the downstream universe).
+                    for uk in keys {
+                        if let PartitionKey::Single { keys: parts } = uk
+                            && parts.len() == 1
+                            && !mapping.contains_key(&parts[0])
+                            && !mapping.values().any(|v| v == &parts[0])
+                        {
+                            mapped.insert(uk.clone());
+                        }
+                    }
                     if mapped.is_empty() {
                         PartitionSelection::Empty
                     } else {
