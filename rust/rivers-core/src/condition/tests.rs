@@ -13001,3 +13001,63 @@ fn test_next_cron_occurrence_utc_fall_back_never_returns_past_instant() {
         "the first 01:30 wall time after 01:05 EST is 01:30 EST"
     );
 }
+
+/// On the root's FIRST tick (`last_tick_timestamp` = None) a `CronTickPassed`
+/// in a dep pivot must default to a zero-width window (`ctx.now`), not bleed the
+/// pivoted dep's own `last_tick_timestamp`. A conditioned dep that ran earlier
+/// carries an old tick spanning a cron boundary; reading it would span a wide
+/// window and spuriously fire the root on its very first evaluation.
+#[test]
+fn test_cron_in_dep_pivot_does_not_use_dep_tick_on_root_first_eval() {
+    let cron = ConditionNode::CronTickPassed {
+        cron_schedule: "30 16 * * 1-5".to_string(),
+        timezone: None,
+    };
+    let tree = ConditionNode::all_deps_match(cron);
+    let deps = HashMap::from([("r".to_string(), vec!["a".to_string()])]);
+    let r = make_materialized_record("r", 100);
+    let a = make_materialized_record("a", 100);
+    let records = HashMap::from([("r".to_string(), r.clone()), ("a".to_string(), a.clone())]);
+
+    // Tue 2023-11-14: 16:00 (dep's old tick) → 16:31 (now); cron tick at 16:30.
+    let t_old: i64 = 1_699_977_600_000_000_000;
+    let now: i64 = 1_699_979_460_000_000_000;
+
+    // The dep `a` is CONDITIONED and last evaluated at t_old; the root `r` has
+    // never ticked (absent from all_asset_states → last_tick None).
+    let dep_state = AssetConditionState {
+        last_tick_timestamp: Some(t_old),
+        ..Default::default()
+    };
+    let all_states: HashMap<String, AssetConditionState> =
+        HashMap::from([("a".to_string(), dep_state)]);
+    let prev_r = AssetConditionState::default();
+
+    let ctx = EvalContext {
+        target_key: "r",
+        root_key: "r",
+        target_record: &r,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &EMPTY_SET,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &prev_r,
+        all_asset_states: &all_states,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now,
+        is_initial: false,
+        partitions: None,
+        root_partition_floor: None,
+    };
+    let result = evaluate(&tree, &ctx);
+    assert!(
+        !result.fired,
+        "root's first tick: cron window is zero-width (ctx.now), so no cron tick \
+         has passed; the dep's old tick must NOT widen the window and fire"
+    );
+}

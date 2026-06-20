@@ -51,13 +51,20 @@ fn root_dep_selections<'a>(
 
 /// The root asset's previous-tick evaluation time. In a dep pivot `prev_state`
 /// is the dep's state (and unconditioned deps never get `last_tick_timestamp`),
-/// so read the root from `all_asset_states`; fall back to `prev_state` when the
-/// root isn't tracked there (root-level eval / first tick).
+/// so read the root from `all_asset_states`.
 fn root_last_tick(ctx: &EvalContext) -> Option<i64> {
     ctx.all_asset_states
         .get(ctx.root_key)
         .and_then(|s| s.last_tick_timestamp)
-        .or(ctx.prev_state.last_tick_timestamp)
+        // Only fall back to `prev_state` at root level, where it IS the root's
+        // state. In a dep pivot `prev_state` is the dep's state — using its tick
+        // would leak the dep's (possibly far-older) boundary into the root's
+        // cron window and spuriously fire on the root's first tick.
+        .or_else(|| {
+            (ctx.target_key == ctx.root_key)
+                .then_some(ctx.prev_state.last_tick_timestamp)
+                .flatten()
+        })
 }
 
 /// Merge (not replace) a dep's stateful-node results into the per-dep accumulator,
