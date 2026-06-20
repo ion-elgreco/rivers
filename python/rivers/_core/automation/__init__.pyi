@@ -149,7 +149,7 @@ class AutomationCondition:
         """True when the latest run that materialized this asset had matching tags.
 
         Args:
-            tag_keys: Match if any of these keys are present (any value).
+            tag_keys: Match only if all of these keys are present (any value).
             tag_values: Match if these exact key-value pairs are present.
         """
         ...
@@ -178,7 +178,7 @@ class AutomationCondition:
         """True if any new materialization this tick came from a run with matching tags.
 
         Args:
-            tag_keys: Match if any of these keys are present.
+            tag_keys: Match only if all of these keys are present.
             tag_values: Match if these exact key-value pairs are present.
         """
         ...
@@ -193,7 +193,7 @@ class AutomationCondition:
         Vacuously true if there were no new materializations.
 
         Args:
-            tag_keys: Match if any of these keys are present.
+            tag_keys: Match only if all of these keys are present.
             tag_values: Match if these exact key-value pairs are present.
         """
         ...
