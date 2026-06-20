@@ -494,11 +494,25 @@ impl AssetConditionCache {
             // cancellation also produces no record-ts change / StepSuccess for
             // the ts-unchanged fallback above to catch. Without this the asset
             // would stay wedged in_progress forever.
+            // `get_runs_since` uses `>`, so a run only ever seen as Started is
+            // never re-observed and its terminal state never reaches the
+            // new_runs loop below. The clearable sweep and the completed_run_ids
+            // application both fetch and apply the run-derived effects so
+            // `LastRunIncludesTarget` / `HasRunWithTags` / `failed_assets`
+            // reflect the actual completed run. Ids that ARE in `new_runs` as
+            // terminal are skipped (the new_runs loop applies them).
+            let new_runs_terminal: HashSet<&str> = new_runs
+                .iter()
+                .filter(|r| !matches!(r.status, RunStatus::Started | RunStatus::NotStarted))
+                .map(|r| r.run_id.as_str())
+                .collect();
+
             let clearable: Vec<String> = self
                 .in_progress_assets
                 .values()
                 .flat_map(|runs| runs.keys().cloned())
                 .collect();
+            let mut swept_applied: HashSet<String> = HashSet::new();
             if !clearable.is_empty() {
                 let tracked_runs = storage.get_runs_by_ids(&clearable, None).await?;
                 for run in &tracked_runs {
@@ -513,22 +527,25 @@ impl AssetConditionCache {
                             });
                         }
                     }
+                    // A terminal run reaching only this sweep (cursor missed it,
+                    // no record-ts change / StepSuccess) still needs its effects
+                    // applied — otherwise a Failure here sets no failure floor
+                    // and an eager asset re-dispatches the failing run every
+                    // tick. Canceled only clears (matches the new_runs arm).
+                    // Skip ids the new_runs / completed_run_ids paths apply.
+                    if matches!(run.status, RunStatus::Success | RunStatus::Failure)
+                        && !new_runs_terminal.contains(run.run_id.as_str())
+                        && !completed_run_ids.contains(&run.run_id)
+                    {
+                        self.apply_run_effects_to_delta(run, &mut delta);
+                        swept_applied.insert(run.run_id.clone());
+                    }
                 }
             }
 
-            // `get_runs_since` uses `>`, so a run only ever seen as Started
-            // is never re-observed and its terminal state never reaches the
-            // new_runs loop below. Fetch and apply the run-derived effects
-            // here so `LastRunIncludesTarget` / `HasRunWithTags` /
-            // `failed_assets` reflect the actual completed run. Skip ids that
-            // ARE in `new_runs` as terminal — those are about to be applied
-            // by the loop and double-applying would issue a redundant query.
-            let new_runs_terminal: HashSet<&str> = new_runs
-                .iter()
-                .filter(|r| !matches!(r.status, RunStatus::Started | RunStatus::NotStarted))
-                .map(|r| r.run_id.as_str())
-                .collect();
-            completed_run_ids.retain(|id| !new_runs_terminal.contains(id.as_str()));
+            completed_run_ids.retain(|id| {
+                !new_runs_terminal.contains(id.as_str()) && !swept_applied.contains(id)
+            });
             if !completed_run_ids.is_empty() {
                 let ids: Vec<String> = completed_run_ids.into_iter().collect();
                 let completed_runs = storage.get_runs_by_ids(&ids, None).await?;

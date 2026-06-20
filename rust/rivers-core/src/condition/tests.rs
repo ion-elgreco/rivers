@@ -7026,6 +7026,76 @@ async fn test_cache_clears_in_progress_when_run_canceled_after_cursor_advanced()
 }
 
 #[tokio::test]
+async fn test_clearable_sweep_sets_failure_floor_on_missed_terminal_failure() {
+    // Regression (C1): a Started run that storage reports once advances the run
+    // cursor and leaves the phantom-eviction net. If it then FAILS without a
+    // materialization (record ts unchanged) and without a StepFailure event
+    // (pod death / event-write lag), `get_runs_since` (`>`) never re-delivers
+    // it and the ts/StepSuccess completion check can't see it — only the
+    // clearable sweep catches the terminal transition. That sweep must also set
+    // the failure floor; otherwise an `eager`/`on_missing` condition has nothing
+    // to suppress it and re-dispatches the failing run every tick.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+
+    let rec_a = make_materialized_record("a", 1000);
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_a])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    // Started run for a → observed, in_progress set, cursor advances to 2000.
+    let run_id = "run-fail".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(cache.in_progress_assets.contains_key("a"));
+
+    // Run fails. start_time stays 2000 (no new materialization record), no
+    // StepFailure event written → only the clearable sweep sees the failure.
+    storage
+        .update_run_status(&run_id, RunStatus::Failure, Some(3000))
+        .await
+        .unwrap();
+
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        !cache.in_progress_assets.contains_key("a"),
+        "a must be cleared from in_progress after the failure"
+    );
+    assert!(
+        cache.failed_assets.contains("a"),
+        "the clearable sweep must set the failure floor for a terminal failure \
+         caught only there; got failed_assets={:?}",
+        cache.failed_assets,
+    );
+    assert_eq!(cache.failed_asset_timestamps.get("a"), Some(&3000));
+}
+
+#[tokio::test]
 async fn test_cache_does_not_store_empty_run_tags() {
     // Regression: update_run_tags previously stored empty tag vecs in the cache.
     // With an empty entry, run_tags_match(&[], &[], &[]) returns true (vacuous
