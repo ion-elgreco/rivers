@@ -301,6 +301,24 @@ class TestCronValidation:
         rs.AutomationCondition.cron_tick_passed("0 0 * * *", timezone="Europe/London")
         rs.AutomationCondition.all_deps_updated_since_cron("0 0 * * *", timezone="UTC")
 
+    def test_tag_condition_rejects_empty_filter(self):
+        # An empty key+value filter vacuously matches every run; reject it.
+        with pytest.raises(ValueError):
+            rs.AutomationCondition.has_run_with_tags()
+        with pytest.raises(ValueError):
+            rs.AutomationCondition.all_runs_have_tags()
+        with pytest.raises(ValueError):
+            rs.AutomationCondition.last_executed_with_tags()
+
+    def test_tag_condition_accepts_nonempty_filter(self):
+        rs.AutomationCondition.has_run_with_tags(tag_keys=["env"])
+        rs.AutomationCondition.all_runs_have_tags(tag_values=[("env", "prod")])
+
+    def test_on_selected_rejects_empty_keys(self):
+        # An empty asset-key set never matches → degenerate always-false subtree.
+        with pytest.raises(ValueError):
+            rs.AutomationCondition.newly_updated().on_selected([])
+
 
 # ---------------------------------------------------------------------------
 # without()

@@ -19,6 +19,22 @@ fn validate_tz(timezone: &Option<String>) -> PyResult<()> {
     Ok(())
 }
 
+/// Reject a tag condition with no filter at all: an empty key+value set matches
+/// every run (`all()` over empty is vacuously true), which is never intended.
+fn require_tag_filter(
+    tag_keys: &Option<Vec<String>>,
+    tag_values: &Option<Vec<(String, String)>>,
+) -> PyResult<()> {
+    let keys_empty = tag_keys.as_ref().is_none_or(|k| k.is_empty());
+    let values_empty = tag_values.as_ref().is_none_or(|v| v.is_empty());
+    if keys_empty && values_empty {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "tag condition requires at least one tag_key or tag_value (an empty filter matches every run)",
+        ));
+    }
+    Ok(())
+}
+
 /// Human-readable description of a condition node (for Python display).
 pub(crate) fn description(node: &ConditionNode) -> String {
     match node {
@@ -289,11 +305,12 @@ impl PyAutomationCondition {
     fn last_executed_with_tags(
         tag_keys: Option<Vec<String>>,
         tag_values: Option<Vec<(String, String)>>,
-    ) -> Self {
-        Self::new_node(ConditionNode::LastExecutedWithTags {
+    ) -> PyResult<Self> {
+        require_tag_filter(&tag_keys, &tag_values)?;
+        Ok(Self::new_node(ConditionNode::LastExecutedWithTags {
             tag_keys: tag_keys.unwrap_or_default(),
             tag_values: tag_values.unwrap_or_default(),
-        })
+        }))
     }
 
     /// True if this asset's latest run also included the target (root) asset.
@@ -314,11 +331,12 @@ impl PyAutomationCondition {
     fn has_run_with_tags(
         tag_keys: Option<Vec<String>>,
         tag_values: Option<Vec<(String, String)>>,
-    ) -> Self {
-        Self::new_node(ConditionNode::HasRunWithTags {
+    ) -> PyResult<Self> {
+        require_tag_filter(&tag_keys, &tag_values)?;
+        Ok(Self::new_node(ConditionNode::HasRunWithTags {
             tag_keys: tag_keys.unwrap_or_default(),
             tag_values: tag_values.unwrap_or_default(),
-        })
+        }))
     }
 
     /// True if all of this asset's new materializations (this tick) came from runs with matching tags.
@@ -327,11 +345,12 @@ impl PyAutomationCondition {
     fn all_runs_have_tags(
         tag_keys: Option<Vec<String>>,
         tag_values: Option<Vec<(String, String)>>,
-    ) -> Self {
-        Self::new_node(ConditionNode::AllRunsHaveTags {
+    ) -> PyResult<Self> {
+        require_tag_filter(&tag_keys, &tag_values)?;
+        Ok(Self::new_node(ConditionNode::AllRunsHaveTags {
             tag_keys: tag_keys.unwrap_or_default(),
             tag_values: tag_values.unwrap_or_default(),
-        })
+        }))
     }
 
     /// True when any dependency is missing.
@@ -384,6 +403,11 @@ impl PyAutomationCondition {
     /// Accepts a single asset key or a list of keys.
     fn on_selected(&self, keys: &Bound<'_, PyAny>) -> PyResult<Self> {
         let keys = extract_keys(keys)?;
+        if keys.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "on_selected requires at least one asset key (an empty set never matches)",
+            ));
+        }
         Ok(Self::new_node(ConditionNode::asset_matches(
             keys,
             self.node.clone(),
