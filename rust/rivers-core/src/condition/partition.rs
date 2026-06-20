@@ -465,6 +465,7 @@ mod partition_key_i64_map {
 
 /// Per-partition condition evaluation state, persisted across ticks.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PartitionState {
     /// Per-node partition selections from previous tick.
     pub previous_selections: HashMap<u32, PartitionSelection>,

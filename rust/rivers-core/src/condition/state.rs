@@ -11,7 +11,10 @@ use super::cache::BackfillState;
 use super::partition::{PartitionEvalContext, PartitionSelection, PartitionState};
 
 /// Per-asset state persisted across daemon ticks.
+// `serde(default)`: an old blob missing a newer field loads with that field's
+// default instead of failing (a load error silently resets every latch).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct AssetConditionState {
     /// Previous tick's evaluation results keyed by node index (u32).
     /// Used by `NewlyTrue` and `Since` to detect transitions.
@@ -63,6 +66,7 @@ impl AssetConditionState {
 
 /// Global condition evaluation state persisted across daemon restarts (via KV store).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ConditionEvalState {
     /// Per-asset evaluation state.
     pub assets: HashMap<String, AssetConditionState>,

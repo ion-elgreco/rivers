@@ -12294,6 +12294,29 @@ fn test_condition_eval_state_round_trips_with_partition_timestamps() {
     );
 }
 
+/// An OLD persisted blob missing newer fields must still load (using defaults)
+/// rather than failing to deserialize — a deserialize error silently resets all
+/// latches (see the load-path hardening). Guards `#[serde(default)]` coverage so
+/// future field additions stay forward-compatible for persisted storage.
+#[test]
+fn test_condition_eval_state_tolerates_missing_fields() {
+    // Top-level `is_initial` omitted; asset "a" carries only `is_initial` —
+    // every other field (previous_results, fingerprint, timestamps, …) absent.
+    let json = r#"{"assets":{"a":{"is_initial":true}}}"#;
+    let state: ConditionEvalState =
+        serde_json::from_str(json).expect("a partial/old blob must load with defaults");
+    assert!(
+        !state.is_initial,
+        "missing top-level is_initial → default false"
+    );
+    let a = &state.assets["a"];
+    assert!(a.is_initial);
+    assert!(a.previous_results.is_empty());
+    assert_eq!(a.condition_fingerprint, "");
+    assert!(a.last_handled_timestamp.is_none());
+    assert!(a.partition_state.is_none());
+}
+
 /// `DataVersionChanged` over an UNCONDITIONED dep must not re-fire every tick.
 /// `update_dep_baselines` has to record the dep's `last_data_version` (like it
 /// does `last_materialized_timestamp`), else the pivot reads prev=None forever
