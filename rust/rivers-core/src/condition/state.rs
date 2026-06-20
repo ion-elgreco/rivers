@@ -276,11 +276,13 @@ pub fn update_condition_state(
     }
 }
 
-/// Establish partition timestamp baselines for upstream deps that don't have
-/// their own automation condition.
+/// Establish timestamp / data-version baselines for upstream deps that don't
+/// have their own automation condition.
 ///
 /// Without this, `NewlyUpdated` in `AnyDepsMatch` sees `None` for previous
-/// partition timestamps and returns all partitions as "newly updated" every tick.
+/// timestamps and returns all partitions as "newly updated" every tick, and
+/// `DataVersionChanged` sees `None` for the previous version and fires every
+/// tick despite a stable version.
 ///
 /// Called by the daemon after condition evaluation. `conditioned_assets` is the
 /// set of asset keys that have their own condition (their state is managed by
@@ -292,12 +294,13 @@ pub fn update_dep_baselines(
     partition_statuses: &HashMap<String, super::cache::PartitionStatusEntry>,
     records: &HashMap<String, crate::storage::AssetRecord>,
 ) {
-    type DepTimestampUpdate = (
+    type DepBaselineUpdate = (
         String,
         Option<i64>,
+        Option<String>,
         Option<HashMap<crate::storage::PartitionKey, i64>>,
     );
-    let mut updates: Vec<DepTimestampUpdate> = Vec::new();
+    let mut updates: Vec<DepBaselineUpdate> = Vec::new();
 
     for deps in upstream_deps.values() {
         for dep in deps {
@@ -305,14 +308,16 @@ pub fn update_dep_baselines(
                 continue;
             }
             let record_ts = records.get(dep).and_then(|r| r.last_timestamp);
+            let data_version = records.get(dep).and_then(|r| r.last_data_version.clone());
             let partition_ts = partition_statuses.get(dep).map(|ps| ps.timestamps.clone());
-            updates.push((dep.clone(), record_ts, partition_ts));
+            updates.push((dep.clone(), record_ts, data_version, partition_ts));
         }
     }
 
-    for (dep, record_ts, partition_ts) in updates {
+    for (dep, record_ts, data_version, partition_ts) in updates {
         let dep_state = eval_state.entry(dep).or_default();
         dep_state.last_materialized_timestamp = record_ts;
+        dep_state.last_data_version = data_version;
         if let Some(ts) = partition_ts {
             let ps = dep_state
                 .partition_state
