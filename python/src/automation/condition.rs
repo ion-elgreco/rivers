@@ -457,6 +457,14 @@ impl PyAutomationCondition {
             let target = condition.extract::<PyAutomationCondition>()?.node;
             self.node.without_matching(&|child| *child == target)
         };
+        // Removing every operand leaves an empty `And`, which evaluates to
+        // vacuously true (fires every tick). Reject it rather than ship a
+        // condition that materializes unconditionally.
+        if matches!(&node, ConditionNode::And(c) if c.is_empty()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "without() removed every operand, leaving an empty condition that would fire on every tick",
+            ));
+        }
         Ok(Self {
             node,
             label: self.label.clone(),
