@@ -508,19 +508,26 @@ impl ConditionNode {
                 tag_keys,
                 tag_values,
             } => format_tag_label("all_runs_have_tags", tag_keys, tag_values),
-            ConditionNode::AnyDepsMatch { label, .. } => {
-                label.as_deref().unwrap_or("any_deps_match(...)").into()
-            }
-            ConditionNode::AllDepsMatch { label, .. } => {
-                label.as_deref().unwrap_or("all_deps_match(...)").into()
-            }
-            ConditionNode::AssetMatches { keys, .. } => {
-                if keys.len() == 1 {
-                    format!("asset_matches('{}')", keys[0])
+            // Unlabeled dep-aggregates fold the inner condition's fingerprint in
+            // so two siblings differing only by inner condition don't collapse
+            // to one label (replace_by_label/contains_label would otherwise hit
+            // the wrong subtree — same reasoning as the cron tz above).
+            ConditionNode::AnyDepsMatch { condition, label } => match label {
+                Some(l) => l.clone(),
+                None => format!("any_deps_match({})", condition.fingerprint_hex()),
+            },
+            ConditionNode::AllDepsMatch { condition, label } => match label {
+                Some(l) => l.clone(),
+                None => format!("all_deps_match({})", condition.fingerprint_hex()),
+            },
+            ConditionNode::AssetMatches { keys, condition } => {
+                let keys_label = if keys.len() == 1 {
+                    format!("'{}'", keys[0])
                 } else {
                     let joined: Vec<_> = keys.iter().map(|k| format!("'{}'", k)).collect();
-                    format!("asset_matches([{}])", joined.join(", "))
-                }
+                    format!("[{}]", joined.join(", "))
+                };
+                format!("asset_matches({}, {})", keys_label, condition.fingerprint_hex())
             }
             ConditionNode::And(_) => "All of".into(),
             ConditionNode::Or(_) => "Any of".into(),

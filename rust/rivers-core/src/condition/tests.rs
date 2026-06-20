@@ -10479,11 +10479,11 @@ fn test_node_label_exhaustive() {
     );
     assert_eq!(
         ConditionNode::any_deps_match(ConditionNode::Missing).node_label(),
-        "any_deps_match(...)"
+        format!("any_deps_match({})", ConditionNode::Missing.fingerprint_hex())
     );
     assert_eq!(
         ConditionNode::all_deps_match(ConditionNode::Missing).node_label(),
-        "all_deps_match(...)"
+        format!("all_deps_match({})", ConditionNode::Missing.fingerprint_hex())
     );
     assert_eq!(
         ConditionNode::And(vec![ConditionNode::Missing]).node_label(),
@@ -10508,6 +10508,46 @@ fn test_node_label_exhaustive() {
         ConditionNode::Missing.since_last_handled().node_label(),
         "since_last_handled"
     );
+}
+
+#[test]
+fn test_node_label_distinguishes_unlabeled_aggregate_inner_condition() {
+    // Regression (C3): node_label for an unlabeled any_deps_match/all_deps_match
+    // and for asset_matches must include the inner condition, else two
+    // structurally-distinct siblings collapse to one label and
+    // replace_by_label/contains_label hit the wrong subtree (same class as the
+    // cron-timezone label fix).
+    let a = ConditionNode::any_deps_match(ConditionNode::Missing);
+    let b = ConditionNode::any_deps_match(ConditionNode::NewlyUpdated);
+    assert_ne!(
+        a.node_label(),
+        b.node_label(),
+        "distinct inner conditions must yield distinct labels"
+    );
+
+    // asset_matches with identical keys but different inner conditions.
+    let am1 = ConditionNode::asset_matches(vec!["x".into()], ConditionNode::Missing);
+    let am2 = ConditionNode::asset_matches(vec!["x".into()], ConditionNode::InProgress);
+    assert_ne!(am1.node_label(), am2.node_label());
+
+    // replace_by_label must touch only the matching sibling, preserving the
+    // other's inner condition.
+    let tree = a.clone() | b.clone();
+    let replaced = tree.replace_by_label(&a.node_label(), &ConditionNode::ExecutionFailed);
+    if let ConditionNode::Or(children) = &replaced {
+        assert!(
+            children
+                .iter()
+                .any(|c| matches!(c, ConditionNode::ExecutionFailed)),
+            "the matched sibling must be replaced; got {replaced:?}"
+        );
+        assert!(
+            children.iter().any(|c| c.node_label() == b.node_label()),
+            "the non-matching sibling must be preserved; got {replaced:?}"
+        );
+    } else {
+        panic!("expected Or, got {replaced:?}");
+    }
 }
 
 #[test]
