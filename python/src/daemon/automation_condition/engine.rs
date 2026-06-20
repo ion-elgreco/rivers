@@ -173,11 +173,18 @@ impl ConditionTickEngine {
             self.send_eval_records(&output.results, now, &tick_id);
         }
 
-        let _ = self
+        if let Err(e) = self
             .storage
             .scoped()
             .set_condition_eval_state(&self.pass.eval_state)
-            .await;
+            .await
+        {
+            tracing::warn!(
+                target: "rivers::daemon",
+                error = %e,
+                "failed to persist condition eval state; latches reset on restart"
+            );
+        }
     }
 
     /// Send per-asset `ConditionEvalRecord`s referencing the already-persisted

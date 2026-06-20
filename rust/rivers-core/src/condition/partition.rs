@@ -440,12 +440,38 @@ pub struct PartitionEvalContext<'a> {
     pub dep_root_floor: Option<&'a HashMap<PartitionKey, Option<i64>>>,
 }
 
+/// Serde adapter for a `PartitionKey`-keyed map: `serde_json` rejects non-string
+/// map keys, so persist it as a sequence of `(key, value)` pairs.
+mod partition_key_i64_map {
+    use super::PartitionKey;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::HashMap;
+
+    pub fn serialize<S: Serializer>(
+        map: &HashMap<PartitionKey, i64>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        map.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<HashMap<PartitionKey, i64>, D::Error> {
+        Ok(Vec::<(PartitionKey, i64)>::deserialize(deserializer)?
+            .into_iter()
+            .collect())
+    }
+}
+
 /// Per-partition condition evaluation state, persisted across ticks.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PartitionState {
     /// Per-node partition selections from previous tick.
     pub previous_selections: HashMap<u32, PartitionSelection>,
     /// Per-partition materialization timestamps from previous tick.
+    /// Persisted as a sequence of pairs: `serde_json` can't use `PartitionKey`
+    /// (an enum) as a JSON map key.
+    #[serde(with = "partition_key_i64_map")]
     pub timestamps: HashMap<PartitionKey, i64>,
     /// Partitions that have been handled (materialization triggered) since last reset.
     pub handled: HashSet<PartitionKey>,

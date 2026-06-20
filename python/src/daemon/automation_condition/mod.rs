@@ -446,11 +446,18 @@ pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
         tokio::select! {
             _ = cancel.cancelled() => {
                 // Persist state before exiting.
-                let _ = engine
+                if let Err(e) = engine
                     .storage
                     .scoped()
                     .set_condition_eval_state(&engine.pass.eval_state)
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        target: "rivers::daemon",
+                        error = %e,
+                        "failed to persist condition eval state on shutdown"
+                    );
+                }
                 tracing::info!(target: "rivers::daemon", "condition eval loop stopped");
                 return;
             }

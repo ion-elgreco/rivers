@@ -12167,6 +12167,41 @@ fn test_cron_reset_in_dep_pivot_uses_root_tick() {
     );
 }
 
+/// `ConditionEvalState` is persisted via `serde_json`, which cannot use a
+/// `PartitionKey` (an object-serializing enum) as a JSON map key. `PartitionState`
+/// timestamps are keyed by `PartitionKey`, so any partitioned automation
+/// condition's state must still round-trip — otherwise the save fails silently
+/// and every daemon restart wipes all latches/baselines.
+#[test]
+fn test_condition_eval_state_round_trips_with_partition_timestamps() {
+    let pk = PartitionKey::Single {
+        keys: vec!["2024-01-01".to_string()],
+    };
+    let mut asset = AssetConditionState::default();
+    asset.partition_state = Some(PartitionState {
+        timestamps: HashMap::from([(pk.clone(), 100i64)]),
+        ..Default::default()
+    });
+    let mut state = ConditionEvalState::default();
+    state.assets.insert("a".to_string(), asset);
+
+    let bytes = serde_json::to_vec(&state)
+        .expect("ConditionEvalState must serialize via serde_json (storage uses kv_set_json)");
+    let round: ConditionEvalState =
+        serde_json::from_slice(&bytes).expect("ConditionEvalState must round-trip");
+    let ts = round.assets["a"]
+        .partition_state
+        .as_ref()
+        .unwrap()
+        .timestamps
+        .get(&pk);
+    assert_eq!(
+        ts,
+        Some(&100),
+        "partition timestamp must survive the round-trip"
+    );
+}
+
 /// `DataVersionChanged` over an UNCONDITIONED dep must not re-fire every tick.
 /// `update_dep_baselines` has to record the dep's `last_data_version` (like it
 /// does `last_materialized_timestamp`), else the pivot reads prev=None forever
