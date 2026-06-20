@@ -134,6 +134,11 @@ struct RefreshDelta {
     /// timestamp — a remove only clears a failure floor older than it, so a
     /// co-batched older success can't clobber a newer failure.
     failed_removes: HashMap<String, i64>,
+    /// `asset → run_id` where the asset's step SUCCEEDED in that run but its
+    /// asset_record write lags (last_run_id not yet updated). Treated as
+    /// "materialized here" so a co-batched failure in the same run doesn't floor
+    /// the asset that actually produced output.
+    materialized_overrides: HashMap<String, String>,
     /// Tag updates: `(asset, partition_key, tags)`.
     run_tag_updates: Vec<RunTagUpdate>,
     /// Tick tag updates: `(asset, partition_key, tags)`.
@@ -487,6 +492,21 @@ impl AssetConditionCache {
                         .await?
                     {
                         completed_keys.push(record.asset_key.clone());
+                        // The record write lags the step events: if the asset's
+                        // step SUCCEEDED in one of these runs, mark it
+                        // materialized-here so a co-batched failure in the same
+                        // run can't floor the asset that produced output.
+                        for rid in &run_ids {
+                            if storage
+                                .has_step_succeeded(&record.asset_key, std::slice::from_ref(rid))
+                                .await?
+                            {
+                                delta
+                                    .materialized_overrides
+                                    .insert(record.asset_key.clone(), rid.clone());
+                                break;
+                            }
+                        }
                         completed_run_ids.extend(run_ids);
                     }
                 }
@@ -509,11 +529,25 @@ impl AssetConditionCache {
             // cancellation also produces no record-ts change / StepSuccess for
             // the ts-unchanged fallback above to catch. Without this the asset
             // would stay wedged in_progress forever.
+            // `get_runs_since` uses `>`, so a run only ever seen as Started is
+            // never re-observed and its terminal state never reaches the
+            // new_runs loop below. The clearable sweep and the completed_run_ids
+            // application both fetch and apply the run-derived effects so
+            // `LastRunIncludesTarget` / `HasRunWithTags` / `failed_assets`
+            // reflect the actual completed run. Ids that ARE in `new_runs` as
+            // terminal are skipped (the new_runs loop applies them).
+            let new_runs_terminal: HashSet<&str> = new_runs
+                .iter()
+                .filter(|r| !matches!(r.status, RunStatus::Started | RunStatus::NotStarted))
+                .map(|r| r.run_id.as_str())
+                .collect();
+
             let clearable: Vec<String> = self
                 .in_progress_assets
                 .values()
                 .flat_map(|runs| runs.keys().cloned())
                 .collect();
+            let mut swept_applied: HashSet<String> = HashSet::new();
             if !clearable.is_empty() {
                 let tracked_runs = storage.get_runs_by_ids(&clearable, None).await?;
                 for run in &tracked_runs {
@@ -528,22 +562,25 @@ impl AssetConditionCache {
                             });
                         }
                     }
+                    // A terminal run reaching only this sweep (cursor missed it,
+                    // no record-ts change / StepSuccess) still needs its effects
+                    // applied — otherwise a Failure here sets no failure floor
+                    // and an eager asset re-dispatches the failing run every
+                    // tick. Canceled only clears (matches the new_runs arm).
+                    // Skip ids the new_runs / completed_run_ids paths apply.
+                    if matches!(run.status, RunStatus::Success | RunStatus::Failure)
+                        && !new_runs_terminal.contains(run.run_id.as_str())
+                        && !completed_run_ids.contains(&run.run_id)
+                    {
+                        self.apply_run_effects_to_delta(run, &mut delta);
+                        swept_applied.insert(run.run_id.clone());
+                    }
                 }
             }
 
-            // `get_runs_since` uses `>`, so a run only ever seen as Started
-            // is never re-observed and its terminal state never reaches the
-            // new_runs loop below. Fetch and apply the run-derived effects
-            // here so `LastRunIncludesTarget` / `HasRunWithTags` /
-            // `failed_assets` reflect the actual completed run. Skip ids that
-            // ARE in `new_runs` as terminal — those are about to be applied
-            // by the loop and double-applying would issue a redundant query.
-            let new_runs_terminal: HashSet<&str> = new_runs
-                .iter()
-                .filter(|r| !matches!(r.status, RunStatus::Started | RunStatus::NotStarted))
-                .map(|r| r.run_id.as_str())
-                .collect();
-            completed_run_ids.retain(|id| !new_runs_terminal.contains(id.as_str()));
+            completed_run_ids.retain(|id| {
+                !new_runs_terminal.contains(id.as_str()) && !swept_applied.contains(id)
+            });
             if !completed_run_ids.is_empty() {
                 let ids: Vec<String> = completed_run_ids.into_iter().collect();
                 let completed_runs = storage.get_runs_by_ids(&ids, None).await?;
@@ -721,26 +758,32 @@ impl AssetConditionCache {
         };
         let run_ts = run.end_time.unwrap_or(run.start_time);
         for asset in &run.node_names {
-            if is_failure {
-                delta
-                    .failed_adds
-                    .entry(asset.clone())
-                    .and_modify(|e| {
-                        if run_ts > e.ts {
-                            e.run_id = run.run_id.clone();
-                            e.ts = run_ts;
-                        }
-                    })
-                    .or_insert_with(|| FailedRun {
-                        ts: run_ts,
-                        run_id: run.run_id.clone(),
-                    });
-            } else {
-                delta
-                    .failed_removes
-                    .entry(asset.clone())
-                    .and_modify(|t| *t = (*t).max(run_ts))
-                    .or_insert(run_ts);
+            // The asset-level failure floor is unpartitioned. A partitioned
+            // run's failure/success belongs in partition_status (recomputed from
+            // storage each refresh); floor it here and one partition's outcome
+            // would (un)floor the whole asset for unpartitioned consumers.
+            if run.partition_key.is_none() {
+                if is_failure {
+                    delta
+                        .failed_adds
+                        .entry(asset.clone())
+                        .and_modify(|e| {
+                            if run_ts > e.ts {
+                                e.run_id = run.run_id.clone();
+                                e.ts = run_ts;
+                            }
+                        })
+                        .or_insert_with(|| FailedRun {
+                            ts: run_ts,
+                            run_id: run.run_id.clone(),
+                        });
+                } else {
+                    delta
+                        .failed_removes
+                        .entry(asset.clone())
+                        .and_modify(|t| *t = (*t).max(run_ts))
+                        .or_insert(run_ts);
+                }
             }
             for partition_key in &run_partitions {
                 if !run_tags.is_empty() {
@@ -893,6 +936,7 @@ impl AssetConditionCache {
             in_progress_changes,
             failed_adds,
             failed_removes,
+            materialized_overrides,
             run_tag_updates,
             tick_tag_updates,
             asset_names_updates,
@@ -940,7 +984,8 @@ impl AssetConditionCache {
                 .records
                 .get(asset.as_str())
                 .and_then(|r| r.last_run_id.as_deref())
-                == Some(run_id.as_str());
+                == Some(run_id.as_str())
+                || materialized_overrides.get(&asset).map(String::as_str) == Some(run_id.as_str());
             if materialized_here {
                 if self
                     .failed_asset_timestamps
@@ -1092,7 +1137,9 @@ impl AssetConditionCache {
                 .flatten()
                 .collect();
             for (asset_key, status, run_ts, partition_key, tags, asset_names) in &asset_runs {
-                if *status == RunStatus::Failure {
+                // Asset-level floor is unpartitioned; partitioned failures live
+                // in partition_status (loaded separately).
+                if *status == RunStatus::Failure && partition_key.is_none() {
                     self.failed_assets.insert(asset_key.clone());
                     self.failed_asset_timestamps
                         .entry(asset_key.clone())
@@ -1393,5 +1440,32 @@ mod tests {
         );
         assert!(!cache.failed_assets.contains("X"));
         assert!(cache.failed_assets.contains("Y"));
+    }
+
+    #[test]
+    fn partitioned_failure_does_not_set_asset_level_floor() {
+        // A run for a single partition that fails must NOT floor the whole asset
+        // at asset granularity. Per-partition failures are tracked in
+        // partition_status (recomputed from storage); the asset-level
+        // failed_assets/failed_asset_timestamps feed unpartitioned consumers
+        // (e.g. an unpartitioned downstream matching this dep on
+        // execution_failed()) and would wrongly report the whole asset failed.
+        let mut cache = AssetConditionCache::new("default".to_string());
+        let mut run = mk_run("P", RunStatus::Failure, &["P"], 150);
+        run.partition_key = Some(PartitionKey::Single {
+            keys: vec!["p1".to_string()],
+        });
+        let mut delta = RefreshDelta::default();
+        cache.apply_run_effects_to_delta(&run, &mut delta);
+        cache.apply_refresh_delta(delta);
+
+        assert!(
+            !cache.failed_assets.contains("P"),
+            "a single partition's failure must not floor the whole asset"
+        );
+        assert!(
+            !cache.failed_asset_timestamps.contains_key("P"),
+            "no asset-level failure timestamp for a partitioned run"
+        );
     }
 }

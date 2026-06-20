@@ -2106,6 +2106,16 @@ pub trait StorageBackend: PerCodeLocationStorage {
         run_ids: &[String],
     ) -> impl Future<Output = Result<bool>> + Send;
 
+    /// Check if a step SUCCEEDED (a StepSuccess event exists, distinct from a
+    /// StepFailure) for a specific asset in any of the given runs. Used to tell
+    /// a materialized asset from a co-batched failure when the asset_record
+    /// write lags behind the step events.
+    fn has_step_succeeded(
+        &self,
+        asset_key: &str,
+        run_ids: &[String],
+    ) -> impl Future<Output = Result<bool>> + Send;
+
     // Runs
     fn create_run(&self, run: &RunRecord) -> impl Future<Output = Result<()>> + Send;
     fn create_runs(&self, runs: &[RunRecord]) -> impl Future<Output = Result<()>> + Send;
