@@ -308,6 +308,22 @@ impl AssetConditionCache {
             .insert(run_id, partition_key);
     }
 
+    /// Drop a pre-dispatch placeholder entry (the empty `in_progress_assets`
+    /// slot `classify` creates so an asset isn't re-fired before its runs
+    /// surface) when dispatch failed before any run was registered. Unlike
+    /// single-partition runs — which `register_dispatched_run` backs with a
+    /// phantom-eviction safety net — a multi-partition backfill registers
+    /// nothing up front, so a dispatch failure would otherwise leave the empty
+    /// entry forever, wedging the asset's `InProgress` (its key is present).
+    /// No-op if real runs have since been tracked for the asset.
+    pub fn clear_predispatch_mark(&mut self, asset_key: &str) {
+        if let Some(runs) = self.in_progress_assets.get(asset_key) {
+            if runs.is_empty() {
+                self.in_progress_assets.remove(asset_key);
+            }
+        }
+    }
+
     /// Drop a run (removing the asset once empty) — the one path for run
     /// completion (`ClearRun`) and phantom eviction.
     fn untrack_in_progress_run(&mut self, asset_key: &str, run_id: &str) {

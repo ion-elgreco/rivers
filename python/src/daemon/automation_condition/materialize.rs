@@ -129,6 +129,10 @@ impl ConditionTickEngine {
         mats: Vec<(String, Vec<CorePartitionKey>)>,
         handle: &mut ConditionTickHandle,
     ) {
+        // Captured before the keys are moved into the requests; used to clear
+        // the pre-dispatch `in_progress` placeholders if the whole batch fails
+        // (no sub-runs will ever surface to self-heal them).
+        let backfill_asset_keys: Vec<String> = mats.iter().map(|(k, _)| k.clone()).collect();
         let mut requests: Vec<BackfillRequestData> = Vec::with_capacity(mats.len());
         for (asset_key, partition_keys) in mats {
             let strategy = self
@@ -178,6 +182,12 @@ impl ConditionTickEngine {
                     error = %e,
                     "condition backfill dispatch failed"
                 );
+                // The whole batch failed: no sub-runs will surface to clear the
+                // pre-marked placeholders, so drop them now or the assets stay
+                // wedged as InProgress until daemon restart.
+                for asset_key in &backfill_asset_keys {
+                    self.pass.cache.clear_predispatch_mark(asset_key);
+                }
             }
         }
     }

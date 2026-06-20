@@ -6606,6 +6606,35 @@ async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completio
     );
 }
 
+#[test]
+fn test_clear_predispatch_mark_drops_empty_entry_only() {
+    // A multi-partition backfill registers no run up front, so `classify`'s
+    // pre-marked empty in_progress entry has no phantom-eviction safety net.
+    // On dispatch failure it must be cleared, but never when real runs exist.
+    let mut cache =
+        AssetConditionCache::new(crate::storage::DEFAULT_CODE_LOCATION_ID.to_string());
+
+    // Pre-mark (empty placeholder, as classify does) → cleared.
+    cache.in_progress_assets.entry("dst".to_string()).or_default();
+    assert!(cache.in_progress_assets.contains_key("dst"));
+    cache.clear_predispatch_mark("dst");
+    assert!(
+        !cache.in_progress_assets.contains_key("dst"),
+        "empty pre-dispatch placeholder must be cleared"
+    );
+
+    // A real run was registered → clear is a no-op (must not wipe live runs).
+    cache.register_dispatched_run("dst".to_string(), "run-1".to_string(), 0, None);
+    cache.clear_predispatch_mark("dst");
+    assert!(
+        cache
+            .in_progress_assets
+            .get("dst")
+            .is_some_and(|r| r.contains_key("run-1")),
+        "an entry with a real run must NOT be cleared"
+    );
+}
+
 #[tokio::test]
 async fn test_cache_completion_fallback_skips_still_started_sibling_effects() {
     // Regression: in the ts-unchanged completion fallback, `has_step_completed`
