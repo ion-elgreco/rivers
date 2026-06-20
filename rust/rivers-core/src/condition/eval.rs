@@ -406,7 +406,7 @@ fn eval_inner<O: EvalOutput>(
 
         ConditionNode::CronTickPassed {
             cron_schedule,
-            timezone: _,
+            timezone,
         } => {
             // Use the previous evaluation tick as the left boundary. The cron
             // boundary belongs to the ROOT, so in a dep pivot read the root's
@@ -415,7 +415,7 @@ fn eval_inner<O: EvalOutput>(
             // window → no match) so cron conditions don't fire on startup.
             let prev_ts = root_last_tick(ctx).unwrap_or(ctx.now);
             O::leaf(
-                cron_tick_between(cron_schedule, prev_ts, ctx.now),
+                cron_tick_between(cron_schedule, prev_ts, ctx.now, timezone.as_deref()),
                 my_idx,
                 node,
             )
@@ -952,7 +952,21 @@ pub fn validate_cron(schedule: &str) -> Result<(), String> {
     build_cron(schedule).map(|_| ())
 }
 
-fn cron_tick_between(cron_schedule: &str, prev_nanos: i64, now_nanos: i64) -> bool {
+/// Validate an IANA timezone name at construction (parsed via `chrono-tz`), so a
+/// typo'd zone fails loudly instead of silently evaluating the schedule in UTC.
+pub fn validate_timezone(tz: &str) -> Result<(), String> {
+    tz.parse::<chrono_tz::Tz>()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn cron_tick_between(
+    cron_schedule: &str,
+    prev_nanos: i64,
+    now_nanos: i64,
+    timezone: Option<&str>,
+) -> bool {
+    use chrono::TimeZone;
     use std::cell::RefCell;
 
     thread_local! {
@@ -962,15 +976,29 @@ fn cron_tick_between(cron_schedule: &str, prev_nanos: i64, now_nanos: i64) -> bo
     let prev_secs = prev_nanos / 1_000_000_000;
     let now_secs = now_nanos / 1_000_000_000;
 
+    // Evaluate the schedule against the target zone's WALL CLOCK: shift each UTC
+    // instant into the zone's naive local time, then hand it to croner as if it
+    // were UTC. croner never sees a real `Tz`, so it can't stall on a DST
+    // fall-back (mirrors the time-partition grid in `timegrid`); the only cost is
+    // a possibly missed/doubled tick at the fall-back hour, never a hang.
+    // `None`/unparsable timezone → UTC (unchanged behavior).
+    let tz: Option<chrono_tz::Tz> = timezone.and_then(|t| t.parse().ok());
+    let to_wall = |secs: i64| -> Option<chrono::DateTime<chrono::Utc>> {
+        let utc = chrono::DateTime::from_timestamp(secs, 0)?;
+        let naive = match tz {
+            Some(tz) => utc.with_timezone(&tz).naive_local(),
+            None => utc.naive_utc(),
+        };
+        Some(chrono::Utc.from_utc_datetime(&naive))
+    };
+
     CRON_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let cron = cache.entry(cron_schedule.to_string()).or_insert_with(|| {
             // Validated at construction, so a parse error here is a bug.
             build_cron(cron_schedule).expect("cron schedule validated at construction")
         });
-        let prev_dt = chrono::DateTime::from_timestamp(prev_secs, 0);
-        let now_dt = chrono::DateTime::from_timestamp(now_secs, 0);
-        match (prev_dt, now_dt) {
+        match (to_wall(prev_secs), to_wall(now_secs)) {
             (Some(prev), Some(now)) => cron
                 .find_next_occurrence(&prev, false)
                 .map(|next| next <= now)
@@ -1160,11 +1188,11 @@ fn eval_partitioned<O: PartEvalOutput>(
 
         ConditionNode::CronTickPassed {
             cron_schedule,
-            timezone: _,
+            timezone,
         } => {
             // The cron boundary belongs to the root, not the pivoted dep.
             let prev_ts = root_last_tick(ctx).unwrap_or(ctx.now);
-            let val = cron_tick_between(cron_schedule, prev_ts, ctx.now);
+            let val = cron_tick_between(cron_schedule, prev_ts, ctx.now, timezone.as_deref());
             let sel = if val {
                 PartitionSelection::Keys(pctx.all_keys.clone())
             } else {

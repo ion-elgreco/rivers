@@ -10429,6 +10429,98 @@ fn test_partitioned_on_cron_no_deps_fires_all_partitions() {
 }
 
 #[test]
+fn test_cron_tick_respects_timezone() {
+    use chrono::{TimeZone, Utc};
+    // "0 9 * * *" in America/New_York must fire when the NY wall clock crosses
+    // 09:00 (= 13:00 UTC in summer/EDT), not at 09:00 UTC. The timezone field was
+    // previously ignored and the schedule evaluated in UTC.
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let cond = ConditionNode::CronTickPassed {
+        cron_schedule: "0 9 * * *".to_string(),
+        timezone: Some("America/New_York".to_string()),
+    };
+
+    // Tue 2026-06-16: 12:30 UTC (08:30 EDT) → 13:30 UTC (09:30 EDT). The 09:00
+    // EDT tick (= 13:00 UTC) lies inside this window.
+    let prev_tick = Utc
+        .with_ymd_and_hms(2026, 6, 16, 12, 30, 0)
+        .unwrap()
+        .timestamp_nanos_opt()
+        .unwrap();
+    let now = Utc
+        .with_ymd_and_hms(2026, 6, 16, 13, 30, 0)
+        .unwrap()
+        .timestamp_nanos_opt()
+        .unwrap();
+    let prev = AssetConditionState {
+        last_tick_timestamp: Some(prev_tick),
+        ..Default::default()
+    };
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.prev_state = &prev;
+    ctx.now = now;
+
+    let result = evaluate(&cond, &ctx);
+    assert!(
+        result.fired,
+        "cron '0 9' in America/New_York must fire at 09:00 EDT (13:00 UTC), not 09:00 UTC"
+    );
+
+    // Control: with no UTC cron tick in the window, the UTC-evaluated schedule
+    // would NOT fire — proving the fire above came from the tz, not luck.
+    let cond_utc = ConditionNode::CronTickPassed {
+        cron_schedule: "0 9 * * *".to_string(),
+        timezone: None,
+    };
+    let result_utc = evaluate(&cond_utc, &ctx);
+    assert!(
+        !result_utc.fired,
+        "same window has no 09:00 UTC tick, so the UTC schedule must not fire"
+    );
+}
+
+#[test]
+fn test_cron_tick_across_dst_fallback_terminates_and_fires() {
+    use chrono::{TimeZone, Utc};
+    // America/New_York falls back 2025-11-02 (02:00 EDT → 01:00 EST). A noon
+    // schedule is clear of the ambiguous 01:00 hour and must still fire on that
+    // day — and crucially the call must TERMINATE (the naive-as-UTC croner path
+    // can't spin on the fall-back, unlike croner+Local).
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let cond = ConditionNode::CronTickPassed {
+        cron_schedule: "0 12 * * *".to_string(),
+        timezone: Some("America/New_York".to_string()),
+    };
+    // 16:00 UTC (11:00 EST) → 17:30 UTC (12:30 EST); noon EST = 17:00 UTC.
+    let prev_tick = Utc
+        .with_ymd_and_hms(2025, 11, 2, 16, 0, 0)
+        .unwrap()
+        .timestamp_nanos_opt()
+        .unwrap();
+    let now = Utc
+        .with_ymd_and_hms(2025, 11, 2, 17, 30, 0)
+        .unwrap()
+        .timestamp_nanos_opt()
+        .unwrap();
+    let prev = AssetConditionState {
+        last_tick_timestamp: Some(prev_tick),
+        ..Default::default()
+    };
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.prev_state = &prev;
+    ctx.now = now;
+
+    assert!(
+        evaluate(&cond, &ctx).fired,
+        "noon schedule must fire on the DST fall-back day"
+    );
+}
+
+#[test]
 fn test_partitioned_on_cron_does_not_fire_without_tick() {
     // No cron tick between evals → on_cron should not fire.
     let empty_partition_statuses = HashMap::new();
