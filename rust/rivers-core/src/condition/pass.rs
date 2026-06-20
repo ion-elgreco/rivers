@@ -633,6 +633,7 @@ impl ConditionPass {
 
     fn apply_results(&mut self, results: &[EvalResultRow], now: i64) -> Vec<ToMaterialize> {
         let mut to_materialize: Vec<ToMaterialize> = Vec::new();
+        let mut needs_dep_baselines = false;
 
         for row in results {
             let info = &self.conditions[row.info_idx];
@@ -658,17 +659,12 @@ impl ConditionPass {
             };
             update_condition_state(prev, &update_ctx, &row.result);
 
-            // Baseline dep state when fired or on initial tick so that
-            // NewlyUpdated has previous timestamps to compare against.
-            if row.result.fired || was_initial {
-                update_dep_baselines(
-                    &mut self.eval_state.assets,
-                    &self.cache.upstream_deps,
-                    &self.active,
-                    &self.cache.partition_status,
-                    &self.cache.records,
-                );
-            }
+            // Baseline dep state when any asset fired or it's an initial tick so
+            // NewlyUpdated has previous timestamps to compare against. The call
+            // is asset-independent (writes only non-conditioned deps from the
+            // immutable cache), so run it ONCE after the loop instead of
+            // O(fired × edges) times.
+            needs_dep_baselines |= row.result.fired || was_initial;
 
             // The condition tree is the sole dispatch gate
             if row.result.fired {
@@ -677,6 +673,16 @@ impl ConditionPass {
                     selection: row.result.selection.clone(),
                 });
             }
+        }
+
+        if needs_dep_baselines {
+            update_dep_baselines(
+                &mut self.eval_state.assets,
+                &self.cache.upstream_deps,
+                &self.active,
+                &self.cache.partition_status,
+                &self.cache.records,
+            );
         }
 
         for tm in &to_materialize {
