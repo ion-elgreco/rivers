@@ -12126,6 +12126,105 @@ fn test_and_short_circuit_preserves_stateful_child_latch() {
     );
 }
 
+/// A per-dep `Since` whose reset is `CronTickPassed`, evaluated in a dep pivot
+/// over an UNCONDITIONED dep, must use the ROOT's last tick as the cron-window
+/// boundary. Unconditioned deps never get `last_tick_timestamp` set, so reading
+/// the dep's tick gives a zero-width window — the reset never fires, the latch
+/// sticks true, and `on_cron` re-fires every cron tick even without fresh data.
+#[test]
+fn test_cron_reset_in_dep_pivot_uses_root_tick() {
+    let cron = ConditionNode::CronTickPassed {
+        cron_schedule: "30 16 * * 1-5".to_string(),
+        timezone: None,
+    };
+    let tree = ConditionNode::all_deps_match(ConditionNode::InProgress.since(cron));
+    let deps = HashMap::from([("r".to_string(), vec!["a".to_string()])]);
+    let r = make_materialized_record("r", 100);
+    let a = make_materialized_record("a", 100);
+    let records = HashMap::from([("r".to_string(), r.clone()), ("a".to_string(), a.clone())]);
+
+    let only_a = HashSet::from(["a".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+
+    // Tue 2023-11-14: 16:00 (tick 1) → 16:31 (tick 2); cron tick at 16:30.
+    let t1: i64 = 1_699_977_600_000_000_000;
+    let t2: i64 = 1_699_979_460_000_000_000;
+
+    // ── Tick 1: dep `a` in-progress → the per-dep Since latches true ──
+    let prev1 = AssetConditionState::default();
+    let all1: HashMap<String, AssetConditionState> = HashMap::new();
+    let ctx1 = EvalContext {
+        target_key: "r",
+        root_key: "r",
+        target_record: &r,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &only_a,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &prev1,
+        all_asset_states: &all1,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: t1,
+        is_initial: false,
+        partitions: None,
+        root_partition_floor: None,
+    };
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: dep in-progress latches the Since");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext {
+            target_record_timestamp: r.last_timestamp,
+            target_data_version: r.last_data_version.as_ref(),
+            now: t1,
+            is_initial: false,
+            partition_timestamps: None,
+        },
+        &result1,
+    );
+    // The root's own state as seen on the next tick (last_tick = t1).
+    let all2: HashMap<String, AssetConditionState> =
+        HashMap::from([("r".to_string(), state_r.clone())]);
+
+    // ── Tick 2: a cron tick (16:30) passed since t1, dep no longer in-progress.
+    //    The reset must clear the latch → all_deps_match false. Pre-fix it read
+    //    the unconditioned dep's unset tick → no reset → still fires ──
+    let ctx2 = EvalContext {
+        target_key: "r",
+        root_key: "r",
+        target_record: &r,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &none,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &state_r,
+        all_asset_states: &all2,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: t2,
+        is_initial: false,
+        partitions: None,
+        root_partition_floor: None,
+    };
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        !result2.fired,
+        "tick 2: the cron reset (root's tick boundary) must clear the per-dep \
+         Since latch over an unconditioned dep"
+    );
+}
+
 /// The `Or` counterpart: a stateful child skipped because an earlier child made
 /// the Or already-true must still keep its latch.
 #[test]
