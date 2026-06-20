@@ -390,6 +390,13 @@ impl ConditionPass {
             keys_map.insert(k.clone(), keys);
             universes_map.insert(k, universe);
         }
+        // Seed an eval-state entry for every conditioned asset so the
+        // evaluate/apply_results access sites can't panic on a missing key —
+        // panic-safety must not depend on the caller pre-seeding the map.
+        let mut eval_state = eval_state;
+        for info in &conditions {
+            eval_state.assets.entry(info.asset_key.clone()).or_default();
+        }
         Self {
             cache,
             eval_state,
@@ -949,6 +956,35 @@ mod tests {
         let plan = pass.classify_materializations(to_mat);
         pass.stamp_dispatched_handled(&plan, 5000);
         pass.eval_state.assets["down"].last_handled_timestamp
+    }
+
+    #[test]
+    fn run_seeds_missing_eval_state_instead_of_panicking() {
+        // Regression (C8): ConditionPass::new must seed eval_state.assets for
+        // every condition. The invariant was previously established only by the
+        // daemon's external seeding loop, so a pass built with a condition but
+        // no matching eval_state entry panicked at the [idx]/unwrap access sites
+        // (pass.rs evaluate/apply_results) on the very first tick.
+        let mut cache = AssetConditionCache::default();
+        cache.records.insert("a".to_string(), test_record("a"));
+        let mut pass = ConditionPass::new(
+            cache,
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "a".to_string(),
+                condition: ConditionNode::eager(),
+                partition_info: None,
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        );
+        // Deliberately NO `pass.eval_state.assets.insert(...)` — new() must seed.
+        let out = pass.run(1000, false);
+        assert_eq!(
+            out.results.len(),
+            1,
+            "conditioned asset must evaluate without panicking on a missing eval_state entry"
+        );
     }
 
     #[test]
