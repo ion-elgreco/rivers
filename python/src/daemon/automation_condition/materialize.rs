@@ -175,6 +175,15 @@ impl ConditionTickEngine {
                         "condition backfill dispatch error"
                     );
                 }
+                // Per-request failures leave no surfacing sub-run to self-heal
+                // the pre-dispatch `in_progress` placeholder, so clear it now —
+                // same wedge the whole-batch failure path below guards against,
+                // but for the assets that failed within an otherwise-Ok batch.
+                for target in &outcome.failed_targets {
+                    for asset_key in target {
+                        self.pass.cache.clear_predispatch_mark(asset_key);
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!(
