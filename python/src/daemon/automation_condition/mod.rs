@@ -51,8 +51,11 @@ fn partition_info_from_node(
     // rather than skipped.
     let now = chrono::Local::now().naive_local();
     let universe = partition_universe_for(def, now);
+    // Cap the automation universe at `now`: future time windows are not yet
+    // materializable (refresh_universe grows them in as wall-clock advances), so
+    // an explicit future `end` must not seed a backfill of the whole range.
     let all_keys = def
-        .get_partition_keys()
+        .get_partition_keys_capped(now)
         .ok()
         .map(|keys| {
             keys.iter()
@@ -73,14 +76,16 @@ fn partition_info_from_node(
     })
 }
 
-/// Seeding enumerates through an explicit end — future windows included — so
-/// the watermark starts past whatever the seed covered, not at `now`.
+/// Watermark the per-tick refresh resumes from. Seeding caps enumeration at
+/// `now` (see `get_partition_keys_capped`), so the watermark must also be
+/// `min(end, now)` — `refresh_universe` then grows the universe one window at a
+/// time as wall-clock reaches each, stopping at the explicit `end`.
 fn seeded_watermark(
     def: &PartitionsDefinition,
     now: chrono::NaiveDateTime,
 ) -> chrono::NaiveDateTime {
     match def {
-        PartitionsDefinition::TimeWindow { end: Some(e), .. } => (*e).max(now),
+        PartitionsDefinition::TimeWindow { end: Some(e), .. } => (*e).min(now),
         _ => now,
     }
 }
