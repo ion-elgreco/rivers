@@ -723,26 +723,32 @@ impl AssetConditionCache {
         };
         let run_ts = run.end_time.unwrap_or(run.start_time);
         for asset in &run.node_names {
-            if is_failure {
-                delta
-                    .failed_adds
-                    .entry(asset.clone())
-                    .and_modify(|e| {
-                        if run_ts > e.ts {
-                            e.run_id = run.run_id.clone();
-                            e.ts = run_ts;
-                        }
-                    })
-                    .or_insert_with(|| FailedRun {
-                        ts: run_ts,
-                        run_id: run.run_id.clone(),
-                    });
-            } else {
-                delta
-                    .failed_removes
-                    .entry(asset.clone())
-                    .and_modify(|t| *t = (*t).max(run_ts))
-                    .or_insert(run_ts);
+            // The asset-level failure floor is unpartitioned. A partitioned
+            // run's failure/success belongs in partition_status (recomputed from
+            // storage each refresh); floor it here and one partition's outcome
+            // would (un)floor the whole asset for unpartitioned consumers.
+            if run.partition_key.is_none() {
+                if is_failure {
+                    delta
+                        .failed_adds
+                        .entry(asset.clone())
+                        .and_modify(|e| {
+                            if run_ts > e.ts {
+                                e.run_id = run.run_id.clone();
+                                e.ts = run_ts;
+                            }
+                        })
+                        .or_insert_with(|| FailedRun {
+                            ts: run_ts,
+                            run_id: run.run_id.clone(),
+                        });
+                } else {
+                    delta
+                        .failed_removes
+                        .entry(asset.clone())
+                        .and_modify(|t| *t = (*t).max(run_ts))
+                        .or_insert(run_ts);
+                }
             }
             for partition_key in &run_partitions {
                 if !run_tags.is_empty() {
@@ -1094,7 +1100,9 @@ impl AssetConditionCache {
                 .flatten()
                 .collect();
             for (asset_key, status, run_ts, partition_key, tags, asset_names) in &asset_runs {
-                if *status == RunStatus::Failure {
+                // Asset-level floor is unpartitioned; partitioned failures live
+                // in partition_status (loaded separately).
+                if *status == RunStatus::Failure && partition_key.is_none() {
                     self.failed_assets.insert(asset_key.clone());
                     self.failed_asset_timestamps
                         .entry(asset_key.clone())
@@ -1395,5 +1403,32 @@ mod tests {
         );
         assert!(!cache.failed_assets.contains("X"));
         assert!(cache.failed_assets.contains("Y"));
+    }
+
+    #[test]
+    fn partitioned_failure_does_not_set_asset_level_floor() {
+        // A run for a single partition that fails must NOT floor the whole asset
+        // at asset granularity. Per-partition failures are tracked in
+        // partition_status (recomputed from storage); the asset-level
+        // failed_assets/failed_asset_timestamps feed unpartitioned consumers
+        // (e.g. an unpartitioned downstream matching this dep on
+        // execution_failed()) and would wrongly report the whole asset failed.
+        let mut cache = AssetConditionCache::new("default".to_string());
+        let mut run = mk_run("P", RunStatus::Failure, &["P"], 150);
+        run.partition_key = Some(PartitionKey::Single {
+            keys: vec!["p1".to_string()],
+        });
+        let mut delta = RefreshDelta::default();
+        cache.apply_run_effects_to_delta(&run, &mut delta);
+        cache.apply_refresh_delta(delta);
+
+        assert!(
+            !cache.failed_assets.contains("P"),
+            "a single partition's failure must not floor the whole asset"
+        );
+        assert!(
+            !cache.failed_asset_timestamps.contains_key("P"),
+            "no asset-level failure timestamp for a partitioned run"
+        );
     }
 }
