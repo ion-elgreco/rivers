@@ -478,9 +478,15 @@ impl ConditionNode {
             ConditionNode::NewlyUpdated => "newly_updated".into(),
             ConditionNode::NewlyRequested => "newly_requested".into(),
             ConditionNode::CodeVersionChanged => "code_version_changed".into(),
-            ConditionNode::CronTickPassed { cron_schedule, .. } => {
-                format!("cron_tick_passed('{}')", cron_schedule)
-            }
+            ConditionNode::CronTickPassed {
+                cron_schedule,
+                timezone,
+            } => match timezone {
+                // Include the tz: it's load-bearing (changes fire times), so two
+                // crons differing only by zone must not collapse to one label.
+                Some(tz) => format!("cron_tick_passed('{}', tz='{}')", cron_schedule, tz),
+                None => format!("cron_tick_passed('{}')", cron_schedule),
+            },
             ConditionNode::InLatestTimeWindow { lookback_delta } => match lookback_delta {
                 Some(d) => format!("in_latest_time_window({}s)", d),
                 None => "in_latest_time_window".into(),

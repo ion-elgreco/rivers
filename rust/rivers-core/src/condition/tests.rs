@@ -9878,6 +9878,16 @@ fn test_node_label_exhaustive() {
             timezone: Some("UTC".to_string()),
         }
         .node_label(),
+        // tz is load-bearing → it must appear in the label (else two crons
+        // differing only by zone collapse and replace_by_label hits the wrong one)
+        "cron_tick_passed('0 */5 * * *', tz='UTC')"
+    );
+    assert_eq!(
+        ConditionNode::CronTickPassed {
+            cron_schedule: "0 */5 * * *".to_string(),
+            timezone: None,
+        }
+        .node_label(),
         "cron_tick_passed('0 */5 * * *')"
     );
     assert_eq!(
