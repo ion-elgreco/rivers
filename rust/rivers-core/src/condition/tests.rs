@@ -856,6 +856,25 @@ fn test_data_version_changed_true_first_version() {
 }
 
 #[test]
+fn test_data_version_changed_suppressed_on_initial_tick() {
+    // On the initial tick there is no persisted version baseline, but the asset
+    // already carried a version before the daemon started — not a change, so
+    // DataVersionChanged must suppress (mirrors NewlyUpdated's
+    // `(Some, None) => !is_initial`). Otherwise every fresh start / restart
+    // without persisted state re-fires for every already-versioned asset.
+    let mut record = make_materialized_record("a", 100);
+    record.last_data_version = Some("v1".to_string());
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.is_initial = true;
+    assert!(
+        !evaluate(&ConditionNode::DataVersionChanged, &ctx).fired,
+        "first version observed on the initial tick must not count as a change"
+    );
+}
+
+#[test]
 fn test_data_version_changed_false_no_version() {
     let mut record = make_materialized_record("a", 100);
     record.last_data_version = None;

@@ -443,7 +443,11 @@ fn eval_inner<O: EvalOutput>(
                 ctx.prev_state.last_data_version.as_ref(),
             ) {
                 (Some(current), Some(prev)) => current != prev,
-                (Some(_), None) => true,
+                // No baseline: on the initial tick the version was already
+                // there before startup — not a change, so suppress (else a bare
+                // data_version_changed() re-fires on every restart). Mirrors the
+                // NewlyUpdated arm. Non-initial → it appeared between ticks → fire.
+                (Some(_), None) => !ctx.is_initial,
                 _ => false,
             };
             O::leaf(expr, my_idx, node)
@@ -1305,7 +1309,10 @@ fn eval_partitioned<O: PartEvalOutput>(
                 ctx.prev_state.last_data_version.as_ref(),
             ) {
                 (Some(current), Some(prev)) => current != prev,
-                (Some(_), None) => true,
+                // No baseline on the initial tick = pre-existing version, not a
+                // change (suppress); later = appeared between ticks (fire).
+                // Mirrors the unpartitioned arm and NewlyUpdated.
+                (Some(_), None) => !ctx.is_initial,
                 _ => false,
             };
             let sel = if changed {
