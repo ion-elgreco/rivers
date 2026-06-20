@@ -368,6 +368,19 @@ impl PyScheduleDefinition {
         if job_name.is_empty() {
             return Err(ScheduleDefinitionError::new_err("job_name cannot be empty"));
         }
+        // Reject a bad cron/timezone at construction (same as the condition
+        // `on_cron` path), not silently at daemon build where it is only logged
+        // and the schedule never fires.
+        rivers_core::condition::validate_cron(&cron_schedule).map_err(|e| {
+            ScheduleDefinitionError::new_err(format!(
+                "invalid cron_schedule {cron_schedule:?}: {e}"
+            ))
+        })?;
+        if let Some(tz) = &timezone {
+            rivers_core::condition::validate_timezone(tz).map_err(|e| {
+                ScheduleDefinitionError::new_err(format!("invalid timezone {tz:?}: {e}"))
+            })?;
+        }
         let schedule_name = if let Some(n) = name {
             n
         } else if let Some(ref f) = func {
