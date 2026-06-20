@@ -10691,6 +10691,65 @@ fn test_cron_tick_across_dst_fallback_terminates_and_fires() {
 }
 
 #[test]
+fn test_partitioned_newly_requested_is_per_partition() {
+    // NewlyRequested on a partitioned asset must select only the partitions
+    // actually requested last tick (the prev `handled` set), not widen the
+    // asset-level scalar to every partition.
+    let empty_partition_statuses = HashMap::new();
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let cond = ConditionNode::NewlyRequested;
+
+    let p1 = spk("p1");
+    let p2 = spk("p2");
+    let all_keys = HashSet::from([p1.clone(), p2.clone()]);
+    let ts = HashMap::from([(p1.clone(), 100i64), (p2.clone(), 100)]);
+    let empty_pk: HashSet<PartitionKey> = HashSet::new();
+    let empty_mappings = HashMap::new();
+    let no_upstream_keys = HashMap::new();
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &all_keys,
+        in_progress: &empty_pk,
+        failed: &empty_pk,
+        timestamps: &ts,
+        resolver: PartitionResolver::new(&empty_mappings, &no_upstream_keys),
+        latest_time_window_keys: None,
+        all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
+    };
+
+    // Last tick requested only p1 (handled set), with the asset-level cursor
+    // reflecting a request on the immediately-previous tick.
+    let prev = AssetConditionState {
+        last_handled_timestamp: Some(1000),
+        last_tick_timestamp: Some(1000),
+        partition_state: Some(PartitionState {
+            handled: HashSet::from([p1.clone()]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.prev_state = &prev;
+    ctx.now = 2000;
+    ctx.partitions = Some(&pctx);
+
+    let result = evaluate(&cond, &ctx);
+    match result.selection {
+        Some(PartitionSelection::Keys(ref keys)) => {
+            assert!(keys.contains(&p1), "p1 was requested last tick → selected");
+            assert!(
+                !keys.contains(&p2),
+                "p2 was NOT requested last tick → must not be selected (no widening)"
+            );
+        }
+        other => panic!("expected Keys({{p1}}), got {other:?}"),
+    }
+}
+
+#[test]
 fn test_partitioned_on_cron_does_not_fire_without_tick() {
     // No cron tick between evals → on_cron should not fire.
     let empty_partition_statuses = HashMap::new();
