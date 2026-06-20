@@ -196,23 +196,32 @@ impl ConditionTickEngine {
         let mut eval_records = Vec::with_capacity(results.len());
         for row in results {
             let info = &self.pass.conditions[row.info_idx];
-            if let Ok(tree_json) = serde_json::to_vec(&row.tree) {
-                let selection_json = row
-                    .result
-                    .selection
-                    .as_ref()
-                    .and_then(|sel| serde_json::to_vec(sel).ok());
-                eval_records.push(ConditionEvalRecord {
-                    code_location_id: self.code_location_id.clone(),
-                    asset_key: info.asset_key.clone(),
-                    tick_id: tick_id.to_string(),
-                    timestamp: now,
-                    fired: row.result.fired,
-                    eval_duration_us: row.duration_us,
-                    run_ids: vec![],
-                    tree_json,
-                    selection_json,
-                });
+            match serde_json::to_vec(&row.tree) {
+                Ok(tree_json) => {
+                    let selection_json = row
+                        .result
+                        .selection
+                        .as_ref()
+                        .and_then(|sel| serde_json::to_vec(sel).ok());
+                    eval_records.push(ConditionEvalRecord {
+                        code_location_id: self.code_location_id.clone(),
+                        asset_key: info.asset_key.clone(),
+                        tick_id: tick_id.to_string(),
+                        timestamp: now,
+                        fired: row.result.fired,
+                        eval_duration_us: row.duration_us,
+                        run_ids: vec![],
+                        tree_json,
+                        selection_json,
+                    });
+                }
+                // Surface rather than silently drop the UI eval row.
+                Err(e) => tracing::warn!(
+                    target: "rivers::daemon",
+                    asset = %info.asset_key,
+                    error = %e,
+                    "failed to serialize condition eval tree; skipping eval record"
+                ),
             }
         }
         if !eval_records.is_empty() {
