@@ -967,6 +967,42 @@ pub fn validate_timezone(tz: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Next cron occurrence strictly after `after`, as a real UTC instant, evaluated
+/// against the declared `timezone`'s WALL CLOCK.
+///
+/// Used by the daemon Schedule loop (which stores `next_occurrence` as UTC). Like
+/// `cron_tick_between`, it shifts the instant into the zone's naive local time so
+/// croner never sees a real `Tz` (and so can't stall on a DST fall-back), then
+/// maps the resulting wall time back to UTC. A `None`/unparsable timezone
+/// evaluates in UTC unchanged.
+pub fn next_cron_occurrence_utc(
+    cron: &croner::Cron,
+    after: chrono::DateTime<chrono::Utc>,
+    timezone: Option<&str>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::TimeZone;
+
+    let Some(tz) = timezone.and_then(|t| t.parse::<chrono_tz::Tz>().ok()) else {
+        return cron.find_next_occurrence(&after, false).ok();
+    };
+
+    // Find the next wall-clock occurrence with croner operating in fake-UTC...
+    let naive_after = after.with_timezone(&tz).naive_local();
+    let fake_after = chrono::Utc.from_utc_datetime(&naive_after);
+    let fake_next = cron.find_next_occurrence(&fake_after, false).ok()?;
+    let wall_next = fake_next.naive_utc();
+
+    // ...then reinterpret that wall time as local in `tz` and convert to UTC.
+    match tz.from_local_datetime(&wall_next) {
+        chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&chrono::Utc)),
+        // Fall-back hour (clock repeats): take the earliest valid instant.
+        chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest.with_timezone(&chrono::Utc)),
+        // Spring-forward gap (wall time skipped): no exact instant exists; use
+        // the fake-UTC reading as a best effort so the schedule still advances.
+        chrono::LocalResult::None => Some(fake_next),
+    }
+}
+
 fn cron_tick_between(
     cron_schedule: &str,
     prev_nanos: i64,

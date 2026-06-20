@@ -136,11 +136,15 @@ impl AutomationEntry {
                 *in_flight = true;
             }
             AutomationEntry::Schedule {
+                info,
                 cron,
                 next_occurrence,
-                ..
             } => {
-                *next_occurrence = cron.find_next_occurrence(&now, false).ok();
+                *next_occurrence = rivers_core::condition::next_cron_occurrence_utc(
+                    cron,
+                    now,
+                    info.timezone.as_deref(),
+                );
             }
         }
     }

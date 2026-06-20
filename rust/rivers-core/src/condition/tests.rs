@@ -12520,6 +12520,42 @@ fn test_cron_in_dep_pivot_does_not_use_dep_tick_on_root_first_eval() {
     );
 }
 
+/// The daemon Schedule loop stores `next_occurrence` as a UTC instant. A
+/// tz-qualified schedule must fire at the declared wall-clock time, and the UTC
+/// instant must shift across DST while the wall time stays fixed.
+#[test]
+fn test_next_cron_occurrence_utc_respects_timezone_and_dst() {
+    use chrono::{TimeZone, Utc};
+    let cron = croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Optional)
+        .build()
+        .parse("0 9 * * *")
+        .unwrap();
+
+    // No timezone → evaluated in UTC: next 09:00 UTC.
+    let after = Utc.with_ymd_and_hms(2024, 1, 15, 0, 0, 0).unwrap();
+    assert_eq!(
+        next_cron_occurrence_utc(&cron, after, None),
+        Some(Utc.with_ymd_and_hms(2024, 1, 15, 9, 0, 0).unwrap()),
+    );
+
+    // America/New_York, winter (EST = UTC-5): 09:00 local → 14:00 UTC.
+    assert_eq!(
+        next_cron_occurrence_utc(&cron, after, Some("America/New_York")),
+        Some(Utc.with_ymd_and_hms(2024, 1, 15, 14, 0, 0).unwrap()),
+        "09:00 EST must be 14:00 UTC, not 09:00 UTC"
+    );
+
+    // Same schedule, summer (EDT = UTC-4): 09:00 local → 13:00 UTC. The UTC
+    // instant shifts by an hour across DST while the wall time stays 09:00.
+    let summer = Utc.with_ymd_and_hms(2024, 7, 15, 0, 0, 0).unwrap();
+    assert_eq!(
+        next_cron_occurrence_utc(&cron, summer, Some("America/New_York")),
+        Some(Utc.with_ymd_and_hms(2024, 7, 15, 13, 0, 0).unwrap()),
+        "09:00 EDT must be 13:00 UTC"
+    );
+}
+
 /// When an asset flips from partitioned to unpartitioned while keeping the same
 /// condition tree, the fingerprint is unchanged (it ignores the partition def)
 /// so `reset_for_new_tree` never runs. `update_condition_state` must itself drop
