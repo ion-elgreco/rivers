@@ -6957,6 +6957,103 @@ async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged
 }
 
 #[tokio::test]
+async fn test_step_success_clears_floor_for_lagging_record_in_joint_failed_run() {
+    // Regression (C6/C7): a joint run R=[x,y] fails because y's step failed, but
+    // x materialized (StepSuccess). If x's asset_record write lags (ts unchanged
+    // this tick), records[x].last_run_id still points at the previous run, so
+    // the materialized_here guard would wrongly floor x. The step-completion
+    // fallback must recognize x's StepSuccess in R and treat x as
+    // materialized-here (no floor), while y (StepFailure) is still floored.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, RunRecord, RunStatus, StorageBackend,
+    };
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[
+            make_materialized_record("x", 1000),
+            make_materialized_record("y", 1000),
+        ])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let run_id = "run-joint".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["x".to_string(), "y".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(cache.in_progress_assets.contains_key("x"));
+    assert!(cache.in_progress_assets.contains_key("y"));
+
+    // Run fails: x materialized (StepSuccess), y failed (StepFailure). Neither
+    // asset record is updated this tick (write lag — ts stays 1000).
+    storage
+        .update_run_status(&run_id, RunStatus::Failure, Some(3000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[
+            EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepSuccess,
+                asset_key: Some("x".to_string()),
+                run_id: run_id.clone(),
+                partition_key: None,
+                timestamp: 3000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            },
+            EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("y".to_string()),
+                run_id: run_id.clone(),
+                partition_key: None,
+                timestamp: 3000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            },
+        ])
+        .await
+        .unwrap();
+
+    cache.refresh(&storage, 0).await.unwrap();
+
+    assert!(
+        !cache.failed_assets.contains("x"),
+        "x materialized (StepSuccess) in the failed joint run → must not be floored \
+         despite the lagging record; got failed_assets={:?}",
+        cache.failed_assets,
+    );
+    assert!(
+        cache.failed_assets.contains("y"),
+        "y failed (StepFailure) → must be floored"
+    );
+    assert_eq!(cache.failed_asset_timestamps.get("y"), Some(&3000));
+}
+
+#[tokio::test]
 async fn test_cache_clears_in_progress_when_run_canceled_after_cursor_advanced() {
     // Regression: a dispatched run that storage reports once (Started/Queued)
     // is removed from the phantom-eviction safety net and the run cursor

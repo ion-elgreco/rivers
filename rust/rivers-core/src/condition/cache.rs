@@ -134,6 +134,11 @@ struct RefreshDelta {
     /// timestamp — a remove only clears a failure floor older than it, so a
     /// co-batched older success can't clobber a newer failure.
     failed_removes: HashMap<String, i64>,
+    /// `asset → run_id` where the asset's step SUCCEEDED in that run but its
+    /// asset_record write lags (last_run_id not yet updated). Treated as
+    /// "materialized here" so a co-batched failure in the same run doesn't floor
+    /// the asset that actually produced output.
+    materialized_overrides: HashMap<String, String>,
     /// Tag updates: `(asset, partition_key, tags)`.
     run_tag_updates: Vec<RunTagUpdate>,
     /// Tick tag updates: `(asset, partition_key, tags)`.
@@ -472,6 +477,21 @@ impl AssetConditionCache {
                         .await?
                     {
                         completed_keys.push(record.asset_key.clone());
+                        // The record write lags the step events: if the asset's
+                        // step SUCCEEDED in one of these runs, mark it
+                        // materialized-here so a co-batched failure in the same
+                        // run can't floor the asset that produced output.
+                        for rid in &run_ids {
+                            if storage
+                                .has_step_succeeded(&record.asset_key, std::slice::from_ref(rid))
+                                .await?
+                            {
+                                delta
+                                    .materialized_overrides
+                                    .insert(record.asset_key.clone(), rid.clone());
+                                break;
+                            }
+                        }
                         completed_run_ids.extend(run_ids);
                     }
                 }
@@ -901,6 +921,7 @@ impl AssetConditionCache {
             in_progress_changes,
             failed_adds,
             failed_removes,
+            materialized_overrides,
             run_tag_updates,
             tick_tag_updates,
             asset_names_updates,
@@ -948,7 +969,8 @@ impl AssetConditionCache {
                 .records
                 .get(asset.as_str())
                 .and_then(|r| r.last_run_id.as_deref())
-                == Some(run_id.as_str());
+                == Some(run_id.as_str())
+                || materialized_overrides.get(&asset).map(String::as_str) == Some(run_id.as_str());
             if materialized_here {
                 if self
                     .failed_asset_timestamps

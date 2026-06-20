@@ -1681,6 +1681,23 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
+    async fn has_step_succeeded(&self, asset_key: &str, run_ids: &[String]) -> Result<bool> {
+        super::retry::with_retry(&self.retry_config, || async {
+            for run_id in run_ids {
+                let events = self.get_events_for_run(run_id).await?;
+                let found = events.iter().any(|e| {
+                    e.asset_key.as_deref() == Some(asset_key)
+                        && matches!(e.event_type, EventType::StepSuccess)
+                });
+                if found {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .await
+    }
+
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(run_id = %run.run_id))]
     async fn create_run(&self, run: &RunRecord) -> Result<()> {
         let result = super::retry::with_retry(&self.retry_config, || async {
