@@ -295,21 +295,30 @@ pub fn update_condition_state(
     state.previous_results = result.sub_results.clone();
     state.dep_previous_results = result.dep_sub_results.clone();
 
-    // Update partition state if partition-aware evaluation was used
-    if let (Some(timestamps), Some(sub_selections)) =
-        (ctx.partition_timestamps, &result.sub_selections)
-    {
-        let ps = state
-            .partition_state
-            .get_or_insert_with(PartitionState::default);
-        ps.previous_selections = sub_selections.clone();
-        if let Some(dep_sub_selections) = &result.dep_sub_selections {
-            ps.dep_previous_selections = dep_sub_selections.clone();
+    // Update partition state if partition-aware evaluation was used.
+    // `sub_selections` is `Some` exactly when this was a partitioned eval.
+    if let Some(sub_selections) = &result.sub_selections {
+        if let Some(timestamps) = ctx.partition_timestamps {
+            let ps = state
+                .partition_state
+                .get_or_insert_with(PartitionState::default);
+            ps.previous_selections = sub_selections.clone();
+            if let Some(dep_sub_selections) = &result.dep_sub_selections {
+                ps.dep_previous_selections = dep_sub_selections.clone();
+            }
+            ps.timestamps = timestamps.clone();
+            // `handled` is a per-tick debounce window, not cumulative: reset it
+            // so classification repopulates it with only this tick's dispatched
+            // keys.
+            ps.handled.clear();
         }
-        ps.timestamps = timestamps.clone();
-        // `handled` is a per-tick debounce window, not cumulative: reset it so
-        // classification repopulates it with only this tick's dispatched keys.
-        ps.handled.clear();
+    } else {
+        // Unpartitioned eval: drop any stale `partition_state` from a prior
+        // partitioned incarnation. The condition fingerprint ignores the
+        // partition def, so a partitioned→unpartitioned flip never triggers
+        // `reset_for_new_tree`; without this the stale state lingers forever and
+        // is resurrected if the asset is later re-partitioned with the same tree.
+        state.partition_state = None;
     }
 }
 
