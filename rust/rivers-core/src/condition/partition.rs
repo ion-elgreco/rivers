@@ -261,7 +261,17 @@ impl PartitionMappingKind {
                 PartitionSelection::Empty => PartitionSelection::Empty,
                 PartitionSelection::All => PartitionSelection::All,
                 PartitionSelection::Keys(keys) => {
-                    let map_key_downstream = |pk: &PartitionKey| -> Option<PartitionKey> {
+                    // A per-dimension sub-mapping that fans the whole dimension
+                    // in (`AllPartitions`/`SpecificPartitions`/`ForKeys`) returns
+                    // `All`, which can't be expressed as a single downstream
+                    // `Multi` key. Over-approximate the whole mapping to `All`
+                    // rather than silently dropping the key — an under-mapping
+                    // would miss a downstream materialization.
+                    enum DimMapped {
+                        Key(PartitionKey),
+                        All,
+                    }
+                    let map_key_downstream = |pk: &PartitionKey| -> Option<DimMapped> {
                         let dims = match pk {
                             PartitionKey::Multi { dims } => dims,
                             _ => return None,
@@ -287,15 +297,24 @@ impl PartitionMappingKind {
                                         return None;
                                     }
                                 }
-                                _ => return None,
+                                PartitionSelection::All => return Some(DimMapped::All),
+                                PartitionSelection::Empty => return None,
                             }
                         }
-                        Some(PartitionKey::Multi {
+                        Some(DimMapped::Key(PartitionKey::Multi {
                             dims: downstream_dims,
-                        })
+                        }))
                     };
-                    let mapped: HashSet<PartitionKey> =
-                        keys.iter().filter_map(map_key_downstream).collect();
+                    let mut mapped: HashSet<PartitionKey> = HashSet::new();
+                    for pk in keys {
+                        match map_key_downstream(pk) {
+                            Some(DimMapped::All) => return PartitionSelection::All,
+                            Some(DimMapped::Key(k)) => {
+                                mapped.insert(k);
+                            }
+                            None => {}
+                        }
+                    }
                     if mapped.is_empty() {
                         PartitionSelection::Empty
                     } else {
@@ -310,26 +329,27 @@ impl PartitionMappingKind {
                 PartitionSelection::Empty => PartitionSelection::Empty,
                 PartitionSelection::All => PartitionSelection::All,
                 PartitionSelection::Keys(keys) => {
-                    let mapped: HashSet<PartitionKey> = keys
-                        .iter()
-                        .filter_map(|k| {
-                            if let PartitionKey::Multi { dims } = k {
-                                dims.iter()
-                                    .find(|(d, _)| d == dimension_name)
-                                    .map(|(_, v)| PartitionKey::Single { keys: v.clone() })
-                            } else {
-                                None
-                            }
-                        })
-                        .flat_map(|dim_val| {
-                            let sel = PartitionSelection::Keys(std::iter::once(dim_val).collect());
-                            match inner.map_to_downstream(&sel) {
-                                PartitionSelection::Keys(ks) => ks.into_iter().collect::<Vec<_>>(),
-                                PartitionSelection::All => vec![],
-                                PartitionSelection::Empty => vec![],
-                            }
-                        })
-                        .collect();
+                    let dim_vals = keys.iter().filter_map(|k| {
+                        if let PartitionKey::Multi { dims } = k {
+                            dims.iter()
+                                .find(|(d, _)| d == dimension_name)
+                                .map(|(_, v)| PartitionKey::Single { keys: v.clone() })
+                        } else {
+                            None
+                        }
+                    });
+                    let mut mapped: HashSet<PartitionKey> = HashSet::new();
+                    for dim_val in dim_vals {
+                        let sel = PartitionSelection::Keys(std::iter::once(dim_val).collect());
+                        match inner.map_to_downstream(&sel) {
+                            PartitionSelection::Keys(ks) => mapped.extend(ks),
+                            // `inner` fans the dimension in → can't express as
+                            // specific keys; over-approximate to `All` rather
+                            // than drop (which would miss a materialization).
+                            PartitionSelection::All => return PartitionSelection::All,
+                            PartitionSelection::Empty => {}
+                        }
+                    }
                     if mapped.is_empty() {
                         PartitionSelection::Empty
                     } else {
