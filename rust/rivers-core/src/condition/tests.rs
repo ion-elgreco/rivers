@@ -6611,11 +6611,13 @@ fn test_clear_predispatch_mark_drops_empty_entry_only() {
     // A multi-partition backfill registers no run up front, so `classify`'s
     // pre-marked empty in_progress entry has no phantom-eviction safety net.
     // On dispatch failure it must be cleared, but never when real runs exist.
-    let mut cache =
-        AssetConditionCache::new(crate::storage::DEFAULT_CODE_LOCATION_ID.to_string());
+    let mut cache = AssetConditionCache::new(crate::storage::DEFAULT_CODE_LOCATION_ID.to_string());
 
     // Pre-mark (empty placeholder, as classify does) → cleared.
-    cache.in_progress_assets.entry("dst".to_string()).or_default();
+    cache
+        .in_progress_assets
+        .entry("dst".to_string())
+        .or_default();
     assert!(cache.in_progress_assets.contains_key("dst"));
     cache.clear_predispatch_mark("dst");
     assert!(
@@ -6855,6 +6857,75 @@ async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged
     assert!(
         changed,
         "cache should report changes when an in-progress asset's step completes"
+    );
+}
+
+#[tokio::test]
+async fn test_cache_clears_in_progress_when_run_canceled_after_cursor_advanced() {
+    // Regression: a dispatched run that storage reports once (Started/Queued)
+    // is removed from the phantom-eviction safety net and the run cursor
+    // advances to its start_time. If the run is then CANCELED, its terminal
+    // transition neither changes the asset record (no materialization) nor
+    // advances start_time, so `get_runs_since` (which uses `>`) never
+    // re-delivers it and the in-progress completion check (record-ts /
+    // StepSuccess) cannot see it either. The asset stays wedged in_progress
+    // forever and never re-fires. The cache must re-check tracked in-progress
+    // runs by id so a missed terminal transition still clears them.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+
+    let rec_a = make_materialized_record("a", 1000);
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_a])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(cache.in_progress_assets.is_empty());
+
+    // Started run for a → observed, in_progress set, cursor advances to 2000.
+    let run_id = "run-cancel".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    let changed = cache.refresh(&storage, 0).await.unwrap();
+    assert!(changed);
+    assert!(cache.in_progress_assets.contains_key("a"));
+
+    // Run is canceled. start_time stays 2000 (no new materialization record),
+    // so the cursor `> 2000` will never re-deliver this run.
+    storage
+        .update_run_status(&run_id, RunStatus::Canceled, Some(3000))
+        .await
+        .unwrap();
+
+    // Next refresh must clear a from in_progress despite the cursor miss.
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        !cache.in_progress_assets.contains_key("a"),
+        "a should be cleared from in_progress when its run is canceled, even though \
+         the run cursor never re-delivers the cancel. Got in_progress={:?}",
+        cache.in_progress_assets,
     );
 }
 
@@ -8417,7 +8488,10 @@ fn test_partition_mapping_multi_all_sub_overapproximates_to_all() {
             ),
             (
                 "region".into(),
-                ("region".into(), Box::new(PartitionMappingKind::AllPartitions)),
+                (
+                    "region".into(),
+                    Box::new(PartitionMappingKind::AllPartitions),
+                ),
             ),
         ]),
     };

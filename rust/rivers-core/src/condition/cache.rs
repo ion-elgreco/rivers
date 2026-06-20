@@ -483,11 +483,20 @@ impl AssetConditionCache {
             // Clear per run, not per asset. A backfill registers one run per
             // partition; evicting the whole asset when the first finishes
             // reopens the dispatch gate for its still-running siblings and
-            // re-fires them as duplicate runs. Re-read the completed assets'
+            // re-fires them as duplicate runs. Re-read the tracked in-progress
             // runs and clear only the terminal ones — in-flight runs stay.
-            let clearable: Vec<String> = completed_keys
-                .iter()
-                .filter_map(|k| self.in_progress_assets.get(k))
+            //
+            // Sweep ALL tracked in-progress runs, not just those whose asset
+            // record changed: `get_runs_since` uses `>`, so a run whose
+            // terminal transition doesn't advance its start_time (a
+            // cancellation, or a completion observed in the same tick the run
+            // first surfaced) is never re-delivered by the cursor, and a
+            // cancellation also produces no record-ts change / StepSuccess for
+            // the ts-unchanged fallback above to catch. Without this the asset
+            // would stay wedged in_progress forever.
+            let clearable: Vec<String> = self
+                .in_progress_assets
+                .values()
                 .flat_map(|runs| runs.keys().cloned())
                 .collect();
             if !clearable.is_empty() {
