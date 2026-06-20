@@ -12167,6 +12167,80 @@ fn test_cron_reset_in_dep_pivot_uses_root_tick() {
     );
 }
 
+/// `DataVersionChanged` over an UNCONDITIONED dep must not re-fire every tick.
+/// `update_dep_baselines` has to record the dep's `last_data_version` (like it
+/// does `last_materialized_timestamp`), else the pivot reads prev=None forever
+/// and `(Some, None) => true` fires on every tick despite a stable version.
+#[test]
+fn test_data_version_changed_baselines_unconditioned_dep() {
+    let tree = ConditionNode::any_deps_match(ConditionNode::DataVersionChanged);
+    let deps = HashMap::from([("r".to_string(), vec!["a".to_string()])]);
+    let r = make_materialized_record("r", 100);
+    let a = make_materialized_record("a", 100); // last_data_version = Some("dv_a")
+    let records = HashMap::from([("r".to_string(), r.clone()), ("a".to_string(), a.clone())]);
+    let no_conditioned: HashSet<String> = HashSet::new();
+    let empty_ps = HashMap::new();
+
+    // ── Tick 1: dep `a`'s version is first-seen (prev None) → fires ──
+    let mut assets: HashMap<String, AssetConditionState> = HashMap::new();
+    let prev1 = AssetConditionState::default();
+    let ctx1 = EvalContext {
+        target_key: "r",
+        root_key: "r",
+        target_record: &r,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &EMPTY_SET,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &prev1,
+        all_asset_states: &assets,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: 1000,
+        is_initial: false,
+        partitions: None,
+        root_partition_floor: None,
+    };
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: first-seen dep data version → fires");
+
+    // Baseline deps, as the daemon does after a fired/initial tick.
+    update_dep_baselines(&mut assets, &deps, &no_conditioned, &empty_ps, &records);
+
+    // ── Tick 2: `a`'s version is unchanged → must NOT re-fire ──
+    let prev2 = AssetConditionState::default();
+    let ctx2 = EvalContext {
+        target_key: "r",
+        root_key: "r",
+        target_record: &r,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &EMPTY_SET,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &prev2,
+        all_asset_states: &assets,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: 2000,
+        is_initial: false,
+        partitions: None,
+        root_partition_floor: None,
+    };
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        !result2.fired,
+        "tick 2: a stable dep data version must not re-fire (baseline missing)"
+    );
+}
+
 /// The `Or` counterpart: a stateful child skipped because an earlier child made
 /// the Or already-true must still keep its latch.
 #[test]
