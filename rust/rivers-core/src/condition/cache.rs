@@ -508,6 +508,15 @@ impl AssetConditionCache {
                 let ids: Vec<String> = completed_run_ids.into_iter().collect();
                 let completed_runs = storage.get_runs_by_ids(&ids, None).await?;
                 for run in &completed_runs {
+                    // `has_step_completed` short-circuits true on the FIRST
+                    // finished run, so sibling backfill runs that are still
+                    // Started get swept into `completed_run_ids`. Skip them —
+                    // applying an in-flight run's effects would clear a real
+                    // failure floor and overwrite last-run tags/asset_names
+                    // (same guard as the clearable loop above).
+                    if matches!(run.status, RunStatus::Started | RunStatus::NotStarted) {
+                        continue;
+                    }
                     self.apply_run_effects_to_delta(run, &mut delta);
                 }
             }
