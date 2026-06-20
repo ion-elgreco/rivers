@@ -326,6 +326,14 @@ class TestCronValidation:
 
 
 class TestWithout:
+    def test_without_removing_all_operands_raises(self):
+        # Removing every operand leaves an empty And, which evaluates to
+        # vacuously true (fires every tick) — reject it instead.
+        ac = rs.AutomationCondition
+        cond = ac.in_progress() & ac.in_progress()
+        with pytest.raises(ValueError, match="every operand|empty"):
+            cond.without(ac.in_progress())
+
     def test_without_negated_guard_by_object(self):
         # The And child is Not(any_deps_in_progress); pass it as it appears (~X).
         ac = rs.AutomationCondition
