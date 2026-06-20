@@ -49,6 +49,17 @@ fn root_dep_selections<'a>(
         .unwrap_or(&EMPTY_DEP_SELECTIONS)
 }
 
+/// The root asset's previous-tick evaluation time. In a dep pivot `prev_state`
+/// is the dep's state (and unconditioned deps never get `last_tick_timestamp`),
+/// so read the root from `all_asset_states`; fall back to `prev_state` when the
+/// root isn't tracked there (root-level eval / first tick).
+fn root_last_tick(ctx: &EvalContext) -> Option<i64> {
+    ctx.all_asset_states
+        .get(ctx.root_key)
+        .and_then(|s| s.last_tick_timestamp)
+        .or(ctx.prev_state.last_tick_timestamp)
+}
+
 /// Merge (not replace) a dep's stateful-node results into the per-dep accumulator,
 /// so two sibling aggregates over the same dep don't clobber each other.
 /// Precise writes win over previously-bridged values for the same slot.
@@ -439,10 +450,12 @@ fn eval_inner<O: EvalOutput>(
             cron_schedule,
             timezone: _,
         } => {
-            // Use the previous evaluation tick as the left boundary.
-            // Default to ctx.now on first eval (zero-width window → no match),
-            // so cron conditions don't spuriously fire on daemon startup.
-            let prev_ts = ctx.prev_state.last_tick_timestamp.unwrap_or(ctx.now);
+            // Use the previous evaluation tick as the left boundary. The cron
+            // boundary belongs to the ROOT, so in a dep pivot read the root's
+            // tick (unconditioned deps never have their own) — `prev_state` is
+            // the dep's there. Default to ctx.now on first eval (zero-width
+            // window → no match) so cron conditions don't fire on startup.
+            let prev_ts = root_last_tick(ctx).unwrap_or(ctx.now);
             O::leaf(
                 cron_tick_between(cron_schedule, prev_ts, ctx.now),
                 my_idx,
@@ -1193,7 +1206,8 @@ fn eval_partitioned<O: PartEvalOutput>(
             cron_schedule,
             timezone: _,
         } => {
-            let prev_ts = ctx.prev_state.last_tick_timestamp.unwrap_or(ctx.now);
+            // The cron boundary belongs to the root, not the pivoted dep.
+            let prev_ts = root_last_tick(ctx).unwrap_or(ctx.now);
             let val = cron_tick_between(cron_schedule, prev_ts, ctx.now);
             let sel = if val {
                 PartitionSelection::Keys(pctx.all_keys.clone())
