@@ -1181,9 +1181,33 @@ fn eval_partitioned<O: PartEvalOutput>(
         }
 
         ConditionNode::NewlyRequested => {
-            let val = ctx.prev_state.last_handled_timestamp.is_some()
+            // Same "requested on the immediately-previous tick" gate as the bool
+            // arm, but narrowed to the partitions actually requested (the prev
+            // `handled` set, cleared+repopulated each tick) instead of widening
+            // the asset-level scalar to every partition.
+            let requested_last_tick = ctx.prev_state.last_handled_timestamp.is_some()
                 && ctx.prev_state.last_handled_timestamp == ctx.prev_state.last_tick_timestamp;
-            O::leaf(PartitionSelection::from_bool(val), my_idx, node, total)
+            let sel = if requested_last_tick {
+                match ctx.prev_state.partition_state.as_ref() {
+                    Some(ps) => {
+                        let keys: HashSet<PartitionKey> = ps
+                            .handled
+                            .iter()
+                            .filter(|k| pctx.all_keys.contains(*k))
+                            .cloned()
+                            .collect();
+                        if keys.is_empty() {
+                            PartitionSelection::Empty
+                        } else {
+                            PartitionSelection::Keys(keys)
+                        }
+                    }
+                    None => PartitionSelection::Empty,
+                }
+            } else {
+                PartitionSelection::Empty
+            };
+            O::leaf(sel, my_idx, node, total)
         }
 
         ConditionNode::CronTickPassed {
