@@ -1932,12 +1932,13 @@ fn eval_partitioned_on_dep(
                         PartitionSelection::All => {
                             // Fan-out: uk feeds the whole downstream universe.
                             // Floor over attempted keys only; a never-attempted
-                            // key would force None (→ "updated") and rebroadcast
-                            // All. Nothing attempted → uk not due.
-                            match root_floor_over_attempted(pctx.all_keys.iter(), root_status) {
-                                Some(f) => Some(f),
-                                None => return None,
-                            }
+                            // key among several must not force None (→ "updated")
+                            // and rebroadcast All. But when NOTHING was ever
+                            // attempted the downstream is unmaterialized, so the
+                            // floor is genuinely None ⇒ updated — fire to populate
+                            // it, like the identity/Keys branches (else a fan-out
+                            // downstream never gets its initial materialization).
+                            root_floor_over_attempted(pctx.all_keys.iter(), root_status)
                         }
                         PartitionSelection::Keys(ks) => {
                             let in_universe: Vec<&PartitionKey> =
