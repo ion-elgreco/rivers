@@ -3045,6 +3045,66 @@ fn all_partitions_dep_genuine_update_still_fires() {
 }
 
 #[test]
+fn all_partitions_dep_initial_population_fires() {
+    // A fan-out (AllPartitions) downstream that has NEVER materialized any key
+    // must still fire on the first tick to populate itself — exactly like the
+    // identity-mapped case. When nothing was attempted the per-key floor is
+    // None, which must mean "never materialized ⇒ updated" (fire), not "exclude
+    // the upstream key" (which silently starved initial population).
+    let d1 = spk("d1");
+    let d2 = spk("d2");
+    let all_keys = HashSet::from([d1.clone(), d2.clone()]);
+    let u1 = spk("u1");
+    let up_keys = HashSet::from([u1.clone()]);
+
+    let a = make_record("a"); // never materialized
+    let b = make_materialized_record("b", 100);
+    let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
+    let deps = HashMap::from([("a".to_string(), vec!["b".to_string()])]);
+
+    // Root "a": nothing attempted. Dep "b": u1 materialized at 100.
+    let a_status = crate::condition::cache::PartitionStatusEntry::default();
+    let b_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: up_keys.clone(),
+        timestamps: HashMap::from([(u1.clone(), 100i64)]),
+        ..Default::default()
+    };
+    let partition_statuses =
+        HashMap::from([("a".to_string(), a_status), ("b".to_string(), b_status)]);
+
+    let all_states = HashMap::new();
+    let mut ctx = make_ctx("a", &a, &records, &deps);
+    ctx.all_asset_states = &all_states;
+
+    let mappings = HashMap::from([(
+        ("a".into(), "b".into()),
+        PartitionMappingKind::AllPartitions,
+    )]);
+    let upstream_b = HashMap::from([("b".to_string(), up_keys.clone())]);
+    let empty_ts: HashMap<PartitionKey, i64> = HashMap::new();
+    let empty_mat: HashSet<PartitionKey> = HashSet::new();
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &empty_mat,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &empty_ts,
+        resolver: PartitionResolver::new(&mappings, &upstream_b),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let result = evaluate(&ConditionNode::any_deps_updated(), &ctx);
+    assert!(
+        result.fired,
+        "a never-materialized fan-out downstream must fire to populate itself, got {:?}",
+        result.selection
+    );
+}
+
+#[test]
 fn dep_updated_floor_compares_mapped_downstream_key() {
     // The staleness floor must compare a dep key against the root's
     // materialization of the DOWNSTREAM key the mapping resolves it to —
