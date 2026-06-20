@@ -571,7 +571,8 @@ impl ConditionNode {
                 .find_lookback_delta()
                 .or_else(|| reset.find_lookback_delta()),
             ConditionNode::AnyDepsMatch { condition, .. }
-            | ConditionNode::AllDepsMatch { condition, .. } => condition.find_lookback_delta(),
+            | ConditionNode::AllDepsMatch { condition, .. }
+            | ConditionNode::AssetMatches { condition, .. } => condition.find_lookback_delta(),
             _ => None,
         }
     }

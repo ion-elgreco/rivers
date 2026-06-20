@@ -10551,6 +10551,19 @@ fn test_node_label_distinguishes_unlabeled_aggregate_inner_condition() {
 }
 
 #[test]
+fn find_lookback_delta_recurses_into_asset_matches() {
+    // Regression (C17): find_lookback_delta recurses into AnyDepsMatch/
+    // AllDepsMatch but previously not AssetMatches — an asymmetry vs the other
+    // tree-walks (has_time_based_conditions/has_stateful_nodes/uses_tick_tags),
+    // which would skip the latest-time-window computation for a nested lookback.
+    let inner = ConditionNode::InLatestTimeWindow {
+        lookback_delta: Some(3600.0),
+    };
+    let tree = ConditionNode::asset_matches(vec!["x".into()], inner);
+    assert_eq!(tree.find_lookback_delta(), Some(Some(3600.0)));
+}
+
+#[test]
 fn test_partition_selection_is_empty() {
     assert!(PartitionSelection::Empty.is_empty());
     assert!(!PartitionSelection::All.is_empty());
