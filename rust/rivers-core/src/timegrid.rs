@@ -45,6 +45,9 @@ impl TimeGrid {
         };
         let shifted = if let Some(secs) = self.interval_seconds {
             let interval_ns = (secs * 1_000_000_000.0) as i64;
+            if interval_ns <= 0 {
+                bail!("TimeWindow interval must be positive");
+            }
             let total = interval_ns.checked_mul(offset).ok_or_else(|| {
                 anyhow::anyhow!("time_window offset {offset} overflows for interval {secs}s")
             })?;
@@ -307,6 +310,22 @@ mod tests {
         };
         // Parses to chrono's minimum date; one window earlier is unrepresentable.
         assert!(g.shift_key("-262143-01-01T00:00:00", -1).is_err());
+    }
+
+    #[test]
+    fn interval_shift_rejects_non_positive_interval() {
+        // Regression (C15): shift_key must guard interval_ns <= 0 like
+        // keys_in_range / window_starts_in / nearest_keys. A zero interval
+        // otherwise makes it a silent identity map (wrong downstream keys)
+        // rather than erroring.
+        let g = TimeGrid {
+            cron_schedule: None,
+            interval_seconds: Some(1e-12), // 0.001 ns → rounds to 0
+            start: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap().into(),
+            end: Some(NaiveDate::from_ymd_opt(2024, 12, 31).unwrap().into()),
+            fmt: "%Y-%m-%dT%H:%M:%S".into(),
+        };
+        assert!(g.shift_key("2024-06-01T00:00:00", 1).is_err());
     }
 
     #[test]
