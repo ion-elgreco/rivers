@@ -142,6 +142,23 @@ fn test_missing_false_when_materialized() {
 }
 
 #[test]
+fn test_missing_false_when_materialized_without_data_version() {
+    // A materialization may legitimately carry no data version (the op emits no
+    // data_version metadata), leaving `last_data_version = None` while
+    // `last_timestamp` is set. The asset HAS been materialized, so Missing must
+    // be false — `Missing` keys off materialization presence (`last_timestamp`),
+    // matching the partitioned arm (the `materialized` set) and the cache, not
+    // off `last_data_version`. Otherwise `on_missing`/`eager` re-fire forever.
+    let mut record = make_record("a");
+    record.last_timestamp = Some(100);
+    record.last_data_version = None;
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let ctx = make_ctx("a", &record, &records, &deps);
+    assert!(!evaluate(&ConditionNode::Missing, &ctx).fired);
+}
+
+#[test]
 fn test_in_progress() {
     let record = make_record("a");
     let records = HashMap::from([("a".to_string(), record.clone())]);

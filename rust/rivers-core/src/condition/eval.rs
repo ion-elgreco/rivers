@@ -338,7 +338,12 @@ fn eval_inner<O: EvalOutput>(
 
     match node {
         ConditionNode::Missing => {
-            O::leaf(ctx.target_record.last_data_version.is_none(), my_idx, node)
+            // "Never materialized" keys off materialization presence, not the
+            // data version: a materialization may carry no data_version, so
+            // `last_data_version.is_none()` would report a materialized asset as
+            // missing forever. Mirrors the partitioned arm (the `materialized`
+            // set) and the cache, both of which key off `last_timestamp`.
+            O::leaf(ctx.target_record.last_timestamp.is_none(), my_idx, node)
         }
         ConditionNode::InProgress => O::leaf(
             ctx.cache.in_progress_assets.contains(ctx.target_key),
