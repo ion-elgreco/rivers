@@ -268,7 +268,7 @@ impl PartitionMappingKind {
                     // rather than silently dropping the key — an under-mapping
                     // would miss a downstream materialization.
                     enum DimMapped {
-                        Key(PartitionKey),
+                        Keys(Vec<PartitionKey>),
                         All,
                     }
                     let map_key_downstream = |pk: &PartitionKey| -> Option<DimMapped> {
@@ -280,7 +280,13 @@ impl PartitionMappingKind {
                             .iter()
                             .map(|(d, v)| (d.as_str(), v.as_slice()))
                             .collect();
-                        let mut downstream_dims = Vec::new();
+                        // A per-dimension sub-mapping can be many-to-one reversed
+                        // (several downstream values share one upstream value), so
+                        // each dimension yields a SET of candidate values. The
+                        // downstream keys are the cartesian product across
+                        // dimensions — keeping only the first value would drop a
+                        // downstream materialization.
+                        let mut combos: Vec<Vec<(String, Vec<String>)>> = vec![Vec::new()];
                         for (upstream_dim, (downstream_dim, per_dim_mapping)) in dimension_mappings
                         {
                             let val = upstream_dims.get(upstream_dim.as_str())?;
@@ -290,27 +296,44 @@ impl PartitionMappingKind {
                             );
                             match mapped {
                                 PartitionSelection::Keys(ks) => {
-                                    let first = ks.into_iter().next()?;
-                                    if let PartitionKey::Single { keys: kv } = first {
-                                        downstream_dims.push((downstream_dim.clone(), kv));
-                                    } else {
+                                    let mut values: Vec<Vec<String>> = Vec::new();
+                                    for k in ks {
+                                        if let PartitionKey::Single { keys: kv } = k {
+                                            values.push(kv);
+                                        } else {
+                                            return None;
+                                        }
+                                    }
+                                    if values.is_empty() {
                                         return None;
                                     }
+                                    let mut next = Vec::with_capacity(combos.len() * values.len());
+                                    for combo in &combos {
+                                        for v in &values {
+                                            let mut c = combo.clone();
+                                            c.push((downstream_dim.clone(), v.clone()));
+                                            next.push(c);
+                                        }
+                                    }
+                                    combos = next;
                                 }
                                 PartitionSelection::All => return Some(DimMapped::All),
                                 PartitionSelection::Empty => return None,
                             }
                         }
-                        Some(DimMapped::Key(PartitionKey::Multi {
-                            dims: downstream_dims,
-                        }))
+                        Some(DimMapped::Keys(
+                            combos
+                                .into_iter()
+                                .map(|dims| PartitionKey::Multi { dims })
+                                .collect(),
+                        ))
                     };
                     let mut mapped: HashSet<PartitionKey> = HashSet::new();
                     for pk in keys {
                         match map_key_downstream(pk) {
                             Some(DimMapped::All) => return PartitionSelection::All,
-                            Some(DimMapped::Key(k)) => {
-                                mapped.insert(k);
+                            Some(DimMapped::Keys(ks)) => {
+                                mapped.extend(ks);
                             }
                             None => {}
                         }

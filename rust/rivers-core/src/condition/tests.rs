@@ -8553,6 +8553,46 @@ fn test_partition_mapping_multi_with_static_sub() {
 }
 
 #[test]
+fn test_partition_mapping_multi_many_to_one_sub_keeps_all_downstream_keys() {
+    // A per-dimension Static sub-mapping can be many-to-one (two downstream
+    // regions read the same upstream region). Reverse-mapping that one upstream
+    // value must yield BOTH downstream keys (the cartesian product across
+    // dimensions) — keeping only the first would miss a downstream materialization.
+    let m = PartitionMappingKind::Multi {
+        dimension_mappings: HashMap::from([
+            (
+                "date".into(),
+                ("date".into(), Box::new(PartitionMappingKind::Identity)),
+            ),
+            (
+                "region".into(),
+                (
+                    "region".into(),
+                    Box::new(PartitionMappingKind::Static {
+                        mapping: HashMap::from([
+                            ("north".into(), "shared".into()),
+                            ("south".into(), "shared".into()),
+                        ]),
+                    }),
+                ),
+            ),
+        ]),
+    };
+    let up = PartitionSelection::Keys(HashSet::from([mpk(&[
+        ("date", "2024-01-01"),
+        ("region", "shared"),
+    ])]));
+    let down = m.map_to_downstream(&up);
+    assert_eq!(
+        down,
+        PartitionSelection::Keys(HashSet::from([
+            mpk(&[("date", "2024-01-01"), ("region", "north")]),
+            mpk(&[("date", "2024-01-01"), ("region", "south")]),
+        ]))
+    );
+}
+
+#[test]
 fn test_partition_mapping_multi_empty_and_all() {
     let m = PartitionMappingKind::Multi {
         dimension_mappings: HashMap::from([(
