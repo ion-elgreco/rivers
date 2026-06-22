@@ -3299,6 +3299,18 @@ checksum = "51b326f5219dd55872a72c1b6ddd1b830b8334996c667449c29391d657d78d5e"
 dependencies = [
  "base64",
  "jiff",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "k8s-openapi"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9c6922f6afe80418dd6019818af5d0d34584c371780ff09b9752370c25b4abb"
+dependencies = [
+ "base64",
+ "jiff",
  "schemars",
  "serde",
  "serde_json",
@@ -3338,7 +3350,7 @@ dependencies = [
  "hyper-util",
  "jiff",
  "jsonpath-rust",
- "k8s-openapi",
+ "k8s-openapi 0.27.1",
  "kube-core",
  "pem",
  "rustls",
@@ -3365,7 +3377,7 @@ dependencies = [
  "http",
  "jiff",
  "json-patch",
- "k8s-openapi",
+ "k8s-openapi 0.27.1",
  "schemars",
  "serde",
  "serde-value",
@@ -3402,7 +3414,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "hostname",
  "json-patch",
- "k8s-openapi",
+ "k8s-openapi 0.27.1",
  "kube-client",
  "parking_lot",
  "pin-project",
@@ -5605,7 +5617,7 @@ dependencies = [
  "chrono",
  "croner",
  "humantime",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube-client",
  "mimalloc",
  "opentelemetry",
@@ -5677,7 +5689,7 @@ name = "rivers-k8s"
 version = "0.0.0-dev"
 dependencies = [
  "anyhow",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube-client",
  "kube-core",
  "kube-derive",
@@ -5705,7 +5717,7 @@ dependencies = [
  "http-body-util",
  "json-patch",
  "jsonptr",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube-client",
  "kube-core",
  "kube-derive",
