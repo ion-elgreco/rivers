@@ -1,0 +1,12 @@
+from unittest.mock import MagicMock
+
+from {{ package_name }}.assets.assets import my_asset
+
+
+def test_my_asset_returns_expected_data():
+    context = MagicMock()
+    context.__name__ = "my_asset"
+
+    result = my_asset._asset_fn(context)
+
+    assert result == {"users": 100, "events": 5000}

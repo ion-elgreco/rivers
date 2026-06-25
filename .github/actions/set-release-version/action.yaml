@@ -55,3 +55,5 @@ runs:
         "$YQ" -i -p toml -o toml '.project.version = strenv(TAG)' python/pyproject.toml
         sed -i.bak "s/--version 0.0.0-dev/--version ${TAG}/g" docs/installation/kubernetes.md
         rm -f docs/installation/kubernetes.md.bak
+        sed -i.bak -E "s|rivers>=[^\"]+|rivers>=${TAG}|" python/rivers/cli/_template/pyproject.toml.j2
+        rm -f python/rivers/cli/_template/pyproject.toml.j2.bak

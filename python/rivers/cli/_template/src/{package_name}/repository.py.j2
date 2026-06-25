@@ -1,0 +1,9 @@
+import rivers as rs
+
+from {{ package_name }}.{{ dataset_name }}.assets import my_asset
+from {{ package_name }}.{{ dataset_name }}.jobs import job
+
+repo = rs.CodeRepository(
+    assets=[my_asset],
+    jobs=[job],
+)
