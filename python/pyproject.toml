@@ -9,7 +9,7 @@ dependencies = [
     "loky>=3.5",
     "obstore>=0.9.1",
     "pydantic>=2.11.9",
-    "pydantic-settings>=2.0",
+    "pydantic-settings>=2.14.2",
     "typer>=0.9",
 ]
 
