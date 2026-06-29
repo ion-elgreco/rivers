@@ -52,7 +52,7 @@ reportUnusedFunction = "warning"
 reportUnusedVariable = "warning"
 
 [build-system]
-requires = ["maturin>=1,<2"]
+requires = ["maturin>=1.14.1,<2"]
 build-backend = "maturin"
 
 [tool.maturin]
