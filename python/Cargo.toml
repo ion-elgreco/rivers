@@ -20,7 +20,7 @@ prost.workspace = true
 
 pyo3 = { version = "0.28.2", features = ["extension-module", "abi3-py310", "chrono"] }
 pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
-pyo3-arrow = { version = "0.17", default-features = false }
+pyo3-arrow = { version = "0.18", default-features = false }
 arrow-schema = "58"
 arrow-ipc = "58"
 chrono.workspace = true
