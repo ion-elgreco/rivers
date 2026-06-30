@@ -9,7 +9,7 @@ dependencies = [
     "loky>=3.5",
     "obstore>=0.9.1",
     "pydantic>=2.11.9",
-    "pydantic-settings>=2.0",
+    "pydantic-settings>=2.14.2",
     "typer>=0.9",
 ]
 
@@ -52,7 +52,7 @@ reportUnusedFunction = "warning"
 reportUnusedVariable = "warning"
 
 [build-system]
-requires = ["maturin>=1,<2"]
+requires = ["maturin>=1.14.1,<2"]
 build-backend = "maturin"
 
 [tool.maturin]
