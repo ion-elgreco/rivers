@@ -159,6 +159,19 @@ struct RefreshDelta {
     evicted_pending: Vec<(String, Vec<String>)>,
 }
 
+impl RefreshDelta {
+    /// Queue a `ClearRun` for every asset the run covered. `apply` untracks
+    /// per (asset, run) and no-ops on assets already cleared.
+    fn clear_run(&mut self, run: &crate::storage::RunRecord) {
+        for asset in &run.node_names {
+            self.in_progress_changes.push(InProgressChange::ClearRun {
+                asset_key: asset.clone(),
+                run_id: run.run_id.clone(),
+            });
+        }
+    }
+}
+
 /// Cached state for condition evaluation, minimizing storage queries.
 ///
 /// On first tick, loads everything. On subsequent ticks, uses `get_runs_since`
@@ -547,14 +560,7 @@ impl AssetConditionCache {
                     if matches!(run.status, RunStatus::Started | RunStatus::NotStarted) {
                         continue;
                     }
-                    for asset in &run.node_names {
-                        if self.in_progress_assets.contains_key(asset) {
-                            delta.in_progress_changes.push(InProgressChange::ClearRun {
-                                asset_key: asset.clone(),
-                                run_id: run.run_id.clone(),
-                            });
-                        }
-                    }
+                    delta.clear_run(run);
                     // A terminal run reaching only this sweep (cursor missed it,
                     // no record-ts change / StepSuccess) still needs its effects
                     // applied — otherwise a Failure here sets no failure floor
@@ -611,21 +617,11 @@ impl AssetConditionCache {
                         }
                     }
                     RunStatus::Success | RunStatus::Failure => {
-                        for asset in &run.node_names {
-                            delta.in_progress_changes.push(InProgressChange::ClearRun {
-                                asset_key: asset.clone(),
-                                run_id: run.run_id.clone(),
-                            });
-                        }
+                        delta.clear_run(run);
                         self.apply_run_effects_to_delta(run, &mut delta);
                     }
                     RunStatus::Canceled => {
-                        for asset in &run.node_names {
-                            delta.in_progress_changes.push(InProgressChange::ClearRun {
-                                asset_key: asset.clone(),
-                                run_id: run.run_id.clone(),
-                            });
-                        }
+                        delta.clear_run(run);
                     }
                     RunStatus::Queued => {
                         // Queued runs have no in-progress mutation but are
