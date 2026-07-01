@@ -520,6 +520,26 @@ impl ConditionPass {
         let in_progress_keys: HashSet<String> =
             self.cache.in_progress_assets.keys().cloned().collect();
 
+        // The asset-level floor is scoped to unpartitioned runs, so partitioned
+        // failures live only in partition_status. Watchers evaluating at
+        // unpartitioned granularity (dep pivots, asset_matches) read the
+        // snapshot's failed set — surface "any partition failed" there.
+        // Partitioned roots never read this set; they eval per-key against
+        // `pctx.failed`.
+        let failed_keys: HashSet<String> = self
+            .cache
+            .failed_assets
+            .iter()
+            .cloned()
+            .chain(
+                self.cache
+                    .partition_status
+                    .iter()
+                    .filter(|(_, status)| !status.failed.is_empty())
+                    .map(|(key, _)| key.clone()),
+            )
+            .collect();
+
         // WillBeRequested reads this set inside dep pivots for single-tick cascading.
         let mut requested_this_tick: HashMap<String, PartitionSelection> = HashMap::new();
         let mut results: Vec<EvalResultRow> = Vec::new();
@@ -592,7 +612,7 @@ impl ConditionPass {
                     records: &self.cache.records,
                     upstream_deps: &self.cache.upstream_deps,
                     in_progress_assets: &in_progress_keys,
-                    failed_assets: &self.cache.failed_assets,
+                    failed_assets: &failed_keys,
                     failed_asset_timestamps: &self.cache.failed_asset_timestamps,
                     backfill: &self.cache.backfill,
                 },
@@ -956,6 +976,51 @@ mod tests {
         let plan = pass.classify_materializations(to_mat);
         pass.stamp_dispatched_handled(&plan, 5000);
         pass.eval_state.assets["down"].last_handled_timestamp
+    }
+
+    #[test]
+    fn unpartitioned_watcher_sees_partition_failure_of_dep() {
+        // The asset-level failure floor is scoped to unpartitioned runs, so a
+        // partitioned dep's failure lives only in partition_status. A watcher
+        // evaluating at unpartitioned granularity (dep pivot) reads the
+        // snapshot's failed set — "any partition failed" must surface there.
+        let mut cache = AssetConditionCache::default();
+        let mut down = test_record("down");
+        down.last_timestamp = Some(100);
+        cache.records.insert("down".to_string(), down);
+        let mut up = test_record("up");
+        up.last_timestamp = Some(100);
+        cache.records.insert("up".to_string(), up);
+        cache
+            .upstream_deps
+            .insert("down".to_string(), vec!["up".to_string()]);
+        cache.partition_status.insert(
+            "up".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                failed: HashSet::from([spk("2024-01-01")]),
+                ..Default::default()
+            },
+        );
+
+        let pass = ConditionPass::new(
+            cache,
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "down".to_string(),
+                condition: ConditionNode::AnyDepsMatch {
+                    condition: Box::new(ConditionNode::ExecutionFailed),
+                    label: None,
+                },
+                partition_info: None,
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        );
+        let rows = pass.evaluate(5000, false);
+        assert!(
+            rows[0].result.fired,
+            "an unpartitioned watcher must see a partitioned dep's failed partition"
+        );
     }
 
     #[test]
