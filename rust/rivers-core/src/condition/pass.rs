@@ -525,20 +525,30 @@ impl ConditionPass {
         // unpartitioned granularity (dep pivots, asset_matches) read the
         // snapshot's failed set — surface "any partition failed" there.
         // Partitioned roots never read this set; they eval per-key against
-        // `pctx.failed`.
-        let failed_keys: HashSet<String> = self
-            .cache
-            .failed_assets
-            .iter()
-            .cloned()
-            .chain(
-                self.cache
-                    .partition_status
-                    .iter()
-                    .filter(|(_, status)| !status.failed.is_empty())
-                    .map(|(key, _)| key.clone()),
-            )
-            .collect();
+        // `pctx.failed`. Built only when something has actually failed — the
+        // steady state allocates nothing (empty HashSet doesn't allocate).
+        let has_failures = !self.cache.failed_assets.is_empty()
+            || self
+                .cache
+                .partition_status
+                .values()
+                .any(|status| !status.failed.is_empty());
+        let failed_keys: HashSet<String> = if has_failures {
+            self.cache
+                .failed_assets
+                .iter()
+                .cloned()
+                .chain(
+                    self.cache
+                        .partition_status
+                        .iter()
+                        .filter(|(_, status)| !status.failed.is_empty())
+                        .map(|(key, _)| key.clone()),
+                )
+                .collect()
+        } else {
+            HashSet::new()
+        };
 
         // WillBeRequested reads this set inside dep pivots for single-tick cascading.
         let mut requested_this_tick: HashMap<String, PartitionSelection> = HashMap::new();
