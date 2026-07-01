@@ -1379,6 +1379,9 @@ impl PartitionMapping {
 
             let rejected = match &mapping {
                 PartitionMapping::Multi { .. } => Some("Multi"),
+                // Per-dimension mappings receive Single components; MultiToSingle
+                // maps those to Empty, silently dropping the whole upstream key.
+                PartitionMapping::MultiToSingle { .. } => Some("MultiToSingle"),
                 PartitionMapping::ForKeys { .. } => Some("ForKeys"),
                 PartitionMapping::Subset {} => Some("Subset"),
                 _ => None,
