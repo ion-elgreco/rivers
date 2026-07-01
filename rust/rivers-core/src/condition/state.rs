@@ -308,12 +308,26 @@ pub fn update_condition_state(
             if let Some(dep_sub_selections) = &result.dep_sub_selections {
                 ps.dep_previous_selections = dep_sub_selections.clone();
             }
-            ps.timestamps = timestamps.clone();
-            // `partition_status` is recomputed from storage, which never
-            // forgets renamed/rescheduled partitions; keep the persisted
-            // baseline bounded to the live universe.
-            if let Some(universe) = ctx.partition_universe {
-                ps.timestamps.retain(|key, _| universe.contains(key));
+            // Delta-update the baseline in place — a wholesale clone of a
+            // large partition map every tick is the dominant allocation for
+            // big universes. End state must equal the snapshot restricted to
+            // the live universe: `partition_status` is recomputed from
+            // storage, which never forgets renamed/rescheduled partitions, so
+            // the persisted baseline stays bounded to the universe.
+            let in_universe =
+                |key: &crate::storage::PartitionKey| ctx.partition_universe.is_none_or(|u| u.contains(key));
+            ps.timestamps
+                .retain(|key, _| in_universe(key) && timestamps.contains_key(key));
+            for (key, ts) in timestamps {
+                if !in_universe(key) {
+                    continue;
+                }
+                match ps.timestamps.get_mut(key) {
+                    Some(v) => *v = *ts,
+                    None => {
+                        ps.timestamps.insert(key.clone(), *ts);
+                    }
+                }
             }
             // `handled` is a per-tick debounce window, not cumulative: reset it
             // so classification repopulates it with only this tick's dispatched

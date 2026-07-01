@@ -13279,6 +13279,49 @@ fn test_update_condition_state_prunes_timestamps_outside_universe() {
     );
 }
 
+/// The baseline must mirror the partition_status snapshot exactly: keys the
+/// snapshot no longer contains (retention cleanup, storage rollback) must
+/// leave the persisted baseline too — pinned so an in-place delta update
+/// can't drift from replace semantics.
+#[test]
+fn test_update_condition_state_drops_baseline_keys_missing_from_snapshot() {
+    let kept = spk("2024-01-02");
+    let gone = spk("2024-01-01");
+    let universe = HashSet::from([kept.clone(), gone.clone()]);
+
+    let mut state = AssetConditionState {
+        partition_state: Some(PartitionState {
+            timestamps: HashMap::from([(kept.clone(), 50i64), (gone.clone(), 40)]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    // New snapshot: `gone` vanished, `kept` advanced.
+    let timestamps = HashMap::from([(kept.clone(), 100i64)]);
+    update_condition_state(
+        &mut state,
+        &StateUpdateContext {
+            target_record_timestamp: Some(100),
+            target_data_version: None,
+            now: 1_000,
+            is_initial: false,
+            partition_timestamps: Some(&timestamps),
+            partition_universe: Some(&universe),
+        },
+        &EvalResult {
+            fired: false,
+            sub_selections: Some(HashMap::new()),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        state.partition_state.unwrap().timestamps,
+        HashMap::from([(kept, 100i64)]),
+        "baseline must equal the snapshot: stale key dropped, kept key advanced"
+    );
+}
+
 /// The persisted eval-state blob carries a schema stamp so incompatible field
 /// changes get an explicit migration point (`migrate_loaded`) instead of
 /// leaning on `serde(default)` silently. A pre-versioning blob (no stamp
