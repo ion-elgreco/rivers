@@ -578,23 +578,18 @@ impl ConditionPass {
             // dispatched runs (which lag storage). Allocate the union only when
             // there are pending partitions; otherwise borrow storage's set.
             let pending = self.cache.in_progress_partition_keys(&info.asset_key);
+            let partition_status = self.cache.partition_status.get(&info.asset_key);
             let merged_in_progress: Option<HashSet<PartitionKey>> = if pending.is_empty() {
                 None
             } else {
-                self.cache
-                    .partition_status
-                    .get(&info.asset_key)
-                    .map(|status| {
-                        let mut s = status.in_progress.clone();
-                        s.extend(pending);
-                        s
-                    })
+                partition_status.map(|status| {
+                    let mut s = status.in_progress.clone();
+                    s.extend(pending);
+                    s
+                })
             };
             let pctx = info.partition_info.as_ref().and_then(|pi| {
-                self.cache
-                    .partition_status
-                    .get(&info.asset_key)
-                    .map(|status| PartitionEvalContext {
+                partition_status.map(|status| PartitionEvalContext {
                         all_keys: &pi.all_keys,
                         materialized: &status.materialized,
                         in_progress: merged_in_progress.as_ref().unwrap_or(&status.in_progress),
