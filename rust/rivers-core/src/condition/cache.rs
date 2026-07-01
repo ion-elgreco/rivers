@@ -565,13 +565,11 @@ impl AssetConditionCache {
                     // no record-ts change / StepSuccess) still needs its effects
                     // applied — otherwise a Failure here sets no failure floor
                     // and an eager asset re-dispatches the failing run every
-                    // tick. Canceled only clears (matches the new_runs arm).
-                    // Skip ids the new_runs / completed_run_ids paths apply.
-                    if matches!(run.status, RunStatus::Success | RunStatus::Failure)
-                        && !new_runs_terminal.contains(run.run_id.as_str())
+                    // tick. Skip ids the new_runs / completed_run_ids paths apply.
+                    if !new_runs_terminal.contains(run.run_id.as_str())
                         && !completed_run_ids.contains(&run.run_id)
+                        && self.apply_run_effects_to_delta(run, &mut delta)
                     {
-                        self.apply_run_effects_to_delta(run, &mut delta);
                         swept_applied.insert(run.run_id.clone());
                     }
                 }
@@ -584,15 +582,9 @@ impl AssetConditionCache {
                 let ids: Vec<String> = completed_run_ids.into_iter().collect();
                 let completed_runs = storage.get_runs_by_ids(&ids, None).await?;
                 for run in &completed_runs {
-                    // `step_completion` short-circuits on the FIRST
-                    // finished run, so sibling backfill runs that are still
-                    // Started get swept into `completed_run_ids`. Skip them —
-                    // applying an in-flight run's effects would clear a real
-                    // failure floor and overwrite last-run tags/asset_names
-                    // (same guard as the clearable loop above).
-                    if matches!(run.status, RunStatus::Started | RunStatus::NotStarted) {
-                        continue;
-                    }
+                    // Sibling backfill runs that are still Started get swept
+                    // into `completed_run_ids` (`step_completion` short-circuits
+                    // on the first finished run); apply no-ops on them.
                     self.apply_run_effects_to_delta(run, &mut delta);
                 }
             }
@@ -737,7 +729,15 @@ impl AssetConditionCache {
     /// run/tick tag updates, asset_names updates) for a completed
     /// Success/Failure run into `delta`. Caller is responsible for emitting the
     /// matching `InProgressChange::ClearRun` separately.
-    fn apply_run_effects_to_delta(&self, run: &RunRecord, delta: &mut RefreshDelta) {
+    ///
+    /// Owns the terminal-only invariant: a non-Success/Failure run is a no-op
+    /// (returns false) — applying an in-flight run would clear a real failure
+    /// floor and overwrite last-run tags/asset_names, and Canceled only clears
+    /// in-progress. Returns whether effects were applied.
+    fn apply_run_effects_to_delta(&self, run: &RunRecord, delta: &mut RefreshDelta) -> bool {
+        if !matches!(run.status, RunStatus::Success | RunStatus::Failure) {
+            return false;
+        }
         let run_asset_names: Arc<[String]> = Arc::from(run.node_names.as_slice());
         let run_tags: Arc<[(String, String)]> = Arc::from(run.tags.as_slice());
         let is_failure = matches!(run.status, RunStatus::Failure);
@@ -796,6 +796,7 @@ impl AssetConditionCache {
                 ));
             }
         }
+        true
     }
 
     /// Plan-phase helper: fetch fresh records for `keys` and their transitive
