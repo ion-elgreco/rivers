@@ -324,15 +324,25 @@ impl PartitionMappingKind {
                                     if values.is_empty() {
                                         return None;
                                     }
-                                    let mut next = Vec::with_capacity(combos.len() * values.len());
-                                    for combo in &combos {
-                                        for v in &values {
-                                            let mut c = combo.clone();
-                                            c.push((downstream_dim.clone(), v.clone()));
-                                            next.push(c);
+                                    // 1-1 dimensions (the common case) extend in
+                                    // place; only genuine fan-out pays for the
+                                    // product rebuild.
+                                    if let [v] = values.as_slice() {
+                                        for combo in &mut combos {
+                                            combo.push((downstream_dim.clone(), v.clone()));
                                         }
+                                    } else {
+                                        let mut next =
+                                            Vec::with_capacity(combos.len() * values.len());
+                                        for combo in &combos {
+                                            for v in &values {
+                                                let mut c = combo.clone();
+                                                c.push((downstream_dim.clone(), v.clone()));
+                                                next.push(c);
+                                            }
+                                        }
+                                        combos = next;
                                     }
-                                    combos = next;
                                 }
                                 PartitionSelection::All => return Some(DimMapped::All),
                                 PartitionSelection::Empty => return None,
