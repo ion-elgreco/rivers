@@ -8326,6 +8326,46 @@ fn test_partition_mapping_multi_with_static_sub() {
 }
 
 #[test]
+fn test_partition_mapping_multi_many_to_one_sub_keeps_all_downstream_keys() {
+    // A per-dimension Static sub-mapping can be many-to-one (two downstream
+    // regions read the same upstream region). Reverse-mapping that one upstream
+    // value must yield BOTH downstream keys (the cartesian product across
+    // dimensions) — keeping only the first would miss a downstream materialization.
+    let m = PartitionMappingKind::Multi {
+        dimension_mappings: HashMap::from([
+            (
+                "date".into(),
+                ("date".into(), Box::new(PartitionMappingKind::Identity)),
+            ),
+            (
+                "region".into(),
+                (
+                    "region".into(),
+                    Box::new(PartitionMappingKind::Static {
+                        mapping: HashMap::from([
+                            ("north".into(), "shared".into()),
+                            ("south".into(), "shared".into()),
+                        ]),
+                    }),
+                ),
+            ),
+        ]),
+    };
+    let up = PartitionSelection::Keys(HashSet::from([mpk(&[
+        ("date", "2024-01-01"),
+        ("region", "shared"),
+    ])]));
+    let down = m.map_to_downstream(&up);
+    assert_eq!(
+        down,
+        PartitionSelection::Keys(HashSet::from([
+            mpk(&[("date", "2024-01-01"), ("region", "north")]),
+            mpk(&[("date", "2024-01-01"), ("region", "south")]),
+        ]))
+    );
+}
+
+#[test]
 fn test_partition_mapping_multi_empty_and_all() {
     let m = PartitionMappingKind::Multi {
         dimension_mappings: HashMap::from([(
@@ -8341,6 +8381,46 @@ fn test_partition_mapping_multi_empty_and_all() {
         m.map_to_downstream(&PartitionSelection::All),
         PartitionSelection::All
     );
+}
+
+#[test]
+fn test_partition_mapping_multi_all_sub_overapproximates_to_all() {
+    // A per-dimension sub-mapping that fans the whole dimension in
+    // (`AllPartitions`) can't be expressed as a single downstream Multi key.
+    // It must over-approximate to `All`, not silently drop the key (which
+    // would miss a downstream materialization).
+    let m = PartitionMappingKind::Multi {
+        dimension_mappings: HashMap::from([
+            (
+                "date".into(),
+                ("date".into(), Box::new(PartitionMappingKind::Identity)),
+            ),
+            (
+                "region".into(),
+                ("region".into(), Box::new(PartitionMappingKind::AllPartitions)),
+            ),
+        ]),
+    };
+    let up = PartitionSelection::Keys(HashSet::from([mpk(&[
+        ("date", "2024-01-01"),
+        ("region", "us"),
+    ])]));
+    assert_eq!(m.map_to_downstream(&up), PartitionSelection::All);
+}
+
+#[test]
+fn test_partition_mapping_multi_to_single_all_sub_overapproximates_to_all() {
+    // MultiToSingle whose inner per-dimension mapping fans the dimension in
+    // must over-approximate to `All`, not drop the key.
+    let m = PartitionMappingKind::MultiToSingle {
+        dimension_name: "region".into(),
+        inner: Box::new(PartitionMappingKind::AllPartitions),
+    };
+    let up = PartitionSelection::Keys(HashSet::from([mpk(&[
+        ("date", "2024-01-01"),
+        ("region", "us"),
+    ])]));
+    assert_eq!(m.map_to_downstream(&up), PartitionSelection::All);
 }
 
 #[test]
