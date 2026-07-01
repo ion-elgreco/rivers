@@ -683,6 +683,7 @@ impl ConditionPass {
                 now,
                 is_initial: was_initial,
                 partition_timestamps,
+                partition_universe: info.partition_info.as_ref().map(|pi| &pi.all_keys),
             };
             update_condition_state(prev, &update_ctx, &row.result);
 
@@ -1380,6 +1381,7 @@ mod tests {
             now: 1,
             is_initial: false,
             partition_timestamps: Some(&timestamps),
+            partition_universe: None,
         };
         let result = EvalResult {
             fired: true,
@@ -1414,6 +1416,7 @@ mod tests {
             now: 2,
             is_initial: false,
             partition_timestamps: Some(&timestamps),
+            partition_universe: None,
         };
         let result = EvalResult {
             fired: false,

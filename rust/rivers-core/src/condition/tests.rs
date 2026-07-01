@@ -10733,6 +10733,7 @@ fn test_update_condition_state_basic() {
         now: 2000,
         is_initial: false,
         partition_timestamps: None,
+        partition_universe: None,
     };
     update_condition_state(&mut state, &ctx, &result);
 
@@ -12685,6 +12686,7 @@ fn test_dep_aggregate_short_circuit_preserves_skipped_dep_latch() {
             now: 2000,
             is_initial: false,
             partition_timestamps: None,
+            partition_universe: None,
         },
         &result2,
     );
@@ -12830,6 +12832,7 @@ fn test_nested_dep_aggregate_under_unpartitioned_dep_persists_latch() {
             now: 1000,
             is_initial: false,
             partition_timestamps: Some(&r_timestamps),
+            partition_universe: None,
         },
         &result1,
     );
@@ -12902,6 +12905,7 @@ fn test_and_short_circuit_preserves_stateful_child_latch() {
             now: 2000,
             is_initial: false,
             partition_timestamps: None,
+            partition_universe: None,
         },
         &result2,
     );
@@ -12981,6 +12985,7 @@ fn test_cron_reset_in_dep_pivot_uses_root_tick() {
             now: t1,
             is_initial: false,
             partition_timestamps: None,
+            partition_universe: None,
         },
         &result1,
     );
@@ -13167,12 +13172,54 @@ fn test_update_condition_state_clears_stale_partition_state_when_unpartitioned()
         now: 300,
         is_initial: false,
         partition_timestamps: None,
+        partition_universe: None,
     };
     update_condition_state(&mut state, &ctx, &result);
 
     assert!(
         state.partition_state.is_none(),
         "stale partition_state must be cleared on an unpartitioned eval"
+    );
+}
+
+/// `partition_status` is recomputed from storage, which never forgets
+/// materializations of renamed/rescheduled partitions. The persisted baseline
+/// must not accrete those out-of-universe keys forever — the blob would grow
+/// on every partition-scheme change with the same condition tree (the
+/// fingerprint ignores the partition def, so nothing else resets it).
+#[test]
+fn test_update_condition_state_prunes_timestamps_outside_universe() {
+    let live = spk("2024-01-02");
+    let stale = spk("2023-12-31");
+    let timestamps = HashMap::from([(live.clone(), 100i64), (stale.clone(), 50)]);
+    let universe = HashSet::from([live.clone()]);
+
+    let mut state = AssetConditionState::default();
+    let result = EvalResult {
+        fired: false,
+        sub_selections: Some(HashMap::new()),
+        ..Default::default()
+    };
+    update_condition_state(
+        &mut state,
+        &StateUpdateContext {
+            target_record_timestamp: Some(100),
+            target_data_version: None,
+            now: 1_000,
+            is_initial: false,
+            partition_timestamps: Some(&timestamps),
+            partition_universe: Some(&universe),
+        },
+        &result,
+    );
+
+    let ps = state
+        .partition_state
+        .expect("partitioned eval must store partition_state");
+    assert_eq!(
+        ps.timestamps,
+        HashMap::from([(live, 100i64)]),
+        "keys outside the current universe must be pruned from the baseline"
     );
 }
 
@@ -13355,6 +13402,7 @@ fn test_or_short_circuit_preserves_stateful_child_latch() {
             now: 2000,
             is_initial: false,
             partition_timestamps: None,
+            partition_universe: None,
         },
         &result2,
     );

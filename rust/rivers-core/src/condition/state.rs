@@ -232,6 +232,9 @@ pub struct StateUpdateContext<'a> {
     pub now: i64,
     pub is_initial: bool,
     pub partition_timestamps: Option<&'a HashMap<crate::storage::PartitionKey, i64>>,
+    /// Current partition universe; baseline keys outside it are pruned so the
+    /// persisted blob doesn't accrete renamed/rescheduled partitions forever.
+    pub partition_universe: Option<&'a HashSet<crate::storage::PartitionKey>>,
 }
 
 impl<'a> StateUpdateContext<'a> {
@@ -243,6 +246,7 @@ impl<'a> StateUpdateContext<'a> {
             now: ctx.now,
             is_initial: ctx.is_initial,
             partition_timestamps: ctx.partitions.map(|p| p.timestamps),
+            partition_universe: ctx.partitions.map(|p| p.all_keys),
         }
     }
 }
@@ -274,6 +278,12 @@ pub fn update_condition_state(
                 ps.dep_previous_selections = dep_sub_selections.clone();
             }
             ps.timestamps = timestamps.clone();
+            // `partition_status` is recomputed from storage, which never
+            // forgets renamed/rescheduled partitions; keep the persisted
+            // baseline bounded to the live universe.
+            if let Some(universe) = ctx.partition_universe {
+                ps.timestamps.retain(|key, _| universe.contains(key));
+            }
             // `handled` is a per-tick debounce window, not cumulative: reset it
             // so classification repopulates it with only this tick's dispatched
             // keys.
