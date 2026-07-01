@@ -329,6 +329,21 @@ impl AssetConditionCache {
         }
     }
 
+    /// Roll back a `register_dispatched_run` whose dispatch failed
+    /// synchronously: the run record never reached storage, so nothing will
+    /// ever confirm the pending entry. Dropping it now frees the asset to
+    /// re-fire immediately instead of waiting out the phantom-eviction
+    /// grace period.
+    pub fn clear_dispatched_run(&mut self, asset_key: &str, run_id: &str) {
+        self.untrack_in_progress_run(asset_key, run_id);
+        if let Some(pending) = self.pending_runs.get_mut(run_id) {
+            pending.asset_keys.retain(|k| k != asset_key);
+            if pending.asset_keys.is_empty() {
+                self.pending_runs.remove(run_id);
+            }
+        }
+    }
+
     /// Drop a run (removing the asset once empty) — the one path for run
     /// completion (`ClearRun`) and phantom eviction.
     fn untrack_in_progress_run(&mut self, asset_key: &str, run_id: &str) {

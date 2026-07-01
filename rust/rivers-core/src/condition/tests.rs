@@ -11897,6 +11897,48 @@ async fn test_pending_run_not_evicted_within_grace() {
 }
 
 #[tokio::test]
+async fn test_clear_dispatched_run_rolls_back_failed_dispatch() {
+    // A synchronous dispatch failure means the run record never reached
+    // storage; the mark must drop immediately instead of waiting out the
+    // phantom-eviction grace period.
+    let (_storage, mut cache) = pending_test_setup().await;
+    cache.register_dispatched_run("a".into(), "joint-run".into(), 1_000_000, None);
+    cache.register_dispatched_run("b".into(), "joint-run".into(), 1_000_000, None);
+    cache.register_dispatched_run("c".into(), "solo-run".into(), 1_000_000, None);
+
+    cache.clear_dispatched_run("a", "joint-run");
+    assert!(
+        !cache.in_progress_assets.contains_key("a"),
+        "cleared asset must be untracked immediately"
+    );
+    assert!(
+        cache
+            .in_progress_assets
+            .get("b")
+            .is_some_and(|v| v.contains_key("joint-run")),
+        "other assets of the run keep their mark until cleared themselves"
+    );
+    assert!(
+        cache
+            .pending_runs
+            .get("joint-run")
+            .is_some_and(|p| p.asset_keys == vec!["b".to_string()]),
+        "pending entry drops only the cleared asset"
+    );
+
+    cache.clear_dispatched_run("b", "joint-run");
+    assert!(
+        !cache.pending_runs.contains_key("joint-run"),
+        "pending entry is removed once its last asset is cleared"
+    );
+    assert!(!cache.in_progress_assets.contains_key("b"));
+
+    cache.clear_dispatched_run("c", "solo-run");
+    assert!(!cache.in_progress_assets.contains_key("c"));
+    assert!(!cache.pending_runs.contains_key("solo-run"));
+}
+
+#[tokio::test]
 async fn test_pending_eviction_only_drops_phantom_run_id_not_other_runs() {
     // Two run_ids on the same asset: one phantom (registered, never confirmed,
     // grace expired), one real (registered, then confirmed by storage). The
