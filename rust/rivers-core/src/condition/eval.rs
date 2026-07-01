@@ -446,8 +446,15 @@ fn eval_inner<O: EvalOutput>(
                 // No baseline: on the initial tick the version was already
                 // there before startup — not a change, so suppress (else a bare
                 // data_version_changed() re-fires on every restart). Mirrors the
-                // NewlyUpdated arm. Non-initial → it appeared between ticks → fire.
-                (Some(_), None) => !ctx.is_initial,
+                // NewlyUpdated arm. Post-initial, persisted state may simply
+                // predate version tracking: only count the appearance as a
+                // change if a materialization actually landed since the last
+                // observation, else old blobs fire once per asset on upgrade.
+                (Some(_), None) => {
+                    !ctx.is_initial
+                        && ctx.prev_state.last_materialized_timestamp
+                            != ctx.target_record.last_timestamp
+                }
                 _ => false,
             };
             O::leaf(expr, my_idx, node)

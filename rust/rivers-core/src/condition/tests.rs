@@ -875,6 +875,42 @@ fn test_data_version_changed_suppressed_on_initial_tick() {
 }
 
 #[test]
+fn test_data_version_changed_suppressed_when_baseline_predates_tracking() {
+    // Persisted state from before last_data_version tracking: is_initial is
+    // false (state exists), last_materialized_timestamp matches the record (no
+    // materialization landed since), only the version baseline is missing. The
+    // version was already there — must not read as "changed", else every
+    // versioned asset fires one spurious materialization on the first
+    // post-upgrade tick.
+    let mut record = make_materialized_record("a", 100);
+    record.last_data_version = Some("v1".to_string());
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let state = AssetConditionState {
+        last_materialized_timestamp: record.last_timestamp,
+        ..Default::default()
+    };
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.prev_state = &state;
+    assert!(
+        !evaluate(&ConditionNode::DataVersionChanged, &ctx).fired,
+        "missing baseline with no new materialization is not a version change"
+    );
+
+    // A materialization that landed while the baseline was untracked IS a
+    // change signal: the record moved past the state's last observation.
+    let stale = AssetConditionState {
+        last_materialized_timestamp: Some(50),
+        ..Default::default()
+    };
+    ctx.prev_state = &stale;
+    assert!(
+        evaluate(&ConditionNode::DataVersionChanged, &ctx).fired,
+        "version appearing alongside a new materialization must fire"
+    );
+}
+
+#[test]
 fn test_data_version_changed_false_no_version() {
     let mut record = make_materialized_record("a", 100);
     record.last_data_version = None;
