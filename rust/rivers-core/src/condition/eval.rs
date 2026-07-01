@@ -1047,6 +1047,11 @@ fn cron_tick_between(
 
     thread_local! {
         static CRON_CACHE: RefCell<HashMap<String, croner::Cron>> = RefCell::new(HashMap::new());
+        // Parsed-Tz cache: this runs per asset/partition every tick, and
+        // re-parsing the same zone name (a ~600-entry table lookup) plus the
+        // cron-key String alloc were the only per-eval allocations here.
+        static TZ_CACHE: RefCell<HashMap<String, Option<chrono_tz::Tz>>> =
+            RefCell::new(HashMap::new());
     }
 
     let prev_secs = prev_nanos / 1_000_000_000;
@@ -1058,7 +1063,15 @@ fn cron_tick_between(
     // fall-back (mirrors the time-partition grid in `timegrid`); the only cost is
     // a possibly missed/doubled tick at the fall-back hour, never a hang.
     // `None`/unparsable timezone → UTC (unchanged behavior).
-    let tz: Option<chrono_tz::Tz> = timezone.and_then(|t| t.parse().ok());
+    let tz: Option<chrono_tz::Tz> = timezone.and_then(|t| {
+        TZ_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if !cache.contains_key(t) {
+                cache.insert(t.to_string(), t.parse().ok());
+            }
+            cache[t]
+        })
+    });
     let to_wall = |secs: i64| -> Option<chrono::DateTime<chrono::Utc>> {
         let utc = chrono::DateTime::from_timestamp(secs, 0)?;
         let naive = match tz {
@@ -1070,10 +1083,14 @@ fn cron_tick_between(
 
     CRON_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let cron = cache.entry(cron_schedule.to_string()).or_insert_with(|| {
+        if !cache.contains_key(cron_schedule) {
             // Validated at construction, so a parse error here is a bug.
-            build_cron(cron_schedule).expect("cron schedule validated at construction")
-        });
+            cache.insert(
+                cron_schedule.to_string(),
+                build_cron(cron_schedule).expect("cron schedule validated at construction"),
+            );
+        }
+        let cron = &cache[cron_schedule];
         match (to_wall(prev_secs), to_wall(now_secs)) {
             (Some(prev), Some(now)) => cron
                 .find_next_occurrence(&prev, false)
