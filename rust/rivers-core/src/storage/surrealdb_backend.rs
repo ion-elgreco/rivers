@@ -1661,39 +1661,28 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
-    async fn has_step_completed(&self, asset_key: &str, run_ids: &[String]) -> Result<bool> {
+    async fn step_completion(
+        &self,
+        asset_key: &str,
+        run_ids: &[String],
+    ) -> Result<(bool, Option<String>)> {
         super::retry::with_retry(&self.retry_config, || async {
+            let mut completed = false;
             for run_id in run_ids {
                 let events = self.get_events_for_run(run_id).await?;
-                let found = events.iter().any(|e| {
-                    e.asset_key.as_deref() == Some(asset_key)
-                        && matches!(
-                            e.event_type,
-                            EventType::StepSuccess | EventType::StepFailure
-                        )
-                });
-                if found {
-                    return Ok(true);
+                for e in &events {
+                    if e.asset_key.as_deref() != Some(asset_key) {
+                        continue;
+                    }
+                    if matches!(e.event_type, EventType::StepSuccess) {
+                        return Ok((true, Some(run_id.clone())));
+                    }
+                    if matches!(e.event_type, EventType::StepFailure) {
+                        completed = true;
+                    }
                 }
             }
-            Ok(false)
-        })
-        .await
-    }
-
-    async fn has_step_succeeded(&self, asset_key: &str, run_ids: &[String]) -> Result<bool> {
-        super::retry::with_retry(&self.retry_config, || async {
-            for run_id in run_ids {
-                let events = self.get_events_for_run(run_id).await?;
-                let found = events.iter().any(|e| {
-                    e.asset_key.as_deref() == Some(asset_key)
-                        && matches!(e.event_type, EventType::StepSuccess)
-                });
-                if found {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+            Ok((completed, None))
         })
         .await
     }
@@ -6784,7 +6773,7 @@ mod tests {
     // ── Zero-coverage function tests ──
 
     #[tokio::test]
-    async fn test_has_step_completed() {
+    async fn test_step_completion_completed_flag() {
         let storage = make_storage().await;
         register(&storage, &["asset_a", "asset_b"]).await;
 
@@ -6836,39 +6825,44 @@ mod tests {
         // Only StepStart — not completed
         assert!(
             !storage
-                .has_step_completed("asset_a", &["run_1".to_string()])
+                .step_completion("asset_a", &["run_1".to_string()])
                 .await
                 .unwrap()
+                .0
         );
         // StepSuccess — completed
         assert!(
             storage
-                .has_step_completed("asset_a", &["run_2".to_string()])
+                .step_completion("asset_a", &["run_2".to_string()])
                 .await
                 .unwrap()
+                .0
         );
         // StepFailure — completed
         assert!(
             storage
-                .has_step_completed("asset_b", &["run_3".to_string()])
+                .step_completion("asset_b", &["run_3".to_string()])
                 .await
                 .unwrap()
+                .0
         );
         // Unknown run
         assert!(
             !storage
-                .has_step_completed("asset_a", &["run_99".to_string()])
+                .step_completion("asset_a", &["run_99".to_string()])
                 .await
                 .unwrap()
+                .0
         );
         // Empty slice
-        assert!(!storage.has_step_completed("asset_a", &[]).await.unwrap());
+        assert!(!storage.step_completion("asset_a", &[]).await.unwrap().0);
         // Multiple runs — finds it in run_2
         assert!(
             storage
-                .has_step_completed("asset_a", &["run_1".to_string(), "run_2".to_string()])
+                .step_completion("asset_a", &["run_1".to_string(), "run_2".to_string()])
                 .await
                 .unwrap()
+                .0
         );
     }
 
