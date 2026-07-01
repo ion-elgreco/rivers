@@ -377,7 +377,10 @@ pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
     };
     let mut eval_state: ConditionEvalState = match storage.scoped().get_condition_eval_state().await
     {
-        Ok(Some(state)) => state,
+        Ok(Some(mut state)) => {
+            state.migrate_loaded();
+            state
+        }
         Ok(None) => fresh(),
         // Degrade gracefully but surface it: a swallowed load error silently
         // wipes every latch and treats all assets as initial (sibling of the

@@ -6330,6 +6330,7 @@ fn test_invalidation_on_tree_change() {
             },
         )]),
         is_initial: false,
+        ..Default::default()
     };
 
     let on_missing = ConditionNode::on_missing();
@@ -6382,6 +6383,7 @@ fn test_invalidation_noop_on_unchanged_tree() {
     let mut eval_state = ConditionEvalState {
         assets: HashMap::from([("asset_a".into(), original_state.clone())]),
         is_initial: false,
+        ..Default::default()
     };
 
     run_invalidation(
@@ -6435,6 +6437,7 @@ fn test_invalidation_prunes_removed_assets() {
             ),
         ]),
         is_initial: false,
+        ..Default::default()
     };
 
     run_invalidation(
@@ -13273,6 +13276,35 @@ fn test_update_condition_state_prunes_timestamps_outside_universe() {
         ps.timestamps,
         HashMap::from([(live, 100i64)]),
         "keys outside the current universe must be pruned from the baseline"
+    );
+}
+
+/// The persisted eval-state blob carries a schema stamp so incompatible field
+/// changes get an explicit migration point (`migrate_loaded`) instead of
+/// leaning on `serde(default)` silently. A pre-versioning blob (no stamp
+/// field) must read as version 0 — NOT the current version — so migrations
+/// can tell the two apart.
+#[test]
+fn test_condition_eval_state_schema_version_stamps_and_migrates() {
+    assert_eq!(
+        ConditionEvalState::default().schema_version,
+        EVAL_STATE_SCHEMA_VERSION,
+        "fresh state must carry the current schema version"
+    );
+
+    let mut old: ConditionEvalState = serde_json::from_str("{}").unwrap();
+    assert_eq!(
+        old.schema_version, 0,
+        "a blob written before versioning must load as version 0"
+    );
+    old.migrate_loaded();
+    assert_eq!(old.schema_version, EVAL_STATE_SCHEMA_VERSION);
+
+    let bytes = serde_json::to_vec(&ConditionEvalState::default()).unwrap();
+    let round: ConditionEvalState = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        round.schema_version, EVAL_STATE_SCHEMA_VERSION,
+        "the stamp must survive a persist round-trip"
     );
 }
 
