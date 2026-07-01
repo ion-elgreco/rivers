@@ -1006,9 +1006,26 @@ pub fn next_cron_occurrence_utc(
         chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&chrono::Utc)),
         // Fall-back hour (clock repeats): take the earliest valid instant.
         chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest.with_timezone(&chrono::Utc)),
-        // Spring-forward gap (wall time skipped): no exact instant exists; use
-        // the fake-UTC reading as a best effort so the schedule still advances.
-        chrono::LocalResult::None => Some(fake_next),
+        // Spring-forward gap (wall time skipped): fire at the first valid wall
+        // minute after the gap, like cron daemons do. Bounded probe (gaps are
+        // ≤ a few hours in real zones); a pathological zone falls back to the
+        // fake-UTC reading so the schedule still advances.
+        chrono::LocalResult::None => {
+            let mut probe = wall_next;
+            for _ in 0..240 {
+                probe += chrono::Duration::minutes(1);
+                match tz.from_local_datetime(&probe) {
+                    chrono::LocalResult::Single(dt) => {
+                        return Some(dt.with_timezone(&chrono::Utc));
+                    }
+                    chrono::LocalResult::Ambiguous(earliest, _) => {
+                        return Some(earliest.with_timezone(&chrono::Utc));
+                    }
+                    chrono::LocalResult::None => {}
+                }
+            }
+            Some(fake_next)
+        }
     }
 }
 

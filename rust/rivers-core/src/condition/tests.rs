@@ -13080,6 +13080,28 @@ fn test_next_cron_occurrence_utc_respects_timezone_and_dst() {
     );
 }
 
+/// A wall time skipped by spring-forward (02:30 America/New_York does not exist
+/// on 2026-03-08; 02:00 EST jumps to 03:00 EDT) must fire at the first valid
+/// instant after the gap — 03:00 EDT = 07:00 UTC — not at the skipped wall time
+/// misread as a UTC instant (02:30 UTC, hours before the intended fire).
+#[test]
+fn test_next_cron_occurrence_utc_spring_forward_gap_advances_to_gap_end() {
+    use chrono::{TimeZone, Utc};
+    let cron = croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Optional)
+        .build()
+        .parse("30 2 * * *")
+        .unwrap();
+
+    // 2026-03-08 01:00 EST = 06:00 UTC, one wall-clock hour before the gap.
+    let after = Utc.with_ymd_and_hms(2026, 3, 8, 6, 0, 0).unwrap();
+    assert_eq!(
+        next_cron_occurrence_utc(&cron, after, Some("America/New_York")),
+        Some(Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0).unwrap()),
+        "gap occurrence must fire at the first valid wall time after the gap (03:00 EDT)"
+    );
+}
+
 /// When an asset flips from partitioned to unpartitioned while keeping the same
 /// condition tree, the fingerprint is unchanged (it ignores the partition def)
 /// so `reset_for_new_tree` never runs. `update_condition_state` must itself drop
