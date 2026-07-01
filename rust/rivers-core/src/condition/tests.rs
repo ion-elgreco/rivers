@@ -6835,7 +6835,7 @@ fn test_clear_predispatch_mark_drops_empty_entry_only() {
 
 #[tokio::test]
 async fn test_cache_completion_fallback_skips_still_started_sibling_effects() {
-    // Regression: in the ts-unchanged completion fallback, `has_step_completed`
+    // Regression: in the ts-unchanged completion fallback, `step_completion`
     // short-circuits true on the FIRST finished run, so every tracked run_id of
     // a backfill (including still-Started siblings) is swept into
     // `completed_run_ids`. The effects loop must skip the in-flight siblings —
@@ -7489,8 +7489,8 @@ async fn test_cache_tick_materialization_tags_includes_empty_tags() {
 }
 
 #[tokio::test]
-async fn test_has_step_completed_sql_query() {
-    // Direct test of has_step_completed SQL query against SurrealDB.
+async fn test_step_completion_sql_query() {
+    // Direct test of the step_completion event scan against SurrealDB.
     // Populates events, then verifies the query finds them correctly.
 
     use crate::storage::surrealdb_backend::SurrealStorage;
@@ -7573,65 +7573,118 @@ async fn test_has_step_completed_sql_query() {
     // Test 1: asset "a" in run-query-test → true
     assert!(
         storage
-            .has_step_completed("a", std::slice::from_ref(&run_id))
+            .step_completion("a", std::slice::from_ref(&run_id))
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         "should find StepSuccess for 'a' in run-query-test"
     );
 
     // Test 2: asset "b" in run-query-test → true
     assert!(
         storage
-            .has_step_completed("b", std::slice::from_ref(&run_id))
+            .step_completion("b", std::slice::from_ref(&run_id))
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         "should find StepSuccess for 'b' in run-query-test"
     );
 
     // Test 3: asset "a" in other-run → true
     assert!(
         storage
-            .has_step_completed("a", std::slice::from_ref(&other_run))
+            .step_completion("a", std::slice::from_ref(&other_run))
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         "should find StepSuccess for 'a' in run-other"
     );
 
     // Test 4: asset "c" (doesn't exist) → false
     assert!(
         !storage
-            .has_step_completed("c", std::slice::from_ref(&run_id))
+            .step_completion("c", std::slice::from_ref(&run_id))
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         "should NOT find StepSuccess for 'c'"
     );
 
     // Test 5: asset "a" in non-existent run → false
     assert!(
         !storage
-            .has_step_completed("a", &["run-nonexistent".to_string()])
+            .step_completion("a", &["run-nonexistent".to_string()])
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         "should NOT find StepSuccess in non-existent run"
     );
 
     // Test 6: asset "a" in multiple run_ids → true (matches first)
     assert!(
         storage
-            .has_step_completed("a", &[run_id.clone(), other_run.clone()])
+            .step_completion("a", &[run_id.clone(), other_run.clone()])
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         "should find StepSuccess for 'a' across multiple run_ids"
     );
 
     // Test 7: asset "b" in other_run only → false (b only has events in run_id)
     assert!(
         !storage
-            .has_step_completed("b", std::slice::from_ref(&other_run))
+            .step_completion("b", std::slice::from_ref(&other_run))
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         "should NOT find StepSuccess for 'b' in run-other"
     );
+}
+
+#[tokio::test]
+async fn test_step_completion_single_pass() {
+    // One storage call answers both "did any step complete" and "which run
+    // succeeded" — the refresh fallback previously issued one
+    // has_step_succeeded query per in-progress run (N+1 during backfills).
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{EventRecord, EventType, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ev = |run: &str, asset: &str, event_type: EventType| EventRecord {
+        code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+        event_type,
+        asset_key: Some(asset.to_string()),
+        run_id: run.to_string(),
+        partition_key: None,
+        timestamp: 1000,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+    storage
+        .store_events(&[
+            ev("run-fail", "a", EventType::StepFailure),
+            ev("run-ok", "a", EventType::StepSuccess),
+            ev("run-ok", "b", EventType::StepFailure),
+        ])
+        .await
+        .unwrap();
+
+    let runs = vec!["run-fail".to_string(), "run-ok".to_string()];
+    let (completed, succeeded) = storage.step_completion("a", &runs).await.unwrap();
+    assert!(completed, "a completed a step in the given runs");
+    assert_eq!(
+        succeeded.as_deref(),
+        Some("run-ok"),
+        "the succeeding run must be identified"
+    );
+
+    let (completed, succeeded) = storage.step_completion("b", &runs).await.unwrap();
+    assert!(completed, "a failure is still a completion");
+    assert_eq!(succeeded, None, "no success run for a failed-only asset");
+
+    let (completed, succeeded) = storage.step_completion("c", &runs).await.unwrap();
+    assert!(!completed, "no events for 'c' in the given runs");
+    assert_eq!(succeeded, None);
 }
 
 // ── Partition-aware tests ───────────────────────────────────────────────

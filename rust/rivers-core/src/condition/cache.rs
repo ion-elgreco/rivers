@@ -487,25 +487,18 @@ impl AssetConditionCache {
                     // back to the in_progress map for the run_id since
                     // `record.last_run_id` may still point at the previous run.
                     let run_ids: Vec<String> = runs.keys().cloned().collect();
-                    if storage
-                        .has_step_completed(&record.asset_key, &run_ids)
-                        .await?
-                    {
+                    let (completed, succeeded_run) =
+                        storage.step_completion(&record.asset_key, &run_ids).await?;
+                    if completed {
                         completed_keys.push(record.asset_key.clone());
                         // The record write lags the step events: if the asset's
                         // step SUCCEEDED in one of these runs, mark it
                         // materialized-here so a co-batched failure in the same
                         // run can't floor the asset that produced output.
-                        for rid in &run_ids {
-                            if storage
-                                .has_step_succeeded(&record.asset_key, std::slice::from_ref(rid))
-                                .await?
-                            {
-                                delta
-                                    .materialized_overrides
-                                    .insert(record.asset_key.clone(), rid.clone());
-                                break;
-                            }
+                        if let Some(rid) = succeeded_run {
+                            delta
+                                .materialized_overrides
+                                .insert(record.asset_key.clone(), rid);
                         }
                         completed_run_ids.extend(run_ids);
                     }
@@ -585,7 +578,7 @@ impl AssetConditionCache {
                 let ids: Vec<String> = completed_run_ids.into_iter().collect();
                 let completed_runs = storage.get_runs_by_ids(&ids, None).await?;
                 for run in &completed_runs {
-                    // `has_step_completed` short-circuits true on the FIRST
+                    // `step_completion` short-circuits on the FIRST
                     // finished run, so sibling backfill runs that are still
                     // Started get swept into `completed_run_ids`. Skip them —
                     // applying an in-flight run's effects would clear a real
