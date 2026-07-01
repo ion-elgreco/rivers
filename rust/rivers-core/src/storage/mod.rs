@@ -2098,14 +2098,6 @@ pub trait StorageBackend: PerCodeLocationStorage {
         &self,
         run_id: &str,
     ) -> impl Future<Output = Result<Vec<StoredEvent>>> + Send;
-    /// Check if a step completed (StepSuccess or StepFailure event exists)
-    /// for a specific asset in any of the given runs.
-    fn has_step_completed(
-        &self,
-        asset_key: &str,
-        run_ids: &[String],
-    ) -> impl Future<Output = Result<bool>> + Send;
-
     /// Scan the given runs' step events for `asset_key` in one pass: whether
     /// any step completed (StepSuccess or StepFailure) and the first run with
     /// a StepSuccess. Used to tell a materialized asset from a co-batched
