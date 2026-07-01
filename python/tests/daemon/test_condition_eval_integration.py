@@ -43,6 +43,16 @@ def _wait_for_asset_up_to_date(storage, key, timeout=15.0, prev_version=None):
     return storage.get_asset_record(key)
 
 
+def _wait_until(predicate, timeout=10.0):
+    """Poll until ``predicate()`` is truthy or timeout; returns the last value."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.2)
+    return predicate()
+
+
 # ---------------------------------------------------------------------------
 # Test: Schedule materializes upstream → downstream eager() fires via daemon
 # ---------------------------------------------------------------------------
@@ -1557,7 +1567,9 @@ class TestDepAggregateShortCircuitLatch:
         )
         d1.start()
         try:
-            time.sleep(3.0)
+            _wait_until(
+                lambda: storage.get_latest_materialization("r", None) is not None
+            )
         finally:
             d1.stop()
         assert storage.get_latest_materialization("r", None) is not None, (
@@ -1594,7 +1606,7 @@ class TestDepAggregateShortCircuitLatch:
         )
         d3.start()
         try:
-            time.sleep(3.0)
+            _wait_until(lambda: len(storage.get_runs(limit=500)) > baseline)
         finally:
             d3.stop()
         after = len(storage.get_runs(limit=500))
@@ -1645,7 +1657,9 @@ class TestSiblingDepAggregateLatch:
         )
         daemon1.start()
         try:
-            time.sleep(3.0)
+            _wait_until(
+                lambda: storage.get_latest_materialization("r", None) is not None
+            )
         finally:
             daemon1.stop()
         assert storage.get_latest_materialization("r", None) is not None, (
@@ -1661,7 +1675,7 @@ class TestSiblingDepAggregateLatch:
         )
         daemon2.start()
         try:
-            time.sleep(3.0)
+            _wait_until(lambda: len(storage.get_runs(limit=500)) > baseline)
         finally:
             daemon2.stop()
         after = len(storage.get_runs(limit=500))
