@@ -7570,6 +7570,52 @@ async fn test_has_step_completed_sql_query() {
     );
 }
 
+#[tokio::test]
+async fn test_step_completion_single_pass() {
+    // One storage call answers both "did any step complete" and "which run
+    // succeeded" — the refresh fallback previously issued one
+    // has_step_succeeded query per in-progress run (N+1 during backfills).
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{EventRecord, EventType, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ev = |run: &str, asset: &str, event_type: EventType| EventRecord {
+        code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+        event_type,
+        asset_key: Some(asset.to_string()),
+        run_id: run.to_string(),
+        partition_key: None,
+        timestamp: 1000,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+    storage
+        .store_events(&[
+            ev("run-fail", "a", EventType::StepFailure),
+            ev("run-ok", "a", EventType::StepSuccess),
+            ev("run-ok", "b", EventType::StepFailure),
+        ])
+        .await
+        .unwrap();
+
+    let runs = vec!["run-fail".to_string(), "run-ok".to_string()];
+    let (completed, succeeded) = storage.step_completion("a", &runs).await.unwrap();
+    assert!(completed, "a completed a step in the given runs");
+    assert_eq!(
+        succeeded.as_deref(),
+        Some("run-ok"),
+        "the succeeding run must be identified"
+    );
+
+    let (completed, succeeded) = storage.step_completion("b", &runs).await.unwrap();
+    assert!(completed, "a failure is still a completion");
+    assert_eq!(succeeded, None, "no success run for a failed-only asset");
+
+    let (completed, succeeded) = storage.step_completion("c", &runs).await.unwrap();
+    assert!(!completed, "no events for 'c' in the given runs");
+    assert_eq!(succeeded, None);
+}
+
 // ── Partition-aware tests ───────────────────────────────────────────────
 
 /// Owned partition data for tests. Build this, then borrow from it to create PartitionEvalContext.

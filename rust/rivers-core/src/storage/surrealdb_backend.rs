@@ -1681,19 +1681,28 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
-    async fn has_step_succeeded(&self, asset_key: &str, run_ids: &[String]) -> Result<bool> {
+    async fn step_completion(
+        &self,
+        asset_key: &str,
+        run_ids: &[String],
+    ) -> Result<(bool, Option<String>)> {
         super::retry::with_retry(&self.retry_config, || async {
+            let mut completed = false;
             for run_id in run_ids {
                 let events = self.get_events_for_run(run_id).await?;
-                let found = events.iter().any(|e| {
-                    e.asset_key.as_deref() == Some(asset_key)
-                        && matches!(e.event_type, EventType::StepSuccess)
-                });
-                if found {
-                    return Ok(true);
+                for e in &events {
+                    if e.asset_key.as_deref() != Some(asset_key) {
+                        continue;
+                    }
+                    if matches!(e.event_type, EventType::StepSuccess) {
+                        return Ok((true, Some(run_id.clone())));
+                    }
+                    if matches!(e.event_type, EventType::StepFailure) {
+                        completed = true;
+                    }
                 }
             }
-            Ok(false)
+            Ok((completed, None))
         })
         .await
     }
