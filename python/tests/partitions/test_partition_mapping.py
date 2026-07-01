@@ -236,6 +236,15 @@ def test_multi_mapping_nested_rejected():
         rs.PartitionMapping.multi({"outer": inner})
 
 
+def test_multi_mapping_multi_to_single_rejected():
+    """MultiToSingle per-dimension mappings are rejected: inside Multi each
+    dimension maps Single components, so MultiToSingle always yields Empty and
+    the whole upstream key would silently vanish from the downstream selection."""
+    inner = rs.PartitionMapping.multi_to_single("date", rs.PartitionMapping.identity())
+    with pytest.raises(PartitionValidationError, match="Nested MultiToSingle"):
+        rs.PartitionMapping.multi({"date": inner})
+
+
 def test_multi_mapping_invalid_value_type():
     """Invalid value type in dimension_mappings is rejected."""
     with pytest.raises(TypeError, match="Multi mapping values"):
