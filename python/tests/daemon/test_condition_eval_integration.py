@@ -14,6 +14,7 @@ import rivers as rs
 from rivers._core import AutomationDaemon
 
 from _polling import wait_for_asset_materialized as _wait_for_asset_materialized
+from _polling import wait_until as _wait_until
 
 
 def _stale(storage, key):
@@ -41,16 +42,6 @@ def _wait_for_asset_up_to_date(storage, key, timeout=15.0, prev_version=None):
             return record
         time.sleep(0.2)
     return storage.get_asset_record(key)
-
-
-def _wait_until(predicate, timeout=10.0):
-    """Poll until ``predicate()`` is truthy or timeout; returns the last value."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.2)
-    return predicate()
 
 
 # ---------------------------------------------------------------------------
