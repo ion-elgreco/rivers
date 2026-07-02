@@ -1665,24 +1665,28 @@ impl StorageBackend for SurrealStorage {
         &self,
         asset_key: &str,
         run_ids: &[String],
-    ) -> Result<(bool, Option<String>)> {
+    ) -> Result<(bool, Vec<String>)> {
         super::retry::with_retry(&self.retry_config, || async {
             let mut completed = false;
+            let mut succeeded: Vec<String> = Vec::new();
             for run_id in run_ids {
                 let events = self.get_events_for_run(run_id).await?;
                 for e in &events {
                     if e.asset_key.as_deref() != Some(asset_key) {
                         continue;
                     }
-                    if matches!(e.event_type, EventType::StepSuccess) {
-                        return Ok((true, Some(run_id.clone())));
-                    }
-                    if matches!(e.event_type, EventType::StepFailure) {
-                        completed = true;
+                    match e.event_type {
+                        EventType::StepSuccess => {
+                            completed = true;
+                            succeeded.push(run_id.clone());
+                            break;
+                        }
+                        EventType::StepFailure => completed = true,
+                        _ => {}
                     }
                 }
             }
-            Ok((completed, None))
+            Ok((completed, succeeded))
         })
         .await
     }

@@ -7703,18 +7703,18 @@ async fn test_step_completion_single_pass() {
     let (completed, succeeded) = storage.step_completion("a", &runs).await.unwrap();
     assert!(completed, "a completed a step in the given runs");
     assert_eq!(
-        succeeded.as_deref(),
-        Some("run-ok"),
-        "the succeeding run must be identified"
+        succeeded,
+        vec!["run-ok".to_string()],
+        "every succeeding run must be identified"
     );
 
     let (completed, succeeded) = storage.step_completion("b", &runs).await.unwrap();
     assert!(completed, "a failure is still a completion");
-    assert_eq!(succeeded, None, "no success run for a failed-only asset");
+    assert!(succeeded.is_empty(), "no success run for a failed-only asset");
 
     let (completed, succeeded) = storage.step_completion("c", &runs).await.unwrap();
     assert!(!completed, "no events for 'c' in the given runs");
-    assert_eq!(succeeded, None);
+    assert!(succeeded.is_empty());
 }
 
 // ── Partition-aware tests ───────────────────────────────────────────────
