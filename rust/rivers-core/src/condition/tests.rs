@@ -10490,6 +10490,98 @@ fn test_partitioned_on_cron_no_deps_fires_all_partitions() {
 }
 
 #[test]
+fn test_cron_tick_respects_timezone() {
+    use chrono::{TimeZone, Utc};
+    // "0 9 * * *" in America/New_York must fire when the NY wall clock crosses
+    // 09:00 (= 13:00 UTC in summer/EDT), not at 09:00 UTC. The timezone field was
+    // previously ignored and the schedule evaluated in UTC.
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let cond = ConditionNode::CronTickPassed {
+        cron_schedule: "0 9 * * *".to_string(),
+        timezone: Some("America/New_York".to_string()),
+    };
+
+    // Tue 2026-06-16: 12:30 UTC (08:30 EDT) → 13:30 UTC (09:30 EDT). The 09:00
+    // EDT tick (= 13:00 UTC) lies inside this window.
+    let prev_tick = Utc
+        .with_ymd_and_hms(2026, 6, 16, 12, 30, 0)
+        .unwrap()
+        .timestamp_nanos_opt()
+        .unwrap();
+    let now = Utc
+        .with_ymd_and_hms(2026, 6, 16, 13, 30, 0)
+        .unwrap()
+        .timestamp_nanos_opt()
+        .unwrap();
+    let prev = AssetConditionState {
+        last_tick_timestamp: Some(prev_tick),
+        ..Default::default()
+    };
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.prev_state = &prev;
+    ctx.now = now;
+
+    let result = evaluate(&cond, &ctx);
+    assert!(
+        result.fired,
+        "cron '0 9' in America/New_York must fire at 09:00 EDT (13:00 UTC), not 09:00 UTC"
+    );
+
+    // Control: with no UTC cron tick in the window, the UTC-evaluated schedule
+    // would NOT fire — proving the fire above came from the tz, not luck.
+    let cond_utc = ConditionNode::CronTickPassed {
+        cron_schedule: "0 9 * * *".to_string(),
+        timezone: None,
+    };
+    let result_utc = evaluate(&cond_utc, &ctx);
+    assert!(
+        !result_utc.fired,
+        "same window has no 09:00 UTC tick, so the UTC schedule must not fire"
+    );
+}
+
+#[test]
+fn test_cron_tick_across_dst_fallback_terminates_and_fires() {
+    use chrono::{TimeZone, Utc};
+    // America/New_York falls back 2025-11-02 (02:00 EDT → 01:00 EST). A noon
+    // schedule is clear of the ambiguous 01:00 hour and must still fire on that
+    // day — and crucially the call must TERMINATE (the naive-as-UTC croner path
+    // can't spin on the fall-back, unlike croner+Local).
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let cond = ConditionNode::CronTickPassed {
+        cron_schedule: "0 12 * * *".to_string(),
+        timezone: Some("America/New_York".to_string()),
+    };
+    // 16:00 UTC (11:00 EST) → 17:30 UTC (12:30 EST); noon EST = 17:00 UTC.
+    let prev_tick = Utc
+        .with_ymd_and_hms(2025, 11, 2, 16, 0, 0)
+        .unwrap()
+        .timestamp_nanos_opt()
+        .unwrap();
+    let now = Utc
+        .with_ymd_and_hms(2025, 11, 2, 17, 30, 0)
+        .unwrap()
+        .timestamp_nanos_opt()
+        .unwrap();
+    let prev = AssetConditionState {
+        last_tick_timestamp: Some(prev_tick),
+        ..Default::default()
+    };
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.prev_state = &prev;
+    ctx.now = now;
+
+    assert!(
+        evaluate(&cond, &ctx).fired,
+        "noon schedule must fire on the DST fall-back day"
+    );
+}
+
+#[test]
 fn test_partitioned_on_cron_does_not_fire_without_tick() {
     // No cron tick between evals → on_cron should not fire.
     let empty_partition_statuses = HashMap::new();
@@ -12476,5 +12568,96 @@ fn test_or_short_circuit_preserves_stateful_child_latch() {
         result3.fired,
         "tick 3: a stateful child's latch must persist across a tick where \
          Or short-circuited and skipped it"
+    );
+}
+
+/// The daemon Schedule loop stores `next_occurrence` as a UTC instant. A
+/// tz-qualified schedule must fire at the declared wall-clock time, and the UTC
+/// instant must shift across DST while the wall time stays fixed.
+#[test]
+fn test_next_cron_occurrence_utc_respects_timezone_and_dst() {
+    use chrono::{TimeZone, Utc};
+    let cron = croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Optional)
+        .build()
+        .parse("0 9 * * *")
+        .unwrap();
+
+    // No timezone → evaluated in UTC: next 09:00 UTC.
+    let after = Utc.with_ymd_and_hms(2024, 1, 15, 0, 0, 0).unwrap();
+    assert_eq!(
+        next_cron_occurrence_utc(&cron, after, None),
+        Some(Utc.with_ymd_and_hms(2024, 1, 15, 9, 0, 0).unwrap()),
+    );
+
+    // America/New_York, winter (EST = UTC-5): 09:00 local → 14:00 UTC.
+    assert_eq!(
+        next_cron_occurrence_utc(&cron, after, Some("America/New_York")),
+        Some(Utc.with_ymd_and_hms(2024, 1, 15, 14, 0, 0).unwrap()),
+        "09:00 EST must be 14:00 UTC, not 09:00 UTC"
+    );
+
+    // Same schedule, summer (EDT = UTC-4): 09:00 local → 13:00 UTC. The UTC
+    // instant shifts by an hour across DST while the wall time stays 09:00.
+    let summer = Utc.with_ymd_and_hms(2024, 7, 15, 0, 0, 0).unwrap();
+    assert_eq!(
+        next_cron_occurrence_utc(&cron, summer, Some("America/New_York")),
+        Some(Utc.with_ymd_and_hms(2024, 7, 15, 13, 0, 0).unwrap()),
+        "09:00 EDT must be 13:00 UTC"
+    );
+}
+
+/// A wall time skipped by spring-forward (02:30 America/New_York does not exist
+/// on 2026-03-08; 02:00 EST jumps to 03:00 EDT) must fire at the first valid
+/// instant after the gap — 03:00 EDT = 07:00 UTC — not at the skipped wall time
+/// misread as a UTC instant (02:30 UTC, hours before the intended fire).
+#[test]
+fn test_next_cron_occurrence_utc_spring_forward_gap_advances_to_gap_end() {
+    use chrono::{TimeZone, Utc};
+    let cron = croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Optional)
+        .build()
+        .parse("30 2 * * *")
+        .unwrap();
+
+    // 2026-03-08 01:00 EST = 06:00 UTC, one wall-clock hour before the gap.
+    let after = Utc.with_ymd_and_hms(2026, 3, 8, 6, 0, 0).unwrap();
+    assert_eq!(
+        next_cron_occurrence_utc(&cron, after, Some("America/New_York")),
+        Some(Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0).unwrap()),
+        "gap occurrence must fire at the first valid wall time after the gap (03:00 EDT)"
+    );
+}
+
+/// Fall-back repeated hour: when `after` sits in the SECOND pass, resolving the
+/// next wall occurrence to the earliest ambiguous instant lands in the past.
+/// The daemon treats `now >= next_occurrence` as due and Schedule entries have
+/// no in-flight guard, so a past instant re-fires the schedule on every loop
+/// pass until the repeated hour ends. The next occurrence must be strictly
+/// after `after` — here the second-pass (EST) mapping of the wall time.
+#[test]
+fn test_next_cron_occurrence_utc_fall_back_never_returns_past_instant() {
+    use chrono::{TimeZone, Utc};
+    let cron = croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Optional)
+        .build()
+        .parse("30 1 * * *")
+        .unwrap();
+
+    // 2025-11-02 06:05 UTC = 01:05 EST, the second pass of the repeated
+    // 01:00-02:00 hour (01:05 EDT was 05:05 UTC). Next wall occurrence 01:30
+    // is ambiguous: 01:30 EDT = 05:30 UTC (past) vs 01:30 EST = 06:30 UTC.
+    let after = Utc.with_ymd_and_hms(2025, 11, 2, 6, 5, 0).unwrap();
+    let next = next_cron_occurrence_utc(&cron, after, Some("America/New_York"))
+        .expect("occurrence must exist");
+    assert!(
+        next > after,
+        "next occurrence must be strictly after `after`; got {next} <= {after} \
+         (schedule would re-fire on every daemon loop pass)"
+    );
+    assert_eq!(
+        next,
+        Utc.with_ymd_and_hms(2025, 11, 2, 6, 30, 0).unwrap(),
+        "the first 01:30 wall time after 01:05 EST is 01:30 EST"
     );
 }

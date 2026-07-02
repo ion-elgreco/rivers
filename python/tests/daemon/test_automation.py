@@ -289,6 +289,18 @@ class TestCronValidation:
         rs.AutomationCondition.on_cron("*/15 * * * *")
         rs.AutomationCondition.on_cron("0 0 0 * * *")
 
+    def test_cron_rejects_invalid_timezone(self):
+        # An unknown IANA zone must fail loudly, not silently fall back to UTC.
+        with pytest.raises(ValueError):
+            rs.AutomationCondition.on_cron("0 0 * * *", timezone="Not/AZone")
+        with pytest.raises(ValueError):
+            rs.AutomationCondition.cron_tick_passed("0 0 * * *", timezone="bogus")
+
+    def test_valid_timezones_accepted(self):
+        rs.AutomationCondition.on_cron("0 0 * * *", timezone="America/New_York")
+        rs.AutomationCondition.cron_tick_passed("0 0 * * *", timezone="Europe/London")
+        rs.AutomationCondition.all_deps_updated_since_cron("0 0 * * *", timezone="UTC")
+
 
 # ---------------------------------------------------------------------------
 # without()

@@ -448,7 +448,7 @@ fn eval_inner<O: EvalOutput>(
 
         ConditionNode::CronTickPassed {
             cron_schedule,
-            timezone: _,
+            timezone,
         } => {
             // Use the previous evaluation tick as the left boundary. The cron
             // boundary belongs to the ROOT, so in a dep pivot read the root's
@@ -457,7 +457,7 @@ fn eval_inner<O: EvalOutput>(
             // window → no match) so cron conditions don't fire on startup.
             let prev_ts = root_last_tick(ctx).unwrap_or(ctx.now);
             O::leaf(
-                cron_tick_between(cron_schedule, prev_ts, ctx.now),
+                cron_tick_between(cron_schedule, prev_ts, ctx.now, timezone.as_deref()),
                 my_idx,
                 node,
             )
@@ -996,25 +996,142 @@ pub fn validate_cron(schedule: &str) -> Result<(), String> {
     build_cron(schedule).map(|_| ())
 }
 
-fn cron_tick_between(cron_schedule: &str, prev_nanos: i64, now_nanos: i64) -> bool {
+/// Validate an IANA timezone name at construction (parsed via `chrono-tz`), so a
+/// typo'd zone fails loudly instead of silently evaluating the schedule in UTC.
+pub fn validate_timezone(tz: &str) -> Result<(), String> {
+    tz.parse::<chrono_tz::Tz>()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Next cron occurrence strictly after `after`, as a real UTC instant, evaluated
+/// against the declared `timezone`'s WALL CLOCK.
+///
+/// Used by the daemon Schedule loop (which stores `next_occurrence` as UTC). Like
+/// `cron_tick_between`, it shifts the instant into the zone's naive local time so
+/// croner never sees a real `Tz` (and so can't stall on a DST fall-back), then
+/// maps the resulting wall time back to UTC. A `None`/unparsable timezone
+/// evaluates in UTC unchanged.
+pub fn next_cron_occurrence_utc(
+    cron: &croner::Cron,
+    after: chrono::DateTime<chrono::Utc>,
+    timezone: Option<&str>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::TimeZone;
+
+    let Some(tz) = timezone.and_then(|t| t.parse::<chrono_tz::Tz>().ok()) else {
+        return cron.find_next_occurrence(&after, false).ok();
+    };
+
+    // Fall-back hour (clock repeats): the earliest instant of an ambiguous
+    // wall time can precede `after` when `after` sits in the second pass. The
+    // daemon treats `now >= next_occurrence` as due, so a past instant would
+    // re-fire the schedule on every loop pass until the repeated hour ends —
+    // pick the second-pass instant instead (the next real moment the wall
+    // clock reads that time).
+    let resolve_ambiguous = |earliest: chrono::DateTime<chrono_tz::Tz>,
+                             latest: chrono::DateTime<chrono_tz::Tz>| {
+        let e = earliest.with_timezone(&chrono::Utc);
+        if e > after {
+            e
+        } else {
+            latest.with_timezone(&chrono::Utc)
+        }
+    };
+
+    // Find the next wall-clock occurrence with croner operating in fake-UTC...
+    let naive_after = after.with_timezone(&tz).naive_local();
+    let fake_after = chrono::Utc.from_utc_datetime(&naive_after);
+    let fake_next = cron.find_next_occurrence(&fake_after, false).ok()?;
+    let wall_next = fake_next.naive_utc();
+
+    // ...then reinterpret that wall time as local in `tz` and convert to UTC.
+    match tz.from_local_datetime(&wall_next) {
+        chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&chrono::Utc)),
+        chrono::LocalResult::Ambiguous(earliest, latest) => {
+            Some(resolve_ambiguous(earliest, latest))
+        }
+        // Spring-forward gap (wall time skipped): fire at the first valid wall
+        // minute after the gap, like cron daemons do. Bounded probe (gaps are
+        // ≤ a few hours in real zones); a pathological zone falls back to the
+        // fake-UTC reading so the schedule still advances.
+        chrono::LocalResult::None => {
+            let mut probe = wall_next;
+            for _ in 0..240 {
+                probe += chrono::Duration::minutes(1);
+                match tz.from_local_datetime(&probe) {
+                    chrono::LocalResult::Single(dt) => {
+                        return Some(dt.with_timezone(&chrono::Utc));
+                    }
+                    chrono::LocalResult::Ambiguous(earliest, latest) => {
+                        return Some(resolve_ambiguous(earliest, latest));
+                    }
+                    chrono::LocalResult::None => {}
+                }
+            }
+            // Never hand back an instant at/before `after` — a stale value
+            // keeps is_due() true forever.
+            Some(fake_next.max(after + chrono::Duration::minutes(1)))
+        }
+    }
+}
+
+fn cron_tick_between(
+    cron_schedule: &str,
+    prev_nanos: i64,
+    now_nanos: i64,
+    timezone: Option<&str>,
+) -> bool {
+    use chrono::TimeZone;
     use std::cell::RefCell;
 
     thread_local! {
         static CRON_CACHE: RefCell<HashMap<String, croner::Cron>> = RefCell::new(HashMap::new());
+        // Parsed-Tz cache: this runs per asset/partition every tick, and
+        // re-parsing the same zone name (a ~600-entry table lookup) plus the
+        // cron-key String alloc were the only per-eval allocations here.
+        static TZ_CACHE: RefCell<HashMap<String, Option<chrono_tz::Tz>>> =
+            RefCell::new(HashMap::new());
     }
 
     let prev_secs = prev_nanos / 1_000_000_000;
     let now_secs = now_nanos / 1_000_000_000;
 
+    // Evaluate the schedule against the target zone's WALL CLOCK: shift each UTC
+    // instant into the zone's naive local time, then hand it to croner as if it
+    // were UTC. croner never sees a real `Tz`, so it can't stall on a DST
+    // fall-back (mirrors the time-partition grid in `timegrid`); the only cost is
+    // a possibly missed/doubled tick at the fall-back hour, never a hang.
+    // `None`/unparsable timezone → UTC (unchanged behavior).
+    let tz: Option<chrono_tz::Tz> = timezone.and_then(|t| {
+        TZ_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if !cache.contains_key(t) {
+                cache.insert(t.to_string(), t.parse().ok());
+            }
+            cache[t]
+        })
+    });
+    let to_wall = |secs: i64| -> Option<chrono::DateTime<chrono::Utc>> {
+        let utc = chrono::DateTime::from_timestamp(secs, 0)?;
+        let naive = match tz {
+            Some(tz) => utc.with_timezone(&tz).naive_local(),
+            None => utc.naive_utc(),
+        };
+        Some(chrono::Utc.from_utc_datetime(&naive))
+    };
+
     CRON_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let cron = cache.entry(cron_schedule.to_string()).or_insert_with(|| {
+        if !cache.contains_key(cron_schedule) {
             // Validated at construction, so a parse error here is a bug.
-            build_cron(cron_schedule).expect("cron schedule validated at construction")
-        });
-        let prev_dt = chrono::DateTime::from_timestamp(prev_secs, 0);
-        let now_dt = chrono::DateTime::from_timestamp(now_secs, 0);
-        match (prev_dt, now_dt) {
+            cache.insert(
+                cron_schedule.to_string(),
+                build_cron(cron_schedule).expect("cron schedule validated at construction"),
+            );
+        }
+        let cron = &cache[cron_schedule];
+        match (to_wall(prev_secs), to_wall(now_secs)) {
             (Some(prev), Some(now)) => cron
                 .find_next_occurrence(&prev, false)
                 .map(|next| next <= now)
@@ -1204,11 +1321,11 @@ fn eval_partitioned<O: PartEvalOutput>(
 
         ConditionNode::CronTickPassed {
             cron_schedule,
-            timezone: _,
+            timezone,
         } => {
             // The cron boundary belongs to the root, not the pivoted dep.
             let prev_ts = root_last_tick(ctx).unwrap_or(ctx.now);
-            let val = cron_tick_between(cron_schedule, prev_ts, ctx.now);
+            let val = cron_tick_between(cron_schedule, prev_ts, ctx.now, timezone.as_deref());
             let sel = if val {
                 PartitionSelection::Keys(pctx.all_keys.clone())
             } else {
