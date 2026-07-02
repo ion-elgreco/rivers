@@ -1002,6 +1002,22 @@ pub fn next_cron_occurrence_utc(
         return cron.find_next_occurrence(&after, false).ok();
     };
 
+    // Fall-back hour (clock repeats): the earliest instant of an ambiguous
+    // wall time can precede `after` when `after` sits in the second pass. The
+    // daemon treats `now >= next_occurrence` as due, so a past instant would
+    // re-fire the schedule on every loop pass until the repeated hour ends —
+    // pick the second-pass instant instead (the next real moment the wall
+    // clock reads that time).
+    let resolve_ambiguous = |earliest: chrono::DateTime<chrono_tz::Tz>,
+                             latest: chrono::DateTime<chrono_tz::Tz>| {
+        let e = earliest.with_timezone(&chrono::Utc);
+        if e > after {
+            e
+        } else {
+            latest.with_timezone(&chrono::Utc)
+        }
+    };
+
     // Find the next wall-clock occurrence with croner operating in fake-UTC...
     let naive_after = after.with_timezone(&tz).naive_local();
     let fake_after = chrono::Utc.from_utc_datetime(&naive_after);
@@ -1011,8 +1027,9 @@ pub fn next_cron_occurrence_utc(
     // ...then reinterpret that wall time as local in `tz` and convert to UTC.
     match tz.from_local_datetime(&wall_next) {
         chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&chrono::Utc)),
-        // Fall-back hour (clock repeats): take the earliest valid instant.
-        chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest.with_timezone(&chrono::Utc)),
+        chrono::LocalResult::Ambiguous(earliest, latest) => {
+            Some(resolve_ambiguous(earliest, latest))
+        }
         // Spring-forward gap (wall time skipped): fire at the first valid wall
         // minute after the gap, like cron daemons do. Bounded probe (gaps are
         // ≤ a few hours in real zones); a pathological zone falls back to the
@@ -1025,13 +1042,15 @@ pub fn next_cron_occurrence_utc(
                     chrono::LocalResult::Single(dt) => {
                         return Some(dt.with_timezone(&chrono::Utc));
                     }
-                    chrono::LocalResult::Ambiguous(earliest, _) => {
-                        return Some(earliest.with_timezone(&chrono::Utc));
+                    chrono::LocalResult::Ambiguous(earliest, latest) => {
+                        return Some(resolve_ambiguous(earliest, latest));
                     }
                     chrono::LocalResult::None => {}
                 }
             }
-            Some(fake_next)
+            // Never hand back an instant at/before `after` — a stale value
+            // keeps is_due() true forever.
+            Some(fake_next.max(after + chrono::Duration::minutes(1)))
         }
     }
 }

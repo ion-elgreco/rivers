@@ -13280,6 +13280,39 @@ fn test_next_cron_occurrence_utc_spring_forward_gap_advances_to_gap_end() {
     );
 }
 
+/// Fall-back repeated hour: when `after` sits in the SECOND pass, resolving the
+/// next wall occurrence to the earliest ambiguous instant lands in the past.
+/// The daemon treats `now >= next_occurrence` as due and Schedule entries have
+/// no in-flight guard, so a past instant re-fires the schedule on every loop
+/// pass until the repeated hour ends. The next occurrence must be strictly
+/// after `after` — here the second-pass (EST) mapping of the wall time.
+#[test]
+fn test_next_cron_occurrence_utc_fall_back_never_returns_past_instant() {
+    use chrono::{TimeZone, Utc};
+    let cron = croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Optional)
+        .build()
+        .parse("30 1 * * *")
+        .unwrap();
+
+    // 2025-11-02 06:05 UTC = 01:05 EST, the second pass of the repeated
+    // 01:00-02:00 hour (01:05 EDT was 05:05 UTC). Next wall occurrence 01:30
+    // is ambiguous: 01:30 EDT = 05:30 UTC (past) vs 01:30 EST = 06:30 UTC.
+    let after = Utc.with_ymd_and_hms(2025, 11, 2, 6, 5, 0).unwrap();
+    let next = next_cron_occurrence_utc(&cron, after, Some("America/New_York"))
+        .expect("occurrence must exist");
+    assert!(
+        next > after,
+        "next occurrence must be strictly after `after`; got {next} <= {after} \
+         (schedule would re-fire on every daemon loop pass)"
+    );
+    assert_eq!(
+        next,
+        Utc.with_ymd_and_hms(2025, 11, 2, 6, 30, 0).unwrap(),
+        "the first 01:30 wall time after 01:05 EST is 01:30 EST"
+    );
+}
+
 /// When an asset flips from partitioned to unpartitioned while keeping the same
 /// condition tree, the fingerprint is unchanged (it ignores the partition def)
 /// so `reset_for_new_tree` never runs. `update_condition_state` must itself drop
