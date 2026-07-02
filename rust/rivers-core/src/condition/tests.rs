@@ -13598,6 +13598,63 @@ fn test_condition_eval_state_loads_legacy_map_shaped_timestamps() {
     assert!(ps.timestamps.is_empty());
 }
 
+/// Upgrading a deployment whose persisted eval state predates data-version
+/// tracking: the per-asset baseline has `last_data_version = None` while the
+/// record carries `Some` and `is_initial` is false (fingerprint unchanged →
+/// no reset). The partitioned arm fired its ENTIRE universe as one spurious
+/// multi-partition backfill; the unpartitioned arm's gate — only a change if
+/// a materialization actually landed since the last observation — applies
+/// identically.
+#[test]
+fn test_partitioned_data_version_changed_suppressed_for_pre_versioning_state() {
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+
+    // Pre-versioning blob: baseline ts matches the record, version None.
+    let mut prev = AssetConditionState::default();
+    prev.last_materialized_timestamp = Some(100);
+    prev.last_tick_timestamp = Some(900);
+    prev.last_data_version = None;
+
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.prev_state = &prev;
+
+    let k1 = spk("2024-01-01");
+    let all_keys = HashSet::from([k1.clone()]);
+    let materialized = HashSet::from([k1.clone()]);
+    let timestamps = HashMap::from([(k1.clone(), 100i64)]);
+    let partition_status = HashMap::new();
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &materialized,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &timestamps,
+        resolver: PartitionResolver::empty(),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_status,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    assert!(
+        !evaluate(&ConditionNode::DataVersionChanged, &ctx).fired,
+        "a missing baseline with no new materialization must not fire the whole universe"
+    );
+
+    // A version that appears WITH a fresh materialization is a real change.
+    let record2 = make_materialized_record("a", 200);
+    let records2 = HashMap::from([("a".to_string(), record2.clone())]);
+    let mut ctx = make_ctx("a", &record2, &records2, &deps);
+    ctx.prev_state = &prev; // baseline still at 100, version None
+    ctx.partitions = Some(&pctx);
+    assert!(
+        evaluate(&ConditionNode::DataVersionChanged, &ctx).fired,
+        "a version appearing with a new materialization must fire"
+    );
+}
+
 /// An Observation bumps `assets.last_timestamp` (and may carry a data
 /// version) without materializing anything. A never-materialized asset that
 /// has been observed must still read as Missing — otherwise `on_missing()` /

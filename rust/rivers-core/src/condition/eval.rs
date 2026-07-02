@@ -1397,10 +1397,18 @@ fn eval_partitioned<O: PartEvalOutput>(
                 ctx.prev_state.last_data_version.as_ref(),
             ) {
                 (Some(current), Some(prev)) => current != prev,
-                // No baseline on the initial tick = pre-existing version, not a
-                // change (suppress); later = appeared between ticks (fire).
-                // Mirrors the unpartitioned arm and NewlyUpdated.
-                (Some(_), None) => !ctx.is_initial,
+                // No baseline: on the initial tick the version was already
+                // there before startup — not a change (suppress). Post-initial,
+                // persisted state may simply predate version tracking: only
+                // count the appearance as a change if a materialization
+                // actually landed since the last observation, else an old blob
+                // fires the WHOLE universe once per asset on upgrade. Same
+                // gate as the unpartitioned arm.
+                (Some(_), None) => {
+                    !ctx.is_initial
+                        && ctx.prev_state.last_materialized_timestamp
+                            != ctx.target_record.last_timestamp
+                }
                 _ => false,
             };
             let sel = if changed {
