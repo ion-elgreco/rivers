@@ -10,6 +10,15 @@ fn validate_cron_schedule(schedule: &str) -> PyResult<()> {
     })
 }
 
+fn validate_tz(timezone: &Option<String>) -> PyResult<()> {
+    if let Some(tz) = timezone {
+        rivers_core::condition::validate_timezone(tz).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid timezone {tz:?}: {e}"))
+        })?;
+    }
+    Ok(())
+}
+
 /// Human-readable description of a condition node (for Python display).
 pub(crate) fn description(node: &ConditionNode) -> String {
     match node {
@@ -156,6 +165,7 @@ impl PyAutomationCondition {
     #[pyo3(signature = (cron_schedule, timezone=None))]
     fn on_cron(cron_schedule: String, timezone: Option<String>) -> PyResult<Self> {
         validate_cron_schedule(&cron_schedule)?;
+        validate_tz(&timezone)?;
         let label = if let Some(ref tz) = timezone {
             format!("on_cron('{}', tz='{}')", cron_schedule, tz)
         } else {
@@ -217,6 +227,7 @@ impl PyAutomationCondition {
     #[pyo3(signature = (cron_schedule, timezone=None))]
     fn cron_tick_passed(cron_schedule: String, timezone: Option<String>) -> PyResult<Self> {
         validate_cron_schedule(&cron_schedule)?;
+        validate_tz(&timezone)?;
         Ok(Self::new_node(ConditionNode::CronTickPassed {
             cron_schedule,
             timezone,
@@ -362,6 +373,7 @@ impl PyAutomationCondition {
         timezone: Option<String>,
     ) -> PyResult<Self> {
         validate_cron_schedule(&cron_schedule)?;
+        validate_tz(&timezone)?;
         Ok(Self::new_node(ConditionNode::all_deps_updated_since_cron(
             cron_schedule,
             timezone,
