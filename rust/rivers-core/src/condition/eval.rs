@@ -488,7 +488,18 @@ fn eval_inner<O: EvalOutput>(
                 ctx.prev_state.last_data_version.as_ref(),
             ) {
                 (Some(current), Some(prev)) => current != prev,
-                (Some(_), None) => true,
+                // No baseline: on the initial tick the version was already
+                // there before startup — not a change, so suppress (else a bare
+                // data_version_changed() re-fires on every restart). Mirrors the
+                // NewlyUpdated arm. Post-initial, persisted state may simply
+                // predate version tracking: only count the appearance as a
+                // change if a materialization actually landed since the last
+                // observation, else old blobs fire once per asset on upgrade.
+                (Some(_), None) => {
+                    !ctx.is_initial
+                        && ctx.prev_state.last_materialized_timestamp
+                            != ctx.target_record.last_timestamp
+                }
                 _ => false,
             };
             O::leaf(expr, my_idx, node)
@@ -1405,7 +1416,18 @@ fn eval_partitioned<O: PartEvalOutput>(
                 ctx.prev_state.last_data_version.as_ref(),
             ) {
                 (Some(current), Some(prev)) => current != prev,
-                (Some(_), None) => true,
+                // No baseline: on the initial tick the version was already
+                // there before startup — not a change (suppress). Post-initial,
+                // persisted state may simply predate version tracking: only
+                // count the appearance as a change if a materialization
+                // actually landed since the last observation, else an old blob
+                // fires the WHOLE universe once per asset on upgrade. Same
+                // gate as the unpartitioned arm.
+                (Some(_), None) => {
+                    !ctx.is_initial
+                        && ctx.prev_state.last_materialized_timestamp
+                            != ctx.target_record.last_timestamp
+                }
                 _ => false,
             };
             let sel = if changed {
