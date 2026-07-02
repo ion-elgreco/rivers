@@ -14027,3 +14027,54 @@ async fn test_initial_load_does_not_floor_asset_materialized_in_failed_joint_run
         cache.failed_assets,
     );
 }
+
+/// `SinceLastHandled` debounces the ROOT's dispatch cycle. Inside a dep pivot
+/// `prev_state` is the DEP's state — never written for unconditioned deps —
+/// so the debounce read the wrong entity and vacuously passed: the tick right
+/// after the root fired and was dispatched, `any_deps_match(...)` fired again
+/// (duplicate dispatch) instead of being suppressed for that one tick.
+#[test]
+fn test_since_last_handled_in_dep_pivot_debounces_root_cycle() {
+    let record_down = make_record("down");
+    let record_up = make_record("up"); // never materialized → Missing is true
+    let records = HashMap::from([
+        ("down".to_string(), record_down.clone()),
+        ("up".to_string(), record_up.clone()),
+    ]);
+    let deps = HashMap::from([("down".to_string(), vec!["up".to_string()])]);
+
+    let condition = ConditionNode::AnyDepsMatch {
+        condition: Box::new(ConditionNode::SinceLastHandled(Box::new(
+            ConditionNode::Missing,
+        ))),
+        label: None,
+    };
+
+    // Root fired AND was dispatched on the previous tick: handled == tick.
+    let mut root_state = AssetConditionState::default();
+    root_state.last_handled_timestamp = Some(1000);
+    root_state.last_tick_timestamp = Some(1000);
+    let states = HashMap::from([("down".to_string(), root_state.clone())]);
+
+    let mut ctx = make_ctx("down", &record_down, &records, &deps);
+    ctx.prev_state = &root_state;
+    ctx.all_asset_states = &states;
+    assert!(
+        !evaluate(&condition, &ctx).fired,
+        "the tick after the root was handled must be debounced — a vacuous \
+         pass here re-dispatches the root every tick until its run lands"
+    );
+
+    // An OLDER handled cycle (handled < last tick) must pass again.
+    let mut stale_state = AssetConditionState::default();
+    stale_state.last_handled_timestamp = Some(500);
+    stale_state.last_tick_timestamp = Some(1000);
+    let states = HashMap::from([("down".to_string(), stale_state.clone())]);
+    let mut ctx = make_ctx("down", &record_down, &records, &deps);
+    ctx.prev_state = &stale_state;
+    ctx.all_asset_states = &states;
+    assert!(
+        evaluate(&condition, &ctx).fired,
+        "an older handled cycle must not suppress the trigger"
+    );
+}
