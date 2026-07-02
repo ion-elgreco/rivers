@@ -3099,6 +3099,38 @@ impl PerCodeLocationStorage for SurrealStorage {
                     .or_insert(row.ts);
             }
         }
+
+        // StepFailure events miss runs that die without writing step events
+        // (pod death / operator status sync). Union in terminal-Failure runs
+        // by partition key, floored at start_time so anything the run did
+        // manage to materialize (mat ts > start) still supersedes.
+        let mut result = self
+            .db
+            .query(
+                "SELECT partition_key, start_time FROM runs \
+                 WHERE code_location_id = $cl AND status = 'Failure' \
+                 AND $asset_key IN node_names AND partition_key IS NOT NONE",
+            )
+            .bind(("cl", code_location_id.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .await?;
+
+        #[derive(Debug, SurrealValue)]
+        struct RunFailRow {
+            partition_key: PartitionKey,
+            start_time: i64,
+        }
+
+        let run_rows: Vec<RunFailRow> = result.take(0)?;
+        for row in run_rows {
+            for member in row.partition_key.members() {
+                latest_failure
+                    .entry(member)
+                    .and_modify(|t| *t = (*t).max(row.start_time))
+                    .or_insert(row.start_time);
+            }
+        }
+
         Ok(latest_failure
             .into_iter()
             .filter(|(pk, ts)| materialized.get(pk).is_none_or(|&mat_ts| mat_ts < *ts))

@@ -1499,10 +1499,13 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         asset_key: &str,
     ) -> impl Future<Output = Result<Vec<PartitionKey>>> + Send;
 
-    /// Partitions whose latest `StepFailure` isn't superseded by a later
-    /// materialization, with that failure's timestamp. `materialized` is the
-    /// caller's per-partition timestamps (from `get_partition_timestamps`),
-    /// so we don't re-read `asset_partitions`.
+    /// Partitions whose latest failure isn't superseded by a later
+    /// materialization, with that failure's timestamp. A failure is either a
+    /// `StepFailure` event or a terminal-`Failure` run's partition key (runs
+    /// that die without writing step events — pod death / operator status
+    /// sync — have no event to key off). `materialized` is the caller's
+    /// per-partition timestamps (from `get_partition_timestamps`), so we
+    /// don't re-read `asset_partitions`.
     fn get_failed_partitions(
         &self,
         code_location_id: &str,
