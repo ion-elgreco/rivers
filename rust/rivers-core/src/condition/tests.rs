@@ -8583,11 +8583,40 @@ fn test_partition_mapping_static() {
     let m = PartitionMappingKind::Static {
         mapping: HashMap::from([("d1".into(), "u1".into()), ("d2".into(), "u2".into())]),
     };
-    // Upstream u2 maps to downstream d2
+    // Upstream u2 maps to downstream d2, plus its identity image u2 (a
+    // downstream key named u2, absent from the mapping keys, forward-reads
+    // upstream u2); phantoms are filtered against the downstream universe.
     let sel2 = PartitionSelection::Keys(HashSet::from([spk("u2")]));
     assert_eq!(
         m.map_to_downstream(&sel2),
-        PartitionSelection::Keys(HashSet::from([spk("d2")]))
+        PartitionSelection::Keys(HashSet::from([spk("d2"), spk("u2")]))
+    );
+}
+
+#[test]
+fn test_partition_mapping_static_identity_fallback() {
+    // Partial Static map: d1 is explicit, d2 is unmapped. The runtime
+    // (mapping.rs map_key) reads upstream d2 for the unmapped downstream d2 via
+    // identity, so an upstream d2 update must trigger downstream d2 — the
+    // condition-eval reverse map previously dropped it (missed materialization).
+    let m = PartitionMappingKind::Static {
+        mapping: HashMap::from([("d1".to_string(), "u1".to_string())]),
+    };
+    assert_eq!(
+        m.map_to_downstream(&PartitionSelection::Keys(HashSet::from([spk("d2")]))),
+        PartitionSelection::Keys(HashSet::from([spk("d2")])),
+        "unmapped upstream d2 must identity-map to downstream d2"
+    );
+    // The explicit reverse mapping AND the identity image both fire: forward
+    // map_key applies identity to ANY downstream key absent from the mapping
+    // KEYS — being some other entry's upstream target is irrelevant — so a
+    // downstream partition literally named u1 reads upstream u1 too. Dropping
+    // the identity image left that downstream permanently stale; a spurious
+    // key (no downstream u1 exists) is filtered against the universe later.
+    assert_eq!(
+        m.map_to_downstream(&PartitionSelection::Keys(HashSet::from([spk("u1")]))),
+        PartitionSelection::Keys(HashSet::from([spk("d1"), spk("u1")])),
+        "explicit u1 -> d1 plus the identity image u1 -> u1"
     );
 }
 
@@ -8804,7 +8833,11 @@ fn test_partition_mapping_multi_with_static_sub() {
             ),
         ]),
     };
-    // Upstream "eu" → downstream "europe"
+    // Upstream "eu" → downstream "europe" (explicit) plus the identity image
+    // "eu": forward map_key applies identity to any downstream value absent
+    // from the mapping KEYS, so a downstream region literally named "eu"
+    // reads upstream "eu" too. Spurious combos are filtered against the
+    // downstream universe later.
     let up = PartitionSelection::Keys(HashSet::from([mpk(&[
         ("date", "2024-01-01"),
         ("region", "eu"),
@@ -8812,10 +8845,10 @@ fn test_partition_mapping_multi_with_static_sub() {
     let down = m.map_to_downstream(&up);
     assert_eq!(
         down,
-        PartitionSelection::Keys(HashSet::from([mpk(&[
-            ("date", "2024-01-01"),
-            ("region", "europe")
-        ])]))
+        PartitionSelection::Keys(HashSet::from([
+            mpk(&[("date", "2024-01-01"), ("region", "europe")]),
+            mpk(&[("date", "2024-01-01"), ("region", "eu")]),
+        ]))
     );
 }
 
@@ -8855,6 +8888,9 @@ fn test_partition_mapping_multi_many_to_one_sub_keeps_all_downstream_keys() {
         PartitionSelection::Keys(HashSet::from([
             mpk(&[("date", "2024-01-01"), ("region", "north")]),
             mpk(&[("date", "2024-01-01"), ("region", "south")]),
+            // Identity image: a downstream region named "shared" (absent from
+            // the mapping keys) would forward-read upstream "shared" too.
+            mpk(&[("date", "2024-01-01"), ("region", "shared")]),
         ]))
     );
 }
@@ -8972,7 +9008,10 @@ fn test_partition_mapping_multi_to_single_with_static_inner() {
         }),
     };
 
-    // Upstream multi key has region=us → downstream single "north" (reverse of static)
+    // Upstream multi key has region=us → downstream "north" (reverse of the
+    // explicit entry) plus the identity image "us" (a downstream key named
+    // "us" would forward-read upstream "us"); phantoms are filtered against
+    // the downstream universe later.
     let upstream = PartitionSelection::Keys(HashSet::from([mpk(&[
         ("date", "2024-01-01"),
         ("region", "us"),
@@ -8980,7 +9019,7 @@ fn test_partition_mapping_multi_to_single_with_static_inner() {
     let downstream = m.map_to_downstream(&upstream);
     assert_eq!(
         downstream,
-        PartitionSelection::Keys(HashSet::from([spk("north")]))
+        PartitionSelection::Keys(HashSet::from([spk("north"), spk("us")]))
     );
 }
 
