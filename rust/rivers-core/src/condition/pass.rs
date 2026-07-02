@@ -162,9 +162,9 @@ fn refresh_universe(
                         }
                         match grid.window_starts_in(*enumerated_to, bound) {
                             Ok(new_keys) => {
-                                // Seeding can enumerate past the watermark
-                                // (explicit future end; start/enumerate race),
-                                // so re-yielded starts insert as no-ops.
+                                // Seeding is capped at its own `now`, which can
+                                // trail this tick's — a re-yielded start inserts
+                                // as a no-op and must not count as a change.
                                 for k in new_keys {
                                     changed |= du.keys.insert(k);
                                 }

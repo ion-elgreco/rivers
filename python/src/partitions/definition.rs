@@ -277,7 +277,7 @@ impl PartitionsDefinition {
     }
 
     /// Single-dimension variant of [`get_partition_keys_capped`].
-    fn enumerate_single_dim_keys_capped(&self, cap: NaiveDateTime) -> PyResult<Vec<String>> {
+    pub fn enumerate_single_dim_keys_capped(&self, cap: NaiveDateTime) -> PyResult<Vec<String>> {
         self.get_partition_keys_capped(cap)?
             .into_iter()
             .map(|pk| match pk {

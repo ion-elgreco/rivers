@@ -112,8 +112,14 @@ fn partition_universe_for(
             dims: dimensions
                 .iter()
                 .map(|(dim_name, dim_def)| {
+                    // Seed capped at `now`, like `all_keys` (get_partition_keys_capped):
+                    // dims seeded through a future `end` would (a) make every
+                    // arriving window a no-op insert in refresh_universe — so
+                    // `changed` stays false and the cartesian `all_keys` never
+                    // grows — and (b) flood the whole future range back into
+                    // `all_keys` on the first sibling-dimension change.
                     let keys = dim_def
-                        .enumerate_single_dim_keys()
+                        .enumerate_single_dim_keys_capped(now)
                         .unwrap_or_default()
                         .into_iter()
                         .collect();

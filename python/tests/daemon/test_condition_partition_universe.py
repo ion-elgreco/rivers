@@ -10,6 +10,7 @@ import datetime as _dt
 
 import rivers as rs
 from _polling import wait_for_runs as _wait_for_runs
+from _polling import wait_until as _wait_until
 from rivers._core import AutomationDaemon
 
 
@@ -104,5 +105,75 @@ def test_condition_does_not_materialize_future_time_windows(storage):
             f"future window {future_key} must not be materialized; the automation "
             "universe enumerated windows past now"
         )
+    finally:
+        daemon.stop()
+
+
+def test_multi_dimension_change_does_not_flood_future_time_windows(storage):
+    """Multi [dynamic color x daily(end in the future)] with ``on_missing``:
+    registering a new color rebuilds the cartesian universe from the dimension
+    key sets. Those sets must stay capped at now — seeded uncapped, the rebuild
+    floods every future window back in and the daemon backfills the whole
+    future range (the single-dim bug above resurfacing through Multi seeding).
+    """
+    today = _dt.date.today()
+    start = _dt.datetime.combine(today - _dt.timedelta(days=2), _dt.time.min)
+    end = _dt.datetime.combine(today + _dt.timedelta(days=10), _dt.time.min)
+    past_key = (today - _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+    future_key = (today + _dt.timedelta(days=5)).strftime("%Y-%m-%d")
+
+    @rs.Asset(
+        name="colored_daily",
+        io_handler=rs.InMemoryIOHandler(),
+        partitions_def=rs.PartitionsDefinition.multi(
+            {
+                "color": rs.PartitionsDefinition.dynamic("mcolors"),
+                "date": rs.PartitionsDefinition.daily(start=start, end=end),
+            }
+        ),
+        automation_condition=rs.AutomationCondition.on_missing(),
+    )
+    def colored_daily() -> str:
+        return "data"
+
+    repo = rs.CodeRepository(
+        assets=[colored_daily],
+        default_executor=rs.Executor.in_process(),
+    )
+    repo.resolve(storage=storage)
+    storage.add_dynamic_partitions("mcolors", ["blue"])
+
+    daemon = AutomationDaemon(
+        repo=repo,
+        storage=storage,
+        condition_eval_interval="500ms",
+    )
+    daemon.start()
+    try:
+        _wait_for_runs(storage, min_count=1, timeout=25, status="Success")
+
+        # The running daemon picks 'red' up via the per-tick dimension refresh,
+        # which rebuilds the cartesian universe.
+        storage.add_dynamic_partitions("mcolors", ["red"])
+        assert _wait_until(
+            lambda: storage.get_latest_materialization(
+                "colored_daily", f"color=red|date={past_key}"
+            )
+            is not None,
+            timeout=25,
+        ), "red x past window never materialized — the cartesian rebuild never ran"
+
+        # Let several more ticks pass so any (buggy) future materializations land.
+        _wait_for_runs(storage, min_count=999, timeout=6, status="Success")
+        for color in ("blue", "red"):
+            assert (
+                storage.get_latest_materialization(
+                    "colored_daily", f"color={color}|date={future_key}"
+                )
+                is None
+            ), (
+                f"future window color={color}|date={future_key} must not be "
+                "materialized; the dimension rebuild flooded windows past now in"
+            )
     finally:
         daemon.stop()
