@@ -60,6 +60,23 @@ fn root_last_tick(ctx: &EvalContext) -> Option<i64> {
         })
 }
 
+/// The root asset's previous-tick (handled, tick) timestamps, as a pair.
+/// `SinceLastHandled` debounces the ROOT's dispatch cycle: in a dep pivot
+/// `prev_state` is the dep's state — never written for unconditioned deps
+/// (vacuous pass → duplicate dispatch the tick after the root fired), and a
+/// conditioned dep's own cycle is the wrong entity to debounce against.
+/// Mirrors `root_last_tick`.
+fn root_handled_state(ctx: &EvalContext) -> (Option<i64>, Option<i64>) {
+    match ctx.all_asset_states.get(ctx.root_key) {
+        Some(s) => (s.last_handled_timestamp, s.last_tick_timestamp),
+        None if ctx.target_key == ctx.root_key => (
+            ctx.prev_state.last_handled_timestamp,
+            ctx.prev_state.last_tick_timestamp,
+        ),
+        None => (None, None),
+    }
+}
+
 /// Merge (not replace) a dep's stateful-node results into the per-dep accumulator,
 /// so two sibling aggregates over the same dep don't clobber each other.
 fn collect_dep_latch<V>(
@@ -714,13 +731,12 @@ fn eval_inner<O: EvalOutput>(
             let result = if !current {
                 false
             } else {
-                match ctx.prev_state.last_handled_timestamp {
+                // Debounce against the ROOT's dispatch cycle — in a dep
+                // pivot `prev_state` is the dep's (see `root_handled_state`).
+                let (last_handled, last_tick) = root_handled_state(ctx);
+                match last_handled {
                     None => true,
-                    Some(handled) => ctx
-                        .prev_state
-                        .last_tick_timestamp
-                        .map(|last_tick| handled < last_tick)
-                        .unwrap_or(true),
+                    Some(handled) => last_tick.map(|lt| handled < lt).unwrap_or(true),
                 }
             };
             if O::COLLECTS_CHILDREN {
@@ -1582,35 +1598,36 @@ fn eval_partitioned<O: PartEvalOutput>(
             let result = if current.is_empty() {
                 PartitionSelection::Empty
             } else {
-                let handled = ctx
-                    .prev_state
-                    .partition_state
-                    .as_ref()
-                    .map(|ps| &ps.handled);
-                match handled {
-                    None => current, // never handled
-                    Some(handled_set) => {
-                        // Remove handled partitions, but only if handling happened
-                        // on the previous tick (same debounce logic as unpartitioned).
-                        let was_just_handled = ctx
-                            .prev_state
-                            .last_handled_timestamp
-                            .map(|h| {
-                                ctx.prev_state
-                                    .last_tick_timestamp
-                                    .map(|lt| h >= lt)
-                                    .unwrap_or(false)
-                            })
-                            .unwrap_or(false);
-                        if was_just_handled {
+                // Debounce against the ROOT's dispatch cycle, not the pivoted
+                // dep's (see `root_handled_state`).
+                let (last_handled, last_tick) = root_handled_state(ctx);
+                let was_just_handled = last_handled
+                    .map(|h| last_tick.map(|lt| h >= lt).unwrap_or(false))
+                    .unwrap_or(false);
+                if !was_just_handled {
+                    current
+                } else if ctx.target_key != ctx.root_key {
+                    // Dep pivot: the root's handled keys live in the ROOT's
+                    // key space with no cheap translation to the dep's —
+                    // debounce the whole selection for this one tick
+                    // (handled < last_tick next tick, so it self-heals).
+                    PartitionSelection::Empty
+                } else {
+                    // At the root, subtract exactly the keys handled last tick.
+                    match ctx
+                        .prev_state
+                        .partition_state
+                        .as_ref()
+                        .map(|ps| &ps.handled)
+                    {
+                        None => current, // never handled
+                        Some(handled_set) => {
                             let handled_sel = if handled_set.is_empty() {
                                 PartitionSelection::Empty
                             } else {
                                 PartitionSelection::Keys(handled_set.clone())
                             };
                             current.difference(&handled_sel, pctx.all_keys)
-                        } else {
-                            current
                         }
                     }
                 }
