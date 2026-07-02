@@ -7152,12 +7152,19 @@ async fn test_cache_clears_in_progress_when_run_canceled_after_cursor_advanced()
         .unwrap();
 
     // Next refresh must clear a from in_progress despite the cursor miss.
-    cache.refresh(&storage, 0).await.unwrap();
+    let changed = cache.refresh(&storage, 0).await.unwrap();
     assert!(
         !cache.in_progress_assets.contains_key("a"),
         "a should be cleared from in_progress when its run is canceled, even though \
          the run cursor never re-delivers the cancel. Got in_progress={:?}",
         cache.in_progress_assets,
+    );
+    // The sweep mutated eval-visible state, so refresh must report a change —
+    // otherwise should_skip suppresses evaluation and the un-wedged asset
+    // never re-fires on a quiet deployment.
+    assert!(
+        changed,
+        "a sweep-only terminal transition must report the refresh as changed"
     );
 }
 
