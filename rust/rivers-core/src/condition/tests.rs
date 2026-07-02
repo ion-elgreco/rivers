@@ -34,6 +34,7 @@ fn make_materialized_record(key: &str, ts: i64) -> AssetRecord {
     let mut r = make_record(key);
     r.last_timestamp = Some(ts);
     r.last_data_version = Some(format!("dv_{key}"));
+    r.last_run_id = Some(format!("run_{key}"));
     r
 }
 
@@ -139,6 +140,25 @@ fn test_missing_false_when_materialized() {
     let ctx = make_ctx("a", &record, &records, &deps);
     let result = evaluate(&ConditionNode::Missing, &ctx);
     assert!(!result.fired);
+}
+
+#[test]
+fn test_missing_false_when_materialized_without_data_version() {
+    // A materialization may legitimately carry no data version (the op emits no
+    // data_version metadata), leaving `last_data_version = None` while the
+    // materialization is recorded. The asset HAS been materialized, so Missing
+    // must be false — `Missing` keys off materialization presence
+    // (`last_run_id`, written only by materialization events), matching the
+    // partitioned arm (the `materialized` set), not off `last_data_version`.
+    // Otherwise `on_missing`/`eager` re-fire forever.
+    let mut record = make_record("a");
+    record.last_timestamp = Some(100);
+    record.last_run_id = Some("run_a".to_string());
+    record.last_data_version = None;
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let ctx = make_ctx("a", &record, &records, &deps);
+    assert!(!evaluate(&ConditionNode::Missing, &ctx).fired);
 }
 
 #[test]
@@ -12952,6 +12972,32 @@ fn test_condition_eval_state_loads_legacy_map_shaped_timestamps() {
         .as_ref()
         .expect("partition_state present in the blob must load");
     assert!(ps.timestamps.is_empty());
+}
+
+/// An Observation bumps `assets.last_timestamp` (and may carry a data
+/// version) without materializing anything. A never-materialized asset that
+/// has been observed must still read as Missing — otherwise `on_missing()` /
+/// `eager()` never fire its initial materialization. `last_run_id` is written
+/// only by materialization events.
+#[test]
+fn test_missing_true_for_observed_never_materialized_asset() {
+    let mut record = make_record("a");
+    record.last_timestamp = Some(500); // bumped by the observation
+    record.last_data_version = Some("obs-v1".to_string()); // observation-carried
+    record.last_run_id = None; // no materialization ever
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let ctx = make_ctx("a", &record, &records, &deps);
+    assert!(
+        evaluate(&ConditionNode::Missing, &ctx).fired,
+        "an observed-but-never-materialized asset must still be Missing"
+    );
+
+    // And a real materialization (which always records its run) clears it.
+    let record = make_materialized_record("a", 600);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let ctx = make_ctx("a", &record, &records, &deps);
+    assert!(!evaluate(&ConditionNode::Missing, &ctx).fired);
 }
 
 /// `DataVersionChanged` over an UNCONDITIONED dep must not re-fire every tick.
