@@ -1269,18 +1269,27 @@ fn eval_partitioned<O: PartEvalOutput>(
             let updated: HashSet<PartitionKey> = pctx
                 .timestamps
                 .iter()
-                .filter(|&(pk, &ts)| match pctx.dep_root_floor {
-                    Some(floor) => match floor.get(pk) {
-                        None => false,
-                        Some(&inner) => dep_newer_than_floor(ts, inner),
-                    },
-                    None => match prev_timestamps.and_then(|pt| pt.get(pk)) {
-                        Some(&prev) => ts > prev,
-                        // No baseline on the initial tick = materialized before
-                        // startup, not new (suppress); later = appeared between
-                        // ticks (fire). Mirrors the unpartitioned arm.
-                        None => !ctx.is_initial,
-                    },
+                .filter(|&(pk, &ts)| {
+                    // The snapshot outlives the universe (storage never
+                    // forgets; the universe drops retired/re-scoped keys).
+                    // An out-of-universe key is not evaluable — selecting it
+                    // spams fired records and requested_this_tick every tick,
+                    // and classify only trims it after the fact.
+                    pctx.all_keys.contains(pk)
+                        && match pctx.dep_root_floor {
+                            Some(floor) => match floor.get(pk) {
+                                None => false,
+                                Some(&inner) => dep_newer_than_floor(ts, inner),
+                            },
+                            None => match prev_timestamps.and_then(|pt| pt.get(pk)) {
+                                Some(&prev) => ts > prev,
+                                // No baseline on the initial tick = materialized
+                                // before startup, not new (suppress); later =
+                                // appeared between ticks (fire). Mirrors the
+                                // unpartitioned arm.
+                                None => !ctx.is_initial,
+                            },
+                        }
                 })
                 .map(|(pk, _)| pk.clone())
                 .collect();

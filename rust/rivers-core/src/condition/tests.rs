@@ -10870,7 +10870,6 @@ fn test_update_condition_state_basic() {
         now: 2000,
         is_initial: false,
         partition_timestamps: None,
-        partition_universe: None,
     };
     update_condition_state(&mut state, &ctx, &result);
 
@@ -12823,7 +12822,6 @@ fn test_dep_aggregate_short_circuit_preserves_skipped_dep_latch() {
             now: 2000,
             is_initial: false,
             partition_timestamps: None,
-            partition_universe: None,
         },
         &result2,
     );
@@ -12969,7 +12967,6 @@ fn test_nested_dep_aggregate_under_unpartitioned_dep_persists_latch() {
             now: 1000,
             is_initial: false,
             partition_timestamps: Some(&r_timestamps),
-            partition_universe: None,
         },
         &result1,
     );
@@ -13042,7 +13039,6 @@ fn test_and_short_circuit_preserves_stateful_child_latch() {
             now: 2000,
             is_initial: false,
             partition_timestamps: None,
-            partition_universe: None,
         },
         &result2,
     );
@@ -13122,7 +13118,6 @@ fn test_cron_reset_in_dep_pivot_uses_root_tick() {
             now: t1,
             is_initial: false,
             partition_timestamps: None,
-            partition_universe: None,
         },
         &result1,
     );
@@ -13342,7 +13337,6 @@ fn test_update_condition_state_clears_stale_partition_state_when_unpartitioned()
         now: 300,
         is_initial: false,
         partition_timestamps: None,
-        partition_universe: None,
     };
     update_condition_state(&mut state, &ctx, &result);
 
@@ -13352,17 +13346,18 @@ fn test_update_condition_state_clears_stale_partition_state_when_unpartitioned()
     );
 }
 
-/// `partition_status` is recomputed from storage, which never forgets
-/// materializations of renamed/rescheduled partitions. The persisted baseline
-/// must not accrete those out-of-universe keys forever — the blob would grow
-/// on every partition-scheme change with the same condition tree (the
-/// fingerprint ignores the partition def, so nothing else resets it).
+/// The baseline is bounded by the partition_status SNAPSHOT, not the universe:
+/// storage never forgets a materialization, so a snapshot key outside the
+/// universe (retired dynamic key, def change, future-window cap) must KEEP its
+/// baseline. Pruning it regressed two ways — the key read as newly-updated on
+/// every tick forever (no baseline is ever re-established while the snapshot
+/// retains it), and a later re-add of the key with unchanged data fired one
+/// spurious materialization.
 #[test]
-fn test_update_condition_state_prunes_timestamps_outside_universe() {
+fn test_update_condition_state_keeps_baseline_for_snapshot_keys_outside_universe() {
     let live = spk("2024-01-02");
     let stale = spk("2023-12-31");
     let timestamps = HashMap::from([(live.clone(), 100i64), (stale.clone(), 50)]);
-    let universe = HashSet::from([live.clone()]);
 
     let mut state = AssetConditionState::default();
     let result = EvalResult {
@@ -13378,7 +13373,6 @@ fn test_update_condition_state_prunes_timestamps_outside_universe() {
             now: 1_000,
             is_initial: false,
             partition_timestamps: Some(&timestamps),
-            partition_universe: Some(&universe),
         },
         &result,
     );
@@ -13388,8 +13382,57 @@ fn test_update_condition_state_prunes_timestamps_outside_universe() {
         .expect("partitioned eval must store partition_state");
     assert_eq!(
         ps.timestamps,
-        HashMap::from([(live, 100i64)]),
-        "keys outside the current universe must be pruned from the baseline"
+        HashMap::from([(live, 100i64), (stale, 50)]),
+        "every snapshot key keeps its baseline, in or out of the universe"
+    );
+}
+
+/// Storage never forgets a materialization; the universe can (retired dynamic
+/// key, def change, future-window cap). A snapshot key outside the universe
+/// is not evaluable — without a universe filter, partitioned `NewlyUpdated`
+/// selects a baseline-less one on every tick forever, spamming fired eval
+/// records and polluting `requested_this_tick` before classify trims it.
+#[test]
+fn test_partitioned_newly_updated_ignores_keys_outside_universe() {
+    let live = spk("2024-01-02");
+    let retired = spk("2020-01-01");
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+
+    // Baseline covers only the live key — the retired key's baseline was
+    // (legitimately) never established.
+    let mut prev = AssetConditionState::default();
+    prev.partition_state = Some(PartitionState {
+        timestamps: HashMap::from([(live.clone(), 100i64)]),
+        ..Default::default()
+    });
+
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.prev_state = &prev;
+
+    let all_keys = HashSet::from([live.clone()]);
+    let materialized = HashSet::from([live.clone(), retired.clone()]);
+    let timestamps = HashMap::from([(live.clone(), 100i64), (retired.clone(), 50)]);
+    let partition_status = HashMap::new();
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &materialized,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &timestamps,
+        resolver: PartitionResolver::empty(),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_status,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let result = evaluate(&ConditionNode::NewlyUpdated, &ctx);
+    assert!(
+        !result.fired,
+        "a snapshot key outside the universe must not fire NewlyUpdated; got {:?}",
+        result.selection
     );
 }
 
@@ -13401,7 +13444,6 @@ fn test_update_condition_state_prunes_timestamps_outside_universe() {
 fn test_update_condition_state_drops_baseline_keys_missing_from_snapshot() {
     let kept = spk("2024-01-02");
     let gone = spk("2024-01-01");
-    let universe = HashSet::from([kept.clone(), gone.clone()]);
 
     let mut state = AssetConditionState {
         partition_state: Some(PartitionState {
@@ -13420,7 +13462,6 @@ fn test_update_condition_state_drops_baseline_keys_missing_from_snapshot() {
             now: 1_000,
             is_initial: false,
             partition_timestamps: Some(&timestamps),
-            partition_universe: Some(&universe),
         },
         &EvalResult {
             fired: false,
@@ -13668,7 +13709,6 @@ fn test_or_short_circuit_preserves_stateful_child_latch() {
             now: 2000,
             is_initial: false,
             partition_timestamps: None,
-            partition_universe: None,
         },
         &result2,
     );

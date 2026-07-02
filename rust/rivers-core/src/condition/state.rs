@@ -263,9 +263,6 @@ pub struct StateUpdateContext<'a> {
     pub now: i64,
     pub is_initial: bool,
     pub partition_timestamps: Option<&'a HashMap<crate::storage::PartitionKey, i64>>,
-    /// Current partition universe; baseline keys outside it are pruned so the
-    /// persisted blob doesn't accrete renamed/rescheduled partitions forever.
-    pub partition_universe: Option<&'a HashSet<crate::storage::PartitionKey>>,
 }
 
 impl<'a> StateUpdateContext<'a> {
@@ -277,7 +274,6 @@ impl<'a> StateUpdateContext<'a> {
             now: ctx.now,
             is_initial: ctx.is_initial,
             partition_timestamps: ctx.partitions.map(|p| p.timestamps),
-            partition_universe: ctx.partitions.map(|p| p.all_keys),
         }
     }
 }
@@ -310,18 +306,14 @@ pub fn update_condition_state(
             }
             // Delta-update the baseline in place — a wholesale clone of a
             // large partition map every tick is the dominant allocation for
-            // big universes. End state must equal the snapshot restricted to
-            // the live universe: `partition_status` is recomputed from
-            // storage, which never forgets renamed/rescheduled partitions, so
-            // the persisted baseline stays bounded to the universe.
-            let in_universe =
-                |key: &crate::storage::PartitionKey| ctx.partition_universe.is_none_or(|u| u.contains(key));
-            ps.timestamps
-                .retain(|key, _| in_universe(key) && timestamps.contains_key(key));
+            // big universes. End state must equal the snapshot exactly: the
+            // baseline is bounded by what storage knows, NOT by the current
+            // universe. Storage never forgets a materialization, so pruning a
+            // key the universe dropped leaves it permanently baseline-less —
+            // it would read as newly-updated on every tick while the snapshot
+            // retains it, and fire once spuriously if later re-added.
+            ps.timestamps.retain(|key, _| timestamps.contains_key(key));
             for (key, ts) in timestamps {
-                if !in_universe(key) {
-                    continue;
-                }
                 match ps.timestamps.get_mut(key) {
                     Some(v) => *v = *ts,
                     None => {
