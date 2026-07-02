@@ -19,6 +19,13 @@ struct DepScope<'a, V> {
     prev: &'a HashMap<String, HashMap<u32, V>>,
     acc: &'a mut HashMap<String, HashMap<u32, V>>,
     cur_prev: Option<&'a HashMap<u32, V>>,
+    /// (dep, node idx) slots whose `acc` value came from the unpartitioned
+    /// bool fallback's lossy `from_bool` bridge (true → `All`). A precise
+    /// partitioned selection replaces a bridged value; a bridged value never
+    /// replaces a precise one — on diamond graphs the bridge would otherwise
+    /// widen a sibling pivot's `Keys` latch to the whole universe (and the
+    /// bool path reads a non-empty selection as `true` anyway).
+    bridged: HashMap<String, HashSet<u32>>,
 }
 
 static EMPTY_DEP_SELECTIONS: std::sync::LazyLock<
@@ -79,13 +86,46 @@ fn root_handled_state(ctx: &EvalContext) -> (Option<i64>, Option<i64>) {
 
 /// Merge (not replace) a dep's stateful-node results into the per-dep accumulator,
 /// so two sibling aggregates over the same dep don't clobber each other.
-fn collect_dep_latch<V>(
-    acc: &mut HashMap<String, HashMap<u32, V>>,
+/// Precise writes win over previously-bridged values for the same slot.
+fn collect_dep_latch<V>(scope: &mut DepScope<V>, dep_key: &str, local: HashMap<u32, V>) {
+    if local.is_empty() {
+        return;
+    }
+    if let Some(marks) = scope.bridged.get_mut(dep_key) {
+        for idx in local.keys() {
+            marks.remove(idx);
+        }
+    }
+    scope.acc.entry(dep_key.to_string()).or_default().extend(local);
+}
+
+/// Merge latches bridged out of the unpartitioned bool fallback
+/// (`from_bool`: true → `All`). A bridged value fills a vacant slot or merges
+/// with another bridged one, but never replaces a precise partitioned
+/// selection — that selection already reads as `true` for the bool path.
+fn collect_bridged_latch(
+    scope: &mut DepScope<PartitionSelection>,
     dep_key: &str,
-    local: HashMap<u32, V>,
+    local: HashMap<u32, PartitionSelection>,
 ) {
-    if !local.is_empty() {
-        acc.entry(dep_key.to_string()).or_default().extend(local);
+    if local.is_empty() {
+        return;
+    }
+    let slot = scope.acc.entry(dep_key.to_string()).or_default();
+    let marks = scope.bridged.entry(dep_key.to_string()).or_default();
+    for (idx, sel) in local {
+        match slot.entry(idx) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(sel);
+                marks.insert(idx);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if marks.contains(&idx) {
+                    let merged = e.get().union(&sel);
+                    e.insert(merged);
+                }
+            }
+        }
     }
 }
 
@@ -286,6 +326,7 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
             prev: root_dep_selections(ctx),
             acc: &mut dep_selections,
             cur_prev: None,
+            bridged: HashMap::new(),
         };
         let selection: PartitionSelection = eval_partitioned(
             node,
@@ -318,6 +359,7 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
             prev: &ctx.prev_state.dep_previous_results,
             acc: &mut dep_results,
             cur_prev: None,
+            bridged: HashMap::new(),
         };
         let fired: bool = eval_inner(node, ctx, &mut counter, &mut sub_results, &mut dep_scope);
         tracing::debug!(
@@ -809,6 +851,7 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
             prev: root_dep_selections(ctx),
             acc: &mut dep_selections,
             cur_prev: None,
+            bridged: HashMap::new(),
         };
         let (selection, tree): (PartitionSelection, EvalNodeResult) = eval_partitioned(
             node,
@@ -838,6 +881,7 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
             prev: &ctx.prev_state.dep_previous_results,
             acc: &mut dep_results,
             cur_prev: None,
+            bridged: HashMap::new(),
         };
         let tree =
             eval_inner::<EvalNodeResult>(node, ctx, &mut counter, &mut sub_results, &mut dep_scope);
@@ -1197,7 +1241,7 @@ fn eval_on_dep(
     dep_results.cur_prev = Some(latch);
     let val = eval_inner(condition, &dep_ctx, counter, &mut local, dep_results);
     dep_results.cur_prev = saved;
-    collect_dep_latch(dep_results.acc, dep_key, local);
+    collect_dep_latch(dep_results, dep_key, local);
     val
 }
 
@@ -1842,10 +1886,11 @@ fn eval_partitioned_on_dep(
             prev: &nested_prev,
             acc: &mut nested_acc,
             cur_prev: Some(&bool_latch),
+            bridged: HashMap::new(),
         };
         let val = eval_inner(condition, &dep_ctx, counter, &mut local, &mut bool_scope);
-        collect_dep_latch(
-            dep_selections.acc,
+        collect_bridged_latch(
+            dep_selections,
             dep_key,
             local
                 .into_iter()
@@ -1853,8 +1898,8 @@ fn eval_partitioned_on_dep(
                 .collect(),
         );
         for (nested_key, idx_map) in nested_acc {
-            collect_dep_latch(
-                dep_selections.acc,
+            collect_bridged_latch(
+                dep_selections,
                 &nested_key,
                 idx_map
                     .into_iter()
@@ -1975,9 +2020,90 @@ fn eval_partitioned_on_dep(
         dep_selections,
     );
     dep_selections.cur_prev = saved;
-    collect_dep_latch(dep_selections.acc, dep_key, local);
+    collect_dep_latch(dep_selections, dep_key, local);
 
     // Map result back to downstream partition space.
     pctx.resolver
         .map_downstream(dep_key, ctx.target_key, &upstream_result)
+}
+
+#[cfg(test)]
+mod latch_merge_tests {
+    use super::*;
+
+    fn scope<'a>(
+        prev: &'a HashMap<String, HashMap<u32, PartitionSelection>>,
+        acc: &'a mut HashMap<String, HashMap<u32, PartitionSelection>>,
+    ) -> DepScope<'a, PartitionSelection> {
+        DepScope {
+            prev,
+            acc,
+            cur_prev: None,
+            bridged: HashMap::new(),
+        }
+    }
+
+    fn keys(s: &str) -> PartitionSelection {
+        PartitionSelection::Keys(std::collections::HashSet::from([
+            crate::storage::PartitionKey::Single {
+                keys: vec![s.to_string()],
+            },
+        ]))
+    }
+
+    /// The (dep, node-idx) accumulator is shared by partitioned pivots
+    /// (precise selections) and the unpartitioned bool fallback's bridge
+    /// (lossy `from_bool`: true → `All`). A bridged write must never replace
+    /// a precise one — last-writer-wins would widen a `Keys` latch to the
+    /// whole universe and over-fire every partition next tick. The reverse
+    /// (precise after bridged) must replace.
+    #[test]
+    fn bridged_write_never_clobbers_precise_latch() {
+        let prev = HashMap::new();
+        let mut acc = HashMap::new();
+        let mut sc = scope(&prev, &mut acc);
+
+        collect_dep_latch(&mut sc, "d", HashMap::from([(2u32, keys("d1"))]));
+        collect_bridged_latch(&mut sc, "d", HashMap::from([(2u32, PartitionSelection::All)]));
+        assert_eq!(
+            sc.acc["d"][&2],
+            keys("d1"),
+            "a bridged All must not widen a precise Keys latch"
+        );
+
+        // Precise replaces a previously-bridged slot.
+        collect_bridged_latch(&mut sc, "d", HashMap::from([(3u32, PartitionSelection::All)]));
+        collect_dep_latch(&mut sc, "d", HashMap::from([(3u32, keys("d2"))]));
+        assert_eq!(sc.acc["d"][&3], keys("d2"));
+        // And a later bridged write still can't clobber it.
+        collect_bridged_latch(
+            &mut sc,
+            "d",
+            HashMap::from([(3u32, PartitionSelection::Empty)]),
+        );
+        assert_eq!(sc.acc["d"][&3], keys("d2"));
+    }
+
+    /// Two bridged writers for the same slot (sibling aggregates reaching the
+    /// same nested dep through different unpartitioned paths) must merge by
+    /// union, not last-writer-wins — a later `Empty` (false) would silently
+    /// erase a sibling's latched `All` (true) and re-fire its NewlyTrue/Since.
+    #[test]
+    fn bridged_writes_union_instead_of_clobbering() {
+        let prev = HashMap::new();
+        let mut acc = HashMap::new();
+        let mut sc = scope(&prev, &mut acc);
+
+        collect_bridged_latch(&mut sc, "d", HashMap::from([(1u32, PartitionSelection::All)]));
+        collect_bridged_latch(
+            &mut sc,
+            "d",
+            HashMap::from([(1u32, PartitionSelection::Empty)]),
+        );
+        assert_eq!(
+            sc.acc["d"][&1],
+            PartitionSelection::All,
+            "a sibling's false latch must not erase a latched true"
+        );
+    }
 }
