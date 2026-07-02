@@ -306,7 +306,23 @@ pub fn update_condition_state(
             if let Some(dep_sub_selections) = &result.dep_sub_selections {
                 ps.dep_previous_selections = dep_sub_selections.clone();
             }
-            ps.timestamps = timestamps.clone();
+            // Delta-update the baseline in place — a wholesale clone of a
+            // large partition map every tick is the dominant allocation for
+            // big universes. End state must equal the snapshot exactly: the
+            // baseline is bounded by what storage knows, NOT by the current
+            // universe. Storage never forgets a materialization, so pruning a
+            // key the universe dropped leaves it permanently baseline-less —
+            // it would read as newly-updated on every tick while the snapshot
+            // retains it, and fire once spuriously if later re-added.
+            ps.timestamps.retain(|key, _| timestamps.contains_key(key));
+            for (key, ts) in timestamps {
+                match ps.timestamps.get_mut(key) {
+                    Some(v) => *v = *ts,
+                    None => {
+                        ps.timestamps.insert(key.clone(), *ts);
+                    }
+                }
+            }
             // `handled` is a per-tick debounce window, not cumulative: reset it
             // so classification repopulates it with only this tick's dispatched
             // keys.

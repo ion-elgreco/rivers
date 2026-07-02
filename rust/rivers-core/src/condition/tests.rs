@@ -13213,6 +13213,96 @@ fn test_update_condition_state_clears_stale_partition_state_when_unpartitioned()
     );
 }
 
+/// The baseline is bounded by the partition_status SNAPSHOT, not the universe:
+/// storage never forgets a materialization, so a snapshot key outside the
+/// universe (retired dynamic key, def change, future-window cap) must KEEP its
+/// baseline. Pruning it regressed two ways — the key read as newly-updated on
+/// every tick forever (no baseline is ever re-established while the snapshot
+/// retains it), and a later re-add of the key with unchanged data fired one
+/// spurious materialization.
+#[test]
+fn test_update_condition_state_keeps_baseline_for_snapshot_keys_outside_universe() {
+    let live = spk("2024-01-02");
+    let stale = spk("2023-12-31");
+    let timestamps = HashMap::from([(live.clone(), 100i64), (stale.clone(), 50)]);
+
+    let mut state = AssetConditionState::default();
+    let result = EvalResult {
+        fired: false,
+        sub_selections: Some(HashMap::new()),
+        ..Default::default()
+    };
+    update_condition_state(
+        &mut state,
+        &StateUpdateContext {
+            target_record_timestamp: Some(100),
+            target_data_version: None,
+            now: 1_000,
+            is_initial: false,
+            partition_timestamps: Some(&timestamps),
+        },
+        &result,
+    );
+
+    let ps = state
+        .partition_state
+        .expect("partitioned eval must store partition_state");
+    assert_eq!(
+        ps.timestamps,
+        HashMap::from([(live, 100i64), (stale, 50)]),
+        "every snapshot key keeps its baseline, in or out of the universe"
+    );
+}
+
+/// Storage never forgets a materialization; the universe can (retired dynamic
+/// key, def change, future-window cap). A snapshot key outside the universe
+/// is not evaluable — without a universe filter, partitioned `NewlyUpdated`
+/// selects a baseline-less one on every tick forever, spamming fired eval
+/// records and polluting `requested_this_tick` before classify trims it.
+#[test]
+fn test_partitioned_newly_updated_ignores_keys_outside_universe() {
+    let live = spk("2024-01-02");
+    let retired = spk("2020-01-01");
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+
+    // Baseline covers only the live key — the retired key's baseline was
+    // (legitimately) never established.
+    let mut prev = AssetConditionState::default();
+    prev.partition_state = Some(PartitionState {
+        timestamps: HashMap::from([(live.clone(), 100i64)]),
+        ..Default::default()
+    });
+
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.prev_state = &prev;
+
+    let all_keys = HashSet::from([live.clone()]);
+    let materialized = HashSet::from([live.clone(), retired.clone()]);
+    let timestamps = HashMap::from([(live.clone(), 100i64), (retired.clone(), 50)]);
+    let partition_status = HashMap::new();
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &materialized,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &timestamps,
+        resolver: PartitionResolver::empty(),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_status,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let result = evaluate(&ConditionNode::NewlyUpdated, &ctx);
+    assert!(
+        !result.fired,
+        "a snapshot key outside the universe must not fire NewlyUpdated; got {:?}",
+        result.selection
+    );
+}
+
 /// `ConditionEvalState` is persisted via `serde_json`, which cannot use a
 /// `PartitionKey` (an object-serializing enum) as a JSON map key. `PartitionState`
 /// timestamps are keyed by `PartitionKey`, so any partitioned automation
@@ -13666,5 +13756,46 @@ fn test_cron_in_dep_pivot_does_not_use_dep_tick_on_root_first_eval() {
         !result.fired,
         "root's first tick: cron window is zero-width (ctx.now), so no cron tick \
          has passed; the dep's old tick must NOT widen the window and fire"
+    );
+}
+
+/// The baseline must mirror the partition_status snapshot exactly: keys the
+/// snapshot no longer contains (retention cleanup, storage rollback) must
+/// leave the persisted baseline too — pinned so an in-place delta update
+/// can't drift from replace semantics.
+#[test]
+fn test_update_condition_state_drops_baseline_keys_missing_from_snapshot() {
+    let kept = spk("2024-01-02");
+    let gone = spk("2024-01-01");
+
+    let mut state = AssetConditionState {
+        partition_state: Some(PartitionState {
+            timestamps: HashMap::from([(kept.clone(), 50i64), (gone.clone(), 40)]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    // New snapshot: `gone` vanished, `kept` advanced.
+    let timestamps = HashMap::from([(kept.clone(), 100i64)]);
+    update_condition_state(
+        &mut state,
+        &StateUpdateContext {
+            target_record_timestamp: Some(100),
+            target_data_version: None,
+            now: 1_000,
+            is_initial: false,
+            partition_timestamps: Some(&timestamps),
+        },
+        &EvalResult {
+            fired: false,
+            sub_selections: Some(HashMap::new()),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        state.partition_state.unwrap().timestamps,
+        HashMap::from([(kept, 100i64)]),
+        "baseline must equal the snapshot: stale key dropped, kept key advanced"
     );
 }
