@@ -527,9 +527,21 @@ mod partition_key_i64_map {
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<HashMap<PartitionKey, i64>, D::Error> {
-        Ok(Vec::<(PartitionKey, i64)>::deserialize(deserializer)?
-            .into_iter()
-            .collect())
+        // Blobs written before the pairs format stored this field as a JSON
+        // map — necessarily empty (`{}`): a non-empty `PartitionKey`-keyed
+        // map never survived serialization. Rejecting that shape fails the
+        // whole eval-state load and wipes every latch on upgrade, so accept
+        // both.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum MapOrSeq {
+            Seq(Vec<(PartitionKey, i64)>),
+            LegacyMap(HashMap<String, serde::de::IgnoredAny>),
+        }
+        Ok(match MapOrSeq::deserialize(deserializer)? {
+            MapOrSeq::Seq(pairs) => pairs.into_iter().collect(),
+            MapOrSeq::LegacyMap(_) => HashMap::new(),
+        })
     }
 }
 

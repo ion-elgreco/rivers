@@ -13523,6 +13523,30 @@ fn test_condition_eval_state_tolerates_missing_fields() {
     assert!(a.partition_state.is_none());
 }
 
+/// A blob written BEFORE the pairs-format change stored `timestamps` as a JSON
+/// map — always empty (`{}`), since `PartitionKey` map keys never serialized
+/// (the save error was swallowed). The deserializer must accept that legacy
+/// shape: rejecting it fails the whole `ConditionEvalState` load and wipes
+/// every latch on upgrade, before `schema_version`/`migrate_loaded` can run.
+#[test]
+fn test_condition_eval_state_loads_legacy_map_shaped_timestamps() {
+    let json =
+        r#"{"assets":{"a":{"previous_results":{"3":true},"partition_state":{"timestamps":{}}}}}"#;
+    let state: ConditionEvalState = serde_json::from_str(json)
+        .expect("legacy blob with map-shaped empty timestamps must load, not reset all latches");
+    let a = &state.assets["a"];
+    assert_eq!(
+        a.previous_results.get(&3),
+        Some(&true),
+        "latches must survive the legacy-shape load"
+    );
+    let ps = a
+        .partition_state
+        .as_ref()
+        .expect("partition_state present in the blob must load");
+    assert!(ps.timestamps.is_empty());
+}
+
 /// `DataVersionChanged` over an UNCONDITIONED dep must not re-fire every tick.
 /// `update_dep_baselines` has to record the dep's `last_data_version` (like it
 /// does `last_materialized_timestamp`), else the pivot reads prev=None forever
