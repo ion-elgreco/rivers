@@ -177,3 +177,89 @@ def test_multi_dimension_change_does_not_flood_future_time_windows(storage):
             )
     finally:
         daemon.stop()
+
+
+def test_future_end_upstream_does_not_keep_any_deps_missing_true(storage):
+    """An unconditioned upstream declared with an explicit FUTURE end feeds a
+    partitioned downstream via an all_partitions mapping. The upstream pivot
+    universe must be capped at now: seeded uncapped, its future windows can
+    never materialize, ``any_deps_missing()`` stays true forever, and the
+    daemon re-dispatches the downstream on every tick.
+    """
+    today = _dt.date.today()
+    start = _dt.datetime.combine(today - _dt.timedelta(days=2), _dt.time.min)
+    end = _dt.datetime.combine(today + _dt.timedelta(days=10), _dt.time.min)
+
+    @rs.Asset(
+        name="up_fut",
+        io_handler=rs.InMemoryIOHandler(),
+        partitions_def=rs.PartitionsDefinition.daily(start=start, end=end),
+    )
+    def up_fut() -> str:
+        return "data"
+
+    @rs.Asset(
+        name="down_watcher",
+        io_handler=rs.InMemoryIOHandler(),
+        partitions_def=rs.PartitionsDefinition.static_(["x"]),
+        deps=[
+            rs.AssetDef.input(
+                "up_fut",
+                partition_mapping=rs.PartitionMapping.all_partitions(),
+            ),
+        ],
+        automation_condition=rs.AutomationCondition.any_deps_missing(),
+    )
+    def down_watcher(up_fut: str) -> str:
+        return "d"
+
+    # Unpartitioned canary: proves the eval loop is ticking while we assert
+    # the watcher stays quiet.
+    @rs.Asset(
+        name="canary_missing",
+        io_handler=rs.InMemoryIOHandler(),
+        automation_condition=rs.AutomationCondition.on_missing(),
+    )
+    def canary_missing() -> str:
+        return "c"
+
+    repo = rs.CodeRepository(
+        assets=[up_fut, down_watcher, canary_missing],
+        default_executor=rs.Executor.in_process(),
+    )
+    repo.resolve(storage=storage)
+
+    # Materialize every window that exists up to now (assumes the test does
+    # not straddle midnight), so with a capped pivot universe nothing is
+    # missing and the watcher must stay quiet.
+    for day in (2, 1, 0):
+        key = (today - _dt.timedelta(days=day)).strftime("%Y-%m-%d")
+        result = repo.materialize(
+            ["up_fut"], partition_key=rs.PartitionKey.single(key)
+        )
+        assert result.success
+
+    daemon = AutomationDaemon(
+        repo=repo,
+        storage=storage,
+        condition_eval_interval="500ms",
+    )
+    daemon.start()
+    try:
+        assert _wait_until(
+            lambda: storage.get_latest_materialization("canary_missing") is not None,
+            timeout=25,
+        ), "the canary never materialized — the eval loop is not ticking"
+
+        # Let several more ticks pass; a buggy uncapped pivot universe fires
+        # the watcher on every one of them.
+        _wait_for_runs(storage, min_count=999, timeout=5)
+        watcher_runs = [
+            r for r in storage.get_runs(limit=100) if "down_watcher" in r.node_names
+        ]
+        assert not watcher_runs, (
+            "any_deps_missing() fired although every existing upstream window "
+            "is materialized — the pivot universe enumerated windows past now"
+        )
+    finally:
+        daemon.stop()

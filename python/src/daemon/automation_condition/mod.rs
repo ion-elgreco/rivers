@@ -214,8 +214,13 @@ impl PyCodeRepository {
                     {
                         let now = chrono::Local::now().naive_local();
                         let universe = partition_universe_for(def, now);
+                        // Capped at now, like the conditioned-asset universes:
+                        // a future-`end` upstream would otherwise keep e.g.
+                        // any_deps_match(missing()) permanently true (its
+                        // future windows can never materialize) and leak
+                        // phantom future keys into requested_this_tick.
                         let core_keys: HashSet<CorePartitionKey> = def
-                            .get_partition_keys()
+                            .get_partition_keys_capped(now)
                             .ok()
                             .map(|keys| keys.iter().map(CorePartitionKey::from).collect())
                             .unwrap_or_default();
