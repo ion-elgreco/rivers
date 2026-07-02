@@ -239,10 +239,11 @@ impl PartitionMappingKind {
                         })
                         .collect();
                     // Unmapped downstream keys use identity (mapping.rs map_key:
-                    // a downstream key absent from the map reads the same-named
-                    // upstream key). So an upstream key that is neither an
-                    // explicit downstream mapping key nor an explicit upstream
-                    // target also triggers its same-named downstream partition;
+                    // a downstream key absent from the map's KEYS reads the
+                    // same-named upstream key — whether that name is also some
+                    // other entry's upstream target is irrelevant). So every
+                    // upstream key that is not an explicit downstream mapping
+                    // key also triggers its same-named downstream partition;
                     // emit it so a partial Static map doesn't drop that
                     // materialization (a spurious key is filtered later against
                     // the downstream universe).
@@ -250,7 +251,6 @@ impl PartitionMappingKind {
                         if let PartitionKey::Single { keys: parts } = uk
                             && parts.len() == 1
                             && !mapping.contains_key(&parts[0])
-                            && !mapping.values().any(|v| v == &parts[0])
                         {
                             mapped.insert(uk.clone());
                         }
