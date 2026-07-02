@@ -7232,6 +7232,87 @@ async fn test_clearable_sweep_sets_failure_floor_on_missed_terminal_failure() {
 }
 
 #[tokio::test]
+async fn test_clearable_sweep_records_partitioned_failure_in_partition_status() {
+    // Partitioned sibling of the sweep-floor regression above: a partitioned
+    // run observed once as Started, then marked Failure with no StepFailure
+    // event and no record change (pod death synced from run status). Only the
+    // clearable sweep sees the terminal transition. The asset-level floor is
+    // deliberately not set for partitioned runs, so the failure must land in
+    // partition_status.failed — otherwise the partition is neither
+    // materialized, in progress, nor failed and an eager condition
+    // re-dispatches the doomed run every tick.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+
+    let rec_p = make_materialized_record("p", 1000);
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_p])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.set_partitioned_assets(vec!["p".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let run_id = "run-part-fail".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["p".to_string()],
+            priority: 0,
+            partition_key: Some(spk("2024-01-01")),
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(cache.in_progress_assets.contains_key("p"));
+
+    // Run fails. start_time stays 2000 (no materialization, no StepFailure
+    // event) → only the clearable sweep sees the terminal transition.
+    storage
+        .update_run_status(&run_id, RunStatus::Failure, Some(3000))
+        .await
+        .unwrap();
+
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        !cache.in_progress_assets.contains_key("p"),
+        "p must be cleared from in_progress after the failure"
+    );
+    let status = cache
+        .partition_status
+        .get("p")
+        .expect("p is a registered partitioned asset");
+    assert!(
+        status.failed.contains(&spk("2024-01-01")),
+        "a partitioned terminal failure caught only by the sweep must surface in \
+         partition_status.failed; got failed={:?}",
+        status.failed,
+    );
+    assert!(
+        status.failed_timestamps.contains_key(&spk("2024-01-01")),
+        "the failed partition needs a floor timestamp for root_floor comparisons"
+    );
+    assert!(
+        !cache.failed_assets.contains("p"),
+        "the asset-level floor stays scoped to unpartitioned runs"
+    );
+}
+
+#[tokio::test]
 async fn test_cache_does_not_store_empty_run_tags() {
     // Regression: update_run_tags previously stored empty tag vecs in the cache.
     // With an empty entry, run_tags_match(&[], &[], &[]) returns true (vacuous

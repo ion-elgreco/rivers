@@ -568,9 +568,17 @@ impl AssetConditionCache {
                     // tick. Skip ids the new_runs / completed_run_ids paths apply.
                     if !new_runs_terminal.contains(run.run_id.as_str())
                         && !completed_run_ids.contains(&run.run_id)
-                        && self.apply_run_effects_to_delta(run, &mut delta)
                     {
-                        swept_applied.insert(run.run_id.clone());
+                        // A transition only this sweep observes leaves no
+                        // record-ts change, so nothing else refreshes the
+                        // run's assets: without invalidation a partitioned
+                        // failure never reaches partition_status.failed (the
+                        // asset-level floor is unpartitioned-only) and a
+                        // cancel leaves stale in-progress partitions.
+                        invalidated_keys.extend(run.node_names.iter().cloned());
+                        if self.apply_run_effects_to_delta(run, &mut delta) {
+                            swept_applied.insert(run.run_id.clone());
+                        }
                     }
                 }
             }
