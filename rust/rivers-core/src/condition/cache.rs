@@ -134,11 +134,13 @@ struct RefreshDelta {
     /// timestamp — a remove only clears a failure floor older than it, so a
     /// co-batched older success can't clobber a newer failure.
     failed_removes: HashMap<String, i64>,
-    /// `asset → run_id` where the asset's step SUCCEEDED in that run but its
+    /// `asset → run_ids` where the asset's step SUCCEEDED but its
     /// asset_record write lags (last_run_id not yet updated). Treated as
-    /// "materialized here" so a co-batched failure in the same run doesn't floor
-    /// the asset that actually produced output.
-    materialized_overrides: HashMap<String, String>,
+    /// "materialized here" so a co-batched failure in the same run doesn't
+    /// floor the asset that actually produced output. Every succeeded run is
+    /// recorded — `failed_adds` keeps the NEWEST failing run, so a single
+    /// slot filled in HashMap order would mismatch it nondeterministically.
+    materialized_overrides: HashMap<String, HashSet<String>>,
     /// Tag updates: `(asset, partition_key, tags)`.
     run_tag_updates: Vec<RunTagUpdate>,
     /// Tick tag updates: `(asset, partition_key, tags)`.
@@ -507,7 +509,7 @@ impl AssetConditionCache {
                     // back to the in_progress map for the run_id since
                     // `record.last_run_id` may still point at the previous run.
                     let run_ids: Vec<String> = runs.keys().cloned().collect();
-                    let (completed, succeeded_run) =
+                    let (completed, succeeded_runs) =
                         storage.step_completion(&record.asset_key, &run_ids).await?;
                     if completed {
                         completed_keys.push(record.asset_key.clone());
@@ -515,10 +517,12 @@ impl AssetConditionCache {
                         // step SUCCEEDED in one of these runs, mark it
                         // materialized-here so a co-batched failure in the same
                         // run can't floor the asset that produced output.
-                        if let Some(rid) = succeeded_run {
+                        if !succeeded_runs.is_empty() {
                             delta
                                 .materialized_overrides
-                                .insert(record.asset_key.clone(), rid);
+                                .entry(record.asset_key.clone())
+                                .or_default()
+                                .extend(succeeded_runs);
                         }
                         completed_run_ids.extend(run_ids);
                     }
@@ -564,7 +568,13 @@ impl AssetConditionCache {
             if !clearable.is_empty() {
                 let tracked_runs = storage.get_runs_by_ids(&clearable, None).await?;
                 for run in &tracked_runs {
-                    if matches!(run.status, RunStatus::Started | RunStatus::NotStarted) {
+                    // Only terminal runs un-gate the asset. A Queued run still
+                    // waits in the run queue, so clearing it re-opens the
+                    // dispatch gate and re-enqueues a duplicate every tick.
+                    if !matches!(
+                        run.status,
+                        RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
+                    ) {
                         continue;
                     }
                     delta.clear_run(run);
@@ -601,6 +611,12 @@ impl AssetConditionCache {
                     // into `completed_run_ids` (`step_completion` short-circuits
                     // on the first finished run); apply no-ops on them.
                     self.apply_run_effects_to_delta(run, &mut delta);
+                    // Invalidate every asset of the run, not just the one whose
+                    // record ts changed: a co-scheduled partitioned sibling that
+                    // died event-less lands here (its ts didn't change, so it's
+                    // not in invalidated_keys yet) and needs partition_status
+                    // refetched to surface its failure — same as the sweep path.
+                    invalidated_keys.extend(run.node_names.iter().cloned());
                 }
             }
         }
@@ -993,7 +1009,9 @@ impl AssetConditionCache {
                 .get(asset.as_str())
                 .and_then(|r| r.last_run_id.as_deref())
                 == Some(run_id.as_str())
-                || materialized_overrides.get(&asset).map(String::as_str) == Some(run_id.as_str());
+                || materialized_overrides
+                    .get(&asset)
+                    .is_some_and(|runs| runs.contains(run_id.as_str()));
             if materialized_here {
                 if self
                     .failed_asset_timestamps
@@ -1466,6 +1484,38 @@ mod tests {
         assert!(
             !cache.failed_asset_timestamps.contains_key("P"),
             "no asset-level failure timestamp for a partitioned run"
+        );
+    }
+
+    #[test]
+    fn override_covers_every_succeeded_run_not_the_first_found() {
+        // Asset x is tracked under two joint runs that both fail via
+        // co-batched siblings while x's step SUCCEEDED in both; its record
+        // write lags, so the ts-unchanged fallback discovers the successes.
+        // failed_adds keeps the NEWEST failing run, but a single-slot
+        // override filled with whichever success step_completion met first
+        // (HashMap order) floors the asset that produced output — a
+        // coin-flip per tick. The override must cover every succeeded run.
+        let mut cache = AssetConditionCache::new("default".to_string());
+        let mut delta = RefreshDelta::default();
+        // Older failing run r1 (ts 3000), newer failing run r2 (ts 4000).
+        let r1 = mk_run("r1", RunStatus::Failure, &["x", "y"], 3000);
+        let r2 = mk_run("r2", RunStatus::Failure, &["x", "z"], 4000);
+        cache.apply_run_effects_to_delta(&r1, &mut delta);
+        cache.apply_run_effects_to_delta(&r2, &mut delta);
+        // step_completion found x's StepSuccess in r1 first — but x also
+        // succeeded in r2, the run whose failure would floor it.
+        delta
+            .materialized_overrides
+            .entry("x".to_string())
+            .or_default()
+            .extend(["r1".to_string(), "r2".to_string()]);
+        cache.apply_refresh_delta(delta);
+
+        assert!(
+            !cache.failed_assets.contains("x"),
+            "x's step succeeded in the newest failing run — it must not be \
+             floored just because an older run's success was discovered first"
         );
     }
 

@@ -7381,6 +7381,60 @@ async fn test_clearable_sweep_records_partitioned_failure_in_partition_status() 
 }
 
 #[tokio::test]
+async fn test_queued_run_is_not_cleared_by_sweep() {
+    // A run dispatched in run_queue mode is registered in in_progress_assets and
+    // written to storage as Queued. The clearable sweep must NOT treat Queued as
+    // terminal: clearing it un-gates the asset while its run still waits in the
+    // queue, so eager()/on_missing re-enqueues a duplicate every tick until the
+    // coordinator drains it. Only Success/Failure/Canceled are terminal.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let rec_a = make_materialized_record("a", 1000);
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_a])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    // Dispatch registers the asset; the queued dispatcher writes a Queued record.
+    let run_id = "run-queued".to_string();
+    cache.register_dispatched_run("a".to_string(), run_id.clone(), 0, None);
+    assert!(cache.in_progress_assets.contains_key("a"));
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Queued,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+
+    // Refresh must keep `a` gated — its run is still queued, not terminal.
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        cache.in_progress_assets.contains_key("a"),
+        "a queued run must keep the asset in_progress; got in_progress={:?}",
+        cache.in_progress_assets,
+    );
+}
+
+#[tokio::test]
 async fn test_cache_does_not_store_empty_run_tags() {
     // Regression: update_run_tags previously stored empty tag vecs in the cache.
     // With an empty entry, run_tags_match(&[], &[], &[]) returns true (vacuous
@@ -7761,18 +7815,18 @@ async fn test_step_completion_single_pass() {
     let (completed, succeeded) = storage.step_completion("a", &runs).await.unwrap();
     assert!(completed, "a completed a step in the given runs");
     assert_eq!(
-        succeeded.as_deref(),
-        Some("run-ok"),
-        "the succeeding run must be identified"
+        succeeded,
+        vec!["run-ok".to_string()],
+        "every succeeding run must be identified"
     );
 
     let (completed, succeeded) = storage.step_completion("b", &runs).await.unwrap();
     assert!(completed, "a failure is still a completion");
-    assert_eq!(succeeded, None, "no success run for a failed-only asset");
+    assert!(succeeded.is_empty(), "no success run for a failed-only asset");
 
     let (completed, succeeded) = storage.step_completion("c", &runs).await.unwrap();
     assert!(!completed, "no events for 'c' in the given runs");
-    assert_eq!(succeeded, None);
+    assert!(succeeded.is_empty());
 }
 
 // ── Partition-aware tests ───────────────────────────────────────────────
@@ -14076,5 +14130,93 @@ fn test_since_last_handled_in_dep_pivot_debounces_root_cycle() {
     assert!(
         evaluate(&condition, &ctx).fired,
         "an older handled cycle must not suppress the trigger"
+    );
+}
+
+#[tokio::test]
+async fn test_completed_run_invalidates_event_less_partitioned_sibling() {
+    // Joint keyed run R=[x,y] over partition p: x materializes p (its record ts
+    // changes, so R enters completed_run_ids), while y's step dies event-less
+    // (no StepFailure). The cursor already passed R (seen Started), so only the
+    // completed_run_ids path handles R. That path applied R's effects but never
+    // invalidated y, so y's partition failure (surfaced by the run-status union
+    // in get_failed_partitions) never reached partition_status[y] and eager()
+    // re-dispatched the doomed partition every tick.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, RunRecord, RunStatus, StorageBackend,
+    };
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[
+            make_materialized_record("x", 1000),
+            make_materialized_record("y", 1000),
+        ])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.set_partitioned_assets(vec!["x".to_string(), "y".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let run_id = "run-joint-part".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["x".to_string(), "y".to_string()],
+            priority: 0,
+            partition_key: Some(spk("p")),
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(cache.in_progress_assets.contains_key("x"));
+    assert!(cache.in_progress_assets.contains_key("y"));
+
+    // R fails: x materialized p (Materialization advances x's record ts → R
+    // enters completed_run_ids); y is event-less.
+    storage
+        .update_run_status(&run_id, RunStatus::Failure, Some(3000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[EventRecord {
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            event_type: EventType::Materialization {
+                data_version: Some("dv-xp".to_string()),
+            },
+            asset_key: Some("x".to_string()),
+            run_id: run_id.clone(),
+            partition_key: Some(spk("p")),
+            timestamp: 3000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        }])
+        .await
+        .unwrap();
+
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let y_status = cache
+        .partition_status
+        .get("y")
+        .expect("y is a registered partitioned asset");
+    assert!(
+        y_status.failed.contains(&spk("p")),
+        "y's event-less partition failure in the joint run must surface in \
+         partition_status via completed-path invalidation; got failed={:?}",
+        y_status.failed,
     );
 }

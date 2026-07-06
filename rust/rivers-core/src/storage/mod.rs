@@ -2102,14 +2102,16 @@ pub trait StorageBackend: PerCodeLocationStorage {
         run_id: &str,
     ) -> impl Future<Output = Result<Vec<StoredEvent>>> + Send;
     /// Scan the given runs' step events for `asset_key` in one pass: whether
-    /// any step completed (StepSuccess or StepFailure) and the first run with
-    /// a StepSuccess. Used to tell a materialized asset from a co-batched
-    /// failure when the asset_record write lags behind the step events.
+    /// any step completed (StepSuccess or StepFailure) and EVERY run with a
+    /// StepSuccess. Used to tell a materialized asset from a co-batched
+    /// failure when the asset_record write lags behind the step events — the
+    /// caller matches the failing run against the full success set, so
+    /// returning only the first-found run would misfloor nondeterministically.
     fn step_completion(
         &self,
         asset_key: &str,
         run_ids: &[String],
-    ) -> impl Future<Output = Result<(bool, Option<String>)>> + Send;
+    ) -> impl Future<Output = Result<(bool, Vec<String>)>> + Send;
 
     // Runs
     fn create_run(&self, run: &RunRecord) -> impl Future<Output = Result<()>> + Send;
