@@ -14220,3 +14220,45 @@ async fn test_completed_run_invalidates_event_less_partitioned_sibling() {
         y_status.failed,
     );
 }
+
+#[test]
+fn test_partitioned_execution_failed_ignores_keys_outside_universe() {
+    // A failed partition retired from the universe (dynamic key removed, or a
+    // pod-death Failure run whose key is gone) stays in partition_status.failed
+    // forever (storage never forgets), but it is no longer evaluable. Selecting
+    // it spams requested_this_tick / fired records every tick with no dispatch
+    // and no debounce. ExecutionFailed / InProgress must filter to all_keys,
+    // like NewlyUpdated / NewlyRequested.
+    let live = spk("2024-01-02");
+    let retired = spk("2020-01-01");
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+
+    let all_keys = HashSet::from([live.clone()]);
+    let partition_status = HashMap::new();
+    let failed = HashSet::from([retired.clone()]);
+    let in_progress = HashSet::from([retired.clone()]);
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &HashSet::new(),
+        in_progress: &in_progress,
+        failed: &failed,
+        timestamps: &HashMap::new(),
+        resolver: PartitionResolver::empty(),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_status,
+        dep_root_floor: None,
+    };
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.partitions = Some(&pctx);
+
+    assert!(
+        !evaluate(&ConditionNode::ExecutionFailed, &ctx).fired,
+        "a failed partition outside the universe must not fire ExecutionFailed"
+    );
+    assert!(
+        !evaluate(&ConditionNode::InProgress, &ctx).fired,
+        "an in-progress partition outside the universe must not fire InProgress"
+    );
+}
