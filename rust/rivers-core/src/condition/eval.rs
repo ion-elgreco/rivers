@@ -129,6 +129,28 @@ fn collect_bridged_latch(
     }
 }
 
+/// Restrict a partition-status set (failed / in_progress) to the live universe.
+/// Storage retains a failed/in-progress key even after it is retired from the
+/// universe (dynamic key removed, window rescheduled), but an out-of-universe
+/// key is not evaluable — selecting it spams `requested_this_tick` and fired
+/// records every tick with no dispatch and no debounce. Mirrors the `all_keys`
+/// filter on the `NewlyUpdated` / `NewlyRequested` arms.
+fn select_in_universe(
+    keys: &HashSet<PartitionKey>,
+    pctx: &PartitionEvalContext,
+) -> PartitionSelection {
+    let live: HashSet<PartitionKey> = keys
+        .iter()
+        .filter(|k| pctx.all_keys.contains(*k))
+        .cloned()
+        .collect();
+    if live.is_empty() {
+        PartitionSelection::Empty
+    } else {
+        PartitionSelection::Keys(live)
+    }
+}
+
 /// Previous-tick selection for stateful node `my_idx`: the per-dep latch when
 /// pivoting into a dep (`cur_prev`), otherwise the asset's own state.
 fn prev_partition_latch(
@@ -1280,21 +1302,11 @@ fn eval_partitioned<O: PartEvalOutput>(
         }
 
         ConditionNode::InProgress => {
-            let sel = if pctx.in_progress.is_empty() {
-                PartitionSelection::Empty
-            } else {
-                PartitionSelection::Keys(pctx.in_progress.clone())
-            };
-            O::leaf(sel, my_idx, node, total)
+            O::leaf(select_in_universe(pctx.in_progress, pctx), my_idx, node, total)
         }
 
         ConditionNode::ExecutionFailed => {
-            let sel = if pctx.failed.is_empty() {
-                PartitionSelection::Empty
-            } else {
-                PartitionSelection::Keys(pctx.failed.clone())
-            };
-            O::leaf(sel, my_idx, node, total)
+            O::leaf(select_in_universe(pctx.failed, pctx), my_idx, node, total)
         }
 
         ConditionNode::CodeVersionChanged => {
