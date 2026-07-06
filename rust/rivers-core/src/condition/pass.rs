@@ -523,14 +523,15 @@ impl ConditionPass {
         // The asset-level floor is scoped to unpartitioned runs, so partitioned
         // failures live only in partition_status. Watchers evaluating at
         // unpartitioned granularity (dep pivots, asset_matches) read the
-        // snapshot's failed set — surface a partition failure there only while
-        // it is NEWER than the asset's latest materialization, mirroring the
-        // floor's recovery semantics (a fresh success supersedes). Set
-        // membership alone would poison ExecutionFailed forever: an abandoned
-        // failed partition stays in `failed` until that exact key re-runs.
-        // Partitioned roots never read this set; they eval per-key against
-        // `pctx.failed` (which keeps per-key supersession). Collecting an
-        // empty chain allocates nothing, so the steady state stays free.
+        // snapshot's failed set — surface an asset whenever it has any
+        // currently-failed partition. `status.failed` is already per-key
+        // superseded by get_failed_partitions (a partition that re-materialized
+        // after its failure is dropped), so recovery happens per-key and this
+        // view stays consistent with the partitioned watcher's `pctx.failed`.
+        // Comparing against the asset-level record.last_timestamp instead would
+        // mis-recover on an observation (which bumps it without materializing)
+        // or on an unrelated partition's success. Collecting an empty chain
+        // allocates nothing, so the steady state stays free.
         let failed_keys: HashSet<String> = self
             .cache
             .failed_assets
@@ -540,15 +541,7 @@ impl ConditionPass {
                 self.cache
                     .partition_status
                     .iter()
-                    .filter(|(key, status)| {
-                        let latest_mat =
-                            self.cache.records.get(*key).and_then(|r| r.last_timestamp);
-                        status
-                            .failed_timestamps
-                            .values()
-                            .max()
-                            .is_some_and(|f| latest_mat.is_none_or(|m| *f > m))
-                    })
+                    .filter(|(_, status)| !status.failed.is_empty())
                     .map(|(key, _)| key.clone()),
             )
             .collect();
@@ -1034,21 +1027,21 @@ mod tests {
     }
 
     #[test]
-    fn recovered_dep_partition_failure_does_not_poison_unpartitioned_watcher() {
-        // `get_failed_partitions` keeps an abandoned failed partition until
-        // THAT key re-materializes, but the unpartitioned view must mirror
-        // the asset-level floor's recovery semantics: any NEWER
-        // materialization supersedes older partition failures. Otherwise one
-        // abandoned failed partition holds ExecutionFailed true forever —
-        // permanently resetting `since(execution_failed())` latches and
-        // suppressing gated downstreams — even as the dep lands fresh
-        // successful partitions daily.
+    fn observation_and_sibling_success_do_not_unsurface_partition_failure() {
+        // `status.failed` is already per-key superseded by get_failed_partitions
+        // (a partition that re-materialized after its failure is dropped). So a
+        // partition still in `failed` is genuinely failed, and neither an
+        // OBSERVATION (which bumps the asset-level record.last_timestamp without
+        // materializing anything) nor a DIFFERENT partition's success may
+        // un-surface it to unpartitioned watchers.
         let mut cache = AssetConditionCache::default();
         let mut down = test_record("down");
         down.last_timestamp = Some(100);
         cache.records.insert("down".to_string(), down);
         let mut up = test_record("up");
-        up.last_timestamp = Some(300); // a fresh partition succeeded at 300
+        // Bumped above the failure ts by an observation or a sibling partition's
+        // materialization — must NOT recover the still-failed partition p.
+        up.last_timestamp = Some(300);
         cache.records.insert("up".to_string(), up);
         cache
             .upstream_deps
@@ -1056,8 +1049,61 @@ mod tests {
         cache.partition_status.insert(
             "up".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                failed: HashSet::from([spk("2024-01-01")]),
-                failed_timestamps: HashMap::from([(spk("2024-01-01"), 150i64)]),
+                failed: HashSet::from([spk("p")]),
+                failed_timestamps: HashMap::from([(spk("p"), 150i64)]),
+                // A sibling partition q materialized at 400 (newer than p's
+                // failure) — p is a different key and stays failed.
+                timestamps: HashMap::from([(spk("q"), 400i64)]),
+                ..Default::default()
+            },
+        );
+
+        let pass = ConditionPass::new(
+            cache,
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "down".to_string(),
+                condition: ConditionNode::AnyDepsMatch {
+                    condition: Box::new(ConditionNode::ExecutionFailed),
+                    label: None,
+                },
+                partition_info: None,
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        );
+        let rows = pass.evaluate(5000, false);
+        assert!(
+            rows[0].result.fired,
+            "a still-failed partition must stay surfaced despite an observation \
+             or a sibling partition's success bumping the asset-level timestamp"
+        );
+    }
+
+    #[test]
+    fn recovered_dep_partition_failure_does_not_poison_unpartitioned_watcher() {
+        // Recovery is per-key: `get_failed_partitions` drops a failed partition
+        // from `status.failed` once THAT key re-materializes (its mat ts passes
+        // its failure ts). A recovered dep therefore has an empty `failed` set
+        // and must not surface to unpartitioned watchers — even though the
+        // asset-level record.last_timestamp could point anywhere.
+        let mut cache = AssetConditionCache::default();
+        let mut down = test_record("down");
+        down.last_timestamp = Some(100);
+        cache.records.insert("down".to_string(), down);
+        let mut up = test_record("up");
+        up.last_timestamp = Some(300);
+        cache.records.insert("up".to_string(), up);
+        cache
+            .upstream_deps
+            .insert("down".to_string(), vec!["up".to_string()]);
+        cache.partition_status.insert(
+            "up".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                // The previously-failed partition re-materialized, so
+                // get_failed_partitions dropped it — `failed` is empty.
+                failed: HashSet::new(),
+                timestamps: HashMap::from([(spk("2024-01-01"), 300i64)]),
                 ..Default::default()
             },
         );
@@ -1079,7 +1125,7 @@ mod tests {
         let rows = pass.evaluate(5000, false);
         assert!(
             !rows[0].result.fired,
-            "a partition failure older than the dep's latest materialization \
+            "a dep whose failed partition re-materialized (empty failed set) \
              must not surface to unpartitioned watchers"
         );
     }
