@@ -107,6 +107,9 @@ impl ConditionTickEngine {
                             for asset in &req.asset_selection {
                                 self.pass.cache.clear_dispatched_run(asset, &req.run_id);
                             }
+                            // Its record never persisted — drop it from the tick
+                            // record too, or the UI links to a nonexistent run.
+                            handle.unregister_run(&req.run_id);
                         }
                     }
                 }
@@ -122,6 +125,7 @@ impl ConditionTickEngine {
                         for asset in &req.asset_selection {
                             self.pass.cache.clear_dispatched_run(asset, &req.run_id);
                         }
+                        handle.unregister_run(&req.run_id);
                     }
                 }
             }

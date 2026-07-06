@@ -56,6 +56,13 @@ impl ConditionTickHandle {
         self.run_ids.push(run_id);
     }
 
+    /// Drop a `run_id` whose dispatch failed before its run record reached
+    /// storage. Without this the finalized tick record references a run that
+    /// does not exist — dead links and an inflated count in the UI tick grid.
+    pub(super) fn unregister_run(&mut self, run_id: &str) {
+        self.run_ids.retain(|id| id != run_id);
+    }
+
     /// Record a `backfill_id` produced by `BackfillDispatcherKind::dispatch`
     /// after the multi-partition fan-out has completed.
     pub(super) fn register_backfill_id(&mut self, backfill_id: String) {
@@ -85,5 +92,24 @@ impl ConditionTickHandle {
                 format!("tick_{}", record.timestamp)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConditionTickHandle;
+
+    #[test]
+    fn unregister_run_drops_only_the_named_id() {
+        let mut handle = ConditionTickHandle::new("cl".to_string(), 0, &[]);
+        handle.register_run("a".to_string());
+        handle.register_run("b".to_string());
+        // Dispatch of `a` failed before its record reached storage.
+        handle.unregister_run("a");
+        assert_eq!(
+            handle.run_ids,
+            vec!["b".to_string()],
+            "the finalized tick must not reference a run that never persisted"
+        );
     }
 }
