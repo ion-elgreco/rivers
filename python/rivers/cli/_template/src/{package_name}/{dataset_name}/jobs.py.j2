@@ -1,0 +1,10 @@
+import rivers as rs
+
+from {{ package_name }}.{{ dataset_name }}.assets import my_asset
+
+
+job = rs.Job(
+    name="my_job",
+    assets=[my_asset],
+    executor=rs.Executor.in_process(),
+)

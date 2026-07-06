@@ -5,7 +5,9 @@ from __future__ import annotations
 import atexit
 import importlib
 import os
+import re
 import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +16,7 @@ import typer
 
 from rivers._core.storage import Storage
 from rivers.cli.config import RiversConfig
+from rivers.cli.scaffold import scaffold
 from rivers.exceptions import SchemaMigrationNeededError
 
 app = typer.Typer(name="rivers", help="rivers orchestration CLI")
@@ -70,6 +73,109 @@ def _open_or_prompt_migrate(open_fn, migrate_fn) -> Storage:
             raise
         migrate_fn()
         return open_fn()
+
+
+def _git_config(key: str) -> str | None:
+    """Best-effort read of a git config value, e.g. 'user.name'."""
+    try:
+        result = subprocess.run(
+            ["git", "config", key],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip() or None
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def _authors_line(name: str | None, email: str | None) -> str:
+    """Build a PEP 621 `authors` line, omitting whichever field is missing."""
+    fields = []
+    if name:
+        fields.append(f'name = "{name}"')
+    if email:
+        fields.append(f'email = "{email}"')
+    if not fields:
+        return ""
+    return f"authors = [{{ {', '.join(fields)} }}]"
+
+
+def _slugify(name: str) -> str:
+    """Turn 'My Cool Tool' into a PyPI-safe distribution name."""
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", name.strip()).strip("-").lower()
+    return slug or "my-project"
+
+
+def _package_name(slug: str) -> str:
+    """Turn a distribution slug into a valid Python import name."""
+    package = slug.replace("-", "_")
+    if package[:1].isdigit():
+        package = f"_{package}"
+    return package
+
+
+@app.command()
+def init(
+    name: str = typer.Option(
+        None,
+        prompt="Project name",
+        help="The name of the project",
+    ),
+    dataset_name: str = typer.Option(
+        "my_dataset",
+        help="Name of dataset to scaffold",
+    ),
+    description: str = typer.Option(
+        "",
+        help="A short description of the project",
+    ),
+    author: str | None = typer.Option(
+        None,
+        help="Author name (defaults to your `git config user.name`)",
+    ),
+    email: str | None = typer.Option(
+        None,
+        help="Author email (defaults to your `git config user.email`)",
+    ),
+    python_version: str = typer.Option(
+        "3.10",
+        "--python",
+        help="Minimum Python version the project requires",
+    ),
+    directory: Path | None = typer.Option(
+        None,
+        help="Where to create the project (defaults to ./<project-slug>)",
+    ),
+) -> None:
+    """Initialize a rivers code location project."""
+    project_slug = _slugify(name)
+    package_name = _package_name(project_slug)
+    target_dir = directory or Path.cwd() / project_slug
+
+    if target_dir.exists() and any(target_dir.iterdir()):
+        typer.secho(
+            f"{target_dir} already exists and isn't empty.", fg=typer.colors.RED
+        )
+        raise typer.Exit(code=1)
+
+    author = author or _git_config("user.name")
+    email = email or _git_config("user.email")
+    authors_line = _authors_line(author, email)
+
+    scaffold(
+        target_dir,
+        project_name=project_slug,
+        package_name=package_name,
+        dataset_name=dataset_name,
+        description=description,
+        python_version=python_version,
+        authors_line=authors_line,
+    )
+
+    typer.secho(f"Created {target_dir}", fg=typer.colors.GREEN)
+    typer.echo(f"  cd {target_dir.name}")
+    typer.echo("  uv sync")
 
 
 @app.command()

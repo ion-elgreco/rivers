@@ -1,0 +1,19 @@
+[project]
+name = "{{ project_name }}"
+version = "0.1.0"
+description = "{{ description }}"
+readme = "README.md"
+{{ authors_line }}
+requires-python = ">={{ python_version }}"
+dependencies = [
+    "rivers>=0.0.0.dev0"
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.0,<0.12.0"]
+build-backend = "uv_build"
