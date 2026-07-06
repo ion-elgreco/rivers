@@ -611,6 +611,12 @@ impl AssetConditionCache {
                     // into `completed_run_ids` (`step_completion` short-circuits
                     // on the first finished run); apply no-ops on them.
                     self.apply_run_effects_to_delta(run, &mut delta);
+                    // Invalidate every asset of the run, not just the one whose
+                    // record ts changed: a co-scheduled partitioned sibling that
+                    // died event-less lands here (its ts didn't change, so it's
+                    // not in invalidated_keys yet) and needs partition_status
+                    // refetched to surface its failure — same as the sweep path.
+                    invalidated_keys.extend(run.node_names.iter().cloned());
                 }
             }
         }

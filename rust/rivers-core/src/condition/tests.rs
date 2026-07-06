@@ -7323,6 +7323,94 @@ async fn test_clearable_sweep_records_partitioned_failure_in_partition_status() 
 }
 
 #[tokio::test]
+async fn test_completed_run_invalidates_event_less_partitioned_sibling() {
+    // Joint keyed run R=[x,y] over partition p: x materializes p (its record ts
+    // changes, so R enters completed_run_ids), while y's step dies event-less
+    // (no StepFailure). The cursor already passed R (seen Started), so only the
+    // completed_run_ids path handles R. That path applied R's effects but never
+    // invalidated y, so y's partition failure (surfaced by the run-status union
+    // in get_failed_partitions) never reached partition_status[y] and eager()
+    // re-dispatched the doomed partition every tick.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, RunRecord, RunStatus, StorageBackend,
+    };
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[
+            make_materialized_record("x", 1000),
+            make_materialized_record("y", 1000),
+        ])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.set_partitioned_assets(vec!["x".to_string(), "y".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let run_id = "run-joint-part".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["x".to_string(), "y".to_string()],
+            priority: 0,
+            partition_key: Some(spk("p")),
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(cache.in_progress_assets.contains_key("x"));
+    assert!(cache.in_progress_assets.contains_key("y"));
+
+    // R fails: x materialized p (Materialization advances x's record ts → R
+    // enters completed_run_ids); y is event-less.
+    storage
+        .update_run_status(&run_id, RunStatus::Failure, Some(3000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[EventRecord {
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            event_type: EventType::Materialization {
+                data_version: Some("dv-xp".to_string()),
+            },
+            asset_key: Some("x".to_string()),
+            run_id: run_id.clone(),
+            partition_key: Some(spk("p")),
+            timestamp: 3000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        }])
+        .await
+        .unwrap();
+
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let y_status = cache
+        .partition_status
+        .get("y")
+        .expect("y is a registered partitioned asset");
+    assert!(
+        y_status.failed.contains(&spk("p")),
+        "y's event-less partition failure in the joint run must surface in \
+         partition_status via completed-path invalidation; got failed={:?}",
+        y_status.failed,
+    );
+}
+
+#[tokio::test]
 async fn test_initial_load_does_not_floor_asset_materialized_in_failed_joint_run() {
     // Regression (restart inversion): a joint run R=[x,y] fails because y's step
     // failed, but x materialized (its Materialization event advanced
