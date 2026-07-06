@@ -1665,24 +1665,28 @@ impl StorageBackend for SurrealStorage {
         &self,
         asset_key: &str,
         run_ids: &[String],
-    ) -> Result<(bool, Option<String>)> {
+    ) -> Result<(bool, Vec<String>)> {
         super::retry::with_retry(&self.retry_config, || async {
             let mut completed = false;
+            let mut succeeded: Vec<String> = Vec::new();
             for run_id in run_ids {
                 let events = self.get_events_for_run(run_id).await?;
                 for e in &events {
                     if e.asset_key.as_deref() != Some(asset_key) {
                         continue;
                     }
-                    if matches!(e.event_type, EventType::StepSuccess) {
-                        return Ok((true, Some(run_id.clone())));
-                    }
-                    if matches!(e.event_type, EventType::StepFailure) {
-                        completed = true;
+                    match e.event_type {
+                        EventType::StepSuccess => {
+                            completed = true;
+                            succeeded.push(run_id.clone());
+                            break;
+                        }
+                        EventType::StepFailure => completed = true,
+                        _ => {}
                     }
                 }
             }
-            Ok((completed, None))
+            Ok((completed, succeeded))
         })
         .await
     }
@@ -1786,16 +1790,20 @@ impl StorageBackend for SurrealStorage {
             if run_ids.is_empty() {
                 return Ok(Vec::new());
             }
+            // ORDER BY start_time ASC: the condition cache applies run effects
+            // (last_run tags / asset_names) in iteration order with last-write-
+            // wins, so the newest run must come last. run_id tiebreaks equal
+            // start_times for full determinism.
             let mut result = if let Some(s) = status.clone() {
                 let status_str = format!("{:?}", s);
                 self.db
-                    .query("SELECT * FROM runs WHERE run_id IN $ids AND status = $status")
+                    .query("SELECT * FROM runs WHERE run_id IN $ids AND status = $status ORDER BY start_time ASC, run_id ASC")
                     .bind(("ids", run_ids.to_vec()))
                     .bind(("status", status_str))
                     .await?
             } else {
                 self.db
-                    .query("SELECT * FROM runs WHERE run_id IN $ids")
+                    .query("SELECT * FROM runs WHERE run_id IN $ids ORDER BY start_time ASC, run_id ASC")
                     .bind(("ids", run_ids.to_vec()))
                     .await?
             };
@@ -7013,6 +7021,48 @@ mod tests {
         // Empty IDs
         let results = storage.get_runs_by_ids(&[], None).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_runs_by_ids_orders_by_start_time() {
+        // The condition cache applies run effects (last_run tags / asset_names)
+        // in iteration order with last-write-wins, so get_runs_by_ids must
+        // return runs oldest-first. Use ids whose lexical order is the REVERSE
+        // of start_time order, so an unordered (id/insertion) return would not
+        // accidentally match.
+        let storage = make_storage().await;
+        let mk = |id: &str, start: i64| RunRecord {
+            run_id: id.to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("j".to_string()),
+            status: RunStatus::Success,
+            start_time: start,
+            end_time: Some(start + 100),
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        };
+        // id order "aaa" < "mmm" < "zzz" is the reverse of start_time order.
+        storage.create_run(&mk("zzz", 1000)).await.unwrap();
+        storage.create_run(&mk("mmm", 2000)).await.unwrap();
+        storage.create_run(&mk("aaa", 3000)).await.unwrap();
+
+        let ordered = storage
+            .get_runs_by_ids(
+                &["aaa".to_string(), "zzz".to_string(), "mmm".to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+        let start_times: Vec<i64> = ordered.iter().map(|r| r.start_time).collect();
+        assert_eq!(
+            start_times,
+            vec![1000, 2000, 3000],
+            "get_runs_by_ids must return runs ordered by start_time ASC"
+        );
     }
 
     #[tokio::test]
