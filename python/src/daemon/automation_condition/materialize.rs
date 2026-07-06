@@ -16,7 +16,7 @@
 //! condition uses `RunDispatcher::dispatch_materialization` (asset
 //! selection with caller-minted run_id), but the underlying Direct/Queued
 //! mode logic is centralized in `dispatchers.rs`.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rivers_core::condition::MaterializationPlan;
 use rivers_core::storage::{LaunchedBy, PartitionKey as CorePartitionKey};
@@ -97,6 +97,21 @@ impl ConditionTickEngine {
                             "condition run dispatch error"
                         );
                     }
+                    // A request whose run record never reached storage leaves
+                    // nothing to confirm its pending mark — roll it back now
+                    // instead of waiting out the phantom-eviction grace period.
+                    let created: HashSet<&str> =
+                        outcome.ids.iter().map(String::as_str).collect();
+                    for req in &run_requests {
+                        if !created.contains(req.run_id.as_str()) {
+                            for asset in &req.asset_selection {
+                                self.pass.cache.clear_dispatched_run(asset, &req.run_id);
+                            }
+                            // Its record never persisted — drop it from the tick
+                            // record too, or the UI links to a nonexistent run.
+                            handle.unregister_run(&req.run_id);
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
@@ -104,6 +119,14 @@ impl ConditionTickEngine {
                         error = %e,
                         "condition run dispatch failed"
                     );
+                    // The whole batch failed before any run record was
+                    // written; roll back every pre-dispatch mark.
+                    for req in &run_requests {
+                        for asset in &req.asset_selection {
+                            self.pass.cache.clear_dispatched_run(asset, &req.run_id);
+                        }
+                        handle.unregister_run(&req.run_id);
+                    }
                 }
             }
         }
@@ -129,6 +152,10 @@ impl ConditionTickEngine {
         mats: Vec<(String, Vec<CorePartitionKey>)>,
         handle: &mut ConditionTickHandle,
     ) {
+        // Captured before the keys are moved into the requests; used to clear
+        // the pre-dispatch `in_progress` placeholders if the whole batch fails
+        // (no sub-runs will ever surface to self-heal them).
+        let backfill_asset_keys: Vec<String> = mats.iter().map(|(k, _)| k.clone()).collect();
         let mut requests: Vec<BackfillRequestData> = Vec::with_capacity(mats.len());
         for (asset_key, partition_keys) in mats {
             let strategy = self
@@ -171,6 +198,15 @@ impl ConditionTickEngine {
                         "condition backfill dispatch error"
                     );
                 }
+                // Per-request failures leave no surfacing sub-run to self-heal
+                // the pre-dispatch `in_progress` placeholder, so clear it now —
+                // same wedge the whole-batch failure path below guards against,
+                // but for the assets that failed within an otherwise-Ok batch.
+                for target in &outcome.failed_targets {
+                    for asset_key in target {
+                        self.pass.cache.clear_predispatch_mark(asset_key);
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!(
@@ -178,6 +214,12 @@ impl ConditionTickEngine {
                     error = %e,
                     "condition backfill dispatch failed"
                 );
+                // The whole batch failed: no sub-runs will surface to clear the
+                // pre-marked placeholders, so drop them now or the assets stay
+                // wedged as InProgress until daemon restart.
+                for asset_key in &backfill_asset_keys {
+                    self.pass.cache.clear_predispatch_mark(asset_key);
+                }
             }
         }
     }

@@ -449,6 +449,12 @@ pub(crate) enum BackfillDispatcherKind {
 pub(crate) struct BackfillDispatchOutcome {
     pub(crate) results: Vec<PyBackfillResult>,
     pub(crate) errors: Vec<anyhow::Error>,
+    /// The request selections (asset lists) that failed to launch. A backfill
+    /// registers no run up front, so a per-request failure leaves the asset's
+    /// pre-dispatch `in_progress` placeholder with no surfacing sub-run to
+    /// self-heal it — the caller clears these marks (parallel to the
+    /// whole-batch failure path).
+    pub(crate) failed_targets: Vec<Vec<String>>,
 }
 
 impl BackfillDispatcherKind {
@@ -541,18 +547,29 @@ impl LocalBackfillDispatcher {
 
         let mut results: Vec<PyBackfillResult> = Vec::with_capacity(pending.len());
         let mut errors: Vec<anyhow::Error> = Vec::new();
+        let mut failed_targets: Vec<Vec<String>> = Vec::new();
         for (selection, rx) in pending {
             match rx.await {
                 Ok(Ok(result)) => results.push(result),
-                Ok(Err(e)) => errors.push(anyhow!("backfill {:?}: {}", selection, e)),
-                Err(e) => errors.push(anyhow!(
-                    "backfill {:?}: oneshot recv failed: {}",
-                    selection,
-                    e
-                )),
+                Ok(Err(e)) => {
+                    errors.push(anyhow!("backfill {:?}: {}", selection, e));
+                    failed_targets.push(selection);
+                }
+                Err(e) => {
+                    errors.push(anyhow!(
+                        "backfill {:?}: oneshot recv failed: {}",
+                        selection,
+                        e
+                    ));
+                    failed_targets.push(selection);
+                }
             }
         }
 
-        Ok(BackfillDispatchOutcome { results, errors })
+        Ok(BackfillDispatchOutcome {
+            results,
+            errors,
+            failed_targets,
+        })
     }
 }

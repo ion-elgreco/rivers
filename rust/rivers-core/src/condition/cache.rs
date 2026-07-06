@@ -308,6 +308,37 @@ impl AssetConditionCache {
             .insert(run_id, partition_key);
     }
 
+    /// Drop a pre-dispatch placeholder entry (the empty `in_progress_assets`
+    /// slot `classify` creates so an asset isn't re-fired before its runs
+    /// surface) when dispatch failed before any run was registered. Unlike
+    /// single-partition runs — which `register_dispatched_run` backs with a
+    /// phantom-eviction safety net — a multi-partition backfill registers
+    /// nothing up front, so a dispatch failure would otherwise leave the empty
+    /// entry forever, wedging the asset's `InProgress` (its key is present).
+    /// No-op if real runs have since been tracked for the asset.
+    pub fn clear_predispatch_mark(&mut self, asset_key: &str) {
+        if let Some(runs) = self.in_progress_assets.get(asset_key) {
+            if runs.is_empty() {
+                self.in_progress_assets.remove(asset_key);
+            }
+        }
+    }
+
+    /// Roll back a `register_dispatched_run` whose dispatch failed
+    /// synchronously: the run record never reached storage, so nothing will
+    /// ever confirm the pending entry. Dropping it now frees the asset to
+    /// re-fire immediately instead of waiting out the phantom-eviction
+    /// grace period.
+    pub fn clear_dispatched_run(&mut self, asset_key: &str, run_id: &str) {
+        self.untrack_in_progress_run(asset_key, run_id);
+        if let Some(pending) = self.pending_runs.get_mut(run_id) {
+            pending.asset_keys.retain(|k| k != asset_key);
+            if pending.asset_keys.is_empty() {
+                self.pending_runs.remove(run_id);
+            }
+        }
+    }
+
     /// Drop a run (removing the asset once empty) — the one path for run
     /// completion (`ClearRun`) and phantom eviction.
     fn untrack_in_progress_run(&mut self, asset_key: &str, run_id: &str) {
@@ -467,11 +498,20 @@ impl AssetConditionCache {
             // Clear per run, not per asset. A backfill registers one run per
             // partition; evicting the whole asset when the first finishes
             // reopens the dispatch gate for its still-running siblings and
-            // re-fires them as duplicate runs. Re-read the completed assets'
+            // re-fires them as duplicate runs. Re-read the tracked in-progress
             // runs and clear only the terminal ones — in-flight runs stay.
-            let clearable: Vec<String> = completed_keys
-                .iter()
-                .filter_map(|k| self.in_progress_assets.get(k))
+            //
+            // Sweep ALL tracked in-progress runs, not just those whose asset
+            // record changed: `get_runs_since` uses `>`, so a run whose
+            // terminal transition doesn't advance its start_time (a
+            // cancellation, or a completion observed in the same tick the run
+            // first surfaced) is never re-delivered by the cursor, and a
+            // cancellation also produces no record-ts change / StepSuccess for
+            // the ts-unchanged fallback above to catch. Without this the asset
+            // would stay wedged in_progress forever.
+            let clearable: Vec<String> = self
+                .in_progress_assets
+                .values()
                 .flat_map(|runs| runs.keys().cloned())
                 .collect();
             if !clearable.is_empty() {
