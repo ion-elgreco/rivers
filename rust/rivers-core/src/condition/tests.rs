@@ -2851,6 +2851,64 @@ fn all_partitions_dep_frontier_key_does_not_refire_whole_universe() {
 }
 
 #[test]
+fn test_empty_partitioned_dep_universe_does_not_bridge_latch_to_all() {
+    // A partitioned dep whose universe is momentarily empty (dynamic namespace
+    // with no keys yet) is PRESENT in the resolver's upstream_partition_keys
+    // with an empty set — distinct from a genuinely-unpartitioned dep, which is
+    // ABSENT. It must take the partitioned path, not the bool fallback: the
+    // fallback bridges a true stateful latch to `All`, and next tick (once the
+    // dep gains keys) the partitioned pivot reads that `All` and fires the
+    // whole universe for keys that were never updated.
+    let rk = spk("rk1");
+    let all_keys = HashSet::from([rk.clone()]);
+    let r = make_materialized_record("r", 100);
+    let u = make_record("u"); // never materialized → Missing is true
+    let records = HashMap::from([("r".to_string(), r.clone()), ("u".to_string(), u.clone())]);
+    let deps = HashMap::from([("r".to_string(), vec!["u".to_string()])]);
+
+    let partition_statuses =
+        HashMap::from([("r".to_string(), Default::default())]);
+    let all_states = HashMap::new();
+    let mut ctx = make_ctx("r", &r, &records, &deps);
+    ctx.all_asset_states = &all_states;
+
+    let mappings = HashMap::from([(("r".into(), "u".into()), PartitionMappingKind::Identity)]);
+    // u PRESENT with an EMPTY universe (partitioned, no keys yet).
+    let upstream_u = HashMap::from([("u".to_string(), HashSet::<PartitionKey>::new())]);
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &HashSet::new(),
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &HashMap::new(),
+        resolver: PartitionResolver::new(&mappings, &upstream_u),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let condition = ConditionNode::AnyDepsMatch {
+        condition: Box::new(ConditionNode::NewlyTrue(Box::new(ConditionNode::Missing))),
+        label: None,
+    };
+    let result = evaluate(&condition, &ctx);
+
+    if let Some(dep_sels) = &result.dep_sub_selections {
+        for (dep, latch) in dep_sels {
+            for (idx, sel) in latch {
+                assert_ne!(
+                    sel,
+                    &PartitionSelection::All,
+                    "empty-universe dep {dep} latched node {idx} as All \
+                     (bool-fallback bridge); the partitioned path must be taken"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn all_partitions_dep_genuine_update_still_fires() {
     // The boundary the floor must preserve: when an upstream key IS newer than
     // an attempted downstream key, the AllPartitions edge must still fire.
@@ -4213,9 +4271,12 @@ fn test_counter_stability_and_short_circuit() {
     let ctx1 = make_ctx("a", &record, &records, &deps);
     let r1 = evaluate(&cond, &ctx1);
     assert!(!r1.fired);
-    // NewlyTrue's index should be 2 (And=0, InProgress=1, NewlyTrue=2, Missing=3)
-    // Since And short-circuited, NewlyTrue wasn't evaluated, so no sub_results entry
-    assert!(r1.sub_results.is_empty());
+    // NewlyTrue's index is 2 (And=0, InProgress=1, NewlyTrue=2, Missing=3). Even
+    // though the And short-circuited, the stateful child is still evaluated so its
+    // latch survives; Missing is true (record unmaterialized) → it records
+    // `current=true` at the stable index 2.
+    assert_eq!(r1.sub_results.get(&2), Some(&true));
+    assert_eq!(r1.sub_results.len(), 1);
 
     // Tick 2: Make InProgress=true so And doesn't short-circuit.
     // NewlyTrue(Missing) should fire (inner=true, previous=false).
@@ -11762,5 +11823,371 @@ fn test_nested_dep_aggregate_since_latch_persists() {
     assert!(
         result2.fired,
         "tick 2: a latch nested two dep-hops deep must persist under the root's state"
+    );
+}
+
+/// A dep-aggregate with a STATEFUL inner condition must evaluate every dep even
+/// when an earlier dep makes the aggregate short-circuit. Otherwise the skipped
+/// dep is absent from `dep_sub_results`, and `update_condition_state` (full
+/// replace) drops its persisted latch — so a dep loses its memory the moment a
+/// sibling short-circuits the aggregate. Multi-dep `on_cron` relies on each
+/// dep's "updated since reset" latch being independent.
+#[test]
+fn test_dep_aggregate_short_circuit_preserves_skipped_dep_latch() {
+    // `.all()` short-circuits on the first false dep; `a` is first.
+    let tree = ConditionNode::all_deps_match(
+        ConditionNode::InProgress.since(ConditionNode::ExecutionFailed),
+    );
+    let deps = HashMap::from([("r".to_string(), vec!["a".to_string(), "b".to_string()])]);
+
+    let both = HashSet::from(["a".to_string(), "b".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+    let only_a = HashSet::from(["a".to_string()]);
+
+    let r = make_record("r");
+    let a = make_materialized_record("a", 100);
+    let b = make_materialized_record("b", 100);
+    let records = HashMap::from([
+        ("r".to_string(), r.clone()),
+        ("a".to_string(), a.clone()),
+        ("b".to_string(), b.clone()),
+    ]);
+
+    // ── Tick 1: a and b both in-progress → both deps' Since latch true ──
+    let mut ctx1 = make_ctx("r", &r, &records, &deps);
+    ctx1.cache.in_progress_assets = &both;
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: both deps in-progress → latch fires");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext::from_eval_context(&ctx1),
+        &result1,
+    );
+
+    // ── Tick 2: a FAILED → its reset fires → Since(a) false, so `.all()`
+    //    short-circuits at a and would skip b. b did not fail and is still
+    //    latched; its latch must survive the skipped tick ──
+    let mut ctx2 = make_ctx("r", &r, &records, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.cache.failed_assets = &only_a;
+    ctx2.cache.in_progress_assets = &none;
+    ctx2.now = 2000;
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        !result2.fired,
+        "tick 2: a's latch reset by its failure → aggregate false this tick"
+    );
+
+    // Built manually (not `from_eval_context`) so it doesn't transitively borrow
+    // `state_r` through `ctx2`, which would block the `&mut state_r` below.
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext {
+            target_record_timestamp: r.last_timestamp,
+            target_data_version: r.last_data_version.as_ref(),
+            now: 2000,
+            is_initial: false,
+            partition_timestamps: None,
+        },
+        &result2,
+    );
+
+    // ── Tick 3: a in-progress again (re-latches), b neither in-progress nor
+    //    failed → b can only fire from its persisted latch. With the bug b's
+    //    latch was dropped on tick 2 (skipped), so the aggregate stays false ──
+    let mut ctx3 = make_ctx("r", &r, &records, &deps);
+    ctx3.prev_state = &state_r;
+    ctx3.cache.in_progress_assets = &only_a;
+    ctx3.now = 3000;
+    let result3 = evaluate(&tree, &ctx3);
+    assert!(
+        result3.fired,
+        "tick 3: b's per-dep latch must persist across the tick where a \
+         short-circuited the aggregate"
+    );
+}
+
+/// Two sibling dep-aggregates that pivot on the SAME dep must not clobber each
+/// other's per-dep latch. Each aggregate's stateful node gets a distinct node
+/// index, so the per-dep maps should MERGE — but a plain `acc.insert(dep, ..)`
+/// replaces the whole entry, dropping the first aggregate's latch.
+#[test]
+fn test_sibling_dep_aggregates_do_not_clobber_shared_dep_latch() {
+    // `And` so BOTH aggregates are evaluated on tick 1 (with `Or` the first
+    // truthy one would short-circuit the second, and no clobber would occur).
+    // Both pivot dep `a`; Agg1's Since lands at idx 2, Agg2's at idx 6, so the
+    // per-dep map needs both keys — a wholesale insert keeps only Agg2's.
+    let agg = || {
+        ConditionNode::any_deps_match(
+            ConditionNode::InProgress.since(ConditionNode::ExecutionFailed),
+        )
+    };
+    let tree = ConditionNode::And(vec![agg(), agg()]);
+    let deps = HashMap::from([("r".to_string(), vec!["a".to_string()])]);
+
+    let only_a = HashSet::from(["a".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+    let r = make_record("r");
+    let a = make_materialized_record("a", 100);
+    let records = HashMap::from([("r".to_string(), r.clone()), ("a".to_string(), a.clone())]);
+
+    // ── Tick 1: a in-progress → both aggregates' Since latch true. Both write
+    //    the shared dep's per-dep map; the second must not drop the first ──
+    let mut ctx1 = make_ctx("r", &r, &records, &deps);
+    ctx1.cache.in_progress_assets = &only_a;
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: a in-progress → both latches set");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext::from_eval_context(&ctx1),
+        &result1,
+    );
+
+    // ── Tick 2: a no longer in-progress, never failed → both Since triggers are
+    //    false, so both aggregates fire only from their persisted latch. With the
+    //    clobber bug Agg1's latch (idx 2) was overwritten, so `And` short-circuits
+    //    false at Agg1 ──
+    let mut ctx2 = make_ctx("r", &r, &records, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.cache.in_progress_assets = &none;
+    ctx2.now = 2000;
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        result2.fired,
+        "tick 2: both sibling aggregates' latches on the shared dep must persist"
+    );
+}
+
+/// A dep-aggregate NESTED inside the unpartitioned-upstream bool fallback of a
+/// partitioned root must persist its per-dep latch. Pre-fix that nested latch
+/// landed in a throwaway `nested_acc` (discarded every tick), so the inner
+/// `Since` could never hold across ticks.
+#[test]
+fn test_nested_dep_aggregate_under_unpartitioned_dep_persists_latch() {
+    // Partitioned root `r` ← UNPARTITIONED dep `b` ← `b`'s upstream `c`.
+    // Condition: any_deps_match(any_deps_match(InProgress.since(ExecutionFailed))).
+    // Outer aggregate pivots to `b` (unpartitioned → bool fallback); the inner
+    // aggregate pivots to `c`, whose Since latch is the state under test.
+    let tree = ConditionNode::any_deps_match(ConditionNode::any_deps_match(
+        ConditionNode::InProgress.since(ConditionNode::ExecutionFailed),
+    ));
+    let p1 = spk("p1");
+    let all_keys = HashSet::from([p1.clone()]);
+
+    let r = make_record("r");
+    let b = make_materialized_record("b", 100);
+    let c = make_materialized_record("c", 100);
+    let records = HashMap::from([
+        ("r".to_string(), r.clone()),
+        ("b".to_string(), b.clone()),
+        ("c".to_string(), c.clone()),
+    ]);
+    let deps = HashMap::from([
+        ("r".to_string(), vec!["b".to_string()]),
+        ("b".to_string(), vec!["c".to_string()]),
+    ]);
+
+    let only_c = HashSet::from(["c".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+
+    let r_timestamps = HashMap::from([(p1.clone(), 50i64)]);
+    let r_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: all_keys.clone(),
+        timestamps: r_timestamps.clone(),
+        ..Default::default()
+    };
+    let partition_statuses = HashMap::from([("r".to_string(), r_status)]);
+    let empty_mappings = HashMap::new();
+    // `b` absent from upstream_partition_keys → unpartitioned dep → bool fallback.
+    let no_upstream_keys = HashMap::new();
+    let empty_pk: HashSet<PartitionKey> = HashSet::new();
+
+    let make_pctx = || PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &all_keys,
+        in_progress: &empty_pk,
+        failed: &empty_pk,
+        timestamps: &r_timestamps,
+        resolver: PartitionResolver::new(&empty_mappings, &no_upstream_keys),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+
+    // ── Tick 1: c in-progress → inner Since latches true for c ──
+    let mut ctx1 = make_ctx("r", &r, &records, &deps);
+    ctx1.cache.in_progress_assets = &only_c;
+    let pctx1 = make_pctx();
+    ctx1.partitions = Some(&pctx1);
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: c in-progress → nested Since fires");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext {
+            target_record_timestamp: r.last_timestamp,
+            target_data_version: r.last_data_version.as_ref(),
+            now: 1000,
+            is_initial: false,
+            partition_timestamps: Some(&r_timestamps),
+        },
+        &result1,
+    );
+
+    // ── Tick 2: c no longer in-progress and never failed → the inner Since can
+    //    fire only from its persisted latch. Pre-fix the nested latch was
+    //    dropped, so the aggregate stays false ──
+    let mut ctx2 = make_ctx("r", &r, &records, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.cache.in_progress_assets = &none;
+    ctx2.now = 2000;
+    let pctx2 = make_pctx();
+    ctx2.partitions = Some(&pctx2);
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        result2.fired,
+        "tick 2: a dep-aggregate nested inside the unpartitioned-dep fallback \
+         must persist its per-dep latch"
+    );
+}
+
+/// A stateful child (Since/NewlyTrue) skipped by an `And`/`Or` short-circuit
+/// must keep its latch. `update_condition_state` full-replaces previous_results,
+/// so a skipped stateful node that isn't re-written loses its latch — the same
+/// class fixed for dep-aggregates, but And/Or were missed.
+#[test]
+fn test_and_short_circuit_preserves_stateful_child_latch() {
+    // And([gate, trigger.since(reset)]); when `gate` is false the And
+    // short-circuits and the stateful child is skipped.
+    let tree = ConditionNode::And(vec![
+        ConditionNode::InProgress,
+        ConditionNode::ExecutionFailed.since(ConditionNode::Missing),
+    ]);
+    let deps = HashMap::new();
+    let r = make_materialized_record("r", 100); // materialized → Missing (reset) false
+    let records = HashMap::from([("r".to_string(), r.clone())]);
+    let only_r = HashSet::from(["r".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+
+    // ── Tick 1: gate (InProgress) true AND trigger (ExecutionFailed) true →
+    //    Since latches true, And fires ──
+    let mut ctx1 = make_ctx("r", &r, &records, &deps);
+    ctx1.cache.in_progress_assets = &only_r;
+    ctx1.cache.failed_assets = &only_r;
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: gate + trigger true → And fires");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext::from_eval_context(&ctx1),
+        &result1,
+    );
+
+    // ── Tick 2: gate false → And short-circuits and the Since is skipped.
+    //    trigger also false this tick ──
+    let mut ctx2 = make_ctx("r", &r, &records, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.cache.in_progress_assets = &none;
+    ctx2.cache.failed_assets = &none;
+    ctx2.now = 2000;
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(!result2.fired, "tick 2: gate false → And false");
+
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext {
+            target_record_timestamp: r.last_timestamp,
+            target_data_version: r.last_data_version.as_ref(),
+            now: 2000,
+            is_initial: false,
+            partition_timestamps: None,
+        },
+        &result2,
+    );
+
+    // ── Tick 3: gate true again, trigger false → the Since can fire only from
+    //    its persisted latch. Pre-fix the latch was dropped on tick 2 ──
+    let mut ctx3 = make_ctx("r", &r, &records, &deps);
+    ctx3.prev_state = &state_r;
+    ctx3.cache.in_progress_assets = &only_r;
+    ctx3.cache.failed_assets = &none;
+    ctx3.now = 3000;
+    let result3 = evaluate(&tree, &ctx3);
+    assert!(
+        result3.fired,
+        "tick 3: a stateful child's latch must persist across a tick where \
+         And short-circuited and skipped it"
+    );
+}
+
+/// The `Or` counterpart: a stateful child skipped because an earlier child made
+/// the Or already-true must still keep its latch.
+#[test]
+fn test_or_short_circuit_preserves_stateful_child_latch() {
+    // Or([gate, trigger.since(reset)]); when `gate` is true the Or short-circuits
+    // and the stateful child is skipped.
+    let tree = ConditionNode::Or(vec![
+        ConditionNode::InProgress,
+        ConditionNode::ExecutionFailed.since(ConditionNode::Missing),
+    ]);
+    let deps = HashMap::new();
+    let r = make_materialized_record("r", 100); // materialized → Missing (reset) false
+    let records = HashMap::from([("r".to_string(), r.clone())]);
+    let only_r = HashSet::from(["r".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+
+    // ── Tick 1: gate false, trigger true → Or evaluates the Since (latches true) ──
+    let mut ctx1 = make_ctx("r", &r, &records, &deps);
+    ctx1.cache.in_progress_assets = &none;
+    ctx1.cache.failed_assets = &only_r;
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: trigger true → Or fires");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext::from_eval_context(&ctx1),
+        &result1,
+    );
+
+    // ── Tick 2: gate true → Or short-circuits and skips the Since. trigger false ──
+    let mut ctx2 = make_ctx("r", &r, &records, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.cache.in_progress_assets = &only_r;
+    ctx2.cache.failed_assets = &none;
+    ctx2.now = 2000;
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(result2.fired, "tick 2: gate true → Or fires (from gate)");
+
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext {
+            target_record_timestamp: r.last_timestamp,
+            target_data_version: r.last_data_version.as_ref(),
+            now: 2000,
+            is_initial: false,
+            partition_timestamps: None,
+        },
+        &result2,
+    );
+
+    // ── Tick 3: gate false, trigger false → Or fires only if the Since latch
+    //    persisted across the skipped tick ──
+    let mut ctx3 = make_ctx("r", &r, &records, &deps);
+    ctx3.prev_state = &state_r;
+    ctx3.cache.in_progress_assets = &none;
+    ctx3.cache.failed_assets = &none;
+    ctx3.now = 3000;
+    let result3 = evaluate(&tree, &ctx3);
+    assert!(
+        result3.fired,
+        "tick 3: a stateful child's latch must persist across a tick where \
+         Or short-circuited and skipped it"
     );
 }

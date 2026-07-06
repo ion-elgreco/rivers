@@ -288,6 +288,30 @@ impl ConditionNode {
         }
     }
 
+    /// True if the tree contains a stateful operator (`Since`/`NewlyTrue`).
+    /// Dep-aggregates must not short-circuit over one, or a skipped dep loses
+    /// its latch.
+    pub fn has_stateful_nodes(&self) -> bool {
+        match self {
+            ConditionNode::Since { .. } | ConditionNode::NewlyTrue(_) => true,
+            ConditionNode::And(children) | ConditionNode::Or(children) => {
+                children.iter().any(|c| c.has_stateful_nodes())
+            }
+            ConditionNode::Not(child)
+            | ConditionNode::SinceLastHandled(child)
+            | ConditionNode::AnyDepsMatch {
+                condition: child, ..
+            }
+            | ConditionNode::AllDepsMatch {
+                condition: child, ..
+            }
+            | ConditionNode::AssetMatches {
+                condition: child, ..
+            } => child.has_stateful_nodes(),
+            _ => false,
+        }
+    }
+
     /// Returns true if this condition tree contains `HasRunWithTags` or `AllRunsHaveTags`.
     pub fn uses_tick_tags(&self) -> bool {
         match self {

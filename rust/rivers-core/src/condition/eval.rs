@@ -5,22 +5,38 @@ use std::collections::{HashMap, HashSet};
 use crate::storage::PartitionKey;
 
 use super::node::ConditionNode;
-use super::partition::{
-    PartitionEvalContext, PartitionResolver, PartitionSelection, PartitionState,
-};
+use super::partition::{PartitionEvalContext, PartitionResolver, PartitionSelection};
 use super::state::{AssetConditionState, EvalContext, EvalNodeResult, EvalResult, NodeStatus};
 
 /// Per-dep latch state for stateful ops inside dep-aggregates, keyed by dep then
 /// node index. `prev` (root's last tick) is threaded unchanged into nested
 /// pivots so a latch resolves against the root; `acc` collects this tick's.
+///
+/// `cur_prev` is the pivoted dep's latch (`Some` in a pivot, `None` at the root),
+/// set/restored by the pivot so stateful ops read it instead of `prev_state` —
+/// letting the pivot borrow the dep's state rather than clone it.
 struct DepScope<'a, V> {
     prev: &'a HashMap<String, HashMap<u32, V>>,
     acc: &'a mut HashMap<String, HashMap<u32, V>>,
+    cur_prev: Option<&'a HashMap<u32, V>>,
+    /// (dep, node idx) slots whose `acc` value came from the unpartitioned
+    /// bool fallback's lossy `from_bool` bridge (true → `All`). A precise
+    /// partitioned selection replaces a bridged value; a bridged value never
+    /// replaces a precise one — on diamond graphs the bridge would otherwise
+    /// widen a sibling pivot's `Keys` latch to the whole universe (and the
+    /// bool path reads a non-empty selection as `true` anyway).
+    bridged: HashMap<String, HashSet<u32>>,
 }
 
 static EMPTY_DEP_SELECTIONS: std::sync::LazyLock<
     HashMap<String, HashMap<u32, PartitionSelection>>,
 > = std::sync::LazyLock::new(HashMap::new);
+
+/// Empty per-dep latch maps for pivots into a dep with no persisted latch yet.
+static EMPTY_BOOL_LATCH: std::sync::LazyLock<HashMap<u32, bool>> =
+    std::sync::LazyLock::new(HashMap::new);
+static EMPTY_SELECTION_LATCH: std::sync::LazyLock<HashMap<u32, PartitionSelection>> =
+    std::sync::LazyLock::new(HashMap::new);
 
 /// Root's previous-tick per-dep partition latches (empty when unpartitioned).
 fn root_dep_selections<'a>(
@@ -31,6 +47,70 @@ fn root_dep_selections<'a>(
         .as_ref()
         .map(|ps| &ps.dep_previous_selections)
         .unwrap_or(&EMPTY_DEP_SELECTIONS)
+}
+
+/// Merge (not replace) a dep's stateful-node results into the per-dep accumulator,
+/// so two sibling aggregates over the same dep don't clobber each other.
+/// Precise writes win over previously-bridged values for the same slot.
+fn collect_dep_latch<V>(scope: &mut DepScope<V>, dep_key: &str, local: HashMap<u32, V>) {
+    if local.is_empty() {
+        return;
+    }
+    if let Some(marks) = scope.bridged.get_mut(dep_key) {
+        for idx in local.keys() {
+            marks.remove(idx);
+        }
+    }
+    scope.acc.entry(dep_key.to_string()).or_default().extend(local);
+}
+
+/// Merge latches bridged out of the unpartitioned bool fallback
+/// (`from_bool`: true → `All`). A bridged value fills a vacant slot or merges
+/// with another bridged one, but never replaces a precise partitioned
+/// selection — that selection already reads as `true` for the bool path.
+fn collect_bridged_latch(
+    scope: &mut DepScope<PartitionSelection>,
+    dep_key: &str,
+    local: HashMap<u32, PartitionSelection>,
+) {
+    if local.is_empty() {
+        return;
+    }
+    let slot = scope.acc.entry(dep_key.to_string()).or_default();
+    let marks = scope.bridged.entry(dep_key.to_string()).or_default();
+    for (idx, sel) in local {
+        match slot.entry(idx) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(sel);
+                marks.insert(idx);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if marks.contains(&idx) {
+                    let merged = e.get().union(&sel);
+                    e.insert(merged);
+                }
+            }
+        }
+    }
+}
+
+/// Previous-tick selection for stateful node `my_idx`: the per-dep latch when
+/// pivoting into a dep (`cur_prev`), otherwise the asset's own state.
+fn prev_partition_latch(
+    dep_selections: &DepScope<PartitionSelection>,
+    ctx: &EvalContext,
+    my_idx: u32,
+) -> PartitionSelection {
+    match dep_selections.cur_prev {
+        Some(map) => map.get(&my_idx).cloned(),
+        None => ctx
+            .prev_state
+            .partition_state
+            .as_ref()
+            .and_then(|ps| ps.previous_selections.get(&my_idx))
+            .cloned(),
+    }
+    .unwrap_or(PartitionSelection::Empty)
 }
 
 // These traits abstract over "bool only" vs "bool + tree" output modes,
@@ -210,6 +290,8 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
         let mut dep_scope = DepScope {
             prev: root_dep_selections(ctx),
             acc: &mut dep_selections,
+            cur_prev: None,
+            bridged: HashMap::new(),
         };
         let selection: PartitionSelection = eval_partitioned(
             node,
@@ -241,6 +323,8 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
         let mut dep_scope = DepScope {
             prev: &ctx.prev_state.dep_previous_results,
             acc: &mut dep_results,
+            cur_prev: None,
+            bridged: HashMap::new(),
         };
         let fired: bool = eval_inner(node, ctx, &mut counter, &mut sub_results, &mut dep_scope);
         tracing::debug!(
@@ -444,15 +528,24 @@ fn eval_inner<O: EvalOutput>(
 
         ConditionNode::AnyDepsMatch { condition, .. } => {
             let base = *counter;
+            // Stateful inner: visit every dep, else a short-circuited dep loses its latch.
+            let eval_all = condition.has_stateful_nodes();
             let val = ctx
                 .cache
                 .upstream_deps
                 .get(ctx.target_key)
                 .map(|deps| {
-                    deps.iter().any(|dep| {
+                    let mut any = false;
+                    for dep in deps {
                         *counter = base;
-                        eval_on_dep(dep, condition, ctx, counter, dep_results)
-                    })
+                        if eval_on_dep(dep, condition, ctx, counter, dep_results) {
+                            any = true;
+                            if !eval_all {
+                                break;
+                            }
+                        }
+                    }
+                    any
                 })
                 .unwrap_or(false);
             finalize_dep_counter(counter, base, condition);
@@ -461,15 +554,23 @@ fn eval_inner<O: EvalOutput>(
 
         ConditionNode::AllDepsMatch { condition, .. } => {
             let base = *counter;
+            let eval_all = condition.has_stateful_nodes();
             let val = ctx
                 .cache
                 .upstream_deps
                 .get(ctx.target_key)
                 .map(|deps| {
-                    deps.iter().all(|dep| {
+                    let mut all = true;
+                    for dep in deps {
                         *counter = base;
-                        eval_on_dep(dep, condition, ctx, counter, dep_results)
-                    })
+                        if !eval_on_dep(dep, condition, ctx, counter, dep_results) {
+                            all = false;
+                            if !eval_all {
+                                break;
+                            }
+                        }
+                    }
+                    all
                 })
                 .unwrap_or(true);
             finalize_dep_counter(counter, base, condition);
@@ -478,10 +579,17 @@ fn eval_inner<O: EvalOutput>(
 
         ConditionNode::AssetMatches { keys, condition } => {
             let base = *counter;
-            let val = keys.iter().any(|key| {
+            let eval_all = condition.has_stateful_nodes();
+            let mut val = false;
+            for key in keys {
                 *counter = base;
-                eval_on_dep(key, condition, ctx, counter, dep_results)
-            });
+                if eval_on_dep(key, condition, ctx, counter, dep_results) {
+                    val = true;
+                    if !eval_all {
+                        break;
+                    }
+                }
+            }
             finalize_dep_counter(counter, base, condition);
             O::leaf(val, my_idx, node)
         }
@@ -501,6 +609,13 @@ fn eval_inner<O: EvalOutput>(
                 if result {
                     let out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
                     result = out.val();
+                    if O::COLLECTS_CHILDREN {
+                        child_outs.push(out);
+                    }
+                } else if child.has_stateful_nodes() {
+                    // Short-circuited, but evaluate to persist the child's latch
+                    // (its value is ignored — the And stays false).
+                    let out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
                     if O::COLLECTS_CHILDREN {
                         child_outs.push(out);
                     }
@@ -527,6 +642,13 @@ fn eval_inner<O: EvalOutput>(
                     if O::COLLECTS_CHILDREN {
                         child_outs.push(out);
                     }
+                } else if child.has_stateful_nodes() {
+                    // Short-circuited, but evaluate to persist the child's latch
+                    // (its value is ignored — the Or stays true).
+                    let out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
+                    if O::COLLECTS_CHILDREN {
+                        child_outs.push(out);
+                    }
                 } else if O::COLLECTS_CHILDREN {
                     child_outs.push(O::skipped(child, counter));
                 } else {
@@ -550,9 +672,9 @@ fn eval_inner<O: EvalOutput>(
         ConditionNode::NewlyTrue(child) => {
             let child_out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
             let current = child_out.val();
-            let previous = ctx
-                .prev_state
-                .previous_results
+            let previous = dep_results
+                .cur_prev
+                .unwrap_or(&ctx.prev_state.previous_results)
                 .get(&my_idx)
                 .copied()
                 .unwrap_or(false);
@@ -573,9 +695,9 @@ fn eval_inner<O: EvalOutput>(
             let reset_out = eval_inner::<O>(reset, ctx, counter, sub_results, dep_results);
             let trigger_val = trigger_out.val();
             let reset_val = reset_out.val();
-            let prev_latch = ctx
-                .prev_state
-                .previous_results
+            let prev_latch = dep_results
+                .cur_prev
+                .unwrap_or(&ctx.prev_state.previous_results)
                 .get(&my_idx)
                 .copied()
                 .unwrap_or(false);
@@ -673,6 +795,8 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
         let mut dep_scope = DepScope {
             prev: root_dep_selections(ctx),
             acc: &mut dep_selections,
+            cur_prev: None,
+            bridged: HashMap::new(),
         };
         let (selection, tree): (PartitionSelection, EvalNodeResult) = eval_partitioned(
             node,
@@ -701,6 +825,8 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
         let mut dep_scope = DepScope {
             prev: &ctx.prev_state.dep_previous_results,
             acc: &mut dep_results,
+            cur_prev: None,
+            bridged: HashMap::new(),
         };
         let tree =
             eval_inner::<EvalNodeResult>(node, ctx, &mut counter, &mut sub_results, &mut dep_scope);
@@ -922,15 +1048,13 @@ fn eval_on_dep(
         .all_asset_states
         .get(dep_key)
         .unwrap_or(&EMPTY_CONDITION_STATE);
-    let mut synthetic = dep_state.clone();
-    synthetic.previous_results = dep_results.prev.get(dep_key).cloned().unwrap_or_default();
     let dep_ctx = EvalContext {
         target_key: dep_key,
         root_key: ctx.root_key,
         target_record: dep_record,
         cache: ctx.cache,
         tags: ctx.tags,
-        prev_state: &synthetic,
+        prev_state: dep_state,
         all_asset_states: ctx.all_asset_states,
         requested_this_tick: ctx.requested_this_tick,
         now: ctx.now,
@@ -939,10 +1063,13 @@ fn eval_on_dep(
         root_partition_floor: None,
     };
     let mut local = HashMap::new();
+    // Stateful ops read the root's per-dep latch, not the dep's own results.
+    let saved = dep_results.cur_prev;
+    let latch = dep_results.prev.get(dep_key).unwrap_or(&EMPTY_BOOL_LATCH);
+    dep_results.cur_prev = Some(latch);
     let val = eval_inner(condition, &dep_ctx, counter, &mut local, dep_results);
-    if !local.is_empty() {
-        dep_results.acc.insert(dep_key.to_string(), local);
-    }
+    dep_results.cur_prev = saved;
+    collect_dep_latch(dep_results, dep_key, local);
     val
 }
 
@@ -1217,7 +1344,7 @@ fn eval_partitioned<O: PartEvalOutput>(
             let mut result = PartitionSelection::Keys(pctx.all_keys.clone());
             let mut child_parts = Vec::with_capacity(children.len());
             for child in children {
-                if result.is_empty() {
+                if result.is_empty() && !child.has_stateful_nodes() {
                     child_parts.push(O::skipped_child(child, counter));
                 } else {
                     let child_out = eval_partitioned::<O>(
@@ -1229,7 +1356,11 @@ fn eval_partitioned<O: PartEvalOutput>(
                         dep_selections,
                     );
                     let (child_sel, child_part) = O::into_parts(child_out);
-                    result = result.intersect(&child_sel);
+                    // Once empty the And stays empty; a stateful child is still
+                    // evaluated above to persist its latch.
+                    if !result.is_empty() {
+                        result = result.intersect(&child_sel);
+                    }
                     child_parts.push(child_part);
                 }
             }
@@ -1240,7 +1371,7 @@ fn eval_partitioned<O: PartEvalOutput>(
             let mut result = PartitionSelection::Empty;
             let mut child_parts = Vec::with_capacity(children.len());
             for child in children {
-                if result.is_all() {
+                if result.is_all() && !child.has_stateful_nodes() {
                     child_parts.push(O::skipped_child(child, counter));
                 } else {
                     let child_out = eval_partitioned::<O>(
@@ -1252,7 +1383,11 @@ fn eval_partitioned<O: PartEvalOutput>(
                         dep_selections,
                     );
                     let (child_sel, child_part) = O::into_parts(child_out);
-                    result = result.union(&child_sel);
+                    // Once all the Or stays all; a stateful child is still
+                    // evaluated above to persist its latch.
+                    if !result.is_all() {
+                        result = result.union(&child_sel);
+                    }
                     child_parts.push(child_part);
                 }
             }
@@ -1271,13 +1406,7 @@ fn eval_partitioned<O: PartEvalOutput>(
             let child_out =
                 eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
             let (current, child_part) = O::into_parts(child_out);
-            let previous = ctx
-                .prev_state
-                .partition_state
-                .as_ref()
-                .and_then(|ps| ps.previous_selections.get(&my_idx))
-                .cloned()
-                .unwrap_or(PartitionSelection::Empty);
+            let previous = prev_partition_latch(dep_selections, ctx, my_idx);
             // First-tick behavior handled via InitialEvaluation composition.
             let result = current.difference(&previous, pctx.all_keys);
             sub_selections.insert(my_idx, current);
@@ -1291,13 +1420,7 @@ fn eval_partitioned<O: PartEvalOutput>(
                 eval_partitioned::<O>(reset, ctx, pctx, counter, sub_selections, dep_selections);
             let (trigger_sel, trigger_part) = O::into_parts(trigger_out);
             let (reset_sel, reset_part) = O::into_parts(reset_out);
-            let prev_latch = ctx
-                .prev_state
-                .partition_state
-                .as_ref()
-                .and_then(|ps| ps.previous_selections.get(&my_idx))
-                .cloned()
-                .unwrap_or(PartitionSelection::Empty);
+            let prev_latch = prev_partition_latch(dep_selections, ctx, my_idx);
             // (prev_latched ∪ trigger) - reset
             let result = prev_latch
                 .union(&trigger_sel)
@@ -1384,6 +1507,9 @@ fn eval_partitioned_all_deps(
     dep_selections: &mut DepScope<PartitionSelection>,
 ) -> PartitionSelection {
     let base = *counter;
+    // Stateful inner: visit every dep, else a dep skipped by the empty-intersection
+    // break loses its latch.
+    let eval_all = condition.has_stateful_nodes();
     let result = match ctx.cache.upstream_deps.get(ctx.target_key) {
         Some(deps) if !deps.is_empty() => {
             let mut result = PartitionSelection::Keys(pctx.all_keys.clone());
@@ -1392,7 +1518,7 @@ fn eval_partitioned_all_deps(
                 let dep_sel =
                     eval_partitioned_on_dep(dep, condition, ctx, pctx, counter, dep_selections);
                 result = result.intersect(&dep_sel);
-                if result.is_empty() {
+                if result.is_empty() && !eval_all {
                     break;
                 }
             }
@@ -1480,21 +1606,19 @@ fn eval_partitioned_on_dep(
         None => return PartitionSelection::Empty,
     };
 
-    // Per-dep latch lives under the root's partition state, keyed by dep.
-    let prev_dep_sel: HashMap<u32, PartitionSelection> = dep_selections
-        .prev
-        .get(dep_key)
-        .cloned()
-        .unwrap_or_default();
+    // Per-dep latch lives under the root's partition state, keyed by dep. Borrowed
+    // (not cloned): threaded into the dep eval via `cur_prev`/`bool_latch` below.
+    let prev_dep_sel: Option<&HashMap<u32, PartitionSelection>> = dep_selections.prev.get(dep_key);
 
-    let upstream_all_keys: HashSet<PartitionKey> = pctx
-        .resolver
-        .upstream_partition_keys
-        .get(dep_key)
-        .cloned()
-        .unwrap_or_default();
+    // A genuinely-unpartitioned dep is ABSENT from the partition-key map; a
+    // partitioned dep with a momentarily-empty universe (dynamic namespace with
+    // no keys yet) is PRESENT with an empty set. Only the former takes the bool
+    // fallback — the latter must stay on the partitioned path below, or the
+    // fallback bridges its stateful latch to `All` and fires the whole universe
+    // once the dep gains keys.
+    let upstream_entry = pctx.resolver.upstream_partition_keys.get(dep_key);
 
-    if upstream_all_keys.is_empty() {
+    if upstream_entry.is_none() {
         // Upstream is unpartitioned — fall back to bool evaluation, but floor
         // the dep against the root's OLDEST partition (min), not the asset-level
         // max, so a `NewlyUpdated` pivot fires while any root partition is
@@ -1507,19 +1631,13 @@ fn eval_partitioned_on_dep(
             .all_asset_states
             .get(dep_key)
             .unwrap_or(&EMPTY_CONDITION_STATE);
-        // Recover the bool view of the per-dep latch (non-empty selection == true).
-        let mut synthetic = dep_state.clone();
-        synthetic.previous_results = prev_dep_sel
-            .iter()
-            .map(|(idx, sel)| (*idx, !sel.is_empty()))
-            .collect();
         let dep_ctx = EvalContext {
             target_key: dep_key,
             root_key: ctx.root_key,
             target_record: dep_record,
             cache: ctx.cache,
             tags: ctx.tags,
-            prev_state: &synthetic,
+            prev_state: dep_state,
             all_asset_states: ctx.all_asset_states,
             requested_this_tick: ctx.requested_this_tick,
             now: ctx.now,
@@ -1527,21 +1645,46 @@ fn eval_partitioned_on_dep(
             partitions: None,
             root_partition_floor: Some(root_floor),
         };
+        // Bool view of the per-dep latch (non-empty selection == true).
+        let bool_latch: HashMap<u32, bool> = prev_dep_sel
+            .map(|m| m.iter().map(|(idx, sel)| (*idx, !sel.is_empty())).collect())
+            .unwrap_or_default();
         let mut local = HashMap::new();
         // Unpartitioned upstream → bool eval; the dep's own latch round-trips via
-        // `local`. A dep-aggregate nested inside the fallback isn't carried (would
-        // need bool<->selection bridging — a rare corner).
-        let nested_prev = HashMap::new();
+        // `local`. A dep-aggregate nested inside the fallback keeps its own per-dep
+        // latches in `nested_acc`, bridged to/from selection space (non-empty == true)
+        // so they persist across ticks like the partitioned path.
+        let nested_prev: HashMap<String, HashMap<u32, bool>> = dep_selections
+            .prev
+            .iter()
+            .map(|(k, m)| {
+                (
+                    k.clone(),
+                    m.iter().map(|(idx, sel)| (*idx, !sel.is_empty())).collect(),
+                )
+            })
+            .collect();
         let mut nested_acc = HashMap::new();
         let mut bool_scope = DepScope {
             prev: &nested_prev,
             acc: &mut nested_acc,
+            cur_prev: Some(&bool_latch),
+            bridged: HashMap::new(),
         };
         let val = eval_inner(condition, &dep_ctx, counter, &mut local, &mut bool_scope);
-        if !local.is_empty() {
-            dep_selections.acc.insert(
-                dep_key.to_string(),
-                local
+        collect_bridged_latch(
+            dep_selections,
+            dep_key,
+            local
+                .into_iter()
+                .map(|(idx, b)| (idx, PartitionSelection::from_bool(b)))
+                .collect(),
+        );
+        for (nested_key, idx_map) in nested_acc {
+            collect_bridged_latch(
+                dep_selections,
+                &nested_key,
+                idx_map
                     .into_iter()
                     .map(|(idx, b)| (idx, PartitionSelection::from_bool(b)))
                     .collect(),
@@ -1549,6 +1692,9 @@ fn eval_partitioned_on_dep(
         }
         return PartitionSelection::from_bool(val);
     }
+
+    // Partitioned dep (present in the map); the universe may be empty this tick.
+    let upstream_all_keys: HashSet<PartitionKey> = upstream_entry.cloned().unwrap_or_default();
 
     let empty_status = crate::condition::cache::PartitionStatusEntry::default();
     let upstream_status = pctx
@@ -1631,25 +1777,14 @@ fn eval_partitioned_on_dep(
         .all_asset_states
         .get(dep_key)
         .unwrap_or(&EMPTY_CONDITION_STATE);
-    // Latch state (previous_selections) comes from the root's per-dep map, in the
-    // dep's key space; everything else (timestamps, handled) stays the dep's own.
-    let mut synthetic = dep_state.clone();
-    match synthetic.partition_state.as_mut() {
-        Some(ps) => ps.previous_selections = prev_dep_sel,
-        None => {
-            synthetic.partition_state = Some(PartitionState {
-                previous_selections: prev_dep_sel,
-                ..Default::default()
-            })
-        }
-    }
+    // Borrow the dep's real state; the latch is overridden via `cur_prev` below.
     let dep_ctx = EvalContext {
         target_key: dep_key,
         root_key: ctx.root_key,
         target_record: dep_record,
         cache: ctx.cache,
         tags: ctx.tags,
-        prev_state: &synthetic,
+        prev_state: dep_state,
         all_asset_states: ctx.all_asset_states,
         requested_this_tick: ctx.requested_this_tick,
         now: ctx.now,
@@ -1659,6 +1794,8 @@ fn eval_partitioned_on_dep(
     };
 
     let mut local = HashMap::new();
+    let saved = dep_selections.cur_prev;
+    dep_selections.cur_prev = Some(prev_dep_sel.unwrap_or(&EMPTY_SELECTION_LATCH));
     let upstream_result: PartitionSelection = eval_partitioned(
         condition,
         &dep_ctx,
@@ -1667,11 +1804,91 @@ fn eval_partitioned_on_dep(
         &mut local,
         dep_selections,
     );
-    if !local.is_empty() {
-        dep_selections.acc.insert(dep_key.to_string(), local);
-    }
+    dep_selections.cur_prev = saved;
+    collect_dep_latch(dep_selections, dep_key, local);
 
     // Map result back to downstream partition space.
     pctx.resolver
         .map_downstream(dep_key, ctx.target_key, &upstream_result)
+}
+
+#[cfg(test)]
+mod latch_merge_tests {
+    use super::*;
+
+    fn scope<'a>(
+        prev: &'a HashMap<String, HashMap<u32, PartitionSelection>>,
+        acc: &'a mut HashMap<String, HashMap<u32, PartitionSelection>>,
+    ) -> DepScope<'a, PartitionSelection> {
+        DepScope {
+            prev,
+            acc,
+            cur_prev: None,
+            bridged: HashMap::new(),
+        }
+    }
+
+    fn keys(s: &str) -> PartitionSelection {
+        PartitionSelection::Keys(std::collections::HashSet::from([
+            crate::storage::PartitionKey::Single {
+                keys: vec![s.to_string()],
+            },
+        ]))
+    }
+
+    /// The (dep, node-idx) accumulator is shared by partitioned pivots
+    /// (precise selections) and the unpartitioned bool fallback's bridge
+    /// (lossy `from_bool`: true → `All`). A bridged write must never replace
+    /// a precise one — last-writer-wins would widen a `Keys` latch to the
+    /// whole universe and over-fire every partition next tick. The reverse
+    /// (precise after bridged) must replace.
+    #[test]
+    fn bridged_write_never_clobbers_precise_latch() {
+        let prev = HashMap::new();
+        let mut acc = HashMap::new();
+        let mut sc = scope(&prev, &mut acc);
+
+        collect_dep_latch(&mut sc, "d", HashMap::from([(2u32, keys("d1"))]));
+        collect_bridged_latch(&mut sc, "d", HashMap::from([(2u32, PartitionSelection::All)]));
+        assert_eq!(
+            sc.acc["d"][&2],
+            keys("d1"),
+            "a bridged All must not widen a precise Keys latch"
+        );
+
+        // Precise replaces a previously-bridged slot.
+        collect_bridged_latch(&mut sc, "d", HashMap::from([(3u32, PartitionSelection::All)]));
+        collect_dep_latch(&mut sc, "d", HashMap::from([(3u32, keys("d2"))]));
+        assert_eq!(sc.acc["d"][&3], keys("d2"));
+        // And a later bridged write still can't clobber it.
+        collect_bridged_latch(
+            &mut sc,
+            "d",
+            HashMap::from([(3u32, PartitionSelection::Empty)]),
+        );
+        assert_eq!(sc.acc["d"][&3], keys("d2"));
+    }
+
+    /// Two bridged writers for the same slot (sibling aggregates reaching the
+    /// same nested dep through different unpartitioned paths) must merge by
+    /// union, not last-writer-wins — a later `Empty` (false) would silently
+    /// erase a sibling's latched `All` (true) and re-fire its NewlyTrue/Since.
+    #[test]
+    fn bridged_writes_union_instead_of_clobbering() {
+        let prev = HashMap::new();
+        let mut acc = HashMap::new();
+        let mut sc = scope(&prev, &mut acc);
+
+        collect_bridged_latch(&mut sc, "d", HashMap::from([(1u32, PartitionSelection::All)]));
+        collect_bridged_latch(
+            &mut sc,
+            "d",
+            HashMap::from([(1u32, PartitionSelection::Empty)]),
+        );
+        assert_eq!(
+            sc.acc["d"][&1],
+            PartitionSelection::All,
+            "a sibling's false latch must not erase a latched true"
+        );
+    }
 }
