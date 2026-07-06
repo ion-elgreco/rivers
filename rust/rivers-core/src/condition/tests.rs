@@ -2926,6 +2926,64 @@ fn all_partitions_dep_frontier_key_does_not_refire_whole_universe() {
 }
 
 #[test]
+fn test_empty_partitioned_dep_universe_does_not_bridge_latch_to_all() {
+    // A partitioned dep whose universe is momentarily empty (dynamic namespace
+    // with no keys yet) is PRESENT in the resolver's upstream_partition_keys
+    // with an empty set — distinct from a genuinely-unpartitioned dep, which is
+    // ABSENT. It must take the partitioned path, not the bool fallback: the
+    // fallback bridges a true stateful latch to `All`, and next tick (once the
+    // dep gains keys) the partitioned pivot reads that `All` and fires the
+    // whole universe for keys that were never updated.
+    let rk = spk("rk1");
+    let all_keys = HashSet::from([rk.clone()]);
+    let r = make_materialized_record("r", 100);
+    let u = make_record("u"); // never materialized → Missing is true
+    let records = HashMap::from([("r".to_string(), r.clone()), ("u".to_string(), u.clone())]);
+    let deps = HashMap::from([("r".to_string(), vec!["u".to_string()])]);
+
+    let partition_statuses =
+        HashMap::from([("r".to_string(), Default::default())]);
+    let all_states = HashMap::new();
+    let mut ctx = make_ctx("r", &r, &records, &deps);
+    ctx.all_asset_states = &all_states;
+
+    let mappings = HashMap::from([(("r".into(), "u".into()), PartitionMappingKind::Identity)]);
+    // u PRESENT with an EMPTY universe (partitioned, no keys yet).
+    let upstream_u = HashMap::from([("u".to_string(), HashSet::<PartitionKey>::new())]);
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &HashSet::new(),
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &HashMap::new(),
+        resolver: PartitionResolver::new(&mappings, &upstream_u),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let condition = ConditionNode::AnyDepsMatch {
+        condition: Box::new(ConditionNode::NewlyTrue(Box::new(ConditionNode::Missing))),
+        label: None,
+    };
+    let result = evaluate(&condition, &ctx);
+
+    if let Some(dep_sels) = &result.dep_sub_selections {
+        for (dep, latch) in dep_sels {
+            for (idx, sel) in latch {
+                assert_ne!(
+                    sel,
+                    &PartitionSelection::All,
+                    "empty-universe dep {dep} latched node {idx} as All \
+                     (bool-fallback bridge); the partitioned path must be taken"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn all_partitions_dep_genuine_update_still_fires() {
     // The boundary the floor must preserve: when an upstream key IS newer than
     // an attempted downstream key, the AllPartitions edge must still fire.

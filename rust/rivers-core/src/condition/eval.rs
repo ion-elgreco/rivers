@@ -1840,14 +1840,15 @@ fn eval_partitioned_on_dep(
     // (not cloned): threaded into the dep eval via `cur_prev`/`bool_latch` below.
     let prev_dep_sel: Option<&HashMap<u32, PartitionSelection>> = dep_selections.prev.get(dep_key);
 
-    let upstream_all_keys: HashSet<PartitionKey> = pctx
-        .resolver
-        .upstream_partition_keys
-        .get(dep_key)
-        .cloned()
-        .unwrap_or_default();
+    // A genuinely-unpartitioned dep is ABSENT from the partition-key map; a
+    // partitioned dep with a momentarily-empty universe (dynamic namespace with
+    // no keys yet) is PRESENT with an empty set. Only the former takes the bool
+    // fallback — the latter must stay on the partitioned path below, or the
+    // fallback bridges its stateful latch to `All` and fires the whole universe
+    // once the dep gains keys.
+    let upstream_entry = pctx.resolver.upstream_partition_keys.get(dep_key);
 
-    if upstream_all_keys.is_empty() {
+    if upstream_entry.is_none() {
         // Upstream is unpartitioned — fall back to bool evaluation, but floor
         // the dep against the root's OLDEST partition (min), not the asset-level
         // max, so a `NewlyUpdated` pivot fires while any root partition is
@@ -1921,6 +1922,9 @@ fn eval_partitioned_on_dep(
         }
         return PartitionSelection::from_bool(val);
     }
+
+    // Partitioned dep (present in the map); the universe may be empty this tick.
+    let upstream_all_keys: HashSet<PartitionKey> = upstream_entry.cloned().unwrap_or_default();
 
     let empty_status = crate::condition::cache::PartitionStatusEntry::default();
     let upstream_status = pctx
