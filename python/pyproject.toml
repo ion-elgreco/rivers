@@ -7,7 +7,7 @@ license = "LICENSE"
 requires-python = ">=3.10"
 dependencies = [
     "loky>=3.5",
-    "obstore>=0.9.1",
+    "obstore>=0.11.0",
     "pydantic>=2.11.9",
     "pydantic-settings>=2.14.2",
     "typer>=0.9",
