@@ -6667,6 +6667,37 @@ async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completio
     );
 }
 
+#[test]
+fn test_clear_predispatch_mark_drops_empty_entry_only() {
+    // A multi-partition backfill registers no run up front, so `classify`'s
+    // pre-marked empty in_progress entry has no phantom-eviction safety net.
+    // On dispatch failure it must be cleared, but never when real runs exist.
+    let mut cache = AssetConditionCache::new(crate::storage::DEFAULT_CODE_LOCATION_ID.to_string());
+
+    // Pre-mark (empty placeholder, as classify does) → cleared.
+    cache
+        .in_progress_assets
+        .entry("dst".to_string())
+        .or_default();
+    assert!(cache.in_progress_assets.contains_key("dst"));
+    cache.clear_predispatch_mark("dst");
+    assert!(
+        !cache.in_progress_assets.contains_key("dst"),
+        "empty pre-dispatch placeholder must be cleared"
+    );
+
+    // A real run was registered → clear is a no-op (must not wipe live runs).
+    cache.register_dispatched_run("dst".to_string(), "run-1".to_string(), 0, None);
+    cache.clear_predispatch_mark("dst");
+    assert!(
+        cache
+            .in_progress_assets
+            .get("dst")
+            .is_some_and(|r| r.contains_key("run-1")),
+        "an entry with a real run must NOT be cleared"
+    );
+}
+
 #[tokio::test]
 async fn test_cache_completion_fallback_skips_still_started_sibling_effects() {
     // Regression: in the ts-unchanged completion fallback, `has_step_completed`
@@ -6887,6 +6918,75 @@ async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged
     assert!(
         changed,
         "cache should report changes when an in-progress asset's step completes"
+    );
+}
+
+#[tokio::test]
+async fn test_cache_clears_in_progress_when_run_canceled_after_cursor_advanced() {
+    // Regression: a dispatched run that storage reports once (Started/Queued)
+    // is removed from the phantom-eviction safety net and the run cursor
+    // advances to its start_time. If the run is then CANCELED, its terminal
+    // transition neither changes the asset record (no materialization) nor
+    // advances start_time, so `get_runs_since` (which uses `>`) never
+    // re-delivers it and the in-progress completion check (record-ts /
+    // StepSuccess) cannot see it either. The asset stays wedged in_progress
+    // forever and never re-fires. The cache must re-check tracked in-progress
+    // runs by id so a missed terminal transition still clears them.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+
+    let rec_a = make_materialized_record("a", 1000);
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_a])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(cache.in_progress_assets.is_empty());
+
+    // Started run for a → observed, in_progress set, cursor advances to 2000.
+    let run_id = "run-cancel".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    let changed = cache.refresh(&storage, 0).await.unwrap();
+    assert!(changed);
+    assert!(cache.in_progress_assets.contains_key("a"));
+
+    // Run is canceled. start_time stays 2000 (no new materialization record),
+    // so the cursor `> 2000` will never re-deliver this run.
+    storage
+        .update_run_status(&run_id, RunStatus::Canceled, Some(3000))
+        .await
+        .unwrap();
+
+    // Next refresh must clear a from in_progress despite the cursor miss.
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        !cache.in_progress_assets.contains_key("a"),
+        "a should be cleared from in_progress when its run is canceled, even though \
+         the run cursor never re-delivers the cancel. Got in_progress={:?}",
+        cache.in_progress_assets,
     );
 }
 
@@ -8489,7 +8589,10 @@ fn test_partition_mapping_multi_all_sub_overapproximates_to_all() {
             ),
             (
                 "region".into(),
-                ("region".into(), Box::new(PartitionMappingKind::AllPartitions)),
+                (
+                    "region".into(),
+                    Box::new(PartitionMappingKind::AllPartitions),
+                ),
             ),
         ]),
     };
@@ -11612,6 +11715,48 @@ async fn test_pending_run_not_evicted_within_grace() {
             .is_some_and(|v| v.contains_key("pending-run")),
         "in_progress entry within grace should remain"
     );
+}
+
+#[tokio::test]
+async fn test_clear_dispatched_run_rolls_back_failed_dispatch() {
+    // A synchronous dispatch failure means the run record never reached
+    // storage; the mark must drop immediately instead of waiting out the
+    // phantom-eviction grace period.
+    let (_storage, mut cache) = pending_test_setup().await;
+    cache.register_dispatched_run("a".into(), "joint-run".into(), 1_000_000, None);
+    cache.register_dispatched_run("b".into(), "joint-run".into(), 1_000_000, None);
+    cache.register_dispatched_run("c".into(), "solo-run".into(), 1_000_000, None);
+
+    cache.clear_dispatched_run("a", "joint-run");
+    assert!(
+        !cache.in_progress_assets.contains_key("a"),
+        "cleared asset must be untracked immediately"
+    );
+    assert!(
+        cache
+            .in_progress_assets
+            .get("b")
+            .is_some_and(|v| v.contains_key("joint-run")),
+        "other assets of the run keep their mark until cleared themselves"
+    );
+    assert!(
+        cache
+            .pending_runs
+            .get("joint-run")
+            .is_some_and(|p| p.asset_keys == vec!["b".to_string()]),
+        "pending entry drops only the cleared asset"
+    );
+
+    cache.clear_dispatched_run("b", "joint-run");
+    assert!(
+        !cache.pending_runs.contains_key("joint-run"),
+        "pending entry is removed once its last asset is cleared"
+    );
+    assert!(!cache.in_progress_assets.contains_key("b"));
+
+    cache.clear_dispatched_run("c", "solo-run");
+    assert!(!cache.in_progress_assets.contains_key("c"));
+    assert!(!cache.pending_runs.contains_key("solo-run"));
 }
 
 #[tokio::test]

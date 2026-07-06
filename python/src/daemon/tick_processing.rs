@@ -64,7 +64,11 @@ pub(crate) async fn process_tick_result(
                 // Same outcome shape as runs: successful non-dry-run ids +
                 // per-request errors (a dry run produces no record).
                 let bf_outcome = backfill_dispatcher.dispatch(backfill_requests).await.map(
-                    |BackfillDispatchOutcome { results, errors }| DispatchOutcome {
+                    |BackfillDispatchOutcome {
+                         results,
+                         errors,
+                         failed_targets: _,
+                     }| DispatchOutcome {
                         ids: results
                             .into_iter()
                             .filter(|r| !r.is_dry_run && !r.backfill_id.is_empty())
