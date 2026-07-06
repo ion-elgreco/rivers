@@ -1122,14 +1122,16 @@ impl AssetConditionCache {
             let last_runs = storage.get_runs_by_ids(&last_run_ids, None).await?;
             let runs_by_id: HashMap<&str, &crate::storage::RunRecord> =
                 last_runs.iter().map(|r| (r.run_id.as_str(), r)).collect();
-            type AssetRunRow = (
-                String,
-                RunStatus,
-                i64,
-                Option<PartitionKey>,
-                RunTags,
-                Arc<[String]>,
-            );
+            // Only the last run's tags / asset_names are restored here. NO
+            // asset-level floor: this run is the asset's `last_run_id`, and
+            // `last_run_id` is advanced only by a materialization event, so the
+            // asset produced output in it — exactly the `materialized_here`
+            // case the live refresh path exempts. Flooring it would invert the
+            // floor across restart for an asset that materialized in a failed
+            // joint run. A genuinely-failed asset (step failed, no
+            // materialization) keeps its `last_run_id` at its prior success and
+            // is never reached through this lookup.
+            type AssetRunRow = (String, Option<PartitionKey>, RunTags, Arc<[String]>);
             let asset_runs: Vec<AssetRunRow> = self
                 .records
                 .values()
@@ -1144,8 +1146,6 @@ impl AssetConditionCache {
                         .map(|pk| {
                             (
                                 record.asset_key.clone(),
-                                run.status.clone(),
-                                run.end_time.unwrap_or(run.start_time),
                                 pk,
                                 Arc::from(run.tags.as_slice()),
                                 Arc::from(run.node_names.as_slice()),
@@ -1156,20 +1156,7 @@ impl AssetConditionCache {
                 })
                 .flatten()
                 .collect();
-            for (asset_key, status, run_ts, partition_key, tags, asset_names) in &asset_runs {
-                // Asset-level floor is unpartitioned; a partitioned asset's
-                // keyed failures live in partition_status (loaded separately).
-                // Unpartitioned assets floor even from partition-keyed (mixed
-                // selection) runs — nothing else records their outcome.
-                if *status == RunStatus::Failure
-                    && (partition_key.is_none() || !self.is_partitioned(asset_key))
-                {
-                    self.failed_assets.insert(asset_key.clone());
-                    self.failed_asset_timestamps
-                        .entry(asset_key.clone())
-                        .and_modify(|t| *t = (*t).max(*run_ts))
-                        .or_insert(*run_ts);
-                }
+            for (asset_key, partition_key, tags, asset_names) in &asset_runs {
                 if !tags.is_empty() {
                     self.update_run_tags(asset_key, partition_key, tags);
                 }

@@ -7323,6 +7323,93 @@ async fn test_clearable_sweep_records_partitioned_failure_in_partition_status() 
 }
 
 #[tokio::test]
+async fn test_initial_load_does_not_floor_asset_materialized_in_failed_joint_run() {
+    // Regression (restart inversion): a joint run R=[x,y] fails because y's step
+    // failed, but x materialized (its Materialization event advanced
+    // records[x].last_run_id to R). The live path exempts x from the floor via
+    // materialized_here. On daemon restart, initial_load rebuilds floors by
+    // looking up each asset's last_run_id run — which, for x, IS R (status
+    // Failure). Because last_run_id is written only by materialization events,
+    // an asset whose last_run_id names a failed run necessarily materialized in
+    // it, so initial_load must NOT floor it — else the floor inverts across
+    // restart.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, RunRecord, RunStatus, StorageBackend,
+    };
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[
+            make_materialized_record("x", 1000),
+            make_materialized_record("y", 1000),
+        ])
+        .await
+        .unwrap();
+
+    let run_id = "run-joint-fail".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Failure,
+            start_time: 2000,
+            end_time: Some(3000),
+            tags: vec![],
+            node_names: vec!["x".to_string(), "y".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    // x materialized in R (advances x.last_run_id to R); y's step failed.
+    storage
+        .store_events(&[
+            EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::Materialization {
+                    data_version: Some("dv-x2".to_string()),
+                },
+                asset_key: Some("x".to_string()),
+                run_id: run_id.clone(),
+                partition_key: None,
+                timestamp: 3000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            },
+            EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("y".to_string()),
+                run_id: run_id.clone(),
+                partition_key: None,
+                timestamp: 3000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            },
+        ])
+        .await
+        .unwrap();
+
+    // Fresh cache = daemon restart → initial_load.
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    assert!(
+        !cache.failed_assets.contains("x"),
+        "x materialized in the failed joint run → must not be floored on restart; \
+         got failed_assets={:?}",
+        cache.failed_assets,
+    );
+}
+
+#[tokio::test]
 async fn test_queued_run_is_not_cleared_by_sweep() {
     // A run dispatched in run_queue mode is registered in in_progress_assets and
     // written to storage as Queued. The clearable sweep must NOT treat Queued as
