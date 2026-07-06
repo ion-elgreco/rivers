@@ -51,7 +51,7 @@ prost = "0.14"
 # member crate only pulls (and rebuilds) the layer it actually uses.
 # `kube-client` defaults are `client + ring`; `rustls-tls` mirrors the old
 # `kube` umbrella default.
-kube-client = { version = "3.1", features = ["rustls-tls"] }
+kube-client = { version = "4.0", features = ["rustls-tls"] }
 kube-runtime = "3.1"
 kube-derive = "3.1"
 kube-core = "3.1"
