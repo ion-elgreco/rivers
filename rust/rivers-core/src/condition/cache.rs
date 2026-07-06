@@ -568,7 +568,13 @@ impl AssetConditionCache {
             if !clearable.is_empty() {
                 let tracked_runs = storage.get_runs_by_ids(&clearable, None).await?;
                 for run in &tracked_runs {
-                    if matches!(run.status, RunStatus::Started | RunStatus::NotStarted) {
+                    // Only terminal runs un-gate the asset. A Queued run still
+                    // waits in the run queue, so clearing it re-opens the
+                    // dispatch gate and re-enqueues a duplicate every tick.
+                    if !matches!(
+                        run.status,
+                        RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
+                    ) {
                         continue;
                     }
                     delta.clear_run(run);

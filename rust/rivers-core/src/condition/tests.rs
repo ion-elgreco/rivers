@@ -7323,6 +7323,60 @@ async fn test_clearable_sweep_records_partitioned_failure_in_partition_status() 
 }
 
 #[tokio::test]
+async fn test_queued_run_is_not_cleared_by_sweep() {
+    // A run dispatched in run_queue mode is registered in in_progress_assets and
+    // written to storage as Queued. The clearable sweep must NOT treat Queued as
+    // terminal: clearing it un-gates the asset while its run still waits in the
+    // queue, so eager()/on_missing re-enqueues a duplicate every tick until the
+    // coordinator drains it. Only Success/Failure/Canceled are terminal.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let rec_a = make_materialized_record("a", 1000);
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_a])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    // Dispatch registers the asset; the queued dispatcher writes a Queued record.
+    let run_id = "run-queued".to_string();
+    cache.register_dispatched_run("a".to_string(), run_id.clone(), 0, None);
+    assert!(cache.in_progress_assets.contains_key("a"));
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Queued,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+
+    // Refresh must keep `a` gated — its run is still queued, not terminal.
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        cache.in_progress_assets.contains_key("a"),
+        "a queued run must keep the asset in_progress; got in_progress={:?}",
+        cache.in_progress_assets,
+    );
+}
+
+#[tokio::test]
 async fn test_cache_does_not_store_empty_run_tags() {
     // Regression: update_run_tags previously stored empty tag vecs in the cache.
     // With an empty entry, run_tags_match(&[], &[], &[]) returns true (vacuous
