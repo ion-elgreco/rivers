@@ -224,8 +224,9 @@ pub struct AssetConditionCache {
     pub last_run_asset_names: HashMap<String, Arc<[String]>>,
     /// Full `asset_names` from the latest completed run per asset+partition.
     pub partition_last_run_asset_names: PartitionLastRunAssetNamesMap,
-    /// Asset keys that are partitioned — drives partition status loading/refresh.
-    partitioned_asset_keys: Vec<String>,
+    /// Asset keys that are partitioned — drives partition status loading/refresh
+    /// and scopes run outcomes to partition_status vs the asset-level floor.
+    partitioned_asset_keys: HashSet<String>,
     /// Whether any condition tree uses HasRunWithTags/AllRunsHaveTags.
     /// When false, `update_tick_materialization_tags` is skipped entirely.
     needs_tick_tags: bool,
@@ -269,7 +270,7 @@ impl AssetConditionCache {
             tick_partition_materialization_tags: HashMap::new(),
             last_run_asset_names: HashMap::new(),
             partition_last_run_asset_names: HashMap::new(),
-            partitioned_asset_keys: Vec::new(),
+            partitioned_asset_keys: HashSet::new(),
             needs_tick_tags: false,
             ctx: crate::storage::CodeLocationContext::new(code_location_id),
             pending_runs: HashMap::new(),
@@ -376,7 +377,13 @@ impl AssetConditionCache {
     /// Register which assets are partitioned. Must be called before the first
     /// `refresh()` so that `initial_load` knows to load partition status.
     pub fn set_partitioned_assets(&mut self, keys: Vec<String>) {
-        self.partitioned_asset_keys = keys;
+        self.partitioned_asset_keys = keys.into_iter().collect();
+    }
+
+    /// Whether `asset` is registered partitioned — its run outcomes belong in
+    /// `partition_status`, not the unpartitioned asset-level failure floor.
+    fn is_partitioned(&self, asset: &str) -> bool {
+        self.partitioned_asset_keys.contains(asset)
     }
 
     /// Scan condition trees and enable tick-level tag tracking only if any tree
@@ -756,10 +763,13 @@ impl AssetConditionCache {
         let run_ts = run.end_time.unwrap_or(run.start_time);
         for asset in &run.node_names {
             // The asset-level failure floor is unpartitioned. A partitioned
-            // run's failure/success belongs in partition_status (recomputed from
-            // storage each refresh); floor it here and one partition's outcome
-            // would (un)floor the whole asset for unpartitioned consumers.
-            if run.partition_key.is_none() {
+            // ASSET's keyed outcome belongs in partition_status (recomputed
+            // from storage); floor it here and one partition's outcome would
+            // (un)floor the whole asset for unpartitioned consumers. But a
+            // partition-keyed run can also cover UNPARTITIONED assets (mixed
+            // selection) whose outcome lands nowhere else — gate per asset,
+            // not per run, or their floor never sets/clears.
+            if run.partition_key.is_none() || !self.is_partitioned(asset) {
                 if is_failure {
                     delta
                         .failed_adds
@@ -1100,14 +1110,16 @@ impl AssetConditionCache {
             let last_runs = storage.get_runs_by_ids(&last_run_ids, None).await?;
             let runs_by_id: HashMap<&str, &crate::storage::RunRecord> =
                 last_runs.iter().map(|r| (r.run_id.as_str(), r)).collect();
-            type AssetRunRow = (
-                String,
-                RunStatus,
-                i64,
-                Option<PartitionKey>,
-                RunTags,
-                Arc<[String]>,
-            );
+            // Only the last run's tags / asset_names are restored here. NO
+            // asset-level floor: this run is the asset's `last_run_id`, and
+            // `last_run_id` is advanced only by a materialization event, so the
+            // asset produced output in it — exactly the `materialized_here`
+            // case the live refresh path exempts. Flooring it would invert the
+            // floor across restart for an asset that materialized in a failed
+            // joint run. A genuinely-failed asset (step failed, no
+            // materialization) keeps its `last_run_id` at its prior success and
+            // is never reached through this lookup.
+            type AssetRunRow = (String, Option<PartitionKey>, RunTags, Arc<[String]>);
             let asset_runs: Vec<AssetRunRow> = self
                 .records
                 .values()
@@ -1122,8 +1134,6 @@ impl AssetConditionCache {
                         .map(|pk| {
                             (
                                 record.asset_key.clone(),
-                                run.status.clone(),
-                                run.end_time.unwrap_or(run.start_time),
                                 pk,
                                 Arc::from(run.tags.as_slice()),
                                 Arc::from(run.node_names.as_slice()),
@@ -1134,16 +1144,7 @@ impl AssetConditionCache {
                 })
                 .flatten()
                 .collect();
-            for (asset_key, status, run_ts, partition_key, tags, asset_names) in &asset_runs {
-                // Asset-level floor is unpartitioned; partitioned failures live
-                // in partition_status (loaded separately).
-                if *status == RunStatus::Failure && partition_key.is_none() {
-                    self.failed_assets.insert(asset_key.clone());
-                    self.failed_asset_timestamps
-                        .entry(asset_key.clone())
-                        .and_modify(|t| *t = (*t).max(*run_ts))
-                        .or_insert(*run_ts);
-                }
+            for (asset_key, partition_key, tags, asset_names) in &asset_runs {
                 if !tags.is_empty() {
                     self.update_run_tags(asset_key, partition_key, tags);
                 }
@@ -1449,6 +1450,7 @@ mod tests {
         // (e.g. an unpartitioned downstream matching this dep on
         // execution_failed()) and would wrongly report the whole asset failed.
         let mut cache = AssetConditionCache::new("default".to_string());
+        cache.set_partitioned_assets(vec!["P".to_string()]);
         let mut run = mk_run("P", RunStatus::Failure, &["P"], 150);
         run.partition_key = Some(PartitionKey::Single {
             keys: vec!["p1".to_string()],
@@ -1464,6 +1466,44 @@ mod tests {
         assert!(
             !cache.failed_asset_timestamps.contains_key("P"),
             "no asset-level failure timestamp for a partitioned run"
+        );
+    }
+
+    #[test]
+    fn partition_keyed_success_clears_unpartitioned_asset_floor() {
+        // repo.materialize(["P","D"], partition_key=...) is a sanctioned mixed
+        // selection: the run carries a partition key but also covers the
+        // unpartitioned asset D, whose outcome can't land in partition_status.
+        // A run-level partition gate would skip D's floor bookkeeping entirely
+        // — a pre-existing failure floor then survives every mixed success
+        // (execution_failed() stays true, eager() stays suppressed) until an
+        // unpartitioned success or a daemon restart.
+        let mut cache = AssetConditionCache::new("default".to_string());
+        cache.set_partitioned_assets(vec!["P".to_string()]);
+
+        // D floored by an earlier unpartitioned failure.
+        let fail = mk_run("run-f", RunStatus::Failure, &["D"], 100);
+        let mut delta = RefreshDelta::default();
+        cache.apply_run_effects_to_delta(&fail, &mut delta);
+        cache.apply_refresh_delta(delta);
+        assert!(cache.failed_assets.contains("D"));
+
+        // A later mixed-selection success carrying a partition key.
+        let mut ok = mk_run("run-s", RunStatus::Success, &["P", "D"], 200);
+        ok.partition_key = Some(PartitionKey::Single {
+            keys: vec!["2024-01-01".to_string()],
+        });
+        let mut delta = RefreshDelta::default();
+        cache.apply_run_effects_to_delta(&ok, &mut delta);
+        cache.apply_refresh_delta(delta);
+
+        assert!(
+            !cache.failed_assets.contains("D"),
+            "a partition-keyed success covering unpartitioned D must clear D's floor"
+        );
+        assert!(
+            !cache.failed_assets.contains("P"),
+            "the partitioned asset's outcome stays out of the asset-level floor"
         );
     }
 }
