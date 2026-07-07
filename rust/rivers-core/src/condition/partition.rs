@@ -440,12 +440,56 @@ pub struct PartitionEvalContext<'a> {
     pub dep_root_floor: Option<&'a HashMap<PartitionKey, Option<i64>>>,
 }
 
+/// Serde adapter for a `PartitionKey`-keyed map: `serde_json` rejects non-string
+/// map keys, so persist it as a sequence of `(key, value)` pairs.
+mod partition_key_i64_map {
+    use super::PartitionKey;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::HashMap;
+
+    pub fn serialize<S: Serializer>(
+        map: &HashMap<PartitionKey, i64>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        map.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<HashMap<PartitionKey, i64>, D::Error> {
+        // Blobs written before the pairs format stored this field as a JSON
+        // map — necessarily empty (`{}`): a non-empty `PartitionKey`-keyed
+        // map never survived serialization. Rejecting that shape fails the
+        // whole eval-state load and wipes every latch on upgrade, so accept
+        // both.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum MapOrSeq {
+            Seq(Vec<(PartitionKey, i64)>),
+            // Match the legacy JSON-MAP shape specifically (only `{}` ever
+            // persisted) so a corrupted scalar still fails loudly rather than
+            // silently loading as empty. The payload is deserialize-only; its
+            // contents are discarded.
+            #[allow(dead_code)]
+            LegacyMap(HashMap<String, serde::de::IgnoredAny>),
+        }
+        Ok(match MapOrSeq::deserialize(deserializer)? {
+            MapOrSeq::Seq(pairs) => pairs.into_iter().collect(),
+            MapOrSeq::LegacyMap(_) => HashMap::new(),
+        })
+    }
+}
+
 /// Per-partition condition evaluation state, persisted across ticks.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PartitionState {
     /// Per-node partition selections from previous tick.
     pub previous_selections: HashMap<u32, PartitionSelection>,
     /// Per-partition materialization timestamps from previous tick.
+    /// Persisted as a sequence of pairs: `serde_json` can't use `PartitionKey`
+    /// (an enum) as a JSON map key.
+    #[serde(with = "partition_key_i64_map")]
     pub timestamps: HashMap<PartitionKey, i64>,
     /// Partitions that have been handled (materialization triggered) since last reset.
     pub handled: HashSet<PartitionKey>,
