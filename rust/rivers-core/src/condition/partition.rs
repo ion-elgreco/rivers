@@ -536,6 +536,11 @@ mod partition_key_i64_map {
         #[serde(untagged)]
         enum MapOrSeq {
             Seq(Vec<(PartitionKey, i64)>),
+            // Match the legacy JSON-MAP shape specifically (only `{}` ever
+            // persisted) so a corrupted scalar still fails loudly rather than
+            // silently loading as empty. The payload is deserialize-only; its
+            // contents are discarded.
+            #[allow(dead_code)]
             LegacyMap(HashMap<String, serde::de::IgnoredAny>),
         }
         Ok(match MapOrSeq::deserialize(deserializer)? {
