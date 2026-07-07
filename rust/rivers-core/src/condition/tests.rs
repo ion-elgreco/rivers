@@ -10997,6 +10997,52 @@ fn test_node_label_exhaustive() {
 }
 
 #[test]
+fn test_display_label_is_readable_not_a_fingerprint() {
+    // node_label folds a fingerprint into unlabeled dep-aggregates / asset_matches
+    // to disambiguate replace-by-label, but that raw hex must not leak into the
+    // UI eval tree. display_label (used by EvalNodeResult) renders the inner
+    // condition readably instead.
+    let dep = ConditionNode::any_deps_match(ConditionNode::NewlyUpdated);
+    assert_eq!(dep.display_label(), "any_deps_match(newly_updated)");
+    assert!(
+        !dep.display_label()
+            .contains(&ConditionNode::NewlyUpdated.fingerprint_hex()),
+        "display_label must not contain the raw fingerprint"
+    );
+
+    let am = ConditionNode::asset_matches(
+        vec!["upstream_feed".to_string()],
+        ConditionNode::Missing,
+    );
+    assert_eq!(am.display_label(), "asset_matches('upstream_feed', missing)");
+
+    // A user-provided label on a dep-aggregate is already readable — keep it.
+    let labeled = ConditionNode::AnyDepsMatch {
+        condition: Box::new(ConditionNode::Missing),
+        label: Some("any_deps_missing".to_string()),
+    };
+    assert_eq!(labeled.display_label(), "any_deps_missing");
+
+    // Leaf and composite nodes keep their existing labels.
+    assert_eq!(ConditionNode::Missing.display_label(), "missing");
+    assert_eq!(
+        ConditionNode::And(vec![ConditionNode::Missing]).display_label(),
+        "All of"
+    );
+
+    // The eval tree (EvalNodeResult, rendered verbatim by the UI) must carry
+    // the readable label, not the fingerprint.
+    let tree_node = crate::condition::state::EvalNodeResult::new(
+        &dep,
+        0,
+        crate::condition::state::NodeStatus::True,
+        vec![],
+        None,
+    );
+    assert_eq!(tree_node.label, "any_deps_match(newly_updated)");
+}
+
+#[test]
 fn test_node_label_distinguishes_unlabeled_aggregate_inner_condition() {
     // Regression (C3): node_label for an unlabeled any_deps_match/all_deps_match
     // and for asset_matches must include the inner condition, else two

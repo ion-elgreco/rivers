@@ -538,6 +538,62 @@ impl ConditionNode {
         }
     }
 
+    /// Readable label for UI display (the eval tree). Unlike [`node_label`],
+    /// which folds a fingerprint into unlabeled dep-aggregates / asset_matches
+    /// to disambiguate `replace_by_label`, this renders the inner condition
+    /// readably — those nodes are eval-tree leaves (their inner is folded, not a
+    /// child), so the label must describe it without leaking a raw hash.
+    pub fn display_label(&self) -> String {
+        match self {
+            ConditionNode::AnyDepsMatch { .. }
+            | ConditionNode::AllDepsMatch { .. }
+            | ConditionNode::AssetMatches { .. } => self.describe(),
+            _ => self.node_label(),
+        }
+    }
+
+    /// Readable recursive description of this tree (used for the folded inner of
+    /// a dep-aggregate / asset_matches leaf, and thus by [`display_label`]).
+    pub fn describe(&self) -> String {
+        match self {
+            ConditionNode::And(children) => {
+                let parts: Vec<String> = children.iter().map(|c| c.describe()).collect();
+                format!("({})", parts.join(" & "))
+            }
+            ConditionNode::Or(children) => {
+                let parts: Vec<String> = children.iter().map(|c| c.describe()).collect();
+                format!("({})", parts.join(" | "))
+            }
+            ConditionNode::Not(child) => format!("~{}", child.describe()),
+            ConditionNode::NewlyTrue(child) => format!("newly_true({})", child.describe()),
+            ConditionNode::Since { trigger, reset } => {
+                format!("since({}, {})", trigger.describe(), reset.describe())
+            }
+            ConditionNode::SinceLastHandled(child) => {
+                format!("since_last_handled({})", child.describe())
+            }
+            ConditionNode::AnyDepsMatch { condition, label } => match label {
+                Some(l) => l.clone(),
+                None => format!("any_deps_match({})", condition.describe()),
+            },
+            ConditionNode::AllDepsMatch { condition, label } => match label {
+                Some(l) => l.clone(),
+                None => format!("all_deps_match({})", condition.describe()),
+            },
+            ConditionNode::AssetMatches { keys, condition } => {
+                let keys_label = if keys.len() == 1 {
+                    format!("'{}'", keys[0])
+                } else {
+                    let joined: Vec<_> = keys.iter().map(|k| format!("'{}'", k)).collect();
+                    format!("[{}]", joined.join(", "))
+                };
+                format!("asset_matches({}, {})", keys_label, condition.describe())
+            }
+            // Leaf nodes: node_label is already readable and fingerprint-free.
+            _ => self.node_label(),
+        }
+    }
+
     /// Deterministic fingerprint of this condition tree.
     ///
     /// Serializes the tree to canonical JSON and hashes with fixed-key SipHash
