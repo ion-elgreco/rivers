@@ -243,7 +243,9 @@ impl EvalNodeResult {
     ) -> Self {
         Self {
             node_idx: idx,
-            label: node.node_label(),
+            // Readable label for the UI eval tree — never the fingerprint that
+            // node_label folds in for replace-by-label disambiguation.
+            label: node.display_label(),
             node_type: node.node_type_str().to_string(),
             status,
             children,
