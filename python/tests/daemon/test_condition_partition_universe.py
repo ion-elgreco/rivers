@@ -229,10 +229,12 @@ def test_future_end_upstream_does_not_keep_any_deps_missing_true(storage):
     )
     repo.resolve(storage=storage)
 
-    # Materialize every window that exists up to now (assumes the test does
-    # not straddle midnight), so with a capped pivot universe nothing is
-    # missing and the watcher must stay quiet.
-    for day in (2, 1, 0):
+    # Materialize every window up to now, plus tomorrow, so a capped pivot
+    # universe has nothing missing and the watcher stays quiet. Tomorrow is
+    # included so that if wall-clock crosses midnight during the run, the new
+    # current-day window the universe refresh adds is already materialized —
+    # otherwise the watcher would legitimately fire and flake the test.
+    for day in (2, 1, 0, -1):
         key = (today - _dt.timedelta(days=day)).strftime("%Y-%m-%d")
         result = repo.materialize(
             ["up_fut"], partition_key=rs.PartitionKey.single(key)
