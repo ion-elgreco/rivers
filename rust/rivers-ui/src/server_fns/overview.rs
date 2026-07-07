@@ -159,6 +159,26 @@ fn partition_key_members(pk: &rivers_core::storage::PartitionKey) -> Vec<String>
         .collect()
 }
 
+/// Tri-state heatmap label for one partition. `failed` comes from
+/// `get_failed_partitions` (the same source the daemon acts on), which already
+/// supersedes a materialization by a newer failure — so a key present in
+/// `failed` has a failure as its newest event and must render Failed even if it
+/// was materialized earlier.
+#[cfg(feature = "ssr")]
+fn partition_status_label(
+    key: &str,
+    materialized: &std::collections::HashSet<String>,
+    failed: &std::collections::HashSet<String>,
+) -> &'static str {
+    if failed.contains(key) {
+        "Failed"
+    } else if materialized.contains(key) {
+        "Materialized"
+    } else {
+        "Missing"
+    }
+}
+
 /// Tri-state per-partition status (Materialized / Failed / Missing) for the
 /// asset-detail partition heatmap. Joins materialized keys from storage,
 /// failed keys from event scan (last 10k events), and the partition
@@ -235,22 +255,27 @@ pub async fn get_partition_status(
         .flat_map(partition_key_members)
         .collect();
 
-    let events = scoped
-        .get_events_for_asset(&asset_key, 10000)
+    // Failed partitions from the same source the daemon acts on
+    // (get_failed_partitions: StepFailure events UNION terminal-Failure runs,
+    // superseded per-key by a newer materialization). A plain StepFailure event
+    // scan would miss pod-death failures the daemon retries, so the heatmap
+    // would render a partition healthy while automation reacts to a failure.
+    let partition_timestamps: std::collections::HashMap<
+        rivers_core::storage::PartitionKey,
+        i64,
+    > = scoped
+        .get_partition_timestamps(&asset_key)
         .await
-        .unwrap_or_default();
-    let mut failed_keys: HashSet<String> = HashSet::new();
-    for evt in &events {
-        if matches!(evt.event_type, rivers_core::storage::EventType::StepFailure)
-            && let Some(ref pk) = evt.partition_key
-        {
-            for k in partition_key_members(pk) {
-                if !materialized_keys.contains(&k) {
-                    failed_keys.insert(k);
-                }
-            }
-        }
-    }
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let failed_keys: HashSet<String> = scoped
+        .get_failed_partitions(&asset_key, &partition_timestamps)
+        .await
+        .unwrap_or_default()
+        .keys()
+        .flat_map(partition_key_members)
+        .collect();
     let failed_count = failed_keys.len();
 
     // gRPC unavailable / no partition def → fall back to listing materialized keys.
@@ -267,19 +292,10 @@ pub async fn get_partition_status(
 
     let partition_details: Vec<PartitionDetail> = detail_keys
         .iter()
-        .map(|key| {
-            let status = if materialized_keys.contains(key) {
-                "Materialized"
-            } else if failed_keys.contains(key) {
-                "Failed"
-            } else {
-                "Missing"
-            };
-            PartitionDetail {
-                key: key.clone(),
-                status: status.to_string(),
-                last_timestamp: None,
-            }
+        .map(|key| PartitionDetail {
+            key: key.clone(),
+            status: partition_status_label(key, &materialized_keys, &failed_keys).to_string(),
+            last_timestamp: None,
         })
         .collect();
 
@@ -569,5 +585,27 @@ mod tests {
             keys: vec!["a".into(), "b".into()],
         };
         assert_eq!(partition_key_members(&pk), vec!["a", "b"]);
+    }
+
+    /// Failed wins over Materialized: the failed set comes from
+    /// get_failed_partitions, which already supersedes a materialization by a
+    /// NEWER failure, so a key in `failed` means its newest event is a failure
+    /// — the heatmap must show Failed, matching what the daemon acts on.
+    #[test]
+    fn failed_status_wins_over_materialized() {
+        use super::partition_status_label;
+        use std::collections::HashSet;
+        let materialized: HashSet<String> =
+            ["p".to_string(), "q".to_string()].into_iter().collect();
+        let failed: HashSet<String> = ["p".to_string()].into_iter().collect();
+        // p was materialized then failed → Failed wins.
+        assert_eq!(partition_status_label("p", &materialized, &failed), "Failed");
+        // q materialized, no newer failure → Materialized.
+        assert_eq!(
+            partition_status_label("q", &materialized, &failed),
+            "Materialized"
+        );
+        // z neither → Missing.
+        assert_eq!(partition_status_label("z", &materialized, &failed), "Missing");
     }
 }
