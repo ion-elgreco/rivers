@@ -478,9 +478,15 @@ impl ConditionNode {
             ConditionNode::NewlyUpdated => "newly_updated".into(),
             ConditionNode::NewlyRequested => "newly_requested".into(),
             ConditionNode::CodeVersionChanged => "code_version_changed".into(),
-            ConditionNode::CronTickPassed { cron_schedule, .. } => {
-                format!("cron_tick_passed('{}')", cron_schedule)
-            }
+            ConditionNode::CronTickPassed {
+                cron_schedule,
+                timezone,
+            } => match timezone {
+                // Include the tz: it's load-bearing (changes fire times), so two
+                // crons differing only by zone must not collapse to one label.
+                Some(tz) => format!("cron_tick_passed('{}', tz='{}')", cron_schedule, tz),
+                None => format!("cron_tick_passed('{}')", cron_schedule),
+            },
             ConditionNode::InLatestTimeWindow { lookback_delta } => match lookback_delta {
                 Some(d) => format!("in_latest_time_window({}s)", d),
                 None => "in_latest_time_window".into(),
@@ -502,19 +508,26 @@ impl ConditionNode {
                 tag_keys,
                 tag_values,
             } => format_tag_label("all_runs_have_tags", tag_keys, tag_values),
-            ConditionNode::AnyDepsMatch { label, .. } => {
-                label.as_deref().unwrap_or("any_deps_match(...)").into()
-            }
-            ConditionNode::AllDepsMatch { label, .. } => {
-                label.as_deref().unwrap_or("all_deps_match(...)").into()
-            }
-            ConditionNode::AssetMatches { keys, .. } => {
-                if keys.len() == 1 {
-                    format!("asset_matches('{}')", keys[0])
+            // Unlabeled dep-aggregates fold the inner condition's fingerprint in
+            // so two siblings differing only by inner condition don't collapse
+            // to one label (replace_by_label/contains_label would otherwise hit
+            // the wrong subtree — same reasoning as the cron tz above).
+            ConditionNode::AnyDepsMatch { condition, label } => match label {
+                Some(l) => l.clone(),
+                None => format!("any_deps_match({})", condition.fingerprint_hex()),
+            },
+            ConditionNode::AllDepsMatch { condition, label } => match label {
+                Some(l) => l.clone(),
+                None => format!("all_deps_match({})", condition.fingerprint_hex()),
+            },
+            ConditionNode::AssetMatches { keys, condition } => {
+                let keys_label = if keys.len() == 1 {
+                    format!("'{}'", keys[0])
                 } else {
                     let joined: Vec<_> = keys.iter().map(|k| format!("'{}'", k)).collect();
-                    format!("asset_matches([{}])", joined.join(", "))
-                }
+                    format!("[{}]", joined.join(", "))
+                };
+                format!("asset_matches({}, {})", keys_label, condition.fingerprint_hex())
             }
             ConditionNode::And(_) => "All of".into(),
             ConditionNode::Or(_) => "Any of".into(),
@@ -522,6 +535,62 @@ impl ConditionNode {
             ConditionNode::NewlyTrue(_) => "newly_true".into(),
             ConditionNode::Since { .. } => "since".into(),
             ConditionNode::SinceLastHandled(_) => "since_last_handled".into(),
+        }
+    }
+
+    /// Readable label for UI display (the eval tree). Unlike [`node_label`],
+    /// which folds a fingerprint into unlabeled dep-aggregates / asset_matches
+    /// to disambiguate `replace_by_label`, this renders the inner condition
+    /// readably — those nodes are eval-tree leaves (their inner is folded, not a
+    /// child), so the label must describe it without leaking a raw hash.
+    pub fn display_label(&self) -> String {
+        match self {
+            ConditionNode::AnyDepsMatch { .. }
+            | ConditionNode::AllDepsMatch { .. }
+            | ConditionNode::AssetMatches { .. } => self.describe(),
+            _ => self.node_label(),
+        }
+    }
+
+    /// Readable recursive description of this tree (used for the folded inner of
+    /// a dep-aggregate / asset_matches leaf, and thus by [`display_label`]).
+    pub fn describe(&self) -> String {
+        match self {
+            ConditionNode::And(children) => {
+                let parts: Vec<String> = children.iter().map(|c| c.describe()).collect();
+                format!("({})", parts.join(" & "))
+            }
+            ConditionNode::Or(children) => {
+                let parts: Vec<String> = children.iter().map(|c| c.describe()).collect();
+                format!("({})", parts.join(" | "))
+            }
+            ConditionNode::Not(child) => format!("~{}", child.describe()),
+            ConditionNode::NewlyTrue(child) => format!("newly_true({})", child.describe()),
+            ConditionNode::Since { trigger, reset } => {
+                format!("since({}, {})", trigger.describe(), reset.describe())
+            }
+            ConditionNode::SinceLastHandled(child) => {
+                format!("since_last_handled({})", child.describe())
+            }
+            ConditionNode::AnyDepsMatch { condition, label } => match label {
+                Some(l) => l.clone(),
+                None => format!("any_deps_match({})", condition.describe()),
+            },
+            ConditionNode::AllDepsMatch { condition, label } => match label {
+                Some(l) => l.clone(),
+                None => format!("all_deps_match({})", condition.describe()),
+            },
+            ConditionNode::AssetMatches { keys, condition } => {
+                let keys_label = if keys.len() == 1 {
+                    format!("'{}'", keys[0])
+                } else {
+                    let joined: Vec<_> = keys.iter().map(|k| format!("'{}'", k)).collect();
+                    format!("[{}]", joined.join(", "))
+                };
+                format!("asset_matches({}, {})", keys_label, condition.describe())
+            }
+            // Leaf nodes: node_label is already readable and fingerprint-free.
+            _ => self.node_label(),
         }
     }
 
@@ -558,7 +627,8 @@ impl ConditionNode {
                 .find_lookback_delta()
                 .or_else(|| reset.find_lookback_delta()),
             ConditionNode::AnyDepsMatch { condition, .. }
-            | ConditionNode::AllDepsMatch { condition, .. } => condition.find_lookback_delta(),
+            | ConditionNode::AllDepsMatch { condition, .. }
+            | ConditionNode::AssetMatches { condition, .. } => condition.find_lookback_delta(),
             _ => None,
         }
     }
