@@ -164,6 +164,7 @@ fn partition_key_members(pk: &rivers_core::storage::PartitionKey) -> Vec<String>
 /// supersedes a materialization by a newer failure — so a key present in
 /// `failed` has a failure as its newest event and must render Failed even if it
 /// was materialized earlier.
+#[cfg(feature = "ssr")]
 fn partition_status_label(
     key: &str,
     materialized: &std::collections::HashSet<String>,
