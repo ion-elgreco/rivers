@@ -11,7 +11,10 @@ use super::cache::BackfillState;
 use super::partition::{PartitionEvalContext, PartitionSelection, PartitionState};
 
 /// Per-asset state persisted across daemon ticks.
+// `serde(default)`: an old blob missing a newer field loads with that field's
+// default instead of failing (a load error silently resets every latch).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct AssetConditionState {
     /// Previous tick's evaluation results keyed by node index (u32).
     /// Used by `NewlyTrue` and `Since` to detect transitions.
@@ -61,13 +64,45 @@ impl AssetConditionState {
     }
 }
 
+/// Persisted eval-state schema version. Bump when a field change is not
+/// safely covered by `serde(default)` semantics, and add a migration arm in
+/// [`ConditionEvalState::migrate_loaded`].
+pub const EVAL_STATE_SCHEMA_VERSION: u32 = 1;
+
 /// Global condition evaluation state persisted across daemon restarts (via KV store).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ConditionEvalState {
+    /// Schema stamp of the blob. Field-level default (0) so a pre-versioning
+    /// blob is distinguishable from a fresh state, which stamps the current
+    /// version via `Default`.
+    #[serde(default)]
+    pub schema_version: u32,
     /// Per-asset evaluation state.
     pub assets: HashMap<String, AssetConditionState>,
     /// Whether this is the very first evaluation (no previous tick).
     pub is_initial: bool,
+}
+
+impl Default for ConditionEvalState {
+    fn default() -> Self {
+        Self {
+            schema_version: EVAL_STATE_SCHEMA_VERSION,
+            assets: HashMap::new(),
+            is_initial: false,
+        }
+    }
+}
+
+impl ConditionEvalState {
+    /// Upgrade a just-loaded blob to the current schema in place. Version 0
+    /// predates the stamp; its only gap (missing `last_data_version`
+    /// baselines) is compensated at eval time, so it just restamps. Future
+    /// incompatible field changes add explicit arms here instead of leaning
+    /// on `serde(default)`.
+    pub fn migrate_loaded(&mut self) {
+        self.schema_version = EVAL_STATE_SCHEMA_VERSION;
+    }
 }
 
 /// Borrowed snapshot of `AssetConditionCache` fields used during evaluation.

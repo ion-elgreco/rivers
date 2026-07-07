@@ -366,16 +366,29 @@ pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
     let code_location_id = storage.code_location_id().to_string();
     let mut cache = AssetConditionCache::new(code_location_id.clone());
 
-    let mut eval_state: ConditionEvalState = storage
-        .scoped()
-        .get_condition_eval_state()
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| ConditionEvalState {
-            is_initial: true,
-            ..Default::default()
-        });
+    let fresh = || ConditionEvalState {
+        is_initial: true,
+        ..Default::default()
+    };
+    let mut eval_state: ConditionEvalState = match storage.scoped().get_condition_eval_state().await
+    {
+        Ok(Some(mut state)) => {
+            state.migrate_loaded();
+            state
+        }
+        Ok(None) => fresh(),
+        // Degrade gracefully but surface it: a swallowed load error silently
+        // wipes every latch and treats all assets as initial (sibling of the
+        // save-path hardening). Transient-retry belongs in the storage layer.
+        Err(e) => {
+            tracing::warn!(
+                target: "rivers::daemon",
+                error = %e,
+                "failed to load condition eval state; starting fresh (latches reset)"
+            );
+            fresh()
+        }
+    };
 
     for info in &conditions {
         let current_fp = info.condition.fingerprint_hex();
@@ -446,11 +459,18 @@ pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
         tokio::select! {
             _ = cancel.cancelled() => {
                 // Persist state before exiting.
-                let _ = engine
+                if let Err(e) = engine
                     .storage
                     .scoped()
                     .set_condition_eval_state(&engine.pass.eval_state)
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        target: "rivers::daemon",
+                        error = %e,
+                        "failed to persist condition eval state on shutdown"
+                    );
+                }
                 tracing::info!(target: "rivers::daemon", "condition eval loop stopped");
                 return;
             }

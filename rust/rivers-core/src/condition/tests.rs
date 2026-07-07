@@ -6256,6 +6256,7 @@ fn test_invalidation_on_tree_change() {
             },
         )]),
         is_initial: false,
+        ..Default::default()
     };
 
     let on_missing = ConditionNode::on_missing();
@@ -6308,6 +6309,7 @@ fn test_invalidation_noop_on_unchanged_tree() {
     let mut eval_state = ConditionEvalState {
         assets: HashMap::from([("asset_a".into(), original_state.clone())]),
         is_initial: false,
+        ..Default::default()
     };
 
     run_invalidation(
@@ -6361,6 +6363,7 @@ fn test_invalidation_prunes_removed_assets() {
             ),
         ]),
         is_initial: false,
+        ..Default::default()
     };
 
     run_invalidation(
@@ -12223,6 +12226,117 @@ fn test_cron_reset_in_dep_pivot_uses_root_tick() {
         "tick 2: the cron reset (root's tick boundary) must clear the per-dep \
          Since latch over an unconditioned dep"
     );
+}
+
+/// The persisted eval-state blob carries a schema stamp so incompatible field
+/// changes get an explicit migration point (`migrate_loaded`) instead of
+/// leaning on `serde(default)` silently. A pre-versioning blob (no stamp
+/// field) must read as version 0 — NOT the current version — so migrations
+/// can tell the two apart.
+#[test]
+fn test_condition_eval_state_schema_version_stamps_and_migrates() {
+    assert_eq!(
+        ConditionEvalState::default().schema_version,
+        EVAL_STATE_SCHEMA_VERSION,
+        "fresh state must carry the current schema version"
+    );
+
+    let mut old: ConditionEvalState = serde_json::from_str("{}").unwrap();
+    assert_eq!(
+        old.schema_version, 0,
+        "a blob written before versioning must load as version 0"
+    );
+    old.migrate_loaded();
+    assert_eq!(old.schema_version, EVAL_STATE_SCHEMA_VERSION);
+
+    let bytes = serde_json::to_vec(&ConditionEvalState::default()).unwrap();
+    let round: ConditionEvalState = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        round.schema_version, EVAL_STATE_SCHEMA_VERSION,
+        "the stamp must survive a persist round-trip"
+    );
+}
+
+/// `ConditionEvalState` is persisted via `serde_json`, which cannot use a
+/// `PartitionKey` (an object-serializing enum) as a JSON map key. `PartitionState`
+/// timestamps are keyed by `PartitionKey`, so any partitioned automation
+/// condition's state must still round-trip — otherwise the save fails silently
+/// and every daemon restart wipes all latches/baselines.
+#[test]
+fn test_condition_eval_state_round_trips_with_partition_timestamps() {
+    let pk = PartitionKey::Single {
+        keys: vec!["2024-01-01".to_string()],
+    };
+    let mut asset = AssetConditionState::default();
+    asset.partition_state = Some(PartitionState {
+        timestamps: HashMap::from([(pk.clone(), 100i64)]),
+        ..Default::default()
+    });
+    let mut state = ConditionEvalState::default();
+    state.assets.insert("a".to_string(), asset);
+
+    let bytes = serde_json::to_vec(&state)
+        .expect("ConditionEvalState must serialize via serde_json (storage uses kv_set_json)");
+    let round: ConditionEvalState =
+        serde_json::from_slice(&bytes).expect("ConditionEvalState must round-trip");
+    let ts = round.assets["a"]
+        .partition_state
+        .as_ref()
+        .unwrap()
+        .timestamps
+        .get(&pk);
+    assert_eq!(
+        ts,
+        Some(&100),
+        "partition timestamp must survive the round-trip"
+    );
+}
+
+/// An OLD persisted blob missing newer fields must still load (using defaults)
+/// rather than failing to deserialize — a deserialize error silently resets all
+/// latches (see the load-path hardening). Guards `#[serde(default)]` coverage so
+/// future field additions stay forward-compatible for persisted storage.
+#[test]
+fn test_condition_eval_state_tolerates_missing_fields() {
+    // Top-level `is_initial` omitted; asset "a" carries only `is_initial` —
+    // every other field (previous_results, fingerprint, timestamps, …) absent.
+    let json = r#"{"assets":{"a":{"is_initial":true}}}"#;
+    let state: ConditionEvalState =
+        serde_json::from_str(json).expect("a partial/old blob must load with defaults");
+    assert!(
+        !state.is_initial,
+        "missing top-level is_initial → default false"
+    );
+    let a = &state.assets["a"];
+    assert!(a.is_initial);
+    assert!(a.previous_results.is_empty());
+    assert_eq!(a.condition_fingerprint, "");
+    assert!(a.last_handled_timestamp.is_none());
+    assert!(a.partition_state.is_none());
+}
+
+/// A blob written BEFORE the pairs-format change stored `timestamps` as a JSON
+/// map — always empty (`{}`), since `PartitionKey` map keys never serialized
+/// (the save error was swallowed). The deserializer must accept that legacy
+/// shape: rejecting it fails the whole `ConditionEvalState` load and wipes
+/// every latch on upgrade, before `schema_version`/`migrate_loaded` can run.
+#[test]
+fn test_condition_eval_state_loads_legacy_map_shaped_timestamps() {
+    let json =
+        r#"{"assets":{"a":{"previous_results":{"3":true},"partition_state":{"timestamps":{}}}}}"#;
+    let state: ConditionEvalState = serde_json::from_str(json)
+        .expect("legacy blob with map-shaped empty timestamps must load, not reset all latches");
+    let a = &state.assets["a"];
+    assert_eq!(
+        a.previous_results.get(&3),
+        Some(&true),
+        "latches must survive the legacy-shape load"
+    );
+    let ps = a
+        .partition_state
+        .as_ref()
+        .expect("partition_state present in the blob must load");
+    assert!(ps.timestamps.is_empty());
 }
 
 /// `DataVersionChanged` over an UNCONDITIONED dep must not re-fire every tick.
