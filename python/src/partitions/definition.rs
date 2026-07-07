@@ -230,6 +230,67 @@ impl PartitionsDefinition {
         }
     }
 
+    /// Like [`get_partition_keys`](Self::get_partition_keys) but clamps every
+    /// TimeWindow grid's effective end to `cap`. The automation universe must
+    /// not enumerate windows that haven't arrived yet — `refresh_universe` grows
+    /// them in as wall-clock advances. Open-ended grids already cap at now, so
+    /// `cap = now` only trims an explicit *future* `end`.
+    pub fn get_partition_keys_capped(
+        &self,
+        cap: NaiveDateTime,
+    ) -> PyResult<Vec<PyPartitionKey>> {
+        match self {
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => {
+                let capped_end = Some(match end {
+                    Some(e) => (*e).min(cap),
+                    None => cap,
+                });
+                let keys =
+                    enumerate_time_windows(cron_schedule, interval_seconds, start, &capped_end, fmt)?;
+                Ok(keys
+                    .into_iter()
+                    .map(|k| PyPartitionKey::Single { key: vec![k] })
+                    .collect())
+            }
+            Self::Multi { dimensions } => {
+                let mut dim_keys: Vec<(String, Vec<String>)> = Vec::new();
+                for (name, def) in dimensions {
+                    dim_keys.push((name.clone(), def.enumerate_single_dim_keys_capped(cap)?));
+                }
+                let combos = cartesian_product(&dim_keys);
+                Ok(combos
+                    .into_iter()
+                    .map(|keys| PyPartitionKey::Multi {
+                        keys: keys.into_iter().map(|(k, v)| (k, vec![v])).collect(),
+                    })
+                    .collect())
+            }
+            // Static / Dynamic have no time dimension to cap.
+            _ => self.get_partition_keys(),
+        }
+    }
+
+    /// Single-dimension variant of [`get_partition_keys_capped`].
+    pub fn enumerate_single_dim_keys_capped(&self, cap: NaiveDateTime) -> PyResult<Vec<String>> {
+        self.get_partition_keys_capped(cap)?
+            .into_iter()
+            .map(|pk| match pk {
+                PyPartitionKey::Single { mut key } => Ok(key.remove(0)),
+                PyPartitionKey::Multi { .. } | PyPartitionKey::Set { .. } => {
+                    Err(PartitionDefinitionError::new_err(
+                        "enumerate_single_dim_keys called on a non-single-dimension definition",
+                    ))
+                }
+            })
+            .collect()
+    }
+
     /// A window `[offset, offset+limit)` of keys without materializing the full
     /// set. `Static` slices the `OrderSet`; `TimeWindow` seeks lazily (interval
     /// by arithmetic, cron by skipping the occurrence iterator); `Multi` /
