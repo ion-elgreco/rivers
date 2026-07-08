@@ -62,7 +62,7 @@ schemars = "1.0"
 # HTTP / web
 axum = "0.8"
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
-tower-http = "0.6"
+tower-http = "0.7"
 reqwest = { version = "0.13", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
