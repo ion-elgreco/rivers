@@ -1,9 +1,4 @@
 //! Per-tick orchestration for the condition evaluation engine.
-//!
-//! [`ConditionPass`] owns long-lived state across ticks. One tick is
-//! `refresh_cache` → `ensure_time_based_eval_set` → `should_skip` → `run`.
-//! `run` returns a [`MaterializationPlan`] classified into the three dispatch
-//! shapes; dispatch back to Python is the caller's responsibility.
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
@@ -25,51 +20,41 @@ use crate::timegrid::TimeGrid;
 use crate::util::parse_key_datetime;
 use chrono::{NaiveDateTime, TimeZone};
 
-/// Info about an asset with an automation condition, extracted at daemon
-/// start. Pure-Rust so the per-tick evaluation loop can run inside
-/// [`ConditionPass`] without crossing the FFI per asset.
+/// Info about an asset with an automation condition, extracted at daemon start.
 pub struct AssetConditionInfo {
     pub asset_key: String,
     pub condition: ConditionNode,
     /// Partition info for this asset. `None` if unpartitioned.
     pub partition_info: Option<PartitionInfo>,
-    /// Backfill strategy from the `@Asset` decorator (controls how
-    /// multi-partition condition selections are dispatched).
+    /// Backfill strategy from the `@Asset` decorator.
     pub backfill_strategy: Option<BackfillStrategy>,
 }
 
 /// Partition-level info for a partitioned asset, extracted at daemon start.
 pub struct PartitionInfo {
-    /// All valid partition keys for this asset, advanced per tick by
-    /// [`ConditionPass::refresh_partition_universes`].
+    /// All valid partition keys for this asset.
     pub all_keys: HashSet<PartitionKey>,
     /// Partition mappings for upstream deps. Key = `(this_asset, upstream_asset)`.
     pub mappings: HashMap<(String, String), PartitionMappingKind>,
     /// For time-windowed partitions: the format string used to parse keys.
-    /// Used by `InLatestTimeWindow` to select recent partitions per-tick.
     pub time_window_fmt: Option<String>,
     /// How `all_keys` evolves after extraction.
     pub universe: PartitionUniverse,
 }
 
-/// How an asset's partition universe evolves after extraction. A universe
-/// frozen at daemon start silently stops automation for open-ended time
-/// windows and never starts it for dynamic partitions.
+/// How an asset's partition universe evolves after extraction.
 #[derive(Clone, Debug)]
 pub enum PartitionUniverse {
     /// Fixed key set (Static definitions).
     Frozen,
-    /// Window starts enter the universe as wall-clock time passes
-    /// (and stop at the grid's explicit end, when there is one).
+    /// Window starts enter the universe as wall-clock time passes.
     TimeWindow {
         grid: TimeGrid,
         enumerated_to: NaiveDateTime,
     },
-    /// Storage-managed: the key set mirrors the `dynamic_partitions`
-    /// namespace, including retirements.
+    /// Storage-managed: the key set mirrors the `dynamic_partitions` namespace.
     Dynamic { namespace: String },
-    /// Cartesian product over dimensions; recomputed when any dimension's
-    /// key list changes.
+    /// Cartesian product over dimensions; recomputed when any dimension's key list changes.
     Multi {
         dims: Vec<(String, DimensionUniverse)>,
     },
@@ -78,8 +63,7 @@ pub enum PartitionUniverse {
 /// One dimension of a Multi universe: its current key list plus how it evolves.
 #[derive(Clone, Debug)]
 pub struct DimensionUniverse {
-    /// Dim values in definition/seed order; a set so refresh re-yields
-    /// (explicit future end, seed/watermark races) cannot duplicate.
+    /// Dim values in definition/seed order.
     pub keys: OrderSet<String>,
     pub kind: DimensionKind,
 }
@@ -96,10 +80,7 @@ pub enum DimensionKind {
     },
 }
 
-/// Advance one universe, mutating `all_keys` in place. Returns whether the
-/// key set changed. `dynamic_keys` maps namespace → currently registered
-/// keys; a namespace missing from the map (storage failure) leaves the
-/// previous set untouched — stale beats empty.
+/// Advance one universe, mutating `all_keys` in place. Returns whether the key set changed.
 fn refresh_universe(
     universe: &mut PartitionUniverse,
     all_keys: &mut HashSet<PartitionKey>,
@@ -125,7 +106,6 @@ fn refresh_universe(
                     *enumerated_to = bound;
                 }
                 Err(e) => {
-                    // Leave the watermark so the range is retried next tick.
                     tracing::warn!(target: "rivers::daemon", error = %e, "time-window universe refresh failed");
                 }
             }
@@ -162,16 +142,12 @@ fn refresh_universe(
                         }
                         match grid.window_starts_in(*enumerated_to, bound) {
                             Ok(new_keys) => {
-                                // Seeding is capped at its own `now`, which can
-                                // trail this tick's — a re-yielded start inserts
-                                // as a no-op and must not count as a change.
                                 for k in new_keys {
                                     changed |= du.keys.insert(k);
                                 }
                                 *enumerated_to = bound;
                             }
                             Err(e) => {
-                                // Leave the watermark so the range is retried.
                                 tracing::warn!(target: "rivers::daemon", error = %e, "time-window dimension refresh failed");
                             }
                         }
@@ -198,8 +174,6 @@ fn refresh_universe(
 }
 
 /// Cartesian product of dimension key lists as `Multi` keys (def order).
-/// Walks an index odometer so each key is built exactly once — no
-/// intermediate combo vectors.
 fn cartesian_universe(dims: &[(String, DimensionUniverse)]) -> HashSet<PartitionKey> {
     if dims.is_empty() || dims.iter().any(|(_, du)| du.keys.is_empty()) {
         return HashSet::new();
@@ -246,8 +220,7 @@ fn universe_namespaces(universe: &PartitionUniverse, out: &mut HashSet<String>) 
     }
 }
 
-/// One row of the per-asset evaluation result list, accumulated during
-/// `evaluate` and consumed by `apply_results`.
+/// One row of the per-asset evaluation result list.
 pub struct EvalResultRow {
     pub info_idx: usize,
     pub result: EvalResult,
@@ -262,12 +235,6 @@ pub struct ToMaterialize {
 }
 
 /// Materializations classified into the three dispatch shapes.
-///
-/// * `unpartitioned` — assets that materialize as a single combined run.
-/// * `single_partition_groups` — assets that fired with one partition key,
-///   bucketed by key so they share a combined run.
-/// * `multi_partition_backfills` — assets that fired across 2+ partition keys,
-///   each becoming its own backfill.
 pub struct MaterializationPlan {
     pub unpartitioned: Vec<String>,
     pub single_partition_groups: HashMap<PartitionKey, Vec<String>>,
@@ -289,15 +256,6 @@ pub struct PassOutput {
 }
 
 /// Compute partition keys that fall within the latest time window.
-///
-/// Partition keys are wall-clock labels, so the comparison happens on the
-/// wall-clock timeline: `now_local` is the current local naive datetime. If
-/// `lookback_delta` is `None`, only the single latest started window is
-/// returned. With a lookback the cutoff anchors at that latest window's
-/// START — keys within `[latest_start - lookback_delta, latest_start]` are
-/// selected (`lookback_delta` in seconds) — so the selection never depends
-/// on how far into the current window `now` falls, and a lookback of one
-/// period reaches exactly one window back.
 pub fn compute_latest_time_window_keys(
     all_keys: &HashSet<PartitionKey>,
     fmt: &str,
@@ -330,7 +288,6 @@ pub fn compute_latest_time_window_keys(
         Some(delta_secs) => {
             let latest_start = parsed[0].1;
             let lookback_nanos = (delta_secs * 1_000_000_000.0) as i64;
-            // A lookback too large to subtract means "no cutoff".
             let cutoff =
                 latest_start.checked_sub_signed(chrono::Duration::nanoseconds(lookback_nanos));
             parsed
@@ -343,10 +300,7 @@ pub fn compute_latest_time_window_keys(
     }
 }
 
-/// Owns the long-lived state of the condition evaluation loop and exposes a
-/// per-tick `run` that returns evaluation results plus a classified
-/// [`MaterializationPlan`]. The outer Python orchestrator drives `refresh_cache`
-/// and `run`, then dispatches the plan via PyO3-bound launchers.
+/// Owns the long-lived state of the condition evaluation loop.
 pub struct ConditionPass {
     pub cache: AssetConditionCache,
     pub eval_state: ConditionEvalState,
@@ -356,19 +310,15 @@ pub struct ConditionPass {
     /// Set of asset keys with active conditions, used by `update_dep_baselines`.
     pub active: HashSet<String>,
     pub has_time_based: bool,
-    /// Lazily computed once `cache.initialized`; the asset subset to evaluate
-    /// when storage hasn't changed but time-based conditions need re-eval.
+    /// Asset subset to evaluate when only time-based conditions need re-eval.
     pub time_based_eval_set: Option<HashSet<String>>,
     pub upstream_partition_keys: HashMap<String, HashSet<PartitionKey>>,
-    /// How each `upstream_partition_keys` entry evolves. Entries for
-    /// conditioned assets are re-synced from their `PartitionInfo` instead.
+    /// How each `upstream_partition_keys` entry evolves.
     pub upstream_universes: HashMap<String, PartitionUniverse>,
 }
 
 impl ConditionPass {
-    /// Build a new pass. `conditions` is expected to be in topological order
-    /// (deps before downstreams) so single-tick `WillBeRequested` cascading
-    /// works correctly.
+    /// Build a new pass; `conditions` must be in topological order (deps before downstreams).
     pub fn new(
         cache: AssetConditionCache,
         eval_state: ConditionEvalState,
@@ -390,9 +340,6 @@ impl ConditionPass {
             keys_map.insert(k.clone(), keys);
             universes_map.insert(k, universe);
         }
-        // Seed an eval-state entry for every conditioned asset so the
-        // evaluate/apply_results access sites can't panic on a missing key —
-        // panic-safety must not depend on the caller pre-seeding the map.
         let mut eval_state = eval_state;
         for info in &conditions {
             eval_state.assets.entry(info.asset_key.clone()).or_default();
@@ -410,9 +357,7 @@ impl ConditionPass {
         }
     }
 
-    /// Dynamic namespaces any tracked universe depends on — the caller
-    /// fetches their current key sets and passes them to
-    /// [`refresh_partition_universes`](Self::refresh_partition_universes).
+    /// Dynamic namespaces any tracked universe depends on.
     pub fn dynamic_universe_namespaces(&self) -> HashSet<String> {
         let mut out = HashSet::new();
         for info in &self.conditions {
@@ -426,11 +371,7 @@ impl ConditionPass {
         out
     }
 
-    /// Advance every tracked partition universe to `now`: open time grids
-    /// gain newly started windows, dynamic namespaces mirror storage, and
-    /// conditioned assets' upstream entries re-sync from their refreshed
-    /// `PartitionInfo`. Returns whether any universe changed, so the caller
-    /// can force an eval even when the storage cache reports no changes.
+    /// Advance every tracked partition universe to `now`. Returns whether any universe changed.
     pub fn refresh_partition_universes(
         &mut self,
         now: NaiveDateTime,
@@ -442,9 +383,6 @@ impl ConditionPass {
                 let pi_changed =
                     refresh_universe(&mut pi.universe, &mut pi.all_keys, now, dynamic_keys);
                 changed |= pi_changed;
-                // The conditioned asset's upstream entry mirrors its
-                // PartitionInfo; it was synced at extraction, so only a
-                // change needs a re-copy.
                 if pi_changed
                     && let Some(entry) = self.upstream_partition_keys.get_mut(&info.asset_key)
                 {
@@ -460,11 +398,7 @@ impl ConditionPass {
         changed
     }
 
-    /// Refresh `cache` from storage atomically. Returns whether anything
-    /// changed; surface errors so the caller can decide whether to skip
-    /// the tick. `now` (wall-clock nanos) is used by the cache to evict
-    /// dispatched-but-never-confirmed run_ids that have outlived the
-    /// pending-grace window.
+    /// Refresh `cache` from storage. Returns whether anything changed.
     pub async fn refresh_cache<S: StorageBackend>(
         &mut self,
         storage: &S,
@@ -474,9 +408,6 @@ impl ConditionPass {
     }
 
     /// Lazily compute the time-based eval subset once cache is initialized.
-    /// Only relevant when conditions contain time-based nodes (e.g.
-    /// `CronTickPassed`). The subset includes their downstream descendants
-    /// so cron cascades fire same-tick.
     pub fn ensure_time_based_eval_set(&mut self) {
         if !self.has_time_based || !self.cache.initialized || self.time_based_eval_set.is_some() {
             return;
@@ -490,8 +421,7 @@ impl ConditionPass {
         self.time_based_eval_set = Some(eval_set);
     }
 
-    /// Skip this tick when nothing has changed in storage AND we're past
-    /// the initial tick AND no time-based conditions need re-eval.
+    /// Skip this tick when nothing changed, we're past the initial tick, and no time-based conditions need re-eval.
     pub fn should_skip(&self, has_changes: bool) -> bool {
         !has_changes
             && self.cache.initialized
@@ -499,9 +429,7 @@ impl ConditionPass {
             && !self.has_time_based
     }
 
-    /// One full tick: evaluate every condition tree (or the time-based subset
-    /// when `selective`), apply per-asset state mutations, and return the
-    /// classified materialization plan.
+    /// One full tick: evaluate conditions, apply state mutations, and return the materialization plan.
     pub fn run(&mut self, now: i64, selective: bool) -> PassOutput {
         if self.eval_state.is_initial {
             self.eval_state.is_initial = false;
@@ -514,24 +442,10 @@ impl ConditionPass {
     }
 
     fn evaluate(&self, now: i64, selective: bool) -> Vec<EvalResultRow> {
-        // Partition keys are wall-clock labels; latest-window math compares
-        // them against the local naive reading of the tick instant.
         let now_local = chrono::Local.timestamp_nanos(now).naive_local();
         let in_progress_keys: HashSet<String> =
             self.cache.in_progress_assets.keys().cloned().collect();
 
-        // The asset-level floor is scoped to unpartitioned runs, so partitioned
-        // failures live only in partition_status. Watchers evaluating at
-        // unpartitioned granularity (dep pivots, asset_matches) read the
-        // snapshot's failed set — surface an asset whenever it has any
-        // currently-failed partition. `status.failed` is already per-key
-        // superseded by get_failed_partitions (a partition that re-materialized
-        // after its failure is dropped), so recovery happens per-key and this
-        // view stays consistent with the partitioned watcher's `pctx.failed`.
-        // Comparing against the asset-level record.last_timestamp instead would
-        // mis-recover on an observation (which bumps it without materializing)
-        // or on an unrelated partition's success. Collecting an empty chain
-        // allocates nothing, so the steady state stays free.
         let failed_keys: HashSet<String> = self
             .cache
             .failed_assets
@@ -546,7 +460,6 @@ impl ConditionPass {
             )
             .collect();
 
-        // WillBeRequested reads this set inside dep pivots for single-tick cascading.
         let mut requested_this_tick: HashMap<String, PartitionSelection> = HashMap::new();
         let mut results: Vec<EvalResultRow> = Vec::new();
 
@@ -574,9 +487,6 @@ impl ConditionPass {
                 ))
             });
 
-            // `!InProgress` view = storage's in-progress ∪ the cache's just-
-            // dispatched runs (which lag storage). Allocate the union only when
-            // there are pending partitions; otherwise borrow storage's set.
             let pending = self.cache.in_progress_partition_keys(&info.asset_key);
             let partition_status = self.cache.partition_status.get(&info.asset_key);
             let merged_in_progress: Option<HashSet<PartitionKey>> = if pending.is_empty() {
@@ -687,14 +597,8 @@ impl ConditionPass {
             };
             update_condition_state(prev, &update_ctx, &row.result);
 
-            // Baseline dep state when any asset fired or it's an initial tick so
-            // NewlyUpdated has previous timestamps to compare against. The call
-            // is asset-independent (writes only non-conditioned deps from the
-            // immutable cache), so run it ONCE after the loop instead of
-            // O(fired × edges) times.
             needs_dep_baselines |= row.result.fired || was_initial;
 
-            // The condition tree is the sole dispatch gate
             if row.result.fired {
                 to_materialize.push(ToMaterialize {
                     asset_key: info.asset_key.clone(),
@@ -733,8 +637,7 @@ impl ConditionPass {
         to_materialize
     }
 
-    /// Record dispatched partition keys in the asset's `handled` set so
-    /// since-last-handled semantics don't re-fire them on the next tick.
+    /// Record dispatched partition keys in the asset's `handled` set.
     fn mark_partitions_handled(&mut self, asset_key: &str, keys: &[PartitionKey]) {
         if let Some(prev) = self.eval_state.assets.get_mut(asset_key) {
             prev.partition_state
@@ -744,18 +647,7 @@ impl ConditionPass {
         }
     }
 
-    /// Split the materialization list into the three dispatch shapes:
-    /// * unpartitioned bulk
-    /// * single-partition groups (bucketed by partition key)
-    /// * multi-partition backfills
-    ///
-    /// Selections of `Some(All)` or `None` for a partitioned asset are
-    /// resolved to all of the asset's partition keys; for an unpartitioned
-    /// asset they collapse to the bulk path. Marks each materialized asset
-    /// present in `cache.in_progress_assets` so subsequent ticks see it as
-    /// in-progress before the dispatch loop pushes any run ids, and records
-    /// the surviving keys in the asset's `handled` set — only keys actually
-    /// dispatched may suppress future fires.
+    /// Split the materialization list into the three dispatch shapes.
     fn classify_materializations(
         &mut self,
         to_materialize: Vec<ToMaterialize>,
@@ -764,16 +656,8 @@ impl ConditionPass {
         let mut partitioned_mats: Vec<(String, Vec<PartitionKey>)> = Vec::new();
 
         for tm in to_materialize {
-            // The in-progress entry gates next tick's dispatch until run ids
-            // land on it, so it may only exist for assets that actually
-            // produce a dispatch — a fully-dropped selection would leave an
-            // empty entry nothing ever clears, wedging the asset.
             match tm.selection {
                 Some(PartitionSelection::Keys(keys)) if !keys.is_empty() => {
-                    // A mapped selection can name keys this asset doesn't
-                    // have (e.g. a time_window shift when the upstream's
-                    // range extends past this asset's) — constrain to real
-                    // partitions instead of dispatching phantom ones.
                     let total = keys.len();
                     let surviving: Vec<PartitionKey> = match self
                         .conditions_by_key
@@ -820,7 +704,7 @@ impl ConditionPass {
                             self.mark_partitions_handled(&tm.asset_key, &all_keys);
                             partitioned_mats.push((tm.asset_key, all_keys));
                         }
-                        Some(_) => {} // partitioned asset with zero keys — drop
+                        Some(_) => {}
                         None => {
                             self.cache
                                 .in_progress_assets
@@ -843,8 +727,6 @@ impl ConditionPass {
         let mut single_partition_groups: HashMap<PartitionKey, Vec<String>> = HashMap::new();
         let mut multi_partition_backfills: Vec<(String, Vec<PartitionKey>)> = Vec::new();
         for (asset_key, mut partition_keys) in partitioned_mats {
-            // Selections come out of HashSets (per-process random order); the
-            // list persists into backfill records and drives dispatch order.
             partition_keys.sort_by_cached_key(|k| k.to_display());
             if partition_keys.len() == 1 {
                 single_partition_groups
@@ -863,10 +745,7 @@ impl ConditionPass {
         }
     }
 
-    /// Advance the asset-level handled cursor only for assets the plan actually
-    /// dispatched — a selection `classify` trimmed to zero must not advance it,
-    /// or `NewlyRequested` reads true next tick with nothing dispatched. Mirrors
-    /// the per-partition `handled` set classify already restricts to survivors.
+    /// Advance the asset-level handled cursor only for assets the plan actually dispatched.
     fn stamp_dispatched_handled(&mut self, plan: &MaterializationPlan, now: i64) {
         let dispatched: HashSet<&str> = plan
             .unpartitioned
@@ -929,9 +808,7 @@ mod tests {
         }
     }
 
-    /// Build a one-partitioned-asset pass and run a full
-    /// apply_results → classify → stamp tick with the given fired selection.
-    /// Returns the asset's handled cursor after the tick.
+    /// Build a one-partitioned-asset pass and run a full tick with the given fired selection.
     fn handled_after_fired_selection(selection: PartitionSelection) -> Option<i64> {
         let mut cache = AssetConditionCache::default();
         cache
@@ -981,10 +858,6 @@ mod tests {
 
     #[test]
     fn unpartitioned_watcher_sees_partition_failure_of_dep() {
-        // The asset-level failure floor is scoped to unpartitioned runs, so a
-        // partitioned dep's failure lives only in partition_status. A watcher
-        // evaluating at unpartitioned granularity (dep pivot) reads the
-        // snapshot's failed set — "any partition failed" must surface there.
         let mut cache = AssetConditionCache::default();
         let mut down = test_record("down");
         down.last_timestamp = Some(100);
@@ -999,7 +872,6 @@ mod tests {
             "up".to_string(),
             crate::condition::cache::PartitionStatusEntry {
                 failed: HashSet::from([spk("2024-01-01")]),
-                // Failure newer than up's latest materialization (100).
                 failed_timestamps: HashMap::from([(spk("2024-01-01"), 200i64)]),
                 ..Default::default()
             },
@@ -1028,19 +900,11 @@ mod tests {
 
     #[test]
     fn observation_and_sibling_success_do_not_unsurface_partition_failure() {
-        // `status.failed` is already per-key superseded by get_failed_partitions
-        // (a partition that re-materialized after its failure is dropped). So a
-        // partition still in `failed` is genuinely failed, and neither an
-        // OBSERVATION (which bumps the asset-level record.last_timestamp without
-        // materializing anything) nor a DIFFERENT partition's success may
-        // un-surface it to unpartitioned watchers.
         let mut cache = AssetConditionCache::default();
         let mut down = test_record("down");
         down.last_timestamp = Some(100);
         cache.records.insert("down".to_string(), down);
         let mut up = test_record("up");
-        // Bumped above the failure ts by an observation or a sibling partition's
-        // materialization — must NOT recover the still-failed partition p.
         up.last_timestamp = Some(300);
         cache.records.insert("up".to_string(), up);
         cache
@@ -1051,8 +915,6 @@ mod tests {
             crate::condition::cache::PartitionStatusEntry {
                 failed: HashSet::from([spk("p")]),
                 failed_timestamps: HashMap::from([(spk("p"), 150i64)]),
-                // A sibling partition q materialized at 400 (newer than p's
-                // failure) — p is a different key and stays failed.
                 timestamps: HashMap::from([(spk("q"), 400i64)]),
                 ..Default::default()
             },
@@ -1082,11 +944,6 @@ mod tests {
 
     #[test]
     fn recovered_dep_partition_failure_does_not_poison_unpartitioned_watcher() {
-        // Recovery is per-key: `get_failed_partitions` drops a failed partition
-        // from `status.failed` once THAT key re-materializes (its mat ts passes
-        // its failure ts). A recovered dep therefore has an empty `failed` set
-        // and must not surface to unpartitioned watchers — even though the
-        // asset-level record.last_timestamp could point anywhere.
         let mut cache = AssetConditionCache::default();
         let mut down = test_record("down");
         down.last_timestamp = Some(100);
@@ -1100,8 +957,6 @@ mod tests {
         cache.partition_status.insert(
             "up".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                // The previously-failed partition re-materialized, so
-                // get_failed_partitions dropped it — `failed` is empty.
                 failed: HashSet::new(),
                 timestamps: HashMap::from([(spk("2024-01-01"), 300i64)]),
                 ..Default::default()
@@ -1132,11 +987,6 @@ mod tests {
 
     #[test]
     fn run_seeds_missing_eval_state_instead_of_panicking() {
-        // Regression (C8): ConditionPass::new must seed eval_state.assets for
-        // every condition. The invariant was previously established only by the
-        // daemon's external seeding loop, so a pass built with a condition but
-        // no matching eval_state entry panicked at the [idx]/unwrap access sites
-        // (pass.rs evaluate/apply_results) on the very first tick.
         let mut cache = AssetConditionCache::default();
         cache.records.insert("a".to_string(), test_record("a"));
         let mut pass = ConditionPass::new(
@@ -1150,7 +1000,6 @@ mod tests {
             }],
             HashMap::new(),
         );
-        // Deliberately NO `pass.eval_state.assets.insert(...)` — new() must seed.
         let out = pass.run(1000, false);
         assert_eq!(
             out.results.len(),
@@ -1161,10 +1010,6 @@ mod tests {
 
     #[test]
     fn handled_cursor_skips_fully_dropped_selection() {
-        // An asset fires for a key outside its universe; classify trims the
-        // selection to zero, so nothing dispatches. The handled cursor must
-        // NOT advance — apply_results used to stamp it before classify ran, so
-        // NewlyRequested read true next tick with nothing dispatched.
         let handled = handled_after_fired_selection(PartitionSelection::Keys(
             [spk("2099-12-31")].into_iter().collect(),
         ));
@@ -1176,8 +1021,6 @@ mod tests {
 
     #[test]
     fn handled_cursor_advances_for_surviving_selection() {
-        // The boundary: a selection with a real key DOES dispatch and so must
-        // advance the handled cursor.
         let handled = handled_after_fired_selection(PartitionSelection::Keys(
             [spk("2024-01-01")].into_iter().collect(),
         ));
@@ -1190,10 +1033,6 @@ mod tests {
 
     #[test]
     fn classify_drops_mapped_keys_the_asset_does_not_have() {
-        // A mapped selection can name keys outside the asset's own range
-        // (e.g. a time_window shift when the upstream's range extends past
-        // this asset's) — those must not dispatch a materialization of a
-        // partition that doesn't exist.
         let mut pass = ConditionPass::new(
             AssetConditionCache::default(),
             ConditionEvalState::default(),
@@ -1284,7 +1123,6 @@ mod tests {
         assert!(all_keys.contains(&spk("2024-01-01T02:00:00")));
         assert!(all_keys.contains(&spk("2024-01-01T03:00:00")));
         assert_eq!(all_keys.len(), 4);
-        // Idempotent: a second refresh at the same now adds nothing.
         refresh_universe(
             &mut universe,
             &mut all_keys,
@@ -1296,10 +1134,6 @@ mod tests {
 
     #[test]
     fn refresh_universe_holds_watermark_on_enumeration_error() {
-        // A grid that can't enumerate must not advance `enumerated_to` past
-        // the failed range — those windows would be skipped forever once the
-        // grid recovers. Unreachable through validated constructors today;
-        // guards against a future Err source.
         let broken = TimeGrid {
             cron_schedule: None,
             interval_seconds: None,
@@ -1371,7 +1205,6 @@ mod tests {
         .collect();
         refresh_universe(&mut universe, &mut all_keys, now, &registered);
         assert_eq!(all_keys, [spk("red"), spk("blue")].into_iter().collect());
-        // Retirement: the set mirrors storage, it doesn't only grow.
         let shrunk: HashMap<String, HashSet<String>> = [(
             "colors".to_string(),
             ["blue".to_string()].into_iter().collect(),
@@ -1380,8 +1213,6 @@ mod tests {
         .collect();
         refresh_universe(&mut universe, &mut all_keys, now, &shrunk);
         assert_eq!(all_keys, [spk("blue")].into_iter().collect());
-        // A namespace missing from the fetch (storage failure) keeps the
-        // previous set — stale beats empty.
         refresh_universe(&mut universe, &mut all_keys, now, &HashMap::new());
         assert_eq!(all_keys, [spk("blue")].into_iter().collect());
     }
@@ -1428,10 +1259,6 @@ mod tests {
 
     #[test]
     fn multi_dim_refresh_never_duplicates_seeded_window_starts() {
-        // Seeding enumerates a dim through its explicit (future) end while
-        // the watermark starts at daemon-start `now`; later refreshes re-yield
-        // already-seeded starts and must neither append duplicates nor report
-        // a spurious change.
         let grid = TimeGrid {
             cron_schedule: None,
             interval_seconds: Some(3600.0),
@@ -1476,9 +1303,6 @@ mod tests {
 
     #[test]
     fn update_state_leaves_handled_to_classification() {
-        // The raw selection may name keys classification will drop (mapped
-        // keys the asset doesn't have). Marking them handled here would
-        // suppress them forever once they become real.
         let mut state = crate::condition::state::AssetConditionState::default();
         let timestamps: HashMap<PartitionKey, i64> = HashMap::new();
         let ctx = StateUpdateContext {
@@ -1506,7 +1330,6 @@ mod tests {
 
     #[test]
     fn update_state_resets_handled_each_tick() {
-        // handled must hold only the latest tick's dispatched keys, not accumulate.
         let mut state = crate::condition::state::AssetConditionState {
             partition_state: Some(crate::condition::partition::PartitionState {
                 handled: [spk("2024-01-01")].into_iter().collect(),
@@ -1580,9 +1403,6 @@ mod tests {
 
     #[test]
     fn classify_orders_partition_keys_canonically() {
-        // HashSet iteration order is per-process random; the dispatched key
-        // list persists into durable backfill records and drives run order,
-        // so it must come out in canonical display order.
         let days: Vec<String> = (1..=12).map(|d| format!("2024-01-{d:02}")).collect();
         let day_refs: Vec<&str> = days.iter().map(String::as_str).collect();
         let mut pass = ConditionPass::new(
@@ -1619,10 +1439,6 @@ mod tests {
 
     #[test]
     fn classify_fully_dropped_selection_leaves_no_in_progress_entry() {
-        // A selection whose keys are all outside the asset's universe
-        // dispatches nothing — it must not pre-mark the asset in-progress.
-        // The empty entry has no clear path (no run ids ever land), so it
-        // would gate every future dispatch for the asset forever.
         let mut pass = ConditionPass::new(
             AssetConditionCache::default(),
             ConditionEvalState::default(),
@@ -1656,7 +1472,6 @@ mod tests {
              in-progress entry nothing will ever clear"
         );
 
-        // Control: a surviving selection still pre-marks the asset.
         let plan = pass.classify_materializations(vec![ToMaterialize {
             asset_key: "down".to_string(),
             selection: Some(PartitionSelection::Keys(make_daily_keys(&["2024-01-01"]))),
@@ -1667,15 +1482,6 @@ mod tests {
 
     #[test]
     fn eager_does_not_fire_for_a_partition_an_active_backfill_covers() {
-        // Regression for the flaky `test_eager_only_fires_for_partitions_with_
-        // upstream_data` ("expected 3 downstream runs, got 4").
-        //
-        // A backfill runs its partitions sequentially and registers sub-runs
-        // lazily, so between partitions `c` has no run yet but is still owned by
-        // the backfill, `in_progress_assets` is empty, and `any_deps_updated`
-        // keeps firing it (root floor `None`). `eager()`'s `!in_flight()` covers c
-        // via `BackfillInProgress`, so it isn't re-selected. Pre-fix it dispatched
-        // a second time.
         let keys = |ks: &[&str]| ks.iter().map(|k| spk(k)).collect::<HashSet<_>>();
 
         let mut cache = AssetConditionCache::default();
@@ -1685,7 +1491,6 @@ mod tests {
             .upstream_deps
             .insert("dst".to_string(), vec!["src".to_string()]);
 
-        // Upstream fully materialized; downstream has a, b but not c.
         cache.partition_status.insert(
             "src".to_string(),
             crate::condition::cache::PartitionStatusEntry {
@@ -1698,14 +1503,11 @@ mod tests {
             "dst".to_string(),
             crate::condition::cache::PartitionStatusEntry {
                 materialized: keys(&["a", "b"]),
-                // a, b newer than their upstream → up to date, won't re-fire.
                 timestamps: HashMap::from([(spk("a"), 200i64), (spk("b"), 200)]),
                 ..Default::default()
             },
         );
 
-        // An active backfill covers {a,b,c}, but no sub-run is tracked yet (the
-        // gap between sequentially executed partitions).
         cache
             .backfill
             .assets
@@ -1748,8 +1550,6 @@ mod tests {
 
         let out = pass.run(1000, false);
 
-        // `BackfillInProgress` reports c as covered, so `!in_flight()` removes it
-        // from the fired selection — eager does not select c.
         let sel = &out.results[0].result.selection;
         let selects_c = matches!(sel, Some(PartitionSelection::Keys(ks)) if ks.contains(&spk("c")));
         assert!(
@@ -1757,8 +1557,6 @@ mod tests {
             "eager must not select a partition an active backfill already covers; got {sel:?}"
         );
 
-        // ...and therefore nothing dispatches. Pre-fix, the asset-level
-        // `in_progress_assets`-only gate let c through a second time.
         assert!(
             out.plan.is_empty(),
             "nothing may dispatch for a backfill-covered partition; plan dispatched \
@@ -1771,11 +1569,6 @@ mod tests {
 
     #[test]
     fn eager_does_not_redispatch_a_just_dispatched_partition_before_storage_catches_up() {
-        // Dispatch is purely `if fired`, so the condition must see a run the
-        // daemon dispatched this/last tick before it shows up in storage's
-        // `get_in_progress_partitions` (StepStart-based, so it lags). The cache's
-        // `in_progress_assets` (run_id → partition key) feeds `pctx.in_progress`
-        // so `!InProgress` covers c; without it, gate removal would re-dispatch c.
         let keys = |ks: &[&str]| ks.iter().map(|k| spk(k)).collect::<HashSet<_>>();
 
         let mut cache = AssetConditionCache::default();
@@ -1795,16 +1588,12 @@ mod tests {
         cache.partition_status.insert(
             "dst".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                // dst/c missing; storage `in_progress` still empty.
                 materialized: keys(&["a", "b"]),
                 timestamps: HashMap::from([(spk("a"), 200i64), (spk("b"), 200)]),
                 ..Default::default()
             },
         );
 
-        // The daemon dispatched a single-partition run for c this tick. Its run is
-        // NOT yet observable in storage, but `register_dispatched_run` recorded
-        // the partition it targets.
         cache.register_dispatched_run("dst".into(), "run_c".into(), 1000, Some(spk("c")));
         assert!(
             cache.partition_status["dst"].in_progress.is_empty(),
@@ -1840,8 +1629,6 @@ mod tests {
 
         let out = pass.run(1000, false);
 
-        // `!InProgress` (storage ∪ the cache's pending dispatches) covers c, so
-        // eager does not select it and nothing re-dispatches.
         let sel = &out.results[0].result.selection;
         let selects_c = matches!(sel, Some(PartitionSelection::Keys(ks)) if ks.contains(&spk("c")));
         assert!(
@@ -1857,11 +1644,6 @@ mod tests {
 
     #[test]
     fn classify_marks_all_selection_keys_handled() {
-        // A partitioned asset can fire with `All` — e.g. an unpartitioned
-        // upstream dep evaluates to a bool selection that widens to every
-        // partition. The dispatched keys must land in `handled` exactly like
-        // a Keys selection, or since-last-handled semantics re-fire the
-        // whole asset on every tick.
         let mut pass = ConditionPass::new(
             AssetConditionCache::default(),
             ConditionEvalState::default(),
@@ -1908,11 +1690,6 @@ mod tests {
 
     #[test]
     fn latest_window_tracks_wall_clock_on_non_utc_hosts() {
-        // Partition keys are wall-clock labels. On a UTC+2 host at 10:30
-        // local, now_ts() reads 08:30Z — the latest window is still the
-        // 10:00 wall-clock one, not 08:00. `evaluate` converts the tick
-        // instant to local naive before calling this, so the helper itself
-        // compares wall clock to wall clock.
         let all_keys =
             make_daily_keys(&["2026-06-11T08:00", "2026-06-11T09:00", "2026-06-11T10:00"]);
         let now_local = to_wall("2026-06-11 10:30");
@@ -1976,7 +1753,6 @@ mod tests {
         let lookback_secs = 3.0 * 86400.0;
         let result =
             compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, Some(lookback_secs));
-        // cutoff = latest start (03-26) - 3d = 2026-03-23 00:00, inclusive.
         assert_eq!(result.len(), 4);
         assert!(result.contains(&spk("2026-03-23")));
         assert!(result.contains(&spk("2026-03-24")));
@@ -2008,9 +1784,6 @@ mod tests {
 
     #[test]
     fn lookback_smaller_than_period_still_selects_latest_window() {
-        // The cutoff anchors at the latest window START, not `now`: a lookback
-        // smaller than the period must select exactly the latest window (same
-        // as lookback=None), never an empty set.
         let all_keys = make_daily_keys(&["2026-03-24", "2026-03-25", "2026-03-26"]);
         let now = to_wall("2026-03-26 12:00");
         let result = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, Some(3600.0));
@@ -2020,8 +1793,6 @@ mod tests {
 
     #[test]
     fn lookback_of_one_period_selects_previous_window_all_day() {
-        // lookback = one period reaches exactly one window back regardless of
-        // where inside the latest window `now` falls.
         let all_keys = make_daily_keys(&["2026-03-24", "2026-03-25", "2026-03-26"]);
         let now = to_wall("2026-03-26 23:59");
         let result = compute_latest_time_window_keys(&all_keys, "%Y-%m-%d", now, Some(86400.0));
@@ -2061,7 +1832,6 @@ mod tests {
         let lookback_secs = 3.0 * 3600.0;
         let result =
             compute_latest_time_window_keys(&all_keys, "%Y-%m-%dT%H:%M", now, Some(lookback_secs));
-        // cutoff = latest start (12:00) - 3h = 09:00, inclusive.
         assert_eq!(result.len(), 4);
         assert!(result.contains(&spk("2026-03-25T09:00")));
         assert!(result.contains(&spk("2026-03-25T10:00")));

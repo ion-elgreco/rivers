@@ -14,8 +14,7 @@ use surrealdb::types::{Error as SurrealError, Kind, SurrealValue, Value};
 pub mod tag_keys {
     /// Run priority. Higher = dequeued first.
     pub const PRIORITY: &str = "rivers/priority";
-    /// Set on a backfill's tags when created via `rerun_backfill` —
-    /// points to the original backfill id.
+    /// Set on a backfill's tags when created via `rerun_backfill`.
     pub const RERUN_OF: &str = "rivers/rerun_of";
 }
 
@@ -204,9 +203,6 @@ impl EventType {
     }
 
     /// Sort priority within the same timestamp.
-    /// Lower = earlier. Ensures
-    /// StepStart < LogOutput < Observation < Materialization < StepSuccess/Failure.
-    /// Concurrency events sort after step lifecycle events.
     pub fn sort_order(&self) -> i64 {
         match self {
             Self::StepStart => 0,
@@ -224,27 +220,19 @@ impl EventType {
 }
 
 /// Partition key stored alongside events and asset partition records.
-///
-/// Stored natively in SurrealDB as an object with `variant` + `keys` fields,
-/// avoiding fragile string serialization.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PartitionKey {
     /// Single-dimension key (e.g. `"2024-01-01"` or `["a", "b"]`).
     Single { keys: Vec<String> },
     /// Multi-dimension key (e.g. `{"date": ["2024-01-01"], "region": ["us"]}`).
     Multi { dims: Vec<(String, Vec<String>)> },
-    /// Explicit set of concrete keys (each member a single Single/Multi key,
-    /// never nested). Internal/transport only: bundles a sparse backfill group
-    /// no cartesian Multi can express; expanded via `members()` at execution.
+    /// Explicit set of concrete keys (each member a single Single/Multi key, never nested).
     Set { keys: Vec<PartitionKey> },
 }
 
 impl PartitionKey {
-    /// Expand a possibly-batched key into its individual single-valued members
-    /// (`Single`: one per value; `Multi`: the cartesian product).
+    /// Expand a possibly-batched key into its individual single-valued members.
     pub fn members(&self) -> Vec<PartitionKey> {
-        // The full expansion is `members_preview` with no cap; keep the
-        // cartesian logic in one place.
         self.members_preview(usize::MAX)
     }
 
@@ -276,9 +264,6 @@ impl PartitionKey {
             Self::Multi { dims } => {
                 let mut sorted = dims.clone();
                 sorted.sort_by(|a, b| a.0.cmp(&b.0));
-                // Extend the cartesian product one dimension at a time, capping
-                // at `limit` after each (`take` is lazy, so we never build the
-                // full product of a huge key).
                 let mut combos: Vec<Vec<(String, Vec<String>)>> = vec![Vec::new()];
                 for (name, vals) in &sorted {
                     combos = combos
@@ -313,12 +298,7 @@ impl PartitionKey {
         }
     }
 
-    /// Canonical key-as-string encoding for display and string matching:
-    /// `Single` → values comma-joined; `Multi` → dims sorted, `dim=v,v`
-    /// pipe-joined; `Set` → member displays joined with `", "`. Every layer
-    /// that renders or matches keys as strings (gRPC window keys, heatmap
-    /// members, run labels, picker rows) must use this — a divergent encoding
-    /// silently breaks cross-layer matching.
+    /// Canonical key-as-string encoding for display and string matching.
     pub fn to_display(&self) -> String {
         match self {
             Self::Single { keys } => keys.join(","),
@@ -339,21 +319,12 @@ impl PartitionKey {
         }
     }
 
-    /// The first display-syntax separator found in `key`, if any. `|` joins
-    /// dimensions and `,` joins values in [`Self::to_display`]; a key value
-    /// containing either cannot round-trip through
-    /// [`Self::display_candidates`], so constructors and the dynamic-key
-    /// write path reject such values.
+    /// The first display-syntax separator found in `key`, if any.
     pub fn reserved_display_char(key: &str) -> Option<char> {
         ['|', ','].into_iter().find(|&c| key.contains(c))
     }
 
-    /// Inverse of [`Self::to_display`] for point lookups: the candidate
-    /// structured keys a display string may denote, ordered least-structured
-    /// first. Always includes the `Single` reading; appends a `Multi` reading
-    /// when the string parses as `dim=v,v|dim=v,v`. A Static key that happens
-    /// to contain `=` is ambiguous — lookups try the candidates
-    /// most-structured first, so the `Multi` reading wins when both match.
+    /// Inverse of [`Self::to_display`] for point lookups.
     pub fn display_candidates(display: &str) -> Vec<PartitionKey> {
         let mut out = vec![PartitionKey::Single {
             keys: vec![display.to_string()],
@@ -383,7 +354,6 @@ impl PartitionKey {
     }
 
     /// Serialize to JSON for CLI args / K8s CRD fields.
-    /// Single: `{"single":["2025-01-16"]}`, Multi: `{"multi":{"region":["us"],"date":["2025-03"]}}`.
     pub fn to_json(&self) -> String {
         match self {
             Self::Single { keys } => serde_json::json!({"single": keys}).to_string(),
@@ -482,9 +452,6 @@ impl SurrealValue for PartitionKey {
                 map.insert("keys".to_string(), keys.into_value());
             }
             Self::Multi { mut dims } => {
-                // Canonical order: the UNIQUE index and equality queries
-                // compare the serialized form, which must not depend on
-                // construction order (Python builds dims from a HashMap).
                 dims.sort_by(|a, b| a.0.cmp(&b.0));
                 map.insert("variant".to_string(), "Multi".to_string().into_value());
                 map.insert("dims".to_string(), dims.into_value());
@@ -498,7 +465,6 @@ impl SurrealValue for PartitionKey {
     }
 
     fn from_value(value: Value) -> std::result::Result<Self, SurrealError> {
-        // Backward compat with old string-serialized data.
         if let Ok(s) = String::from_value(value.clone()) {
             return Ok(Self::Single { keys: vec![s] });
         }
@@ -542,8 +508,7 @@ impl SurrealValue for PartitionKey {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EventRecord {
-    /// Owning code location. Routes asset / partition row updates triggered
-    /// by materialization side-effects in `store_event` to the correct CL.
+    /// Owning code location.
     #[serde(default = "default_code_location_id")]
     pub code_location_id: String,
     pub event_type: EventType,
@@ -553,8 +518,6 @@ pub struct EventRecord {
     pub timestamp: i64,
     pub metadata: Vec<(String, String)>,
     /// Upstream input data versions consumed during this materialization.
-    /// Captured at read time by the executor: `(dep_name, data_version)`.
-    /// Empty for non-Materialization events.
     #[serde(default)]
     pub input_data_versions: Vec<(String, String)>,
 }
@@ -731,23 +694,16 @@ impl SurrealValue for LaunchedBy {
     }
 }
 
-/// Default code-location identity used when the daemon has neither
-/// `RIVERS_CODE_LOCATION_ID` nor `RIVERS_CODE_LOCATION_NAME` set (local
-/// single-CL dev, tests, in-process embedded usage).
+/// Default code-location identity used when neither `RIVERS_CODE_LOCATION_ID` nor `RIVERS_CODE_LOCATION_NAME` is set.
 pub const DEFAULT_CODE_LOCATION_ID: &str = "default";
 
 #[derive(Debug, Clone, PartialEq, SurrealValue, serde::Serialize, serde::Deserialize)]
 pub struct RunRecord {
     pub run_id: String,
-    /// Identity of the code location that owns this run. Filters the run
-    /// queue so daemons sharing a SurrealDB only dequeue their own runs.
-    /// Defaults to [`DEFAULT_CODE_LOCATION_ID`] for rows written
-    /// by older binaries or bare in-process usage.
+    /// Identity of the code location that owns this run.
     #[serde(default = "default_code_location_id")]
     pub code_location_id: String,
-    /// Name of the user-defined `Job` this run targets. `None` for ad-hoc
-    /// runs from `repo.materialize()` and for sensors that drive an asset
-    /// selection without a job.
+    /// Name of the user-defined `Job` this run targets.
     #[serde(default)]
     pub job_name: Option<String>,
     pub status: RunStatus,
@@ -776,8 +732,7 @@ impl crate::concurrency::Tagged for RunRecord {
     }
 }
 
-/// Lightweight projection of a run for the coordinator tick — only the fields
-/// needed for tag checking, dequeue, and launch.
+/// Lightweight projection of a run for the coordinator tick.
 #[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
 pub struct CoordinatorRunInfo {
     pub run_id: String,
@@ -805,25 +760,21 @@ impl crate::concurrency::Tagged for CoordinatorRunInfo {
 #[derive(Debug, Clone, Default)]
 pub struct RunFilter {
     pub status: Option<RunStatus>,
-    /// Exact match on `job_name`. Used by the job-detail page to scope run
-    /// history to one job without the substring ambiguity of e.g. `foo` vs
-    /// `foo_bar`.
+    /// Exact match on `job_name`.
     pub job_name: Option<String>,
     pub job_substring: Option<String>,
     pub asset_substring: Option<String>,
     pub partition_substring: Option<String>,
 }
 
-/// One page of run records plus the total number of rows matching the filter
-/// (so callers can render pagination controls without a second query).
+/// One page of run records plus the total number of rows matching the filter.
 #[derive(Debug, Clone)]
 pub struct RunsPage {
     pub rows: Vec<RunRecord>,
     pub total: u64,
 }
 
-/// Aggregate run counts for the runs-list page header. Covers all runs — the
-/// UI uses these to drive status filter pill badges and the page subtitle.
+/// Aggregate run counts for the runs-list page header.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RunsSummary {
     pub total: u64,
@@ -989,8 +940,7 @@ pub struct BackfillsPage {
     pub total: u64,
 }
 
-/// Aggregate backfill counts for the list-page header pills. Unfiltered so the
-/// pill badges stay stable while the user flips between status tabs.
+/// Aggregate backfill counts for the list-page header pills.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BackfillsSummary {
     pub total: u64,
@@ -1010,8 +960,7 @@ pub struct BackfillRecord {
     pub strategy: BackfillStrategy,
     pub failure_policy: BackfillFailurePolicy,
     pub asset_selection: Vec<String>,
-    /// Set when the backfill targets a named `Job` — each partition runs with the
-    /// job's own plan + executor. `None` for ad-hoc asset-selection backfills.
+    /// Set when the backfill targets a named `Job`.
     #[serde(default)]
     pub job_name: Option<String>,
     pub partition_keys: Vec<PartitionKey>,
@@ -1171,8 +1120,7 @@ pub struct ConditionTickRecord {
     pub total_fired: u32,
     pub eval_duration_us: u64,
     pub run_ids: Vec<String>,
-    /// Backfills this tick spawned. Multi-partition condition fires create
-    /// backfills (one per asset).
+    /// Backfills this tick spawned.
     #[serde(default)]
     pub backfill_ids: Vec<String>,
 }
@@ -1207,7 +1155,6 @@ pub struct ConditionEvalRecord {
     /// Serialized evaluation tree (JSON bytes of `condition::EvalNodeResult`).
     pub tree_json: Vec<u8>,
     /// Serialized partition selection (JSON bytes of `condition::PartitionSelection`).
-    /// None for unpartitioned assets.
     #[serde(default)]
     pub selection_json: Option<Vec<u8>>,
 }
@@ -1277,7 +1224,6 @@ pub struct StoredEvent {
 }
 
 /// A code-location identity bound for the lifetime of a logical operation.
-/// Borrowed by [`ScopedStorage`] returned from [`StorageBackend::for_code_location`].
 #[derive(Debug, Clone)]
 pub struct CodeLocationContext {
     id: String,
@@ -1311,12 +1257,6 @@ impl From<&str> for CodeLocationContext {
 }
 
 /// Per-code-location storage operations.
-///
-/// Crate-private (`pub(crate)`) so callers outside `rivers-core` can only
-/// reach these methods through [`ScopedStorage`], returned by
-/// [`StorageBackend::for_code_location`]. That makes "forgot to scope a
-/// query" a compile-time error at every external call site rather than a
-/// silent cross-CL data leak.
 pub(crate) trait PerCodeLocationStorage: Send + Sync {
     fn get_events_for_asset(
         &self,
@@ -1478,9 +1418,7 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         asset_key: &str,
     ) -> impl Future<Output = Result<u64>> + Send;
 
-    /// Number of registered keys for a dynamic partition namespace (aggregate
-    /// count, not the keys). Dynamic partitions are storage-managed, so this is
-    /// the authoritative count the UI shows (the def-level `partition_count` is 0).
+    /// Number of registered keys for a dynamic partition namespace.
     fn count_dynamic_partitions(
         &self,
         code_location_id: &str,
@@ -1499,13 +1437,7 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         asset_key: &str,
     ) -> impl Future<Output = Result<Vec<PartitionKey>>> + Send;
 
-    /// Partitions whose latest failure isn't superseded by a later
-    /// materialization, with that failure's timestamp. A failure is either a
-    /// `StepFailure` event or a terminal-`Failure` run's partition key (runs
-    /// that die without writing step events — pod death / operator status
-    /// sync — have no event to key off). `materialized` is the caller's
-    /// per-partition timestamps (from `get_partition_timestamps`), so we
-    /// don't re-read `asset_partitions`.
+    /// Partitions whose latest failure isn't superseded by a later materialization, with that failure's timestamp.
     fn get_failed_partitions(
         &self,
         code_location_id: &str,
@@ -1580,8 +1512,7 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         order: SortOrder,
     ) -> impl Future<Output = Result<Vec<RunRecord>>> + Send;
 
-    /// Read the persisted condition-daemon eval state for this CL. Returns
-    /// `None` if the daemon has never persisted state (first run).
+    /// Read the persisted condition-daemon eval state for this CL.
     fn get_condition_eval_state(
         &self,
         code_location_id: &str,
@@ -1594,8 +1525,7 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         state: &crate::condition::ConditionEvalState,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Read the persisted graph topology blob for this CL. Returns `None` if
-    /// the CL has never been resolved into storage.
+    /// Read the persisted graph topology blob for this CL.
     fn get_graph_topology(
         &self,
         code_location_id: &str,
@@ -1610,11 +1540,6 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
 }
 
 /// A backend reference pre-bound to a [`CodeLocationContext`].
-///
-/// Returned by [`StorageBackend::for_code_location`]. All per-CL operations
-/// live as inherent methods here — the caller can't drop the scope and
-/// forgetting it is a compile-time error rather than a silent cross-CL
-/// query.
 pub struct ScopedStorage<'a, S: ?Sized> {
     backend: &'a S,
     code_location_id: &'a str,
@@ -1626,13 +1551,7 @@ impl<'a, S: ?Sized> ScopedStorage<'a, S> {
     }
 }
 
-/// Owned counterpart to [`ScopedStorage`] — bundles `Arc<S>` with a
-/// [`CodeLocationContext`] so a single value can be moved into spawned
-/// tasks instead of threading the storage Arc and identity separately.
-///
-/// `Clone` is cheap (Arc bump + String clone). Call [`Self::scoped`] to get
-/// a borrowed [`ScopedStorage`] for per-CL methods, or [`Self::backend`] to
-/// reach unscoped (UUID-keyed) methods on the underlying [`StorageBackend`].
+/// Owned counterpart to [`ScopedStorage`] — bundles `Arc<S>` with a [`CodeLocationContext`].
 pub struct ScopedStorageHandle<S> {
     backend: Arc<S>,
     ctx: CodeLocationContext,
@@ -2009,8 +1928,7 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
             .await
     }
 
-    /// Compute staleness for every asset in this code location. Nothing is
-    /// persisted — the canonical entry point for UI / CLI / daemon staleness reads.
+    /// Compute staleness for every asset in this code location.
     pub async fn compute_staleness(
         &self,
     ) -> Result<std::collections::HashMap<String, (StaleStatus, Vec<StaleCause>)>> {
@@ -2041,12 +1959,7 @@ impl<'a, S: StorageBackend + ?Sized> ScopedStorage<'a, S> {
         )
     }
 
-    /// Persist a fan-out source's mapping keys, scoped by `data_version` so
-    /// concurrent runs of the same asset+partition can't collide and a
-    /// plain-values run leaves no entry to confuse a subsequent read.
-    /// Callers should only invoke this when the materialization actually
-    /// produced `DynamicOutput`s — absent KV entries are the signal for
-    /// "ran with plain values, use synthetic indices."
+    /// Persist a fan-out source's mapping keys, scoped by `data_version`.
     pub async fn set_dynamic_keys(
         &self,
         asset_key: &str,
@@ -2059,10 +1972,7 @@ impl<'a, S: StorageBackend + ?Sized> ScopedStorage<'a, S> {
         self.backend.kv_set(&key, &bytes).await
     }
 
-    /// Read the fan-out mapping keys for a specific materialization
-    /// (`asset_key` + `partition` + `data_version`). `Ok(None)` means no
-    /// entry exists — the source either ran with plain values or hasn't
-    /// been materialized at this `data_version`.
+    /// Read the fan-out mapping keys for a specific materialization.
     pub async fn get_dynamic_keys(
         &self,
         asset_key: &str,
@@ -2079,8 +1989,7 @@ impl<'a, S: StorageBackend + ?Sized> ScopedStorage<'a, S> {
 
 #[allow(private_bounds)]
 pub trait StorageBackend: PerCodeLocationStorage {
-    /// Bind a [`CodeLocationContext`] to this backend. The only way external
-    /// crates can reach per-CL operations.
+    /// Bind a [`CodeLocationContext`] to this backend.
     fn for_code_location<'a>(&'a self, ctx: &'a CodeLocationContext) -> ScopedStorage<'a, Self>
     where
         Self: Sized,
@@ -2101,12 +2010,7 @@ pub trait StorageBackend: PerCodeLocationStorage {
         &self,
         run_id: &str,
     ) -> impl Future<Output = Result<Vec<StoredEvent>>> + Send;
-    /// Scan the given runs' step events for `asset_key` in one pass: whether
-    /// any step completed (StepSuccess or StepFailure) and EVERY run with a
-    /// StepSuccess. Used to tell a materialized asset from a co-batched
-    /// failure when the asset_record write lags behind the step events — the
-    /// caller matches the failing run against the full success set, so
-    /// returning only the first-found run would misfloor nondeterministically.
+    /// Scan the given runs' step events for `asset_key` in one pass.
     fn step_completion(
         &self,
         asset_key: &str,
@@ -2134,16 +2038,13 @@ pub trait StorageBackend: PerCodeLocationStorage {
         run_ids: &[String],
         status: Option<RunStatus>,
     ) -> impl Future<Output = Result<Vec<RunRecord>>> + Send;
-    /// List runs across every code location. Use [`ScopedStorage::get_runs`]
-    /// for per-CL queries; this method is for global UI / CLI views.
+    /// List runs across every code location.
     fn get_all_runs(
         &self,
         limit: usize,
         status: Option<RunStatus>,
     ) -> impl Future<Output = Result<Vec<RunRecord>>> + Send;
-    /// List runs across every code location created after `since_timestamp`
-    /// (nanoseconds). Per-CL callers should use
-    /// [`ScopedStorage::get_runs_since`].
+    /// List runs across every code location created after `since_timestamp` (nanoseconds).
     fn get_all_runs_since(
         &self,
         since_timestamp: i64,
@@ -2151,9 +2052,7 @@ pub trait StorageBackend: PerCodeLocationStorage {
     ) -> impl Future<Output = Result<Vec<RunRecord>>> + Send;
 
     // Run queue
-    /// Get all queued runs (unordered) across every code location. Caller
-    /// sorts. The daemon coordinator uses
-    /// [`ScopedStorage::coordinator_tick_query`] for per-CL queries instead.
+    /// Get all queued runs (unordered) across every code location.
     fn get_all_queued_runs(&self) -> impl Future<Output = Result<Vec<RunRecord>>> + Send;
 
     /// Count runs in NotStarted or Started status across every code location.
@@ -2190,8 +2089,7 @@ pub trait StorageBackend: PerCodeLocationStorage {
         evals: &[ConditionEvalRecord],
     ) -> impl Future<Output = Result<Vec<String>>> + Send;
 
-    // Backfills (record-keyed by UUID for the writes; queries that need
-    // CL filtering live on ScopedStorage instead).
+    // Backfills
     fn create_backfill(&self, backfill: &BackfillRecord)
     -> impl Future<Output = Result<()>> + Send;
     fn update_backfill_status(
@@ -2212,10 +2110,7 @@ pub trait StorageBackend: PerCodeLocationStorage {
         &self,
         backfill_id: &str,
     ) -> impl Future<Output = Result<Option<BackfillRecord>>> + Send;
-    /// Check if all runs for a backfill are terminal. If so, transition the
-    /// backfill to CompletedSuccess/CompletedFailed/Canceled and set end_time.
-    /// Returns the new status if finalized, None if still in progress.
-    /// `extra_canceled`: never-launched partitions (no run record) to count canceled.
+    /// Check if all runs for a backfill are terminal and finalize it if so.
     fn try_complete_backfill(
         &self,
         backfill_id: &str,
@@ -2223,7 +2118,6 @@ pub trait StorageBackend: PerCodeLocationStorage {
     ) -> impl Future<Output = Result<Option<BackfillStatus>>> + Send;
 
     /// Release all concurrency slots held by a specific step (across all pools).
-    /// Also removes any pending_steps entry for this step.
     fn free_concurrency_slots(
         &self,
         run_id: &str,
@@ -2231,15 +2125,12 @@ pub trait StorageBackend: PerCodeLocationStorage {
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Release all concurrency slots and pending entries for an entire run.
-    /// Called when a run terminates.
     fn free_concurrency_slots_for_run(
         &self,
         run_id: &str,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Renew the lease on all concurrency slots held by a specific step.
-    /// Updates `lease_expires_at` and `last_heartbeat`. Returns the number
-    /// of slot rows renewed (0 if the step has no active slots).
     fn renew_slot_lease(
         &self,
         run_id: &str,
@@ -2248,11 +2139,9 @@ pub trait StorageBackend: PerCodeLocationStorage {
     ) -> impl Future<Output = Result<u32>> + Send;
 
     /// Delete all concurrency slot rows whose lease has expired.
-    /// Returns the number of expired slot rows removed.
     fn free_expired_leases(&self) -> impl Future<Output = Result<u32>> + Send;
 
     /// Cancel a queued run (transition from Queued to Canceled).
-    /// Returns true if the run was actually canceled, false if not found or not Queued.
     fn cancel_queued_run(&self, run_id: &str) -> impl Future<Output = Result<bool>> + Send;
 
     // ── K8s run coordination ──
@@ -2293,7 +2182,6 @@ pub trait StorageBackend: PerCodeLocationStorage {
     ) -> impl Future<Output = Result<HashSet<String>>> + Send;
 
     /// Get data versions produced by materialization events in a run.
-    /// Returns a map of asset_key → data_version for steps that emitted a data version.
     fn get_step_data_versions(
         &self,
         run_id: &str,
@@ -2303,11 +2191,6 @@ pub trait StorageBackend: PerCodeLocationStorage {
 #[cfg(test)]
 mod partition_key_tests {
     use super::PartitionKey;
-
-    // `to_display` is THE canonical key-as-string encoding: every layer that
-    // renders or matches keys as strings (gRPC window keys, heatmap members,
-    // run labels, picker rows) must agree on it. Format: dims sorted and
-    // pipe-joined, values comma-joined — `dim=v,v|dim=v`.
 
     #[test]
     fn single_displays_bare_value() {
