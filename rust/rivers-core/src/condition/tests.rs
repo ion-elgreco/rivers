@@ -2878,8 +2878,7 @@ fn test_empty_partitioned_dep_universe_does_not_bridge_latch_to_all() {
     let records = HashMap::from([("r".to_string(), r.clone()), ("u".to_string(), u.clone())]);
     let deps = HashMap::from([("r".to_string(), vec!["u".to_string()])]);
 
-    let partition_statuses =
-        HashMap::from([("r".to_string(), Default::default())]);
+    let partition_statuses = HashMap::from([("r".to_string(), Default::default())]);
     let all_states = HashMap::new();
     let mut ctx = make_ctx("r", &r, &records, &deps);
     ctx.all_asset_states = &all_states;
@@ -7633,7 +7632,10 @@ async fn test_step_completion_single_pass() {
 
     let (completed, succeeded) = storage.step_completion("b", &runs).await.unwrap();
     assert!(completed, "a failure is still a completion");
-    assert!(succeeded.is_empty(), "no success run for a failed-only asset");
+    assert!(
+        succeeded.is_empty(),
+        "no success run for a failed-only asset"
+    );
 
     let (completed, succeeded) = storage.step_completion("c", &runs).await.unwrap();
     assert!(!completed, "no events for 'c' in the given runs");
@@ -10533,11 +10535,17 @@ fn test_node_label_exhaustive() {
     );
     assert_eq!(
         ConditionNode::any_deps_match(ConditionNode::Missing).node_label(),
-        format!("any_deps_match({})", ConditionNode::Missing.fingerprint_hex())
+        format!(
+            "any_deps_match({})",
+            ConditionNode::Missing.fingerprint_hex()
+        )
     );
     assert_eq!(
         ConditionNode::all_deps_match(ConditionNode::Missing).node_label(),
-        format!("all_deps_match({})", ConditionNode::Missing.fingerprint_hex())
+        format!(
+            "all_deps_match({})",
+            ConditionNode::Missing.fingerprint_hex()
+        )
     );
     assert_eq!(
         ConditionNode::And(vec![ConditionNode::Missing]).node_label(),
@@ -10576,11 +10584,12 @@ fn test_display_label_is_readable_not_a_fingerprint() {
         "display_label must not contain the raw fingerprint"
     );
 
-    let am = ConditionNode::asset_matches(
-        vec!["upstream_feed".to_string()],
-        ConditionNode::Missing,
+    let am =
+        ConditionNode::asset_matches(vec!["upstream_feed".to_string()], ConditionNode::Missing);
+    assert_eq!(
+        am.display_label(),
+        "asset_matches('upstream_feed', missing)"
     );
-    assert_eq!(am.display_label(), "asset_matches('upstream_feed', missing)");
 
     // A user-provided label on a dep-aggregate is already readable — keep it.
     let labeled = ConditionNode::AnyDepsMatch {

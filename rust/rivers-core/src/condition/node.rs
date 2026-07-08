@@ -415,7 +415,11 @@ impl ConditionNode {
                     let joined: Vec<_> = keys.iter().map(|k| format!("'{}'", k)).collect();
                     format!("[{}]", joined.join(", "))
                 };
-                format!("asset_matches({}, {})", keys_label, condition.fingerprint_hex())
+                format!(
+                    "asset_matches({}, {})",
+                    keys_label,
+                    condition.fingerprint_hex()
+                )
             }
             ConditionNode::And(_) => "All of".into(),
             ConditionNode::Or(_) => "Any of".into(),

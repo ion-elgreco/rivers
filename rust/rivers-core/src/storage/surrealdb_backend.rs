@@ -284,9 +284,8 @@ impl From<&EventRecord> for DbEventWrite {
 
 impl DbStoredEvent {
     fn into_stored_event(self) -> StoredEvent {
-        let event_type = EventType::from_type_name(&self.event_type, self.data_version).unwrap_or(
-            EventType::StepFailure,
-        );
+        let event_type = EventType::from_type_name(&self.event_type, self.data_version)
+            .unwrap_or(EventType::StepFailure);
         StoredEvent {
             id: self.id,
             event_type,
@@ -10213,7 +10212,6 @@ mod tests {
                 "  in_progress={n_in_progress:>3}, queued={n_queued:>5}, slots={n_slots:>4} → \
                  {per_tick:>8.3?}/tick ({n_ticks} ticks in {elapsed:.3?})"
             );
-
         }
     }
 

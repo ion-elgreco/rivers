@@ -156,10 +156,12 @@ def test_multi_dimension_change_does_not_flood_future_time_windows(storage):
         # which rebuilds the cartesian universe.
         storage.add_dynamic_partitions("mcolors", ["red"])
         assert _wait_until(
-            lambda: storage.get_latest_materialization(
-                "colored_daily", f"color=red|date={past_key}"
-            )
-            is not None,
+            lambda: (
+                storage.get_latest_materialization(
+                    "colored_daily", f"color=red|date={past_key}"
+                )
+                is not None
+            ),
             timeout=25,
         ), "red x past window never materialized — the cartesian rebuild never ran"
 
@@ -236,9 +238,7 @@ def test_future_end_upstream_does_not_keep_any_deps_missing_true(storage):
     # otherwise the watcher would legitimately fire and flake the test.
     for day in (2, 1, 0, -1):
         key = (today - _dt.timedelta(days=day)).strftime("%Y-%m-%d")
-        result = repo.materialize(
-            ["up_fut"], partition_key=rs.PartitionKey.single(key)
-        )
+        result = repo.materialize(["up_fut"], partition_key=rs.PartitionKey.single(key))
         assert result.success
 
     daemon = AutomationDaemon(

@@ -497,24 +497,20 @@ impl PartitionMapping {
         match self {
             Self::Identity {} => Ok(downstream_key.clone()),
 
-            Self::AllPartitions {} => {
-                Ok(downstream_key.clone())
-            }
+            Self::AllPartitions {} => Ok(downstream_key.clone()),
 
-            Self::Static { mapping } => {
-                match downstream_key {
-                    PyPartitionKey::Single { key } => {
-                        let downstream_str = key.first().ok_or("Empty partition key")?;
-                        match mapping.get(downstream_str) {
-                            Some(upstream_str) => Ok(PyPartitionKey::Single {
-                                key: vec![upstream_str.clone()],
-                            }),
-                            None => Ok(downstream_key.clone()),
-                        }
+            Self::Static { mapping } => match downstream_key {
+                PyPartitionKey::Single { key } => {
+                    let downstream_str = key.first().ok_or("Empty partition key")?;
+                    match mapping.get(downstream_str) {
+                        Some(upstream_str) => Ok(PyPartitionKey::Single {
+                            key: vec![upstream_str.clone()],
+                        }),
+                        None => Ok(downstream_key.clone()),
                     }
-                    _ => Err("Static mapping only works with Single partition keys".to_string()),
                 }
-            }
+                _ => Err("Static mapping only works with Single partition keys".to_string()),
+            },
 
             Self::TimeWindow { offset } => {
                 if *offset == 0 {
@@ -605,68 +601,65 @@ impl PartitionMapping {
             Self::MultiToSingle {
                 dimension_name,
                 partition_mapping,
-            } => {
-                match downstream_key {
-                    PyPartitionKey::Single { key } => {
-                        let up_def = upstream_def.ok_or(
-                            "MultiToSingle (Single→Multi) requires upstream PartitionsDefinition",
-                        )?;
-                        let dimensions =
-                            match up_def {
-                                PartitionsDefinition::Multi { dimensions } => dimensions,
-                                _ => return Err(
-                                    "MultiToSingle upstream must be a Multi PartitionsDefinition"
-                                        .to_string(),
-                                ),
-                            };
-
-                        let single_key = PyPartitionKey::Single { key: key.clone() };
-                        let named_dim_def = dimensions
-                            .iter()
-                            .find(|(n, _)| n == dimension_name)
-                            .map(|(_, dd)| dd);
-                        let mapped_single =
-                            partition_mapping.0.map_key(&single_key, named_dim_def)?;
-                        let mapped_values = match &mapped_single {
-                            PyPartitionKey::Single { key } => key.clone(),
-                            _ => return Err("Inner mapping produced a Multi key".to_string()),
-                        };
-
-                        let mut multi_keys = HashMap::new();
-                        for (dim_name, dim_def) in dimensions {
-                            if dim_name == dimension_name {
-                                multi_keys.insert(dim_name.clone(), mapped_values.clone());
-                            } else {
-                                let key_strings =
-                                    dim_def.enumerate_single_dim_keys().map_err(|e| {
-                                        format!(
-                                            "Failed to get partition keys for dimension '{}': {}",
-                                            dim_name, e
-                                        )
-                                    })?;
-                                multi_keys.insert(dim_name.clone(), key_strings);
-                            }
+            } => match downstream_key {
+                PyPartitionKey::Single { key } => {
+                    let up_def = upstream_def.ok_or(
+                        "MultiToSingle (Single→Multi) requires upstream PartitionsDefinition",
+                    )?;
+                    let dimensions = match up_def {
+                        PartitionsDefinition::Multi { dimensions } => dimensions,
+                        _ => {
+                            return Err(
+                                "MultiToSingle upstream must be a Multi PartitionsDefinition"
+                                    .to_string(),
+                            );
                         }
-                        Ok(PyPartitionKey::Multi { keys: multi_keys })
+                    };
+
+                    let single_key = PyPartitionKey::Single { key: key.clone() };
+                    let named_dim_def = dimensions
+                        .iter()
+                        .find(|(n, _)| n == dimension_name)
+                        .map(|(_, dd)| dd);
+                    let mapped_single = partition_mapping.0.map_key(&single_key, named_dim_def)?;
+                    let mapped_values = match &mapped_single {
+                        PyPartitionKey::Single { key } => key.clone(),
+                        _ => return Err("Inner mapping produced a Multi key".to_string()),
+                    };
+
+                    let mut multi_keys = HashMap::new();
+                    for (dim_name, dim_def) in dimensions {
+                        if dim_name == dimension_name {
+                            multi_keys.insert(dim_name.clone(), mapped_values.clone());
+                        } else {
+                            let key_strings = dim_def.enumerate_single_dim_keys().map_err(|e| {
+                                format!(
+                                    "Failed to get partition keys for dimension '{}': {}",
+                                    dim_name, e
+                                )
+                            })?;
+                            multi_keys.insert(dim_name.clone(), key_strings);
+                        }
                     }
-                    PyPartitionKey::Multi { keys } => {
-                        let dim_values = keys.get(dimension_name.as_str()).ok_or_else(|| {
-                            format!(
-                                "MultiToSingle expects dimension '{}' but key has: {:?}",
-                                dimension_name,
-                                keys.keys().collect::<Vec<_>>()
-                            )
-                        })?;
-                        let single_key = PyPartitionKey::Single {
-                            key: dim_values.clone(),
-                        };
-                        partition_mapping.0.map_key(&single_key, upstream_def)
-                    }
-                    PyPartitionKey::Set { .. } => {
-                        Err("MultiToSingle mapping does not support batched Set keys".to_string())
-                    }
+                    Ok(PyPartitionKey::Multi { keys: multi_keys })
                 }
-            }
+                PyPartitionKey::Multi { keys } => {
+                    let dim_values = keys.get(dimension_name.as_str()).ok_or_else(|| {
+                        format!(
+                            "MultiToSingle expects dimension '{}' but key has: {:?}",
+                            dimension_name,
+                            keys.keys().collect::<Vec<_>>()
+                        )
+                    })?;
+                    let single_key = PyPartitionKey::Single {
+                        key: dim_values.clone(),
+                    };
+                    partition_mapping.0.map_key(&single_key, upstream_def)
+                }
+                PyPartitionKey::Set { .. } => {
+                    Err("MultiToSingle mapping does not support batched Set keys".to_string())
+                }
+            },
         }
     }
 }

@@ -75,8 +75,7 @@ impl ConditionTickEngine {
                             "condition run dispatch error"
                         );
                     }
-                    let created: HashSet<&str> =
-                        outcome.ids.iter().map(String::as_str).collect();
+                    let created: HashSet<&str> = outcome.ids.iter().map(String::as_str).collect();
                     for req in &run_requests {
                         if !created.contains(req.run_id.as_str()) {
                             for asset in &req.asset_selection {

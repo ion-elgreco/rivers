@@ -492,8 +492,7 @@ impl AssetConditionCache {
                     RunStatus::Canceled => {
                         delta.clear_run(run);
                     }
-                    RunStatus::Queued => {
-                    }
+                    RunStatus::Queued => {}
                 }
             }
 

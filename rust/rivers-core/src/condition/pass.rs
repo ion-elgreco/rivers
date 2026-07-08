@@ -500,19 +500,16 @@ impl ConditionPass {
             };
             let pctx = info.partition_info.as_ref().and_then(|pi| {
                 partition_status.map(|status| PartitionEvalContext {
-                        all_keys: &pi.all_keys,
-                        materialized: &status.materialized,
-                        in_progress: merged_in_progress.as_ref().unwrap_or(&status.in_progress),
-                        failed: &status.failed,
-                        timestamps: &status.timestamps,
-                        resolver: PartitionResolver::new(
-                            &pi.mappings,
-                            &self.upstream_partition_keys,
-                        ),
-                        latest_time_window_keys: latest_tw_keys.as_ref(),
-                        all_partition_statuses: &self.cache.partition_status,
-                        dep_root_floor: None,
-                    })
+                    all_keys: &pi.all_keys,
+                    materialized: &status.materialized,
+                    in_progress: merged_in_progress.as_ref().unwrap_or(&status.in_progress),
+                    failed: &status.failed,
+                    timestamps: &status.timestamps,
+                    resolver: PartitionResolver::new(&pi.mappings, &self.upstream_partition_keys),
+                    latest_time_window_keys: latest_tw_keys.as_ref(),
+                    all_partition_statuses: &self.cache.partition_status,
+                    dep_root_floor: None,
+                })
             });
 
             let ctx = EvalContext {

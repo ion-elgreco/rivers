@@ -71,7 +71,11 @@ fn collect_dep_latch<V>(scope: &mut DepScope<V>, dep_key: &str, local: HashMap<u
             marks.remove(idx);
         }
     }
-    scope.acc.entry(dep_key.to_string()).or_default().extend(local);
+    scope
+        .acc
+        .entry(dep_key.to_string())
+        .or_default()
+        .extend(local);
 }
 
 /// Merge latches bridged out of the unpartitioned bool fallback (`from_bool`: true → `All`).
@@ -367,9 +371,7 @@ fn eval_inner<O: EvalOutput>(
     *counter += 1;
 
     match node {
-        ConditionNode::Missing => {
-            O::leaf(ctx.target_record.last_run_id.is_none(), my_idx, node)
-        }
+        ConditionNode::Missing => O::leaf(ctx.target_record.last_run_id.is_none(), my_idx, node),
         ConditionNode::InProgress => O::leaf(
             ctx.cache.in_progress_assets.contains(ctx.target_key),
             my_idx,
@@ -491,13 +493,11 @@ fn eval_inner<O: EvalOutput>(
             O::leaf(expr, my_idx, node)
         }
 
-        ConditionNode::WillBeRequested => {
-            O::leaf(
-                ctx.requested_this_tick.contains_key(ctx.target_key),
-                my_idx,
-                node,
-            )
-        }
+        ConditionNode::WillBeRequested => O::leaf(
+            ctx.requested_this_tick.contains_key(ctx.target_key),
+            my_idx,
+            node,
+        ),
 
         ConditionNode::HasRunWithTags {
             tag_keys,
@@ -1145,9 +1145,12 @@ fn eval_partitioned<O: PartEvalOutput>(
             O::leaf(sel, my_idx, node, total)
         }
 
-        ConditionNode::InProgress => {
-            O::leaf(select_in_universe(pctx.in_progress, pctx), my_idx, node, total)
-        }
+        ConditionNode::InProgress => O::leaf(
+            select_in_universe(pctx.in_progress, pctx),
+            my_idx,
+            node,
+            total,
+        ),
 
         ConditionNode::ExecutionFailed => {
             O::leaf(select_in_universe(pctx.failed, pctx), my_idx, node, total)
@@ -1819,14 +1822,22 @@ mod latch_merge_tests {
         let mut sc = scope(&prev, &mut acc);
 
         collect_dep_latch(&mut sc, "d", HashMap::from([(2u32, keys("d1"))]));
-        collect_bridged_latch(&mut sc, "d", HashMap::from([(2u32, PartitionSelection::All)]));
+        collect_bridged_latch(
+            &mut sc,
+            "d",
+            HashMap::from([(2u32, PartitionSelection::All)]),
+        );
         assert_eq!(
             sc.acc["d"][&2],
             keys("d1"),
             "a bridged All must not widen a precise Keys latch"
         );
 
-        collect_bridged_latch(&mut sc, "d", HashMap::from([(3u32, PartitionSelection::All)]));
+        collect_bridged_latch(
+            &mut sc,
+            "d",
+            HashMap::from([(3u32, PartitionSelection::All)]),
+        );
         collect_dep_latch(&mut sc, "d", HashMap::from([(3u32, keys("d2"))]));
         assert_eq!(sc.acc["d"][&3], keys("d2"));
         collect_bridged_latch(
@@ -1843,7 +1854,11 @@ mod latch_merge_tests {
         let mut acc = HashMap::new();
         let mut sc = scope(&prev, &mut acc);
 
-        collect_bridged_latch(&mut sc, "d", HashMap::from([(1u32, PartitionSelection::All)]));
+        collect_bridged_latch(
+            &mut sc,
+            "d",
+            HashMap::from([(1u32, PartitionSelection::All)]),
+        );
         collect_bridged_latch(
             &mut sc,
             "d",

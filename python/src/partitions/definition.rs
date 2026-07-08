@@ -219,10 +219,7 @@ impl PartitionsDefinition {
     }
 
     /// Like [`get_partition_keys`](Self::get_partition_keys) but clamps every TimeWindow grid's effective end to `cap`.
-    pub fn get_partition_keys_capped(
-        &self,
-        cap: NaiveDateTime,
-    ) -> PyResult<Vec<PyPartitionKey>> {
+    pub fn get_partition_keys_capped(&self, cap: NaiveDateTime) -> PyResult<Vec<PyPartitionKey>> {
         match self {
             Self::TimeWindow {
                 cron_schedule,
@@ -235,8 +232,13 @@ impl PartitionsDefinition {
                     Some(e) => (*e).min(cap),
                     None => cap,
                 });
-                let keys =
-                    enumerate_time_windows(cron_schedule, interval_seconds, start, &capped_end, fmt)?;
+                let keys = enumerate_time_windows(
+                    cron_schedule,
+                    interval_seconds,
+                    start,
+                    &capped_end,
+                    fmt,
+                )?;
                 Ok(keys
                     .into_iter()
                     .map(|k| PyPartitionKey::Single { key: vec![k] })

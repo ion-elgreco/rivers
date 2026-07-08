@@ -229,15 +229,13 @@ pub async fn get_partition_status(
         .flat_map(partition_key_members)
         .collect();
 
-    let partition_timestamps: std::collections::HashMap<
-        rivers_core::storage::PartitionKey,
-        i64,
-    > = scoped
-        .get_partition_timestamps(&asset_key)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+    let partition_timestamps: std::collections::HashMap<rivers_core::storage::PartitionKey, i64> =
+        scoped
+            .get_partition_timestamps(&asset_key)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
     let failed_keys: HashSet<String> = scoped
         .get_failed_partitions(&asset_key, &partition_timestamps)
         .await
@@ -542,11 +540,17 @@ mod tests {
         let materialized: HashSet<String> =
             ["p".to_string(), "q".to_string()].into_iter().collect();
         let failed: HashSet<String> = ["p".to_string()].into_iter().collect();
-        assert_eq!(partition_status_label("p", &materialized, &failed), "Failed");
+        assert_eq!(
+            partition_status_label("p", &materialized, &failed),
+            "Failed"
+        );
         assert_eq!(
             partition_status_label("q", &materialized, &failed),
             "Materialized"
         );
-        assert_eq!(partition_status_label("z", &materialized, &failed), "Missing");
+        assert_eq!(
+            partition_status_label("z", &materialized, &failed),
+            "Missing"
+        );
     }
 }
