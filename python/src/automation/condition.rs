@@ -10,6 +10,30 @@ fn validate_cron_schedule(schedule: &str) -> PyResult<()> {
     })
 }
 
+fn validate_tz(timezone: &Option<String>) -> PyResult<()> {
+    if let Some(tz) = timezone {
+        rivers_core::condition::validate_timezone(tz).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid timezone {tz:?}: {e}"))
+        })?;
+    }
+    Ok(())
+}
+
+/// Reject a tag condition with no filter at all.
+fn require_tag_filter(
+    tag_keys: &Option<Vec<String>>,
+    tag_values: &Option<Vec<(String, String)>>,
+) -> PyResult<()> {
+    let keys_empty = tag_keys.as_ref().is_none_or(|k| k.is_empty());
+    let values_empty = tag_values.as_ref().is_none_or(|v| v.is_empty());
+    if keys_empty && values_empty {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "tag condition requires at least one tag_key or tag_value (an empty filter matches every run)",
+        ));
+    }
+    Ok(())
+}
+
 /// Human-readable description of a condition node (for Python display).
 pub(crate) fn description(node: &ConditionNode) -> String {
     match node {
@@ -141,8 +165,7 @@ impl PyAutomationCondition {
 
 #[pymethods]
 impl PyAutomationCondition {
-    /// Eager materialization: run when deps update or asset becomes missing;
-    /// excludes failed partitions/assets, so they aren't auto-retried until re-run.
+    /// Eager materialization: run when deps update or asset becomes missing.
     #[staticmethod]
     fn eager() -> Self {
         Self {
@@ -156,6 +179,7 @@ impl PyAutomationCondition {
     #[pyo3(signature = (cron_schedule, timezone=None))]
     fn on_cron(cron_schedule: String, timezone: Option<String>) -> PyResult<Self> {
         validate_cron_schedule(&cron_schedule)?;
+        validate_tz(&timezone)?;
         let label = if let Some(ref tz) = timezone {
             format!("on_cron('{}', tz='{}')", cron_schedule, tz)
         } else {
@@ -217,6 +241,7 @@ impl PyAutomationCondition {
     #[pyo3(signature = (cron_schedule, timezone=None))]
     fn cron_tick_passed(cron_schedule: String, timezone: Option<String>) -> PyResult<Self> {
         validate_cron_schedule(&cron_schedule)?;
+        validate_tz(&timezone)?;
         Ok(Self::new_node(ConditionNode::CronTickPassed {
             cron_schedule,
             timezone,
@@ -230,8 +255,6 @@ impl PyAutomationCondition {
         if let Some(delta) = lookback_delta
             && (!delta.is_finite() || delta <= 0.0)
         {
-            // NaN/negative silently select no windows; inf overflows the
-            // cutoff arithmetic.
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "lookback_delta must be a positive number of seconds, got {delta}"
             )));
@@ -259,10 +282,7 @@ impl PyAutomationCondition {
         Self::new_node(ConditionNode::BackfillInProgress)
     }
 
-    /// True while being materialized by anything — a run (`in_progress`) or an
-    /// active backfill (`backfill_in_progress`). Negate it
-    /// (`~AutomationCondition.in_flight()`) in custom conditions to avoid
-    /// re-dispatching running work; the presets already do.
+    /// True while being materialized by anything — a run or an active backfill.
     #[staticmethod]
     fn in_flight() -> Self {
         Self {
@@ -272,17 +292,17 @@ impl PyAutomationCondition {
     }
 
     /// True when the latest run that materialized this asset/partition had matching tags.
-    /// `tag_keys` checks key presence (any value), `tag_values` checks exact key-value pairs.
     #[staticmethod]
     #[pyo3(signature = (*, tag_keys=None, tag_values=None))]
     fn last_executed_with_tags(
         tag_keys: Option<Vec<String>>,
         tag_values: Option<Vec<(String, String)>>,
-    ) -> Self {
-        Self::new_node(ConditionNode::LastExecutedWithTags {
+    ) -> PyResult<Self> {
+        require_tag_filter(&tag_keys, &tag_values)?;
+        Ok(Self::new_node(ConditionNode::LastExecutedWithTags {
             tag_keys: tag_keys.unwrap_or_default(),
             tag_values: tag_values.unwrap_or_default(),
-        })
+        }))
     }
 
     /// True if this asset's latest run also included the target (root) asset.
@@ -303,11 +323,12 @@ impl PyAutomationCondition {
     fn has_run_with_tags(
         tag_keys: Option<Vec<String>>,
         tag_values: Option<Vec<(String, String)>>,
-    ) -> Self {
-        Self::new_node(ConditionNode::HasRunWithTags {
+    ) -> PyResult<Self> {
+        require_tag_filter(&tag_keys, &tag_values)?;
+        Ok(Self::new_node(ConditionNode::HasRunWithTags {
             tag_keys: tag_keys.unwrap_or_default(),
             tag_values: tag_values.unwrap_or_default(),
-        })
+        }))
     }
 
     /// True if all of this asset's new materializations (this tick) came from runs with matching tags.
@@ -316,11 +337,12 @@ impl PyAutomationCondition {
     fn all_runs_have_tags(
         tag_keys: Option<Vec<String>>,
         tag_values: Option<Vec<(String, String)>>,
-    ) -> Self {
-        Self::new_node(ConditionNode::AllRunsHaveTags {
+    ) -> PyResult<Self> {
+        require_tag_filter(&tag_keys, &tag_values)?;
+        Ok(Self::new_node(ConditionNode::AllRunsHaveTags {
             tag_keys: tag_keys.unwrap_or_default(),
             tag_values: tag_values.unwrap_or_default(),
-        })
+        }))
     }
 
     /// True when any dependency is missing.
@@ -335,8 +357,7 @@ impl PyAutomationCondition {
         Self::new_node(ConditionNode::any_deps_in_progress())
     }
 
-    /// True when any dependency has been updated and the update wasn't from a
-    /// joint run that already included the target asset.
+    /// True when any dependency has been updated.
     #[staticmethod]
     fn any_deps_updated() -> Self {
         Self::new_node(ConditionNode::any_deps_updated())
@@ -362,6 +383,7 @@ impl PyAutomationCondition {
         timezone: Option<String>,
     ) -> PyResult<Self> {
         validate_cron_schedule(&cron_schedule)?;
+        validate_tz(&timezone)?;
         Ok(Self::new_node(ConditionNode::all_deps_updated_since_cron(
             cron_schedule,
             timezone,
@@ -369,9 +391,13 @@ impl PyAutomationCondition {
     }
 
     /// Evaluate this condition on specific named assets (true if any match).
-    /// Accepts a single asset key or a list of keys.
     fn on_selected(&self, keys: &Bound<'_, PyAny>) -> PyResult<Self> {
         let keys = extract_keys(keys)?;
+        if keys.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "on_selected requires at least one asset key (an empty set never matches)",
+            ));
+        }
         Ok(Self::new_node(ConditionNode::asset_matches(
             keys,
             self.node.clone(),
@@ -394,8 +420,6 @@ impl PyAutomationCondition {
     }
 
     /// Recursively replace sub-conditions matching `old` with `new`.
-    /// `old` can be a label string (matches by label) or an AutomationCondition
-    /// (matches by structural equality).
     fn replace(&self, old: &Bound<'_, PyAny>, new: PyAutomationCondition) -> PyResult<Self> {
         let node = if let Ok(s) = old.extract::<String>() {
             self.node.replace_by_label(&s, &new.node)
@@ -410,10 +434,6 @@ impl PyAutomationCondition {
     }
 
     /// Remove an operand from an `And` condition.
-    ///
-    /// A condition object is matched structurally`.
-    /// A string is matched against an operand's full description, e.g.
-    /// `"~any_deps_missing"`.
     fn without(&self, condition: &Bound<'_, PyAny>) -> PyResult<Self> {
         let node = if let Ok(s) = condition.extract::<String>() {
             self.node.without_matching(&|child| description(child) == s)
@@ -421,6 +441,11 @@ impl PyAutomationCondition {
             let target = condition.extract::<PyAutomationCondition>()?.node;
             self.node.without_matching(&|child| *child == target)
         };
+        if matches!(&node, ConditionNode::And(c) if c.is_empty()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "without() removed every operand, leaving an empty condition that would fire on every tick",
+            ));
+        }
         Ok(Self {
             node,
             label: self.label.clone(),
@@ -476,7 +501,6 @@ impl PyAutomationCondition {
     }
 
     fn __and__(&self, other: &PyAutomationCondition) -> Self {
-        // Flatten nested ANDs
         let mut children = Vec::new();
         match &self.node {
             ConditionNode::And(c) if self.label.is_none() => children.extend(c.clone()),
@@ -490,7 +514,6 @@ impl PyAutomationCondition {
     }
 
     fn __or__(&self, other: &PyAutomationCondition) -> Self {
-        // Flatten nested ORs
         let mut children = Vec::new();
         match &self.node {
             ConditionNode::Or(c) if self.label.is_none() => children.extend(c.clone()),

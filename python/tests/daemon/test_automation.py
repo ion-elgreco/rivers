@@ -289,6 +289,36 @@ class TestCronValidation:
         rs.AutomationCondition.on_cron("*/15 * * * *")
         rs.AutomationCondition.on_cron("0 0 0 * * *")
 
+    def test_cron_rejects_invalid_timezone(self):
+        # An unknown IANA zone must fail loudly, not silently fall back to UTC.
+        with pytest.raises(ValueError):
+            rs.AutomationCondition.on_cron("0 0 * * *", timezone="Not/AZone")
+        with pytest.raises(ValueError):
+            rs.AutomationCondition.cron_tick_passed("0 0 * * *", timezone="bogus")
+
+    def test_valid_timezones_accepted(self):
+        rs.AutomationCondition.on_cron("0 0 * * *", timezone="America/New_York")
+        rs.AutomationCondition.cron_tick_passed("0 0 * * *", timezone="Europe/London")
+        rs.AutomationCondition.all_deps_updated_since_cron("0 0 * * *", timezone="UTC")
+
+    def test_tag_condition_rejects_empty_filter(self):
+        # An empty key+value filter vacuously matches every run; reject it.
+        with pytest.raises(ValueError):
+            rs.AutomationCondition.has_run_with_tags()
+        with pytest.raises(ValueError):
+            rs.AutomationCondition.all_runs_have_tags()
+        with pytest.raises(ValueError):
+            rs.AutomationCondition.last_executed_with_tags()
+
+    def test_tag_condition_accepts_nonempty_filter(self):
+        rs.AutomationCondition.has_run_with_tags(tag_keys=["env"])
+        rs.AutomationCondition.all_runs_have_tags(tag_values=[("env", "prod")])
+
+    def test_on_selected_rejects_empty_keys(self):
+        # An empty asset-key set never matches → degenerate always-false subtree.
+        with pytest.raises(ValueError):
+            rs.AutomationCondition.newly_updated().on_selected([])
+
 
 # ---------------------------------------------------------------------------
 # without()
@@ -296,6 +326,14 @@ class TestCronValidation:
 
 
 class TestWithout:
+    def test_without_removing_all_operands_raises(self):
+        # Removing every operand leaves an empty And, which evaluates to
+        # vacuously true (fires every tick) — reject it instead.
+        ac = rs.AutomationCondition
+        cond = ac.in_progress() & ac.in_progress()
+        with pytest.raises(ValueError, match="every operand|empty"):
+            cond.without(ac.in_progress())
+
     def test_without_negated_guard_by_object(self):
         # The And child is Not(any_deps_in_progress); pass it as it appears (~X).
         ac = rs.AutomationCondition

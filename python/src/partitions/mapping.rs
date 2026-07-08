@@ -1,8 +1,4 @@
 //! PartitionMapping — defines how partition keys map between connected assets.
-//!
-//! `PartitionMapping` enum with 7 variants (Identity, AllPartitions, LastPartition, etc.).
-//! `map_key()` transforms downstream partition keys to upstream keys for dependency loading.
-//! `PartitionMappingDict` accepts `str` or `AssetDef` keys from Python for per-dep overrides.
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Deref;
 
@@ -116,9 +112,6 @@ impl std::fmt::Display for DimensionErrorKind {
 }
 
 /// Why a `PartitionMapping` is not valid for a given dependency edge.
-///
-/// Carries enough structured detail to test specific failure modes without
-/// substring-matching prose. Callers add asset-name context when wrapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MappingValidationError {
     /// Mapping requires both definitions to be the same partition type.
@@ -183,7 +176,6 @@ impl std::fmt::Display for MappingValidationError {
                 f,
                 "{mapping} mapping requires {expected} partitions on {side}, but found {found}"
             ),
-            // Per-(mapping, side) prose preserved from the original validator.
             Self::KeyNotInDefinition { key, side, mapping } => match (*mapping, *side) {
                 ("Static", Side::Downstream) => write!(
                     f,
@@ -206,7 +198,6 @@ impl std::fmt::Display for MappingValidationError {
                     "{mapping} mapping references key '{key}' which is not a valid partition key for {side}"
                 ),
             },
-            // Per-(mapping, shape) prose preserved from the original validator.
             Self::IncompatibleMappingForShape {
                 mapping,
                 downstream_partitioned,
@@ -265,9 +256,6 @@ pub enum UpstreamKeyResolution {
 }
 
 /// Why a `PartitionMapping` could not produce an `UpstreamKeyResolution`.
-///
-/// Distinct from `MappingValidationError` because these are runtime invariants
-/// (materialize time), not edge validity (resolve time).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MappingResolutionError {
     /// Mapping requires a downstream partition key but none was supplied.
@@ -314,7 +302,6 @@ fn single_dim_key_set(
 }
 
 /// Selector for matching partition keys: either an exact key or a range.
-/// Used by `ForKeys` to specify which downstream partition keys map to the upstream.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PartitionKeySelector {
     Key(PyPartitionKey),
@@ -369,8 +356,7 @@ impl<'py> pyo3::IntoPyObject<'py> for &PartitionKeySelector {
     }
 }
 
-/// Newtype around `Box<PartitionMapping>` with manual `FromPyObject`/`IntoPyObject`
-/// so it can be used as a field in a PyO3 `from_py_object` enum variant.
+/// Newtype around `Box<PartitionMapping>` with manual `FromPyObject`/`IntoPyObject`.
 #[derive(Clone, Debug)]
 pub struct BoxedMapping(pub Box<PartitionMapping>);
 
@@ -426,7 +412,6 @@ pub enum PartitionMapping {
         offset: i64,
     },
     /// Maps dimensions between two MultiPartitionsDefinitions.
-    /// Keys = upstream dimension names, values = (downstream dimension name, per-dimension mapping).
     Multi {
         dimension_mappings: HashMap<String, (String, PartitionMapping)>,
     },
@@ -440,14 +425,10 @@ pub enum PartitionMapping {
         partition_keys: Vec<String>,
     },
     /// Maps an unpartitioned upstream to specific downstream partition keys.
-    /// When the downstream partition key matches a selector, the upstream is loaded;
-    /// otherwise the parameter receives `None`.
     ForKeys {
         selectors: Vec<PartitionKeySelector>,
     },
-    /// Subset mapping for partitioned-to-partitioned edges where upstream has a
-    /// subset of downstream's partition keys. When the downstream key doesn't
-    /// exist in the upstream, the parameter receives `None`.
+    /// Subset mapping for partitioned-to-partitioned edges where upstream has a subset of downstream's partition keys.
     Subset {},
 }
 
@@ -461,13 +442,6 @@ impl PartitionMapping {
     }
 
     /// Resolve the upstream load decision at materialize time.
-    ///
-    /// Owns the variant-specific Skip semantics (`ForKeys`, `Subset`) and the
-    /// `SpecificPartitions` short-circuit. For variants that simply transform
-    /// the partition key, delegates to the private `map_key` helper.
-    ///
-    /// `downstream_key` is `None` when the downstream asset is unpartitioned;
-    /// in that case all "passthrough" mappings load the upstream unpartitioned.
     pub fn resolve_upstream_key(
         &self,
         downstream_key: Option<&PyPartitionKey>,
@@ -504,7 +478,6 @@ impl PartitionMapping {
                     Ok(UpstreamKeyResolution::Skip)
                 }
             }
-            // Identity / AllPartitions / Static / TimeWindow / Multi / MultiToSingle
             _ => match downstream_key {
                 None => Ok(UpstreamKeyResolution::Load(None)),
                 Some(key) => self
@@ -515,12 +488,7 @@ impl PartitionMapping {
         }
     }
 
-    /// Transform a downstream partition key into an upstream key. Private — only
-    /// reachable for variants that don't carry Skip semantics; callers go through
-    /// `resolve_upstream_key`. Errors for `ForKeys`/`Subset` (use `resolve_upstream_key`).
-    ///
-    /// `upstream_def` is needed for `MultiToSingle` (Single→Multi) to enumerate
-    /// unmapped dimensions.
+    /// Transform a downstream partition key into an upstream key.
     fn map_key(
         &self,
         downstream_key: &PyPartitionKey,
@@ -529,27 +497,20 @@ impl PartitionMapping {
         match self {
             Self::Identity {} => Ok(downstream_key.clone()),
 
-            Self::AllPartitions {} => {
-                // AllPartitions means the downstream depends on ALL upstream partitions.
-                // We pass through the key as-is (the IO handler handles fan-in).
-                Ok(downstream_key.clone())
-            }
+            Self::AllPartitions {} => Ok(downstream_key.clone()),
 
-            Self::Static { mapping } => {
-                match downstream_key {
-                    PyPartitionKey::Single { key } => {
-                        let downstream_str = key.first().ok_or("Empty partition key")?;
-                        match mapping.get(downstream_str) {
-                            Some(upstream_str) => Ok(PyPartitionKey::Single {
-                                key: vec![upstream_str.clone()],
-                            }),
-                            // Unmapped keys use identity
-                            None => Ok(downstream_key.clone()),
-                        }
+            Self::Static { mapping } => match downstream_key {
+                PyPartitionKey::Single { key } => {
+                    let downstream_str = key.first().ok_or("Empty partition key")?;
+                    match mapping.get(downstream_str) {
+                        Some(upstream_str) => Ok(PyPartitionKey::Single {
+                            key: vec![upstream_str.clone()],
+                        }),
+                        None => Ok(downstream_key.clone()),
                     }
-                    _ => Err("Static mapping only works with Single partition keys".to_string()),
                 }
-            }
+                _ => Err("Static mapping only works with Single partition keys".to_string()),
+            },
 
             Self::TimeWindow { offset } => {
                 if *offset == 0 {
@@ -567,8 +528,6 @@ impl PartitionMapping {
                 let shifted_key = PyPartitionKey::Single {
                     key: vec![shifted.clone()],
                 };
-                // A cross-cadence mapping can land between upstream windows —
-                // loading a partition that doesn't exist must fail loudly.
                 if !def
                     .validate_partition_key(&shifted_key)
                     .map_err(|e| e.to_string())?
@@ -599,8 +558,6 @@ impl PartitionMapping {
                         let single_key = PyPartitionKey::Single {
                             key: dim_values.clone(),
                         };
-                        // Thread the upstream dimension's own def so nested
-                        // mappings that need it (TimeWindow offset) can shift.
                         let dim_def = upstream_def.and_then(|d| match d {
                             PartitionsDefinition::Multi { dimensions } => dimensions
                                 .iter()
@@ -644,90 +601,70 @@ impl PartitionMapping {
             Self::MultiToSingle {
                 dimension_name,
                 partition_mapping,
-            } => {
-                // One side is Multi, the other is Single.
-                // We extract/inject the named dimension.
-                match downstream_key {
-                    // Downstream is Single → upstream is Multi: construct a full Multi key.
-                    // The named dimension gets the (mapped) single key value.
-                    // Unmapped dimensions get ALL their partition keys (fan-in).
-                    PyPartitionKey::Single { key } => {
-                        // Get the upstream Multi definition to enumerate unmapped dimensions
-                        let up_def = upstream_def.ok_or(
-                            "MultiToSingle (Single→Multi) requires upstream PartitionsDefinition",
-                        )?;
-                        let dimensions =
-                            match up_def {
-                                PartitionsDefinition::Multi { dimensions } => dimensions,
-                                _ => return Err(
-                                    "MultiToSingle upstream must be a Multi PartitionsDefinition"
-                                        .to_string(),
-                                ),
-                            };
-
-                        let single_key = PyPartitionKey::Single { key: key.clone() };
-                        // The inner mapping maps within the named dimension —
-                        // give it that dimension's def (TimeWindow offset).
-                        let named_dim_def = dimensions
-                            .iter()
-                            .find(|(n, _)| n == dimension_name)
-                            .map(|(_, dd)| dd);
-                        let mapped_single =
-                            partition_mapping.0.map_key(&single_key, named_dim_def)?;
-                        let mapped_values = match &mapped_single {
-                            PyPartitionKey::Single { key } => key.clone(),
-                            _ => return Err("Inner mapping produced a Multi key".to_string()),
-                        };
-
-                        let mut multi_keys = HashMap::new();
-                        for (dim_name, dim_def) in dimensions {
-                            if dim_name == dimension_name {
-                                // This is the mapped dimension — use the transformed key
-                                multi_keys.insert(dim_name.clone(), mapped_values.clone());
-                            } else {
-                                let key_strings =
-                                    dim_def.enumerate_single_dim_keys().map_err(|e| {
-                                        format!(
-                                            "Failed to get partition keys for dimension '{}': {}",
-                                            dim_name, e
-                                        )
-                                    })?;
-                                multi_keys.insert(dim_name.clone(), key_strings);
-                            }
+            } => match downstream_key {
+                PyPartitionKey::Single { key } => {
+                    let up_def = upstream_def.ok_or(
+                        "MultiToSingle (Single→Multi) requires upstream PartitionsDefinition",
+                    )?;
+                    let dimensions = match up_def {
+                        PartitionsDefinition::Multi { dimensions } => dimensions,
+                        _ => {
+                            return Err(
+                                "MultiToSingle upstream must be a Multi PartitionsDefinition"
+                                    .to_string(),
+                            );
                         }
-                        Ok(PyPartitionKey::Multi { keys: multi_keys })
+                    };
+
+                    let single_key = PyPartitionKey::Single { key: key.clone() };
+                    let named_dim_def = dimensions
+                        .iter()
+                        .find(|(n, _)| n == dimension_name)
+                        .map(|(_, dd)| dd);
+                    let mapped_single = partition_mapping.0.map_key(&single_key, named_dim_def)?;
+                    let mapped_values = match &mapped_single {
+                        PyPartitionKey::Single { key } => key.clone(),
+                        _ => return Err("Inner mapping produced a Multi key".to_string()),
+                    };
+
+                    let mut multi_keys = HashMap::new();
+                    for (dim_name, dim_def) in dimensions {
+                        if dim_name == dimension_name {
+                            multi_keys.insert(dim_name.clone(), mapped_values.clone());
+                        } else {
+                            let key_strings = dim_def.enumerate_single_dim_keys().map_err(|e| {
+                                format!(
+                                    "Failed to get partition keys for dimension '{}': {}",
+                                    dim_name, e
+                                )
+                            })?;
+                            multi_keys.insert(dim_name.clone(), key_strings);
+                        }
                     }
-                    // Downstream is Multi → upstream is Single: extract the named dimension
-                    PyPartitionKey::Multi { keys } => {
-                        let dim_values = keys.get(dimension_name.as_str()).ok_or_else(|| {
-                            format!(
-                                "MultiToSingle expects dimension '{}' but key has: {:?}",
-                                dimension_name,
-                                keys.keys().collect::<Vec<_>>()
-                            )
-                        })?;
-                        let single_key = PyPartitionKey::Single {
-                            key: dim_values.clone(),
-                        };
-                        // Upstream is Single here, so its whole def belongs to
-                        // the inner mapping (TimeWindow offset shifts in it).
-                        partition_mapping.0.map_key(&single_key, upstream_def)
-                    }
-                    PyPartitionKey::Set { .. } => {
-                        Err("MultiToSingle mapping does not support batched Set keys".to_string())
-                    }
+                    Ok(PyPartitionKey::Multi { keys: multi_keys })
                 }
-            }
+                PyPartitionKey::Multi { keys } => {
+                    let dim_values = keys.get(dimension_name.as_str()).ok_or_else(|| {
+                        format!(
+                            "MultiToSingle expects dimension '{}' but key has: {:?}",
+                            dimension_name,
+                            keys.keys().collect::<Vec<_>>()
+                        )
+                    })?;
+                    let single_key = PyPartitionKey::Single {
+                        key: dim_values.clone(),
+                    };
+                    partition_mapping.0.map_key(&single_key, upstream_def)
+                }
+                PyPartitionKey::Set { .. } => {
+                    Err("MultiToSingle mapping does not support batched Set keys".to_string())
+                }
+            },
         }
     }
 }
 
-/// Require the downstream grid to be a subgrid of the upstream one (same
-/// fmt; identical cron, or interval multiple with aligned starts). Applies
-/// to any mapping that resolves downstream keys on the upstream grid —
-/// `time_window` shifts them, `Identity` loads them verbatim. Ranges
-/// (start/end) may differ; range edges are a per-key concern. No-op unless
-/// both definitions are TimeWindow.
+/// Require the downstream grid to be a subgrid of the upstream one.
 fn validate_time_window_grid_compat(
     mapping: &str,
     down: &PartitionsDefinition,
@@ -782,18 +719,7 @@ fn validate_time_window_grid_compat(
             }
         }
         _ => {
-            // At least one side is a cron grid. Equivalent schedules can be
-            // spelled differently (5- vs 6-field, nicknames) and a cron grid
-            // can coincide with an interval grid, so prove the subgrid
-            // relation on the ticks themselves: every downstream window
-            // start over a bounded probe must fall on the upstream grid.
-            // The budget matches validate_time_window_fmt's walk — calendar
-            // gates (day-of-week, month ranges) diverge far past the first
-            // ticks: an hourly grid meets its first Saturday at tick 121.
             const PROBE_TICKS: usize = 1024;
-            // Judge exactly the keys the definition will mint: window starts
-            // at/after the downstream's explicit end never exist downstream,
-            // so they must not fail the edge.
             let horizon = down_start
                 .checked_add_signed(chrono::Duration::days(1461))
                 .unwrap_or(chrono::NaiveDateTime::MAX);
@@ -801,8 +727,6 @@ fn validate_time_window_grid_compat(
                 Some(e) => (*e).min(horizon),
                 None => horizon,
             };
-            // Is `t` a tick of the upstream grid? `Err` carries a cron-parse
-            // failure to surface after the walk.
             let on_upstream = |t: chrono::NaiveDateTime| -> Result<bool, String> {
                 match (up_cron, up_interval) {
                     (Some(expr), _) => cron_grid_contains(expr, t).map_err(|e| e.to_string()),
@@ -841,10 +765,6 @@ fn validate_time_window_grid_compat(
                     for_each_interval_tick(*di, down_start, horizon, &mut visit);
                 }
             }
-            // A grid whose 2nd tick lies past the 1461-day horizon would be
-            // judged on tick 0 alone; always probe the first two ticks against
-            // the true end so a tick-1 divergence is caught (the same
-            // min-two-ticks guard validate_time_window_fmt applies).
             if walk_err.is_none() && offgrid.is_none() && count < 2 {
                 let true_end = match down_end {
                     Some(e) => *e,
@@ -910,13 +830,7 @@ impl PartitionMapping {
         }
     }
 
-    /// Validate a dependency edge. Owns the full decision matrix:
-    /// whether the mapping is allowed for the (downstream_partitioned, upstream_partitioned)
-    /// shape, and whether it is internally valid against the partition definitions.
-    ///
-    /// `mapping=None` means no explicit mapping was supplied; semantics are
-    /// shape-dependent (treated as Identity when both sides are partitioned;
-    /// rejected when only the upstream is partitioned; otherwise allowed).
+    /// Validate a dependency edge.
     pub fn validate_edge(
         mapping: Option<&Self>,
         downstream: Option<&PartitionsDefinition>,
@@ -958,9 +872,6 @@ impl PartitionMapping {
                         upstream: up.variant_name().to_string(),
                     });
                 }
-                // Identity loads each downstream key verbatim from upstream,
-                // so every downstream key must exist there — same subgrid
-                // requirement as a zero-offset time_window mapping.
                 validate_time_window_grid_compat("Identity", down, up)?;
                 if let (
                     PartitionsDefinition::Dynamic { name: down_name },
@@ -1105,7 +1016,6 @@ impl PartitionMapping {
                         return Err(MappingValidationError::UpstreamKeysNotSubset { extras });
                     }
                 }
-                // For TimeWindow / Dynamic: subset relationship is checked at runtime.
                 Ok(())
             }
             Self::MultiToSingle {
@@ -1148,10 +1058,6 @@ impl PartitionMapping {
                         )
                     })?;
 
-                // The inner mapping's orientation follows the edge: with a
-                // Multi downstream it maps the named dim's key -> the single
-                // upstream; with a Multi upstream it maps the downstream
-                // single key -> the named dim.
                 let (inner_down, inner_up) = match multi_side {
                     Side::Downstream => (dim_def, single_def),
                     Side::Upstream => (single_def, dim_def),
@@ -1271,9 +1177,6 @@ impl PartitionMapping {
                                 });
                             }
                         }
-                        // An unknown or inverted range endpoint would silently
-                        // match nothing (every downstream key Skips its dep) —
-                        // surface it here instead.
                         PartitionKeySelector::Range(range) => {
                             range
                                 .validate_against(down)
@@ -1341,8 +1244,7 @@ impl PartitionMapping {
         Self::TimeWindow { offset }
     }
 
-    /// Create a SpecificPartitions mapping that maps all downstream partitions to
-    /// a specific set of upstream partition keys.
+    /// Create a SpecificPartitions mapping that maps all downstream partitions to a specific set of upstream partition keys.
     #[staticmethod]
     fn specific_partitions(mut partition_keys: Vec<String>) -> PyResult<Self> {
         if partition_keys.is_empty() {
@@ -1355,10 +1257,6 @@ impl PartitionMapping {
     }
 
     /// Create a Multi mapping that maps dimensions between MultiPartitionsDefinitions.
-    ///
-    /// Each key is an upstream dimension name. Each value is either:
-    /// - A `PartitionMapping` (shorthand: maps to same-named downstream dimension)
-    /// - A `(str, PartitionMapping)` tuple (maps to a differently-named downstream dimension)
     #[staticmethod]
     fn multi(dimension_mappings: &Bound<'_, PyDict>) -> PyResult<Self> {
         let mut map = HashMap::with_capacity(dimension_mappings.len());
@@ -1379,6 +1277,7 @@ impl PartitionMapping {
 
             let rejected = match &mapping {
                 PartitionMapping::Multi { .. } => Some("Multi"),
+                PartitionMapping::MultiToSingle { .. } => Some("MultiToSingle"),
                 PartitionMapping::ForKeys { .. } => Some("ForKeys"),
                 PartitionMapping::Subset {} => Some("Subset"),
                 _ => None,
@@ -1400,11 +1299,7 @@ impl PartitionMapping {
         })
     }
 
-    /// Create a MultiToSingle mapping that maps one dimension of a MultiPartitionsDefinition
-    /// to a single-dimension PartitionsDefinition (or vice versa).
-    ///
-    /// `partition_mapping` controls how the selected dimension maps to the single-dimension side.
-    /// Defaults to Identity if not provided.
+    /// Create a MultiToSingle mapping that maps one dimension of a MultiPartitionsDefinition to a single-dimension PartitionsDefinition (or vice versa).
     #[staticmethod]
     #[pyo3(signature = (dimension_name, partition_mapping=None))]
     fn multi_to_single(
@@ -1433,9 +1328,7 @@ impl PartitionMapping {
         })
     }
 
-    /// Create a ForKeys mapping that maps an unpartitioned upstream to specific
-    /// downstream partition keys. The upstream is loaded only when the downstream
-    /// key matches one of the selectors; otherwise the parameter receives `None`.
+    /// Create a ForKeys mapping that maps an unpartitioned upstream to specific downstream partition keys.
     #[staticmethod]
     fn for_keys(selectors: Vec<PartitionKeySelector>) -> PyResult<Self> {
         if selectors.is_empty() {
@@ -1446,8 +1339,7 @@ impl PartitionMapping {
         Ok(Self::ForKeys { selectors })
     }
 
-    /// Create a Subset mapping for partitioned-to-partitioned edges where upstream
-    /// has a subset of downstream's partition keys.
+    /// Create a Subset mapping for partitioned-to-partitioned edges where upstream has a subset of downstream's partition keys.
     #[staticmethod]
     fn subset() -> Self {
         Self::Subset {}
@@ -1570,8 +1462,7 @@ impl PartitionMapping {
     }
 }
 
-/// A newtype for `HashMap<String, PartitionMapping>` that accepts keys as
-/// `str` or `AssetDef` (extracting `.name`) from Python.
+/// A newtype for `HashMap<String, PartitionMapping>` that accepts keys as `str` or `AssetDef` from Python.
 #[derive(Clone, Debug)]
 pub struct PartitionMappingDict(pub HashMap<String, PartitionMapping>);
 
@@ -1605,7 +1496,7 @@ impl<'py> pyo3::IntoPyObject<'py> for &PartitionMappingDict {
 impl FromPyObject<'_, '_> for PartitionMappingDict {
     type Error = PyErr;
 
-    #[allow(deprecated)] // downcast is correct for Borrowed; cast() has different semantics
+    #[allow(deprecated)]
     fn extract(ob: pyo3::Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
         let dict = ob.downcast::<PyDict>()?;
         let mut map = HashMap::with_capacity(dict.len());

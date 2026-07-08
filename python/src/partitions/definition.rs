@@ -1,8 +1,4 @@
 //! PartitionsDefinition — Static, TimeWindow, Multi, and Dynamic partition schemes.
-//!
-//! `PartitionsDefinition` enum with four variants. `get_partition_keys()` enumerates all valid
-//! keys for a given definition. Time window partitions are generated from cron expressions
-//! via the `croner` crate, bounded by `start_date` / `end_date` / `end_offset`.
 use std::collections::HashMap;
 
 use chrono::{Local, NaiveDateTime, TimeZone, Utc};
@@ -57,8 +53,6 @@ impl OrderedKeySet {
 
 impl std::fmt::Debug for OrderedKeySet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Render as a list literal so the PartitionsDefinition repr stays
-        // `static_(["a", "b"])`.
         f.debug_list().entries(self.0.iter()).finish()
     }
 }
@@ -141,8 +135,7 @@ impl PartitionsDefinition {
         }
     }
 
-    /// The single-dim sub-definition of `Multi` dimension `name` (so the UI can
-    /// page it via the single-dim path).
+    /// The single-dim sub-definition of `Multi` dimension `name`.
     pub fn dimension_def(&self, name: &str) -> Option<&PartitionsDefinition> {
         match self {
             Self::Multi { dimensions } => {
@@ -152,10 +145,7 @@ impl PartitionsDefinition {
         }
     }
 
-    /// The `idx`-th key (in definition order) of a single-dimension definition —
-    /// the per-dimension lookup behind the `Multi` window. `Static` indexes the
-    /// `OrderSet` directly; `TimeWindow` reuses the windowing seek (a window of
-    /// length 1 at `idx`). `None` if out of range or not single-dim.
+    /// The `idx`-th key (in definition order) of a single-dimension definition.
     fn nth_single_dim_key(&self, idx: usize) -> PyResult<Option<String>> {
         match self {
             Self::Static { keys } => Ok(keys.get_at(idx).cloned()),
@@ -171,9 +161,7 @@ impl PartitionsDefinition {
         }
     }
 
-    /// Enumerate keys for a single-dimension definition (Static or TimeWindow),
-    /// returning them as plain strings. Errors if `self` is Multi or Dynamic,
-    /// since both yield non-Single PyPartitionKey values.
+    /// Enumerate keys for a single-dimension definition (Static or TimeWindow) as plain strings.
     pub fn enumerate_single_dim_keys(&self) -> PyResult<Vec<String>> {
         self.get_partition_keys()?
             .into_iter()
@@ -230,10 +218,65 @@ impl PartitionsDefinition {
         }
     }
 
-    /// A window `[offset, offset+limit)` of keys without materializing the full
-    /// set. `Static` slices the `OrderSet`; `TimeWindow` seeks lazily (interval
-    /// by arithmetic, cron by skipping the occurrence iterator); `Multi` /
-    /// `Dynamic` enumerate then slice.
+    /// Like [`get_partition_keys`](Self::get_partition_keys) but clamps every TimeWindow grid's effective end to `cap`.
+    pub fn get_partition_keys_capped(&self, cap: NaiveDateTime) -> PyResult<Vec<PyPartitionKey>> {
+        match self {
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => {
+                let capped_end = Some(match end {
+                    Some(e) => (*e).min(cap),
+                    None => cap,
+                });
+                let keys = enumerate_time_windows(
+                    cron_schedule,
+                    interval_seconds,
+                    start,
+                    &capped_end,
+                    fmt,
+                )?;
+                Ok(keys
+                    .into_iter()
+                    .map(|k| PyPartitionKey::Single { key: vec![k] })
+                    .collect())
+            }
+            Self::Multi { dimensions } => {
+                let mut dim_keys: Vec<(String, Vec<String>)> = Vec::new();
+                for (name, def) in dimensions {
+                    dim_keys.push((name.clone(), def.enumerate_single_dim_keys_capped(cap)?));
+                }
+                let combos = cartesian_product(&dim_keys);
+                Ok(combos
+                    .into_iter()
+                    .map(|keys| PyPartitionKey::Multi {
+                        keys: keys.into_iter().map(|(k, v)| (k, vec![v])).collect(),
+                    })
+                    .collect())
+            }
+            _ => self.get_partition_keys(),
+        }
+    }
+
+    /// Single-dimension variant of [`get_partition_keys_capped`].
+    pub fn enumerate_single_dim_keys_capped(&self, cap: NaiveDateTime) -> PyResult<Vec<String>> {
+        self.get_partition_keys_capped(cap)?
+            .into_iter()
+            .map(|pk| match pk {
+                PyPartitionKey::Single { mut key } => Ok(key.remove(0)),
+                PyPartitionKey::Multi { .. } | PyPartitionKey::Set { .. } => {
+                    Err(PartitionDefinitionError::new_err(
+                        "enumerate_single_dim_keys called on a non-single-dimension definition",
+                    ))
+                }
+            })
+            .collect()
+    }
+
+    /// A window `[offset, offset+limit)` of keys without materializing the full set.
     pub fn get_partition_keys_window(
         &self,
         offset: usize,
@@ -274,11 +317,6 @@ impl PartitionsDefinition {
                 Ok(keys.into_iter().map(single).collect())
             }
             Self::Multi { dimensions } => {
-                // Lazy mixed-radix window: build only combos `[offset, offset+limit)`,
-                // never the full cartesian product. First dimension is most
-                // significant, matching `cartesian_product` / `get_partition_keys`.
-                // Count each dimension once and take the product (matches
-                // `partition_count`'s Multi arm) — don't re-walk per dimension.
                 let n = dimensions.len();
                 let sizes: Vec<usize> = dimensions
                     .iter()
@@ -311,7 +349,6 @@ impl PartitionsDefinition {
                 }
                 Ok(out)
             }
-            // Dynamic can't be enumerated — `get_partition_keys` propagates the error.
             Self::Dynamic { .. } => Ok(self
                 .get_partition_keys()?
                 .into_iter()
@@ -322,8 +359,6 @@ impl PartitionsDefinition {
     }
 
     /// `(page, match_count)` for single-dim keys containing `query`, in one pass.
-    /// `Static` scans the `OrderSet`; `TimeWindow` walks lazily (interval / cron).
-    /// `Multi`/`Dynamic` return `(empty, 0)` (not single-dim).
     pub fn get_partition_keys_filtered(
         &self,
         query: &str,
@@ -371,9 +406,7 @@ impl PartitionsDefinition {
         Ok((page, total))
     }
 
-    /// Index of `key` in single-dim order — the "jump to key" target. Direct for
-    /// `Static`; `TimeWindow` is arithmetic (interval) or a lazy scan (cron).
-    /// `None` for absent keys, `Multi`, or `Dynamic`.
+    /// Index of `key` in single-dim order — the "jump to key" target.
     pub fn single_dim_key_index(&self, key: &str) -> PyResult<Option<usize>> {
         match self {
             Self::Static { keys } => Ok(keys.get_index_of(key)),
@@ -407,21 +440,14 @@ impl PartitionsDefinition {
         }
     }
 
-    /// Total partitions, as cheaply as the kind allows: `len` for `Static`,
-    /// product for `Multi`, arithmetic for interval `TimeWindow` (exact), a lazy
-    /// count for cron `TimeWindow` (exact, but walks the range), 0 for `Dynamic`
-    /// (storage-managed).
+    /// Total partitions, as cheaply as the kind allows.
     pub fn partition_count(&self) -> usize {
         match self {
             Self::Static { keys } => keys.len(),
-            // Saturating product — a huge cartesian product must not overflow
-            // (panic in debug / silent wrap in release).
             Self::Multi { dimensions } => dimensions
                 .iter()
                 .map(|(_, d)| d.partition_count())
                 .fold(1usize, |acc, n| acc.saturating_mul(n)),
-            // Storage-managed: the def holds no keys, so it has no count here.
-            // The UI sources the real count from storage (`count_dynamic_partitions`).
             Self::Dynamic { .. } => 0,
             Self::TimeWindow {
                 cron_schedule,
@@ -434,7 +460,6 @@ impl PartitionsDefinition {
                 if let Some(secs) = interval_seconds {
                     interval_window_count(*secs, start, end_dt)
                 } else if let Some(expr) = cron_schedule {
-                    // No closed form for cron — count lazily over the full range.
                     let mut n = 0usize;
                     let _ = for_each_cron_tick(expr, start, end_dt, |_| {
                         n += 1;
@@ -449,7 +474,6 @@ impl PartitionsDefinition {
     }
 
     /// Compute the time window (start, end) for a given partition key string.
-    /// Returns None for non-TimeWindow definitions or if neither cron nor interval is set.
     pub fn compute_time_window(
         &self,
         key: &str,
@@ -487,7 +511,6 @@ impl PartitionsDefinition {
     }
 
     /// The definition's wall-clock grid, for shifting/aligning keys.
-    /// `None` for non-TimeWindow kinds.
     pub fn time_grid(&self) -> Option<rivers_core::timegrid::TimeGrid> {
         match self {
             Self::TimeWindow {
@@ -507,9 +530,7 @@ impl PartitionsDefinition {
         }
     }
 
-    /// Shift a TimeWindow key by `offset` windows (negative = earlier) —
-    /// the engine behind `PartitionMapping.time_window(offset=..)`. Errors
-    /// when the shifted window falls outside `[start, end)`.
+    /// Shift a TimeWindow key by `offset` windows (negative = earlier).
     pub fn shift_time_key(&self, key: &str, offset: i64) -> PyResult<String> {
         let grid = self.time_grid().ok_or_else(|| {
             PartitionDefinitionError::new_err(
@@ -520,8 +541,7 @@ impl PartitionsDefinition {
             .map_err(|e| PartitionDefinitionError::new_err(e.to_string()))
     }
 
-    /// Check if a partition key is valid for this definition. Empty key
-    /// vectors are invalid for every kind.
+    /// Check if a partition key is valid for this definition.
     pub fn validate_partition_key(&self, key: &PyPartitionKey) -> PyResult<bool> {
         match (self, key) {
             (Self::Static { keys: valid_keys }, PyPartitionKey::Single { key }) => {
@@ -538,8 +558,6 @@ impl PartitionsDefinition {
                 PyPartitionKey::Single { key },
             ) => validate_time_window_key(key, cron_schedule, interval_seconds, start, end, fmt),
             (Self::Multi { dimensions }, PyPartitionKey::Multi { keys }) => {
-                // Extra dimensions the def doesn't declare are rejected here;
-                // missing ones are caught by the per-dim loop below.
                 if keys.len() != dimensions.len() {
                     return Ok(false);
                 }
@@ -563,9 +581,7 @@ impl PartitionsDefinition {
                 }
                 Ok(true)
             }
-            // Dynamic membership is checked at the submit boundary against storage, not here.
             (Self::Dynamic { .. }, PyPartitionKey::Single { key }) => Ok(!key.is_empty()),
-            // A batched Set is valid iff non-empty and every member is valid.
             (_, PyPartitionKey::Set { keys }) => {
                 if keys.is_empty() {
                     return Ok(false);
@@ -581,21 +597,11 @@ impl PartitionsDefinition {
         }
     }
 
-    /// Compute the structural intersection of two partition definitions —
-    /// the def whose keys are valid for both inputs. `None` (well, `Err`)
-    /// when no key can satisfy both: different kinds, mismatched cadence
-    /// or format on TimeWindow, mismatched dimensions on Multi, mismatched
-    /// namespace on Dynamic, or empty key overlap on Static.
-    ///
-    /// Used at `repo.resolve()` to reject jobs whose partitioned assets
-    /// can never share a single partition_key. The `Err` payload is a
-    /// human-readable reason so callers can render a precise error.
+    /// Compute the structural intersection of two partition definitions.
     pub fn intersect(&self, other: &Self) -> Result<Self, String> {
         match (self, other) {
             (Self::Static { keys: a }, Self::Static { keys: b }) => {
                 let a_set: std::collections::HashSet<&str> = a.iter().map(String::as_str).collect();
-                // Preserve `b`'s order on the intersection — same convention
-                // as set intersection elsewhere in the codebase.
                 let common: Vec<String> = b
                     .iter()
                     .filter(|k| a_set.contains(k.as_str()))
@@ -709,10 +715,7 @@ impl PartitionsDefinition {
 }
 
 impl PartitionsDefinition {
-    /// Full structural validation — every rule the factory staticmethods
-    /// enforce. PyO3 generates a raw constructor per enum variant that
-    /// bypasses the factories (and the unpickle path depends on them), so
-    /// `resolve()` re-validates every asset's definition through this.
+    /// Full structural validation — every rule the factory staticmethods enforce.
     pub(crate) fn validate_definition(&self) -> PyResult<()> {
         match self {
             Self::Static { keys } => {
@@ -755,8 +758,6 @@ impl PartitionsDefinition {
                     ));
                 }
                 if let Some(secs) = interval_seconds {
-                    // Sub-nanosecond values truncate to 0ns, which would divide
-                    // by zero in the key-validation modulo.
                     if !secs.is_finite() || *secs <= 0.0 || (secs * 1_000_000_000.0) as i64 == 0 {
                         return Err(PartitionDefinitionError::new_err(format!(
                             "interval_seconds must be positive and at least 1 nanosecond, \
@@ -772,9 +773,6 @@ impl PartitionsDefinition {
                         "Multi partitions must have at least one dimension",
                     ));
                 }
-                // The multi() factory's dict input can't duplicate names, but
-                // the raw variant constructor takes a list — a duplicate
-                // silently collapses the cartesian universe.
                 let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
                 for (name, _) in dimensions {
                     if !seen.insert(name.as_str()) {
@@ -794,9 +792,6 @@ impl PartitionsDefinition {
                             "Multi dimension names cannot be empty",
                         ));
                     }
-                    // Dim names sit left of '=' in `dim=value` display
-                    // segments, so '=' is reserved for them on top of the
-                    // value separators.
                     if let Some(ch) = ['|', ',', '='].into_iter().find(|&c| name.contains(c)) {
                         return Err(PartitionDefinitionError::new_err(format!(
                             "dimension name '{name}' contains reserved character '{ch}' \
@@ -1025,14 +1020,7 @@ fn parse_cron(expr: &str) -> PyResult<Cron> {
         })
 }
 
-/// A TimeWindow fmt must round-trip the grid's window starts: each tick
-/// formats to a key that parses back to exactly that tick. A coarser fmt
-/// collapses neighbouring windows into the same key string (duplicate keys
-/// from enumerate, double-dispatched backfill runs); a non-parseable fmt
-/// breaks every downstream key validation. Checked across the grid's first
-/// four years (one full leap cycle), capped at 1024 ticks — calendar drift
-/// that two ticks can't show (a month-grain fmt over a 31-day interval first
-/// diverges at tick 2) surfaces inside that horizon.
+/// A TimeWindow fmt must round-trip the grid's window starts.
 fn validate_time_window_fmt(
     cron_schedule: &Option<String>,
     interval_seconds: &Option<f64>,
@@ -1040,9 +1028,6 @@ fn validate_time_window_fmt(
     end: &Option<NaiveDateTime>,
     fmt: &str,
 ) -> PyResult<()> {
-    // Cron schedules are second-granular: croner leaks a sub-second start's
-    // fraction into every tick here, while the core grid walk truncates to
-    // whole seconds — the two layers would mint different universes.
     if cron_schedule.is_some() {
         use chrono::Timelike;
         if start.nanosecond() != 0 {
@@ -1059,8 +1044,6 @@ fn validate_time_window_fmt(
         Some(e) => (*e).min(horizon),
         None => horizon,
     };
-    // Walk the grid with the same helpers `enumerate` uses — validation must
-    // judge exactly the keys the definition will mint.
     fn round_trip_tick(t: NaiveDateTime, fmt: &str, failure: &mut Option<PyErr>) -> bool {
         let key = t.format(fmt).to_string();
         if let Some(ch) = rivers_core::storage::PartitionKey::reserved_display_char(&key) {
@@ -1102,9 +1085,6 @@ fn validate_time_window_fmt(
             round_trip_tick(t, fmt, &mut failure) && checked < MAX_TICKS
         })?;
     }
-    // A grid sparser than the horizon still mints its first ticks — they
-    // must round-trip no matter how far out they lie (the pre-horizon code
-    // always checked the first two).
     if failure.is_none() && checked < 2 {
         let true_end = match end {
             Some(e) => *e,
@@ -1164,8 +1144,6 @@ fn validate_time_window_key(
                 return Ok(false);
             }
         } else if let Some(expr) = cron_schedule {
-            // Compare formatted keys, not parsed datetimes — cron ticks near
-            // DST transitions don't round-trip through the formatter reliably.
             let window_start = (dt - chrono::Duration::hours(26)).max(*start);
             let window_end = (dt + chrono::Duration::hours(26)).min(end_dt);
             let mut found = false;
@@ -1184,8 +1162,7 @@ fn validate_time_window_key(
     Ok(true)
 }
 
-/// Enumerate all time window partition keys in `[start, end)` (or now) — the
-/// eager collect-everything form of the lazy `for_each_*_tick` walkers.
+/// Enumerate all time window partition keys in `[start, end)` (or now).
 fn enumerate_time_windows(
     cron_schedule: &Option<String>,
     interval_seconds: &Option<f64>,
@@ -1218,9 +1195,7 @@ fn time_window_end(end: &Option<NaiveDateTime>) -> NaiveDateTime {
     end.unwrap_or_else(|| Local::now().naive_local())
 }
 
-/// Count of interval windows in `[start, end)` — the number of `k >= 0` with
-/// `start + k*interval < end`. Exact: the span is computed in i128 nanoseconds
-/// (i64 ns overflows past ~292 years), then clamped to the `usize` range.
+/// Count of interval windows in `[start, end)`.
 fn interval_window_count(secs: f64, start: &NaiveDateTime, end_dt: NaiveDateTime) -> usize {
     if end_dt <= *start {
         return 0;
@@ -1291,9 +1266,6 @@ fn interval_index(
 }
 
 /// Walk interval windows in `[start, end)` lazily; `f` returns false to stop.
-/// Always terminates at `end_dt` (the explicit `end`, or now if open-ended);
-/// uncapped, so a fine-grained def over a wide range is slow but never hides
-/// partitions.
 pub(crate) fn for_each_interval_tick(
     secs: f64,
     start: &NaiveDateTime,
@@ -1318,9 +1290,6 @@ pub(crate) fn for_each_interval_tick(
 }
 
 /// Walk cron occurrences in `[start, end)` lazily; `f` returns false to stop.
-/// Always terminates at `end_dt` (the explicit `end`, or now if open-ended);
-/// uncapped, so a fine-grained schedule over a wide range is slow but never
-/// hides partitions.
 pub(crate) fn for_each_cron_tick(
     cron_expr: &str,
     start: &NaiveDateTime,
@@ -1344,9 +1313,6 @@ pub(crate) fn for_each_cron_tick(
 /// Whether `t` falls exactly on the cron grid (cron is second-granular).
 pub(crate) fn cron_grid_contains(cron_expr: &str, t: NaiveDateTime) -> PyResult<bool> {
     use chrono::Timelike;
-    // croner never inspects nanoseconds and echoes a fractional `t` back
-    // verbatim from the inclusive iterator, so it would report sub-second
-    // times as on-grid.
     if t.nanosecond() != 0 {
         return Ok(false);
     }

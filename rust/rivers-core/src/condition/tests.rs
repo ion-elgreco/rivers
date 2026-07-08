@@ -34,6 +34,7 @@ fn make_materialized_record(key: &str, ts: i64) -> AssetRecord {
     let mut r = make_record(key);
     r.last_timestamp = Some(ts);
     r.last_data_version = Some(format!("dv_{key}"));
+    r.last_run_id = Some(format!("run_{key}"));
     r
 }
 
@@ -139,6 +140,20 @@ fn test_missing_false_when_materialized() {
     let ctx = make_ctx("a", &record, &records, &deps);
     let result = evaluate(&ConditionNode::Missing, &ctx);
     assert!(!result.fired);
+}
+
+#[test]
+fn test_missing_false_when_materialized_without_data_version() {
+    // Missing keys off materialization presence (last_run_id), not last_data_version:
+    // a materialized asset carrying no data version is still not Missing.
+    let mut record = make_record("a");
+    record.last_timestamp = Some(100);
+    record.last_run_id = Some("run_a".to_string());
+    record.last_data_version = None;
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let ctx = make_ctx("a", &record, &records, &deps);
+    assert!(!evaluate(&ConditionNode::Missing, &ctx).fired);
 }
 
 #[test]
@@ -441,11 +456,8 @@ fn test_newly_updated_no_change() {
 
 #[test]
 fn test_newly_updated_self_suppressed_on_initial_tick() {
-    // A bare newly_updated() self-condition must NOT fire for an
-    // already-materialized asset on the daemon's first/restart tick, where
-    // prev_state is empty (no baseline). Pre-fix the (Some, None) self arm
-    // returned true unconditionally and re-materialized up-to-date data once
-    // per (re)start.
+    // A bare newly_updated() self-condition must not fire for an
+    // already-materialized asset on the initial tick (empty prev_state).
     let record = make_materialized_record("a", 200);
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
@@ -487,8 +499,7 @@ fn test_newly_updated_self_suppressed_on_initial_tick() {
 
 #[test]
 fn test_newly_updated_self_fires_when_appears_between_ticks() {
-    // The boundary the is_initial guard must preserve: on a NON-initial tick a
-    // missing baseline means the asset genuinely appeared between ticks → fire.
+    // On a non-initial tick a missing baseline means the asset appeared between ticks → fire.
     let record = make_materialized_record("a", 200);
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
@@ -609,9 +620,8 @@ fn test_initial_evaluation_since_last_handled() {
 
 #[test]
 fn test_newly_true_pure_no_initial_hack() {
-    // NewlyTrue is a pure rising-edge detector — it does NOT have special
-    // is_initial behavior. On first tick with no previous results, it fires
-    // if the child is true (because previous defaults to false).
+    // NewlyTrue is a pure rising-edge detector with no is_initial special-casing;
+    // fires when child is true and previous defaults to false.
     let record = make_record("a"); // missing
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
@@ -622,23 +632,20 @@ fn test_newly_true_pure_no_initial_hack() {
     let cond = ConditionNode::NewlyTrue(Box::new(ConditionNode::Missing));
     assert!(evaluate(&cond, &ctx).fired);
 
-    // is_initial=false, child=true, previous=false (no prev results) → also fires
-    // (this is the key: NewlyTrue doesn't care about is_initial)
+    // is_initial=false, child=true, previous=false → also fires (NewlyTrue ignores is_initial)
     let ctx2 = make_ctx("a", &record, &records, &deps);
     assert!(evaluate(&cond, &ctx2).fired);
 }
 
 #[test]
 fn test_newly_true_does_not_refire_with_previous_true() {
-    // After child was true on previous tick, NewlyTrue should NOT fire
-    // regardless of is_initial
+    // After child was true last tick, NewlyTrue must not fire regardless of is_initial.
     let record = make_record("a"); // missing
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
 
     let mut prev = AssetConditionState::default();
-    // NewlyTrue is at index 0, child (Missing) at index 1
-    // NewlyTrue stores the child's raw value at its own index
+    // NewlyTrue (index 0) stores the child's raw value at its own index.
     prev.previous_results.insert(0, true);
 
     // is_initial=true but previous=true → should NOT fire (pure rising-edge)
@@ -679,9 +686,8 @@ fn test_newly_true_does_not_refire_with_previous_true() {
 
 #[test]
 fn test_any_deps_updated_initial_heuristic_dep_newer() {
-    // On initial tick with no previous dep timestamps, AnyDepsUpdated uses a
-    // heuristic: fire only if dep_ts > target_ts (genuine new data).
-    // Here dep "a" at ts=200 is NEWER than target "b" at ts=100 → fires.
+    // On initial tick with no dep baseline, AnyDepsUpdated fires only if dep_ts > target_ts;
+    // dep a(200) newer than target b(100) → fires.
     let a = make_materialized_record("a", 200);
     let b = make_materialized_record("b", 100);
     let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
@@ -713,8 +719,7 @@ fn test_any_deps_updated_initial_heuristic_dep_same_age() {
 
 #[test]
 fn test_any_deps_updated_fires_on_non_initial_without_prev_timestamps() {
-    // On non-initial tick with no previous dep timestamps (e.g., new dep added),
-    // AnyDepsUpdated SHOULD fire — the dep has data but we've never seen it.
+    // On non-initial tick with no dep baseline (e.g. new dep), AnyDepsUpdated fires — dep has unseen data.
     let a = make_materialized_record("a", 200);
     let b = make_materialized_record("b", 100);
     let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
@@ -839,6 +844,53 @@ fn test_data_version_changed_true_first_version() {
 }
 
 #[test]
+fn test_data_version_changed_suppressed_on_initial_tick() {
+    // On the initial tick a pre-existing version is not a change, so DataVersionChanged
+    // suppresses (mirrors NewlyUpdated's `(Some, None) => !is_initial`).
+    let mut record = make_materialized_record("a", 100);
+    record.last_data_version = Some("v1".to_string());
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.is_initial = true;
+    assert!(
+        !evaluate(&ConditionNode::DataVersionChanged, &ctx).fired,
+        "first version observed on the initial tick must not count as a change"
+    );
+}
+
+#[test]
+fn test_data_version_changed_suppressed_when_baseline_predates_tracking() {
+    // Baseline predates version tracking (state exists, timestamp matches record, only
+    // version baseline missing): the version was already there, so not a change.
+    let mut record = make_materialized_record("a", 100);
+    record.last_data_version = Some("v1".to_string());
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let state = AssetConditionState {
+        last_materialized_timestamp: record.last_timestamp,
+        ..Default::default()
+    };
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.prev_state = &state;
+    assert!(
+        !evaluate(&ConditionNode::DataVersionChanged, &ctx).fired,
+        "missing baseline with no new materialization is not a version change"
+    );
+
+    // But a materialization past the state's last observation IS a change signal.
+    let stale = AssetConditionState {
+        last_materialized_timestamp: Some(50),
+        ..Default::default()
+    };
+    ctx.prev_state = &stale;
+    assert!(
+        evaluate(&ConditionNode::DataVersionChanged, &ctx).fired,
+        "version appearing alongside a new materialization must fire"
+    );
+}
+
+#[test]
 fn test_data_version_changed_false_no_version() {
     let mut record = make_materialized_record("a", 100);
     record.last_data_version = None;
@@ -935,8 +987,7 @@ fn test_data_version_changed_with_tree() {
 
 #[test]
 fn test_data_version_changed_state_tracking() {
-    // Verify that update_condition_state persists last_data_version,
-    // so a subsequent tick with the same version returns false.
+    // update_condition_state persists last_data_version, so a repeat version returns false.
     let mut record = make_materialized_record("a", 100);
     record.last_data_version = Some("v1".to_string());
     let records = HashMap::from([("a".to_string(), record.clone())]);
@@ -1497,8 +1548,7 @@ fn test_backfill_in_progress_multiple_backfills_union_partitions() {
 
 #[test]
 fn test_backfill_in_progress_one_backfill_empty_keys_short_circuits() {
-    // Two backfills: one with specific partitions, one with empty (whole-asset).
-    // Empty-keys backfill should short-circuit to all partitions regardless of the other.
+    // An empty-keys backfill short-circuits to all partitions regardless of the other.
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
@@ -1869,10 +1919,8 @@ fn test_last_executed_with_tags_partitioned_key_only() {
 
 #[test]
 fn test_last_executed_with_tags_empty_tags_in_cache_does_not_match() {
-    // Regression: if empty tags were stored in the cache (e.g. from a run with no tags),
-    // run_tags_match(&[], &[], &[]) returns true because .all() on empty iterators
-    // is vacuously true. The evaluator must return false when the run had no tags,
-    // even if a cache entry exists with an empty vec.
+    // A cached empty-tags entry must not vacuously match (.all() on empty iters is true);
+    // the evaluator returns false when the run had no tags.
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
@@ -1893,9 +1941,8 @@ fn test_last_executed_with_tags_empty_tags_in_cache_does_not_match() {
     };
     assert!(!evaluate(&cond2, &ctx).fired);
 
-    // BOTH empty: vacuous truth bug — .all() on empty iters returns true.
-    // The defense is at the cache layer (never store empty tags); this
-    // documents the known edge case if the guard were ever bypassed.
+    // BOTH empty: vacuous truth (.all() on empty iters); defended at the cache
+    // layer, documented here for the bypassed-guard edge case.
     let cond3 = ConditionNode::LastExecutedWithTags {
         tag_keys: vec![],
         tag_values: vec![],
@@ -2293,14 +2340,12 @@ fn test_new_update_tags_partitioned_no_materializations() {
     assert!(!result.fired);
 }
 
-// New semantics: checks if the dep's latest run also included the root asset
-// (the top-level asset being evaluated) in its `asset_names`.
-// Always false when target_key == root_key (self-referential guard).
+// LastRunIncludesTarget: dep's latest run also included the root asset in
+// `asset_names`; always false when target_key == root_key (self-referential guard).
 
 #[test]
 fn test_last_run_includes_target_true_when_run_includes_root() {
-    // Dep "b" was materialized by a joint run [b, c]. root_key is "c".
-    // b's latest run asset_names = [b, c] → contains root "c" → true
+    // Dep b's joint run [b, c] contains root "c" → true.
     let record = make_materialized_record("b", 100);
     let records = HashMap::from([("b".to_string(), record.clone())]);
     let deps = HashMap::new();
@@ -2317,8 +2362,7 @@ fn test_last_run_includes_target_true_when_run_includes_root() {
 
 #[test]
 fn test_last_run_includes_target_false_when_run_excludes_root() {
-    // Dep "b" was materialized by a solo run [b]. root_key is "c".
-    // b's latest run asset_names = [b] → does NOT contain "c" → false
+    // Dep b's solo run [b] excludes root "c" → false.
     let record = make_materialized_record("b", 100);
     let records = HashMap::from([("b".to_string(), record.clone())]);
     let deps = HashMap::new();
@@ -2376,10 +2420,8 @@ fn test_last_run_includes_target_not_composition() {
 
 #[test]
 fn test_last_run_includes_target_in_any_deps_match() {
-    // Primary use case: any_deps_match(newly_updated & ~last_run_includes_target)
-    // Evaluating root "a" with deps [b, c].
-    // Dep "b": latest run was joint [a, b] → last_run_includes_target=true → filtered
-    // Dep "c": latest run was solo [c] → last_run_includes_target=false → included
+    // any_deps_match(newly_updated & ~last_run_includes_target) on root "a", deps [b,c]:
+    // dep b (joint [a,b]) filtered, dep c (solo [c]) included.
     let a = make_materialized_record("a", 50);
     let b = make_materialized_record("b", 100);
     let c = make_materialized_record("c", 100);
@@ -2447,8 +2489,7 @@ fn test_last_run_includes_target_tree_output() {
 
 #[test]
 fn test_last_run_includes_target_partitioned() {
-    // Partition-level: pk1's run included root "c", pk2's run did not.
-    // target_key="b", root_key="c"
+    // Partition-level: pk1's run included root "c", pk2's did not (target b, root c).
     let record = make_materialized_record("b", 100);
     let records = HashMap::from([("b".to_string(), record.clone())]);
     let deps = HashMap::new();
@@ -2503,9 +2544,8 @@ fn test_last_run_includes_target_partitioned() {
 
 #[test]
 fn test_last_run_includes_target_only_checks_target_not_root() {
-    // The check is on the dep's (target_key's) run, not the root's run.
-    // target_key="b", root_key="c". Even if "c" has asset_names containing "b",
-    // what matters is "b"'s run asset_names containing "c".
+    // The check is on the dep's (target b) run, not the root's (c):
+    // what matters is b's asset_names containing "c".
     let record_b = make_materialized_record("b", 100);
     let record_c = make_materialized_record("c", 100);
     let records = HashMap::from([
@@ -2531,13 +2571,8 @@ fn test_last_run_includes_target_only_checks_target_not_root() {
 
 #[test]
 fn test_last_run_includes_target_partitioned_joint_run_suppresses_newly_updated() {
-    // Scenario: partitioned dep "b" and root "a" were co-materialized at partition
-    // pk1 in a joint run. On the next tick, b:pk1 shows as NewlyUpdated but
-    // LastRunIncludesTarget should suppress it.
-    //
-    // This is the core correctness case: without grouping partitioned condition
-    // materializations by partition key, each asset gets its own run, and
-    // LastRunIncludesTarget would fail to suppress the re-fire.
+    // Dep b and root a co-materialized at pk1 in a joint run; next tick b:pk1 is
+    // NewlyUpdated but LastRunIncludesTarget must suppress the re-fire.
     let a = make_materialized_record("a", 50);
     let b = make_materialized_record("b", 200); // b was updated (ts > prev)
     let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
@@ -2548,8 +2583,7 @@ fn test_last_run_includes_target_partitioned_joint_run_suppresses_newly_updated(
     let all_keys = HashSet::from([pk1.clone(), pk2.clone()]);
     let timestamps = HashMap::from([(pk1.clone(), 200i64), (pk2.clone(), 100)]);
 
-    // Joint run: b:pk1 was in a run with [a, b] → includes root "a"
-    // Solo run: b:pk2 was in a run with [b] only
+    // b:pk1 joint run [a, b] includes root "a"; b:pk2 solo run [b].
     let partition_asset_names = HashMap::from([(
         "b".to_string(),
         HashMap::from([
@@ -2605,10 +2639,7 @@ fn test_last_run_includes_target_partitioned_joint_run_suppresses_newly_updated(
     let cond = ConditionNode::any_deps_updated();
     let result = evaluate(&cond, &ctx);
 
-    // pk1: b:pk1 is NewlyUpdated (200 > 100) BUT LastRunIncludesTarget = true
-    //       (joint run [a, b]) → NewlyUpdated & !true = false → suppressed
-    // pk2: b:pk2 is NOT NewlyUpdated (100 == 100) → false
-    // Neither partition fires any_deps_updated
+    // pk1 NewlyUpdated but joint-run suppressed; pk2 not NewlyUpdated → neither fires.
     assert!(!result.fired, "joint run should suppress re-fire for pk1");
     match result.selection {
         Some(PartitionSelection::Empty) | None => {} // expected
@@ -2619,12 +2650,8 @@ fn test_last_run_includes_target_partitioned_joint_run_suppresses_newly_updated(
 
 #[test]
 fn dep_updated_requires_dep_newer_than_target_key() {
-    // Observation baselines lag async event drains: a fire can baseline stale
-    // timestamps and the same events re-surface as "updated" a tick later
-    // (or, with no baseline at all, every key reads as newly appeared). A dep
-    // key counts as updated only while it is strictly newer than the root's
-    // own materialization of that key — the dispatched run then advances the
-    // root past the dep, making the trigger self-suppressing.
+    // A dep key counts as updated only while strictly newer than the root's own
+    // materialization of that key (self-suppressing once the root advances past it).
     let a = make_materialized_record("a", 100);
     let b = make_materialized_record("b", 100);
     let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
@@ -2633,13 +2660,11 @@ fn dep_updated_requires_dep_newer_than_target_key() {
     let pk1 = spk("2024-01-01");
     let pk2 = spk("2024-01-02");
     let all_keys = HashSet::from([pk1.clone(), pk2.clone()]);
-    // Root "a" materialized pk1 at 100 (same joint baseline run as the dep)
-    // and pk2 at 100.
+    // Root "a" materialized pk1 and pk2 at 100.
     let a_timestamps = HashMap::from([(pk1.clone(), 100i64), (pk2.clone(), 100)]);
 
-    // Dep "b": pk1 ts equals the root's (nothing new); pk2 genuinely newer.
-    // Its eval-state baseline is EMPTY — the drain-lag shape where every key
-    // would read as "newly appeared".
+    // Dep "b": pk1 ts equals the root's (nothing new), pk2 genuinely newer;
+    // empty eval-state baseline (drain-lag shape).
     let all_states = HashMap::new();
     let b_partition_status = crate::condition::cache::PartitionStatusEntry {
         materialized: HashSet::from([pk1.clone(), pk2.clone()]),
@@ -2702,21 +2727,17 @@ fn dep_updated_requires_dep_newer_than_target_key() {
 
 #[test]
 fn partitioned_root_unpartitioned_dep_refires_stale_older_partitions() {
-    // A partitioned root reading an UNPARTITIONED dep takes the bool fallback
-    // in eval_partitioned_on_dep. The staleness floor there must be the root's
-    // OLDEST partition attempt (min across partitions), not the asset-level max
-    // — otherwise a dep update older than the newest partition floors against
-    // that newest ts and the genuinely-stale older partitions never re-fire.
+    // A partitioned root on an unpartitioned dep (bool fallback): the staleness
+    // floor must be the root's oldest partition attempt (min), not the asset-level
+    // max, or genuinely-stale older partitions never re-fire.
     let pk_old = spk("2024-01-01");
     let pk_mid = spk("2024-01-02");
     let pk_new = spk("2024-01-03");
     let all_keys = HashSet::from([pk_old.clone(), pk_mid.clone(), pk_new.clone()]);
 
-    // Root "a": partitions materialized at 10 / 30 / 50; the asset-level record
-    // carries the MAX (50) — exactly the value the buggy floor compared against.
+    // Root "a": partitions at 10 / 30 / 50; the asset-level record carries the max (50).
     let a = make_materialized_record("a", 50);
-    // Dep "b": UNPARTITIONED, updated at 35 — newer than pk_old/pk_mid, older
-    // than pk_new.
+    // Dep "b": unpartitioned, updated at 35 — newer than pk_old/pk_mid, older than pk_new.
     let b = make_materialized_record("b", 35);
     let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
     let deps = HashMap::from([("a".to_string(), vec!["b".to_string()])]);
@@ -2760,9 +2781,8 @@ fn partitioned_root_unpartitioned_dep_refires_stale_older_partitions() {
         Some(PartitionSelection::Keys(ks)) => ks.contains(k),
         _ => false,
     };
-    // dep@35 is newer than the older partition attempts (10, 30), so the edge
-    // must fire and re-materialize those stale partitions. Pre-fix it floored
-    // against the asset-level max (50), got 35 > 50 = false, and starved them.
+    // dep@35 newer than the older partition attempts (10, 30) → the edge must
+    // fire and re-materialize those stale partitions.
     assert!(
         result.fired,
         "dep@35 newer than older partitions (10/30) → must re-fire, got {:?}",
@@ -2782,11 +2802,9 @@ fn partitioned_root_unpartitioned_dep_refires_stale_older_partitions() {
 
 #[test]
 fn all_partitions_dep_frontier_key_does_not_refire_whole_universe() {
-    // AllPartitions floors the dep against the MIN effective ts over the whole
-    // downstream universe. A freshly-minted, never-attempted frontier key made
-    // root_floor_over return None → the dep counted as "updated" with no
-    // upstream change and re-dispatched the entire universe. The floor must
-    // ignore never-attempted keys.
+    // AllPartitions floors the dep against the min effective ts over the universe;
+    // the floor must ignore never-attempted frontier keys, else a new key refires
+    // the whole universe with no upstream change.
     let d1 = spk("d1");
     let d2 = spk("d2");
     let d3 = spk("d3"); // freshly minted, never attempted
@@ -2799,8 +2817,7 @@ fn all_partitions_dep_frontier_key_does_not_refire_whole_universe() {
     let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
     let deps = HashMap::from([("a".to_string(), vec!["b".to_string()])]);
 
-    // Root "a": d1/d2 materialized at 100, d3 never attempted. Dep "b": u1 at
-    // 90 — older than every attempted downstream key, already consumed.
+    // Root "a": d1/d2 at 100, d3 never attempted. Dep "b": u1 at 90, older than every attempted key.
     let a_timestamps = HashMap::from([(d1.clone(), 100i64), (d2.clone(), 100)]);
     let a_mat = HashSet::from([d1.clone(), d2.clone()]);
     let a_status = crate::condition::cache::PartitionStatusEntry {
@@ -2840,8 +2857,7 @@ fn all_partitions_dep_frontier_key_does_not_refire_whole_universe() {
 
     let result = evaluate(&ConditionNode::any_deps_updated(), &ctx);
 
-    // Dep u1@90 is older than every attempted downstream key (100); the new
-    // frontier key d3 must not drag the floor to None and broadcast All.
+    // Dep u1@90 older than every attempted key (100); new frontier d3 must not drag the floor to None and broadcast All.
     assert!(
         !result.fired,
         "a never-attempted frontier key must not refire the universe with no \
@@ -2851,9 +2867,61 @@ fn all_partitions_dep_frontier_key_does_not_refire_whole_universe() {
 }
 
 #[test]
+fn test_empty_partitioned_dep_universe_does_not_bridge_latch_to_all() {
+    // An empty-universe partitioned dep (present with empty set, unlike an absent
+    // unpartitioned dep) must take the partitioned path, not the bool fallback that
+    // bridges a stateful latch to `All` and later fires the whole universe.
+    let rk = spk("rk1");
+    let all_keys = HashSet::from([rk.clone()]);
+    let r = make_materialized_record("r", 100);
+    let u = make_record("u"); // never materialized → Missing is true
+    let records = HashMap::from([("r".to_string(), r.clone()), ("u".to_string(), u.clone())]);
+    let deps = HashMap::from([("r".to_string(), vec!["u".to_string()])]);
+
+    let partition_statuses = HashMap::from([("r".to_string(), Default::default())]);
+    let all_states = HashMap::new();
+    let mut ctx = make_ctx("r", &r, &records, &deps);
+    ctx.all_asset_states = &all_states;
+
+    let mappings = HashMap::from([(("r".into(), "u".into()), PartitionMappingKind::Identity)]);
+    // u PRESENT with an EMPTY universe (partitioned, no keys yet).
+    let upstream_u = HashMap::from([("u".to_string(), HashSet::<PartitionKey>::new())]);
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &HashSet::new(),
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &HashMap::new(),
+        resolver: PartitionResolver::new(&mappings, &upstream_u),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let condition = ConditionNode::AnyDepsMatch {
+        condition: Box::new(ConditionNode::NewlyTrue(Box::new(ConditionNode::Missing))),
+        label: None,
+    };
+    let result = evaluate(&condition, &ctx);
+
+    if let Some(dep_sels) = &result.dep_sub_selections {
+        for (dep, latch) in dep_sels {
+            for (idx, sel) in latch {
+                assert_ne!(
+                    sel,
+                    &PartitionSelection::All,
+                    "empty-universe dep {dep} latched node {idx} as All \
+                     (bool-fallback bridge); the partitioned path must be taken"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn all_partitions_dep_genuine_update_still_fires() {
-    // The boundary the floor must preserve: when an upstream key IS newer than
-    // an attempted downstream key, the AllPartitions edge must still fire.
+    // When an upstream key is newer than an attempted downstream key, the AllPartitions edge must still fire.
     let d1 = spk("d1");
     let d2 = spk("d2");
     let d3 = spk("d3"); // never attempted
@@ -2912,12 +2980,67 @@ fn all_partitions_dep_genuine_update_still_fires() {
 }
 
 #[test]
+fn all_partitions_dep_initial_population_fires() {
+    // A never-materialized AllPartitions fan-out must still fire to populate itself:
+    // a None per-key floor means "never materialized ⇒ updated" (fire), not exclude.
+    let d1 = spk("d1");
+    let d2 = spk("d2");
+    let all_keys = HashSet::from([d1.clone(), d2.clone()]);
+    let u1 = spk("u1");
+    let up_keys = HashSet::from([u1.clone()]);
+
+    let a = make_record("a"); // never materialized
+    let b = make_materialized_record("b", 100);
+    let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
+    let deps = HashMap::from([("a".to_string(), vec!["b".to_string()])]);
+
+    // Root "a": nothing attempted. Dep "b": u1 materialized at 100.
+    let a_status = crate::condition::cache::PartitionStatusEntry::default();
+    let b_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: up_keys.clone(),
+        timestamps: HashMap::from([(u1.clone(), 100i64)]),
+        ..Default::default()
+    };
+    let partition_statuses =
+        HashMap::from([("a".to_string(), a_status), ("b".to_string(), b_status)]);
+
+    let all_states = HashMap::new();
+    let mut ctx = make_ctx("a", &a, &records, &deps);
+    ctx.all_asset_states = &all_states;
+
+    let mappings = HashMap::from([(
+        ("a".into(), "b".into()),
+        PartitionMappingKind::AllPartitions,
+    )]);
+    let upstream_b = HashMap::from([("b".to_string(), up_keys.clone())]);
+    let empty_ts: HashMap<PartitionKey, i64> = HashMap::new();
+    let empty_mat: HashSet<PartitionKey> = HashSet::new();
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &empty_mat,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &empty_ts,
+        resolver: PartitionResolver::new(&mappings, &upstream_b),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let result = evaluate(&ConditionNode::any_deps_updated(), &ctx);
+    assert!(
+        result.fired,
+        "a never-materialized fan-out downstream must fire to populate itself, got {:?}",
+        result.selection
+    );
+}
+
+#[test]
 fn dep_updated_floor_compares_mapped_downstream_key() {
-    // The staleness floor must compare a dep key against the root's
-    // materialization of the DOWNSTREAM key the mapping resolves it to —
-    // not the root's unrelated same-named key. With time_window(offset=-1)
-    // ("read yesterday's partition"), b@D drives a@(D+1): once a@(D+1) has
-    // landed newer than b@D, the trigger must self-suppress.
+    // The staleness floor must compare a dep key against the root's materialization
+    // of the mapped downstream key, not a same-named key. With time_window(offset=-1),
+    // b@D drives a@(D+1) and self-suppresses once a@(D+1) is newer.
     let a = make_materialized_record("a", 400);
     let b = make_materialized_record("b", 300);
     let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
@@ -2941,8 +3064,7 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
 
     let b_keys = HashSet::from([spk("2024-01-04"), spk("2024-01-05")]);
     let a_keys = HashSet::from([spk("2024-01-05"), spk("2024-01-06")]);
-    // Root already consumed both dep updates: a@05 (from b@04) and a@06
-    // (from b@05) are newer than their driving dep keys.
+    // Root already consumed both dep updates: a@05 (from b@04) and a@06 (from b@05) newer than their driving dep keys.
     let a_timestamps = HashMap::from([(spk("2024-01-05"), 100i64), (spk("2024-01-06"), 400)]);
 
     let all_states = HashMap::new();
@@ -3002,8 +3124,7 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
         result.selection
     );
 
-    // Control: the root's mapped key a@06 older than b@05 -> exactly that
-    // downstream key fires.
+    // Control: root's mapped key a@06 older than b@05 → that downstream key fires.
     let a_timestamps_stale = HashMap::from([(spk("2024-01-05"), 100i64), (spk("2024-01-06"), 200)]);
     let statuses_stale = HashMap::from([
         (
@@ -3054,11 +3175,9 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
 
 #[test]
 fn will_be_requested_carries_the_upstream_fired_selection() {
-    // A partitioned upstream whose own condition fired for ONE key this tick
-    // must make only the mapped downstream key eligible — the old arm
-    // broadcast the whole universe (`requested_this_tick` carried bare asset
-    // names), re-introducing the per-partition-contract violation through
-    // any_deps_updated's WillBeRequested branch.
+    // A partitioned upstream that fired for one key this tick must make only the
+    // mapped downstream key eligible via any_deps_updated's WillBeRequested branch,
+    // not the whole universe.
     let down = make_materialized_record("down", 100);
     let up = make_materialized_record("up", 100);
     let records = HashMap::from([
@@ -3071,8 +3190,7 @@ fn will_be_requested_carries_the_upstream_fired_selection() {
     let pb = spk("b");
     let pc = spk("c");
     let keys = HashSet::from([pa.clone(), pb.clone(), pc.clone()]);
-    // Equal timestamps on both sides: the NewlyUpdated branch stays quiet,
-    // isolating WillBeRequested.
+    // Equal timestamps on both sides keep NewlyUpdated quiet, isolating WillBeRequested.
     let ts: HashMap<PartitionKey, i64> = keys.iter().map(|k| (k.clone(), 100i64)).collect();
 
     let all_states = HashMap::new();
@@ -3144,11 +3262,9 @@ fn will_be_requested_carries_the_upstream_fired_selection() {
 
 #[test]
 fn dep_updated_retries_once_per_dep_update_after_failure() {
-    // A failed run never advances the root's materialization floor, so
-    // without failure awareness a deterministically failing partition is
-    // re-dispatched every tick forever. The failure timestamp must raise the
-    // floor: suppressed while the failure postdates the dep update, retried
-    // exactly when the dep lands something newer.
+    // A failed run never advances the materialization floor; the failure timestamp
+    // must raise it — suppressed while the failure postdates the dep update, retried
+    // when the dep lands something newer.
     let a = make_materialized_record("a", 100);
     let b = make_materialized_record("b", 300);
     let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
@@ -3207,8 +3323,7 @@ fn dep_updated_retries_once_per_dep_update_after_failure() {
         result.selection
     );
 
-    // Control: the dep lands NEW data (500 > failure 400) -> exactly one
-    // retry becomes due again.
+    // Control: dep lands new data (500 > failure 400) → exactly one retry becomes due.
     let statuses_retry = HashMap::from([
         (
             "a".to_string(),
@@ -3255,11 +3370,9 @@ fn dep_updated_retries_once_per_dep_update_after_failure() {
 
 #[test]
 fn dep_updated_ignores_dep_keys_outside_root_universe() {
-    // Identity dep whose upstream range is a superset of the root's
-    // (upstream daily since 2020, downstream added with start=2024): the
-    // upstream-only keys can never be dispatched downstream, so they must
-    // not count as updated — pre-fix they kept the condition permanently
-    // firing phantom selections.
+    // Identity dep whose upstream range is a superset of the root's (upstream since
+    // 2020, downstream start=2024): upstream-only keys can never be dispatched
+    // downstream, so must not count as updated.
     let a = make_materialized_record("a", 100);
     let b = make_materialized_record("b", 500);
     let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
@@ -3372,8 +3485,7 @@ fn dep_updated_ignores_dep_keys_outside_root_universe() {
 
 #[test]
 fn test_last_run_includes_target_partitioned_solo_run_allows_newly_updated() {
-    // Scenario: partitioned dep "b" was materialized in a solo run (not with root "a").
-    // On the next tick, b:pk1 shows NewlyUpdated and should NOT be suppressed.
+    // Dep b in a solo run (not with root a): next tick b:pk1 is NewlyUpdated and must not be suppressed.
     let a = make_materialized_record("a", 50);
     let b = make_materialized_record("b", 200);
     let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
@@ -3430,8 +3542,7 @@ fn test_last_run_includes_target_partitioned_solo_run_allows_newly_updated() {
     let cond = ConditionNode::any_deps_updated();
     let result = evaluate(&cond, &ctx);
 
-    // pk1: b:pk1 is NewlyUpdated (200 > 100) AND LastRunIncludesTarget = false
-    //       (solo run [b]) → NewlyUpdated & !false = true → fires
+    // pk1 NewlyUpdated and solo-run (not suppressed) → fires.
     assert!(result.fired, "solo run should allow NewlyUpdated to fire");
     match result.selection {
         Some(PartitionSelection::Keys(ref keys)) => {
@@ -3444,8 +3555,7 @@ fn test_last_run_includes_target_partitioned_solo_run_allows_newly_updated() {
 
 #[test]
 fn test_last_run_includes_target_partitioned_mixed_joint_and_solo() {
-    // Two partitions of dep "b": pk1 was in a joint run with root "a",
-    // pk2 was in a solo run. Only pk2 should fire any_deps_updated.
+    // Dep b: pk1 joint run with root a, pk2 solo → only pk2 fires any_deps_updated.
     let a = make_materialized_record("a", 50);
     let b = make_materialized_record("b", 200);
     let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
@@ -3574,8 +3684,7 @@ fn test_asset_matches_false_when_key_not_in_records() {
 
 #[test]
 fn test_asset_matches_newly_updated_on_non_dep() {
-    // asset_matches can target an asset that isn't a dep — useful for
-    // cross-graph condition checks (e.g. "fire when sibling asset updated")
+    // asset_matches can target a non-dep asset (cross-graph checks, e.g. "fire when sibling updated").
     let a = make_materialized_record("a", 50);
     let b = make_materialized_record("b", 200); // updated
     let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
@@ -3594,8 +3703,7 @@ fn test_asset_matches_newly_updated_on_non_dep() {
 
 #[test]
 fn test_asset_matches_preserves_root_key() {
-    // asset_matches should preserve root_key (like eval_on_dep does)
-    // so LastRunIncludesTarget still checks against the original root
+    // asset_matches preserves root_key so LastRunIncludesTarget still checks against the original root.
     let a = make_materialized_record("a", 100);
     let b = make_materialized_record("b", 100);
     let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
@@ -3690,10 +3798,8 @@ fn test_bitor_flattens_nested_or() {
 
 #[test]
 fn test_without_matching_removes_matching_child() {
-    // eager = SinceLastHandled(...) & !any_deps_missing & !any_deps_in_progress
-    //         & !in_flight & !ExecutionFailed
-    // The in-progress guard is the operand `Not(any_deps_in_progress())`; match it
-    // structurally to strip it.
+    // eager = SinceLastHandled(...) & !any_deps_missing & !any_deps_in_progress & !in_flight & !ExecutionFailed.
+    // Strip the in-progress guard operand Not(any_deps_in_progress()) by structural match.
     let eager = ConditionNode::eager();
     let result = eager.without_matching(&|c| *c == !ConditionNode::any_deps_in_progress());
     let expected = (ConditionNode::Missing.newly_true() | ConditionNode::any_deps_updated())
@@ -3706,9 +3812,8 @@ fn test_without_matching_removes_matching_child() {
 
 #[test]
 fn test_without_matching_removes_only_exact_operand() {
-    // Operands are matched structurally. The bare form `any_deps_missing()` does
-    // NOT match the `Not(any_deps_missing())` guard (no-op); the exact negated
-    // operand strips it.
+    // Operands match structurally: bare any_deps_missing() does not match the
+    // Not(...) guard (no-op); the exact negated operand strips it.
     let eager = ConditionNode::eager();
     assert_eq!(
         eager.without_matching(&|c| *c == ConditionNode::any_deps_missing()),
@@ -3768,9 +3873,8 @@ fn test_replace_by_node_structural_match() {
         &ConditionNode::any_deps_in_progress(),
         &ConditionNode::InProgress,
     );
-    // Not(any_deps_in_progress) becomes Not(InProgress). The InProgress inside
-    // Not(in_flight()) isn't a structural any_deps_in_progress match, so the
-    // in-flight guard is untouched.
+    // Not(any_deps_in_progress) becomes Not(InProgress); the InProgress inside
+    // Not(in_flight()) isn't a structural match, so the in-flight guard is untouched.
     let expected = (ConditionNode::Missing.newly_true() | ConditionNode::any_deps_updated())
         .since_last_handled()
         & !ConditionNode::any_deps_missing()
@@ -3926,10 +4030,8 @@ fn test_any_deps_updated() {
 
 #[test]
 fn unpartitioned_dep_updated_compares_against_root_record() {
-    // Drain-lag double fire: the root already ran at 110 reading b@99's
-    // durably-written data; b's completion drains into the cache a tick
-    // later with a stale fire-time baseline (50). Baselines re-fire; the
-    // staleness floor must see the root is already newer and suppress.
+    // The root ran at 110 reading b@99; b drains a tick later with a stale baseline (50).
+    // The staleness floor must see the root is already newer and suppress.
     let r = make_materialized_record("R", 110);
     let b = make_materialized_record("b", 99);
     let records = HashMap::from([("R".to_string(), r.clone()), ("b".to_string(), b.clone())]);
@@ -3960,9 +4062,8 @@ fn unpartitioned_dep_updated_compares_against_root_record() {
 
 #[test]
 fn unpartitioned_dep_updated_failed_root_retries_once() {
-    // A failed root run consumes the dep update that triggered it: while the
-    // failure postdates the dep, re-firing every tick is an unbounded retry
-    // loop. A newer dep update retries exactly once more.
+    // A failed root run consumes the dep update that triggered it; suppressed while
+    // the failure postdates the dep, one retry when a newer dep lands.
     let r = make_materialized_record("R", 100);
     let b = make_materialized_record("b", 120);
     let records = HashMap::from([("R".to_string(), r.clone()), ("b".to_string(), b.clone())]);
@@ -4158,9 +4259,8 @@ fn test_newly_true_transition() {
     };
     assert!(!evaluate(&cond, &ctx2).fired);
 
-    // Third tick: Missing still true, inner was true on tick 2 → still does NOT fire
-    // (Regression test: previously stored `result` instead of `current`, causing
-    //  re-fire every other tick when inner stays continuously true.)
+    // Third tick: Missing still true, inner was true tick 2 → still does not fire
+    // (must store `current`, not `result`, or it re-fires every other tick).
     let mut prev3 = AssetConditionState::default();
     prev3.previous_results.insert(0, true); // inner was true last tick
     let ctx3 = EvalContext {
@@ -4196,9 +4296,8 @@ fn test_newly_true_transition() {
 
 #[test]
 fn test_counter_stability_and_short_circuit() {
-    // Regression test: And short-circuit must not shift node indices.
-    // Tree: And(InProgress, NewlyTrue(Missing))
-    // NewlyTrue is at a fixed index regardless of whether And short-circuits.
+    // And short-circuit must not shift node indices: in And(InProgress, NewlyTrue(Missing)),
+    // NewlyTrue keeps a fixed index whether or not And short-circuits.
     let record = make_record("a"); // missing
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
@@ -4208,17 +4307,17 @@ fn test_counter_stability_and_short_circuit() {
         ConditionNode::NewlyTrue(Box::new(ConditionNode::Missing)),
     ]);
 
-    // Tick 1: InProgress=false → And short-circuits, but NewlyTrue's index
-    // must still be assigned (not shifted). Result: false (short-circuited)
+    // Tick 1: InProgress=false → And short-circuits, but NewlyTrue's index must still be assigned; result false.
     let ctx1 = make_ctx("a", &record, &records, &deps);
     let r1 = evaluate(&cond, &ctx1);
     assert!(!r1.fired);
-    // NewlyTrue's index should be 2 (And=0, InProgress=1, NewlyTrue=2, Missing=3)
-    // Since And short-circuited, NewlyTrue wasn't evaluated, so no sub_results entry
-    assert!(r1.sub_results.is_empty());
+    // NewlyTrue's index is 2 (And=0, InProgress=1, NewlyTrue=2, Missing=3); the
+    // short-circuited And still evaluates the stateful child, so Missing=true records
+    // current=true at stable index 2.
+    assert_eq!(r1.sub_results.get(&2), Some(&true));
+    assert_eq!(r1.sub_results.len(), 1);
 
-    // Tick 2: Make InProgress=true so And doesn't short-circuit.
-    // NewlyTrue(Missing) should fire (inner=true, previous=false).
+    // Tick 2: InProgress=true (no short-circuit) → NewlyTrue(Missing) fires (inner=true, previous=false).
     let in_progress = HashSet::from(["a".to_string()]);
     let mut prev2 = AssetConditionState::default();
     // No previous results → NewlyTrue fires
@@ -4478,9 +4577,8 @@ fn test_any_deps_match_recursive() {
 
 #[test]
 fn test_bug_cron_tick_always_fires_on_first_eval() {
-    // Regression: CronTickPassed uses last_materialized_timestamp.unwrap_or(0),
-    // making the cron window [epoch, now] on first eval — always matches.
-    // A "30 16 * * 1-5" schedule should NOT fire at ~22:13 UTC on first eval.
+    // CronTickPassed with no baseline must not make the window [epoch, now] and always
+    // match: "30 16 * * 1-5" must not fire at ~22:13 UTC on first eval.
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
@@ -4533,9 +4631,7 @@ fn test_cron_tick_fires_when_tick_passes_between_evals() {
 
     let cond = ConditionNode::on_cron("30 16 * * 1-5".to_string(), None);
 
-    // Previous eval: Tuesday 2023-11-14 16:00 UTC
-    // Current eval:  Tuesday 2023-11-14 16:31 UTC
-    // The 16:30 cron tick falls between these → should fire.
+    // Prev eval 16:00, current 16:31 UTC (Tue 2023-11-14); the 16:30 cron tick falls between → fires.
     let prev_tick_nanos = 1_699_977_600_000_000_000_i64;
     let now_nanos = 1_699_979_460_000_000_000_i64;
 
@@ -4650,15 +4746,13 @@ fn test_find_lookback_delta() {
 
 #[test]
 fn test_bug_since_last_handled_refires_after_own_materialization() {
-    // Regression: SinceLastHandled checks target.last_timestamp > last_handled_timestamp.
-    // After the triggered materialization completes, target.last_timestamp is updated
-    // to a time after last_handled_timestamp, causing a spurious re-fire.
+    // SinceLastHandled checks target.last_timestamp > last_handled_timestamp; the asset's
+    // own completed materialization must not read as a spurious re-fire.
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
 
-    // Use a child that stays true across ticks:
-    // Not(Missing) is always true for a materialized asset.
+    // Child Not(Missing) stays true across ticks for a materialized asset.
     let cond = ConditionNode::SinceLastHandled(Box::new(ConditionNode::Not(Box::new(
         ConditionNode::Missing,
     ))));
@@ -4743,12 +4837,8 @@ fn test_bug_since_last_handled_refires_after_own_materialization() {
 
 #[test]
 fn test_newly_requested_any_deps_match_cross_asset_signaling() {
-    // Use case: downstream triggers when upstream was requested last tick.
-    // Condition: any_deps_match(newly_requested())
-    //
-    // Tick 1: upstream hasn't been requested → downstream doesn't fire
-    // Tick 2: upstream was requested on tick 1 → downstream fires
-    // Tick 3: upstream no longer newly_requested → downstream doesn't fire
+    // any_deps_match(newly_requested()): downstream fires the tick after upstream was requested.
+    // Tick 1: not requested → no fire; Tick 2: requested last tick → fires; Tick 3: no longer newly_requested → no fire.
 
     let upstream_record = make_materialized_record("upstream", 100);
     let downstream_record = make_materialized_record("downstream", 100);
@@ -4796,8 +4886,7 @@ fn test_newly_requested_any_deps_match_cross_asset_signaling() {
         "Tick 1: upstream not requested yet"
     );
 
-    // Simulate: upstream's condition fired on tick 1 (now=1000)
-    // After tick 1: upstream has last_handled_timestamp=1000, last_tick_timestamp=1000
+    // After tick 1 upstream has last_handled=1000, last_tick=1000 (fired at now=1000).
     let all_states_2 = HashMap::from([
         (
             "upstream".to_string(),
@@ -4850,8 +4939,7 @@ fn test_newly_requested_any_deps_match_cross_asset_signaling() {
         "Tick 2: upstream was requested last tick → downstream fires"
     );
 
-    // Tick 3: upstream's last_handled_timestamp=1000 != last_tick_timestamp=2000
-    // → no longer newly_requested → downstream doesn't fire
+    // Tick 3: upstream last_handled=1000 != last_tick=2000 → no longer newly_requested → no fire.
     let all_states_3 = HashMap::from([(
         "upstream".to_string(),
         AssetConditionState {
@@ -4900,12 +4988,8 @@ fn test_newly_requested_any_deps_match_cross_asset_signaling() {
 
 #[test]
 fn test_newly_requested_as_since_reset() {
-    // Use case: code_version_changed().since(newly_requested())
-    // Realistic timeline where materialization completes between ticks.
-    //
-    // Tick 1: code_version=v2, last_materialization_code_version=v1 → fires
-    // Between ticks: materialization completes → last_materialization_code_version=v2
-    // Tick 2: code versions now match → CodeVersionChanged is false → doesn't fire
+    // code_version_changed().since(newly_requested()) with materialization completing between ticks:
+    // Tick 1 (v2 vs v1) fires; after materialization (v2==v2) Tick 2 doesn't fire.
 
     let mut record = make_materialized_record("a", 100);
     record.code_version = Some("v2".to_string());
@@ -5001,13 +5085,8 @@ fn test_newly_requested_as_since_reset() {
 
 #[test]
 fn test_newly_requested_as_since_reset_fast_ticks() {
-    // When ticks are faster than materialization, the condition re-fires
-    // because CodeVersionChanged is still true (materialization hasn't completed).
-    // Users should add & ~InProgress to guard against this.
-    //
-    // Tick 1: code changed → fires, materialization starts
-    // Tick 2: still materializing, newly_requested resets latch → doesn't fire
-    // Tick 3: still materializing, no longer newly_requested, code still changed → re-fires
+    // With ticks faster than materialization, CodeVersionChanged stays true and the condition re-fires (add & ~InProgress to guard):
+    // Tick 1 fires; Tick 2 newly_requested resets latch → no fire; Tick 3 no longer newly_requested, code still changed → re-fires.
 
     let mut record = make_materialized_record("a", 100);
     record.code_version = Some("v2".to_string());
@@ -5094,8 +5173,7 @@ fn test_newly_requested_as_since_reset_fast_ticks() {
         "Tick 2: newly_requested resets latch → doesn't fire"
     );
 
-    // Tick 3: no longer newly_requested, code still changed → re-fires
-    // This spurious re-fire is what & ~InProgress would prevent.
+    // Tick 3: no longer newly_requested, code still changed → re-fires (what & ~InProgress would prevent).
     let mut prev3 = AssetConditionState {
         last_handled_timestamp: Some(1000),
         last_tick_timestamp: Some(2000),
@@ -5139,13 +5217,8 @@ fn test_newly_requested_as_since_reset_fast_ticks() {
 
 #[test]
 fn test_newly_requested_in_since_last_handled() {
-    // Use case: since_last_handled() uses newly_requested as part of its
-    // debounce logic. Verify that after firing and being handled,
-    // the condition doesn't re-fire on the next tick.
-    //
-    // SinceLastHandled(Not(Missing)):
-    // - child is true when asset is materialized
-    // - should fire once, then suppress until last_handled_timestamp < last_tick_timestamp
+    // SinceLastHandled(Not(Missing)) debounces: fires once, then suppresses until
+    // last_handled_timestamp < last_tick_timestamp.
 
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".to_string(), record.clone())]);
@@ -5990,10 +6063,8 @@ async fn bench_cache_tick<S: StorageBackend>(
     let initial_elapsed = start.elapsed();
     eprintln!("  {label:40} initial load:       {initial_elapsed:?}");
 
-    // Warm-up refresh: `initial_load` parks the cursor 1ns before the
-    // newest known run so a daemon-startup race doesn't lose its
-    // terminal state (see cache.rs::initial_load). That makes the very
-    // first delta refresh re-include that run; subsequent ticks settle.
+    // Warm-up refresh: initial_load parks the cursor 1ns before the newest run
+    // (cache.rs::initial_load), so the first delta refresh re-includes it; then ticks settle.
     cache.refresh(storage, 0).await.unwrap();
 
     // No-change tick
@@ -6195,6 +6266,7 @@ fn test_invalidation_on_tree_change() {
             },
         )]),
         is_initial: false,
+        ..Default::default()
     };
 
     let on_missing = ConditionNode::on_missing();
@@ -6247,6 +6319,7 @@ fn test_invalidation_noop_on_unchanged_tree() {
     let mut eval_state = ConditionEvalState {
         assets: HashMap::from([("asset_a".into(), original_state.clone())]),
         is_initial: false,
+        ..Default::default()
     };
 
     run_invalidation(
@@ -6300,6 +6373,7 @@ fn test_invalidation_prunes_removed_assets() {
             ),
         ]),
         is_initial: false,
+        ..Default::default()
     };
 
     run_invalidation(
@@ -6360,12 +6434,8 @@ async fn bench_condition_cache_embedded() {
 
 #[tokio::test]
 async fn test_cache_detects_in_progress_completion_as_change() {
-    // Scenario: a → b. Both materialized. A run re-materializes a.
-    // Tick 1: cache.refresh detects the run (Started) → has_changes=true, a in in_progress
-    // Tick 2: run completes (Success), a's record updated → cache.refresh must return true
-    //
-    // This tests the bug where b's condition eval was skipped because
-    // cache.refresh returned false after a's run completed.
+    // a → b, both materialized; a run re-materializes a. Tick 1 detects Started (a in-progress);
+    // Tick 2 a completes → cache.refresh must return true so b's eval isn't skipped.
 
     use crate::storage::surrealdb_backend::SurrealStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
@@ -6455,9 +6525,8 @@ async fn test_cache_detects_in_progress_completion_as_change() {
         .await
         .unwrap();
 
-    // Simulate a's materialization updating its record
-    // (In the real system, the executor writes a new Materialization event
-    //  which updates last_timestamp via recompute_staleness)
+    // Simulate a's materialization updating its record (the executor writes a
+    // Materialization event that updates last_timestamp via recompute_staleness).
     storage
         .store_events(&[crate::storage::EventRecord {
             code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
@@ -6496,11 +6565,9 @@ async fn test_cache_detects_in_progress_completion_as_change() {
 
 #[tokio::test]
 async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completion() {
-    // Regression: a backfill registers one run per partition, all on the same
-    // asset. When the first run completes, refresh must clear only that run —
-    // wiping the whole asset reopens the dispatch gate for the still-running
-    // siblings, re-firing them as duplicate runs (the flaky "expected 3, got 4
-    // successful runs").
+    // A backfill registers one run per partition on the same asset; when the first
+    // completes, refresh must clear only that run — wiping the whole asset reopens
+    // the dispatch gate for still-running siblings.
 
     use crate::storage::surrealdb_backend::SurrealStorage;
     use crate::storage::{
@@ -6560,8 +6627,7 @@ async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completio
         .expect("dst should be in-progress after dispatch");
     assert_eq!(tracked.len(), 3, "all three backfill runs are tracked");
 
-    // Partition a finishes: its run flips to Success and its materialization
-    // lands (advancing `dst`'s asset-record timestamp).
+    // Partition a finishes: its run flips to Success and its materialization lands (advancing dst's timestamp).
     storage
         .update_run_status("run_a", RunStatus::Success, Some(3000))
         .await
@@ -6582,8 +6648,7 @@ async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completio
         .await
         .unwrap();
 
-    // Tick 2: a's completion is detected. Only run_a may clear — b and c are
-    // still running, so `dst` must stay gated against re-dispatch.
+    // Tick 2: a's completion detected; only run_a clears — b and c still running, so dst stays gated.
     cache.refresh(&storage, 0).await.unwrap();
     let tracked = cache
         .in_progress_assets
@@ -6603,25 +6668,128 @@ async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completio
     );
 }
 
+#[test]
+fn test_clear_predispatch_mark_drops_empty_entry_only() {
+    // A multi-partition backfill pre-marks an empty in_progress entry (classify) with no
+    // phantom-eviction net; on dispatch failure it must be cleared, but never when real runs exist.
+    let mut cache = AssetConditionCache::new(crate::storage::DEFAULT_CODE_LOCATION_ID.to_string());
+
+    // Pre-mark (empty placeholder, as classify does) → cleared.
+    cache
+        .in_progress_assets
+        .entry("dst".to_string())
+        .or_default();
+    assert!(cache.in_progress_assets.contains_key("dst"));
+    cache.clear_predispatch_mark("dst");
+    assert!(
+        !cache.in_progress_assets.contains_key("dst"),
+        "empty pre-dispatch placeholder must be cleared"
+    );
+
+    // A real run was registered → clear is a no-op (must not wipe live runs).
+    cache.register_dispatched_run("dst".to_string(), "run-1".to_string(), 0, None);
+    cache.clear_predispatch_mark("dst");
+    assert!(
+        cache
+            .in_progress_assets
+            .get("dst")
+            .is_some_and(|r| r.contains_key("run-1")),
+        "an entry with a real run must NOT be cleared"
+    );
+}
+
+#[tokio::test]
+async fn test_cache_completion_fallback_skips_still_started_sibling_effects() {
+    // In the ts-unchanged completion fallback the effects loop must skip still-Started
+    // siblings — applying a still-running run's effects would record its incomplete
+    // tags as that partition's last-run tags prematurely.
+
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, PartitionKey, RunRecord, RunStatus,
+        StorageBackend,
+    };
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[make_materialized_record("dst", 1000)])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let part = |k: &str| PartitionKey::Single {
+        keys: vec![k.to_string()],
+    };
+    let mk_run = |id: &str, k: &str| RunRecord {
+        run_id: id.to_string(),
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        job_name: Some("backfill".to_string()),
+        status: RunStatus::Started,
+        start_time: 2000,
+        end_time: None,
+        tags: vec![("batch".to_string(), k.to_string())],
+        node_names: vec!["dst".to_string()],
+        priority: 0,
+        partition_key: Some(part(k)),
+        block_reason: None,
+        launched_by: LaunchedBy::Manual,
+    };
+    storage
+        .create_runs(&[mk_run("run_a", "a"), mk_run("run_b", "b")])
+        .await
+        .unwrap();
+
+    // Tick 1: both observed Started, tracked, no tags recorded yet.
+    cache.refresh(&storage, 0).await.unwrap();
+
+    // Partition a finishes (StepSuccess) but dst's timestamp is unchanged (idempotent)
+    // → forces the ts-unchanged fallback; run_b stays Started.
+    storage
+        .update_run_status("run_a", RunStatus::Success, Some(3000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[EventRecord {
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            event_type: EventType::StepSuccess,
+            asset_key: Some("dst".to_string()),
+            run_id: "run_a".to_string(),
+            partition_key: Some(part("a")),
+            timestamp: 3000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        }])
+        .await
+        .unwrap();
+
+    // Tick 2: fallback fires; run_a's tags recorded for partition a, but run_b still Started → its tags must not be recorded.
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let tracked = cache.in_progress_assets.get("dst").unwrap();
+    assert!(!tracked.contains_key("run_a"), "completed run a is cleared");
+    assert!(tracked.contains_key("run_b"), "still-running run b stays");
+
+    let dst_tags = cache.partition_last_run_tags.get("dst");
+    assert!(
+        dst_tags.is_some_and(|m| m.contains_key(&part("a"))),
+        "partition a (completed) should have recorded tags"
+    );
+    assert!(
+        dst_tags.is_none_or(|m| !m.contains_key(&part("b"))),
+        "partition b is still running — its tags must NOT be recorded yet, got: {:?}",
+        dst_tags.and_then(|m| m.get(&part("b"))),
+    );
+}
+
 #[tokio::test]
 async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged() {
-    // Root cause of flaky test_schedule_chain_three_layers.
-    //
-    // Scenario: a → b. Both materialized at ts=1000. A schedule re-materializes
-    // a, but a's output is identical (same data), so recompute_staleness does NOT
-    // update a's last_timestamp in the asset record.
-    //
-    // Timeline:
-    //   1. cache.refresh() detects the new Started run → a added to in_progress_assets
-    //   2. Condition eval: b sees AnyDepsInProgress=true → blocked, doesn't fire
-    //   3. Run completes (Success). a's last_timestamp is unchanged (idempotent output).
-    //   4. cache.refresh() checks in_progress_assets: re-fetches a's record,
-    //      compares last_timestamp → unchanged → a stays in in_progress_assets FOREVER
-    //   5. has_changes=false → skip evaluation → b never fires
-    //
-    // The bug: the in-progress check only looks at last_timestamp changes on the
-    // asset record. It should also check if the run status changed from Started
-    // to Success/Failure, and remove the asset from in_progress_assets accordingly.
+    // a → b materialized at 1000; a schedule re-materializes a with identical output
+    // (last_timestamp unchanged). The in-progress check must also detect the
+    // Started→Success status change and clear a, or b never fires.
 
     use crate::storage::surrealdb_backend::SurrealStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
@@ -6696,9 +6864,8 @@ async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged
     assert!(changed);
     assert!(cache.in_progress_assets.contains_key("a"));
 
-    // Run completes with Success, BUT a's record timestamp is NOT updated
-    // (idempotent output — same data, recompute_staleness sees no change).
-    // The executor DOES write a StepSuccess event for a.
+    // Run completes Success but a's timestamp is not updated (idempotent);
+    // the executor writes a StepSuccess event for a.
     storage
         .update_run_status(&run_id, RunStatus::Success, Some(3000))
         .await
@@ -6716,11 +6883,9 @@ async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged
         }])
         .await
         .unwrap();
-    // Deliberately NOT updating a's asset record last_timestamp.
-    // This simulates the case where the output is identical.
+    // Deliberately not updating a's last_timestamp (identical output).
 
-    // Next tick: cache should detect that a's step completed (via StepSuccess event)
-    // and remove it from in_progress_assets, even though last_timestamp didn't change.
+    // Next tick: cache detects a's StepSuccess and removes it from in_progress, even though last_timestamp didn't change.
     let changed = cache.refresh(&storage, 0).await.unwrap();
     assert!(
         !cache.in_progress_assets.contains_key("a"),
@@ -6735,11 +6900,361 @@ async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged
 }
 
 #[tokio::test]
+async fn test_step_success_clears_floor_for_lagging_record_in_joint_failed_run() {
+    // A joint run R=[x,y] fails on y but x materialized (StepSuccess); with x's record
+    // write lagging, the step-completion fallback must treat x as materialized-here
+    // (no floor) while y (StepFailure) is floored.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, RunRecord, RunStatus, StorageBackend,
+    };
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[
+            make_materialized_record("x", 1000),
+            make_materialized_record("y", 1000),
+        ])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let run_id = "run-joint".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["x".to_string(), "y".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(cache.in_progress_assets.contains_key("x"));
+    assert!(cache.in_progress_assets.contains_key("y"));
+
+    // Run fails: x StepSuccess, y StepFailure; neither record updated this tick (write lag, ts stays 1000).
+    storage
+        .update_run_status(&run_id, RunStatus::Failure, Some(3000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[
+            EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepSuccess,
+                asset_key: Some("x".to_string()),
+                run_id: run_id.clone(),
+                partition_key: None,
+                timestamp: 3000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            },
+            EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("y".to_string()),
+                run_id: run_id.clone(),
+                partition_key: None,
+                timestamp: 3000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            },
+        ])
+        .await
+        .unwrap();
+
+    cache.refresh(&storage, 0).await.unwrap();
+
+    assert!(
+        !cache.failed_assets.contains("x"),
+        "x materialized (StepSuccess) in the failed joint run → must not be floored \
+         despite the lagging record; got failed_assets={:?}",
+        cache.failed_assets,
+    );
+    assert!(
+        cache.failed_assets.contains("y"),
+        "y failed (StepFailure) → must be floored"
+    );
+    assert_eq!(cache.failed_asset_timestamps.get("y"), Some(&3000));
+}
+
+#[tokio::test]
+async fn test_cache_clears_in_progress_when_run_canceled_after_cursor_advanced() {
+    // A run reported once advances the cursor past its start_time; a later CANCEL changes
+    // neither the record nor start_time, so get_runs_since (`>`) never re-delivers it.
+    // The cache must re-check tracked in-progress runs by id so a missed terminal transition still clears them.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+
+    let rec_a = make_materialized_record("a", 1000);
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_a])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(cache.in_progress_assets.is_empty());
+
+    // Started run for a → observed, in_progress set, cursor advances to 2000.
+    let run_id = "run-cancel".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    let changed = cache.refresh(&storage, 0).await.unwrap();
+    assert!(changed);
+    assert!(cache.in_progress_assets.contains_key("a"));
+
+    // Run canceled; start_time stays 2000 → the cursor `> 2000` never re-delivers it.
+    storage
+        .update_run_status(&run_id, RunStatus::Canceled, Some(3000))
+        .await
+        .unwrap();
+
+    // Next refresh must clear a from in_progress despite the cursor miss.
+    let changed = cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        !cache.in_progress_assets.contains_key("a"),
+        "a should be cleared from in_progress when its run is canceled, even though \
+         the run cursor never re-delivers the cancel. Got in_progress={:?}",
+        cache.in_progress_assets,
+    );
+    // The sweep mutated eval-visible state, so refresh must report a change, or
+    // should_skip suppresses evaluation and the un-wedged asset never re-fires.
+    assert!(
+        changed,
+        "a sweep-only terminal transition must report the refresh as changed"
+    );
+}
+
+#[tokio::test]
+async fn test_clearable_sweep_sets_failure_floor_on_missed_terminal_failure() {
+    // A Started run reported once fails with no materialization and no StepFailure event;
+    // only the clearable sweep catches it. That sweep must also set the failure floor,
+    // or eager/on_missing re-dispatches the failing run every tick.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+
+    let rec_a = make_materialized_record("a", 1000);
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_a])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    // Started run for a → observed, in_progress set, cursor advances to 2000.
+    let run_id = "run-fail".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(cache.in_progress_assets.contains_key("a"));
+
+    // Run fails; start_time stays 2000, no StepFailure event → only the clearable sweep sees the failure.
+    storage
+        .update_run_status(&run_id, RunStatus::Failure, Some(3000))
+        .await
+        .unwrap();
+
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        !cache.in_progress_assets.contains_key("a"),
+        "a must be cleared from in_progress after the failure"
+    );
+    assert!(
+        cache.failed_assets.contains("a"),
+        "the clearable sweep must set the failure floor for a terminal failure \
+         caught only there; got failed_assets={:?}",
+        cache.failed_assets,
+    );
+    assert_eq!(cache.failed_asset_timestamps.get("a"), Some(&3000));
+}
+
+#[tokio::test]
+async fn test_clearable_sweep_records_partitioned_failure_in_partition_status() {
+    // Partitioned sibling of the sweep-floor case: a partitioned run fails with no
+    // StepFailure event or record change; only the clearable sweep sees it. Since the
+    // asset-level floor isn't set for partitioned runs, the failure must land in partition_status.failed.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+
+    let rec_p = make_materialized_record("p", 1000);
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_p])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.set_partitioned_assets(vec!["p".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let run_id = "run-part-fail".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["p".to_string()],
+            priority: 0,
+            partition_key: Some(spk("2024-01-01")),
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(cache.in_progress_assets.contains_key("p"));
+
+    // Run fails; start_time stays 2000, no StepFailure event → only the clearable sweep sees the terminal transition.
+    storage
+        .update_run_status(&run_id, RunStatus::Failure, Some(3000))
+        .await
+        .unwrap();
+
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        !cache.in_progress_assets.contains_key("p"),
+        "p must be cleared from in_progress after the failure"
+    );
+    let status = cache
+        .partition_status
+        .get("p")
+        .expect("p is a registered partitioned asset");
+    assert!(
+        status.failed.contains(&spk("2024-01-01")),
+        "a partitioned terminal failure caught only by the sweep must surface in \
+         partition_status.failed; got failed={:?}",
+        status.failed,
+    );
+    assert!(
+        status.failed_timestamps.contains_key(&spk("2024-01-01")),
+        "the failed partition needs a floor timestamp for root_floor comparisons"
+    );
+    assert!(
+        !cache.failed_assets.contains("p"),
+        "the asset-level floor stays scoped to unpartitioned runs"
+    );
+}
+
+#[tokio::test]
+async fn test_queued_run_is_not_cleared_by_sweep() {
+    // A run dispatched in run_queue mode is written as Queued; the clearable sweep must
+    // not treat Queued as terminal, or eager/on_missing re-enqueues a duplicate every
+    // tick. Only Success/Failure/Canceled are terminal.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let rec_a = make_materialized_record("a", 1000);
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_a])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    // Dispatch registers the asset; the queued dispatcher writes a Queued record.
+    let run_id = "run-queued".to_string();
+    cache.register_dispatched_run("a".to_string(), run_id.clone(), 0, None);
+    assert!(cache.in_progress_assets.contains_key("a"));
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Queued,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+
+    // Refresh must keep `a` gated — its run is still queued, not terminal.
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        cache.in_progress_assets.contains_key("a"),
+        "a queued run must keep the asset in_progress; got in_progress={:?}",
+        cache.in_progress_assets,
+    );
+}
+
+#[tokio::test]
 async fn test_cache_does_not_store_empty_run_tags() {
-    // Regression: update_run_tags previously stored empty tag vecs in the cache.
-    // With an empty entry, run_tags_match(&[], &[], &[]) returns true (vacuous
-    // .all()), so a no-arg LastExecutedWithTags condition would fire on every
-    // asset that ever had a completed run — even untagged ones.
+    // The cache must not store empty tag vecs: an empty entry makes run_tags_match(&[],&[],&[])
+    // vacuously true, so a no-arg LastExecutedWithTags would fire on every asset with any completed run.
 
     use crate::storage::surrealdb_backend::SurrealStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
@@ -6759,8 +7274,7 @@ async fn test_cache_does_not_store_empty_run_tags() {
     cache.refresh(&storage, 0).await.unwrap();
     assert!(cache.last_run_tags.is_empty());
 
-    // Create a completed run with NO tags (arrives as Success in one tick,
-    // simulating a fast run that completes between daemon ticks).
+    // Create a completed run with no tags (arrives Success, a fast run completing between ticks).
     storage
         .create_run(&RunRecord {
             run_id: "run-no-tags".to_string(),
@@ -6787,8 +7301,7 @@ async fn test_cache_does_not_store_empty_run_tags() {
         cache.last_run_tags.get("a"),
     );
 
-    // Now create a run WITH tags that arrives as already-completed (Success).
-    // This simulates a fast run that completes between ticks.
+    // Now create a run with tags arriving already-completed (Success), a fast run between ticks.
     storage
         .create_run(&RunRecord {
             run_id: "run-tagged".to_string(),
@@ -6879,8 +7392,7 @@ async fn test_cache_tick_materialization_tags() {
 
 #[tokio::test]
 async fn test_cache_tick_materialization_tags_includes_empty_tags() {
-    // A run with no tags should still be recorded in tick_materialization_tags
-    // (empty vec), so AllRunsHaveTags can correctly return false.
+    // A run with no tags is still recorded (empty vec) so AllRunsHaveTags returns false.
     use crate::storage::surrealdb_backend::SurrealStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
@@ -6931,9 +7443,8 @@ async fn test_cache_tick_materialization_tags_includes_empty_tags() {
 }
 
 #[tokio::test]
-async fn test_has_step_completed_sql_query() {
-    // Direct test of has_step_completed SQL query against SurrealDB.
-    // Populates events, then verifies the query finds them correctly.
+async fn test_step_completion_sql_query() {
+    // Direct test of the step_completion event scan against SurrealDB.
 
     use crate::storage::surrealdb_backend::SurrealStorage;
     use crate::storage::{EventRecord, EventType, StorageBackend};
@@ -7015,65 +7526,120 @@ async fn test_has_step_completed_sql_query() {
     // Test 1: asset "a" in run-query-test → true
     assert!(
         storage
-            .has_step_completed("a", std::slice::from_ref(&run_id))
+            .step_completion("a", std::slice::from_ref(&run_id))
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         "should find StepSuccess for 'a' in run-query-test"
     );
 
     // Test 2: asset "b" in run-query-test → true
     assert!(
         storage
-            .has_step_completed("b", std::slice::from_ref(&run_id))
+            .step_completion("b", std::slice::from_ref(&run_id))
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         "should find StepSuccess for 'b' in run-query-test"
     );
 
     // Test 3: asset "a" in other-run → true
     assert!(
         storage
-            .has_step_completed("a", std::slice::from_ref(&other_run))
+            .step_completion("a", std::slice::from_ref(&other_run))
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         "should find StepSuccess for 'a' in run-other"
     );
 
     // Test 4: asset "c" (doesn't exist) → false
     assert!(
         !storage
-            .has_step_completed("c", std::slice::from_ref(&run_id))
+            .step_completion("c", std::slice::from_ref(&run_id))
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         "should NOT find StepSuccess for 'c'"
     );
 
     // Test 5: asset "a" in non-existent run → false
     assert!(
         !storage
-            .has_step_completed("a", &["run-nonexistent".to_string()])
+            .step_completion("a", &["run-nonexistent".to_string()])
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         "should NOT find StepSuccess in non-existent run"
     );
 
     // Test 6: asset "a" in multiple run_ids → true (matches first)
     assert!(
         storage
-            .has_step_completed("a", &[run_id.clone(), other_run.clone()])
+            .step_completion("a", &[run_id.clone(), other_run.clone()])
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         "should find StepSuccess for 'a' across multiple run_ids"
     );
 
     // Test 7: asset "b" in other_run only → false (b only has events in run_id)
     assert!(
         !storage
-            .has_step_completed("b", std::slice::from_ref(&other_run))
+            .step_completion("b", std::slice::from_ref(&other_run))
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         "should NOT find StepSuccess for 'b' in run-other"
     );
+}
+
+#[tokio::test]
+async fn test_step_completion_single_pass() {
+    // One storage call answers both "did any step complete" and "which run succeeded"
+    // (avoids the per-run N+1 during backfills).
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{EventRecord, EventType, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ev = |run: &str, asset: &str, event_type: EventType| EventRecord {
+        code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+        event_type,
+        asset_key: Some(asset.to_string()),
+        run_id: run.to_string(),
+        partition_key: None,
+        timestamp: 1000,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+    storage
+        .store_events(&[
+            ev("run-fail", "a", EventType::StepFailure),
+            ev("run-ok", "a", EventType::StepSuccess),
+            ev("run-ok", "b", EventType::StepFailure),
+        ])
+        .await
+        .unwrap();
+
+    let runs = vec!["run-fail".to_string(), "run-ok".to_string()];
+    let (completed, succeeded) = storage.step_completion("a", &runs).await.unwrap();
+    assert!(completed, "a completed a step in the given runs");
+    assert_eq!(
+        succeeded,
+        vec!["run-ok".to_string()],
+        "every succeeding run must be identified"
+    );
+
+    let (completed, succeeded) = storage.step_completion("b", &runs).await.unwrap();
+    assert!(completed, "a failure is still a completion");
+    assert!(
+        succeeded.is_empty(),
+        "no success run for a failed-only asset"
+    );
+
+    let (completed, succeeded) = storage.step_completion("c", &runs).await.unwrap();
+    assert!(!completed, "no events for 'c' in the given runs");
+    assert!(succeeded.is_empty());
 }
 
 // ── Partition-aware tests ───────────────────────────────────────────────
@@ -7199,8 +7765,7 @@ fn test_partition_selection_complement() {
 
 #[test]
 fn test_partition_selection_complement_empty_universe() {
-    // With no partitions, the complement of anything is nothing — not `All`,
-    // which would falsely report a partitionless asset as firing.
+    // With no partitions, the complement of anything is nothing (not `All`, which would falsely report firing).
     let empty: HashSet<PartitionKey> = HashSet::new();
     assert_eq!(
         PartitionSelection::Empty.complement(&empty),
@@ -7233,9 +7798,8 @@ fn test_partition_selection_difference() {
     );
 }
 
-/// `time_window(offset)` must shift in condition eval exactly as the
-/// runtime IO path does — a pass-through here fires conditions on the
-/// partition that does NOT read the updated upstream.
+/// `time_window(offset)` must shift in condition eval exactly as the runtime IO
+/// path does, or it fires the partition that never read the updated upstream.
 #[test]
 fn test_time_window_mapping_shifts_selections_by_offset() {
     use crate::timegrid::TimeGrid;
@@ -7273,10 +7837,8 @@ fn test_time_window_mapping_without_grid_passes_through() {
     assert_eq!(m.map_to_downstream(&sel), sel);
 }
 
-/// `All - Keys` must resolve to the complement, not fall back to `All` —
-/// the fallback re-selects the very partitions the subtraction was meant to
-/// drop (e.g. `newly_requested().since_last_handled()` re-selecting handled
-/// keys).
+/// `All - Keys` must resolve to the complement, not fall back to `All` (which would
+/// re-select the dropped keys, e.g. handled keys in newly_requested().since_last_handled()).
 #[test]
 fn test_partition_selection_difference_all_minus_keys() {
     let universe: HashSet<PartitionKey> = ["p1", "p2", "p3"].iter().map(|s| spk(s)).collect();
@@ -7333,9 +7895,7 @@ fn test_partitioned_missing_all_materialized() {
 #[test]
 fn test_partitioned_in_latest_time_window_selects_recent_keys() {
     let empty_partition_statuses = HashMap::new();
-    // Time-partitioned asset with 5 daily partitions.
-    // latest_time_window_keys = {p4, p5} (the 2 most recent).
-    // InLatestTimeWindow should select only those.
+    // 5 daily partitions, latest_time_window_keys = {p4, p5}; InLatestTimeWindow selects only those.
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".into(), record.clone())]);
     let deps = HashMap::new();
@@ -7371,8 +7931,7 @@ fn test_partitioned_in_latest_time_window_selects_recent_keys() {
 #[test]
 fn test_partitioned_in_latest_time_window_empty_when_no_recent() {
     let empty_partition_statuses = HashMap::new();
-    // Time-partitioned asset but latest_time_window_keys is empty
-    // (e.g., all partitions are in the future).
+    // Time-partitioned asset with empty latest_time_window_keys (e.g. all partitions in the future).
     let record = make_record("a");
     let records = HashMap::from([("a".into(), record.clone())]);
     let deps = HashMap::new();
@@ -7421,10 +7980,8 @@ fn test_partitioned_in_latest_time_window_static_partitions_selects_all() {
 #[test]
 fn test_partitioned_in_latest_time_window_combined_with_missing() {
     let empty_partition_statuses = HashMap::new();
-    // Realistic pattern: InLatestTimeWindow & Missing
-    // 5 daily partitions, latest 2 in window, p1 materialized, p4+p5 in window.
-    // Missing = {p2, p3, p4, p5}, InLatestTimeWindow = {p4, p5}
-    // AND → {p4, p5} (only missing partitions that are also in the latest window)
+    // InLatestTimeWindow & Missing over 5 daily partitions (p1 materialized, latest = {p4,p5}):
+    // Missing={p2,p3,p4,p5} ∩ latest={p4,p5} → {p4,p5}.
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".into(), record.clone())]);
     let deps = HashMap::new();
@@ -7582,10 +8139,8 @@ fn test_partitioned_newly_updated() {
 
 #[test]
 fn test_partitioned_newly_updated_suppressed_on_initial_tick() {
-    // On the very first tick (is_initial=true), partitions already materialized
-    // before the daemon started have no previous baseline and must NOT count as
-    // newly updated — mirror of the unpartitioned guard. Otherwise a bare
-    // newly_updated() re-fires every materialized partition on every restart.
+    // On the initial tick, pre-existing partitions with no baseline must not count as
+    // newly updated (mirror of the unpartitioned guard).
     let record = make_materialized_record("a", 200);
     let records = HashMap::from([("a".into(), record.clone())]);
     let deps = HashMap::new();
@@ -7621,8 +8176,7 @@ fn test_partitioned_newly_updated_suppressed_on_initial_tick() {
         result.selection
     );
 
-    // Boundary: on a non-initial tick the same baseline-less partitions are
-    // genuinely new (appeared between ticks) and DO fire.
+    // On a non-initial tick the same baseline-less partitions appeared between ticks and do fire.
     ctx.is_initial = false;
     let result2 = evaluate(&ConditionNode::NewlyUpdated, &ctx);
     assert!(
@@ -7633,8 +8187,7 @@ fn test_partitioned_newly_updated_suppressed_on_initial_tick() {
 
 #[test]
 fn test_partitioned_and() {
-    // And(Missing, Not(InProgress))
-    // 3 partitions: p1 materialized, p2 missing, p3 missing+in_progress
+    // And(Missing, Not(InProgress)); p1 materialized, p2 missing, p3 missing+in_progress.
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".into(), record.clone())]);
     let deps = HashMap::new();
@@ -7698,8 +8251,7 @@ fn test_partitioned_not() {
 
 #[test]
 fn test_partitioned_not_over_empty_universe_does_not_fire() {
-    // A partitioned asset with an empty universe (e.g. dynamic, no keys yet)
-    // must not report fired for a Not(...) clause.
+    // A partitioned asset with an empty universe must not report fired for a Not(...) clause.
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".into(), record.clone())]);
     let deps = HashMap::new();
@@ -7833,9 +8385,7 @@ fn test_partitioned_since() {
 
 #[test]
 fn test_partitioned_any_deps_missing_with_identity() {
-    // b depends on a. a has 3 partitions, all materialized.
-    // b has same 3 partitions with identity mapping.
-    // AnyDepsMissing on b should NOT fire (a is fully materialized).
+    // b depends on a (3 partitions, all materialized, identity mapping); AnyDepsMissing on b must not fire.
     let a = make_materialized_record("a", 100);
     let b = make_materialized_record("b", 100);
     let records = HashMap::from([("a".into(), a.clone()), ("b".into(), b.clone())]);
@@ -7909,21 +8459,15 @@ fn test_partitioned_any_deps_missing_with_identity() {
         root_partition_floor: None,
     };
 
-    // AnyDepsMissing evaluates Missing on upstream "a" which has
-    // all_keys = {p1, p2, p3} and materialized via the resolver's upstream_partition_keys.
-    // Since a is not StaleStatus::Missing, the upstream pctx has all keys materialized,
-    // so the result should be empty.
+    // AnyDepsMissing evaluates Missing on upstream a (all keys materialized via the resolver), so the result is empty.
     let result = evaluate(&ConditionNode::any_deps_missing(), &ctx);
-    // The upstream "a" record is not Missing at the asset level, and the
-    // eval_partitioned_on_dep builds a pctx with all upstream keys materialized
-    // (since stale_status != Missing). So no missing partitions.
+    // a isn't Missing and eval_partitioned_on_dep builds a pctx with all upstream keys materialized → no missing partitions.
     assert!(!result.fired);
 }
 
 #[test]
 fn test_partitioned_all_deps_match_not_missing() {
-    // b depends on a (both partitioned). AllDepsMatch(Not(Missing)) on b.
-    // a is fully materialized → all partitions satisfy Not(Missing).
+    // b depends on a (both partitioned), a fully materialized → AllDepsMatch(Not(Missing)) on b holds.
     let a = make_materialized_record("a", 100);
     let b = make_record("b"); // b is missing
     let records = HashMap::from([("a".into(), a.clone()), ("b".into(), b.clone())]);
@@ -8025,11 +8569,34 @@ fn test_partition_mapping_static() {
     let m = PartitionMappingKind::Static {
         mapping: HashMap::from([("d1".into(), "u1".into()), ("d2".into(), "u2".into())]),
     };
-    // Upstream u2 maps to downstream d2
+    // Upstream u2 maps to downstream d2 plus its identity image u2 (a downstream key named
+    // u2 forward-reads upstream u2); phantoms filtered against the universe.
     let sel2 = PartitionSelection::Keys(HashSet::from([spk("u2")]));
     assert_eq!(
         m.map_to_downstream(&sel2),
-        PartitionSelection::Keys(HashSet::from([spk("d2")]))
+        PartitionSelection::Keys(HashSet::from([spk("d2"), spk("u2")]))
+    );
+}
+
+#[test]
+fn test_partition_mapping_static_identity_fallback() {
+    // Partial Static map (d1 explicit, d2 unmapped): the runtime reads upstream d2 for
+    // unmapped downstream d2 via identity, so an upstream d2 update must trigger downstream d2.
+    let m = PartitionMappingKind::Static {
+        mapping: HashMap::from([("d1".to_string(), "u1".to_string())]),
+    };
+    assert_eq!(
+        m.map_to_downstream(&PartitionSelection::Keys(HashSet::from([spk("d2")]))),
+        PartitionSelection::Keys(HashSet::from([spk("d2")])),
+        "unmapped upstream d2 must identity-map to downstream d2"
+    );
+    // Both the explicit reverse mapping and the identity image fire: forward map_key applies
+    // identity to any downstream key absent from the mapping keys, so a downstream named u1
+    // reads upstream u1 too (spurious keys filtered against the universe).
+    assert_eq!(
+        m.map_to_downstream(&PartitionSelection::Keys(HashSet::from([spk("u1")]))),
+        PartitionSelection::Keys(HashSet::from([spk("d1"), spk("u1")])),
+        "explicit u1 -> d1 plus the identity image u1 -> u1"
     );
 }
 
@@ -8076,9 +8643,7 @@ fn test_unpartitioned_result_has_no_selection() {
 
 #[test]
 fn test_partitioned_eager_selects_new_partition() {
-    // Daily pipeline: raw_events → cleaned_events (eager)
-    // raw_events has p1, p2, p3 materialized. cleaned_events has p1, p2 materialized.
-    // eager() on cleaned_events should select p3 only.
+    // raw_events → cleaned_events (eager): raw has p1/p2/p3, cleaned has p1/p2 → eager selects p3 only.
     let raw = make_materialized_record("raw", 200);
     let cleaned = make_materialized_record("cleaned", 100);
     let records = HashMap::from([
@@ -8246,7 +8811,8 @@ fn test_partition_mapping_multi_with_static_sub() {
             ),
         ]),
     };
-    // Upstream "eu" → downstream "europe"
+    // Upstream "eu" → downstream "europe" (explicit) plus the identity image "eu"
+    // (a downstream region named "eu" reads upstream "eu"); spurious combos filtered against the universe.
     let up = PartitionSelection::Keys(HashSet::from([mpk(&[
         ("date", "2024-01-01"),
         ("region", "eu"),
@@ -8254,10 +8820,50 @@ fn test_partition_mapping_multi_with_static_sub() {
     let down = m.map_to_downstream(&up);
     assert_eq!(
         down,
-        PartitionSelection::Keys(HashSet::from([mpk(&[
-            ("date", "2024-01-01"),
-            ("region", "europe")
-        ])]))
+        PartitionSelection::Keys(HashSet::from([
+            mpk(&[("date", "2024-01-01"), ("region", "europe")]),
+            mpk(&[("date", "2024-01-01"), ("region", "eu")]),
+        ]))
+    );
+}
+
+#[test]
+fn test_partition_mapping_multi_many_to_one_sub_keeps_all_downstream_keys() {
+    // A many-to-one per-dimension Static sub-mapping must reverse-map one upstream value
+    // to both downstream keys (cartesian product), not just the first.
+    let m = PartitionMappingKind::Multi {
+        dimension_mappings: HashMap::from([
+            (
+                "date".into(),
+                ("date".into(), Box::new(PartitionMappingKind::Identity)),
+            ),
+            (
+                "region".into(),
+                (
+                    "region".into(),
+                    Box::new(PartitionMappingKind::Static {
+                        mapping: HashMap::from([
+                            ("north".into(), "shared".into()),
+                            ("south".into(), "shared".into()),
+                        ]),
+                    }),
+                ),
+            ),
+        ]),
+    };
+    let up = PartitionSelection::Keys(HashSet::from([mpk(&[
+        ("date", "2024-01-01"),
+        ("region", "shared"),
+    ])]));
+    let down = m.map_to_downstream(&up);
+    assert_eq!(
+        down,
+        PartitionSelection::Keys(HashSet::from([
+            mpk(&[("date", "2024-01-01"), ("region", "north")]),
+            mpk(&[("date", "2024-01-01"), ("region", "south")]),
+            // Identity image: a downstream region named "shared" would forward-read upstream "shared" too.
+            mpk(&[("date", "2024-01-01"), ("region", "shared")]),
+        ]))
     );
 }
 
@@ -8277,6 +8883,46 @@ fn test_partition_mapping_multi_empty_and_all() {
         m.map_to_downstream(&PartitionSelection::All),
         PartitionSelection::All
     );
+}
+
+#[test]
+fn test_partition_mapping_multi_all_sub_overapproximates_to_all() {
+    // A per-dimension AllPartitions sub-mapping can't be a single downstream Multi key,
+    // so it must over-approximate to `All`, not drop the key.
+    let m = PartitionMappingKind::Multi {
+        dimension_mappings: HashMap::from([
+            (
+                "date".into(),
+                ("date".into(), Box::new(PartitionMappingKind::Identity)),
+            ),
+            (
+                "region".into(),
+                (
+                    "region".into(),
+                    Box::new(PartitionMappingKind::AllPartitions),
+                ),
+            ),
+        ]),
+    };
+    let up = PartitionSelection::Keys(HashSet::from([mpk(&[
+        ("date", "2024-01-01"),
+        ("region", "us"),
+    ])]));
+    assert_eq!(m.map_to_downstream(&up), PartitionSelection::All);
+}
+
+#[test]
+fn test_partition_mapping_multi_to_single_all_sub_overapproximates_to_all() {
+    // MultiToSingle whose inner fans the dimension in must over-approximate to `All`, not drop the key.
+    let m = PartitionMappingKind::MultiToSingle {
+        dimension_name: "region".into(),
+        inner: Box::new(PartitionMappingKind::AllPartitions),
+    };
+    let up = PartitionSelection::Keys(HashSet::from([mpk(&[
+        ("date", "2024-01-01"),
+        ("region", "us"),
+    ])]));
+    assert_eq!(m.map_to_downstream(&up), PartitionSelection::All);
 }
 
 #[test]
@@ -8331,7 +8977,8 @@ fn test_partition_mapping_multi_to_single_with_static_inner() {
         }),
     };
 
-    // Upstream multi key has region=us → downstream single "north" (reverse of static)
+    // Upstream region=us → downstream "north" (reverse of the explicit entry) plus the
+    // identity image "us"; phantoms filtered against the universe.
     let upstream = PartitionSelection::Keys(HashSet::from([mpk(&[
         ("date", "2024-01-01"),
         ("region", "us"),
@@ -8339,7 +8986,7 @@ fn test_partition_mapping_multi_to_single_with_static_inner() {
     let downstream = m.map_to_downstream(&upstream);
     assert_eq!(
         downstream,
-        PartitionSelection::Keys(HashSet::from([spk("north")]))
+        PartitionSelection::Keys(HashSet::from([spk("north"), spk("us")]))
     );
 }
 
@@ -8424,10 +9071,7 @@ fn test_resolver_multi_to_single_mapping() {
 
 #[test]
 fn test_partitioned_eager_partial_upstream_update() {
-    // Daily pipeline: raw → processed (eager)
-    // raw has p1,p2,p3 materialized. processed has p1,p2 materialized.
-    // raw p3 was just materialized (timestamp newer than prev).
-    // eager() should select p3 for processed.
+    // raw → processed (eager): raw has p1/p2/p3, processed has p1/p2; raw p3 just materialized → eager selects p3.
     let raw = make_materialized_record("raw", 200);
     let processed = make_materialized_record("processed", 100);
     let records = HashMap::from([
@@ -8446,8 +9090,7 @@ fn test_partitioned_eager_partial_upstream_update() {
     )]);
     let resolver = PartitionResolver::new(&mappings, &upstream_keys);
 
-    // raw_state has partition_state with p1, p2 already known at ts=200
-    // so only p3 (newly materialized at ts=200) will be "NewlyUpdated"
+    // raw_state knows p1,p2 at ts=200, so only p3 (new at 200) is NewlyUpdated.
     let raw_state = AssetConditionState {
         partition_state: Some(PartitionState {
             previous_selections: HashMap::new(),
@@ -8532,10 +9175,8 @@ fn test_partitioned_eager_partial_upstream_update() {
 
 #[test]
 fn test_partitioned_eager_only_fires_for_partitions_with_upstream_data() {
-    // Regression test: upstream has 3 of 5 partitions materialized.
-    // eager() on the downstream (never materialized) should ONLY fire for
-    // the 3 partitions that have upstream data, NOT all 5.
-    // The !AnyDepsMissing clause must use actual per-partition upstream status.
+    // Upstream has 3 of 5 partitions materialized; eager() on the never-materialized downstream
+    // fires only for those 3 (the !AnyDepsMissing clause uses per-partition upstream status).
     let raw = make_materialized_record("raw", 200);
     let processed = make_record("processed"); // Missing by default
     let records = HashMap::from([("raw".into(), raw), ("processed".into(), processed.clone())]);
@@ -8643,8 +9284,7 @@ fn test_partitioned_eager_only_fires_for_partitions_with_upstream_data() {
 
 #[test]
 fn test_partitioned_on_missing_only_missing_partitions() {
-    // on_missing() should only fire for partitions that are missing
-    // AND all upstream deps are not missing for those partitions.
+    // on_missing() fires only for missing partitions whose upstream deps are not missing.
     let a = make_materialized_record("a", 100);
     let b = make_materialized_record("b", 100);
     let records = HashMap::from([("a".into(), a.clone()), ("b".into(), b.clone())]);
@@ -8732,8 +9372,7 @@ fn test_partitioned_on_missing_only_missing_partitions() {
 #[test]
 fn test_partitioned_in_progress_excludes_from_and() {
     let empty_partition_statuses = HashMap::new();
-    // And(Missing, Not(InProgress)): p2 is missing, p3 is missing+in_progress
-    // Result should be {p2} only.
+    // And(Missing, Not(InProgress)): p2 missing, p3 missing+in_progress → {p2}.
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".into(), record.clone())]);
     let deps = HashMap::new();
@@ -8836,10 +9475,8 @@ fn test_partitioned_code_version_changed_all_partitions() {
 #[test]
 fn test_partitioned_since_latch_per_partition() {
     let empty_partition_statuses = HashMap::new();
-    // Since { trigger: Missing, reset: NewlyUpdated }
-    // Tick 1: p2,p3 missing → trigger fires for {p2,p3}, latch = {p2,p3}
-    // Tick 2: p2 materialized (NewlyUpdated), p3 still missing →
-    //   trigger = {p3}, reset = {p2}, latch = ({p2,p3} ∪ {p3}) - {p2} = {p3}
+    // Since{Missing, reset NewlyUpdated}. Tick 1: p2,p3 missing → latch {p2,p3}.
+    // Tick 2: p2 materialized (reset), p3 latched → {p3}.
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".into(), record.clone())]);
     let deps = HashMap::new();
@@ -8961,10 +9598,8 @@ fn test_partitioned_since_latch_per_partition() {
 
 #[test]
 fn test_partitioned_newly_true_only_new_partitions() {
-    // NewlyTrue(Missing): only partitions that BECAME missing this tick.
-    // Tick 1: p2,p3 missing → NewlyTrue = {p2,p3} (first tick)
-    // Tick 2: still p2,p3 missing → NewlyTrue = {} (no change)
-    // Tick 3: p4 added to all_keys and is missing → NewlyTrue = {p4}
+    // NewlyTrue(Missing): only partitions that became missing this tick.
+    // Tick 1 {p2,p3}, Tick 2 {} (no change), Tick 3 p4 added → {p4}.
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".into(), record.clone())]);
     let deps = HashMap::new();
@@ -9131,8 +9766,7 @@ fn test_partitioned_execution_failed_subset() {
 #[test]
 fn test_partitioned_complex_or_and_not() {
     let empty_partition_statuses = HashMap::new();
-    // Or(Missing, ExecutionFailed) & Not(InProgress)
-    // p1: materialized, p2: missing, p3: failed, p4: missing+in_progress
+    // Or(Missing, ExecutionFailed) & Not(InProgress); p1 materialized, p2 missing, p3 failed, p4 missing+in_progress.
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".into(), record.clone())]);
     let deps = HashMap::new();
@@ -9161,22 +9795,19 @@ fn test_partitioned_complex_or_and_not() {
     ]);
     let result = evaluate(&cond, &ctx);
     assert!(result.fired);
-    // Missing = {p2, p4}, Failed = {p3}, Or = {p2, p3, p4}
-    // Not(InProgress) = {p1, p2, p3}
-    // And = {p2, p3}
+    // Missing={p2,p4}, Failed={p3}, Or={p2,p3,p4}; Not(InProgress)={p1,p2,p3}; And={p2,p3}.
     assert_eq!(
         result.selection.unwrap(),
         PartitionSelection::Keys(HashSet::from([spk("p2"), spk("p3")]))
     );
 }
 
-// ── Bug: eager should not fire on first daemon tick when all assets are UpToDate ──
+// ── eager must not fire on first daemon tick when all assets are UpToDate ──
 
 #[test]
 fn test_eager_does_not_fire_when_all_up_to_date_first_tick() {
-    // Scenario: a → b → c, all materialized (UpToDate).
-    // Daemon starts fresh (no previous state, is_initial=true).
-    // Eager condition on b and c should NOT fire — nothing changed.
+    // a → b → c all materialized (UpToDate); on a fresh daemon start (is_initial=true),
+    // eager on b/c must not fire.
     let ts = 1_000_000_000;
     let rec_a = make_materialized_record("a", ts);
     let rec_b = make_materialized_record("b", ts);
@@ -9238,8 +9869,7 @@ fn test_eager_does_not_fire_when_all_up_to_date_first_tick() {
         &result_b,
     );
 
-    // Second tick: is_initial=false. Nothing changed — a's timestamp is the same.
-    // Should still not fire.
+    // Second tick: is_initial=false, nothing changed → still no fire.
     let tick2_now = ctx_b.now + 1_000_000_000; // 1s later
     let ctx_b2 = EvalContext {
         target_key: "b",
@@ -9282,13 +9912,8 @@ fn test_eager_does_not_fire_when_all_up_to_date_first_tick() {
 
 #[test]
 fn test_eager_fires_after_upstream_observed_on_second_tick() {
-    // Scenario: ext_feed (observed) → aggregated (eager) → report (eager)
-    // Initial state: ext_feed observed at ts=100, aggregated materialized at ts=200, report at ts=300.
-    // Daemon starts (tick 1, is_initial=true): nothing should fire (all up-to-date).
-    // Then ext_feed gets re-observed at ts=500 (on_cron fires).
-    // Tick 2 (is_initial=false): aggregated should fire (ext_feed updated).
-    // After aggregated materializes at ts=600:
-    // Tick 3: report should fire (aggregated updated).
+    // ext_feed (observed) → aggregated (eager) → report (eager). Tick 1 (initial) no fire;
+    // ext_feed re-observed at 500 → Tick 2 aggregated fires; aggregated materializes at 600 → Tick 3 report fires.
 
     fn print_tree(node: &EvalNodeResult, indent: usize) {
         let pad = " ".repeat(indent);
@@ -9520,13 +10145,9 @@ fn test_eager_fires_after_upstream_observed_on_second_tick() {
 
 #[test]
 fn test_eager_fires_after_dep_in_progress_clears() {
-    // Scenario: a → b, both materialized at same time.
-    // Schedule re-materializes a. While a is in-progress, b should NOT fire
-    // (blocked by AnyDepsInProgress). After a completes with a new timestamp,
-    // b SHOULD fire on the next tick.
-    //
-    // This tests the bug where dep state gets updated while in-progress,
-    // silently consuming the change so it's not detected on the next tick.
+    // a → b, both materialized. While a is in-progress b must not fire (AnyDepsInProgress);
+    // after a completes with a new timestamp b fires next tick. The dep-state update while
+    // in-progress must not silently consume the change.
 
     fn print_tree(node: &EvalNodeResult, indent: usize) {
         let pad = " ".repeat(indent);
@@ -9875,6 +10496,15 @@ fn test_node_label_exhaustive() {
             timezone: Some("UTC".to_string()),
         }
         .node_label(),
+        // tz is load-bearing → must appear in the label (else two crons differing only by zone collapse)
+        "cron_tick_passed('0 */5 * * *', tz='UTC')"
+    );
+    assert_eq!(
+        ConditionNode::CronTickPassed {
+            cron_schedule: "0 */5 * * *".to_string(),
+            timezone: None,
+        }
+        .node_label(),
         "cron_tick_passed('0 */5 * * *')"
     );
     assert_eq!(
@@ -9905,11 +10535,17 @@ fn test_node_label_exhaustive() {
     );
     assert_eq!(
         ConditionNode::any_deps_match(ConditionNode::Missing).node_label(),
-        "any_deps_match(...)"
+        format!(
+            "any_deps_match({})",
+            ConditionNode::Missing.fingerprint_hex()
+        )
     );
     assert_eq!(
         ConditionNode::all_deps_match(ConditionNode::Missing).node_label(),
-        "all_deps_match(...)"
+        format!(
+            "all_deps_match({})",
+            ConditionNode::Missing.fingerprint_hex()
+        )
     );
     assert_eq!(
         ConditionNode::And(vec![ConditionNode::Missing]).node_label(),
@@ -9934,6 +10570,97 @@ fn test_node_label_exhaustive() {
         ConditionNode::Missing.since_last_handled().node_label(),
         "since_last_handled"
     );
+}
+
+#[test]
+fn test_display_label_is_readable_not_a_fingerprint() {
+    // node_label folds a fingerprint into unlabeled dep-aggregates/asset_matches for
+    // replace-by-label, but that hex must not leak into the UI tree — display_label renders it readably.
+    let dep = ConditionNode::any_deps_match(ConditionNode::NewlyUpdated);
+    assert_eq!(dep.display_label(), "any_deps_match(newly_updated)");
+    assert!(
+        !dep.display_label()
+            .contains(&ConditionNode::NewlyUpdated.fingerprint_hex()),
+        "display_label must not contain the raw fingerprint"
+    );
+
+    let am =
+        ConditionNode::asset_matches(vec!["upstream_feed".to_string()], ConditionNode::Missing);
+    assert_eq!(
+        am.display_label(),
+        "asset_matches('upstream_feed', missing)"
+    );
+
+    // A user-provided label on a dep-aggregate is already readable — keep it.
+    let labeled = ConditionNode::AnyDepsMatch {
+        condition: Box::new(ConditionNode::Missing),
+        label: Some("any_deps_missing".to_string()),
+    };
+    assert_eq!(labeled.display_label(), "any_deps_missing");
+
+    // Leaf and composite nodes keep their existing labels.
+    assert_eq!(ConditionNode::Missing.display_label(), "missing");
+    assert_eq!(
+        ConditionNode::And(vec![ConditionNode::Missing]).display_label(),
+        "All of"
+    );
+
+    // The eval tree (rendered verbatim by the UI) must carry the readable label, not the fingerprint.
+    let tree_node = crate::condition::state::EvalNodeResult::new(
+        &dep,
+        0,
+        crate::condition::state::NodeStatus::True,
+        vec![],
+        None,
+    );
+    assert_eq!(tree_node.label, "any_deps_match(newly_updated)");
+}
+
+#[test]
+fn test_node_label_distinguishes_unlabeled_aggregate_inner_condition() {
+    // node_label for unlabeled any/all_deps_match and asset_matches must include the inner
+    // condition, else structurally-distinct siblings collapse to one label and replace_by_label hits the wrong subtree.
+    let a = ConditionNode::any_deps_match(ConditionNode::Missing);
+    let b = ConditionNode::any_deps_match(ConditionNode::NewlyUpdated);
+    assert_ne!(
+        a.node_label(),
+        b.node_label(),
+        "distinct inner conditions must yield distinct labels"
+    );
+
+    // asset_matches with identical keys but different inner conditions.
+    let am1 = ConditionNode::asset_matches(vec!["x".into()], ConditionNode::Missing);
+    let am2 = ConditionNode::asset_matches(vec!["x".into()], ConditionNode::InProgress);
+    assert_ne!(am1.node_label(), am2.node_label());
+
+    // replace_by_label must touch only the matching sibling, preserving the other's inner condition.
+    let tree = a.clone() | b.clone();
+    let replaced = tree.replace_by_label(&a.node_label(), &ConditionNode::ExecutionFailed);
+    if let ConditionNode::Or(children) = &replaced {
+        assert!(
+            children
+                .iter()
+                .any(|c| matches!(c, ConditionNode::ExecutionFailed)),
+            "the matched sibling must be replaced; got {replaced:?}"
+        );
+        assert!(
+            children.iter().any(|c| c.node_label() == b.node_label()),
+            "the non-matching sibling must be preserved; got {replaced:?}"
+        );
+    } else {
+        panic!("expected Or, got {replaced:?}");
+    }
+}
+
+#[test]
+fn find_lookback_delta_recurses_into_asset_matches() {
+    // find_lookback_delta must recurse into AssetMatches like the other tree-walks,
+    // or a nested lookback skips the latest-time-window computation.
+    let inner = ConditionNode::InLatestTimeWindow {
+        lookback_delta: Some(3600.0),
+    };
+    let tree = ConditionNode::asset_matches(vec!["x".into()], inner);
+    assert_eq!(tree.find_lookback_delta(), Some(Some(3600.0)));
 }
 
 #[test]
@@ -10134,9 +10861,7 @@ fn test_will_be_requested_true_when_in_set() {
 
 #[test]
 fn test_will_be_requested_in_dep_pivot() {
-    // Asset "downstream" depends on "upstream".
-    // "upstream" is in requested_this_tick → WillBeRequested should fire
-    // when evaluating any_deps_match(WillBeRequested) on "downstream".
+    // upstream is in requested_this_tick → WillBeRequested fires in any_deps_match(WillBeRequested) on downstream.
     let up_record = make_materialized_record("upstream", 100);
     let down_record = make_materialized_record("downstream", 100);
     let records = HashMap::from([
@@ -10207,9 +10932,8 @@ fn test_will_be_requested_not_in_dep_pivot_when_dep_not_requested() {
 
 #[test]
 fn test_any_deps_updated_fires_via_will_be_requested() {
-    // any_deps_updated() includes WillBeRequested: when upstream is in
-    // requested_this_tick, the composite fires even if the dep wasn't
-    // newly updated (same-tick cascading).
+    // any_deps_updated() includes WillBeRequested: an upstream in requested_this_tick
+    // fires the composite even without a new dep update (same-tick cascading).
     let up_record = make_materialized_record("upstream", 100);
     let down_record = make_materialized_record("downstream", 100);
     let records = HashMap::from([
@@ -10253,9 +10977,8 @@ fn test_any_deps_updated_fires_via_will_be_requested() {
 
 #[test]
 fn test_any_deps_missing_suppressed_by_will_be_requested() {
-    // any_deps_missing() includes & !WillBeRequested: when upstream is
-    // missing but in requested_this_tick, the composite does NOT fire
-    // (the dep is about to be materialized).
+    // any_deps_missing() includes & !WillBeRequested: a missing upstream in
+    // requested_this_tick does not fire (about to be materialized).
     let up_record = make_record("upstream"); // missing
     let down_record = make_materialized_record("downstream", 100);
     let records = HashMap::from([
@@ -10366,8 +11089,7 @@ fn test_partitioned_on_cron_no_deps_fires_all_partitions() {
 
     let cond = ConditionNode::on_cron("30 16 * * 1-5".to_string(), None);
 
-    // Previous eval: Tue 2023-11-14 16:00 UTC
-    // Current eval:  Tue 2023-11-14 16:31 UTC → cron tick at 16:30
+    // Prev eval 16:00, current 16:31 UTC → cron tick at 16:30.
     let prev_tick_nanos = 1_699_977_600_000_000_000_i64;
     let now_nanos = 1_699_979_460_000_000_000_i64;
 
@@ -10426,6 +11148,150 @@ fn test_partitioned_on_cron_no_deps_fires_all_partitions() {
 }
 
 #[test]
+fn test_cron_tick_respects_timezone() {
+    use chrono::{TimeZone, Utc};
+    // "0 9 * * *" in America/New_York must fire when the NY wall clock crosses 09:00
+    // (= 13:00 UTC in EDT), not 09:00 UTC.
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let cond = ConditionNode::CronTickPassed {
+        cron_schedule: "0 9 * * *".to_string(),
+        timezone: Some("America/New_York".to_string()),
+    };
+
+    // Window 12:30→13:30 UTC (08:30→09:30 EDT); the 09:00 EDT tick (13:00 UTC) lies inside.
+    let prev_tick = Utc
+        .with_ymd_and_hms(2026, 6, 16, 12, 30, 0)
+        .unwrap()
+        .timestamp_nanos_opt()
+        .unwrap();
+    let now = Utc
+        .with_ymd_and_hms(2026, 6, 16, 13, 30, 0)
+        .unwrap()
+        .timestamp_nanos_opt()
+        .unwrap();
+    let prev = AssetConditionState {
+        last_tick_timestamp: Some(prev_tick),
+        ..Default::default()
+    };
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.prev_state = &prev;
+    ctx.now = now;
+
+    let result = evaluate(&cond, &ctx);
+    assert!(
+        result.fired,
+        "cron '0 9' in America/New_York must fire at 09:00 EDT (13:00 UTC), not 09:00 UTC"
+    );
+
+    // Control: no 09:00 UTC tick in the window → the UTC schedule must not fire (the fire came from the tz).
+    let cond_utc = ConditionNode::CronTickPassed {
+        cron_schedule: "0 9 * * *".to_string(),
+        timezone: None,
+    };
+    let result_utc = evaluate(&cond_utc, &ctx);
+    assert!(
+        !result_utc.fired,
+        "same window has no 09:00 UTC tick, so the UTC schedule must not fire"
+    );
+}
+
+#[test]
+fn test_cron_tick_across_dst_fallback_terminates_and_fires() {
+    use chrono::{TimeZone, Utc};
+    // On the DST fall-back day (2025-11-02), a noon schedule must still fire and the call
+    // must terminate (the naive-as-UTC croner path can't spin on the fall-back).
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let cond = ConditionNode::CronTickPassed {
+        cron_schedule: "0 12 * * *".to_string(),
+        timezone: Some("America/New_York".to_string()),
+    };
+    // 16:00 UTC (11:00 EST) → 17:30 UTC (12:30 EST); noon EST = 17:00 UTC.
+    let prev_tick = Utc
+        .with_ymd_and_hms(2025, 11, 2, 16, 0, 0)
+        .unwrap()
+        .timestamp_nanos_opt()
+        .unwrap();
+    let now = Utc
+        .with_ymd_and_hms(2025, 11, 2, 17, 30, 0)
+        .unwrap()
+        .timestamp_nanos_opt()
+        .unwrap();
+    let prev = AssetConditionState {
+        last_tick_timestamp: Some(prev_tick),
+        ..Default::default()
+    };
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.prev_state = &prev;
+    ctx.now = now;
+
+    assert!(
+        evaluate(&cond, &ctx).fired,
+        "noon schedule must fire on the DST fall-back day"
+    );
+}
+
+#[test]
+fn test_partitioned_newly_requested_is_per_partition() {
+    // NewlyRequested on a partitioned asset must select only the partitions requested
+    // last tick (prev `handled` set), not widen the scalar to every partition.
+    let empty_partition_statuses = HashMap::new();
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let cond = ConditionNode::NewlyRequested;
+
+    let p1 = spk("p1");
+    let p2 = spk("p2");
+    let all_keys = HashSet::from([p1.clone(), p2.clone()]);
+    let ts = HashMap::from([(p1.clone(), 100i64), (p2.clone(), 100)]);
+    let empty_pk: HashSet<PartitionKey> = HashSet::new();
+    let empty_mappings = HashMap::new();
+    let no_upstream_keys = HashMap::new();
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &all_keys,
+        in_progress: &empty_pk,
+        failed: &empty_pk,
+        timestamps: &ts,
+        resolver: PartitionResolver::new(&empty_mappings, &no_upstream_keys),
+        latest_time_window_keys: None,
+        all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
+    };
+
+    // Last tick requested only p1 (handled set), asset-level cursor on the previous tick.
+    let prev = AssetConditionState {
+        last_handled_timestamp: Some(1000),
+        last_tick_timestamp: Some(1000),
+        partition_state: Some(PartitionState {
+            handled: HashSet::from([p1.clone()]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.prev_state = &prev;
+    ctx.now = 2000;
+    ctx.partitions = Some(&pctx);
+
+    let result = evaluate(&cond, &ctx);
+    match result.selection {
+        Some(PartitionSelection::Keys(ref keys)) => {
+            assert!(keys.contains(&p1), "p1 was requested last tick → selected");
+            assert!(
+                !keys.contains(&p2),
+                "p2 was NOT requested last tick → must not be selected (no widening)"
+            );
+        }
+        other => panic!("expected Keys({{p1}}), got {other:?}"),
+    }
+}
+
+#[test]
 fn test_partitioned_on_cron_does_not_fire_without_tick() {
     // No cron tick between evals → on_cron should not fire.
     let empty_partition_statuses = HashMap::new();
@@ -10435,8 +11301,7 @@ fn test_partitioned_on_cron_does_not_fire_without_tick() {
 
     let cond = ConditionNode::on_cron("30 16 * * 1-5".to_string(), None);
 
-    // Previous eval: Tue 2023-11-14 16:00 UTC
-    // Current eval:  Tue 2023-11-14 16:20 UTC → no cron tick yet
+    // Prev eval 16:00, current 16:20 UTC → no cron tick yet.
     let prev_tick_nanos = 1_699_977_600_000_000_000_i64;
     let now_nanos = 1_699_978_800_000_000_000_i64;
 
@@ -10492,8 +11357,7 @@ fn test_partitioned_on_cron_does_not_fire_without_tick() {
 
 #[test]
 fn test_partitioned_on_cron_waits_for_dep_update() {
-    // b depends on a (both partitioned). Cron tick passes but dep "a" has NOT
-    // been updated since the cron tick → on_cron should NOT fire.
+    // b depends on a (both partitioned); cron tick passes but dep a not updated → on_cron does not fire.
     let cond = ConditionNode::on_cron("30 16 * * 1-5".to_string(), None);
 
     let a = make_materialized_record("a", 100);
@@ -10583,8 +11447,7 @@ fn test_partitioned_on_cron_waits_for_dep_update() {
 
 #[test]
 fn test_partitioned_on_cron_fires_after_dep_update() {
-    // b depends on a (both partitioned). Cron tick passes AND dep "a" has been
-    // updated since the cron tick → on_cron fires for updated partitions.
+    // b depends on a (both partitioned); cron tick passes and dep a updated → on_cron fires for updated partitions.
     let cond = ConditionNode::on_cron("30 16 * * 1-5".to_string(), None);
 
     let a = make_materialized_record("a", 200);
@@ -10678,8 +11541,7 @@ fn test_partitioned_on_cron_fires_after_dep_update() {
 
 #[test]
 fn test_partitioned_on_cron_partial_dep_update() {
-    // b depends on a (both partitioned, p1 and p2). Cron tick passes but only
-    // a:p1 is updated → on_cron should NOT fire (AllDepsMatch requires all partitions).
+    // b depends on a (partitioned p1,p2); cron tick passes but only a:p1 updated.
     let cond = ConditionNode::on_cron("30 16 * * 1-5".to_string(), None);
 
     let a = make_materialized_record("a", 200);
@@ -10761,9 +11623,7 @@ fn test_partitioned_on_cron_partial_dep_update() {
     };
 
     let result = evaluate(&cond, &ctx);
-    // AllDepsMatch uses identity mapping: b:p1 ↔ a:p1, b:p2 ↔ a:p2.
-    // a:p1 updated, a:p2 not → b:p1 fires, b:p2 does not.
-    // on_cron fires for p1 only.
+    // Identity mapping b:pN ↔ a:pN; a:p1 updated, a:p2 not → on_cron fires for p1 only.
     assert!(result.fired, "on_cron should fire for p1 whose dep updated");
     assert_eq!(
         result.selection.unwrap(),
@@ -10773,8 +11633,7 @@ fn test_partitioned_on_cron_partial_dep_update() {
 
 #[test]
 fn test_update_dep_baselines_stores_partition_timestamps() {
-    // Verify that update_dep_baselines populates partition_state.timestamps
-    // for non-conditioned deps, so NewlyUpdated has a baseline on the next tick.
+    // update_dep_baselines populates partition_state.timestamps for non-conditioned deps, so NewlyUpdated has a baseline next tick.
     let pk1 = spk("2025-01-01");
     let pk2 = spk("2025-01-02");
 
@@ -10860,7 +11719,7 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
     };
     let partition_statuses = HashMap::from([("b".into(), b_partition_status)]);
 
-    // Simulate: no baseline → NewlyUpdated fires (the bug)
+    // No baseline → NewlyUpdated false-positives.
     let empty_states: HashMap<String, AssetConditionState> = HashMap::new();
 
     let all_keys = HashSet::from([pk1.clone(), pk2.clone()]);
@@ -10971,11 +11830,9 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
     );
 }
 
-// ── Phantom run eviction: dispatch eagerly inserts run_ids; refresh confirms ─
-//                         from storage or evicts after grace period.
+// ── Phantom run eviction: dispatch inserts run_ids; refresh confirms from storage or evicts after grace ─
 
-/// Helper: build a memory-backed storage with one asset record `a`
-/// already registered, and an initialized cache.
+/// Helper: memory-backed storage with asset `a` registered and an initialized cache.
 async fn pending_test_setup() -> (
     crate::storage::surrealdb_backend::SurrealStorage,
     AssetConditionCache,
@@ -11046,8 +11903,7 @@ async fn test_pending_run_confirmed_by_storage_clears_pending() {
         !cache.pending_runs.contains_key("run-1"),
         "pending should be cleared once storage confirms the run"
     );
-    // The Started run propagates a fresh in-progress entry from refresh, so
-    // the asset stays marked in-progress (not the same data, but same shape).
+    // The Started run propagates a fresh in-progress entry, so the asset stays in-progress.
     assert!(
         cache.in_progress_assets.contains_key("a"),
         "asset should remain in-progress while the Started run is live"
@@ -11119,10 +11975,50 @@ async fn test_pending_run_not_evicted_within_grace() {
 }
 
 #[tokio::test]
+async fn test_clear_dispatched_run_rolls_back_failed_dispatch() {
+    // A synchronous dispatch failure never reaches storage; the mark must drop
+    // immediately, not wait out the phantom-eviction grace.
+    let (_storage, mut cache) = pending_test_setup().await;
+    cache.register_dispatched_run("a".into(), "joint-run".into(), 1_000_000, None);
+    cache.register_dispatched_run("b".into(), "joint-run".into(), 1_000_000, None);
+    cache.register_dispatched_run("c".into(), "solo-run".into(), 1_000_000, None);
+
+    cache.clear_dispatched_run("a", "joint-run");
+    assert!(
+        !cache.in_progress_assets.contains_key("a"),
+        "cleared asset must be untracked immediately"
+    );
+    assert!(
+        cache
+            .in_progress_assets
+            .get("b")
+            .is_some_and(|v| v.contains_key("joint-run")),
+        "other assets of the run keep their mark until cleared themselves"
+    );
+    assert!(
+        cache
+            .pending_runs
+            .get("joint-run")
+            .is_some_and(|p| p.asset_keys == vec!["b".to_string()]),
+        "pending entry drops only the cleared asset"
+    );
+
+    cache.clear_dispatched_run("b", "joint-run");
+    assert!(
+        !cache.pending_runs.contains_key("joint-run"),
+        "pending entry is removed once its last asset is cleared"
+    );
+    assert!(!cache.in_progress_assets.contains_key("b"));
+
+    cache.clear_dispatched_run("c", "solo-run");
+    assert!(!cache.in_progress_assets.contains_key("c"));
+    assert!(!cache.pending_runs.contains_key("solo-run"));
+}
+
+#[tokio::test]
 async fn test_pending_eviction_only_drops_phantom_run_id_not_other_runs() {
-    // Two run_ids on the same asset: one phantom (registered, never confirmed,
-    // grace expired), one real (registered, then confirmed by storage). The
-    // eviction must drop only the phantom, leaving the real run untouched.
+    // Two run_ids on one asset — one phantom (grace expired), one real (storage-confirmed);
+    // eviction drops only the phantom.
     let (storage, mut cache) = pending_test_setup().await;
     cache.pending_grace_nanos = 10_000;
     cache.register_dispatched_run("a".into(), "phantom-run".into(), 1_000_000, None);
@@ -11174,8 +12070,7 @@ async fn test_pending_eviction_only_drops_phantom_run_id_not_other_runs() {
 
 #[tokio::test]
 async fn test_pending_eviction_reports_changed_so_eval_runs() {
-    // After phantom eviction, refresh must return `true` so the engine
-    // re-evaluates conditions on the asset that just unblocked.
+    // After phantom eviction, refresh must return `true` so the unblocked asset is re-evaluated.
     let (storage, mut cache) = pending_test_setup().await;
     cache.pending_grace_nanos = 10_000;
     cache.register_dispatched_run("a".into(), "phantom-run".into(), 1_000_000, None);
@@ -11189,8 +12084,7 @@ async fn test_pending_eviction_reports_changed_so_eval_runs() {
 
 // ── Tests for the daemon-race fix: cursor backoff + ASC ordering ────────────
 
-/// Helper: build memory-backed storage + an asset record `a` and `b`
-/// already registered at the given timestamp, with `b` depending on `a`.
+/// Helper: memory-backed storage with `a` and `b` registered at `ts`, `b` depending on `a`.
 async fn race_test_setup(ts: i64) -> crate::storage::surrealdb_backend::SurrealStorage {
     use crate::storage::surrealdb_backend::SurrealStorage;
     let storage = SurrealStorage::new_memory().await.unwrap();
@@ -11253,11 +12147,8 @@ fn run_record(
     }
 }
 
-/// When `initial_load` finds an existing run, it backs the cursor off by
-/// 1ns so the *next* `get_runs_since(>cursor)` re-includes that run. If
-/// the run was Started, the in-progress entry from `initial_load`'s
-/// Started-filter query and the entry from the subsequent
-/// `get_runs_since` must not pile up duplicate run_ids.
+/// initial_load backs the cursor off 1ns so the next `get_runs_since(>cursor)` re-includes
+/// the run; a Started run must not pile up duplicate in-progress run_ids across both queries.
 #[tokio::test]
 async fn test_cursor_backoff_doesnt_duplicate_in_progress_entries() {
     let storage = race_test_setup(1000).await;
@@ -11280,19 +12171,15 @@ async fn test_cursor_backoff_doesnt_duplicate_in_progress_entries() {
     );
 }
 
-/// The actual bug: when the cache picks up two runs for the same asset
-/// in a single delta (e.g. an old multi-asset run already known at init
-/// + a newer single-asset run created concurrently with init),
-/// `apply_run_effects_to_delta` does last-write-wins per-asset on
-/// `last_run_asset_names`. Iterating ASC means the NEWEST run's state
-/// lands last — which is what `LastRunIncludesTarget` needs.
+/// With two runs for one asset in a single delta, `apply_run_effects_to_delta` does
+/// last-write-wins on `last_run_asset_names`; ASC iteration lands the newest run's state
+/// last, as `LastRunIncludesTarget` needs.
 #[tokio::test]
 async fn test_asc_iteration_makes_newest_run_win_per_asset_state() {
     use crate::storage::surrealdb_backend::SurrealStorage;
     let storage = SurrealStorage::new_memory().await.unwrap();
 
-    // Older "manual bulk" run materializes [a, b] together. Stamp it on
-    // both asset records so initial_load picks up its state.
+    // Older "manual bulk" run materializes [a,b]; stamp it on both records so initial_load picks up its state.
     storage
         .create_run(&run_record("old", RunStatus::Success, 2000, vec!["a", "b"]))
         .await
@@ -11345,8 +12232,7 @@ async fn test_asc_iteration_makes_newest_run_win_per_asset_state() {
         "sanity: initial_load reflects the manual bulk run for asset 'a'"
     );
 
-    // After init, a newer schedule run for just 'a' lands. The cursor
-    // backoff makes both runs visible to the next delta refresh.
+    // After init, a newer schedule run for 'a' lands; the cursor backoff makes both visible to the next refresh.
     storage
         .create_run(&run_record("new", RunStatus::Success, 3000, vec!["a"]))
         .await
@@ -11368,11 +12254,8 @@ async fn test_asc_iteration_makes_newest_run_win_per_asset_state() {
     );
 }
 
-/// When an older Success run and a newer Started run for the same asset
-/// land in the same refresh, ASC iteration (old first, new last) leaves
-/// the asset correctly *in* in-progress: the Success run clears it, then
-/// the Started run re-adds it. The opposite order would leave the asset
-/// not-in-progress while a run is still executing.
+/// An older Success + newer Started run in the same refresh: ASC iteration (old first)
+/// leaves the asset in-progress — Success clears it, then Started re-adds it.
 #[tokio::test]
 async fn test_mixed_status_order_started_after_success_lands_in_progress() {
     let storage = race_test_setup(1000).await;
@@ -11412,12 +12295,8 @@ async fn test_mixed_status_order_started_after_success_lands_in_progress() {
     );
 }
 
-/// A run created concurrently with daemon init (the original failing
-/// scenario): `initial_load`'s `get_runs(1)` sees the new Started run as
-/// "the newest", so without the cursor backoff the next refresh's
-/// `get_runs_since(>newest.start_time)` excludes it forever. With the
-/// backoff, the next refresh re-includes it — and (if it's already
-/// terminal) the cache picks up its terminal state.
+/// A run racing daemon init: `initial_load` sees it as the newest, so without the cursor
+/// backoff `get_runs_since(>newest)` excludes it forever; the backoff re-includes it so its terminal state is picked up.
 #[tokio::test]
 async fn test_cursor_backoff_lets_init_racing_run_be_observed_terminal() {
     let storage = race_test_setup(1000).await;
@@ -11458,24 +12337,20 @@ async fn test_cursor_backoff_lets_init_racing_run_be_observed_terminal() {
     );
 }
 
-/// A dep-aggregate must consume a deterministic number of node-index slots,
-/// independent of how many deps it has. Otherwise a stateful node placed after
-/// it (here `NewlyTrue`) lands at a different `sub_results` index when the dep
-/// count changes — and since adding/removing a dep does NOT change the condition
-/// tree fingerprint, the persisted latch is read from the wrong key next tick.
+/// A dep-aggregate must consume a fixed number of node-index slots regardless of dep count,
+/// or a trailing stateful node (`NewlyTrue`) drifts index — and since dep changes don't change
+/// the fingerprint, the persisted latch is read from the wrong key.
 #[test]
 fn test_any_deps_aggregate_index_stable_across_dep_count() {
-    // `Or` (not `And`): the aggregate is false here, so a parent `And` would
-    // short-circuit and skip `NewlyTrue`; `Or` keeps evaluating, so the trailing
-    // stateful node still runs and records its index.
+    // `Or` (not `And`): the false aggregate would let `And` short-circuit and skip NewlyTrue;
+    // `Or` keeps evaluating so the trailing stateful node records its index.
     let tree = ConditionNode::Or(vec![
         ConditionNode::any_deps_match(ConditionNode::NewlyUpdated),
         ConditionNode::NewlyTrue(Box::new(ConditionNode::Missing)),
     ]);
 
-    // Root materialized newer than its deps so `NewlyUpdated` is false for every
-    // dep — this forces `.any()` to scan ALL deps (no short-circuit), exposing the
-    // per-dep counter growth.
+    // Root newer than its deps so NewlyUpdated is false for every dep, forcing `.any()`
+    // to scan all deps (no short-circuit) and expose per-dep counter growth.
     let d = make_materialized_record("d", 200);
     let a = make_materialized_record("a", 100);
     let b = make_materialized_record("b", 100);
@@ -11504,9 +12379,8 @@ fn test_any_deps_aggregate_index_stable_across_dep_count() {
     );
 }
 
-/// A dep-aggregate with zero deps must still advance the counter past its inner
-/// condition, matching the non-empty case. Otherwise a trailing stateful node
-/// shifts index the moment the asset gains its first dep.
+/// A zero-dep dep-aggregate must still advance the counter past its inner condition,
+/// or a trailing stateful node shifts index when the asset gains its first dep.
 #[test]
 fn test_all_deps_aggregate_index_stable_with_zero_deps() {
     let tree = ConditionNode::And(vec![
@@ -11537,11 +12411,8 @@ fn test_all_deps_aggregate_index_stable_with_zero_deps() {
     );
 }
 
-/// `on_cron` expands to `AllDepsMatch(Since(NewlyUpdated, reset) | ...)`: the SR
-/// latch lives INSIDE the dep-aggregate, so each dep's "updated since reset"
-/// state must persist per-dep across ticks. Without per-dep state the latch
-/// writes root state but reads dep state, never round-trips, and the aggregate
-/// stops firing the moment the trigger goes false.
+/// `on_cron` puts an SR latch inside a dep-aggregate, so each dep's "updated since reset"
+/// state must persist per-dep across ticks, or the latch stops firing once the trigger goes false.
 #[test]
 fn test_dep_aggregate_since_latch_persists_per_dep() {
     let tree = ConditionNode::all_deps_match(
@@ -11572,8 +12443,7 @@ fn test_dep_aggregate_since_latch_persists_per_dep() {
         &result1,
     );
 
-    // ── Tick 2: root now materialized newer than a → NewlyUpdated(a) false and
-    //    reset (ExecutionFailed) false → the latch must STAY true from tick 1 ──
+    // Tick 2: root newer than a → NewlyUpdated(a) false, reset false → latch must stay true from tick 1.
     let r2 = make_materialized_record("r", 200);
     let records2 = HashMap::from([("r".to_string(), r2.clone()), ("a".to_string(), a.clone())]);
     let mut ctx2 = make_ctx("r", &r2, &records2, &deps);
@@ -11587,10 +12457,8 @@ fn test_dep_aggregate_since_latch_persists_per_dep() {
     );
 }
 
-/// Partitioned twin of the per-dep latch test: each dep's `Since` latch must
-/// persist per-partition under the ROOT's partition state across ticks. Tick 1
-/// latches via the trigger; tick 2 (trigger now false, reset false) must keep
-/// firing from the persisted latch.
+/// Partitioned twin: each dep's `Since` latch must persist per-partition under the root's
+/// partition state; tick 1 latches, tick 2 (trigger/reset false) fires from the persisted latch.
 #[test]
 fn test_dep_aggregate_partitioned_since_latch_persists_per_dep() {
     let tree = ConditionNode::all_deps_match(
@@ -11616,8 +12484,7 @@ fn test_dep_aggregate_partitioned_since_latch_persists_per_dep() {
         timestamps: HashMap::from([(spk("p1"), 200), (spk("p2"), 200)]),
     };
 
-    // ── Tick 1: root "b" never materialized → floor None → NewlyUpdated(a) fires,
-    //    latch sets true for both partitions ──
+    // Tick 1: root b never materialized → NewlyUpdated(a) fires, latch true for both partitions.
     let statuses1 = HashMap::from([("a".to_string(), a_status())]);
     let empty_ts: HashMap<PartitionKey, i64> = HashMap::new();
     let empty_set: HashSet<PartitionKey> = HashSet::new();
@@ -11650,8 +12517,7 @@ fn test_dep_aggregate_partitioned_since_latch_persists_per_dep() {
         &result1,
     );
 
-    // ── Tick 2: root "b" materialized @300 (newer than a's 200) → NewlyUpdated(a)
-    //    false, reset false → the per-partition latch must persist ──
+    // Tick 2: root b @300 (newer than a@200) → NewlyUpdated(a) false, reset false → per-partition latch must persist.
     let b_status = crate::condition::cache::PartitionStatusEntry {
         materialized: HashSet::from([spk("p1"), spk("p2")]),
         in_progress: HashSet::new(),
@@ -11689,9 +12555,8 @@ fn test_dep_aggregate_partitioned_since_latch_persists_per_dep() {
     );
 }
 
-/// A stateful op nested two dep-hops deep (`r → x → y`, latch on grandparent
-/// `y`) must persist under the root's per-dep state — the read comes from the
-/// ROOT's dep map, not the intermediate dep's own state.
+/// A stateful op two dep-hops deep (`r → x → y`, latch on `y`) must persist under the
+/// root's per-dep state (read from the root's dep map, not x's).
 #[test]
 fn test_nested_dep_aggregate_since_latch_persists() {
     let tree = ConditionNode::any_deps_match(ConditionNode::any_deps_match(
@@ -11744,10 +12609,8 @@ fn test_nested_dep_aggregate_since_latch_persists() {
         &result1,
     );
 
-    // ── Tick 2: root materialized newer than y → NewlyUpdated(y) false, reset
-    //    false → the latch on the grandparent must persist (read from the ROOT's
-    //    per-dep state keyed by y, even though y is reached via a nested
-    //    dep-aggregate) ──
+    // Tick 2: root newer than y → NewlyUpdated(y) false, reset false → the grandparent latch
+    // must persist (read from the root's per-dep state keyed by y).
     let r2 = make_materialized_record("r", 200);
     let records2 = HashMap::from([
         ("r".to_string(), r2.clone()),
@@ -11762,5 +12625,1242 @@ fn test_nested_dep_aggregate_since_latch_persists() {
     assert!(
         result2.fired,
         "tick 2: a latch nested two dep-hops deep must persist under the root's state"
+    );
+}
+
+/// A dep-aggregate with a stateful inner condition must evaluate every dep even when a
+/// sibling short-circuits it, or the skipped dep drops from `dep_sub_results` and
+/// `update_condition_state` (full replace) loses its latch. Multi-dep `on_cron` needs each dep's latch independent.
+#[test]
+fn test_dep_aggregate_short_circuit_preserves_skipped_dep_latch() {
+    // `.all()` short-circuits on the first false dep; `a` is first.
+    let tree = ConditionNode::all_deps_match(
+        ConditionNode::InProgress.since(ConditionNode::ExecutionFailed),
+    );
+    let deps = HashMap::from([("r".to_string(), vec!["a".to_string(), "b".to_string()])]);
+
+    let both = HashSet::from(["a".to_string(), "b".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+    let only_a = HashSet::from(["a".to_string()]);
+
+    let r = make_record("r");
+    let a = make_materialized_record("a", 100);
+    let b = make_materialized_record("b", 100);
+    let records = HashMap::from([
+        ("r".to_string(), r.clone()),
+        ("a".to_string(), a.clone()),
+        ("b".to_string(), b.clone()),
+    ]);
+
+    // ── Tick 1: a and b both in-progress → both deps' Since latch true ──
+    let mut ctx1 = make_ctx("r", &r, &records, &deps);
+    ctx1.cache.in_progress_assets = &both;
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: both deps in-progress → latch fires");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext::from_eval_context(&ctx1),
+        &result1,
+    );
+
+    // Tick 2: a fails → its reset fires → Since(a) false, `.all()` short-circuits at a
+    // and skips b; b's latch must survive the skipped tick.
+    let mut ctx2 = make_ctx("r", &r, &records, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.cache.failed_assets = &only_a;
+    ctx2.cache.in_progress_assets = &none;
+    ctx2.now = 2000;
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        !result2.fired,
+        "tick 2: a's latch reset by its failure → aggregate false this tick"
+    );
+
+    // Built manually (not from_eval_context) to avoid borrowing state_r through ctx2, which would block the &mut below.
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext {
+            target_record_timestamp: r.last_timestamp,
+            target_data_version: r.last_data_version.as_ref(),
+            now: 2000,
+            is_initial: false,
+            partition_timestamps: None,
+        },
+        &result2,
+    );
+
+    // Tick 3: a in-progress again (re-latches), b neither in-progress nor failed → b fires
+    // only from its persisted latch, which must survive the tick 2 skip.
+    let mut ctx3 = make_ctx("r", &r, &records, &deps);
+    ctx3.prev_state = &state_r;
+    ctx3.cache.in_progress_assets = &only_a;
+    ctx3.now = 3000;
+    let result3 = evaluate(&tree, &ctx3);
+    assert!(
+        result3.fired,
+        "tick 3: b's per-dep latch must persist across the tick where a \
+         short-circuited the aggregate"
+    );
+}
+
+/// Two sibling dep-aggregates pivoting on the same dep must merge their per-dep latch maps
+/// (each at a distinct node index), not clobber each other via a wholesale insert.
+#[test]
+fn test_sibling_dep_aggregates_do_not_clobber_shared_dep_latch() {
+    // `And` so both aggregates evaluate on tick 1 (Or would short-circuit). Both pivot
+    // dep `a` (Agg1 idx 2, Agg2 idx 6), so the per-dep map needs both keys.
+    let agg = || {
+        ConditionNode::any_deps_match(
+            ConditionNode::InProgress.since(ConditionNode::ExecutionFailed),
+        )
+    };
+    let tree = ConditionNode::And(vec![agg(), agg()]);
+    let deps = HashMap::from([("r".to_string(), vec!["a".to_string()])]);
+
+    let only_a = HashSet::from(["a".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+    let r = make_record("r");
+    let a = make_materialized_record("a", 100);
+    let records = HashMap::from([("r".to_string(), r.clone()), ("a".to_string(), a.clone())]);
+
+    // Tick 1: a in-progress → both aggregates latch true; the second write must not drop the first.
+    let mut ctx1 = make_ctx("r", &r, &records, &deps);
+    ctx1.cache.in_progress_assets = &only_a;
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: a in-progress → both latches set");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext::from_eval_context(&ctx1),
+        &result1,
+    );
+
+    // Tick 2: a no longer in-progress, never failed → both aggregates fire only from their
+    // persisted latch; Agg1's latch (idx 2) must not be overwritten.
+    let mut ctx2 = make_ctx("r", &r, &records, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.cache.in_progress_assets = &none;
+    ctx2.now = 2000;
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        result2.fired,
+        "tick 2: both sibling aggregates' latches on the shared dep must persist"
+    );
+}
+
+/// A dep-aggregate nested inside a partitioned root's unpartitioned-dep bool fallback must
+/// persist its per-dep latch across ticks (not land in a throwaway accumulator).
+#[test]
+fn test_nested_dep_aggregate_under_unpartitioned_dep_persists_latch() {
+    // Partitioned root r ← unpartitioned b ← c; any_deps_match(any_deps_match(InProgress.since(ExecutionFailed))).
+    // Outer pivots to b (bool fallback), inner pivots to c whose Since latch is under test.
+    let tree = ConditionNode::any_deps_match(ConditionNode::any_deps_match(
+        ConditionNode::InProgress.since(ConditionNode::ExecutionFailed),
+    ));
+    let p1 = spk("p1");
+    let all_keys = HashSet::from([p1.clone()]);
+
+    let r = make_record("r");
+    let b = make_materialized_record("b", 100);
+    let c = make_materialized_record("c", 100);
+    let records = HashMap::from([
+        ("r".to_string(), r.clone()),
+        ("b".to_string(), b.clone()),
+        ("c".to_string(), c.clone()),
+    ]);
+    let deps = HashMap::from([
+        ("r".to_string(), vec!["b".to_string()]),
+        ("b".to_string(), vec!["c".to_string()]),
+    ]);
+
+    let only_c = HashSet::from(["c".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+
+    let r_timestamps = HashMap::from([(p1.clone(), 50i64)]);
+    let r_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: all_keys.clone(),
+        timestamps: r_timestamps.clone(),
+        ..Default::default()
+    };
+    let partition_statuses = HashMap::from([("r".to_string(), r_status)]);
+    let empty_mappings = HashMap::new();
+    // `b` absent from upstream_partition_keys → unpartitioned dep → bool fallback.
+    let no_upstream_keys = HashMap::new();
+    let empty_pk: HashSet<PartitionKey> = HashSet::new();
+
+    let make_pctx = || PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &all_keys,
+        in_progress: &empty_pk,
+        failed: &empty_pk,
+        timestamps: &r_timestamps,
+        resolver: PartitionResolver::new(&empty_mappings, &no_upstream_keys),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+
+    // ── Tick 1: c in-progress → inner Since latches true for c ──
+    let mut ctx1 = make_ctx("r", &r, &records, &deps);
+    ctx1.cache.in_progress_assets = &only_c;
+    let pctx1 = make_pctx();
+    ctx1.partitions = Some(&pctx1);
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: c in-progress → nested Since fires");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext {
+            target_record_timestamp: r.last_timestamp,
+            target_data_version: r.last_data_version.as_ref(),
+            now: 1000,
+            is_initial: false,
+            partition_timestamps: Some(&r_timestamps),
+        },
+        &result1,
+    );
+
+    // Tick 2: c no longer in-progress, never failed → the inner Since fires only from its persisted latch, which must survive.
+    let mut ctx2 = make_ctx("r", &r, &records, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.cache.in_progress_assets = &none;
+    ctx2.now = 2000;
+    let pctx2 = make_pctx();
+    ctx2.partitions = Some(&pctx2);
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        result2.fired,
+        "tick 2: a dep-aggregate nested inside the unpartitioned-dep fallback \
+         must persist its per-dep latch"
+    );
+}
+
+/// A stateful child (Since/NewlyTrue) skipped by an `And`/`Or` short-circuit must keep its
+/// latch, or `update_condition_state` (full replace of previous_results) drops it.
+#[test]
+fn test_and_short_circuit_preserves_stateful_child_latch() {
+    // And([gate, trigger.since(reset)]); a false gate short-circuits the And and skips the stateful child.
+    let tree = ConditionNode::And(vec![
+        ConditionNode::InProgress,
+        ConditionNode::ExecutionFailed.since(ConditionNode::Missing),
+    ]);
+    let deps = HashMap::new();
+    let r = make_materialized_record("r", 100); // materialized → Missing (reset) false
+    let records = HashMap::from([("r".to_string(), r.clone())]);
+    let only_r = HashSet::from(["r".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+
+    // Tick 1: gate (InProgress) and trigger (ExecutionFailed) true → Since latches, And fires.
+    let mut ctx1 = make_ctx("r", &r, &records, &deps);
+    ctx1.cache.in_progress_assets = &only_r;
+    ctx1.cache.failed_assets = &only_r;
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: gate + trigger true → And fires");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext::from_eval_context(&ctx1),
+        &result1,
+    );
+
+    // ── Tick 2: gate false → And short-circuits and the Since is skipped.
+    //    trigger also false this tick ──
+    let mut ctx2 = make_ctx("r", &r, &records, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.cache.in_progress_assets = &none;
+    ctx2.cache.failed_assets = &none;
+    ctx2.now = 2000;
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(!result2.fired, "tick 2: gate false → And false");
+
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext {
+            target_record_timestamp: r.last_timestamp,
+            target_data_version: r.last_data_version.as_ref(),
+            now: 2000,
+            is_initial: false,
+            partition_timestamps: None,
+        },
+        &result2,
+    );
+
+    // ── Tick 3: gate true again, trigger false → the Since can fire only from
+    //    its persisted latch. Pre-fix the latch was dropped on tick 2 ──
+    let mut ctx3 = make_ctx("r", &r, &records, &deps);
+    ctx3.prev_state = &state_r;
+    ctx3.cache.in_progress_assets = &only_r;
+    ctx3.cache.failed_assets = &none;
+    ctx3.now = 3000;
+    let result3 = evaluate(&tree, &ctx3);
+    assert!(
+        result3.fired,
+        "tick 3: a stateful child's latch must persist across a tick where \
+         And short-circuited and skipped it"
+    );
+}
+
+/// A per-dep `Since` whose reset is `CronTickPassed`, evaluated in a dep pivot
+/// over an UNCONDITIONED dep, must use the ROOT's last tick as the cron-window
+/// boundary. Unconditioned deps never get `last_tick_timestamp` set, so reading
+/// the dep's tick gives a zero-width window — the reset never fires, the latch
+/// sticks true, and `on_cron` re-fires every cron tick even without fresh data.
+#[test]
+fn test_cron_reset_in_dep_pivot_uses_root_tick() {
+    let cron = ConditionNode::CronTickPassed {
+        cron_schedule: "30 16 * * 1-5".to_string(),
+        timezone: None,
+    };
+    let tree = ConditionNode::all_deps_match(ConditionNode::InProgress.since(cron));
+    let deps = HashMap::from([("r".to_string(), vec!["a".to_string()])]);
+    let r = make_materialized_record("r", 100);
+    let a = make_materialized_record("a", 100);
+    let records = HashMap::from([("r".to_string(), r.clone()), ("a".to_string(), a.clone())]);
+
+    let only_a = HashSet::from(["a".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+
+    // Tue 2023-11-14: 16:00 (tick 1) → 16:31 (tick 2); cron tick at 16:30.
+    let t1: i64 = 1_699_977_600_000_000_000;
+    let t2: i64 = 1_699_979_460_000_000_000;
+
+    // ── Tick 1: dep `a` in-progress → the per-dep Since latches true ──
+    let prev1 = AssetConditionState::default();
+    let all1: HashMap<String, AssetConditionState> = HashMap::new();
+    let ctx1 = EvalContext {
+        target_key: "r",
+        root_key: "r",
+        target_record: &r,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &only_a,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &prev1,
+        all_asset_states: &all1,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: t1,
+        is_initial: false,
+        partitions: None,
+        root_partition_floor: None,
+    };
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: dep in-progress latches the Since");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext {
+            target_record_timestamp: r.last_timestamp,
+            target_data_version: r.last_data_version.as_ref(),
+            now: t1,
+            is_initial: false,
+            partition_timestamps: None,
+        },
+        &result1,
+    );
+    // The root's own state as seen on the next tick (last_tick = t1).
+    let all2: HashMap<String, AssetConditionState> =
+        HashMap::from([("r".to_string(), state_r.clone())]);
+
+    // Tick 2: a cron tick (16:30) passed since t1, dep no longer in-progress → the reset
+    // must clear the latch → all_deps_match false.
+    let ctx2 = EvalContext {
+        target_key: "r",
+        root_key: "r",
+        target_record: &r,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &none,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &state_r,
+        all_asset_states: &all2,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: t2,
+        is_initial: false,
+        partitions: None,
+        root_partition_floor: None,
+    };
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        !result2.fired,
+        "tick 2: the cron reset (root's tick boundary) must clear the per-dep \
+         Since latch over an unconditioned dep"
+    );
+}
+
+/// The eval-state blob carries a schema stamp for an explicit migration point (`migrate_loaded`);
+/// a pre-versioning blob (no stamp) must read as version 0, not the current version.
+#[test]
+fn test_condition_eval_state_schema_version_stamps_and_migrates() {
+    assert_eq!(
+        ConditionEvalState::default().schema_version,
+        EVAL_STATE_SCHEMA_VERSION,
+        "fresh state must carry the current schema version"
+    );
+
+    let mut old: ConditionEvalState = serde_json::from_str("{}").unwrap();
+    assert_eq!(
+        old.schema_version, 0,
+        "a blob written before versioning must load as version 0"
+    );
+    old.migrate_loaded();
+    assert_eq!(old.schema_version, EVAL_STATE_SCHEMA_VERSION);
+
+    let bytes = serde_json::to_vec(&ConditionEvalState::default()).unwrap();
+    let round: ConditionEvalState = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        round.schema_version, EVAL_STATE_SCHEMA_VERSION,
+        "the stamp must survive a persist round-trip"
+    );
+}
+
+/// When an asset flips partitioned→unpartitioned with the same tree, the fingerprint is
+/// unchanged so `reset_for_new_tree` never runs; `update_condition_state` must itself drop
+/// the stale `partition_state` on an unpartitioned eval.
+#[test]
+fn test_update_condition_state_clears_stale_partition_state_when_unpartitioned() {
+    let pk = PartitionKey::Single {
+        keys: vec!["2024-01-01".to_string()],
+    };
+    let mut state = AssetConditionState {
+        partition_state: Some(PartitionState {
+            timestamps: HashMap::from([(pk, 100i64)]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    // An unpartitioned evaluation result: `sub_selections` is None.
+    let result = EvalResult {
+        fired: false,
+        ..Default::default()
+    };
+    let ctx = StateUpdateContext {
+        target_record_timestamp: Some(200),
+        target_data_version: None,
+        now: 300,
+        is_initial: false,
+        partition_timestamps: None,
+    };
+    update_condition_state(&mut state, &ctx, &result);
+
+    assert!(
+        state.partition_state.is_none(),
+        "stale partition_state must be cleared on an unpartitioned eval"
+    );
+}
+
+/// The baseline is bounded by the partition_status snapshot, not the universe: a snapshot
+/// key outside the universe (retired/def-change/future-cap) must keep its baseline, or it
+/// reads newly-updated forever and re-adding it fires a spurious materialization.
+#[test]
+fn test_update_condition_state_keeps_baseline_for_snapshot_keys_outside_universe() {
+    let live = spk("2024-01-02");
+    let stale = spk("2023-12-31");
+    let timestamps = HashMap::from([(live.clone(), 100i64), (stale.clone(), 50)]);
+
+    let mut state = AssetConditionState::default();
+    let result = EvalResult {
+        fired: false,
+        sub_selections: Some(HashMap::new()),
+        ..Default::default()
+    };
+    update_condition_state(
+        &mut state,
+        &StateUpdateContext {
+            target_record_timestamp: Some(100),
+            target_data_version: None,
+            now: 1_000,
+            is_initial: false,
+            partition_timestamps: Some(&timestamps),
+        },
+        &result,
+    );
+
+    let ps = state
+        .partition_state
+        .expect("partitioned eval must store partition_state");
+    assert_eq!(
+        ps.timestamps,
+        HashMap::from([(live, 100i64), (stale, 50)]),
+        "every snapshot key keeps its baseline, in or out of the universe"
+    );
+}
+
+/// A snapshot key outside the universe (retired/def-change/future-cap) is not evaluable;
+/// partitioned `NewlyUpdated` must filter to the universe, or it selects a baseline-less key every tick forever.
+#[test]
+fn test_partitioned_newly_updated_ignores_keys_outside_universe() {
+    let live = spk("2024-01-02");
+    let retired = spk("2020-01-01");
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+
+    // Baseline covers only the live key; the retired key's baseline was never established.
+    let mut prev = AssetConditionState::default();
+    prev.partition_state = Some(PartitionState {
+        timestamps: HashMap::from([(live.clone(), 100i64)]),
+        ..Default::default()
+    });
+
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.prev_state = &prev;
+
+    let all_keys = HashSet::from([live.clone()]);
+    let materialized = HashSet::from([live.clone(), retired.clone()]);
+    let timestamps = HashMap::from([(live.clone(), 100i64), (retired.clone(), 50)]);
+    let partition_status = HashMap::new();
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &materialized,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &timestamps,
+        resolver: PartitionResolver::empty(),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_status,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let result = evaluate(&ConditionNode::NewlyUpdated, &ctx);
+    assert!(
+        !result.fired,
+        "a snapshot key outside the universe must not fire NewlyUpdated; got {:?}",
+        result.selection
+    );
+}
+
+/// `ConditionEvalState` is persisted via `serde_json`, which can't use a `PartitionKey` as a
+/// JSON map key; `PartitionState` timestamps are so keyed, so the state must still round-trip
+/// or every restart wipes all latches.
+#[test]
+fn test_condition_eval_state_round_trips_with_partition_timestamps() {
+    let pk = PartitionKey::Single {
+        keys: vec!["2024-01-01".to_string()],
+    };
+    let mut asset = AssetConditionState::default();
+    asset.partition_state = Some(PartitionState {
+        timestamps: HashMap::from([(pk.clone(), 100i64)]),
+        ..Default::default()
+    });
+    let mut state = ConditionEvalState::default();
+    state.assets.insert("a".to_string(), asset);
+
+    let bytes = serde_json::to_vec(&state)
+        .expect("ConditionEvalState must serialize via serde_json (storage uses kv_set_json)");
+    let round: ConditionEvalState =
+        serde_json::from_slice(&bytes).expect("ConditionEvalState must round-trip");
+    let ts = round.assets["a"]
+        .partition_state
+        .as_ref()
+        .unwrap()
+        .timestamps
+        .get(&pk);
+    assert_eq!(
+        ts,
+        Some(&100),
+        "partition timestamp must survive the round-trip"
+    );
+}
+
+/// An old blob missing newer fields must still load with defaults, not fail to deserialize
+/// (which would silently reset all latches); guards `#[serde(default)]` coverage.
+#[test]
+fn test_condition_eval_state_tolerates_missing_fields() {
+    // Top-level `is_initial` omitted; asset "a" carries only `is_initial`, every other field absent.
+    let json = r#"{"assets":{"a":{"is_initial":true}}}"#;
+    let state: ConditionEvalState =
+        serde_json::from_str(json).expect("a partial/old blob must load with defaults");
+    assert!(
+        !state.is_initial,
+        "missing top-level is_initial → default false"
+    );
+    let a = &state.assets["a"];
+    assert!(a.is_initial);
+    assert!(a.previous_results.is_empty());
+    assert_eq!(a.condition_fingerprint, "");
+    assert!(a.last_handled_timestamp.is_none());
+    assert!(a.partition_state.is_none());
+}
+
+/// A pre-pairs-format blob stored `timestamps` as a JSON map (always empty `{}`); the
+/// deserializer must accept that legacy shape, or the whole load fails and wipes every latch on upgrade.
+#[test]
+fn test_condition_eval_state_loads_legacy_map_shaped_timestamps() {
+    let json =
+        r#"{"assets":{"a":{"previous_results":{"3":true},"partition_state":{"timestamps":{}}}}}"#;
+    let state: ConditionEvalState = serde_json::from_str(json)
+        .expect("legacy blob with map-shaped empty timestamps must load, not reset all latches");
+    let a = &state.assets["a"];
+    assert_eq!(
+        a.previous_results.get(&3),
+        Some(&true),
+        "latches must survive the legacy-shape load"
+    );
+    let ps = a
+        .partition_state
+        .as_ref()
+        .expect("partition_state present in the blob must load");
+    assert!(ps.timestamps.is_empty());
+}
+
+/// Upgrading past pre-data-version state (baseline last_data_version None, record Some,
+/// is_initial false): the partitioned arm must gate on a materialization landing since the
+/// last observation, not fire its whole universe.
+#[test]
+fn test_partitioned_data_version_changed_suppressed_for_pre_versioning_state() {
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+
+    // Pre-versioning blob: baseline ts matches the record, version None.
+    let mut prev = AssetConditionState::default();
+    prev.last_materialized_timestamp = Some(100);
+    prev.last_tick_timestamp = Some(900);
+    prev.last_data_version = None;
+
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.prev_state = &prev;
+
+    let k1 = spk("2024-01-01");
+    let all_keys = HashSet::from([k1.clone()]);
+    let materialized = HashSet::from([k1.clone()]);
+    let timestamps = HashMap::from([(k1.clone(), 100i64)]);
+    let partition_status = HashMap::new();
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &materialized,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &timestamps,
+        resolver: PartitionResolver::empty(),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_status,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    assert!(
+        !evaluate(&ConditionNode::DataVersionChanged, &ctx).fired,
+        "a missing baseline with no new materialization must not fire the whole universe"
+    );
+
+    // A version that appears WITH a fresh materialization is a real change.
+    let record2 = make_materialized_record("a", 200);
+    let records2 = HashMap::from([("a".to_string(), record2.clone())]);
+    let mut ctx = make_ctx("a", &record2, &records2, &deps);
+    ctx.prev_state = &prev; // baseline still at 100, version None
+    ctx.partitions = Some(&pctx);
+    assert!(
+        evaluate(&ConditionNode::DataVersionChanged, &ctx).fired,
+        "a version appearing with a new materialization must fire"
+    );
+}
+
+/// An Observation bumps `last_timestamp` (and maybe a data version) without materializing;
+/// a never-materialized-but-observed asset must still read as Missing (Missing keys off
+/// `last_run_id`, written only by materializations).
+#[test]
+fn test_missing_true_for_observed_never_materialized_asset() {
+    let mut record = make_record("a");
+    record.last_timestamp = Some(500); // bumped by the observation
+    record.last_data_version = Some("obs-v1".to_string()); // observation-carried
+    record.last_run_id = None; // no materialization ever
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let ctx = make_ctx("a", &record, &records, &deps);
+    assert!(
+        evaluate(&ConditionNode::Missing, &ctx).fired,
+        "an observed-but-never-materialized asset must still be Missing"
+    );
+
+    // And a real materialization (which always records its run) clears it.
+    let record = make_materialized_record("a", 600);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let ctx = make_ctx("a", &record, &records, &deps);
+    assert!(!evaluate(&ConditionNode::Missing, &ctx).fired);
+}
+
+/// `DataVersionChanged` over an unconditioned dep must not re-fire every tick:
+/// `update_dep_baselines` must record the dep's `last_data_version`, or the pivot reads
+/// prev=None forever and fires despite a stable version.
+#[test]
+fn test_data_version_changed_baselines_unconditioned_dep() {
+    let tree = ConditionNode::any_deps_match(ConditionNode::DataVersionChanged);
+    let deps = HashMap::from([("r".to_string(), vec!["a".to_string()])]);
+    let r = make_materialized_record("r", 100);
+    let a = make_materialized_record("a", 100); // last_data_version = Some("dv_a")
+    let records = HashMap::from([("r".to_string(), r.clone()), ("a".to_string(), a.clone())]);
+    let no_conditioned: HashSet<String> = HashSet::new();
+    let empty_ps = HashMap::new();
+
+    // ── Tick 1: dep `a`'s version is first-seen (prev None) → fires ──
+    let mut assets: HashMap<String, AssetConditionState> = HashMap::new();
+    let prev1 = AssetConditionState::default();
+    let ctx1 = EvalContext {
+        target_key: "r",
+        root_key: "r",
+        target_record: &r,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &EMPTY_SET,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &prev1,
+        all_asset_states: &assets,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: 1000,
+        is_initial: false,
+        partitions: None,
+        root_partition_floor: None,
+    };
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: first-seen dep data version → fires");
+
+    // Baseline deps, as the daemon does after a fired/initial tick.
+    update_dep_baselines(&mut assets, &deps, &no_conditioned, &empty_ps, &records);
+
+    // ── Tick 2: `a`'s version is unchanged → must NOT re-fire ──
+    let prev2 = AssetConditionState::default();
+    let ctx2 = EvalContext {
+        target_key: "r",
+        root_key: "r",
+        target_record: &r,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &EMPTY_SET,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &prev2,
+        all_asset_states: &assets,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: 2000,
+        is_initial: false,
+        partitions: None,
+        root_partition_floor: None,
+    };
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(
+        !result2.fired,
+        "tick 2: a stable dep data version must not re-fire (baseline missing)"
+    );
+}
+
+/// The `Or` counterpart: a stateful child skipped because an earlier child made the Or true must keep its latch.
+#[test]
+fn test_or_short_circuit_preserves_stateful_child_latch() {
+    // Or([gate, trigger.since(reset)]); a true gate short-circuits the Or and skips the stateful child.
+    let tree = ConditionNode::Or(vec![
+        ConditionNode::InProgress,
+        ConditionNode::ExecutionFailed.since(ConditionNode::Missing),
+    ]);
+    let deps = HashMap::new();
+    let r = make_materialized_record("r", 100); // materialized → Missing (reset) false
+    let records = HashMap::from([("r".to_string(), r.clone())]);
+    let only_r = HashSet::from(["r".to_string()]);
+    let none: HashSet<String> = HashSet::new();
+
+    // ── Tick 1: gate false, trigger true → Or evaluates the Since (latches true) ──
+    let mut ctx1 = make_ctx("r", &r, &records, &deps);
+    ctx1.cache.in_progress_assets = &none;
+    ctx1.cache.failed_assets = &only_r;
+    let result1 = evaluate(&tree, &ctx1);
+    assert!(result1.fired, "tick 1: trigger true → Or fires");
+
+    let mut state_r = AssetConditionState::default();
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext::from_eval_context(&ctx1),
+        &result1,
+    );
+
+    // ── Tick 2: gate true → Or short-circuits and skips the Since. trigger false ──
+    let mut ctx2 = make_ctx("r", &r, &records, &deps);
+    ctx2.prev_state = &state_r;
+    ctx2.cache.in_progress_assets = &only_r;
+    ctx2.cache.failed_assets = &none;
+    ctx2.now = 2000;
+    let result2 = evaluate(&tree, &ctx2);
+    assert!(result2.fired, "tick 2: gate true → Or fires (from gate)");
+
+    update_condition_state(
+        &mut state_r,
+        &StateUpdateContext {
+            target_record_timestamp: r.last_timestamp,
+            target_data_version: r.last_data_version.as_ref(),
+            now: 2000,
+            is_initial: false,
+            partition_timestamps: None,
+        },
+        &result2,
+    );
+
+    // Tick 3: gate false, trigger false → Or fires only if the Since latch persisted across the skipped tick.
+    let mut ctx3 = make_ctx("r", &r, &records, &deps);
+    ctx3.prev_state = &state_r;
+    ctx3.cache.in_progress_assets = &none;
+    ctx3.cache.failed_assets = &none;
+    ctx3.now = 3000;
+    let result3 = evaluate(&tree, &ctx3);
+    assert!(
+        result3.fired,
+        "tick 3: a stateful child's latch must persist across a tick where \
+         Or short-circuited and skipped it"
+    );
+}
+
+/// The Schedule loop stores `next_occurrence` as a UTC instant; a tz-qualified schedule must
+/// fire at the declared wall time, and the UTC instant shifts across DST while the wall time stays fixed.
+#[test]
+fn test_next_cron_occurrence_utc_respects_timezone_and_dst() {
+    use chrono::{TimeZone, Utc};
+    let cron = croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Optional)
+        .build()
+        .parse("0 9 * * *")
+        .unwrap();
+
+    // No timezone → evaluated in UTC: next 09:00 UTC.
+    let after = Utc.with_ymd_and_hms(2024, 1, 15, 0, 0, 0).unwrap();
+    assert_eq!(
+        next_cron_occurrence_utc(&cron, after, None),
+        Some(Utc.with_ymd_and_hms(2024, 1, 15, 9, 0, 0).unwrap()),
+    );
+
+    // America/New_York, winter (EST = UTC-5): 09:00 local → 14:00 UTC.
+    assert_eq!(
+        next_cron_occurrence_utc(&cron, after, Some("America/New_York")),
+        Some(Utc.with_ymd_and_hms(2024, 1, 15, 14, 0, 0).unwrap()),
+        "09:00 EST must be 14:00 UTC, not 09:00 UTC"
+    );
+
+    // Same schedule, summer (EDT = UTC-4): 09:00 local → 13:00 UTC (shifts an hour across DST, wall time fixed).
+    let summer = Utc.with_ymd_and_hms(2024, 7, 15, 0, 0, 0).unwrap();
+    assert_eq!(
+        next_cron_occurrence_utc(&cron, summer, Some("America/New_York")),
+        Some(Utc.with_ymd_and_hms(2024, 7, 15, 13, 0, 0).unwrap()),
+        "09:00 EDT must be 13:00 UTC"
+    );
+}
+
+/// A spring-forward-skipped wall time (02:30 NY doesn't exist on 2026-03-08) must fire at the
+/// first valid instant after the gap (03:00 EDT = 07:00 UTC), not the skipped wall time misread as UTC.
+#[test]
+fn test_next_cron_occurrence_utc_spring_forward_gap_advances_to_gap_end() {
+    use chrono::{TimeZone, Utc};
+    let cron = croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Optional)
+        .build()
+        .parse("30 2 * * *")
+        .unwrap();
+
+    // 2026-03-08 01:00 EST = 06:00 UTC, one wall-clock hour before the gap.
+    let after = Utc.with_ymd_and_hms(2026, 3, 8, 6, 0, 0).unwrap();
+    assert_eq!(
+        next_cron_occurrence_utc(&cron, after, Some("America/New_York")),
+        Some(Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0).unwrap()),
+        "gap occurrence must fire at the first valid wall time after the gap (03:00 EDT)"
+    );
+}
+
+/// Fall-back repeated hour: when `after` is in the second pass, resolving to the earliest
+/// ambiguous instant lands in the past and (no in-flight guard) re-fires every loop;
+/// the next occurrence must be strictly after `after`.
+#[test]
+fn test_next_cron_occurrence_utc_fall_back_never_returns_past_instant() {
+    use chrono::{TimeZone, Utc};
+    let cron = croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Optional)
+        .build()
+        .parse("30 1 * * *")
+        .unwrap();
+
+    // 06:05 UTC = 01:05 EST (second pass of the repeated 01:00-02:00 hour); next 01:30 is
+    // ambiguous: 01:30 EDT = 05:30 UTC (past) vs 01:30 EST = 06:30 UTC.
+    let after = Utc.with_ymd_and_hms(2025, 11, 2, 6, 5, 0).unwrap();
+    let next = next_cron_occurrence_utc(&cron, after, Some("America/New_York"))
+        .expect("occurrence must exist");
+    assert!(
+        next > after,
+        "next occurrence must be strictly after `after`; got {next} <= {after} \
+         (schedule would re-fire on every daemon loop pass)"
+    );
+    assert_eq!(
+        next,
+        Utc.with_ymd_and_hms(2025, 11, 2, 6, 30, 0).unwrap(),
+        "the first 01:30 wall time after 01:05 EST is 01:30 EST"
+    );
+}
+
+/// On the root's first tick (`last_tick_timestamp` None), a `CronTickPassed` in a dep pivot
+/// must default to a zero-width window (`ctx.now`), not bleed the dep's own `last_tick`, which
+/// could span a cron boundary and spuriously fire.
+#[test]
+fn test_cron_in_dep_pivot_does_not_use_dep_tick_on_root_first_eval() {
+    let cron = ConditionNode::CronTickPassed {
+        cron_schedule: "30 16 * * 1-5".to_string(),
+        timezone: None,
+    };
+    let tree = ConditionNode::all_deps_match(cron);
+    let deps = HashMap::from([("r".to_string(), vec!["a".to_string()])]);
+    let r = make_materialized_record("r", 100);
+    let a = make_materialized_record("a", 100);
+    let records = HashMap::from([("r".to_string(), r.clone()), ("a".to_string(), a.clone())]);
+
+    // Tue 2023-11-14: 16:00 (dep's old tick) → 16:31 (now); cron tick at 16:30.
+    let t_old: i64 = 1_699_977_600_000_000_000;
+    let now: i64 = 1_699_979_460_000_000_000;
+
+    // Dep a is conditioned and last evaluated at t_old; root r has never ticked (last_tick None).
+    let dep_state = AssetConditionState {
+        last_tick_timestamp: Some(t_old),
+        ..Default::default()
+    };
+    let all_states: HashMap<String, AssetConditionState> =
+        HashMap::from([("a".to_string(), dep_state)]);
+    let prev_r = AssetConditionState::default();
+
+    let ctx = EvalContext {
+        target_key: "r",
+        root_key: "r",
+        target_record: &r,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &EMPTY_SET,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &prev_r,
+        all_asset_states: &all_states,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now,
+        is_initial: false,
+        partitions: None,
+        root_partition_floor: None,
+    };
+    let result = evaluate(&tree, &ctx);
+    assert!(
+        !result.fired,
+        "root's first tick: cron window is zero-width (ctx.now), so no cron tick \
+         has passed; the dep's old tick must NOT widen the window and fire"
+    );
+}
+
+/// The baseline must mirror the partition_status snapshot exactly: keys the snapshot no longer
+/// contains must leave the persisted baseline too (in-place delta can't drift from replace semantics).
+#[test]
+fn test_update_condition_state_drops_baseline_keys_missing_from_snapshot() {
+    let kept = spk("2024-01-02");
+    let gone = spk("2024-01-01");
+
+    let mut state = AssetConditionState {
+        partition_state: Some(PartitionState {
+            timestamps: HashMap::from([(kept.clone(), 50i64), (gone.clone(), 40)]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    // New snapshot: `gone` vanished, `kept` advanced.
+    let timestamps = HashMap::from([(kept.clone(), 100i64)]);
+    update_condition_state(
+        &mut state,
+        &StateUpdateContext {
+            target_record_timestamp: Some(100),
+            target_data_version: None,
+            now: 1_000,
+            is_initial: false,
+            partition_timestamps: Some(&timestamps),
+        },
+        &EvalResult {
+            fired: false,
+            sub_selections: Some(HashMap::new()),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        state.partition_state.unwrap().timestamps,
+        HashMap::from([(kept, 100i64)]),
+        "baseline must equal the snapshot: stale key dropped, kept key advanced"
+    );
+}
+
+#[tokio::test]
+async fn test_initial_load_does_not_floor_asset_materialized_in_failed_joint_run() {
+    // A joint run R=[x,y] fails on y but x materialized (its last_run_id → R). On restart,
+    // initial_load rebuilds floors from last_run_id; since last_run_id is written only by
+    // materializations, an asset whose last_run_id names a failed run materialized in it and must not be floored.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, RunRecord, RunStatus, StorageBackend,
+    };
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[
+            make_materialized_record("x", 1000),
+            make_materialized_record("y", 1000),
+        ])
+        .await
+        .unwrap();
+
+    let run_id = "run-joint-fail".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Failure,
+            start_time: 2000,
+            end_time: Some(3000),
+            tags: vec![],
+            node_names: vec!["x".to_string(), "y".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    // x materialized in R (advances x.last_run_id to R); y's step failed.
+    storage
+        .store_events(&[
+            EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::Materialization {
+                    data_version: Some("dv-x2".to_string()),
+                },
+                asset_key: Some("x".to_string()),
+                run_id: run_id.clone(),
+                partition_key: None,
+                timestamp: 3000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            },
+            EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("y".to_string()),
+                run_id: run_id.clone(),
+                partition_key: None,
+                timestamp: 3000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            },
+        ])
+        .await
+        .unwrap();
+
+    // Fresh cache = daemon restart → initial_load.
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    assert!(
+        !cache.failed_assets.contains("x"),
+        "x materialized in the failed joint run → must not be floored on restart; \
+         got failed_assets={:?}",
+        cache.failed_assets,
+    );
+}
+
+/// `SinceLastHandled` debounces the root's dispatch cycle; inside a dep pivot `prev_state` is
+/// the dep's state (never written for unconditioned deps), so it must read the root's handled
+/// state, not vacuously pass and re-dispatch the tick after the root fired.
+#[test]
+fn test_since_last_handled_in_dep_pivot_debounces_root_cycle() {
+    let record_down = make_record("down");
+    let record_up = make_record("up"); // never materialized → Missing is true
+    let records = HashMap::from([
+        ("down".to_string(), record_down.clone()),
+        ("up".to_string(), record_up.clone()),
+    ]);
+    let deps = HashMap::from([("down".to_string(), vec!["up".to_string()])]);
+
+    let condition = ConditionNode::AnyDepsMatch {
+        condition: Box::new(ConditionNode::SinceLastHandled(Box::new(
+            ConditionNode::Missing,
+        ))),
+        label: None,
+    };
+
+    // Root fired AND was dispatched on the previous tick: handled == tick.
+    let mut root_state = AssetConditionState::default();
+    root_state.last_handled_timestamp = Some(1000);
+    root_state.last_tick_timestamp = Some(1000);
+    let states = HashMap::from([("down".to_string(), root_state.clone())]);
+
+    let mut ctx = make_ctx("down", &record_down, &records, &deps);
+    ctx.prev_state = &root_state;
+    ctx.all_asset_states = &states;
+    assert!(
+        !evaluate(&condition, &ctx).fired,
+        "the tick after the root was handled must be debounced — a vacuous \
+         pass here re-dispatches the root every tick until its run lands"
+    );
+
+    // An OLDER handled cycle (handled < last tick) must pass again.
+    let mut stale_state = AssetConditionState::default();
+    stale_state.last_handled_timestamp = Some(500);
+    stale_state.last_tick_timestamp = Some(1000);
+    let states = HashMap::from([("down".to_string(), stale_state.clone())]);
+    let mut ctx = make_ctx("down", &record_down, &records, &deps);
+    ctx.prev_state = &stale_state;
+    ctx.all_asset_states = &states;
+    assert!(
+        evaluate(&condition, &ctx).fired,
+        "an older handled cycle must not suppress the trigger"
+    );
+}
+
+#[tokio::test]
+async fn test_completed_run_invalidates_event_less_partitioned_sibling() {
+    // Joint keyed run R=[x,y] over p: x materializes p (R enters completed_run_ids), y dies
+    // event-less. The completed_run_ids path handles R and must invalidate y so its partition
+    // failure (run-status union) reaches partition_status[y].
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, RunRecord, RunStatus, StorageBackend,
+    };
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[
+            make_materialized_record("x", 1000),
+            make_materialized_record("y", 1000),
+        ])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.set_partitioned_assets(vec!["x".to_string(), "y".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let run_id = "run-joint-part".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["x".to_string(), "y".to_string()],
+            priority: 0,
+            partition_key: Some(spk("p")),
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(cache.in_progress_assets.contains_key("x"));
+    assert!(cache.in_progress_assets.contains_key("y"));
+
+    // R fails: x materialized p (R enters completed_run_ids), y is event-less.
+    storage
+        .update_run_status(&run_id, RunStatus::Failure, Some(3000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[EventRecord {
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            event_type: EventType::Materialization {
+                data_version: Some("dv-xp".to_string()),
+            },
+            asset_key: Some("x".to_string()),
+            run_id: run_id.clone(),
+            partition_key: Some(spk("p")),
+            timestamp: 3000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        }])
+        .await
+        .unwrap();
+
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let y_status = cache
+        .partition_status
+        .get("y")
+        .expect("y is a registered partitioned asset");
+    assert!(
+        y_status.failed.contains(&spk("p")),
+        "y's event-less partition failure in the joint run must surface in \
+         partition_status via completed-path invalidation; got failed={:?}",
+        y_status.failed,
+    );
+}
+
+#[test]
+fn test_partitioned_execution_failed_ignores_keys_outside_universe() {
+    // A failed partition retired from the universe stays in partition_status.failed forever but
+    // is no longer evaluable; ExecutionFailed/InProgress must filter to all_keys (like NewlyUpdated),
+    // or it spams requested_this_tick every tick.
+    let live = spk("2024-01-02");
+    let retired = spk("2020-01-01");
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+
+    let all_keys = HashSet::from([live.clone()]);
+    let partition_status = HashMap::new();
+    let failed = HashSet::from([retired.clone()]);
+    let in_progress = HashSet::from([retired.clone()]);
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &HashSet::new(),
+        in_progress: &in_progress,
+        failed: &failed,
+        timestamps: &HashMap::new(),
+        resolver: PartitionResolver::empty(),
+        latest_time_window_keys: None,
+        all_partition_statuses: &partition_status,
+        dep_root_floor: None,
+    };
+    let mut ctx = make_ctx("a", &record, &records, &deps);
+    ctx.partitions = Some(&pctx);
+
+    assert!(
+        !evaluate(&ConditionNode::ExecutionFailed, &ctx).fired,
+        "a failed partition outside the universe must not fire ExecutionFailed"
+    );
+    assert!(
+        !evaluate(&ConditionNode::InProgress, &ctx).fired,
+        "an in-progress partition outside the universe must not fire InProgress"
     );
 }

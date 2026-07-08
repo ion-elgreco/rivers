@@ -122,10 +122,6 @@ pub async fn get_assets_info(
         })
         .collect();
 
-    // Dynamic partitions are storage-managed, so the def-level `total_count` is 0.
-    // Fill in the real count from storage — but only when the location actually
-    // has a Dynamic asset, so the common all-static case skips the registry
-    // lookup + per-asset storage round-trips entirely.
     let has_dynamic = assets.iter().any(|a| {
         a.partition_def
             .as_ref()
@@ -148,9 +144,7 @@ pub async fn get_assets_info(
     Ok(assets)
 }
 
-/// Expand a stored `PartitionKey` into the individual partition-definition
-/// keys it represents. A `Single` entry may bundle multiple keys when a run
-/// materializes several at once — each one counts independently.
+/// Expand a stored `PartitionKey` into the individual partition-definition keys it represents.
 #[cfg(feature = "ssr")]
 fn partition_key_members(pk: &rivers_core::storage::PartitionKey) -> Vec<String> {
     pk.members()
@@ -159,42 +153,46 @@ fn partition_key_members(pk: &rivers_core::storage::PartitionKey) -> Vec<String>
         .collect()
 }
 
-/// Tri-state per-partition status (Materialized / Failed / Missing) for the
-/// asset-detail partition heatmap. Joins materialized keys from storage,
-/// failed keys from event scan (last 10k events), and the partition
-/// definition's full key universe from gRPC. When the gRPC-side
-/// definition is unavailable, falls back to listing only materialized keys.
+/// Tri-state heatmap label for one partition.
+#[cfg(feature = "ssr")]
+fn partition_status_label(
+    key: &str,
+    materialized: &std::collections::HashSet<String>,
+    failed: &std::collections::HashSet<String>,
+) -> &'static str {
+    if failed.contains(key) {
+        "Failed"
+    } else if materialized.contains(key) {
+        "Materialized"
+    } else {
+        "Missing"
+    }
+}
+
+/// Tri-state per-partition status (Materialized / Failed / Missing) for the asset-detail partition heatmap.
 #[server]
 pub async fn get_partition_status(
     loc_ns: String,
     loc_name: String,
     asset_key: String,
     offset: u64,
-    // For a Dynamic asset, its namespace name (keys are storage-managed); empty
-    // for all other kinds, which window via gRPC.
     dynamic_name: String,
 ) -> Result<PartitionStatus, ServerFnError> {
     use rivers_api::rivers::GetPartitionKeysRequest;
     use rivers_core::storage::StorageBackend;
     use std::collections::HashSet;
 
-    // The heatmap renders one cell per key, so it pages in fixed windows
-    // (`offset` = page start); the summary counts below stay global. Keep in
-    // sync with `PartitionsTab`'s `PAGE`.
     const HEATMAP_PAGE: u64 = 1000;
 
     let ctx = super::resolve_identity(&loc_ns, &loc_name).await?;
     let state = expect_context::<crate::state::AppState>();
     let scoped = state.storage.for_code_location(&ctx);
 
-    // Summary count — an aggregate, not one row per materialized partition.
     let materialized_count = scoped
         .count_materialized_partitions(&asset_key)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))? as usize;
 
-    // Total + key window at `offset`. Dynamic keys are storage-managed, so source
-    // them from storage; every other kind windows via gRPC.
     let mut window_keys: Vec<String> = Vec::new();
     let mut total: usize = 0;
     if !dynamic_name.is_empty() {
@@ -222,10 +220,6 @@ pub async fn get_partition_status(
         window_keys = resp.keys;
     }
 
-    // Classify only the visible window. Materialized membership comes from the
-    // materialized set and failed from a bounded event scan. (A windowed status
-    // query that avoids fetching the full materialized set for the window is a
-    // follow-up.)
     let materialized_spks = scoped
         .get_materialized_partitions(&asset_key)
         .await
@@ -235,25 +229,22 @@ pub async fn get_partition_status(
         .flat_map(partition_key_members)
         .collect();
 
-    let events = scoped
-        .get_events_for_asset(&asset_key, 10000)
+    let partition_timestamps: std::collections::HashMap<rivers_core::storage::PartitionKey, i64> =
+        scoped
+            .get_partition_timestamps(&asset_key)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+    let failed_keys: HashSet<String> = scoped
+        .get_failed_partitions(&asset_key, &partition_timestamps)
         .await
-        .unwrap_or_default();
-    let mut failed_keys: HashSet<String> = HashSet::new();
-    for evt in &events {
-        if matches!(evt.event_type, rivers_core::storage::EventType::StepFailure)
-            && let Some(ref pk) = evt.partition_key
-        {
-            for k in partition_key_members(pk) {
-                if !materialized_keys.contains(&k) {
-                    failed_keys.insert(k);
-                }
-            }
-        }
-    }
+        .unwrap_or_default()
+        .keys()
+        .flat_map(partition_key_members)
+        .collect();
     let failed_count = failed_keys.len();
 
-    // gRPC unavailable / no partition def → fall back to listing materialized keys.
     let detail_keys: Vec<String> = if total == 0 {
         total = materialized_keys.len();
         materialized_keys
@@ -267,24 +258,13 @@ pub async fn get_partition_status(
 
     let partition_details: Vec<PartitionDetail> = detail_keys
         .iter()
-        .map(|key| {
-            let status = if materialized_keys.contains(key) {
-                "Materialized"
-            } else if failed_keys.contains(key) {
-                "Failed"
-            } else {
-                "Missing"
-            };
-            PartitionDetail {
-                key: key.clone(),
-                status: status.to_string(),
-                last_timestamp: None,
-            }
+        .map(|key| PartitionDetail {
+            key: key.clone(),
+            status: partition_status_label(key, &materialized_keys, &failed_keys).to_string(),
+            last_timestamp: None,
         })
         .collect();
 
-    // Clamp to the definition's total: stale storage rows (partitions no longer
-    // in the current def) must not make the summary show materialized > total.
     let materialized = materialized_count.min(total);
     let failed = failed_count.min(total - materialized);
     let missing = total - materialized - failed;
@@ -298,9 +278,7 @@ pub async fn get_partition_status(
     })
 }
 
-/// A window `[offset, offset+limit)` of an asset's keys plus the `total`, fetched
-/// on demand. `query` filters by substring (`total` = match count); `dimension`
-/// pages a Multi dimension instead of the asset's single-dim keys.
+/// A window `[offset, offset+limit)` of an asset's keys plus the `total`, fetched on demand.
 #[server]
 pub async fn get_partition_keys_page(
     loc_ns: String,
@@ -332,8 +310,7 @@ pub async fn get_partition_keys_page(
     Ok((resp.keys, resp.total))
 }
 
-/// Index of a key in definition order for the picker's jump; `dimension`
-/// resolves within a Multi dimension. `-1` if absent.
+/// Index of a key in definition order for the picker's jump; `-1` if absent.
 #[server]
 pub async fn get_partition_key_index(
     loc_ns: String,
@@ -361,9 +338,7 @@ pub async fn get_partition_key_index(
     Ok(resp.index)
 }
 
-/// Load a Dynamic partition set's full key list from storage (`partition_key
-/// ASC`). Its keys are storage-managed, not in the in-memory def, so this reads
-/// storage directly like `get_partition_status`; callers filter/window in memory.
+/// Load a Dynamic partition set's full key list from storage.
 #[cfg(feature = "ssr")]
 async fn load_dynamic_partition_keys(
     loc_ns: &str,
@@ -382,8 +357,7 @@ async fn load_dynamic_partition_keys(
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
-/// `[offset, offset+limit)` window of a Dynamic set's keys + total; `query`
-/// filters by substring. Dynamic companion of `get_partition_keys_page`.
+/// `[offset, offset+limit)` window of a Dynamic set's keys + total; `query` filters by substring.
 #[server]
 pub async fn get_dynamic_partition_keys_page(
     loc_ns: String,
@@ -394,7 +368,6 @@ pub async fn get_dynamic_partition_keys_page(
     limit: u64,
 ) -> Result<(Vec<String>, u64), ServerFnError> {
     let all = load_dynamic_partition_keys(&loc_ns, &loc_name, &dynamic_name).await?;
-    // Case-sensitive, like the asset-side `get_partition_keys_filtered`.
     let filtered: Vec<String> = if query.is_empty() {
         all
     } else {
@@ -409,8 +382,7 @@ pub async fn get_dynamic_partition_keys_page(
     Ok((window, total))
 }
 
-/// Index of `key` in a Dynamic set's stored order (`-1` if absent), for the
-/// picker's jump. Dynamic companion of `get_partition_key_index`.
+/// Index of `key` in a Dynamic set's stored order (`-1` if absent), for the picker's jump.
 #[server]
 pub async fn get_dynamic_partition_key_index(
     loc_ns: String,
@@ -426,11 +398,7 @@ pub async fn get_dynamic_partition_key_index(
         .unwrap_or(-1))
 }
 
-/// Aggregate stats for the deployment page: storage-side counts (assets,
-/// runs, events), gRPC-side daemon counts (schedules, sensors, ticks),
-/// connectivity, and a heuristic `daemon_active` flag (a tick within the
-/// last 5 min). Falls back gracefully when the gRPC endpoint isn't
-/// reachable so storage-side fields still render.
+/// Aggregate stats for the deployment page.
 #[server]
 pub async fn get_deployment_info(
     loc_ns: String,
@@ -452,10 +420,6 @@ pub async fn get_deployment_info(
         .map(|r| r.len())
         .unwrap_or(0);
 
-    // Resolve the requested location via the registry. `connect_to` errors
-    // when the entry is missing or non-Ready — treated here as "not configured"
-    // so the deployment page still renders the storage-side fields even
-    // pre-reconcile.
     let mut grpc_url = "Not configured".to_string();
     let mut grpc_connected = false;
     let mut event_count = 0usize;
@@ -529,9 +493,7 @@ mod tests {
     use super::partition_key_members;
     use rivers_core::storage::PartitionKey;
 
-    /// Heatmap classification compares these member strings against the gRPC
-    /// window keys (`dim=v|dim=v`, dims sorted). Any other encoding makes
-    /// every multi-dim cell render Missing.
+    /// Heatmap classification compares these member strings against the gRPC window keys.
     #[test]
     fn multi_dim_member_matches_grpc_window_key_format() {
         let pk = PartitionKey::Multi {
@@ -561,13 +523,34 @@ mod tests {
         );
     }
 
-    /// Single members stay bare values — they must equal the gRPC window
-    /// keys for single-dim assets, which are bare strings.
+    /// Single members stay bare values.
     #[test]
     fn single_members_stay_bare() {
         let pk = PartitionKey::Single {
             keys: vec!["a".into(), "b".into()],
         };
         assert_eq!(partition_key_members(&pk), vec!["a", "b"]);
+    }
+
+    /// Failed wins over Materialized.
+    #[test]
+    fn failed_status_wins_over_materialized() {
+        use super::partition_status_label;
+        use std::collections::HashSet;
+        let materialized: HashSet<String> =
+            ["p".to_string(), "q".to_string()].into_iter().collect();
+        let failed: HashSet<String> = ["p".to_string()].into_iter().collect();
+        assert_eq!(
+            partition_status_label("p", &materialized, &failed),
+            "Failed"
+        );
+        assert_eq!(
+            partition_status_label("q", &materialized, &failed),
+            "Materialized"
+        );
+        assert_eq!(
+            partition_status_label("z", &materialized, &failed),
+            "Missing"
+        );
     }
 }

@@ -57,7 +57,7 @@ impl<'py> pyo3::IntoPyObject<'py> for TickRequest {
     }
 }
 
-#[allow(deprecated)] // downcast on Borrowed — cast() doesn't support clone().unbind()
+#[allow(deprecated)]
 impl<'py> pyo3::FromPyObject<'py, '_> for TickRequest {
     type Error = PyErr;
 
@@ -298,13 +298,6 @@ pub enum PyScheduleStatus {
 }
 
 /// A schedule definition that triggers job execution on a cron schedule.
-///
-/// Can be used as a decorator:
-/// ```python
-/// @rs.Schedule(cron_schedule="0 0 * * *", job_name="my_job")
-/// def my_schedule(context: rs.ScheduleEvaluationContext):
-///     return rs.RunRequest()
-/// ```
 #[pyclass(name = "Schedule", frozen, get_all, module = "rivers._core")]
 pub struct PyScheduleDefinition {
     /// Schedule name (defaults to function name or `{job_name}_schedule`).
@@ -368,6 +361,16 @@ impl PyScheduleDefinition {
         if job_name.is_empty() {
             return Err(ScheduleDefinitionError::new_err("job_name cannot be empty"));
         }
+        rivers_core::condition::validate_cron(&cron_schedule).map_err(|e| {
+            ScheduleDefinitionError::new_err(format!(
+                "invalid cron_schedule {cron_schedule:?}: {e}"
+            ))
+        })?;
+        if let Some(tz) = &timezone {
+            rivers_core::condition::validate_timezone(tz).map_err(|e| {
+                ScheduleDefinitionError::new_err(format!("invalid timezone {tz:?}: {e}"))
+            })?;
+        }
         let schedule_name = if let Some(n) = name {
             n
         } else if let Some(ref f) = func {
@@ -389,8 +392,7 @@ impl PyScheduleDefinition {
         })
     }
 
-    /// When used as `@Schedule(cron_schedule=..., job_name=...)` (without func),
-    /// calling the returned object applies the decorated function.
+    /// When used as a decorator without func, calling the returned object applies the decorated function.
     fn __call__(&self, py: Python, func: Py<PyAny>) -> PyResult<Self> {
         let schedule_name = if self.name == format!("{}_schedule", self.job_name) {
             func.getattr(py, "__name__")?.to_string()

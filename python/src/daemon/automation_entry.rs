@@ -123,8 +123,7 @@ impl AutomationEntry {
         }
     }
 
-    /// Called at dispatch time: sets last_eval (fixes interval measurement)
-    /// and marks sensor as in-flight (prevents overlapping evals).
+    /// Called at dispatch time: sets last_eval and marks sensor as in-flight.
     pub(crate) fn mark_dispatched(&mut self, now: chrono::DateTime<Utc>) {
         match self {
             AutomationEntry::Sensor {
@@ -136,17 +135,20 @@ impl AutomationEntry {
                 *in_flight = true;
             }
             AutomationEntry::Schedule {
+                info,
                 cron,
                 next_occurrence,
-                ..
             } => {
-                *next_occurrence = cron.find_next_occurrence(&now, false).ok();
+                *next_occurrence = rivers_core::condition::next_cron_occurrence_utc(
+                    cron,
+                    now,
+                    info.timezone.as_deref(),
+                );
             }
         }
     }
 
-    /// Called when eval result is processed: clears in-flight and updates
-    /// cursor/last_tick_time from the outcome.
+    /// Called when eval result is processed: clears in-flight and updates cursor/last_tick_time.
     pub(crate) fn complete_eval(&mut self, outcome: &EvalOutcome) {
         if let AutomationEntry::Sensor {
             cursor,

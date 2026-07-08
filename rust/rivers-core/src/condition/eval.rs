@@ -5,22 +5,26 @@ use std::collections::{HashMap, HashSet};
 use crate::storage::PartitionKey;
 
 use super::node::ConditionNode;
-use super::partition::{
-    PartitionEvalContext, PartitionResolver, PartitionSelection, PartitionState,
-};
+use super::partition::{PartitionEvalContext, PartitionResolver, PartitionSelection};
 use super::state::{AssetConditionState, EvalContext, EvalNodeResult, EvalResult, NodeStatus};
 
-/// Per-dep latch state for stateful ops inside dep-aggregates, keyed by dep then
-/// node index. `prev` (root's last tick) is threaded unchanged into nested
-/// pivots so a latch resolves against the root; `acc` collects this tick's.
+/// Per-dep latch state for stateful ops inside dep-aggregates, keyed by dep then node index.
 struct DepScope<'a, V> {
     prev: &'a HashMap<String, HashMap<u32, V>>,
     acc: &'a mut HashMap<String, HashMap<u32, V>>,
+    cur_prev: Option<&'a HashMap<u32, V>>,
+    bridged: HashMap<String, HashSet<u32>>,
 }
 
 static EMPTY_DEP_SELECTIONS: std::sync::LazyLock<
     HashMap<String, HashMap<u32, PartitionSelection>>,
 > = std::sync::LazyLock::new(HashMap::new);
+
+/// Empty per-dep latch maps for pivots into a dep with no persisted latch yet.
+static EMPTY_BOOL_LATCH: std::sync::LazyLock<HashMap<u32, bool>> =
+    std::sync::LazyLock::new(HashMap::new);
+static EMPTY_SELECTION_LATCH: std::sync::LazyLock<HashMap<u32, PartitionSelection>> =
+    std::sync::LazyLock::new(HashMap::new);
 
 /// Root's previous-tick per-dep partition latches (empty when unpartitioned).
 fn root_dep_selections<'a>(
@@ -33,8 +37,109 @@ fn root_dep_selections<'a>(
         .unwrap_or(&EMPTY_DEP_SELECTIONS)
 }
 
-// These traits abstract over "bool only" vs "bool + tree" output modes,
-// allowing a single generic evaluator to replace the duplicated _with_tree variants.
+/// The root asset's previous-tick evaluation time.
+fn root_last_tick(ctx: &EvalContext) -> Option<i64> {
+    ctx.all_asset_states
+        .get(ctx.root_key)
+        .and_then(|s| s.last_tick_timestamp)
+        .or_else(|| {
+            (ctx.target_key == ctx.root_key)
+                .then_some(ctx.prev_state.last_tick_timestamp)
+                .flatten()
+        })
+}
+
+/// The root asset's previous-tick (handled, tick) timestamps, as a pair.
+fn root_handled_state(ctx: &EvalContext) -> (Option<i64>, Option<i64>) {
+    match ctx.all_asset_states.get(ctx.root_key) {
+        Some(s) => (s.last_handled_timestamp, s.last_tick_timestamp),
+        None if ctx.target_key == ctx.root_key => (
+            ctx.prev_state.last_handled_timestamp,
+            ctx.prev_state.last_tick_timestamp,
+        ),
+        None => (None, None),
+    }
+}
+
+/// Merge (not replace) a dep's stateful-node results into the per-dep accumulator.
+fn collect_dep_latch<V>(scope: &mut DepScope<V>, dep_key: &str, local: HashMap<u32, V>) {
+    if local.is_empty() {
+        return;
+    }
+    if let Some(marks) = scope.bridged.get_mut(dep_key) {
+        for idx in local.keys() {
+            marks.remove(idx);
+        }
+    }
+    scope
+        .acc
+        .entry(dep_key.to_string())
+        .or_default()
+        .extend(local);
+}
+
+/// Merge latches bridged out of the unpartitioned bool fallback (`from_bool`: true → `All`).
+fn collect_bridged_latch(
+    scope: &mut DepScope<PartitionSelection>,
+    dep_key: &str,
+    local: HashMap<u32, PartitionSelection>,
+) {
+    if local.is_empty() {
+        return;
+    }
+    let slot = scope.acc.entry(dep_key.to_string()).or_default();
+    let marks = scope.bridged.entry(dep_key.to_string()).or_default();
+    for (idx, sel) in local {
+        match slot.entry(idx) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(sel);
+                marks.insert(idx);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if marks.contains(&idx) {
+                    let merged = e.get().union(&sel);
+                    e.insert(merged);
+                }
+            }
+        }
+    }
+}
+
+/// Restrict a partition-status set (failed / in_progress) to the live universe.
+fn select_in_universe(
+    keys: &HashSet<PartitionKey>,
+    pctx: &PartitionEvalContext,
+) -> PartitionSelection {
+    let live: HashSet<PartitionKey> = keys
+        .iter()
+        .filter(|k| pctx.all_keys.contains(*k))
+        .cloned()
+        .collect();
+    if live.is_empty() {
+        PartitionSelection::Empty
+    } else {
+        PartitionSelection::Keys(live)
+    }
+}
+
+/// Previous-tick selection for stateful node `my_idx`: the per-dep latch when
+/// pivoting into a dep (`cur_prev`), otherwise the asset's own state.
+fn prev_partition_latch(
+    dep_selections: &DepScope<PartitionSelection>,
+    ctx: &EvalContext,
+    my_idx: u32,
+) -> PartitionSelection {
+    match dep_selections.cur_prev {
+        Some(map) => map.get(&my_idx).cloned(),
+        None => ctx
+            .prev_state
+            .partition_state
+            .as_ref()
+            .and_then(|ps| ps.previous_selections.get(&my_idx))
+            .cloned(),
+    }
+    .unwrap_or(PartitionSelection::Empty)
+}
 
 /// Output mode for the unpartitioned evaluator.
 trait EvalOutput: Sized {
@@ -81,8 +186,6 @@ impl EvalOutput for EvalNodeResult {
 }
 
 /// Output mode for the partition-aware evaluator.
-/// `Child` is the type collected into children vectors — `()` when no tree is
-/// needed, `EvalNodeResult` when building a visualization tree.
 trait PartEvalOutput: Sized {
     type Child;
     fn leaf(sel: PartitionSelection, idx: u32, node: &ConditionNode, total: usize) -> Self;
@@ -158,7 +261,6 @@ impl PartEvalOutput for (PartitionSelection, EvalNodeResult) {
 }
 
 /// Build a skipped tree for a subtree that was not evaluated due to short-circuiting.
-/// Mirrors `count_nodes()` to maintain stable counter indices.
 fn build_skipped_subtree(node: &ConditionNode, counter: &mut u32) -> EvalNodeResult {
     let my_idx = *counter;
     *counter += 1;
@@ -195,13 +297,6 @@ fn build_skipped_subtree(node: &ConditionNode, counter: &mut u32) -> EvalNodeRes
 }
 
 /// Evaluate a `ConditionNode` tree against the given context.
-///
-/// Returns an `EvalResult` whose `fired` field indicates whether the
-/// condition is true for this tick. `sub_results` uses monotonic u32 indices
-/// as keys (no string allocation in the hot path).
-///
-/// When `ctx.partitions` is `Some`, evaluates in partition-aware mode and
-/// populates `selection` and `sub_selections` on the result.
 pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
     if let Some(pctx) = ctx.partitions {
         let mut counter = 0u32;
@@ -210,6 +305,8 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
         let mut dep_scope = DepScope {
             prev: root_dep_selections(ctx),
             acc: &mut dep_selections,
+            cur_prev: None,
+            bridged: HashMap::new(),
         };
         let selection: PartitionSelection = eval_partitioned(
             node,
@@ -241,6 +338,8 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
         let mut dep_scope = DepScope {
             prev: &ctx.prev_state.dep_previous_results,
             acc: &mut dep_results,
+            cur_prev: None,
+            bridged: HashMap::new(),
         };
         let fired: bool = eval_inner(node, ctx, &mut counter, &mut sub_results, &mut dep_scope);
         tracing::debug!(
@@ -260,12 +359,7 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
     }
 }
 
-/// Recursive inner evaluator. Uses a monotonic counter for node indexing
-/// instead of string path formatting (zero allocation in the hot path).
-/// Only `NewlyTrue` and `Since` nodes record/read from `sub_results`.
-///
-/// Generic over `O`: when `O = bool` we get the fast path (no tree allocation);
-/// when `O = EvalNodeResult` we get a full visualization tree.
+/// Recursive inner evaluator.
 fn eval_inner<O: EvalOutput>(
     node: &ConditionNode,
     ctx: &EvalContext,
@@ -277,9 +371,7 @@ fn eval_inner<O: EvalOutput>(
     *counter += 1;
 
     match node {
-        ConditionNode::Missing => {
-            O::leaf(ctx.target_record.last_data_version.is_none(), my_idx, node)
-        }
+        ConditionNode::Missing => O::leaf(ctx.target_record.last_run_id.is_none(), my_idx, node),
         ConditionNode::InProgress => O::leaf(
             ctx.cache.in_progress_assets.contains(ctx.target_key),
             my_idx,
@@ -297,20 +389,10 @@ fn eval_inner<O: EvalOutput>(
             O::leaf(expr, my_idx, node)
         }
         ConditionNode::NewlyUpdated => {
-            // In a dep pivot, fire-time baselines are unsound (async event
-            // drains double-fire; global re-baselining loses fires) — same
-            // contract as the partitioned arm: a dep counts as updated while
-            // strictly newer than the root's last successful OR failed
-            // attempt, so the triggered run self-suppresses and a failed one
-            // consumes the update instead of retrying every tick.
             if ctx.target_key != ctx.root_key {
                 let expr = match ctx.target_record.last_timestamp {
                     None => false,
                     Some(dep_ts) => match ctx.root_partition_floor {
-                        // Partitioned root over an unpartitioned dep: the floor
-                        // is the root's OLDEST partition attempt (min), so the
-                        // edge fires while ANY partition is older than the dep
-                        // and self-suppresses once all partitions catch up.
                         Some(floor) => dep_newer_than_floor(dep_ts, floor),
                         None => {
                             let root_mat = ctx
@@ -336,10 +418,6 @@ fn eval_inner<O: EvalOutput>(
                 ctx.prev_state.last_materialized_timestamp,
             ) {
                 (Some(current), Some(prev)) => current > prev,
-                // No previous baseline: on the initial tick the asset was
-                // already materialized before the daemon started — not a new
-                // update, so suppress (else a bare newly_updated() re-fires on
-                // every restart). Non-initial → it appeared between ticks → fire.
                 (Some(_), None) => !ctx.is_initial,
                 _ => false,
             };
@@ -353,14 +431,11 @@ fn eval_inner<O: EvalOutput>(
 
         ConditionNode::CronTickPassed {
             cron_schedule,
-            timezone: _,
+            timezone,
         } => {
-            // Use the previous evaluation tick as the left boundary.
-            // Default to ctx.now on first eval (zero-width window → no match),
-            // so cron conditions don't spuriously fire on daemon startup.
-            let prev_ts = ctx.prev_state.last_tick_timestamp.unwrap_or(ctx.now);
+            let prev_ts = root_last_tick(ctx).unwrap_or(ctx.now);
             O::leaf(
-                cron_tick_between(cron_schedule, prev_ts, ctx.now),
+                cron_tick_between(cron_schedule, prev_ts, ctx.now, timezone.as_deref()),
                 my_idx,
                 node,
             )
@@ -376,7 +451,11 @@ fn eval_inner<O: EvalOutput>(
                 ctx.prev_state.last_data_version.as_ref(),
             ) {
                 (Some(current), Some(prev)) => current != prev,
-                (Some(_), None) => true,
+                (Some(_), None) => {
+                    !ctx.is_initial
+                        && ctx.prev_state.last_materialized_timestamp
+                            != ctx.target_record.last_timestamp
+                }
                 _ => false,
             };
             O::leaf(expr, my_idx, node)
@@ -403,7 +482,7 @@ fn eval_inner<O: EvalOutput>(
 
         ConditionNode::LastRunIncludesTarget => {
             let expr = if ctx.target_key == ctx.root_key {
-                false // self-referential guard: only meaningful on deps, not the root itself
+                false
             } else {
                 ctx.tags
                     .last_run_asset_names
@@ -414,15 +493,11 @@ fn eval_inner<O: EvalOutput>(
             O::leaf(expr, my_idx, node)
         }
 
-        ConditionNode::WillBeRequested => {
-            // Only meaningful inside dep pivots (eval_on_dep); at the root level
-            // it's always false because the root hasn't produced a result yet.
-            O::leaf(
-                ctx.requested_this_tick.contains_key(ctx.target_key),
-                my_idx,
-                node,
-            )
-        }
+        ConditionNode::WillBeRequested => O::leaf(
+            ctx.requested_this_tick.contains_key(ctx.target_key),
+            my_idx,
+            node,
+        ),
 
         ConditionNode::HasRunWithTags {
             tag_keys,
@@ -444,15 +519,23 @@ fn eval_inner<O: EvalOutput>(
 
         ConditionNode::AnyDepsMatch { condition, .. } => {
             let base = *counter;
+            let eval_all = condition.has_stateful_nodes();
             let val = ctx
                 .cache
                 .upstream_deps
                 .get(ctx.target_key)
                 .map(|deps| {
-                    deps.iter().any(|dep| {
+                    let mut any = false;
+                    for dep in deps {
                         *counter = base;
-                        eval_on_dep(dep, condition, ctx, counter, dep_results)
-                    })
+                        if eval_on_dep(dep, condition, ctx, counter, dep_results) {
+                            any = true;
+                            if !eval_all {
+                                break;
+                            }
+                        }
+                    }
+                    any
                 })
                 .unwrap_or(false);
             finalize_dep_counter(counter, base, condition);
@@ -461,15 +544,23 @@ fn eval_inner<O: EvalOutput>(
 
         ConditionNode::AllDepsMatch { condition, .. } => {
             let base = *counter;
+            let eval_all = condition.has_stateful_nodes();
             let val = ctx
                 .cache
                 .upstream_deps
                 .get(ctx.target_key)
                 .map(|deps| {
-                    deps.iter().all(|dep| {
+                    let mut all = true;
+                    for dep in deps {
                         *counter = base;
-                        eval_on_dep(dep, condition, ctx, counter, dep_results)
-                    })
+                        if !eval_on_dep(dep, condition, ctx, counter, dep_results) {
+                            all = false;
+                            if !eval_all {
+                                break;
+                            }
+                        }
+                    }
+                    all
                 })
                 .unwrap_or(true);
             finalize_dep_counter(counter, base, condition);
@@ -478,18 +569,21 @@ fn eval_inner<O: EvalOutput>(
 
         ConditionNode::AssetMatches { keys, condition } => {
             let base = *counter;
-            let val = keys.iter().any(|key| {
+            let eval_all = condition.has_stateful_nodes();
+            let mut val = false;
+            for key in keys {
                 *counter = base;
-                eval_on_dep(key, condition, ctx, counter, dep_results)
-            });
+                if eval_on_dep(key, condition, ctx, counter, dep_results) {
+                    val = true;
+                    if !eval_all {
+                        break;
+                    }
+                }
+            }
             finalize_dep_counter(counter, base, condition);
             O::leaf(val, my_idx, node)
         }
 
-        // We still short-circuit, but always increment the counter for
-        // skipped children via `count_nodes()`. This ensures stable my_idx
-        // assignments across ticks even when short-circuiting changes, so
-        // NewlyTrue/Since nodes always read the correct previous result.
         ConditionNode::And(children) => {
             let mut result = true;
             let mut child_outs = if O::COLLECTS_CHILDREN {
@@ -501,6 +595,11 @@ fn eval_inner<O: EvalOutput>(
                 if result {
                     let out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
                     result = out.val();
+                    if O::COLLECTS_CHILDREN {
+                        child_outs.push(out);
+                    }
+                } else if child.has_stateful_nodes() {
+                    let out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
                     if O::COLLECTS_CHILDREN {
                         child_outs.push(out);
                     }
@@ -527,6 +626,11 @@ fn eval_inner<O: EvalOutput>(
                     if O::COLLECTS_CHILDREN {
                         child_outs.push(out);
                     }
+                } else if child.has_stateful_nodes() {
+                    let out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
+                    if O::COLLECTS_CHILDREN {
+                        child_outs.push(out);
+                    }
                 } else if O::COLLECTS_CHILDREN {
                     child_outs.push(O::skipped(child, counter));
                 } else {
@@ -546,19 +650,15 @@ fn eval_inner<O: EvalOutput>(
             }
         }
 
-        // State-tracking operators — the only ones that read/write sub_results.
         ConditionNode::NewlyTrue(child) => {
             let child_out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
             let current = child_out.val();
-            let previous = ctx
-                .prev_state
-                .previous_results
+            let previous = dep_results
+                .cur_prev
+                .unwrap_or(&ctx.prev_state.previous_results)
                 .get(&my_idx)
                 .copied()
                 .unwrap_or(false);
-            // Pure rising-edge detector: true only when child transitions false→true.
-            // First-tick behavior (firing when there's no previous state) should be
-            // handled via InitialEvaluation composition in presets, not special-cased here.
             let result = current && !previous;
             sub_results.insert(my_idx, current);
             if O::COLLECTS_CHILDREN {
@@ -573,9 +673,9 @@ fn eval_inner<O: EvalOutput>(
             let reset_out = eval_inner::<O>(reset, ctx, counter, sub_results, dep_results);
             let trigger_val = trigger_out.val();
             let reset_val = reset_out.val();
-            let prev_latch = ctx
-                .prev_state
-                .previous_results
+            let prev_latch = dep_results
+                .cur_prev
+                .unwrap_or(&ctx.prev_state.previous_results)
                 .get(&my_idx)
                 .copied()
                 .unwrap_or(false);
@@ -598,13 +698,10 @@ fn eval_inner<O: EvalOutput>(
             let result = if !current {
                 false
             } else {
-                match ctx.prev_state.last_handled_timestamp {
+                let (last_handled, last_tick) = root_handled_state(ctx);
+                match last_handled {
                     None => true,
-                    Some(handled) => ctx
-                        .prev_state
-                        .last_tick_timestamp
-                        .map(|last_tick| handled < last_tick)
-                        .unwrap_or(true),
+                    Some(handled) => last_tick.map(|lt| handled < lt).unwrap_or(true),
                 }
             };
             if O::COLLECTS_CHILDREN {
@@ -617,7 +714,6 @@ fn eval_inner<O: EvalOutput>(
 }
 
 /// Increment the counter for every node in a subtree without evaluating.
-/// Used by `And`/`Or` to maintain stable node indices when short-circuiting.
 fn count_nodes(node: &ConditionNode, counter: &mut u32) {
     *counter += 1;
     match node {
@@ -649,11 +745,7 @@ fn count_nodes(node: &ConditionNode, counter: &mut u32) {
 }
 
 /// Advance `counter` to `base + count_nodes(condition)`, the deterministic number
-/// of node-index slots a dep-aggregate consumes. Each dep is evaluated with the
-/// counter reset to `base` (so all deps share one index range); this call then
-/// lands the counter past the condition exactly once — independent of dep count
-/// or short-circuiting — so stateful nodes after the aggregate keep stable
-/// indices and the skip path (`count_nodes`) agrees with the eval path.
+/// of node-index slots a dep-aggregate consumes.
 fn finalize_dep_counter(counter: &mut u32, base: u32, condition: &ConditionNode) {
     *counter = base;
     count_nodes(condition, counter);
@@ -661,10 +753,6 @@ fn finalize_dep_counter(counter: &mut u32, base: u32, condition: &ConditionNode)
 
 /// Evaluate a `ConditionNode` tree and return both the compact result (for
 /// state tracking) and a full evaluation tree (for UI visualization).
-///
-/// When `ctx.partitions` is `Some`, evaluates in partition-aware mode in a
-/// single pass, producing both the `PartitionSelection` result and the
-/// `EvalNodeResult` tree with `num_partitions` populated at each node.
 pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResult, EvalNodeResult) {
     if let Some(pctx) = ctx.partitions {
         let mut counter = 0u32;
@@ -673,6 +761,8 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
         let mut dep_scope = DepScope {
             prev: root_dep_selections(ctx),
             acc: &mut dep_selections,
+            cur_prev: None,
+            bridged: HashMap::new(),
         };
         let (selection, tree): (PartitionSelection, EvalNodeResult) = eval_partitioned(
             node,
@@ -701,6 +791,8 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
         let mut dep_scope = DepScope {
             prev: &ctx.prev_state.dep_previous_results,
             acc: &mut dep_results,
+            cur_prev: None,
+            bridged: HashMap::new(),
         };
         let tree =
             eval_inner::<EvalNodeResult>(node, ctx, &mut counter, &mut sub_results, &mut dep_scope);
@@ -738,7 +830,6 @@ fn eval_backfill_in_progress_partitioned(
                 targeted.extend(pctx.all_keys.intersection(&bf_set).cloned());
             }
             _ => {
-                // Empty or missing: backfill targets the whole asset.
                 return PartitionSelection::Keys(pctx.all_keys.clone());
             }
         }
@@ -840,10 +931,7 @@ fn eval_new_update_tags_partitioned(
     }
 }
 
-/// Check if a cron tick occurred between `prev_nanos` and `now_nanos`.
-/// Caches parsed cron expressions in a thread-local to avoid re-parsing
-/// the same schedule string on every eval.
-/// Parse a cron schedule (seconds optional) — the one place the syntax is defined.
+/// Parse a cron schedule (seconds optional).
 fn build_cron(schedule: &str) -> Result<croner::Cron, String> {
     croner::parser::CronParser::builder()
         .seconds(croner::parser::Seconds::Optional)
@@ -857,25 +945,111 @@ pub fn validate_cron(schedule: &str) -> Result<(), String> {
     build_cron(schedule).map(|_| ())
 }
 
-fn cron_tick_between(cron_schedule: &str, prev_nanos: i64, now_nanos: i64) -> bool {
+/// Validate an IANA timezone name at construction (parsed via `chrono-tz`).
+pub fn validate_timezone(tz: &str) -> Result<(), String> {
+    tz.parse::<chrono_tz::Tz>()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Next cron occurrence strictly after `after`, as a real UTC instant, evaluated
+/// against the declared `timezone`'s WALL CLOCK.
+pub fn next_cron_occurrence_utc(
+    cron: &croner::Cron,
+    after: chrono::DateTime<chrono::Utc>,
+    timezone: Option<&str>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::TimeZone;
+
+    let Some(tz) = timezone.and_then(|t| t.parse::<chrono_tz::Tz>().ok()) else {
+        return cron.find_next_occurrence(&after, false).ok();
+    };
+
+    let resolve_ambiguous = |earliest: chrono::DateTime<chrono_tz::Tz>,
+                             latest: chrono::DateTime<chrono_tz::Tz>| {
+        let e = earliest.with_timezone(&chrono::Utc);
+        if e > after {
+            e
+        } else {
+            latest.with_timezone(&chrono::Utc)
+        }
+    };
+
+    let naive_after = after.with_timezone(&tz).naive_local();
+    let fake_after = chrono::Utc.from_utc_datetime(&naive_after);
+    let fake_next = cron.find_next_occurrence(&fake_after, false).ok()?;
+    let wall_next = fake_next.naive_utc();
+
+    match tz.from_local_datetime(&wall_next) {
+        chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&chrono::Utc)),
+        chrono::LocalResult::Ambiguous(earliest, latest) => {
+            Some(resolve_ambiguous(earliest, latest))
+        }
+        chrono::LocalResult::None => {
+            let mut probe = wall_next;
+            for _ in 0..240 {
+                probe += chrono::Duration::minutes(1);
+                match tz.from_local_datetime(&probe) {
+                    chrono::LocalResult::Single(dt) => {
+                        return Some(dt.with_timezone(&chrono::Utc));
+                    }
+                    chrono::LocalResult::Ambiguous(earliest, latest) => {
+                        return Some(resolve_ambiguous(earliest, latest));
+                    }
+                    chrono::LocalResult::None => {}
+                }
+            }
+            Some(fake_next.max(after + chrono::Duration::minutes(1)))
+        }
+    }
+}
+
+fn cron_tick_between(
+    cron_schedule: &str,
+    prev_nanos: i64,
+    now_nanos: i64,
+    timezone: Option<&str>,
+) -> bool {
+    use chrono::TimeZone;
     use std::cell::RefCell;
 
     thread_local! {
         static CRON_CACHE: RefCell<HashMap<String, croner::Cron>> = RefCell::new(HashMap::new());
+        static TZ_CACHE: RefCell<HashMap<String, Option<chrono_tz::Tz>>> =
+            RefCell::new(HashMap::new());
     }
 
     let prev_secs = prev_nanos / 1_000_000_000;
     let now_secs = now_nanos / 1_000_000_000;
 
+    let tz: Option<chrono_tz::Tz> = timezone.and_then(|t| {
+        TZ_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if !cache.contains_key(t) {
+                cache.insert(t.to_string(), t.parse().ok());
+            }
+            cache[t]
+        })
+    });
+    let to_wall = |secs: i64| -> Option<chrono::DateTime<chrono::Utc>> {
+        let utc = chrono::DateTime::from_timestamp(secs, 0)?;
+        let naive = match tz {
+            Some(tz) => utc.with_timezone(&tz).naive_local(),
+            None => utc.naive_utc(),
+        };
+        Some(chrono::Utc.from_utc_datetime(&naive))
+    };
+
     CRON_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let cron = cache.entry(cron_schedule.to_string()).or_insert_with(|| {
-            // Validated at construction, so a parse error here is a bug.
-            build_cron(cron_schedule).expect("cron schedule validated at construction")
-        });
-        let prev_dt = chrono::DateTime::from_timestamp(prev_secs, 0);
-        let now_dt = chrono::DateTime::from_timestamp(now_secs, 0);
-        match (prev_dt, now_dt) {
+        if !cache.contains_key(cron_schedule) {
+            cache.insert(
+                cron_schedule.to_string(),
+                build_cron(cron_schedule).expect("cron schedule validated at construction"),
+            );
+        }
+        let cron = &cache[cron_schedule];
+        match (to_wall(prev_secs), to_wall(now_secs)) {
             (Some(prev), Some(now)) => cron
                 .find_next_occurrence(&prev, false)
                 .map(|next| next <= now)
@@ -902,11 +1076,6 @@ static EMPTY_CONDITION_STATE: std::sync::LazyLock<AssetConditionState> =
     std::sync::LazyLock::new(AssetConditionState::default);
 
 /// Evaluate `condition` as if `dep_key` were the target asset.
-///
-/// Stateful ops (`Since`/`NewlyTrue`) latch under the ROOT's state keyed by dep
-/// (read `dep_results.prev`, write `dep_results.acc`); the scope threads into
-/// nested pivots so a multi-hop latch still resolves against the root. Factual
-/// leaves read the dep's own state.
 fn eval_on_dep(
     dep_key: &str,
     condition: &ConditionNode,
@@ -922,15 +1091,13 @@ fn eval_on_dep(
         .all_asset_states
         .get(dep_key)
         .unwrap_or(&EMPTY_CONDITION_STATE);
-    let mut synthetic = dep_state.clone();
-    synthetic.previous_results = dep_results.prev.get(dep_key).cloned().unwrap_or_default();
     let dep_ctx = EvalContext {
         target_key: dep_key,
         root_key: ctx.root_key,
         target_record: dep_record,
         cache: ctx.cache,
         tags: ctx.tags,
-        prev_state: &synthetic,
+        prev_state: dep_state,
         all_asset_states: ctx.all_asset_states,
         requested_this_tick: ctx.requested_this_tick,
         now: ctx.now,
@@ -939,19 +1106,17 @@ fn eval_on_dep(
         root_partition_floor: None,
     };
     let mut local = HashMap::new();
+    let saved = dep_results.cur_prev;
+    let latch = dep_results.prev.get(dep_key).unwrap_or(&EMPTY_BOOL_LATCH);
+    dep_results.cur_prev = Some(latch);
     let val = eval_inner(condition, &dep_ctx, counter, &mut local, dep_results);
-    if !local.is_empty() {
-        dep_results.acc.insert(dep_key.to_string(), local);
-    }
+    dep_results.cur_prev = saved;
+    collect_dep_latch(dep_results, dep_key, local);
     val
 }
 
 /// Recursive partition-aware evaluator. Returns an `O` indicating which
-/// partitions satisfy the condition. Uses the same monotonic counter system
-/// as `eval_inner` for node indexing stability.
-///
-/// Generic over `O`: when `O = PartitionSelection` we get the fast path;
-/// when `O = (PartitionSelection, EvalNodeResult)` we get a full tree.
+/// partitions satisfy the condition.
 fn eval_partitioned<O: PartEvalOutput>(
     node: &ConditionNode,
     ctx: &EvalContext,
@@ -980,22 +1145,15 @@ fn eval_partitioned<O: PartEvalOutput>(
             O::leaf(sel, my_idx, node, total)
         }
 
-        ConditionNode::InProgress => {
-            let sel = if pctx.in_progress.is_empty() {
-                PartitionSelection::Empty
-            } else {
-                PartitionSelection::Keys(pctx.in_progress.clone())
-            };
-            O::leaf(sel, my_idx, node, total)
-        }
+        ConditionNode::InProgress => O::leaf(
+            select_in_universe(pctx.in_progress, pctx),
+            my_idx,
+            node,
+            total,
+        ),
 
         ConditionNode::ExecutionFailed => {
-            let sel = if pctx.failed.is_empty() {
-                PartitionSelection::Empty
-            } else {
-                PartitionSelection::Keys(pctx.failed.clone())
-            };
-            O::leaf(sel, my_idx, node, total)
+            O::leaf(select_in_universe(pctx.failed, pctx), my_idx, node, total)
         }
 
         ConditionNode::CodeVersionChanged => {
@@ -1016,35 +1174,21 @@ fn eval_partitioned<O: PartEvalOutput>(
                 .partition_state
                 .as_ref()
                 .map(|ps| &ps.timestamps);
-            // In a dep pivot (target ≠ root) observation baselines are
-            // unsound both ways: async event drains re-surface already-
-            // acted-on events (double fire), and a fire can baseline a key
-            // that a sibling clause suppressed that tick (lost fire,
-            // forever). Compare staleness instead: a dep key counts as
-            // updated while it is strictly newer than the root's
-            // materialization of the downstream key(s) the partition mapping
-            // resolves it to — the dispatched run advances those keys past
-            // the dep so the trigger self-suppresses, and a missed tick
-            // simply retries. Mapped keys never materialized pass; dep keys
-            // with no counterpart in the downstream universe never count
-            // (nothing could ever be dispatched for them). The floor map is
-            // built per dep by `eval_partitioned_on_dep`; outside dep pivots
-            // (and for roots without partition status) baselines remain.
             let updated: HashSet<PartitionKey> = pctx
                 .timestamps
                 .iter()
-                .filter(|&(pk, &ts)| match pctx.dep_root_floor {
-                    Some(floor) => match floor.get(pk) {
-                        None => false,
-                        Some(&inner) => dep_newer_than_floor(ts, inner),
-                    },
-                    None => match prev_timestamps.and_then(|pt| pt.get(pk)) {
-                        Some(&prev) => ts > prev,
-                        // No baseline on the initial tick = materialized before
-                        // startup, not new (suppress); later = appeared between
-                        // ticks (fire). Mirrors the unpartitioned arm.
-                        None => !ctx.is_initial,
-                    },
+                .filter(|&(pk, &ts)| {
+                    pctx.all_keys.contains(pk)
+                        && match pctx.dep_root_floor {
+                            Some(floor) => match floor.get(pk) {
+                                None => false,
+                                Some(&inner) => dep_newer_than_floor(ts, inner),
+                            },
+                            None => match prev_timestamps.and_then(|pt| pt.get(pk)) {
+                                Some(&prev) => ts > prev,
+                                None => !ctx.is_initial,
+                            },
+                        }
                 })
                 .map(|(pk, _)| pk.clone())
                 .collect();
@@ -1057,17 +1201,37 @@ fn eval_partitioned<O: PartEvalOutput>(
         }
 
         ConditionNode::NewlyRequested => {
-            let val = ctx.prev_state.last_handled_timestamp.is_some()
+            let requested_last_tick = ctx.prev_state.last_handled_timestamp.is_some()
                 && ctx.prev_state.last_handled_timestamp == ctx.prev_state.last_tick_timestamp;
-            O::leaf(PartitionSelection::from_bool(val), my_idx, node, total)
+            let sel = if requested_last_tick {
+                match ctx.prev_state.partition_state.as_ref() {
+                    Some(ps) => {
+                        let keys: HashSet<PartitionKey> = ps
+                            .handled
+                            .iter()
+                            .filter(|k| pctx.all_keys.contains(*k))
+                            .cloned()
+                            .collect();
+                        if keys.is_empty() {
+                            PartitionSelection::Empty
+                        } else {
+                            PartitionSelection::Keys(keys)
+                        }
+                    }
+                    None => PartitionSelection::Empty,
+                }
+            } else {
+                PartitionSelection::Empty
+            };
+            O::leaf(sel, my_idx, node, total)
         }
 
         ConditionNode::CronTickPassed {
             cron_schedule,
-            timezone: _,
+            timezone,
         } => {
-            let prev_ts = ctx.prev_state.last_tick_timestamp.unwrap_or(ctx.now);
-            let val = cron_tick_between(cron_schedule, prev_ts, ctx.now);
+            let prev_ts = root_last_tick(ctx).unwrap_or(ctx.now);
+            let val = cron_tick_between(cron_schedule, prev_ts, ctx.now, timezone.as_deref());
             let sel = if val {
                 PartitionSelection::Keys(pctx.all_keys.clone())
             } else {
@@ -1077,9 +1241,6 @@ fn eval_partitioned<O: PartEvalOutput>(
         }
 
         ConditionNode::InLatestTimeWindow { .. } => {
-            // For time-windowed partitions, select only partitions whose time window
-            // is recent (precomputed by the daemon). For non-time partitions (static,
-            // dynamic), select all partitions
             let sel = match &pctx.latest_time_window_keys {
                 Some(keys) => {
                     if keys.is_empty() {
@@ -1108,7 +1269,11 @@ fn eval_partitioned<O: PartEvalOutput>(
                 ctx.prev_state.last_data_version.as_ref(),
             ) {
                 (Some(current), Some(prev)) => current != prev,
-                (Some(_), None) => true,
+                (Some(_), None) => {
+                    !ctx.is_initial
+                        && ctx.prev_state.last_materialized_timestamp
+                            != ctx.target_record.last_timestamp
+                }
                 _ => false,
             };
             let sel = if changed {
@@ -1158,10 +1323,6 @@ fn eval_partitioned<O: PartEvalOutput>(
         }
 
         ConditionNode::WillBeRequested => {
-            // The target's fired selection from earlier this tick, in its own
-            // key space — a dep pivot maps it downstream like any other
-            // selection. Unpartitioned fires arrive as `All` and widen to the
-            // full universe.
             let sel = match ctx.requested_this_tick.get(ctx.target_key) {
                 None | Some(PartitionSelection::Empty) => PartitionSelection::Empty,
                 Some(PartitionSelection::All) => PartitionSelection::Keys(pctx.all_keys.clone()),
@@ -1217,7 +1378,7 @@ fn eval_partitioned<O: PartEvalOutput>(
             let mut result = PartitionSelection::Keys(pctx.all_keys.clone());
             let mut child_parts = Vec::with_capacity(children.len());
             for child in children {
-                if result.is_empty() {
+                if result.is_empty() && !child.has_stateful_nodes() {
                     child_parts.push(O::skipped_child(child, counter));
                 } else {
                     let child_out = eval_partitioned::<O>(
@@ -1229,7 +1390,9 @@ fn eval_partitioned<O: PartEvalOutput>(
                         dep_selections,
                     );
                     let (child_sel, child_part) = O::into_parts(child_out);
-                    result = result.intersect(&child_sel);
+                    if !result.is_empty() {
+                        result = result.intersect(&child_sel);
+                    }
                     child_parts.push(child_part);
                 }
             }
@@ -1240,7 +1403,7 @@ fn eval_partitioned<O: PartEvalOutput>(
             let mut result = PartitionSelection::Empty;
             let mut child_parts = Vec::with_capacity(children.len());
             for child in children {
-                if result.is_all() {
+                if result.is_all() && !child.has_stateful_nodes() {
                     child_parts.push(O::skipped_child(child, counter));
                 } else {
                     let child_out = eval_partitioned::<O>(
@@ -1252,7 +1415,9 @@ fn eval_partitioned<O: PartEvalOutput>(
                         dep_selections,
                     );
                     let (child_sel, child_part) = O::into_parts(child_out);
-                    result = result.union(&child_sel);
+                    if !result.is_all() {
+                        result = result.union(&child_sel);
+                    }
                     child_parts.push(child_part);
                 }
             }
@@ -1271,14 +1436,7 @@ fn eval_partitioned<O: PartEvalOutput>(
             let child_out =
                 eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
             let (current, child_part) = O::into_parts(child_out);
-            let previous = ctx
-                .prev_state
-                .partition_state
-                .as_ref()
-                .and_then(|ps| ps.previous_selections.get(&my_idx))
-                .cloned()
-                .unwrap_or(PartitionSelection::Empty);
-            // First-tick behavior handled via InitialEvaluation composition.
+            let previous = prev_partition_latch(dep_selections, ctx, my_idx);
             let result = current.difference(&previous, pctx.all_keys);
             sub_selections.insert(my_idx, current);
             O::composite(result, my_idx, node, total, vec![child_part])
@@ -1291,14 +1449,7 @@ fn eval_partitioned<O: PartEvalOutput>(
                 eval_partitioned::<O>(reset, ctx, pctx, counter, sub_selections, dep_selections);
             let (trigger_sel, trigger_part) = O::into_parts(trigger_out);
             let (reset_sel, reset_part) = O::into_parts(reset_out);
-            let prev_latch = ctx
-                .prev_state
-                .partition_state
-                .as_ref()
-                .and_then(|ps| ps.previous_selections.get(&my_idx))
-                .cloned()
-                .unwrap_or(PartitionSelection::Empty);
-            // (prev_latched ∪ trigger) - reset
+            let prev_latch = prev_partition_latch(dep_selections, ctx, my_idx);
             let result = prev_latch
                 .union(&trigger_sel)
                 .difference(&reset_sel, pctx.all_keys);
@@ -1313,35 +1464,29 @@ fn eval_partitioned<O: PartEvalOutput>(
             let result = if current.is_empty() {
                 PartitionSelection::Empty
             } else {
-                let handled = ctx
-                    .prev_state
-                    .partition_state
-                    .as_ref()
-                    .map(|ps| &ps.handled);
-                match handled {
-                    None => current, // never handled
-                    Some(handled_set) => {
-                        // Remove handled partitions, but only if handling happened
-                        // on the previous tick (same debounce logic as unpartitioned).
-                        let was_just_handled = ctx
-                            .prev_state
-                            .last_handled_timestamp
-                            .map(|h| {
-                                ctx.prev_state
-                                    .last_tick_timestamp
-                                    .map(|lt| h >= lt)
-                                    .unwrap_or(false)
-                            })
-                            .unwrap_or(false);
-                        if was_just_handled {
+                let (last_handled, last_tick) = root_handled_state(ctx);
+                let was_just_handled = last_handled
+                    .map(|h| last_tick.map(|lt| h >= lt).unwrap_or(false))
+                    .unwrap_or(false);
+                if !was_just_handled {
+                    current
+                } else if ctx.target_key != ctx.root_key {
+                    PartitionSelection::Empty
+                } else {
+                    match ctx
+                        .prev_state
+                        .partition_state
+                        .as_ref()
+                        .map(|ps| &ps.handled)
+                    {
+                        None => current,
+                        Some(handled_set) => {
                             let handled_sel = if handled_set.is_empty() {
                                 PartitionSelection::Empty
                             } else {
                                 PartitionSelection::Keys(handled_set.clone())
                             };
                             current.difference(&handled_sel, pctx.all_keys)
-                        } else {
-                            current
                         }
                     }
                 }
@@ -1384,6 +1529,7 @@ fn eval_partitioned_all_deps(
     dep_selections: &mut DepScope<PartitionSelection>,
 ) -> PartitionSelection {
     let base = *counter;
+    let eval_all = condition.has_stateful_nodes();
     let result = match ctx.cache.upstream_deps.get(ctx.target_key) {
         Some(deps) if !deps.is_empty() => {
             let mut result = PartitionSelection::Keys(pctx.all_keys.clone());
@@ -1392,13 +1538,12 @@ fn eval_partitioned_all_deps(
                 let dep_sel =
                     eval_partitioned_on_dep(dep, condition, ctx, pctx, counter, dep_selections);
                 result = result.intersect(&dep_sel);
-                if result.is_empty() {
+                if result.is_empty() && !eval_all {
                     break;
                 }
             }
             result
         }
-        // No deps → vacuous truth.
         _ => PartitionSelection::Keys(pctx.all_keys.clone()),
     };
     finalize_dep_counter(counter, base, condition);
@@ -1407,19 +1552,14 @@ fn eval_partitioned_all_deps(
 
 /// Whether a dep at `dep_ts` counts as newly-updated against a downstream
 /// key's effective staleness `floor`: fire when the key was never attempted
-/// (`None`) or the dep is strictly newer than the floor. Shared by the scalar
-/// (unpartitioned-dep) and per-key (partitioned-dep) `NewlyUpdated` arms so the
-/// "never attempted ⇒ updated" rule lives in one place.
+/// (`None`) or the dep is strictly newer than the floor.
 fn dep_newer_than_floor(dep_ts: i64, floor: Option<i64>) -> bool {
     floor.is_none_or(|f| dep_ts > f)
 }
 
 /// The staleness floor across the downstream keys a dep key maps to: the
 /// minimum per-key effective timestamp, where effective = the later of the
-/// last materialization and the last (still-current) failure — a failed
-/// attempt consumes the dep update that triggered it, or the daemon would
-/// re-dispatch a failing partition every tick. `None` as soon as any mapped
-/// key was never attempted at all (that keeps the dep "updated").
+/// last materialization and the last (still-current) failure.
 fn root_floor_over<'k>(
     keys: impl Iterator<Item = &'k PartitionKey>,
     root_status: &crate::condition::cache::PartitionStatusEntry,
@@ -1442,9 +1582,7 @@ fn root_floor_over<'k>(
 
 /// Like `root_floor_over` but for fan-out (`AllPartitions`) edges: floor only
 /// over keys actually attempted, ignoring never-attempted ones instead of
-/// collapsing to `None`. A freshly-minted frontier key must not drag the floor
-/// to `None` and rebroadcast the whole universe on a stale dep. `None` only when
-/// nothing was ever attempted.
+/// collapsing to `None`.
 fn root_floor_over_attempted<'k>(
     keys: impl Iterator<Item = &'k PartitionKey>,
     root_status: &crate::condition::cache::PartitionStatusEntry,
@@ -1480,25 +1618,11 @@ fn eval_partitioned_on_dep(
         None => return PartitionSelection::Empty,
     };
 
-    // Per-dep latch lives under the root's partition state, keyed by dep.
-    let prev_dep_sel: HashMap<u32, PartitionSelection> = dep_selections
-        .prev
-        .get(dep_key)
-        .cloned()
-        .unwrap_or_default();
+    let prev_dep_sel: Option<&HashMap<u32, PartitionSelection>> = dep_selections.prev.get(dep_key);
 
-    let upstream_all_keys: HashSet<PartitionKey> = pctx
-        .resolver
-        .upstream_partition_keys
-        .get(dep_key)
-        .cloned()
-        .unwrap_or_default();
+    let upstream_entry = pctx.resolver.upstream_partition_keys.get(dep_key);
 
-    if upstream_all_keys.is_empty() {
-        // Upstream is unpartitioned — fall back to bool evaluation, but floor
-        // the dep against the root's OLDEST partition (min), not the asset-level
-        // max, so a `NewlyUpdated` pivot fires while any root partition is
-        // staler than the dep. `None` = some partition never attempted → fire.
+    if upstream_entry.is_none() {
         let root_floor = pctx
             .all_partition_statuses
             .get(ctx.root_key)
@@ -1507,19 +1631,13 @@ fn eval_partitioned_on_dep(
             .all_asset_states
             .get(dep_key)
             .unwrap_or(&EMPTY_CONDITION_STATE);
-        // Recover the bool view of the per-dep latch (non-empty selection == true).
-        let mut synthetic = dep_state.clone();
-        synthetic.previous_results = prev_dep_sel
-            .iter()
-            .map(|(idx, sel)| (*idx, !sel.is_empty()))
-            .collect();
         let dep_ctx = EvalContext {
             target_key: dep_key,
             root_key: ctx.root_key,
             target_record: dep_record,
             cache: ctx.cache,
             tags: ctx.tags,
-            prev_state: &synthetic,
+            prev_state: dep_state,
             all_asset_states: ctx.all_asset_states,
             requested_this_tick: ctx.requested_this_tick,
             now: ctx.now,
@@ -1527,21 +1645,41 @@ fn eval_partitioned_on_dep(
             partitions: None,
             root_partition_floor: Some(root_floor),
         };
+        let bool_latch: HashMap<u32, bool> = prev_dep_sel
+            .map(|m| m.iter().map(|(idx, sel)| (*idx, !sel.is_empty())).collect())
+            .unwrap_or_default();
         let mut local = HashMap::new();
-        // Unpartitioned upstream → bool eval; the dep's own latch round-trips via
-        // `local`. A dep-aggregate nested inside the fallback isn't carried (would
-        // need bool<->selection bridging — a rare corner).
-        let nested_prev = HashMap::new();
+        let nested_prev: HashMap<String, HashMap<u32, bool>> = dep_selections
+            .prev
+            .iter()
+            .map(|(k, m)| {
+                (
+                    k.clone(),
+                    m.iter().map(|(idx, sel)| (*idx, !sel.is_empty())).collect(),
+                )
+            })
+            .collect();
         let mut nested_acc = HashMap::new();
         let mut bool_scope = DepScope {
             prev: &nested_prev,
             acc: &mut nested_acc,
+            cur_prev: Some(&bool_latch),
+            bridged: HashMap::new(),
         };
         let val = eval_inner(condition, &dep_ctx, counter, &mut local, &mut bool_scope);
-        if !local.is_empty() {
-            dep_selections.acc.insert(
-                dep_key.to_string(),
-                local
+        collect_bridged_latch(
+            dep_selections,
+            dep_key,
+            local
+                .into_iter()
+                .map(|(idx, b)| (idx, PartitionSelection::from_bool(b)))
+                .collect(),
+        );
+        for (nested_key, idx_map) in nested_acc {
+            collect_bridged_latch(
+                dep_selections,
+                &nested_key,
+                idx_map
                     .into_iter()
                     .map(|(idx, b)| (idx, PartitionSelection::from_bool(b)))
                     .collect(),
@@ -1550,18 +1688,14 @@ fn eval_partitioned_on_dep(
         return PartitionSelection::from_bool(val);
     }
 
+    let upstream_all_keys: HashSet<PartitionKey> = upstream_entry.cloned().unwrap_or_default();
+
     let empty_status = crate::condition::cache::PartitionStatusEntry::default();
     let upstream_status = pctx
         .all_partition_statuses
         .get(dep_key)
         .unwrap_or(&empty_status);
 
-    // Staleness floor for `NewlyUpdated`, translated into the dep's key
-    // space: for each dep key, the root's materialization state of the
-    // downstream key(s) it maps to. Built here because the mapping and both
-    // universes are only visible at the pivot boundary. Identity edges (the
-    // default) skip the per-key selection round-trip — the dep key IS the
-    // downstream key.
     let mapping_kind = pctx.resolver.mapping_kind(dep_key, ctx.target_key);
     let is_identity = matches!(
         mapping_kind,
@@ -1592,14 +1726,7 @@ fn eval_partitioned_on_dep(
                     let floor = match &mapped {
                         PartitionSelection::Empty => return None,
                         PartitionSelection::All => {
-                            // Fan-out: uk feeds the whole downstream universe.
-                            // Floor over attempted keys only; a never-attempted
-                            // key would force None (→ "updated") and rebroadcast
-                            // All. Nothing attempted → uk not due.
-                            match root_floor_over_attempted(pctx.all_keys.iter(), root_status) {
-                                Some(f) => Some(f),
-                                None => return None,
-                            }
+                            root_floor_over_attempted(pctx.all_keys.iter(), root_status)
                         }
                         PartitionSelection::Keys(ks) => {
                             let in_universe: Vec<&PartitionKey> =
@@ -1631,25 +1758,13 @@ fn eval_partitioned_on_dep(
         .all_asset_states
         .get(dep_key)
         .unwrap_or(&EMPTY_CONDITION_STATE);
-    // Latch state (previous_selections) comes from the root's per-dep map, in the
-    // dep's key space; everything else (timestamps, handled) stays the dep's own.
-    let mut synthetic = dep_state.clone();
-    match synthetic.partition_state.as_mut() {
-        Some(ps) => ps.previous_selections = prev_dep_sel,
-        None => {
-            synthetic.partition_state = Some(PartitionState {
-                previous_selections: prev_dep_sel,
-                ..Default::default()
-            })
-        }
-    }
     let dep_ctx = EvalContext {
         target_key: dep_key,
         root_key: ctx.root_key,
         target_record: dep_record,
         cache: ctx.cache,
         tags: ctx.tags,
-        prev_state: &synthetic,
+        prev_state: dep_state,
         all_asset_states: ctx.all_asset_states,
         requested_this_tick: ctx.requested_this_tick,
         now: ctx.now,
@@ -1659,6 +1774,8 @@ fn eval_partitioned_on_dep(
     };
 
     let mut local = HashMap::new();
+    let saved = dep_selections.cur_prev;
+    dep_selections.cur_prev = Some(prev_dep_sel.unwrap_or(&EMPTY_SELECTION_LATCH));
     let upstream_result: PartitionSelection = eval_partitioned(
         condition,
         &dep_ctx,
@@ -1667,11 +1784,90 @@ fn eval_partitioned_on_dep(
         &mut local,
         dep_selections,
     );
-    if !local.is_empty() {
-        dep_selections.acc.insert(dep_key.to_string(), local);
-    }
+    dep_selections.cur_prev = saved;
+    collect_dep_latch(dep_selections, dep_key, local);
 
-    // Map result back to downstream partition space.
     pctx.resolver
         .map_downstream(dep_key, ctx.target_key, &upstream_result)
+}
+
+#[cfg(test)]
+mod latch_merge_tests {
+    use super::*;
+
+    fn scope<'a>(
+        prev: &'a HashMap<String, HashMap<u32, PartitionSelection>>,
+        acc: &'a mut HashMap<String, HashMap<u32, PartitionSelection>>,
+    ) -> DepScope<'a, PartitionSelection> {
+        DepScope {
+            prev,
+            acc,
+            cur_prev: None,
+            bridged: HashMap::new(),
+        }
+    }
+
+    fn keys(s: &str) -> PartitionSelection {
+        PartitionSelection::Keys(std::collections::HashSet::from([
+            crate::storage::PartitionKey::Single {
+                keys: vec![s.to_string()],
+            },
+        ]))
+    }
+
+    #[test]
+    fn bridged_write_never_clobbers_precise_latch() {
+        let prev = HashMap::new();
+        let mut acc = HashMap::new();
+        let mut sc = scope(&prev, &mut acc);
+
+        collect_dep_latch(&mut sc, "d", HashMap::from([(2u32, keys("d1"))]));
+        collect_bridged_latch(
+            &mut sc,
+            "d",
+            HashMap::from([(2u32, PartitionSelection::All)]),
+        );
+        assert_eq!(
+            sc.acc["d"][&2],
+            keys("d1"),
+            "a bridged All must not widen a precise Keys latch"
+        );
+
+        collect_bridged_latch(
+            &mut sc,
+            "d",
+            HashMap::from([(3u32, PartitionSelection::All)]),
+        );
+        collect_dep_latch(&mut sc, "d", HashMap::from([(3u32, keys("d2"))]));
+        assert_eq!(sc.acc["d"][&3], keys("d2"));
+        collect_bridged_latch(
+            &mut sc,
+            "d",
+            HashMap::from([(3u32, PartitionSelection::Empty)]),
+        );
+        assert_eq!(sc.acc["d"][&3], keys("d2"));
+    }
+
+    #[test]
+    fn bridged_writes_union_instead_of_clobbering() {
+        let prev = HashMap::new();
+        let mut acc = HashMap::new();
+        let mut sc = scope(&prev, &mut acc);
+
+        collect_bridged_latch(
+            &mut sc,
+            "d",
+            HashMap::from([(1u32, PartitionSelection::All)]),
+        );
+        collect_bridged_latch(
+            &mut sc,
+            "d",
+            HashMap::from([(1u32, PartitionSelection::Empty)]),
+        );
+        assert_eq!(
+            sc.acc["d"][&1],
+            PartitionSelection::All,
+            "a sibling's false latch must not erase a latched true"
+        );
+    }
 }

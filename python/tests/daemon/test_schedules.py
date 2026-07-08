@@ -100,6 +100,25 @@ class TestSchedule:
         with pytest.raises(ScheduleDefinitionError, match="job_name"):
             rs.Schedule(cron_schedule="0 0 * * *", job_name="")
 
+    def test_invalid_cron_raises_at_construction(self):
+        # A malformed cron must fail loudly at construction, not be silently
+        # dropped at daemon build (logged-only) so the schedule never fires.
+        with pytest.raises(ScheduleDefinitionError, match="cron_schedule"):
+            rs.Schedule(cron_schedule="totally bogus", job_name="my_job")
+
+    def test_invalid_timezone_raises_at_construction(self):
+        with pytest.raises(ScheduleDefinitionError, match="timezone"):
+            rs.Schedule(
+                cron_schedule="0 0 * * *", job_name="my_job", timezone="Not/AZone"
+            )
+
+    def test_valid_cron_and_timezone_accepted(self):
+        rs.Schedule(
+            cron_schedule="0 9 * * *",
+            job_name="my_job",
+            timezone="America/New_York",
+        )
+
     def test_repr(self):
         sched = rs.Schedule(
             cron_schedule="0 0 * * *", job_name="my_job", name="nightly"

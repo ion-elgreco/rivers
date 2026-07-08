@@ -17,7 +17,6 @@ pub(super) struct ScheduleInfo {
     pub(super) name: String,
     pub(super) cron_schedule: String,
     pub(super) job_name: String,
-    #[allow(dead_code)]
     pub(super) timezone: Option<String>,
     pub(super) tags: Option<HashMap<String, String>>,
     pub(super) eval_mode: ResolvedEvalMode,

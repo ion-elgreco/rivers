@@ -405,7 +405,11 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
         {
             Ok(cron) => {
                 let cron = Box::new(cron);
-                let next = cron.find_next_occurrence(&Utc::now(), false).ok();
+                let next = rivers_core::condition::next_cron_occurrence_utc(
+                    &cron,
+                    Utc::now(),
+                    info.timezone.as_deref(),
+                );
                 automations.push(AutomationEntry::Schedule {
                     info,
                     cron,

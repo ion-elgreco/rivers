@@ -1,11 +1,4 @@
 //! Per-tick orchestration of automation conditions on the Python side.
-//!
-//! [`ConditionTickEngine`] owns the PyO3-bound resources (storage handle,
-//! repo `Py` cell, channels) and delegates the pure-Rust phases — refresh,
-//! evaluate, apply, classify — to [`ConditionPass`]. The classified
-//! [`MaterializationPlan`] returned by `pass.run()` is then dispatched via
-//! `materialize_with_launcher` / `repo.backfill` (those calls have to stay
-//! Python-side; rivers-core can't depend on PyO3).
 use std::sync::Arc;
 
 use rivers_core::condition::{ConditionPass, EvalResultRow};
@@ -20,10 +13,7 @@ pub(super) struct ConditionTickEngine {
 
     pub(super) code_location_id: String,
     pub(super) storage: ScopedStorageHandle<SurrealStorage>,
-    /// Shared with the schedule/sensor path. Both run and backfill shapes
-    /// route through these dispatchers — schedule/sensor calls
-    /// `dispatch`/`dispatch` (job-resolved), condition calls
-    /// `dispatch_materialization`/`dispatch` (asset-selection).
+    /// Shared with the schedule/sensor path.
     pub(super) run_dispatcher: Arc<RunDispatcherKind>,
     pub(super) backfill_dispatcher: Arc<BackfillDispatcherKind>,
     pub(super) tick_tx: tokio::sync::mpsc::UnboundedSender<TickWriteMsg>,
@@ -33,15 +23,8 @@ pub(super) struct ConditionTickEngine {
 }
 
 impl ConditionTickEngine {
-    /// Run one tick: refresh cache, run a pure-Rust evaluation pass (evaluate
-    /// then apply state then classify materializations), emit per-asset
-    /// placeholder ticks, dispatch the classified plan into a single-write
-    /// handle, finalize the global condition tick, and persist eval state.
+    /// Run one tick: refresh cache, evaluate, dispatch materializations, persist state.
     pub(super) async fn tick(&mut self, now: i64) {
-        // Refresh is atomic via Plan/Apply: on storage error, the partial
-        // delta is dropped and the cache is unchanged. `now` powers the
-        // grace-period eviction of phantom dispatched run_ids inside the
-        // refresh.
         let has_changes = match self
             .pass
             .refresh_cache(self.storage.backend().as_ref(), now)
@@ -54,8 +37,6 @@ impl ConditionTickEngine {
             }
         };
 
-        // Advance partition universes: open time grids gain newly started
-        // windows; dynamic namespaces mirror storage (incl. retirements).
         let mut dynamic_keys = std::collections::HashMap::new();
         for ns in self.pass.dynamic_universe_namespaces() {
             match self.storage.scoped().get_dynamic_partitions(&ns).await {
@@ -118,9 +99,6 @@ impl ConditionTickEngine {
             );
         }
 
-        // Per-asset placeholder ticks (status: "Requested") — emitted
-        // immediately so the UI sees per-asset intent even while the global
-        // tick is still being assembled.
         let placeholder_keys = output
             .plan
             .unpartitioned
@@ -159,9 +137,6 @@ impl ConditionTickEngine {
         }
 
         if !output.results.is_empty() {
-            // Single-write tick: dispatch contributes ids into the handle;
-            // finalize awaits any pending backfill oneshots and writes the
-            // global ConditionTickRecord once with everything known.
             let mut handle = super::persist::ConditionTickHandle::new(
                 self.code_location_id.clone(),
                 now,
@@ -173,39 +148,50 @@ impl ConditionTickEngine {
             self.send_eval_records(&output.results, now, &tick_id);
         }
 
-        let _ = self
+        if let Err(e) = self
             .storage
             .scoped()
             .set_condition_eval_state(&self.pass.eval_state)
-            .await;
+            .await
+        {
+            tracing::warn!(
+                target: "rivers::daemon",
+                error = %e,
+                "failed to persist condition eval state; latches reset on restart"
+            );
+        }
     }
 
-    /// Send per-asset `ConditionEvalRecord`s referencing the already-persisted
-    /// global `tick_id`. The records go through the unbounded `eval_tx`
-    /// channel and are flushed by the background condition-eval writer.
-    /// The global `ConditionTickRecord` is written separately by
-    /// `ConditionTickHandle::finalize` (single write).
+    /// Send per-asset `ConditionEvalRecord`s referencing the already-persisted global `tick_id`.
     pub(super) fn send_eval_records(&self, results: &[EvalResultRow], now: i64, tick_id: &str) {
         let mut eval_records = Vec::with_capacity(results.len());
         for row in results {
             let info = &self.pass.conditions[row.info_idx];
-            if let Ok(tree_json) = serde_json::to_vec(&row.tree) {
-                let selection_json = row
-                    .result
-                    .selection
-                    .as_ref()
-                    .and_then(|sel| serde_json::to_vec(sel).ok());
-                eval_records.push(ConditionEvalRecord {
-                    code_location_id: self.code_location_id.clone(),
-                    asset_key: info.asset_key.clone(),
-                    tick_id: tick_id.to_string(),
-                    timestamp: now,
-                    fired: row.result.fired,
-                    eval_duration_us: row.duration_us,
-                    run_ids: vec![],
-                    tree_json,
-                    selection_json,
-                });
+            match serde_json::to_vec(&row.tree) {
+                Ok(tree_json) => {
+                    let selection_json = row
+                        .result
+                        .selection
+                        .as_ref()
+                        .and_then(|sel| serde_json::to_vec(sel).ok());
+                    eval_records.push(ConditionEvalRecord {
+                        code_location_id: self.code_location_id.clone(),
+                        asset_key: info.asset_key.clone(),
+                        tick_id: tick_id.to_string(),
+                        timestamp: now,
+                        fired: row.result.fired,
+                        eval_duration_us: row.duration_us,
+                        run_ids: vec![],
+                        tree_json,
+                        selection_json,
+                    });
+                }
+                Err(e) => tracing::warn!(
+                    target: "rivers::daemon",
+                    asset = %info.asset_key,
+                    error = %e,
+                    "failed to serialize condition eval tree; skipping eval record"
+                ),
             }
         }
         if !eval_records.is_empty() {

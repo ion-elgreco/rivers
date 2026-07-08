@@ -1,10 +1,4 @@
 //! The condition tree type system.
-//!
-//! [`ConditionNode`] is a recursive enum representing automation conditions:
-//! leaf predicates (Missing, CronTickPassed, CodeVersionChanged, ...),
-//! dependency aggregates (AnyDepsMatch, AllDepsMatch, ...), boolean combinators
-//! (And, Or, Not), and stateful operators (NewlyTrue, Since, SinceLastHandled).
-//! Includes preset constructors like `eager()`, `on_cron()`, and `on_missing()`.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,9 +13,6 @@ pub fn format_tag_label(
 }
 
 /// A condition tree node describing when an asset should be auto-materialized.
-///
-/// Mirrors the Python-side `ConditionNode` in `python/src/automation/condition.rs`.
-/// Serde derives allow persisting evaluation state to KV store.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ConditionNode {
     Missing,
@@ -38,35 +29,19 @@ pub enum ConditionNode {
         lookback_delta: Option<f64>,
     },
     /// True on the first evaluation tick after daemon startup or condition tree change.
-    /// Use this as a composable primitive for first-tick behavior instead of baking
-    /// `is_initial` checks into stateful operators like `NewlyTrue`.
     InitialEvaluation,
     /// True when the asset's `last_data_version` changed since the previous tick.
-    /// Tracks the data version in `AssetConditionState.last_data_version` across ticks.
     DataVersionChanged,
     /// True when the asset is part of an active backfill (Requested or InProgress status).
-    /// Distinct from `InProgress` which tracks regular run-level in-progress state.
-    /// Users who want both can compose: `InProgress | BackfillInProgress`.
     BackfillInProgress,
     /// True when the latest run that materialized this asset/partition had matching tags.
-    /// Supports two matching modes: `tag_keys` checks key presence (any value),
-    /// `tag_values` checks exact key-value pairs. Both are combined with AND.
     LastExecutedWithTags {
         tag_keys: Vec<String>,
         tag_values: Vec<(String, String)>,
     },
-    /// True if the latest run that materialized this asset also included the
-    /// root target (the top-level asset being evaluated) in its `node_names`.
-    /// Always false when `target_key == root_key` (self-referential guard).
-    /// Designed for use inside `any_deps_match()` to suppress cascading when
-    /// a joint run already covered both the dep and the downstream.
+    /// True if the latest run that materialized this asset also included the root target.
     LastRunIncludesTarget,
-    /// True if the target asset's condition has already fired (will be requested
-    /// for materialization) earlier in this evaluation tick.
-    /// Requires topological evaluation order (deps before downstreams).
-    /// Used in `any_deps_updated()` to trigger downstream before dep run completes,
-    /// and in `any_deps_missing()` to avoid blocking when the missing dep is about
-    /// to be materialized.
+    /// True if the target asset's condition has already fired earlier in this evaluation tick.
     WillBeRequested,
 
     AnyDepsMatch {
@@ -85,43 +60,28 @@ pub enum ConditionNode {
     Not(Box<ConditionNode>),
 
     /// Rising-edge detector: true only on the tick where `child` transitions false → true.
-    /// Stores the child's raw value in `sub_results` so the next tick can detect the transition.
     NewlyTrue(Box<ConditionNode>),
 
     /// Latch (SR flip-flop): once `trigger` fires, stays true until `reset` fires.
     /// Reset takes priority — if both fire on the same tick, the result is false.
-    ///
-    /// Use case: fire-once-then-wait semantics. Without `Since`, conditions that stay
-    /// true across ticks (e.g. code version mismatch) would spam materializations every tick.
-    /// With `Since`, the condition fires once, then turns off when the reset acknowledges it:
-    ///
-    /// - `code_version_changed().since(newly_requested())` — "code changed and we haven't
-    ///   requested materialization yet"
-    /// - `any_deps_updated().since(newly_requested() | newly_updated())` — "a dep updated
-    ///   and we haven't handled it yet" (this is what `since_last_handled` expands to)
     Since {
         trigger: Box<ConditionNode>,
         reset: Box<ConditionNode>,
     },
 
-    /// Shorthand for debounce: true while `child` is true and hasn't been handled
-    /// (i.e. `last_handled_timestamp < last_tick_timestamp`). Used in presets like
-    /// `eager()` and `on_cron()` to prevent re-firing on the tick immediately after handling.
+    /// Shorthand for debounce: true while `child` is true and hasn't been handled.
     SinceLastHandled(Box<ConditionNode>),
     /// True if any of this asset's new materializations (this tick) came from runs with matching tags.
-    /// Designed for composition inside `any_deps_match()` to filter dep updates by run tags.
     HasRunWithTags {
         tag_keys: Vec<String>,
         tag_values: Vec<(String, String)>,
     },
     /// True if all of this asset's new materializations (this tick) came from runs with matching tags.
-    /// Vacuously true if there were no new materializations this tick.
     AllRunsHaveTags {
         tag_keys: Vec<String>,
         tag_values: Vec<(String, String)>,
     },
-    /// Evaluate a condition on specific named assets. True if the condition
-    /// is true for any of the listed assets.
+    /// Evaluate a condition on specific named assets (true if any match).
     AssetMatches {
         keys: Vec<String>,
         condition: Box<ConditionNode>,
@@ -130,35 +90,6 @@ pub enum ConditionNode {
 
 impl ConditionNode {
     /// Eager materialization preset.
-    ///
-    /// ```text
-    /// And([
-    ///     SinceLastHandled(Or([
-    ///         NewlyTrue(Missing),      // = newly_missing()
-    ///         any_deps_updated(),
-    ///     ])),
-    ///     Not(AnyDepsMissing),
-    ///     Not(AnyDepsInProgress),
-    ///     Not(in_flight),             // = Not(InProgress | BackfillInProgress)
-    ///     Not(ExecutionFailed),
-    /// ])
-    /// ```
-    ///
-    /// `NewlyTrue` is a pure rising-edge detector (fires when child transitions
-    /// false→true). On the first tick with no previous state, `previous=false`
-    /// so `NewlyTrue(Missing)` fires if the asset is missing — no `is_initial`
-    /// hack needed. Users can compose `InitialEvaluation` explicitly for custom
-    /// first-tick behavior.
-    ///
-    /// `Not(in_flight)` excludes partitions already being materialized by a run
-    /// *or* an active backfill, and is the *only* dispatch gate (`apply_results`
-    /// dispatches whatever fires). The backfill arm matters: a backfill registers
-    /// its per-partition runs lazily, so a not-yet-started partition is still
-    /// owned by it and must not be re-fired (root floor `None`) as a duplicate.
-    ///
-    /// `Not(ExecutionFailed)` excludes failed partitions/assets, so they aren't
-    /// auto-retried every tick until re-run.
-    ///
     pub fn eager() -> Self {
         (ConditionNode::Missing.newly_true() | ConditionNode::any_deps_updated())
             .since_last_handled()
@@ -168,10 +99,7 @@ impl ConditionNode {
             & !ConditionNode::ExecutionFailed
     }
 
-    /// Composite: true if any dep was updated (and the run didn't already
-    /// include the target) OR will be requested this tick. Enables same-tick
-    /// cascading: downstream fires when its dep's condition fires, without
-    /// waiting for the dep to materialize first.
+    /// Composite: true if any dep was updated OR will be requested this tick.
     pub fn any_deps_updated() -> Self {
         ConditionNode::AnyDepsMatch {
             condition: Box::new(
@@ -183,8 +111,6 @@ impl ConditionNode {
     }
 
     /// Composite: true if any dep is missing AND won't be requested this tick.
-    /// A missing dep that is about to be materialized (WillBeRequested) does
-    /// not block the downstream.
     pub fn any_deps_missing() -> Self {
         ConditionNode::AnyDepsMatch {
             condition: Box::new(ConditionNode::Missing & !ConditionNode::WillBeRequested),
@@ -200,23 +126,12 @@ impl ConditionNode {
         }
     }
 
-    /// Composite: being materialized by *anything* — a run (`InProgress`) or an
-    /// active backfill (`BackfillInProgress`). Presets negate this as their sole
-    /// re-dispatch guard; the two leaves stay separate for composing either alone.
+    /// Composite: being materialized by anything — a run or an active backfill.
     pub fn in_flight() -> Self {
         ConditionNode::InProgress | ConditionNode::BackfillInProgress
     }
 
     /// Composite: true if all deps have been updated since the last cron tick.
-    ///
-    /// ```text
-    /// AllDepsMatch(
-    ///     Since(trigger=NewlyUpdated, reset=CronTickPassed) | WillBeRequested
-    /// )
-    /// ```
-    ///
-    /// Each dep's SR latch resets on the cron tick and goes true when the dep
-    /// updates. `WillBeRequested` allows same-tick cascading.
     pub fn all_deps_updated_since_cron(cron_schedule: String, timezone: Option<String>) -> Self {
         ConditionNode::AllDepsMatch {
             condition: Box::new(
@@ -230,21 +145,6 @@ impl ConditionNode {
     }
 
     /// Cron-based automation preset.
-    ///
-    /// ```text
-    /// And([
-    ///     SinceLastHandled(CronTickPassed),
-    ///     all_deps_updated_since_cron(schedule, tz),
-    ///     Not(in_flight),
-    /// ])
-    /// ```
-    ///
-    /// Waits for a cron tick, then fires once all deps have been updated since
-    /// that tick. Users can compose with `InLatestTimeWindow` or `.without()`
-    /// to customize partition filtering.
-    ///
-    /// `Not(in_flight)` keeps a cron tick from overlapping a materialization
-    /// still in flight (cron interval shorter than the run)
     pub fn on_cron(cron_schedule: String, timezone: Option<String>) -> Self {
         ConditionNode::CronTickPassed {
             cron_schedule: cron_schedule.clone(),
@@ -255,18 +155,14 @@ impl ConditionNode {
             & !ConditionNode::in_flight()
     }
 
-    /// On-missing preset. Fires when an asset becomes missing and has no
-    /// missing deps, skipping partitions in a failed state (so a deliberate
-    /// `mark_partition_failed` isn't re-requested). Users can compose with
-    /// `InLatestTimeWindow` to restrict to recent partitions.
+    /// On-missing preset. Fires when an asset becomes missing and has no missing deps.
     pub fn on_missing() -> Self {
         ConditionNode::Missing.newly_true().since_last_handled()
             & !ConditionNode::any_deps_missing()
             & !ConditionNode::ExecutionFailed
     }
 
-    /// Returns true if this condition tree contains any time-based nodes
-    /// (e.g. `CronTickPassed`) that need evaluation even when storage hasn't changed.
+    /// Returns true if this condition tree contains any time-based nodes.
     pub fn has_time_based_conditions(&self) -> bool {
         match self {
             ConditionNode::CronTickPassed { .. } => true,
@@ -284,6 +180,28 @@ impl ConditionNode {
             | ConditionNode::AssetMatches { condition, .. } => {
                 condition.has_time_based_conditions()
             }
+            _ => false,
+        }
+    }
+
+    /// True if the tree contains a stateful operator (`Since`/`NewlyTrue`).
+    pub fn has_stateful_nodes(&self) -> bool {
+        match self {
+            ConditionNode::Since { .. } | ConditionNode::NewlyTrue(_) => true,
+            ConditionNode::And(children) | ConditionNode::Or(children) => {
+                children.iter().any(|c| c.has_stateful_nodes())
+            }
+            ConditionNode::Not(child)
+            | ConditionNode::SinceLastHandled(child)
+            | ConditionNode::AnyDepsMatch {
+                condition: child, ..
+            }
+            | ConditionNode::AllDepsMatch {
+                condition: child, ..
+            }
+            | ConditionNode::AssetMatches {
+                condition: child, ..
+            } => child.has_stateful_nodes(),
             _ => false,
         }
     }
@@ -454,9 +372,13 @@ impl ConditionNode {
             ConditionNode::NewlyUpdated => "newly_updated".into(),
             ConditionNode::NewlyRequested => "newly_requested".into(),
             ConditionNode::CodeVersionChanged => "code_version_changed".into(),
-            ConditionNode::CronTickPassed { cron_schedule, .. } => {
-                format!("cron_tick_passed('{}')", cron_schedule)
-            }
+            ConditionNode::CronTickPassed {
+                cron_schedule,
+                timezone,
+            } => match timezone {
+                Some(tz) => format!("cron_tick_passed('{}', tz='{}')", cron_schedule, tz),
+                None => format!("cron_tick_passed('{}')", cron_schedule),
+            },
             ConditionNode::InLatestTimeWindow { lookback_delta } => match lookback_delta {
                 Some(d) => format!("in_latest_time_window({}s)", d),
                 None => "in_latest_time_window".into(),
@@ -478,19 +400,26 @@ impl ConditionNode {
                 tag_keys,
                 tag_values,
             } => format_tag_label("all_runs_have_tags", tag_keys, tag_values),
-            ConditionNode::AnyDepsMatch { label, .. } => {
-                label.as_deref().unwrap_or("any_deps_match(...)").into()
-            }
-            ConditionNode::AllDepsMatch { label, .. } => {
-                label.as_deref().unwrap_or("all_deps_match(...)").into()
-            }
-            ConditionNode::AssetMatches { keys, .. } => {
-                if keys.len() == 1 {
-                    format!("asset_matches('{}')", keys[0])
+            ConditionNode::AnyDepsMatch { condition, label } => match label {
+                Some(l) => l.clone(),
+                None => format!("any_deps_match({})", condition.fingerprint_hex()),
+            },
+            ConditionNode::AllDepsMatch { condition, label } => match label {
+                Some(l) => l.clone(),
+                None => format!("all_deps_match({})", condition.fingerprint_hex()),
+            },
+            ConditionNode::AssetMatches { keys, condition } => {
+                let keys_label = if keys.len() == 1 {
+                    format!("'{}'", keys[0])
                 } else {
                     let joined: Vec<_> = keys.iter().map(|k| format!("'{}'", k)).collect();
-                    format!("asset_matches([{}])", joined.join(", "))
-                }
+                    format!("[{}]", joined.join(", "))
+                };
+                format!(
+                    "asset_matches({}, {})",
+                    keys_label,
+                    condition.fingerprint_hex()
+                )
             }
             ConditionNode::And(_) => "All of".into(),
             ConditionNode::Or(_) => "Any of".into(),
@@ -501,11 +430,57 @@ impl ConditionNode {
         }
     }
 
+    /// Readable label for UI display (the eval tree).
+    pub fn display_label(&self) -> String {
+        match self {
+            ConditionNode::AnyDepsMatch { .. }
+            | ConditionNode::AllDepsMatch { .. }
+            | ConditionNode::AssetMatches { .. } => self.describe(),
+            _ => self.node_label(),
+        }
+    }
+
+    /// Readable recursive description of this tree.
+    pub fn describe(&self) -> String {
+        match self {
+            ConditionNode::And(children) => {
+                let parts: Vec<String> = children.iter().map(|c| c.describe()).collect();
+                format!("({})", parts.join(" & "))
+            }
+            ConditionNode::Or(children) => {
+                let parts: Vec<String> = children.iter().map(|c| c.describe()).collect();
+                format!("({})", parts.join(" | "))
+            }
+            ConditionNode::Not(child) => format!("~{}", child.describe()),
+            ConditionNode::NewlyTrue(child) => format!("newly_true({})", child.describe()),
+            ConditionNode::Since { trigger, reset } => {
+                format!("since({}, {})", trigger.describe(), reset.describe())
+            }
+            ConditionNode::SinceLastHandled(child) => {
+                format!("since_last_handled({})", child.describe())
+            }
+            ConditionNode::AnyDepsMatch { condition, label } => match label {
+                Some(l) => l.clone(),
+                None => format!("any_deps_match({})", condition.describe()),
+            },
+            ConditionNode::AllDepsMatch { condition, label } => match label {
+                Some(l) => l.clone(),
+                None => format!("all_deps_match({})", condition.describe()),
+            },
+            ConditionNode::AssetMatches { keys, condition } => {
+                let keys_label = if keys.len() == 1 {
+                    format!("'{}'", keys[0])
+                } else {
+                    let joined: Vec<_> = keys.iter().map(|k| format!("'{}'", k)).collect();
+                    format!("[{}]", joined.join(", "))
+                };
+                format!("asset_matches({}, {})", keys_label, condition.describe())
+            }
+            _ => self.node_label(),
+        }
+    }
+
     /// Deterministic fingerprint of this condition tree.
-    ///
-    /// Serializes the tree to canonical JSON and hashes with fixed-key SipHash
-    /// for cross-process stability. Used to detect when the condition tree has
-    /// changed across daemon restarts.
     pub fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = siphasher::sip::SipHasher::new_with_keys(0, 0);
@@ -520,7 +495,6 @@ impl ConditionNode {
     }
 
     /// Find the first `InLatestTimeWindow` node in the tree and return its `lookback_delta`.
-    /// Returns `None` if no such node exists, `Some(None)` if it exists without a lookback.
     pub fn find_lookback_delta(&self) -> Option<Option<f64>> {
         match self {
             ConditionNode::InLatestTimeWindow { lookback_delta } => Some(*lookback_delta),
@@ -534,7 +508,8 @@ impl ConditionNode {
                 .find_lookback_delta()
                 .or_else(|| reset.find_lookback_delta()),
             ConditionNode::AnyDepsMatch { condition, .. }
-            | ConditionNode::AllDepsMatch { condition, .. } => condition.find_lookback_delta(),
+            | ConditionNode::AllDepsMatch { condition, .. }
+            | ConditionNode::AssetMatches { condition, .. } => condition.find_lookback_delta(),
             _ => None,
         }
     }

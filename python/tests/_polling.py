@@ -5,6 +5,16 @@ from __future__ import annotations
 import time
 
 
+def wait_until(predicate, timeout: float = 10.0):
+    """Poll until ``predicate()`` is truthy or timeout; returns the last value."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.2)
+    return predicate()
+
+
 def wait_for_runs(storage, min_count: int = 1, timeout: float = 10.0, status=None):
     """Poll storage until at least min_count runs (optionally filtered by status) appear."""
     deadline = time.monotonic() + timeout
