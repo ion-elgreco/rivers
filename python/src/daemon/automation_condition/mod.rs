@@ -1,16 +1,4 @@
 //! Automation condition daemon loop — evaluates condition trees and triggers materializations.
-//!
-//! Uses `AssetConditionCache` for incremental evaluation state across ticks. Evaluates
-//! `ConditionNode` trees per asset (including partition-aware conditions), persists
-//! tick/eval records to storage, and emits `RunRequest`s to trigger materializations.
-//!
-//! The pure-Rust per-tick state machine — refresh / evaluate / apply /
-//! classify — lives in [`rivers_core::condition::ConditionPass`]. Python's
-//! [`engine::ConditionTickEngine`] holds the PyO3-bound resources (storage,
-//! repo cell, channels) and delegates each phase to the pass; the
-//! materialization fan-out (after a condition fires) lives in `materialize`.
-//! This module's `condition_eval_loop` is the entry point — it owns the
-//! engine and drives `engine.tick()` on a periodic interval.
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -36,9 +24,6 @@ mod persist;
 use engine::ConditionTickEngine;
 
 /// Build a [`PartitionInfo`] from a graph node. Returns `None` if unpartitioned.
-/// `node_map` supplies upstream definitions so time-window mappings carry
-/// their grid into core eval; `deps` supplies the asset's dependency edges so
-/// unmapped partitioned deps get their default Identity mapping.
 fn partition_info_from_node(
     asset_name: &str,
     node: &ResolvedNode,
@@ -46,14 +31,8 @@ fn partition_info_from_node(
     deps: &[NodeRef],
 ) -> Option<PartitionInfo> {
     let def = node.partitions_def()?;
-    // Captured before enumeration: a window starting between this and the
-    // enumerate call is re-added by the first refresh (extend is idempotent)
-    // rather than skipped.
     let now = chrono::Local::now().naive_local();
     let universe = partition_universe_for(def, now);
-    // Cap the automation universe at `now`: future time windows are not yet
-    // materializable (refresh_universe grows them in as wall-clock advances), so
-    // an explicit future `end` must not seed a backfill of the whole range.
     let all_keys = def
         .get_partition_keys_capped(now)
         .ok()
@@ -76,10 +55,7 @@ fn partition_info_from_node(
     })
 }
 
-/// Watermark the per-tick refresh resumes from. Seeding caps enumeration at
-/// `now` (see `get_partition_keys_capped`), so the watermark must also be
-/// `min(end, now)` — `refresh_universe` then grows the universe one window at a
-/// time as wall-clock reaches each, stopping at the explicit `end`.
+/// Watermark the per-tick refresh resumes from.
 fn seeded_watermark(
     def: &PartitionsDefinition,
     now: chrono::NaiveDateTime,
@@ -90,8 +66,7 @@ fn seeded_watermark(
     }
 }
 
-/// How `def`'s key universe evolves after extraction. `now` is the
-/// enumeration high-water mark for open time grids.
+/// How `def`'s key universe evolves after extraction.
 fn partition_universe_for(
     def: &PartitionsDefinition,
     now: chrono::NaiveDateTime,
@@ -112,12 +87,6 @@ fn partition_universe_for(
             dims: dimensions
                 .iter()
                 .map(|(dim_name, dim_def)| {
-                    // Seed capped at `now`, like `all_keys` (get_partition_keys_capped):
-                    // dims seeded through a future `end` would (a) make every
-                    // arriving window a no-op insert in refresh_universe — so
-                    // `changed` stays false and the cartesian `all_keys` never
-                    // grows — and (b) flood the whole future range back into
-                    // `all_keys` on the first sibling-dimension change.
                     let keys = dim_def
                         .enumerate_single_dim_keys_capped(now)
                         .unwrap_or_default()
@@ -144,17 +113,13 @@ fn partition_universe_for(
 }
 
 impl PyCodeRepository {
-    /// Extract assets with automation conditions from the repo. Returns
-    /// conditions in topological order (deps before downstreams) so that
-    /// `WillBeRequested` can see upstream results during same-tick evaluation.
+    /// Extract assets with automation conditions from the repo.
     pub(in crate::daemon) fn extract_asset_conditions(&self) -> Vec<AssetConditionInfo> {
         let guard = self.state.read().unwrap();
         let Some(state) = guard.as_ref() else {
             return Vec::new();
         };
 
-        // Backfill strategy is converted to the pure-Rust core variant here
-        // while we have the GIL — the eval loop runs without it.
         let mut by_key: HashMap<String, AssetConditionInfo> = HashMap::new();
         for (name, node) in &state.node_map {
             if let ResolvedNode::Asset(asset_node) = node
@@ -187,9 +152,7 @@ impl PyCodeRepository {
         state.inner_repo.sort_topologically(by_key)
     }
 
-    /// Extract upstream partition keys for all conditioned assets. Reads
-    /// the cached `PartitionsDefinition` value off each `ResolvedNode`, so
-    /// no GIL is required.
+    /// Extract upstream partition keys for all conditioned assets.
     pub(in crate::daemon) fn extract_upstream_partition_keys(
         &self,
         conditions: &[AssetConditionInfo],
@@ -203,8 +166,6 @@ impl PyCodeRepository {
             HashMap::new();
         for cond in conditions {
             if let Some(ref pi) = cond.partition_info {
-                // Conditioned assets re-sync from their refreshed
-                // PartitionInfo each tick, so Frozen here is fine.
                 map.entry(cond.asset_key.clone())
                     .or_insert_with(|| (pi.all_keys.clone(), PartitionUniverse::Frozen));
                 for (_, upstream_key) in pi.mappings.keys() {
@@ -214,11 +175,6 @@ impl PyCodeRepository {
                     {
                         let now = chrono::Local::now().naive_local();
                         let universe = partition_universe_for(def, now);
-                        // Capped at now, like the conditioned-asset universes:
-                        // a future-`end` upstream would otherwise keep e.g.
-                        // any_deps_match(missing()) permanently true (its
-                        // future windows can never materialize) and leak
-                        // phantom future keys into requested_this_tick.
                         let core_keys: HashSet<CorePartitionKey> = def
                             .get_partition_keys_capped(now)
                             .ok()
@@ -233,9 +189,7 @@ impl PyCodeRepository {
     }
 }
 
-/// `upstream_def` is the definition of the side the mapping shifts within —
-/// it supplies the time grid for `TimeWindow` and per-dimension defs for
-/// nested mappings.
+/// `upstream_def` is the definition of the side the mapping shifts within.
 fn mapping_to_kind(
     m: &PartitionMapping,
     upstream_def: Option<&PartitionsDefinition>,
@@ -280,8 +234,6 @@ fn mapping_to_kind(
             dimension_name,
             partition_mapping,
         } => {
-            // The inner mapping shifts within the named dimension when the
-            // upstream is Multi, else within the upstream itself.
             let inner_def = upstream_def.and_then(|d| match d {
                 PartitionsDefinition::Multi { dimensions } => dimensions
                     .iter()
@@ -313,9 +265,6 @@ fn extract_partition_mappings(
             result.insert((asset_name.to_string(), upstream_name.clone()), kind);
         }
     }
-    // An unmapped partitioned dep defaults to Identity at resolve time; the
-    // eval context must carry that default or the dep is treated as
-    // unpartitioned and its condition truth broadcasts across the universe.
     for dep in deps {
         let NodeRef::ByName(upstream_name) = dep else {
             continue;
@@ -337,12 +286,9 @@ fn extract_partition_mappings(
 
 pub(super) struct ConditionEvalLoopConfig {
     pub conditions: Vec<AssetConditionInfo>,
-    /// Storage scoped to the owning code location. Filters every per-CL
-    /// query in the loop and supplies `code_location_id` for queued
-    /// `RunRecord`s so the coordinator only dequeues this CL's runs.
+    /// Storage scoped to the owning code location.
     pub storage: ScopedStorageHandle<SurrealStorage>,
-    /// Shared with the schedule/sensor loop — both run and backfill
-    /// shapes route through these dispatchers.
+    /// Shared with the schedule/sensor loop.
     pub run_dispatcher: Arc<crate::daemon::dispatchers::RunDispatcherKind>,
     pub backfill_dispatcher: Arc<crate::daemon::dispatchers::BackfillDispatcherKind>,
     pub cancel: CancellationToken,
@@ -351,18 +297,11 @@ pub(super) struct ConditionEvalLoopConfig {
     pub max_ticks_retained: Option<usize>,
     pub eval_tx: tokio::sync::mpsc::UnboundedSender<ConditionEvalWriteMsg>,
     pub max_evals_retained: Option<usize>,
-    /// Upstream partition keys (+ how each set evolves), pre-extracted with
-    /// GIL at daemon start.
+    /// Upstream partition keys (+ how each set evolves), pre-extracted at daemon start.
     pub upstream_partition_keys: HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)>,
 }
 
 /// Background loop that periodically evaluates automation conditions on assets.
-/// Spawned as a separate tokio task alongside the schedule/sensor loop.
-///
-/// Owns one [`ConditionTickEngine`] for the lifetime of the daemon and drives
-/// `engine.tick()` on `interval`. All per-tick orchestration — cache refresh,
-/// evaluation, state mutation, persistence, materialization fan-out — lives
-/// inside the engine.
 #[tracing::instrument(skip_all, target = "rivers::daemon", name = "condition_loop", fields(asset_count = config.conditions.len()))]
 pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
     let ConditionEvalLoopConfig {
@@ -393,9 +332,6 @@ pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
             state
         }
         Ok(None) => fresh(),
-        // Degrade gracefully but surface it: a swallowed load error silently
-        // wipes every latch and treats all assets as initial (sibling of the
-        // save-path hardening). Transient-retry belongs in the storage layer.
         Err(e) => {
             tracing::warn!(
                 target: "rivers::daemon",
@@ -422,17 +358,11 @@ pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
         state.reset_for_new_tree(current_fp);
     }
 
-    // Prune state for assets that no longer have conditions. Keep dep
-    // entries with meaningful state (last_materialized_timestamp) — these
-    // are used by NewlyUpdated in dep pivots across daemon restarts.
     let active: HashSet<String> = conditions.iter().map(|c| c.asset_key.clone()).collect();
     eval_state
         .assets
         .retain(|k, v| active.contains(k) || v.last_materialized_timestamp.is_some());
 
-    // Register partitioned assets with the cache so refresh() loads their
-    // status. Include both conditioned assets AND their upstream deps —
-    // needed for accurate partition-level AnyDepsMissing / any_deps_updated.
     let mut partitioned_asset_keys: Vec<String> = conditions
         .iter()
         .filter_map(|c| c.partition_info.as_ref().map(|_| c.asset_key.clone()))
@@ -474,7 +404,6 @@ pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                // Persist state before exiting.
                 if let Err(e) = engine
                     .storage
                     .scoped()

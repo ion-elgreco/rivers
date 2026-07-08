@@ -1,9 +1,4 @@
 //! Cursor-based incremental cache for condition evaluation.
-//!
-//! [`AssetConditionCache`] loads all asset records on the first tick, then
-//! uses `get_runs_since` on subsequent ticks to detect changes and only
-//! re-fetches records for touched assets and their transitive downstream
-//! dependents. Minimizes storage queries in the hot evaluation loop.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -53,24 +48,16 @@ pub struct PartitionStatusEntry {
     pub timestamps: HashMap<PartitionKey, i64>,
 }
 
-/// Backfill tracking state — which assets are in active backfills and which
-/// partitions they target. Passed as a unit to the evaluator via `EvalContext`.
+/// Backfill tracking state — which assets are in active backfills and which partitions they target.
 #[derive(Default, PartialEq)]
 pub struct BackfillState {
     /// Maps asset_key → backfill_ids for targeted completion detection.
     pub assets: HashMap<String, Vec<String>>,
     /// Maps backfill_id → targeted partition keys.
-    /// Empty Vec means the backfill targets all partitions (unpartitioned asset).
     pub partition_keys: HashMap<String, Vec<PartitionKey>>,
 }
 
-/// A run_id that dispatch eagerly registered into `in_progress_assets` but
-/// which hasn't yet been confirmed by a storage `get_runs_since` result.
-/// If the corresponding storage write failed (or the OS thread spawned by
-/// dispatch panicked before reaching it), the run never appears in storage
-/// — but the cache still believes the asset is in-progress, blocking
-/// re-evaluation forever. Tracking the dispatch timestamp here lets refresh
-/// detect that case and self-recover after a grace period.
+/// A run_id dispatch eagerly registered into `in_progress_assets` but storage hasn't yet confirmed.
 #[derive(Clone, Debug)]
 pub struct PendingRun {
     /// Every asset the run dispatched (a run_id can cover many — a joint run).
@@ -79,11 +66,7 @@ pub struct PendingRun {
     pub first_seen_ts: i64,
 }
 
-/// Default grace period before an unconfirmed dispatched run_id is treated
-/// as a phantom and evicted: 60 seconds (in nanos). Long enough to swallow
-/// typical storage replication lag and slow `materialize_with_launcher`
-/// startup, short enough that a real phantom doesn't block the asset for
-/// minutes.
+/// Default grace period before an unconfirmed dispatched run_id is evicted as a phantom: 60s in nanos.
 pub const DEFAULT_PENDING_GRACE_NANOS: i64 = 60 * 1_000_000_000;
 
 /// One mutation to `in_progress_assets`, applied in order.
@@ -93,53 +76,34 @@ enum InProgressChange {
         run_id: String,
         partition_key: Option<PartitionKey>,
     },
-    /// Drop one completed run, removing the asset entry when its last run
-    /// clears. Run completions use this so a backfill's still-running
-    /// partitions stay gated when a sibling finishes.
+    /// Drop one completed run, removing the asset entry when its last run clears.
     ClearRun { asset_key: String, run_id: String },
-    /// Drop all of an asset's runs. Only the external-observation path
-    /// (no owning run_id) uses this.
+    /// Drop all of an asset's runs.
     AssetClear(String),
 }
 
-/// A pending `failed_adds` entry: the failing run's end (or start) timestamp
-/// and id. The id lets `apply` skip an asset that actually materialized in a
-/// failed joint run (its record's `last_run_id` matches this run).
+/// A pending `failed_adds` entry: the failing run's timestamp and id.
 struct FailedRun {
     ts: i64,
     run_id: String,
 }
 
-/// Description of every mutation a single steady-state refresh wants to make
-/// to the cache. Built fallibly by `fetch_refresh_delta` (any storage error
-/// → drop the partial delta, cache untouched). Replayed infallibly by
-/// `apply_refresh_delta`. The split makes refresh atomic — there's no
-/// pre-refactor "refresh_runs succeeded but refresh_observations failed"
-/// half-state.
+/// Every mutation a single steady-state refresh wants to make to the cache.
 #[derive(Default)]
 struct RefreshDelta {
     /// True if any phase observed a meaningful change. Returned from `apply`.
     changed: bool,
-    /// Whether to clear `tick_materialization_tags` and
-    /// `tick_partition_materialization_tags` before applying tag updates.
+    /// Whether to clear the tick tag accumulators before applying tag updates.
     clear_tick_accumulators: bool,
     /// Records to insert (or replace) in `records`.
     record_updates: Vec<AssetRecord>,
     /// In-progress changes, in apply order.
     in_progress_changes: Vec<InProgressChange>,
-    /// Asset keys to add to `failed_assets`, each with the [`FailedRun`] that
-    /// floored them.
+    /// Asset keys to add to `failed_assets`, each with the [`FailedRun`] that floored them.
     failed_adds: HashMap<String, FailedRun>,
-    /// Asset keys whose success clears `failed_assets`, with the success run's
-    /// timestamp — a remove only clears a failure floor older than it, so a
-    /// co-batched older success can't clobber a newer failure.
+    /// Asset keys whose success clears `failed_assets`, with the success run's timestamp.
     failed_removes: HashMap<String, i64>,
-    /// `asset → run_ids` where the asset's step SUCCEEDED but its
-    /// asset_record write lags (last_run_id not yet updated). Treated as
-    /// "materialized here" so a co-batched failure in the same run doesn't
-    /// floor the asset that actually produced output. Every succeeded run is
-    /// recorded — `failed_adds` keeps the NEWEST failing run, so a single
-    /// slot filled in HashMap order would mismatch it nondeterministically.
+    /// `asset → run_ids` where the asset's step succeeded but its record write lags.
     materialized_overrides: HashMap<String, HashSet<String>>,
     /// Tag updates: `(asset, partition_key, tags)`.
     run_tag_updates: Vec<RunTagUpdate>,
@@ -156,14 +120,12 @@ struct RefreshDelta {
     new_last_observation_ts: Option<i64>,
     /// Run_ids confirmed by storage (remove from `pending_runs`).
     confirmed_pending: Vec<String>,
-    /// Phantom run_ids past grace: drop from `pending_runs` and untrack every
-    /// covered asset from `in_progress_assets`. `(run_id, asset_keys)`.
+    /// Phantom run_ids past grace to evict; `(run_id, asset_keys)`.
     evicted_pending: Vec<(String, Vec<String>)>,
 }
 
 impl RefreshDelta {
-    /// Queue a `ClearRun` for every asset the run covered. `apply` untracks
-    /// per (asset, run) and no-ops on assets already cleared.
+    /// Queue a `ClearRun` for every asset the run covered.
     fn clear_run(&mut self, run: &crate::storage::RunRecord) {
         for asset in &run.node_names {
             self.in_progress_changes.push(InProgressChange::ClearRun {
@@ -175,10 +137,6 @@ impl RefreshDelta {
 }
 
 /// Cached state for condition evaluation, minimizing storage queries.
-///
-/// On first tick, loads everything. On subsequent ticks, uses `get_runs_since`
-/// to detect new runs and only re-fetches asset records for touched assets
-/// and their transitive downstream dependents.
 pub struct AssetConditionCache {
     /// All asset records, keyed by asset_key.
     pub records: HashMap<String, AssetRecord>,
@@ -188,10 +146,7 @@ pub struct AssetConditionCache {
     pub upstream_deps: HashMap<String, Vec<String>>,
     /// Downstream deps per asset (for invalidation).
     pub downstream_deps: HashMap<String, Vec<String>>,
-    /// In-progress runs per asset: asset_key → (run_id → its partition key, if
-    /// any). The partition keys cover the dispatch→storage window that
-    /// `get_in_progress_partitions` (StepStart-event based) misses, feeding the
-    /// partitioned `InProgress` condition via `in_progress_partition_keys`.
+    /// In-progress runs per asset: asset_key → (run_id → its partition key).
     pub in_progress_assets: HashMap<String, HashMap<String, Option<PartitionKey>>>,
     /// Assets whose latest run failed.
     pub failed_assets: HashSet<String>,
@@ -204,44 +159,30 @@ pub struct AssetConditionCache {
     /// Whether the cache has been initialized.
     pub initialized: bool,
     /// Per-asset partition status (materialized, in-progress, failed, timestamps).
-    /// Only populated for assets registered via `set_partitioned_assets`.
     pub partition_status: HashMap<String, PartitionStatusEntry>,
     /// Active backfill tracking: which assets are in backfills and which partitions they target.
     pub backfill: BackfillState,
     /// Tags from the latest completed run per asset (unpartitioned). Used by `LastExecutedWithTags`.
     pub last_run_tags: HashMap<String, Arc<[(String, String)]>>,
-    /// Tags from the latest completed run per asset+partition. Used by `LastExecutedWithTags`
-    /// for partition-level granularity.
+    /// Tags from the latest completed run per asset+partition.
     pub partition_last_run_tags: PartitionLastRunTagsMap,
     /// Run tag sets from materializations completed this tick (unpartitioned).
-    /// Each entry is a list of tag sets, one per completed run that materialized the asset.
-    /// Cleared at the start of each `refresh()` cycle.
-    /// Used by `HasRunWithTags` / `AllRunsHaveTags`.
     pub tick_materialization_tags: TickMaterializationTagsMap,
     /// Run tag sets from materializations completed this tick, per partition.
-    /// Used by `HasRunWithTags` / `AllRunsHaveTags` in partition mode.
     pub tick_partition_materialization_tags: TickPartitionMaterializationTagsMap,
     /// Full `asset_names` from the latest completed run per asset.
-    /// Used by `LastRunIncludesTarget` to check if a dep's run included the root asset.
     pub last_run_asset_names: HashMap<String, Arc<[String]>>,
     /// Full `asset_names` from the latest completed run per asset+partition.
     pub partition_last_run_asset_names: PartitionLastRunAssetNamesMap,
-    /// Asset keys that are partitioned — drives partition status loading/refresh
-    /// and scopes run outcomes to partition_status vs the asset-level floor.
+    /// Asset keys that are partitioned.
     partitioned_asset_keys: HashSet<String>,
     /// Whether any condition tree uses HasRunWithTags/AllRunsHaveTags.
-    /// When false, `update_tick_materialization_tags` is skipped entirely.
     needs_tick_tags: bool,
-    /// Code-location context used to scope every per-CL storage call this
-    /// cache makes (graph topology, run/eval queries, partition status).
-    /// Bound at construction from the daemon's resolved repo state.
+    /// Code-location context scoping every per-CL storage call this cache makes.
     ctx: crate::storage::CodeLocationContext,
     /// Run_ids inserted by dispatch but not yet confirmed via storage.
-    /// `refresh` clears entries that storage reports back, and evicts entries
-    /// older than `pending_grace_nanos` (assumed-phantom recovery).
     pub pending_runs: HashMap<String, PendingRun>,
-    /// Grace window before an unconfirmed dispatched run_id is treated as a
-    /// phantom. Defaults to [`DEFAULT_PENDING_GRACE_NANOS`].
+    /// Grace window before an unconfirmed dispatched run_id is treated as a phantom.
     pub pending_grace_nanos: i64,
 }
 
@@ -280,14 +221,7 @@ impl AssetConditionCache {
         }
     }
 
-    /// Record a run_id that dispatch has eagerly inserted into
-    /// `in_progress_assets`. The next successful `refresh` will either
-    /// confirm it (storage returns the run, entry cleared from
-    /// `pending_runs`) or, if `pending_grace_nanos` has elapsed without
-    /// confirmation, evict it from both `pending_runs` and
-    /// `in_progress_assets[asset_key]` — recovering automatically from
-    /// dispatch-time phantom IDs (storage write failed or OS thread
-    /// panicked before recording the run).
+    /// Record a run_id that dispatch eagerly inserted into `in_progress_assets`.
     pub fn register_dispatched_run(
         &mut self,
         asset_key: String,
@@ -306,8 +240,7 @@ impl AssetConditionCache {
             .push(asset_key);
     }
 
-    /// In-flight partitions for `asset` from the cache's own tracking — the
-    /// known partition keys of its in-progress runs (see `in_progress_assets`).
+    /// In-flight partitions for `asset` from the cache's own tracking.
     pub fn in_progress_partition_keys(&self, asset: &str) -> HashSet<PartitionKey> {
         self.in_progress_assets
             .get(asset)
@@ -315,8 +248,7 @@ impl AssetConditionCache {
             .unwrap_or_default()
     }
 
-    /// Record an in-progress run — the one mutation path for register / `Push` /
-    /// `initial_load`.
+    /// Record an in-progress run.
     fn track_in_progress_run(
         &mut self,
         asset_key: String,
@@ -329,14 +261,7 @@ impl AssetConditionCache {
             .insert(run_id, partition_key);
     }
 
-    /// Drop a pre-dispatch placeholder entry (the empty `in_progress_assets`
-    /// slot `classify` creates so an asset isn't re-fired before its runs
-    /// surface) when dispatch failed before any run was registered. Unlike
-    /// single-partition runs — which `register_dispatched_run` backs with a
-    /// phantom-eviction safety net — a multi-partition backfill registers
-    /// nothing up front, so a dispatch failure would otherwise leave the empty
-    /// entry forever, wedging the asset's `InProgress` (its key is present).
-    /// No-op if real runs have since been tracked for the asset.
+    /// Drop a pre-dispatch placeholder `in_progress_assets` entry when dispatch failed before any run registered.
     pub fn clear_predispatch_mark(&mut self, asset_key: &str) {
         if let Some(runs) = self.in_progress_assets.get(asset_key) {
             if runs.is_empty() {
@@ -345,11 +270,7 @@ impl AssetConditionCache {
         }
     }
 
-    /// Roll back a `register_dispatched_run` whose dispatch failed
-    /// synchronously: the run record never reached storage, so nothing will
-    /// ever confirm the pending entry. Dropping it now frees the asset to
-    /// re-fire immediately instead of waiting out the phantom-eviction
-    /// grace period.
+    /// Roll back a `register_dispatched_run` whose dispatch failed synchronously.
     pub fn clear_dispatched_run(&mut self, asset_key: &str, run_id: &str) {
         self.untrack_in_progress_run(asset_key, run_id);
         if let Some(pending) = self.pending_runs.get_mut(run_id) {
@@ -360,8 +281,7 @@ impl AssetConditionCache {
         }
     }
 
-    /// Drop a run (removing the asset once empty) — the one path for run
-    /// completion (`ClearRun`) and phantom eviction.
+    /// Drop a run, removing the asset once empty.
     fn untrack_in_progress_run(&mut self, asset_key: &str, run_id: &str) {
         if let Some(runs) = self.in_progress_assets.get_mut(asset_key) {
             runs.remove(run_id);
@@ -376,20 +296,17 @@ impl AssetConditionCache {
         self.ctx.id()
     }
 
-    /// Register which assets are partitioned. Must be called before the first
-    /// `refresh()` so that `initial_load` knows to load partition status.
+    /// Register which assets are partitioned.
     pub fn set_partitioned_assets(&mut self, keys: Vec<String>) {
         self.partitioned_asset_keys = keys.into_iter().collect();
     }
 
-    /// Whether `asset` is registered partitioned — its run outcomes belong in
-    /// `partition_status`, not the unpartitioned asset-level failure floor.
+    /// Whether `asset` is registered partitioned.
     fn is_partitioned(&self, asset: &str) -> bool {
         self.partitioned_asset_keys.contains(asset)
     }
 
-    /// Scan condition trees and enable tick-level tag tracking only if any tree
-    /// uses `HasRunWithTags` or `AllRunsHaveTags`.
+    /// Enable tick-level tag tracking if any tree uses `HasRunWithTags`/`AllRunsHaveTags`.
     pub fn set_needs_tick_tags(&mut self, conditions: &[ConditionNode]) {
         self.needs_tick_tags = conditions.iter().any(|c| c.uses_tick_tags());
     }
@@ -425,12 +342,7 @@ impl AssetConditionCache {
         Ok(())
     }
 
-    /// Refresh the cache from storage. Returns `true` if anything changed
-    /// (callers should evaluate conditions), `false` if nothing changed.
-    ///
-    /// `now` is wall-clock nanos for grace-period tracking on dispatched
-    /// run_ids that haven't yet appeared in storage; passing the tick's
-    /// `now_ts()` is correct.
+    /// Refresh the cache from storage. Returns `true` if anything changed.
     pub async fn refresh<S: StorageBackend>(
         &mut self,
         storage: &S,
@@ -445,16 +357,11 @@ impl AssetConditionCache {
     }
 
     /// Plan phase: all fallible storage I/O for one steady-state refresh.
-    /// Borrows `&self` so any unexpected mutation would be a compile error.
-    /// On any storage failure, returns `Err` — the partial delta is dropped.
     async fn fetch_refresh_delta<S: StorageBackend>(
         &self,
         storage: &S,
         now: i64,
     ) -> anyhow::Result<RefreshDelta> {
-        // Always clear per-tick tag accumulators on a refresh — matches the
-        // pre-refactor behavior where the first thing `refresh_runs` did was
-        // `tick_materialization_tags.clear()`.
         let mut delta = RefreshDelta {
             clear_tick_accumulators: true,
             ..Default::default()
@@ -462,18 +369,9 @@ impl AssetConditionCache {
 
         let scoped = storage.for_code_location(&self.ctx);
 
-        // `get_runs_since` returns ASC; the per-asset `update_run_asset_names`
-        // / `update_run_tags` writes inside `apply_run_effects_to_delta`
-        // overwrite, so processing newest-last makes the newest run's state
-        // win — which is what `LastRunIncludesTarget` needs to read.
         let new_runs = scoped
             .get_runs_since(self.last_seen_run_ts, None, crate::storage::SortOrder::Asc)
             .await?;
-        // Skip in-progress runs: the asset_record write inside `execute_run`
-        // lands before the run_record flips to a terminal status, so picking
-        // up fresh records here races a real bug (in-progress flag set with a
-        // post-completion record burned into the cache). The in-progress
-        // completion detector below is the safe path.
         let mut invalidated_keys: Vec<String> = new_runs
             .iter()
             .filter(|r| !matches!(r.status, RunStatus::Started | RunStatus::NotStarted))
@@ -505,18 +403,11 @@ impl AssetConditionCache {
                     completed_keys.push(record.asset_key.clone());
                     delta.record_updates.push(record);
                 } else if let Some(runs) = self.in_progress_assets.get(&record.asset_key) {
-                    // ts unchanged but step events say it finished — fall
-                    // back to the in_progress map for the run_id since
-                    // `record.last_run_id` may still point at the previous run.
                     let run_ids: Vec<String> = runs.keys().cloned().collect();
                     let (completed, succeeded_runs) =
                         storage.step_completion(&record.asset_key, &run_ids).await?;
                     if completed {
                         completed_keys.push(record.asset_key.clone());
-                        // The record write lags the step events: if the asset's
-                        // step SUCCEEDED in one of these runs, mark it
-                        // materialized-here so a co-batched failure in the same
-                        // run can't floor the asset that produced output.
                         if !succeeded_runs.is_empty() {
                             delta
                                 .materialized_overrides
@@ -532,27 +423,6 @@ impl AssetConditionCache {
                 invalidated_keys.push(key.clone());
             }
 
-            // Clear per run, not per asset. A backfill registers one run per
-            // partition; evicting the whole asset when the first finishes
-            // reopens the dispatch gate for its still-running siblings and
-            // re-fires them as duplicate runs. Re-read the tracked in-progress
-            // runs and clear only the terminal ones — in-flight runs stay.
-            //
-            // Sweep ALL tracked in-progress runs, not just those whose asset
-            // record changed: `get_runs_since` uses `>`, so a run whose
-            // terminal transition doesn't advance its start_time (a
-            // cancellation, or a completion observed in the same tick the run
-            // first surfaced) is never re-delivered by the cursor, and a
-            // cancellation also produces no record-ts change / StepSuccess for
-            // the ts-unchanged fallback above to catch. Without this the asset
-            // would stay wedged in_progress forever.
-            // `get_runs_since` uses `>`, so a run only ever seen as Started is
-            // never re-observed and its terminal state never reaches the
-            // new_runs loop below. The clearable sweep and the completed_run_ids
-            // application both fetch and apply the run-derived effects so
-            // `LastRunIncludesTarget` / `HasRunWithTags` / `failed_assets`
-            // reflect the actual completed run. Ids that ARE in `new_runs` as
-            // terminal are skipped (the new_runs loop applies them).
             let new_runs_terminal: HashSet<&str> = new_runs
                 .iter()
                 .filter(|r| !matches!(r.status, RunStatus::Started | RunStatus::NotStarted))
@@ -568,9 +438,6 @@ impl AssetConditionCache {
             if !clearable.is_empty() {
                 let tracked_runs = storage.get_runs_by_ids(&clearable, None).await?;
                 for run in &tracked_runs {
-                    // Only terminal runs un-gate the asset. A Queued run still
-                    // waits in the run queue, so clearing it re-opens the
-                    // dispatch gate and re-enqueues a duplicate every tick.
                     if !matches!(
                         run.status,
                         RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
@@ -578,20 +445,9 @@ impl AssetConditionCache {
                         continue;
                     }
                     delta.clear_run(run);
-                    // A terminal run reaching only this sweep (cursor missed it,
-                    // no record-ts change / StepSuccess) still needs its effects
-                    // applied — otherwise a Failure here sets no failure floor
-                    // and an eager asset re-dispatches the failing run every
-                    // tick. Skip ids the new_runs / completed_run_ids paths apply.
                     if !new_runs_terminal.contains(run.run_id.as_str())
                         && !completed_run_ids.contains(&run.run_id)
                     {
-                        // A transition only this sweep observes leaves no
-                        // record-ts change, so nothing else refreshes the
-                        // run's assets: without invalidation a partitioned
-                        // failure never reaches partition_status.failed (the
-                        // asset-level floor is unpartitioned-only) and a
-                        // cancel leaves stale in-progress partitions.
                         invalidated_keys.extend(run.node_names.iter().cloned());
                         if self.apply_run_effects_to_delta(run, &mut delta) {
                             swept_applied.insert(run.run_id.clone());
@@ -607,15 +463,7 @@ impl AssetConditionCache {
                 let ids: Vec<String> = completed_run_ids.into_iter().collect();
                 let completed_runs = storage.get_runs_by_ids(&ids, None).await?;
                 for run in &completed_runs {
-                    // Sibling backfill runs that are still Started get swept
-                    // into `completed_run_ids` (`step_completion` short-circuits
-                    // on the first finished run); apply no-ops on them.
                     self.apply_run_effects_to_delta(run, &mut delta);
-                    // Invalidate every asset of the run, not just the one whose
-                    // record ts changed: a co-scheduled partitioned sibling that
-                    // died event-less lands here (its ts didn't change, so it's
-                    // not in invalidated_keys yet) and needs partition_status
-                    // refetched to surface its failure — same as the sweep path.
                     invalidated_keys.extend(run.node_names.iter().cloned());
                 }
             }
@@ -625,8 +473,6 @@ impl AssetConditionCache {
             delta.changed = true;
 
             for run in &new_runs {
-                // A run that comes back from storage is "confirmed" — if we
-                // had a pending entry for it, it's no longer phantom.
                 delta.confirmed_pending.push(run.run_id.clone());
 
                 match run.status {
@@ -647,8 +493,6 @@ impl AssetConditionCache {
                         delta.clear_run(run);
                     }
                     RunStatus::Queued => {
-                        // Queued runs have no in-progress mutation but are
-                        // still confirmed (above).
                     }
                 }
             }
@@ -658,9 +502,6 @@ impl AssetConditionCache {
             }
         }
 
-        // Only fetch downstream records / partition status when something
-        // actually completed; Started-only ticks deliberately keep the previous
-        // record state (see filter above).
         if !invalidated_keys.is_empty() {
             delta.changed = true;
             let downstream_records = self
@@ -673,10 +514,6 @@ impl AssetConditionCache {
                 .await?;
         }
 
-        // Refresh backfill state every tick: with `!in_flight()` the sole dispatch
-        // gate now, `BackfillInProgress` must stay current even on no-completion
-        // ticks (sub-runs register lazily). Mark the tick changed only when it
-        // actually moves, so idle ticks still skip.
         let new_backfill = self.fetch_updated_backfill_state(storage).await?;
         if new_backfill != self.backfill {
             delta.changed = true;
@@ -686,9 +523,6 @@ impl AssetConditionCache {
         self.fetch_refresh_observations_delta(storage, &mut delta)
             .await?;
 
-        // Skip run_ids that storage confirmed THIS refresh (they're being
-        // cleared from pending anyway, and we mustn't drop them from
-        // in_progress_assets).
         let confirmed_set: HashSet<&str> =
             delta.confirmed_pending.iter().map(String::as_str).collect();
         for (run_id, pending) in &self.pending_runs {
@@ -736,10 +570,6 @@ impl AssetConditionCache {
 
         delta.changed = true;
         if !observed_keys.is_empty() {
-            // `fetch_records_with_downstream` covers the observed seed AND
-            // their transitive downstream, so a single fetch suffices. The
-            // pre-refactor code did two fetches (seed + downstream) — this
-            // is a small efficiency win.
             let records = self
                 .fetch_records_with_downstream(storage, &observed_keys)
                 .await?;
@@ -756,15 +586,7 @@ impl AssetConditionCache {
         Ok(())
     }
 
-    /// Plan-phase helper: append the run-derived mutations (failure flag,
-    /// run/tick tag updates, asset_names updates) for a completed
-    /// Success/Failure run into `delta`. Caller is responsible for emitting the
-    /// matching `InProgressChange::ClearRun` separately.
-    ///
-    /// Owns the terminal-only invariant: a non-Success/Failure run is a no-op
-    /// (returns false) — applying an in-flight run would clear a real failure
-    /// floor and overwrite last-run tags/asset_names, and Canceled only clears
-    /// in-progress. Returns whether effects were applied.
+    /// Plan-phase helper: append a completed Success/Failure run's mutations into `delta`.
     fn apply_run_effects_to_delta(&self, run: &RunRecord, delta: &mut RefreshDelta) -> bool {
         if !matches!(run.status, RunStatus::Success | RunStatus::Failure) {
             return false;
@@ -778,13 +600,6 @@ impl AssetConditionCache {
         };
         let run_ts = run.end_time.unwrap_or(run.start_time);
         for asset in &run.node_names {
-            // The asset-level failure floor is unpartitioned. A partitioned
-            // ASSET's keyed outcome belongs in partition_status (recomputed
-            // from storage); floor it here and one partition's outcome would
-            // (un)floor the whole asset for unpartitioned consumers. But a
-            // partition-keyed run can also cover UNPARTITIONED assets (mixed
-            // selection) whose outcome lands nowhere else — gate per asset,
-            // not per run, or their floor never sets/clears.
             if run.partition_key.is_none() || !self.is_partitioned(asset) {
                 if is_failure {
                     delta
@@ -833,8 +648,7 @@ impl AssetConditionCache {
         true
     }
 
-    /// Plan-phase helper: fetch fresh records for `keys` and their transitive
-    /// downstream dependents. `&self` only — does not mutate the cache.
+    /// Plan-phase helper: fetch fresh records for `keys` and their transitive downstream dependents.
     async fn fetch_records_with_downstream<S: StorageBackend>(
         &self,
         storage: &S,
@@ -856,7 +670,6 @@ impl AssetConditionCache {
     }
 
     /// Plan-phase helper: re-fetch partition status for invalidated assets.
-    /// Returns a map of replacement entries; `&self` only.
     async fn fetch_partition_status_for_invalidated<S: StorageBackend>(
         &self,
         storage: &S,
@@ -866,7 +679,7 @@ impl AssetConditionCache {
         let mut out: HashMap<String, PartitionStatusEntry> = HashMap::new();
         for asset_key in invalidated_keys {
             if !self.partition_status.contains_key(asset_key) {
-                continue; // not a partitioned asset
+                continue;
             }
             let mut entry = PartitionStatusEntry::default();
             let timestamps = scoped.get_partition_timestamps(asset_key).await?;
@@ -889,8 +702,7 @@ impl AssetConditionCache {
         Ok(out)
     }
 
-    /// Plan-phase helper: compute the new backfill state from current tracked
-    /// ids + completion checks + a fresh active-backfill load.
+    /// Plan-phase helper: compute the new backfill state.
     async fn fetch_updated_backfill_state<S: StorageBackend>(
         &self,
         storage: &S,
@@ -950,8 +762,7 @@ impl AssetConditionCache {
         Ok(new_state)
     }
 
-    /// Apply phase: replay the planned delta against the cache. Pure
-    /// mutation, infallible. Returns `delta.changed`.
+    /// Apply phase: replay the planned delta against the cache. Returns `delta.changed`.
     fn apply_refresh_delta(&mut self, delta: RefreshDelta) -> bool {
         let RefreshDelta {
             changed,
@@ -981,8 +792,6 @@ impl AssetConditionCache {
             self.records.insert(record.asset_key.clone(), record);
         }
 
-        // Apply in order: fetch can emit Push then ClearRun for one asset (a
-        // newly-Started run alongside a freshly-completed one); order keeps both.
         for change in in_progress_changes {
             match change {
                 InProgressChange::Push {
@@ -999,10 +808,6 @@ impl AssetConditionCache {
             }
         }
 
-        // record_updates are applied above, so `last_run_id` is current. A
-        // joint run can fail one step while others materialized: an asset whose
-        // latest materialization IS this run produced output, so it clears like
-        // a success instead of carrying a failure floor.
         for (asset, FailedRun { ts, run_id }) in failed_adds {
             let materialized_here = self
                 .records
@@ -1029,9 +834,6 @@ impl AssetConditionCache {
                 .and_modify(|t| *t = (*t).max(ts))
                 .or_insert(ts);
         }
-        // A success clears the floor only if it is at least as new as the
-        // recorded failure — an older co-batched success must not clobber a
-        // newer failure.
         for (asset, success_ts) in failed_removes {
             let outranked_by_failure = self
                 .failed_asset_timestamps
@@ -1090,8 +892,6 @@ impl AssetConditionCache {
 
     /// Full initial load — populates everything from scratch.
     async fn initial_load<S: StorageBackend>(&mut self, storage: &S) -> anyhow::Result<()> {
-        // Clone the ctx into a local so `scoped` borrows from this stack
-        // frame, not from `self` — leaves `self` free to mutate below.
         let ctx = self.ctx.clone();
         let scoped = storage.for_code_location(&ctx);
 
@@ -1128,15 +928,6 @@ impl AssetConditionCache {
             let last_runs = storage.get_runs_by_ids(&last_run_ids, None).await?;
             let runs_by_id: HashMap<&str, &crate::storage::RunRecord> =
                 last_runs.iter().map(|r| (r.run_id.as_str(), r)).collect();
-            // Only the last run's tags / asset_names are restored here. NO
-            // asset-level floor: this run is the asset's `last_run_id`, and
-            // `last_run_id` is advanced only by a materialization event, so the
-            // asset produced output in it — exactly the `materialized_here`
-            // case the live refresh path exempts. Flooring it would invert the
-            // floor across restart for an asset that materialized in a failed
-            // joint run. A genuinely-failed asset (step failed, no
-            // materialization) keeps its `last_run_id` at its prior success and
-            // is never reached through this lookup.
             type AssetRunRow = (String, Option<PartitionKey>, RunTags, Arc<[String]>);
             let asset_runs: Vec<AssetRunRow> = self
                 .records
@@ -1174,11 +965,6 @@ impl AssetConditionCache {
 
         self.backfill = Self::load_active_backfills(storage, &self.ctx).await?;
 
-        // Set cursor just below the newest known run. `get_runs_since` uses
-        // `>` exclusively, so a cursor *equal* to the newest run's start_time
-        // hides that run's eventual Started→Success transition from every
-        // subsequent delta refresh — bites when a schedule fires a fresh run
-        // concurrently with daemon startup.
         let recent = scoped.get_runs(1, None).await?;
         if let Some(newest) = recent.first() {
             self.last_seen_run_ts = newest.start_time.saturating_sub(1);
@@ -1216,7 +1002,6 @@ impl AssetConditionCache {
     }
 
     /// Update run tags for an asset after a completed run.
-    /// Routes to asset-level or partition-level storage based on whether the run targets a partition.
     fn update_run_tags(
         &mut self,
         asset: &str,
@@ -1235,9 +1020,6 @@ impl AssetConditionCache {
     }
 
     /// Track a materialization's run tags for the current tick.
-    /// Used by `HasRunWithTags` / `AllRunsHaveTags`.
-    /// Unlike `update_run_tags`, this stores ALL runs' tags (including empty),
-    /// because we need to know if a materialization happened without matching tags.
     fn update_tick_materialization_tags(
         &mut self,
         asset: &str,
@@ -1260,8 +1042,6 @@ impl AssetConditionCache {
     }
 
     /// Update the asset_names for an asset after a completed run.
-    /// Tracks the full list of assets from the run, used by `LastRunIncludesTarget`
-    /// to check if a dep's run also included the root asset.
     pub fn update_run_asset_names(
         &mut self,
         asset: &str,
@@ -1295,10 +1075,7 @@ impl AssetConditionCache {
         }
     }
 
-    /// Compute the set of asset keys that need evaluation when only time-based
-    /// conditions and their transitive downstream dependents should be evaluated.
-    /// Uses the pre-built `downstream_deps` map. Should be called once after
-    /// `initial_load` completes; result can be reused until graph topology changes.
+    /// Compute the asset keys that need evaluation for time-based conditions and their downstream dependents.
     pub fn compute_time_based_eval_set(
         &self,
         conditions: &[(String, ConditionNode)],
@@ -1329,7 +1106,6 @@ impl AssetConditionCache {
     }
 
     /// Expand a set of touched assets to include all transitive downstream dependents.
-    /// Returns borrowed `&str` references into `self.downstream_deps` — no string cloning.
     fn expand_downstream<'a>(&'a self, touched: &HashSet<&'a str>) -> Vec<&'a str> {
         let mut result: HashSet<&str> = touched.iter().copied().collect();
         let mut queue: Vec<&str> = result.iter().copied().collect();
@@ -1387,10 +1163,6 @@ mod tests {
 
     #[test]
     fn failure_floor_survives_co_batched_older_success() {
-        // A refresh batch carrying a Success@100 and a chronologically newer
-        // Failure@200 for the same unpartitioned asset must NOT let the
-        // success clear the newer failure's floor — apply applied all
-        // failed_adds then all failed_removes with no chronology check.
         let mut cache = AssetConditionCache::new("default".to_string());
         let mut delta = RefreshDelta::default();
         cache.apply_run_effects_to_delta(&mk_run("s", RunStatus::Success, &["R"], 100), &mut delta);
@@ -1410,7 +1182,6 @@ mod tests {
 
     #[test]
     fn newer_success_clears_failure_floor() {
-        // The boundary: a Success NEWER than the failure must still clear it.
         let mut cache = AssetConditionCache::new("default".to_string());
         let mut delta = RefreshDelta::default();
         cache.apply_run_effects_to_delta(&mk_run("f", RunStatus::Failure, &["R"], 100), &mut delta);
@@ -1427,10 +1198,6 @@ mod tests {
 
     #[test]
     fn failure_floor_skips_assets_materialized_in_the_failed_run() {
-        // A joint run [X, Y] fails because Y's step failed, but X materialized
-        // fine. Only Y carries a failure floor — X's record
-        // points at the failing run as its latest materialization, so it must
-        // not be floored (else its dep-updated fires are wrongly suppressed).
         let mut cache = AssetConditionCache::new("default".to_string());
         cache
             .records
@@ -1461,12 +1228,6 @@ mod tests {
 
     #[test]
     fn partitioned_failure_does_not_set_asset_level_floor() {
-        // A run for a single partition that fails must NOT floor the whole asset
-        // at asset granularity. Per-partition failures are tracked in
-        // partition_status (recomputed from storage); the asset-level
-        // failed_assets/failed_asset_timestamps feed unpartitioned consumers
-        // (e.g. an unpartitioned downstream matching this dep on
-        // execution_failed()) and would wrongly report the whole asset failed.
         let mut cache = AssetConditionCache::new("default".to_string());
         cache.set_partitioned_assets(vec!["P".to_string()]);
         let mut run = mk_run("P", RunStatus::Failure, &["P"], 150);
@@ -1489,22 +1250,12 @@ mod tests {
 
     #[test]
     fn override_covers_every_succeeded_run_not_the_first_found() {
-        // Asset x is tracked under two joint runs that both fail via
-        // co-batched siblings while x's step SUCCEEDED in both; its record
-        // write lags, so the ts-unchanged fallback discovers the successes.
-        // failed_adds keeps the NEWEST failing run, but a single-slot
-        // override filled with whichever success step_completion met first
-        // (HashMap order) floors the asset that produced output — a
-        // coin-flip per tick. The override must cover every succeeded run.
         let mut cache = AssetConditionCache::new("default".to_string());
         let mut delta = RefreshDelta::default();
-        // Older failing run r1 (ts 3000), newer failing run r2 (ts 4000).
         let r1 = mk_run("r1", RunStatus::Failure, &["x", "y"], 3000);
         let r2 = mk_run("r2", RunStatus::Failure, &["x", "z"], 4000);
         cache.apply_run_effects_to_delta(&r1, &mut delta);
         cache.apply_run_effects_to_delta(&r2, &mut delta);
-        // step_completion found x's StepSuccess in r1 first — but x also
-        // succeeded in r2, the run whose failure would floor it.
         delta
             .materialized_overrides
             .entry("x".to_string())
@@ -1521,24 +1272,15 @@ mod tests {
 
     #[test]
     fn partition_keyed_success_clears_unpartitioned_asset_floor() {
-        // repo.materialize(["P","D"], partition_key=...) is a sanctioned mixed
-        // selection: the run carries a partition key but also covers the
-        // unpartitioned asset D, whose outcome can't land in partition_status.
-        // A run-level partition gate would skip D's floor bookkeeping entirely
-        // — a pre-existing failure floor then survives every mixed success
-        // (execution_failed() stays true, eager() stays suppressed) until an
-        // unpartitioned success or a daemon restart.
         let mut cache = AssetConditionCache::new("default".to_string());
         cache.set_partitioned_assets(vec!["P".to_string()]);
 
-        // D floored by an earlier unpartitioned failure.
         let fail = mk_run("run-f", RunStatus::Failure, &["D"], 100);
         let mut delta = RefreshDelta::default();
         cache.apply_run_effects_to_delta(&fail, &mut delta);
         cache.apply_refresh_delta(delta);
         assert!(cache.failed_assets.contains("D"));
 
-        // A later mixed-selection success carrying a partition key.
         let mut ok = mk_run("run-s", RunStatus::Success, &["P", "D"], 200);
         ok.partition_key = Some(PartitionKey::Single {
             keys: vec!["2024-01-01".to_string()],

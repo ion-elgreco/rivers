@@ -276,7 +276,6 @@ impl From<&EventRecord> for DbEventWrite {
             sort_order: e.event_type.sort_order(),
             metadata: e.metadata.clone(),
             data_version: e.event_type.data_version().map(|s| s.to_string()),
-            // Version tracking fields — populated by store_event for materializations.
             code_version: None,
             input_data_versions: Vec::new(),
         }
@@ -286,7 +285,7 @@ impl From<&EventRecord> for DbEventWrite {
 impl DbStoredEvent {
     fn into_stored_event(self) -> StoredEvent {
         let event_type = EventType::from_type_name(&self.event_type, self.data_version).unwrap_or(
-            EventType::StepFailure, // fallback for unknown types
+            EventType::StepFailure,
         );
         StoredEvent {
             id: self.id,
@@ -302,8 +301,7 @@ impl DbStoredEvent {
     }
 }
 
-/// Identifies which underlying SurrealDB transport a [`SurrealStorage`] was
-/// constructed with.
+/// Identifies which underlying SurrealDB transport a [`SurrealStorage`] was constructed with.
 #[derive(Debug, Clone)]
 pub enum SurrealBackendKind {
     Embedded { path: String },
@@ -351,10 +349,7 @@ impl SurrealConnectConfig {
         }
     }
 
-    /// Attach database-scoped credentials. The scope (`namespace`/`database`)
-    /// is taken from this config — the user must be defined with
-    /// `DEFINE USER ... ON DATABASE` matching those fields, otherwise signin
-    /// fails.
+    /// Attach database-scoped credentials.
     pub fn with_credentials(mut self, username: String, password: String) -> Self {
         self.credentials = Some(SurrealCredentials::Database { username, password });
         self
@@ -364,8 +359,7 @@ impl SurrealConnectConfig {
 /// Credentials used during [`SurrealStorage::connect`].
 #[derive(Debug, Clone)]
 pub enum SurrealCredentials {
-    /// Sign in as a `DEFINE USER ... ON DATABASE` user. The namespace/database
-    /// values come from the enclosing [`SurrealConnectConfig`].
+    /// Sign in as a `DEFINE USER ... ON DATABASE` user.
     Database { username: String, password: String },
 }
 
@@ -373,20 +367,12 @@ pub struct SurrealStorage {
     db: Surreal<Any>,
     retry_config: super::retry::StorageRetryConfig,
     backend_kind: SurrealBackendKind,
-    /// Tokio runtime that hosts the router task when the storage was
-    /// constructed via one of the `*_blocking` constructors. `None` when an
-    /// async constructor was used (caller's runtime hosts the router).
-    /// Declared LAST so it drops after `db` in default field-drop order —
-    /// see [`Drop`] for the synchronous-shutdown handoff.
+    /// Tokio runtime that hosts the router task when constructed via a `*_blocking` constructor.
     runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl Drop for SurrealStorage {
     fn drop(&mut self) {
-        // For per-storage owned runtimes: force `db` to drop first (closes
-        // the route channel, signals the router task to wind down), then
-        // drain the runtime so its tasks aren't force-cancelled mid-cleanup
-        // (RocksDB lock release, in-memory state teardown).
         if let Some(runtime) = self.runtime.take() {
             let _ = std::mem::replace(&mut self.db, Surreal::init());
             if tokio::runtime::Handle::try_current().is_ok() {
@@ -510,8 +496,6 @@ impl SurrealStorage {
                 .use_db(DEFAULT_DATABASE)
                 .await?;
             tracing::debug!("applying schema");
-            // Build the schema via refinery, same as a fresh persistent store
-            // (memory is ephemeral — dropped at process exit).
             migration::ensure_compatible(&db, Capability::ReadWrite).await?;
             Ok(db)
         })
@@ -530,11 +514,6 @@ impl SurrealStorage {
     }
 
     /// Connect to a remote SurrealDB server.
-    ///
-    /// Authenticates with the database-scoped credentials in `config.credentials`
-    /// when set; an absent credentials field skips `signin` and is appropriate
-    /// for SurrealDB instances started with `--unauthenticated`. Opened
-    /// `ReadWrite`; use [`Self::connect_with_capability`] for a read-only opener.
     pub async fn connect(config: SurrealConnectConfig) -> Result<Self> {
         Self::connect_with_retry(
             config,
@@ -643,8 +622,6 @@ impl SurrealStorage {
     }
 
     /// Paginated, filtered slice of runs plus total matching row count.
-    /// Ordered by `start_time` DESC. Substring filters fall back to a full
-    /// scan over the status-filtered subset.
     pub async fn get_all_runs_page(
         &self,
         offset: u64,
@@ -654,8 +631,7 @@ impl SurrealStorage {
         self.runs_page_impl(None, offset, limit, filter).await
     }
 
-    /// Per-CL variant of [`Self::get_all_runs_page`] for the
-    /// `/locations/<ns>/<name>/runs` view.
+    /// Per-CL variant of [`Self::get_all_runs_page`].
     pub async fn get_runs_page(
         &self,
         code_location_id: &str,
@@ -748,9 +724,7 @@ impl SurrealStorage {
         .await
     }
 
-    /// A page of an asset's events (newest first) restricted to `event_types`,
-    /// plus the total count matching that filter — backs the asset-detail events
-    /// pagination. Mirrors `get_runs_page`.
+    /// A page of an asset's events (newest first) restricted to `event_types`, plus the total count.
     pub async fn get_events_for_asset_page(
         &self,
         code_location_id: &str,
@@ -803,8 +777,7 @@ impl SurrealStorage {
         .await
     }
 
-    /// A run's `LogOutput` events (stdout/stderr/logs) — small, kept out of the
-    /// materialization stream so the log tabs don't pull it.
+    /// A run's `LogOutput` events (stdout/stderr/logs).
     pub async fn get_run_log_events(&self, run_id: &str) -> Result<Vec<StoredEvent>> {
         super::retry::with_retry(&self.retry_config, || async {
             let mut result = self
@@ -821,8 +794,7 @@ impl SurrealStorage {
         .await
     }
 
-    /// A page of a run's structured (non-`LogOutput`) events, optionally scoped
-    /// to one asset, plus the total — backs the run-detail events table.
+    /// A page of a run's structured (non-`LogOutput`) events, optionally scoped to one asset, plus the total.
     pub async fn get_run_structured_events_page(
         &self,
         run_id: &str,
@@ -861,9 +833,7 @@ impl SurrealStorage {
         .await
     }
 
-    /// A page of one asset's events of a single type within a run (e.g.
-    /// `Materialization`) + total — so the drawer pages a 15k-partition asset's
-    /// materializations instead of rendering all of them.
+    /// A page of one asset's events of a single type within a run + total.
     pub async fn get_run_asset_events_page(
         &self,
         run_id: &str,
@@ -898,8 +868,7 @@ impl SurrealStorage {
         .await
     }
 
-    /// Aggregate run counts for the runs-list page header. Unfiltered so the
-    /// pill badges stay stable as substring filters change.
+    /// Aggregate run counts for the runs-list page header.
     pub async fn get_all_runs_summary(&self, cutoff_24h_ns: i64) -> Result<RunsSummary> {
         self.runs_summary_impl(None, cutoff_24h_ns).await
     }
@@ -960,9 +929,7 @@ impl SurrealStorage {
         .await
     }
 
-    /// For each requested job name, return the most recent run if any. Ignores
-    /// missing jobs. One multi-statement query (one round-trip) using the
-    /// `idx_runs_job_time` composite, so cost is proportional to job count not row count.
+    /// For each requested job name, return the most recent run if any.
     pub async fn get_all_last_run_per_job(
         &self,
         job_names: &[String],
@@ -1150,9 +1117,7 @@ impl SurrealStorage {
         .await
     }
 
-    /// Subscribe to change notifications on an arbitrary table via a SurrealDB
-    /// LIVE query. Each yielded `()` corresponds to a create/update/delete;
-    /// payload is discarded so callers refetch.
+    /// Subscribe to change notifications on an arbitrary table via a SurrealDB LIVE query.
     pub async fn subscribe_table(
         &self,
         table: &str,
@@ -1165,11 +1130,6 @@ impl SurrealStorage {
             .select::<Vec<Object>>(table.to_string())
             .live()
             .await?;
-        // `Arc<str>` instead of `String` so the per-notification clone in
-        // `filter_map` below is a refcount bump rather than a heap
-        // allocation. The name is only consumed by the error-path
-        // `tracing::warn!`, which is a cold path on a healthy system —
-        // paying an allocation per hot-path event is pure waste.
         let table_owned: Arc<str> = Arc::from(table);
         Ok(stream
             .filter_map(move |result| {
@@ -1189,8 +1149,6 @@ impl SurrealStorage {
                     };
                     match notif.action {
                         Action::Create | Action::Update | Action::Delete => Some(()),
-                        // Killed: the live query itself was terminated; nothing
-                        // to forward to subscribers.
                         _ => None,
                     }
                 }
@@ -1215,8 +1173,7 @@ struct OptStringField {
     value: Option<String>,
 }
 
-/// Build the `RunQueued` event row that pairs with a freshly-written
-/// queued `RunRecord`.
+/// Build the `RunQueued` event row that pairs with a freshly-written queued `RunRecord`.
 fn run_queued_event(record: &RunRecord) -> EventRecord {
     EventRecord {
         code_location_id: record.code_location_id.clone(),
@@ -1234,15 +1191,8 @@ fn run_queued_event(record: &RunRecord) -> EventRecord {
 }
 
 impl SurrealStorage {
-    /// Persist a queued `RunRecord` and emit its `RunQueued` event in one
-    /// step. Single source of truth for the queued-run write — every
-    /// queued-runs writer routes through this so the `RunQueued` event always
-    /// carries `tag_keys::PRIORITY` metadata in the same shape.
+    /// Persist a queued `RunRecord` and emit its `RunQueued` event in one step.
     pub async fn enqueue_run(&self, record: &RunRecord) -> Result<()> {
-        // Atomic: a poller observing the run record is guaranteed to also
-        // see its `RunQueued` event. Splitting the two writes leaves a
-        // race window that breaks the per-run-has-events invariant tests /
-        // UI / metrics depend on.
         let event = DbEventWrite::from(&run_queued_event(record));
         let result = super::retry::with_retry(&self.retry_config, || async {
             self.db
@@ -1267,8 +1217,6 @@ impl SurrealStorage {
         if records.is_empty() {
             return Ok(());
         }
-        // Atomic batch — same rationale as `enqueue_run`: every run record
-        // must materialize together with its `RunQueued` event.
         let events: Vec<DbEventWrite> = records
             .iter()
             .map(|r| DbEventWrite::from(&run_queued_event(r)))
@@ -1306,10 +1254,7 @@ impl SurrealStorage {
         Ok(rows.first().and_then(|r| r.value.clone()))
     }
 
-    /// Bulk upsert `asset_partitions` rows, matched on the table's UNIQUE
-    /// (code_location_id, asset_key, partition_key) index — one statement that
-    /// updates existing rows in place and inserts new ones. Shared by the
-    /// batched `store_events` flush and the single-event `store_event` path.
+    /// Bulk upsert `asset_partitions` rows, matched on the table's UNIQUE (code_location_id, asset_key, partition_key) index.
     async fn upsert_asset_partitions(&self, rows: Vec<DbAssetPartitionWrite>) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
@@ -1356,13 +1301,7 @@ impl SurrealStorage {
         Ok((pool, claimed.unwrap_or(0)))
     }
 
-    /// Build a SurrealQL transaction that atomically checks capacity and claims
-    /// slots. Uses a sentinel `claim_version` bump on each pool to force
-    /// write-write conflicts under RocksDB's optimistic snapshot isolation,
-    /// preventing two concurrent claims from both succeeding.
-    ///
-    /// All reads/writes are scoped to the caller's `code_location_id` (bound
-    /// as `$cl`); pools / slots / pending_steps in other CLs are invisible.
+    /// Build a SurrealQL transaction that atomically checks capacity and claims slots.
     fn build_claim_transaction(pools: &[(String, u32)]) -> String {
         let mut q = String::from("BEGIN TRANSACTION;\n");
 
@@ -1386,7 +1325,6 @@ impl SurrealStorage {
             .collect();
         q += &format!("IF {} {{\n", conditions.join(" AND "));
 
-        // Sentinel: bump claim_version on each pool to force write-write conflicts.
         for i in 0..pools.len() {
             q += &format!(
                 "  UPDATE concurrency_pools \
@@ -1409,14 +1347,12 @@ impl SurrealStorage {
                   WHERE run_id = $run_id AND step_key = $step_key;\n";
         q += "};\n";
         q += "COMMIT TRANSACTION;\n";
-        // run_id+step_key are globally unique on slots, so no CL filter needed.
         q += "SELECT count() AS total FROM concurrency_slots \
                   WHERE run_id = $run_id AND step_key = $step_key GROUP ALL;\n";
         q
     }
 
     /// Statement index of the post-COMMIT SELECT in the claim transaction query.
-    /// Layout: BEGIN(0) + 2*N LETs + IF(2N+1) + COMMIT(2N+2) + SELECT(2N+3).
     fn claim_check_statement_index(num_pools: usize) -> usize {
         2 * num_pools + 3
     }
@@ -1434,11 +1370,7 @@ impl SurrealStorage {
     }
 }
 
-/// Sentinel error type used by `claim_concurrency_slots` to encode the
-/// "snapshot saw the pool as full" race condition as a retryable failure.
-/// This is a *logical* retry, not a SurrealDB transient one — it fires when
-/// the claim transaction's post-CREATE count check returns 0, meaning a
-/// concurrent claim won the race.
+/// Sentinel error type used by `claim_concurrency_slots` to encode the "snapshot saw the pool as full" race as a retryable failure.
 #[derive(Debug)]
 struct PoolContended;
 
@@ -1450,14 +1382,7 @@ impl std::fmt::Display for PoolContended {
 
 impl std::error::Error for PoolContended {}
 
-/// Convert a unique-index violation on a client-supplied-ID `CREATE` into
-/// `Ok(())`, logging a warning. Used by `create_run`, `create_runs`, and
-/// `create_backfill` after a `with_retry` loop: the only realistic way to see
-/// "already contains" on these methods is a phantom commit on a previous
-/// retry attempt, since UUID collision between independent processes is
-/// statistically negligible. Treating it as success is therefore correct,
-/// and the warning surfaces it to operators in case it ever happens for a
-/// reason other than retry (e.g. a real id collision in a test).
+/// Convert a unique-index violation on a client-supplied-ID `CREATE` into `Ok(())`, logging a warning.
 fn swallow_phantom_commit(result: Result<()>, op: &'static str, id: &str) -> Result<()> {
     match result {
         Ok(()) => Ok(()),
@@ -1558,8 +1483,6 @@ impl StorageBackend for SurrealStorage {
             return Ok(vec![]);
         }
 
-        // Bulk insert all events (code_version + input_data_versions are empty
-        // on the DB rows; the asset record gets them in the post-insert loop)
         let db_events: Vec<DbEventWrite> = events.iter().map(DbEventWrite::from).collect();
         let results: Vec<DbStoredEvent> = self
             .db
@@ -1573,8 +1496,6 @@ impl StorageBackend for SurrealStorage {
         // Group materializations by asset (latest wins), then one bulk upsert.
         let mut latest_mat: std::collections::HashMap<(&str, &str), usize> =
             std::collections::HashMap::new();
-        // Dedup partition rows within the batch (last write wins), keyed by the
-        // unique (code_location_id, asset_key, partition_key) index.
         let mut part_rows: std::collections::HashMap<
             (&str, &str, &PartitionKey),
             DbAssetPartitionWrite,
@@ -1790,10 +1711,6 @@ impl StorageBackend for SurrealStorage {
             if run_ids.is_empty() {
                 return Ok(Vec::new());
             }
-            // ORDER BY start_time ASC: the condition cache applies run effects
-            // (last_run tags / asset_names) in iteration order with last-write-
-            // wins, so the newest run must come last. run_id tiebreaks equal
-            // start_times for full determinism.
             let mut result = if let Some(s) = status.clone() {
                 let status_str = format!("{:?}", s);
                 self.db
@@ -2133,9 +2050,6 @@ impl StorageBackend for SurrealStorage {
         let mut any_failed = false;
         let mut any_canceled = false;
 
-        // One query for every Success run's per-partition StepFailures, keyed by
-        // run_id. Safe because EventWriter::flush makes events durable before a
-        // run is marked terminal (TODO.md: durable RunRecord field alternative).
         #[derive(SurrealValue)]
         struct FailRow {
             run_id: String,
@@ -2155,7 +2069,6 @@ impl StorageBackend for SurrealStorage {
                 let mut res = self
                     .db
                     .query(
-                        // IS NOT NONE: exclude None-keyed step-level failures (see get_failed_partitions).
                         "SELECT run_id, partition_key FROM events \
                          WHERE run_id IN $rids AND event_type = 'StepFailure' \
                          AND partition_key IS NOT NONE GROUP BY run_id, partition_key",
@@ -2206,15 +2119,11 @@ impl StorageBackend for SurrealStorage {
             }
         }
 
-        // Never-launched partitions (stop-on-failure / cancel) have no run record.
         if !extra_canceled.is_empty() {
             canceled_pks.extend(extra_canceled.iter().cloned());
             any_canceled = true;
         }
 
-        // Set partition tracking from the authoritative run statuses.
-        // Uses direct SET (not array::union) so this is idempotent regardless
-        // of whether the local execute_backfill path already tracked partitions.
         super::retry::with_retry(&self.retry_config, || async {
             self.db
                 .query(
@@ -2290,8 +2199,6 @@ impl StorageBackend for SurrealStorage {
             let now_ns = now_nanos();
             let lease_exp = now_ns + (lease_duration_secs as i64) * 1_000_000_000;
 
-            // UPDATE doesn't return a usable row count via the Rust SDK,
-            // so we use a follow-up SELECT to count renewed rows.
             let mut result = self
                 .db
                 .query(
@@ -2512,11 +2419,6 @@ impl PerCodeLocationStorage for SurrealStorage {
     ) -> Result<Option<StoredEvent>> {
         let event_type_str = "Materialization".to_string();
         let mut result = if let Some(partition_key) = partition {
-            // The display string may denote a Single or a Multi key. Both
-            // readings can have rows when the asset's def changed shape
-            // (legacy Single events vs current Multi ones) — the structured
-            // reading wins, so try candidates most-structured first instead
-            // of letting timestamps decide.
             for cand in PartitionKey::display_candidates(partition_key)
                 .into_iter()
                 .rev()
@@ -2603,9 +2505,6 @@ impl PerCodeLocationStorage for SurrealStorage {
             let found: Vec<AssetRecord> = existing.take(0)?;
 
             if found.is_empty() {
-                // Create new asset record. Force CL field on the record to
-                // match the scope, so a stale value on the input record
-                // can't write into a different CL.
                 let mut to_insert = record.clone();
                 to_insert.code_location_id = code_location_id.to_string();
                 let _: Option<AssetRecord> = self.db.create("assets").content(to_insert).await?;
@@ -2938,7 +2837,6 @@ impl PerCodeLocationStorage for SurrealStorage {
         partition_key: &str,
         limit: usize,
     ) -> Result<Vec<StoredEvent>> {
-        // Most-structured reading first; see get_latest_materialization.
         for cand in PartitionKey::display_candidates(partition_key)
             .into_iter()
             .rev()
@@ -3049,7 +2947,6 @@ impl PerCodeLocationStorage for SurrealStorage {
         let mut result = self
             .db
             .query(
-                // IS NOT NONE: exclude None-keyed step-level events (see get_failed_partitions).
                 "SELECT partition_key FROM events WHERE code_location_id = $cl AND asset_key = $asset_key \
                  AND event_type = 'StepStart' AND partition_key IS NOT NONE \
                  AND run_id IN (SELECT VALUE run_id FROM runs WHERE code_location_id = $cl AND status = 'Started' \
@@ -3075,11 +2972,9 @@ impl PerCodeLocationStorage for SurrealStorage {
         asset_key: &str,
         materialized: &std::collections::HashMap<PartitionKey, i64>,
     ) -> Result<std::collections::HashMap<PartitionKey, i64>> {
-        // No run-status filter: mark_partition_failed lands in a Success run (review #1).
         let mut result = self
             .db
             .query(
-                // IS NOT NONE, not NULL — `NONE IS NOT NULL` holds in SurrealDB.
                 "SELECT partition_key, math::max(timestamp) AS ts FROM events \
                  WHERE code_location_id = $cl AND asset_key = $asset_key \
                  AND event_type = 'StepFailure' AND partition_key IS NOT NONE \
@@ -3096,7 +2991,6 @@ impl PerCodeLocationStorage for SurrealStorage {
         }
 
         let failed_rows: Vec<FailRow> = result.take(0)?;
-        // Expand each failure key to members (a raised batch records one Set), latest ts each.
         let mut latest_failure: std::collections::HashMap<PartitionKey, i64> =
             std::collections::HashMap::new();
         for row in failed_rows {
@@ -3108,10 +3002,6 @@ impl PerCodeLocationStorage for SurrealStorage {
             }
         }
 
-        // StepFailure events miss runs that die without writing step events
-        // (pod death / operator status sync). Union in terminal-Failure runs
-        // by partition key, floored at start_time so anything the run did
-        // manage to materialize (mat ts > start) still supersedes.
         let mut result = self
             .db
             .query(
@@ -3297,12 +3187,6 @@ impl PerCodeLocationStorage for SurrealStorage {
     ) -> Result<ConcurrencyClaimStatus> {
         anyhow::ensure!(!pools.is_empty(), "pools must not be empty");
 
-        // Retry on either a SurrealDB transient failure (handled by the
-        // default classifier — RocksDB conflicts, query timeouts) OR on a
-        // `PoolContended` sentinel emitted when the claim transaction's
-        // snapshot saw the pool as full from a concurrent winner. The latter
-        // is a *logical* retry (the operation succeeded but a race lost), so
-        // it has to be re-injected through the predicate.
         let predicate =
             |e: &anyhow::Error| super::retry::default_should_retry(e) || e.is::<PoolContended>();
 
@@ -3319,8 +3203,6 @@ impl PerCodeLocationStorage for SurrealStorage {
         })
         .await;
 
-        // Replace the exhausted-retries error with the user-facing message
-        // when the final cause was a pool contention sentinel.
         match result {
             Ok(status) => Ok(status),
             Err(e) if e.is::<PoolContended>() => {
@@ -3456,9 +3338,7 @@ impl PerCodeLocationStorage for SurrealStorage {
 }
 
 impl SurrealStorage {
-    /// One attempt of the [`PerCodeLocationStorage::claim_concurrency_slots`]
-    /// flow. Returns `Err(PoolContended)` when the snapshot lost a race —
-    /// the caller's predicate re-runs the whole attempt.
+    /// One attempt of the [`PerCodeLocationStorage::claim_concurrency_slots`] flow.
     async fn try_claim_concurrency_slots_once(
         &self,
         code_location_id: &str,
@@ -3471,8 +3351,6 @@ impl SurrealStorage {
         let now_ns = now_nanos();
         let lease_exp = now_ns + (lease_duration_secs as i64) * 1_000_000_000;
 
-        // Read capacity (outside transaction, for BlockReason data).
-        // Pools with slot_limit < 0 are unlimited — skip them entirely.
         let mut blocked = Vec::new();
         let mut limited_pools: Vec<(String, u32)> = Vec::new();
         for (pool_key, slots_needed) in pools {
@@ -3480,7 +3358,7 @@ impl SurrealStorage {
                 .query_pool_usage(code_location_id, pool_key, now_ns)
                 .await?;
             if pool.slot_limit < 0 {
-                continue; // unlimited — no claim needed
+                continue;
             }
             limited_pools.push((pool_key.clone(), *slots_needed));
             if current_used + *slots_needed > pool.slot_limit as u32 {
@@ -3541,9 +3419,6 @@ impl SurrealStorage {
             });
         }
 
-        // Atomic claim transaction with sentinel. Re-verifies capacity from
-        // its snapshot and bumps claim_version to force write-write conflicts
-        // with concurrent claims.
         let txn_query = Self::build_claim_transaction(&limited_pools);
         let mut q = self.db.query(&txn_query);
         for (i, (pool_key, _)) in limited_pools.iter().enumerate() {
@@ -3556,8 +3431,6 @@ impl SurrealStorage {
             .bind(("now", now_ns))
             .bind(("lease_exp", lease_exp));
 
-        // Transient SurrealDB errors propagate via `?` — the caller's
-        // predicate decides whether to retry.
         let mut response = q.await?.check()?;
 
         let check_idx = Self::claim_check_statement_index(pools.len());
@@ -3566,9 +3439,6 @@ impl SurrealStorage {
         if count.unwrap_or(0) > 0 {
             Ok(ConcurrencyClaimStatus::Claimed)
         } else {
-            // Transaction's snapshot saw the pool as full — surface as a
-            // retryable sentinel so the outer `with_retry_if` retries with
-            // exponential backoff via the shared retry config.
             Err(anyhow::Error::new(PoolContended))
         }
     }
@@ -3608,7 +3478,6 @@ mod tests {
     }
 
     /// The run-events page must scan `idx_events_run_ts` (timestamp order), not sort.
-    /// RocksDB backend — kv-mem plans differently.
     #[tokio::test]
     async fn run_events_page_uses_ordering_index() {
         let temp = test_temp_dir::test_temp_dir!();
@@ -3662,8 +3531,7 @@ mod tests {
         );
     }
 
-    /// The asset-events page (`ORDER BY timestamp ... LIMIT`) must scan
-    /// `idx_events_loc_asset_ts`, not sort every matching event. RocksDB backend.
+    /// The asset-events page must scan `idx_events_loc_asset_ts`, not sort every matching event.
     #[tokio::test]
     async fn asset_events_page_uses_ordering_index() {
         let temp = test_temp_dir::test_temp_dir!();
@@ -3718,10 +3586,7 @@ mod tests {
         );
     }
 
-    /// The UNIQUE index compares the SERIALIZED partition_key, so the same
-    /// logical Multi key written with dims in a different order must
-    /// canonicalize to one row — Python builds dims from a HashMap whose
-    /// iteration order varies per instance.
+    /// The UNIQUE index compares the SERIALIZED partition_key, so a reordered-dims Multi key canonicalizes to one row.
     #[tokio::test]
     async fn test_multi_partition_key_dims_order_canonicalized() {
         let temp_dir = test_temp_dir::test_temp_dir!();
@@ -3774,11 +3639,7 @@ mod tests {
         );
     }
 
-    /// `store_events`/`store_event` upsert `asset_partitions` via `INSERT ... ON
-    /// DUPLICATE KEY UPDATE`, which must fire on the table's UNIQUE
-    /// (code_location_id, asset_key, partition_key) index — not the record id —
-    /// to replace rather than duplicate. Guard that on the RocksDB backend the
-    /// demo uses (kv-mem enforces indexes differently).
+    /// `store_events`/`store_event` upsert `asset_partitions` on the UNIQUE index to replace rather than duplicate.
     #[tokio::test]
     async fn test_upsert_asset_partitions_replaces_on_unique_index() {
         let temp_dir = test_temp_dir::test_temp_dir!();
@@ -3828,8 +3689,7 @@ mod tests {
         );
     }
 
-    /// Per-partition lookups receive the display string; for Multi-partitioned
-    /// assets the persisted key is a Multi object — the lookup must still match.
+    /// Per-partition lookups receive the display string and must still match a persisted Multi key.
     #[tokio::test]
     async fn test_partition_string_lookup_matches_multi_keys() {
         let temp_dir = test_temp_dir::test_temp_dir!();
@@ -3878,10 +3738,7 @@ mod tests {
         );
     }
 
-    /// After a def-shape change, legacy Single events whose key strings look
-    /// like Multi displays can coexist with real Multi events for the same
-    /// asset. Display lookups must prefer the structured (Multi) reading —
-    /// not whichever row happens to be newest.
+    /// Display lookups must prefer the structured (Multi) reading over a legacy Single event with a Multi-looking key.
     #[tokio::test]
     async fn test_partition_string_lookup_prefers_structured_multi() {
         let temp_dir = test_temp_dir::test_temp_dir!();
@@ -3971,7 +3828,7 @@ mod tests {
         }
     }
 
-    /// Register assets before store_event (which now updates rather than creates).
+    /// Register assets before store_event.
     async fn register(storage: &SurrealStorage, keys: &[&str]) {
         let records: Vec<AssetRecord> = keys.iter().map(|k| make_asset_record(k)).collect();
         storage
@@ -4215,8 +4072,6 @@ mod tests {
         let storage = make_storage().await;
         register(&storage, &["a", "b"]).await;
 
-        // Empty → 0. The `count() ... GROUP ALL` aggregate returns no row when
-        // nothing matches, so the impl must map None → 0 rather than error.
         let n = storage
             .count_materialized_partitions(crate::storage::DEFAULT_CODE_LOCATION_ID, "a")
             .await
@@ -4236,8 +4091,6 @@ mod tests {
             input_data_versions: vec![],
         };
 
-        // Three distinct partitions of "a" + a re-materialization of one — the
-        // UNIQUE index upserts, so the count must not double-count p1.
         for ev in [
             materialize("a", "r1", "p1", 100),
             materialize("a", "r2", "p2", 200),
@@ -4639,24 +4492,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_run_swallows_duplicate_id_after_retry() {
-        // Documents the phantom-commit handling for client-supplied-ID CREATEs.
-        //
-        // Surrealdb v3 surfaces a unique-index violation as
-        // `ErrorDetails::Internal` with a message like "Database index ...
-        // already contains ...", NOT as `AlreadyExists`. Our retry classifier
-        // checks `Internal` against the `"onflict"`/`"Busy"`/`"Try again"`
-        // substrings — `"already contains"` does not match — so the violation
-        // falls through as permanent and the retry loop exits.
-        //
-        // `create_run` then post-processes that permanent error via
-        // `swallow_phantom_commit`: it converts the unique-index violation into
-        // `Ok(())` with a warning, on the assumption that the only realistic
-        // way to land here is a phantom commit on a previous retry attempt
-        // (UUID collision between processes being statistically negligible).
-        //
-        // This test verifies both halves of that contract:
-        //   1. The raw SurrealDB error has the expected shape.
-        //   2. `create_run` swallows it and returns Ok.
         use super::super::retry;
 
         let storage = make_storage().await;
@@ -4688,10 +4523,6 @@ mod tests {
         let fetched = storage.get_run("duplicate_run").await.unwrap().unwrap();
         assert_eq!(fetched, run);
 
-        // Sanity: the raw SurrealDB error this swallow logic catches has the
-        // expected shape — Internal kind + "already contains" message — and
-        // the classifier rejects it as permanent (which is why it surfaces
-        // here in the first place rather than looping inside `with_retry`).
         let raw_err = storage
             .db
             .create::<Option<RunRecord>>("runs")
@@ -4923,8 +4754,6 @@ mod tests {
         assert_eq!(page.total, 1);
         assert_eq!(page.rows[0].job_name.as_deref(), Some("daily_ingest"));
 
-        // Exact job_name filter disambiguates `daily_ingest` from
-        // `daily_export` (substring `daily` would match both).
         let filter = RunFilter {
             job_name: Some("daily_ingest".into()),
             ..Default::default()
@@ -4980,8 +4809,7 @@ mod tests {
         assert_eq!(b.1.run_id, "r4");
     }
 
-    /// Empty input must round-trip without a query (no statements to send)
-    /// and no DB call overhead.
+    /// Empty input must round-trip without a query.
     #[tokio::test]
     async fn test_get_all_last_run_per_job_empty_input() {
         let storage = make_storage().await;
@@ -4989,15 +4817,10 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// Regression guard for the multi-statement batching: many distinct
-    /// job names must all resolve in a single `.query()` call. If the
-    /// statement/bind indexing ever gets off-by-one, this test returns
-    /// the wrong `run_id` per job.
+    /// Guard for the multi-statement batching: distinct job names must all resolve in a single `.query()` call.
     #[tokio::test]
     async fn test_get_all_last_run_per_job_batches_many_jobs_correctly() {
         let storage = make_storage().await;
-        // 50 jobs × 3 runs each = 150 rows. Pick an arbitrary non-trivial
-        // count so the batch covers at least ~5× the default pagination.
         const N_JOBS: usize = 50;
         for i in 0..N_JOBS {
             for k in 0..3 {
@@ -5022,16 +4845,12 @@ mod tests {
             }
         }
 
-        // Request in a non-sorted order to prove the query indexing doesn't
-        // rely on input ordering.
         let mut names: Vec<String> = (0..N_JOBS).map(|i| format!("batched_job_{i}")).collect();
         names.rotate_left(17);
         let out = storage.get_all_last_run_per_job(&names).await.unwrap();
 
         assert_eq!(out.len(), N_JOBS, "every job should resolve");
         for (job_name, run) in &out {
-            // `run_id` must be the latest of the three runs we inserted
-            // for that job (k=2 has the largest start_time).
             let expected_suffix = "_r2";
             assert!(
                 run.run_id.ends_with(expected_suffix),
@@ -5128,18 +4947,7 @@ mod tests {
         assert!(first.is_some(), "expected a notification, got None");
     }
 
-    /// Each table fed by an `rivers-ui` LIVE channel must wake its
-    /// `subscribe_table` stream on a write. Covers every table in
-    /// `rivers_ui::live::LIVE_CHANNELS` (kept in lockstep here by table
-    /// name — adding a new channel-fed table must add a scenario, else
-    /// that table would silently stop emitting to the UI).
-    ///
-    /// Uses high-level APIs where they exist; falls back to raw inserts via
-    /// `self.db` for tables normally written by internal transactions
-    /// (`asset_partitions` via the store_event partition-upsert path,
-    /// `concurrency_slots` / `pending_steps` via the claim transaction).
-    /// For the LIVE-query primitive, bypassing the transaction is equivalent —
-    /// all that matters is that the table saw a `CREATE` and the stream woke.
+    /// Each table fed by an `rivers-ui` LIVE channel must wake its `subscribe_table` stream on a write.
     #[tokio::test]
     async fn test_subscribe_table_wakes_for_every_live_channel_table() {
         use futures_util::StreamExt;
@@ -5203,9 +5011,6 @@ mod tests {
         })
         .await;
 
-        // `asset_partitions` table — no clean public API; raw insert
-        // matches the `CREATE asset_partitions SET …` shape used by
-        // `store_event`'s partition-upsert path.
         expect_yields(&storage, "asset_partitions", async {
             storage
                 .db
@@ -5311,9 +5116,6 @@ mod tests {
         })
         .await;
 
-        // `concurrency_slots` table — raw insert (full claim transaction
-        // is covered by the concurrency tests; here we only need a CREATE
-        // on the table to wake the LIVE query).
         expect_yields(&storage, "concurrency_slots", async {
             storage
                 .db
@@ -6142,8 +5944,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_events_same_timestamp_deterministic_order() {
-        // Regression: events with identical timestamps must have deterministic
-        // ordering via secondary id sort (not random each query).
         let storage = make_storage().await;
         register(&storage, &["a"]).await;
 
@@ -6191,7 +5991,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_runs_filtered_by_status() {
-        // Regression: UI runs page status tabs must correctly filter.
         let storage = make_storage().await;
 
         for (id, status) in [
@@ -6252,7 +6051,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_runs_for_asset_filtering() {
-        // Regression: asset detail page shows runs for the specific asset only.
         let storage = make_storage().await;
         register(&storage, &["asset_a", "asset_b"]).await;
 
@@ -6326,7 +6124,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_ticks_ordered_desc_and_counted() {
-        // Regression: deployment page shows tick count; sensor detail shows tick history.
         let storage = make_storage().await;
 
         let ticks: Vec<TickRecord> = (0..5)
@@ -6391,7 +6188,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_runs_with_tags_and_node_names() {
-        // Regression: runs list page filters by partition tag and asset name.
         let storage = make_storage().await;
 
         storage
@@ -6448,8 +6244,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_events_batch_same_timestamp_deterministic() {
-        // Regression: batch-inserted events with same timestamp must have
-        // deterministic ordering via secondary id sort.
         let storage = make_storage().await;
         register(&storage, &["x"]).await;
 
@@ -6501,11 +6295,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_input_versions_from_event_not_storage() {
-        // Regression: input_data_versions must come from the EventRecord (captured
-        // at read time by the executor), not looked up from storage after the fact.
-        // This prevents a race where a concurrent run updates an upstream's
-        // last_data_version between the time downstream reads it and the time
-        // the materialization event is stored.
         let storage = make_storage().await;
         register(&storage, &["upstream", "downstream"]).await;
 
@@ -6554,8 +6343,6 @@ mod tests {
             .await
             .unwrap();
 
-        // 2. Simulate the race: upstream gets re-materialized to "v2"
-        //    BEFORE downstream's event is stored
         storage
             .store_event(&EventRecord {
                 code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
@@ -6575,8 +6362,6 @@ mod tests {
         // At this point upstream's last_data_version in storage is "v2".
         // But downstream actually read "v1" during its execution.
 
-        // 3. Store downstream's materialization with the version it actually
-        //    consumed ("v1"), provided by the executor in input_data_versions.
         storage
             .store_event(&EventRecord {
                 code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
@@ -6588,7 +6373,6 @@ mod tests {
                 partition_key: None,
                 timestamp: 300,
                 metadata: vec![],
-                // The executor captured this at read time — "v1", not "v2"
                 input_data_versions: vec![("upstream".to_string(), "v1".to_string())],
             })
             .await
@@ -6606,9 +6390,6 @@ mod tests {
             "Should record the version the executor actually read, not the current storage value"
         );
 
-        // 5. Verify staleness: upstream is now at "v2" but downstream consumed "v1"
-        //    → downstream should be Stale. Compute staleness on demand
-        //    (no longer persisted on the record).
         let staleness = crate::staleness::compute_staleness(
             &[
                 storage
@@ -6623,9 +6404,6 @@ mod tests {
         let (status, causes) = staleness.get("downstream").unwrap();
         assert_eq!(status, &StaleStatus::Stale);
         assert!(!causes.is_empty());
-
-        // If the old code had looked up storage at write time, it would have
-        // recorded "v2" and downstream would incorrectly appear UpToDate.
     }
 
     // ── get_observations_since tests ──
@@ -7025,11 +6803,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_runs_by_ids_orders_by_start_time() {
-        // The condition cache applies run effects (last_run tags / asset_names)
-        // in iteration order with last-write-wins, so get_runs_by_ids must
-        // return runs oldest-first. Use ids whose lexical order is the REVERSE
-        // of start_time order, so an unordered (id/insertion) return would not
-        // accidentally match.
         let storage = make_storage().await;
         let mk = |id: &str, start: i64| RunRecord {
             run_id: id.to_string(),
@@ -7045,7 +6818,6 @@ mod tests {
             block_reason: None,
             launched_by: LaunchedBy::Manual,
         };
-        // id order "aaa" < "mmm" < "zzz" is the reverse of start_time order.
         storage.create_run(&mk("zzz", 1000)).await.unwrap();
         storage.create_run(&mk("mmm", 2000)).await.unwrap();
         storage.create_run(&mk("aaa", 3000)).await.unwrap();
@@ -7745,8 +7517,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_failed_partitions_includes_marked_in_success_run() {
-        // review #1: a mark_partition_failed key lands in a Success run but must
-        // still report failed, else automation re-materializes it.
         let storage = make_storage().await;
         register(&storage, &["asset"]).await;
 
@@ -8029,8 +7799,6 @@ mod tests {
     async fn test_new_memory_schema_indexes() {
         let storage = make_storage().await;
 
-        // events: per-CL composite indexes — by-asset filters are scoped via
-        // `(code_location_id, asset_key[, partition_key])`.
         let mut result = storage.db.query("INFO FOR TABLE events").await.unwrap();
         let info: Option<serde_json::Value> = result.take(0).unwrap();
         let indexes = info.unwrap()["indexes"].as_object().unwrap().clone();
@@ -8756,8 +8524,6 @@ mod tests {
         let future_ns = now_ns + 600_000_000_000; // 10 min from now
         let past_ns = now_ns - 60_000_000_000; // 1 min ago (expired)
 
-        // Insert active slots via raw queries (bypasses claim_concurrency_slots).
-        // Use check_errors() to fully consume each response and avoid stale connection state.
         for (run_id, step_key, slots, expires) in [
             ("run1", "step_a", 2i64, future_ns),
             ("run2", "step_b", 3, future_ns),
@@ -9551,8 +9317,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_claims_limit_one() {
-        // Stress test: 50 tasks claim same pool with limit=1.
-        // Exactly 1 should get Claimed, 49 should get Pending.
         let storage = std::sync::Arc::new(make_storage().await);
         storage
             .set_pool_limit(
@@ -9698,8 +9462,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_expired_slots_not_counted() {
-        // Claim with a very short lease (1 second), wait for expiry,
-        // verify the slot is no longer counted as claimed.
         let storage = make_storage().await;
         storage
             .set_pool_limit(crate::storage::DEFAULT_CODE_LOCATION_ID, "db", 2, 300)
@@ -10031,7 +9793,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Simulates InProcess executor: sequential claim → execute → release cycle.
-    /// Three steps sharing a pool with limit=1 should execute one at a time.
     #[tokio::test]
     async fn test_executor_sequential_claim_release() {
         let storage = make_storage().await;
@@ -10075,7 +9836,6 @@ mod tests {
     }
 
     /// Simulates Async executor: concurrent claims with pool limit controlling throughput.
-    /// Pool limit=2, 5 concurrent tasks. Exactly 2 should claim, 3 should pend.
     #[tokio::test]
     async fn test_executor_concurrent_claim_limit() {
         let storage = make_storage().await;
@@ -10143,8 +9903,7 @@ mod tests {
         assert_eq!(s3_retry, ConcurrencyClaimStatus::Claimed);
     }
 
-    /// Simulates run-level cleanup: free_concurrency_slots_for_run removes all
-    /// slots held by a run (defense-in-depth after execute_plan completes).
+    /// Simulates run-level cleanup: free_concurrency_slots_for_run removes all slots held by a run.
     #[tokio::test]
     async fn test_executor_run_level_cleanup() {
         let storage = make_storage().await;
@@ -10330,8 +10089,7 @@ mod tests {
     // Coordinator tick overhead stress test
     // -----------------------------------------------------------------------
 
-    /// Simulates a full coordinator tick cycle at various queue/run sizes and
-    /// measures wall-clock time. Run with `cargo test --release coordinator_tick_stress -- --nocapture`
+    /// Simulates a full coordinator tick cycle at various queue/run sizes and measures wall-clock time.
     #[tokio::test]
     async fn coordinator_tick_stress() {
         use std::time::Instant;
@@ -10456,8 +10214,6 @@ mod tests {
                  {per_tick:>8.3?}/tick ({n_ticks} ticks in {elapsed:.3?})"
             );
 
-            // Assert: each tick must complete well within 250ms
-            // No assertion — this test is for observing scaling behavior.
         }
     }
 
@@ -11003,8 +10759,6 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Per-partition StepFailure events (mark_partition_failed) must NOT count
-        // toward step progress, or completed would exceed total.
         for (key, ts) in [("p1", 150), ("p2", 160)] {
             storage
                 .store_event(&EventRecord {
@@ -11388,9 +11142,7 @@ mod tests {
         assert!(keys_b.contains("y"));
     }
 
-    /// Regression: two CodeLocations writing topology under distinct
-    /// identities must not overwrite each other, and the typed scoped
-    /// reader returns only the calling CL's blob.
+    /// Two CodeLocations writing topology under distinct identities must not overwrite each other.
     #[tokio::test]
     async fn graph_topology_isolated_per_code_location() {
         use crate::assets::graph::{NodeKind, TopologyNode};
@@ -11450,9 +11202,7 @@ mod tests {
         assert_eq!(read_b.nodes[0].name, "b_only");
     }
 
-    /// `condition_eval_state` is keyed per CL — two daemons sharing a
-    /// SurrealDB must round-trip their own state without clobbering each
-    /// other's snapshot.
+    /// `condition_eval_state` is keyed per CL.
     #[tokio::test]
     async fn condition_eval_state_isolated_per_code_location() {
         use crate::condition::ConditionEvalState;
@@ -11496,9 +11246,7 @@ mod tests {
         assert!(read_b.is_initial, "CL-B keeps its own snapshot");
     }
 
-    /// Scoped `get_runs` / `get_queued_runs` / `get_runs_since` only return
-    /// runs owned by the calling CL. The unscoped `get_all_*` variants
-    /// remain global (UI / CLI views).
+    /// Scoped `get_runs` / `get_queued_runs` / `get_runs_since` only return runs owned by the calling CL.
     #[tokio::test]
     async fn scoped_run_queries_isolated_per_code_location() {
         let storage = make_storage().await;
@@ -11601,8 +11349,7 @@ mod tests {
         assert_eq!(all_queued.len(), 2);
     }
 
-    /// The per-CL `get_runs_page` only returns rows for the calling CL,
-    /// while the global `get_all_runs_page` returns both.
+    /// The per-CL `get_runs_page` only returns rows for the calling CL, while the global `get_all_runs_page` returns both.
     #[tokio::test]
     async fn runs_page_isolated_per_code_location() {
         let storage = make_storage().await;
@@ -11705,8 +11452,6 @@ mod tests {
     async fn last_run_per_job_isolated_per_code_location() {
         let storage = make_storage().await;
         let now = now_nanos();
-        // Same job_name across CLs — the bug we want to catch is one CL's last
-        // run leaking into another CL's "latest" view.
         for (id, cl, ts) in [
             ("a-old", "cl-a", now - 10_000_000),
             ("a-new", "cl-a", now),

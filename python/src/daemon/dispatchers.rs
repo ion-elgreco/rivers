@@ -1,14 +1,4 @@
-//! Run and backfill dispatch — the seam between an `EvalOutcome`'s
-//! `RunRequest`/`BackfillRequest` lists and the actual creation of `RunRecord`s
-//! / launch of backfills. Each strategy is a variant of the corresponding
-//! `*DispatcherKind` enum (matches the `RunBackendKind` precedent in `mod.rs`).
-//!
-//! - Direct vs Queued is the run-side strategy: direct creates + spawns an OS
-//!   thread to call `execute_run`; queued submits via `repo.submit_run` so the
-//!   `RunQueueCoordinator` picks them up.
-//! - Backfills currently only have a local strategy (`repo.backfill` on an OS
-//!   thread, results collected via oneshot). The trait-shaped enum exists so a
-//!   future remote/distributed adapter drops in cleanly.
+//! Run and backfill dispatch — the seam between eval outcomes and run/backfill creation.
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -21,14 +11,7 @@ use crate::gil_threads::GilThreads;
 use crate::partitions::PyPartitionKey;
 use crate::repository::{PyBackfillResult, PyCodeRepository, RepoHandle, priority_from_tags};
 
-/// Launch a `Started` run on a fresh OS thread. Both the daemon's
-/// Direct dispatcher and the gRPC `ExecuteJob` handler obtain the
-/// `run_id` via [`RepoHandle::create_started_run`] and hand off here
-/// for execution. Fire-and-forget: errors are logged via tracing —
-/// the run's own status-update path reports failure to storage.
-///
-/// `std::thread::spawn` over `tokio::task::spawn_blocking` here — see
-/// [`crate::runtime`] for the rationale.
+/// Launch a `Started` run on a fresh OS thread.
 pub(crate) fn launch_started_run(
     handle: RepoHandle,
     job_name: String,
@@ -68,12 +51,6 @@ pub(crate) fn launch_started_run(
 }
 
 /// Result of dispatching a batch of run or backfill requests.
-///
-/// `ids` holds the successfully created run / backfill ids (one per
-/// successful request). `errors` holds per-request failures with rich context
-/// already baked in via `anyhow::Error::context` — the caller only needs to
-/// log them. Length of `ids` + length of `errors` may be less than the input
-/// length when an outer failure (e.g. GIL acquisition) aborts the batch.
 #[derive(Default)]
 pub(crate) struct DispatchOutcome {
     pub(crate) ids: Vec<String>,
@@ -81,9 +58,7 @@ pub(crate) struct DispatchOutcome {
 }
 
 pub(crate) struct DirectRunDispatcher {
-    /// Used by `dispatch_materialization` to call
-    /// `materialize_with_launcher`, which fundamentally needs the GIL
-    /// to run user asset code.
+    /// Used by `dispatch_materialization` to call `materialize_with_launcher`.
     repo: Arc<Py<PyCodeRepository>>,
     handle: RepoHandle,
     gil_threads: GilThreads,
@@ -91,10 +66,7 @@ pub(crate) struct DirectRunDispatcher {
 
 pub(crate) struct QueuedRunDispatcher {
     handle: RepoHandle,
-    /// Used by `dispatch_materialization` to write Queued `RunRecord`s
-    /// directly via `SurrealStorage::enqueue_run`. The condition path has
-    /// the asset selection pre-resolved and doesn't need the repo's
-    /// graph/job lookup that `submit_run` performs.
+    /// Used by `dispatch_materialization` to write Queued `RunRecord`s directly via `SurrealStorage::enqueue_run`.
     storage: Arc<SurrealStorage>,
     code_location_id: String,
 }
@@ -135,15 +107,7 @@ impl RunDispatcherKind {
         }
     }
 
-    /// Schedule/sensor tick entry: dispatch one tick's worth of work — both
-    /// job-targeted runs and ad-hoc materializations — and return a single
-    /// merged outcome. The two halves run concurrently via `tokio::join!`;
-    /// they touch disjoint critical sections (both paths now write
-    /// records via async storage and only spawn launch threads as a
-    /// fire-and-forget side effect) so parallelism is free.
-    ///
-    /// `DispatchOutcome.ids` is deterministic: job ids first, materialize
-    /// ids appended.
+    /// Schedule/sensor tick entry: dispatch one tick's worth of work and return a merged outcome.
     pub(crate) async fn dispatch_tick(
         &self,
         job_reqs: &[RunRequestData],
@@ -161,10 +125,7 @@ impl RunDispatcherKind {
         Ok(merged)
     }
 
-    /// Job-targeted half of a tick. Every request must carry `job_name`
-    /// (set on the `RunRequest` itself or applied as a default by
-    /// `parse_*_result`). Asset-selection runs go through
-    /// [`Self::dispatch_materialization`].
+    /// Job-targeted half of a tick.
     pub(crate) async fn dispatch_jobs(
         &self,
         requests: &[RunRequestData],
@@ -176,20 +137,7 @@ impl RunDispatcherKind {
         }
     }
 
-    /// Condition daemon entry: pre-resolved asset selection with
-    /// caller-minted run_ids. Also called as the materialize half of
-    /// [`Self::dispatch_tick`].
-    ///
-    /// Direct mode dispatches via `repo.materialize_with_launcher`; Queued
-    /// mode writes a Queued `RunRecord` + `RunQueued` event directly to
-    /// storage. The returned `DispatchOutcome.ids` echoes the input run_ids
-    /// in success order; callers usually already track them.
-    ///
-    /// Trusts the caller to have validated `asset_selection` and
-    /// `partition_key` already — system-boundary callers (gRPC) check
-    /// at the handler; internal callers (sensor/schedule eval,
-    /// condition daemon) are pre-validated upstream or accept retry
-    /// semantics.
+    /// Condition daemon entry: pre-resolved asset selection with caller-minted run_ids.
     pub(crate) async fn dispatch_materialization(
         &self,
         requests: &[MaterializationRequestData],
@@ -202,17 +150,7 @@ impl RunDispatcherKind {
 }
 
 impl DirectRunDispatcher {
-    /// Materialization variant: write the `Started` `RunRecord`
-    /// up-front via [`RepoHandle::create_materialization_run`] (GIL-free,
-    /// in this async fn), then spawn one OS thread per request to drive
-    /// the GIL-bound execution via `materialize_with_launcher`. The
-    /// thread re-uses the existing record (`RunInit::Existing`) so no
-    /// duplicate write happens.
-    ///
-    /// Pre-writing the record means storage failures land in
-    /// `DispatchOutcome.errors` synchronously (before the launch
-    /// thread is spawned), instead of being swallowed inside the
-    /// fire-and-forget thread.
+    /// Materialization variant: write the `Started` `RunRecord` up-front, then spawn one OS thread per request.
     async fn dispatch_materialization(
         &self,
         requests: &[MaterializationRequestData],
@@ -267,15 +205,7 @@ impl DirectRunDispatcher {
         Ok(DispatchOutcome { ids, errors })
     }
 
-    /// Phase 1 (GIL-free): create one `Started` `RunRecord` per request via
-    /// `RepoHandle::create_started_run`. Partition validation happens
-    /// against the job's resolved asset selection, so a misconfigured
-    /// schedule/sensor partition fails synchronously.
-    ///
-    /// Phase 2 (detached OS thread): launch each successfully created run
-    /// via [`launch_started_run`]. Fire-and-forget — the daemon does not
-    /// await launch completion. Per-request failures from Phase 1 land in
-    /// `DispatchOutcome.errors`; partial progress is preserved.
+    /// Create one `Started` `RunRecord` per request, then launch each on a detached OS thread.
     async fn dispatch_jobs(
         &self,
         requests: &[RunRequestData],
@@ -331,11 +261,7 @@ impl DirectRunDispatcher {
 }
 
 impl QueuedRunDispatcher {
-    /// Materialization variant: write a Queued `RunRecord` for each
-    /// request via `SurrealStorage::enqueue_run`, using the caller-minted
-    /// run_id and the pre-resolved asset selection. The Python boundary is
-    /// not crossed (no GIL, no job lookup) — the storage primitive owns
-    /// the "Queued + RunQueued event" invariant.
+    /// Materialization variant: write a Queued `RunRecord` for each request via `SurrealStorage::enqueue_run`.
     async fn dispatch_materialization(
         &self,
         requests: &[MaterializationRequestData],
@@ -375,10 +301,7 @@ impl QueuedRunDispatcher {
         Ok(DispatchOutcome { ids, errors })
     }
 
-    /// Submit each request via `repo.submit_run`, producing `Queued`
-    /// `RunRecord`s for the `RunQueueCoordinator` to dequeue. Every request
-    /// must carry `job_name` (asset-selection runs go through
-    /// `dispatch_materialization`).
+    /// Submit each request via `repo.submit_run`, producing `Queued` `RunRecord`s.
     async fn dispatch_jobs(
         &self,
         requests: &[RunRequestData],
@@ -438,22 +361,11 @@ pub(crate) enum BackfillDispatcherKind {
 }
 
 /// Per-request result of a backfill dispatch.
-///
-/// Distinct from [`DispatchOutcome`] (run-shaped, ids only) — backfills
-/// produce richer per-request data (`num_partitions`, `run_ids`,
-/// `is_dry_run`, …) that gRPC's `LaunchBackfill` surfaces verbatim.
-/// The daemon's tick logger only consumes `backfill_id` and ignores the
-/// rest; that asymmetry is fine — both callers go through the same
-/// dispatch but read different slices of the result.
 #[derive(Default)]
 pub(crate) struct BackfillDispatchOutcome {
     pub(crate) results: Vec<PyBackfillResult>,
     pub(crate) errors: Vec<anyhow::Error>,
-    /// The request selections (asset lists) that failed to launch. A backfill
-    /// registers no run up front, so a per-request failure leaves the asset's
-    /// pre-dispatch `in_progress` placeholder with no surfacing sub-run to
-    /// self-heal it — the caller clears these marks (parallel to the
-    /// whole-batch failure path).
+    /// The request selections (asset lists) that failed to launch.
     pub(crate) failed_targets: Vec<Vec<String>>,
 }
 
@@ -479,14 +391,7 @@ impl BackfillDispatcherKind {
 }
 
 impl LocalBackfillDispatcher {
-    /// Spawn one OS thread per backfill request; collect [`PyBackfillResult`]s
-    /// via oneshot. `std::thread::spawn` over `spawn_blocking` — see
-    /// [`crate::runtime`].
-    ///
-    /// `dry_run` requests are valid: the resulting `backfill_id` is empty
-    /// and `is_dry_run` is `true`, but the result is otherwise complete
-    /// (partition counts, status). Callers that need a real backfill_id
-    /// (the daemon tick logger) inspect `is_dry_run` themselves.
+    /// Spawn one OS thread per backfill request; collect [`PyBackfillResult`]s via oneshot.
     async fn dispatch(
         &self,
         requests: &[BackfillRequestData],
@@ -504,7 +409,6 @@ impl LocalBackfillDispatcher {
             let repo = Arc::clone(&self.repo);
             let bf = bf.clone();
             let target = bf.target.clone();
-            // Display label for error context: the asset list, or `job:<name>`.
             let label: Vec<String> = match &target {
                 crate::daemon::RunType::Materialization(sel) => sel.clone(),
                 crate::daemon::RunType::Job(name) => vec![format!("job:{name}")],
