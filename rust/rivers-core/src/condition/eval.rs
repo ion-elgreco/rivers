@@ -1623,10 +1623,16 @@ fn eval_partitioned_on_dep(
     let upstream_entry = pctx.resolver.upstream_partition_keys.get(dep_key);
 
     if upstream_entry.is_none() {
-        let root_floor = pctx
-            .all_partition_statuses
-            .get(ctx.root_key)
-            .and_then(|status| root_floor_over(pctx.all_keys.iter(), status));
+        // In a nested pivot `pctx.all_keys` is the intermediate dep's key
+        // space, not the root's — use the floor precomputed at the outer
+        // pivot over the true root universe.
+        let root_floor = match ctx.root_partition_floor {
+            Some(f) => f,
+            None => pctx
+                .all_partition_statuses
+                .get(ctx.root_key)
+                .and_then(|status| root_floor_over(pctx.all_keys.iter(), status)),
+        };
         let dep_state = ctx
             .all_asset_states
             .get(dep_key)
@@ -1758,6 +1764,16 @@ fn eval_partitioned_on_dep(
         .all_asset_states
         .get(dep_key)
         .unwrap_or(&EMPTY_CONDITION_STATE);
+    // Nested dep-aggregates lose sight of the root's universe; carry the
+    // bridge floor computed over it so their unpartitioned-dep pivots don't
+    // recompute it over this dep's key space.
+    let nested_bridge_floor = condition.has_dep_aggregate().then(|| {
+        ctx.root_partition_floor.unwrap_or_else(|| {
+            pctx.all_partition_statuses
+                .get(ctx.root_key)
+                .and_then(|status| root_floor_over(pctx.all_keys.iter(), status))
+        })
+    });
     let dep_ctx = EvalContext {
         target_key: dep_key,
         root_key: ctx.root_key,
@@ -1770,7 +1786,7 @@ fn eval_partitioned_on_dep(
         now: ctx.now,
         is_initial: ctx.is_initial,
         partitions: Some(&upstream_pctx),
-        root_partition_floor: None,
+        root_partition_floor: nested_bridge_floor,
     };
 
     let mut local = HashMap::new();
