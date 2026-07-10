@@ -122,6 +122,8 @@ struct RefreshDelta {
     confirmed_pending: Vec<String>,
     /// Phantom run_ids past grace to evict; `(run_id, asset_keys)`.
     evicted_pending: Vec<(String, Vec<String>)>,
+    /// Runs whose effects were applied this refresh: `(run_id, start_time)`.
+    applied_runs: Vec<(String, i64)>,
 }
 
 impl RefreshDelta {
@@ -184,6 +186,11 @@ pub struct AssetConditionCache {
     pub pending_runs: HashMap<String, PendingRun>,
     /// Grace window before an unconfirmed dispatched run_id is treated as a phantom.
     pub pending_grace_nanos: i64,
+    /// Effects already applied for these run_ids (`run_id → start_time`). The
+    /// cursor trails the newest start_time by 1ns so same-timestamp runs that
+    /// commit after a refresh are still delivered; this set keeps the
+    /// re-delivered, already-applied ones from double-applying.
+    applied_run_ids: HashMap<String, i64>,
 }
 
 impl Default for AssetConditionCache {
@@ -228,6 +235,7 @@ impl AssetConditionCache {
             ctx: crate::storage::CodeLocationContext::new(code_location_id),
             pending_runs: HashMap::new(),
             pending_grace_nanos: DEFAULT_PENDING_GRACE_NANOS,
+            applied_run_ids: HashMap::new(),
         }
     }
 
@@ -384,7 +392,10 @@ impl AssetConditionCache {
             .await?;
         let mut invalidated_keys: Vec<String> = new_runs
             .iter()
-            .filter(|r| run_status_is_terminal(&r.status))
+            .filter(|r| {
+                run_status_is_terminal(&r.status)
+                    && !self.applied_run_ids.contains_key(&r.run_id)
+            })
             .flat_map(|r| r.node_names.iter().cloned())
             .collect();
 
@@ -456,9 +467,13 @@ impl AssetConditionCache {
                         continue;
                     }
                     swept_terminal.insert(run.run_id.clone());
+                    delta
+                        .applied_runs
+                        .push((run.run_id.clone(), run.start_time));
                     delta.clear_run(run);
                     if !new_runs_terminal.contains(run.run_id.as_str())
                         && !completed_run_ids.contains(&run.run_id)
+                        && !self.applied_run_ids.contains_key(&run.run_id)
                     {
                         invalidated_keys.extend(run.node_names.iter().cloned());
                         if self.apply_run_effects_to_delta(run, &mut delta) {
@@ -475,6 +490,9 @@ impl AssetConditionCache {
                 let ids: Vec<String> = completed_run_ids.into_iter().collect();
                 let completed_runs = storage.get_runs_by_ids(&ids, None).await?;
                 for run in &completed_runs {
+                    if self.applied_run_ids.contains_key(&run.run_id) {
+                        continue;
+                    }
                     self.apply_run_effects_to_delta(run, &mut delta);
                     invalidated_keys.extend(run.node_names.iter().cloned());
                 }
@@ -482,7 +500,28 @@ impl AssetConditionCache {
         }
 
         if !new_runs.is_empty() {
-            delta.changed = true;
+            // The cursor trails the newest start_time, so already-processed
+            // runs re-deliver every tick; only genuinely new work may defeat
+            // should_skip.
+            let known_in_flight = |r: &crate::storage::RunRecord| {
+                !r.node_names.is_empty()
+                    && r.node_names.iter().all(|a| {
+                        self.in_progress_assets
+                            .get(a)
+                            .is_some_and(|runs| runs.contains_key(&r.run_id))
+                    })
+            };
+            let has_new_work = new_runs.iter().any(|r| {
+                if run_status_is_terminal(&r.status) {
+                    !self.applied_run_ids.contains_key(&r.run_id)
+                        && !swept_terminal.contains(&r.run_id)
+                } else {
+                    !known_in_flight(r)
+                }
+            });
+            if has_new_work {
+                delta.changed = true;
+            }
 
             for run in &new_runs {
                 delta.confirmed_pending.push(run.run_id.clone());
@@ -501,16 +540,25 @@ impl AssetConditionCache {
                     }
                     RunStatus::Success | RunStatus::Failure => {
                         delta.clear_run(run);
-                        self.apply_run_effects_to_delta(run, &mut delta);
+                        if !self.applied_run_ids.contains_key(&run.run_id) {
+                            self.apply_run_effects_to_delta(run, &mut delta);
+                        }
                     }
                     RunStatus::Canceled => {
                         delta.clear_run(run);
+                        delta
+                            .applied_runs
+                            .push((run.run_id.clone(), run.start_time));
                     }
                 }
             }
 
+            // Trail the newest start_time by 1ns: dispatchers stamp one `now`
+            // across a batch committed record-by-record, so equal-timestamp
+            // runs can land after this refresh. `applied_run_ids` dedups the
+            // re-delivered ones.
             if let Some(newest) = new_runs.iter().map(|r| r.start_time).max() {
-                delta.new_last_seen_run_ts = Some(newest);
+                delta.new_last_seen_run_ts = Some(newest.saturating_sub(1));
             }
         }
 
@@ -603,6 +651,9 @@ impl AssetConditionCache {
         if !matches!(run.status, RunStatus::Success | RunStatus::Failure) {
             return false;
         }
+        delta
+            .applied_runs
+            .push((run.run_id.clone(), run.start_time));
         let run_asset_names: Arc<[String]> = Arc::from(run.node_names.as_slice());
         let run_tags: Arc<[(String, String)]> = Arc::from(run.tags.as_slice());
         let is_failure = matches!(run.status, RunStatus::Failure);
@@ -793,6 +844,7 @@ impl AssetConditionCache {
             new_last_observation_ts,
             confirmed_pending,
             evicted_pending,
+            applied_runs,
         } = delta;
 
         if clear_tick_accumulators {
@@ -875,9 +927,15 @@ impl AssetConditionCache {
             self.backfill = bf;
         }
 
+        for (run_id, start_time) in applied_runs {
+            self.applied_run_ids.insert(run_id, start_time);
+        }
         if let Some(ts) = new_last_seen_run_ts {
             self.last_seen_run_ts = ts;
         }
+        // Runs at or below the cursor can never be re-delivered (`start_time > $since`).
+        let cursor = self.last_seen_run_ts;
+        self.applied_run_ids.retain(|_, st| *st > cursor);
         if let Some(ts) = new_last_observation_ts {
             self.last_observation_ts = ts;
         }
@@ -992,6 +1050,18 @@ impl AssetConditionCache {
         let recent = scoped.get_runs(1, None).await?;
         if let Some(newest) = recent.first() {
             self.last_seen_run_ts = newest.start_time.saturating_sub(1);
+            // The newest runs' effects are already reflected in the records
+            // loaded above; seed them as applied so the first refresh doesn't
+            // replay them into the tick-scoped tag accumulators.
+            let ties = scoped
+                .get_runs_since(self.last_seen_run_ts, None, crate::storage::SortOrder::Asc)
+                .await?;
+            for run in &ties {
+                if run_status_is_terminal(&run.status) {
+                    self.applied_run_ids
+                        .insert(run.run_id.clone(), run.start_time);
+                }
+            }
         }
 
         self.load_partition_status_inner(storage).await?;

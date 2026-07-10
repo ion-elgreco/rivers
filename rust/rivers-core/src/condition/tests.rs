@@ -7207,6 +7207,128 @@ async fn test_initial_load_tracks_queued_and_not_started_runs() {
 }
 
 #[tokio::test]
+async fn test_restart_does_not_replay_newest_run_tick_tags() {
+    // The newest pre-restart run must not repopulate the tick-scoped tag
+    // accumulators on the first steady refresh — HasRunWithTags would report
+    // a days-old run as "completed this tick" and spuriously fire.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let rec_a = make_materialized_record("a", 1000);
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_a])
+        .await
+        .unwrap();
+    storage
+        .create_run(&RunRecord {
+            run_id: "run-old".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Success,
+            start_time: 2000,
+            end_time: Some(3000),
+            tags: vec![("team".to_string(), "x".to_string())],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.set_needs_tick_tags(&[ConditionNode::HasRunWithTags {
+        tag_keys: vec![],
+        tag_values: vec![("team".to_string(), "x".to_string())],
+    }]);
+    cache.refresh(&storage, 4000).await.unwrap();
+    cache.refresh(&storage, 4001).await.unwrap();
+    assert!(
+        cache.tick_materialization_tags.is_empty(),
+        "a pre-restart run must not be reported as completed this tick; got {:?}",
+        cache.tick_materialization_tags
+    );
+}
+
+#[tokio::test]
+async fn test_same_timestamp_run_committed_after_refresh_is_seen() {
+    // Dispatchers stamp one `now` across a batch committed record-by-record;
+    // a refresh landing mid-batch must not permanently lose the runs that
+    // commit afterward with the same start_time.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let recs = [
+        make_materialized_record("a", 1000),
+        make_materialized_record("b", 1000),
+    ];
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&recs)
+        .await
+        .unwrap();
+
+    let mk_run = |id: &str, asset: &str| RunRecord {
+        run_id: id.to_string(),
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        job_name: Some("test".to_string()),
+        status: RunStatus::Started,
+        start_time: 2000,
+        end_time: None,
+        tags: vec![("team".to_string(), "x".to_string())],
+        node_names: vec![asset.to_string()],
+        priority: 0,
+        partition_key: None,
+        block_reason: None,
+        launched_by: LaunchedBy::Manual,
+    };
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.set_needs_tick_tags(&[ConditionNode::HasRunWithTags {
+        tag_keys: vec![],
+        tag_values: vec![("team".to_string(), "x".to_string())],
+    }]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    storage.create_run(&mk_run("run-1", "a")).await.unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(cache.in_progress_assets.contains_key("a"));
+
+    // run-2 commits after the refresh with the SAME start_time.
+    storage.create_run(&mk_run("run-2", "b")).await.unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        cache.in_progress_assets.contains_key("b"),
+        "a same-timestamp run committed after the refresh must still be seen; got {:?}",
+        cache.in_progress_assets
+    );
+
+    // Completion effects apply exactly once despite re-delivery.
+    storage
+        .update_run_status("run-1", RunStatus::Success, Some(3000))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(!cache.in_progress_assets.contains_key("a"));
+    let first_report = cache.tick_materialization_tags.clone();
+    assert!(!first_report.is_empty(), "completion reports tick tags once");
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        cache.tick_materialization_tags.is_empty(),
+        "re-delivered runs must not double-report tick tags; got {:?}",
+        cache.tick_materialization_tags
+    );
+}
+
+#[tokio::test]
 async fn test_failure_floor_survives_daemon_restart() {
     // ExecutionFailed state is maintained by the steady-state refresh only;
     // it must survive a restart via the persisted eval state or failed assets
