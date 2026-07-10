@@ -6719,6 +6719,7 @@ async fn test_cache_completion_fallback_skips_still_started_sibling_effects() {
         .unwrap();
 
     let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.set_partitioned_assets(vec!["dst".to_string()]);
     cache.refresh(&storage, 0).await.unwrap();
 
     let part = |k: &str| PartitionKey::Single {
@@ -7109,9 +7110,25 @@ async fn test_queued_run_from_scheduler_is_tracked_and_applies_effects() {
     );
 
     // The run completes; start_time never changes, so only the tracked-run
-    // sweep can observe the transition.
+    // sweep can observe the transition. The materialization event credits the
+    // record with the run.
     storage
         .update_run_status(&run_id, RunStatus::Success, Some(3000))
+        .await
+        .unwrap();
+    storage
+        .store_event(&crate::storage::EventRecord {
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            event_type: crate::storage::EventType::Materialization {
+                data_version: Some("dvq".to_string()),
+            },
+            asset_key: Some("a".to_string()),
+            run_id: "run-queued".to_string(),
+            partition_key: None,
+            timestamp: 3000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        })
         .await
         .unwrap();
     cache.refresh(&storage, 0).await.unwrap();
@@ -7202,6 +7219,222 @@ async fn test_initial_load_tracks_queued_and_not_started_runs() {
     );
     assert!(cache.in_progress_assets.contains_key("b"));
     assert!(cache.in_progress_assets.contains_key("c"));
+}
+
+#[tokio::test]
+async fn test_joint_partitioned_run_updates_unpartitioned_assets_scalar_tags() {
+    // A partition-keyed joint run spanning a partitioned and an unpartitioned
+    // asset must write the unpartitioned asset's tags into the SCALAR maps the
+    // unpartitioned eval path reads — not only into the partition maps.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let mut rec_p = make_materialized_record("P", 1000);
+    rec_p.last_run_id = Some("run-joint".to_string());
+    let mut rec_d = make_materialized_record("D", 1000);
+    rec_d.last_run_id = Some("run-joint".to_string());
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_p, rec_d])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.set_partitioned_assets(vec!["P".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    storage
+        .create_run(&RunRecord {
+            run_id: "run-joint".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![("team".to_string(), "x".to_string())],
+            node_names: vec!["P".to_string(), "D".to_string()],
+            priority: 0,
+            partition_key: Some(spk("2024-01-01")),
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    storage
+        .update_run_status("run-joint", RunStatus::Success, Some(3000))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+
+    assert!(
+        cache
+            .partition_last_run_tags
+            .get("P")
+            .and_then(|m| m.get(&spk("2024-01-01")))
+            .is_some_and(|t| t.contains(&("team".to_string(), "x".to_string()))),
+        "partitioned asset keeps per-partition tags; got {:?}",
+        cache.partition_last_run_tags
+    );
+    assert!(
+        cache
+            .last_run_tags
+            .get("D")
+            .is_some_and(|t| t.contains(&("team".to_string(), "x".to_string()))),
+        "unpartitioned asset must get scalar tags; got {:?}",
+        cache.last_run_tags
+    );
+}
+
+#[tokio::test]
+async fn test_failed_run_does_not_clobber_latest_materializing_tags() {
+    // LastExecutedWithTags reflects the latest run that MATERIALIZED the
+    // asset; a later run that failed without materializing it must not
+    // overwrite the tags (and must match what a restart rebuilds).
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let mut rec_a = make_materialized_record("A", 1000);
+    rec_a.last_run_id = Some("r1".to_string());
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_a])
+        .await
+        .unwrap();
+
+    let mk_run = |id: &str, start: i64, tags: Vec<(String, String)>| RunRecord {
+        run_id: id.to_string(),
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        job_name: Some("test".to_string()),
+        status: RunStatus::Started,
+        start_time: start,
+        end_time: None,
+        tags,
+        node_names: vec!["A".to_string()],
+        priority: 0,
+        partition_key: None,
+        block_reason: None,
+        launched_by: LaunchedBy::Manual,
+    };
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    // r1 materializes A with env=prod.
+    storage
+        .create_run(&mk_run("r1", 2000, vec![("env".into(), "prod".into())]))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    storage
+        .update_run_status("r1", RunStatus::Success, Some(2100))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        cache
+            .last_run_tags
+            .get("A")
+            .is_some_and(|t| t.contains(&("env".to_string(), "prod".to_string()))),
+        "precondition: r1's tags recorded"
+    );
+
+    // r2 covers A but FAILS without materializing it (record.last_run_id stays r1).
+    storage
+        .create_run(&mk_run("r2", 3000, vec![("env".into(), "dev".into())]))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    storage
+        .update_run_status("r2", RunStatus::Failure, Some(3100))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+
+    assert!(
+        cache
+            .last_run_tags
+            .get("A")
+            .is_some_and(|t| t.contains(&("env".to_string(), "prod".to_string()))),
+        "a failed non-materializing run must not clobber the tags; got {:?}",
+        cache.last_run_tags
+    );
+}
+
+#[tokio::test]
+async fn test_later_finishing_run_keeps_latest_tags() {
+    // Overlapping runs: once the later-finishing materializing run's tags are
+    // recorded, an earlier-finishing run applied afterwards must not win.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let mut rec_x = make_materialized_record("X", 1000);
+    rec_x.last_run_id = Some("run-a".to_string());
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_x])
+        .await
+        .unwrap();
+
+    let mk_run = |id: &str, start: i64, tags: Vec<(String, String)>| RunRecord {
+        run_id: id.to_string(),
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        job_name: Some("test".to_string()),
+        status: RunStatus::Started,
+        start_time: start,
+        end_time: None,
+        tags,
+        node_names: vec!["X".to_string()],
+        priority: 0,
+        partition_key: None,
+        block_reason: None,
+        launched_by: LaunchedBy::Manual,
+    };
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    storage
+        .create_run(&mk_run("run-a", 100, vec![("who".into(), "a".into())]))
+        .await
+        .unwrap();
+    storage
+        .create_run(&mk_run("run-b", 200, vec![("who".into(), "b".into())]))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+
+    // run-a (the run the record credits with the materialization) finishes
+    // later (305) and is applied first; run-b (300) applied in a later refresh
+    // must not overwrite.
+    storage
+        .update_run_status("run-a", RunStatus::Success, Some(305))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    storage
+        .update_run_status("run-b", RunStatus::Success, Some(300))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+
+    assert!(
+        cache
+            .last_run_tags
+            .get("X")
+            .is_some_and(|t| t.contains(&("who".to_string(), "a".to_string()))),
+        "the later-finishing materializing run's tags must win; got {:?}",
+        cache.last_run_tags
+    );
 }
 
 #[tokio::test]
@@ -7777,6 +8010,22 @@ async fn test_cache_does_not_store_empty_run_tags() {
         })
         .await
         .unwrap();
+    // The materialization event credits the record with the run.
+    storage
+        .store_event(&crate::storage::EventRecord {
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            event_type: crate::storage::EventType::Materialization {
+                data_version: Some("dv1".to_string()),
+            },
+            asset_key: Some("a".to_string()),
+            run_id: "run-no-tags".to_string(),
+            partition_key: None,
+            timestamp: 3000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        })
+        .await
+        .unwrap();
     cache.refresh(&storage, 0).await.unwrap();
 
     // Cache must NOT have an entry for "a" — empty tags should be skipped
@@ -7801,6 +8050,21 @@ async fn test_cache_does_not_store_empty_run_tags() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    storage
+        .store_event(&crate::storage::EventRecord {
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            event_type: crate::storage::EventType::Materialization {
+                data_version: Some("dv2".to_string()),
+            },
+            asset_key: Some("a".to_string()),
+            run_id: "run-tagged".to_string(),
+            partition_key: None,
+            timestamp: 5000,
+            metadata: vec![],
+            input_data_versions: vec![],
         })
         .await
         .unwrap();
@@ -13245,6 +13509,21 @@ async fn test_asc_iteration_makes_newest_run_win_per_asset_state() {
     // After init, a newer schedule run for 'a' lands; the cursor backoff makes both visible to the next refresh.
     storage
         .create_run(&run_record("new", RunStatus::Success, 3000, vec!["a"]))
+        .await
+        .unwrap();
+    storage
+        .store_event(&crate::storage::EventRecord {
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            event_type: crate::storage::EventType::Materialization {
+                data_version: Some("dv-new".to_string()),
+            },
+            asset_key: Some("a".to_string()),
+            run_id: "new".to_string(),
+            partition_key: None,
+            timestamp: 3000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        })
         .await
         .unwrap();
     cache.refresh(&storage, 5000).await.unwrap();

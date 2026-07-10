@@ -30,8 +30,16 @@ pub type PartitionLastRunAssetNamesMap = HashMap<String, HashMap<PartitionKey, A
 /// Tag-update entry: `(asset_key, optional partition, tags)`.
 type RunTagUpdate = (String, Option<PartitionKey>, RunTags);
 
-/// Asset-names update entry: `(asset_key, optional partition, asset_names)`.
-type AssetNamesUpdate = (String, Option<PartitionKey>, Arc<[String]>);
+/// Latest-run map update: `(asset_key, optional partition, run_id, run_ts, tags, asset_names)`.
+/// Applied only when the run actually materialized the asset, newest run last.
+type LastRunUpdate = (
+    String,
+    Option<PartitionKey>,
+    String,
+    i64,
+    RunTags,
+    Arc<[String]>,
+);
 
 /// Per-asset partition status, loaded from storage and refreshed incrementally.
 #[derive(Debug, Default)]
@@ -105,12 +113,10 @@ struct RefreshDelta {
     failed_removes: HashMap<String, i64>,
     /// `asset → run_ids` where the asset's step succeeded but its record write lags.
     materialized_overrides: HashMap<String, HashSet<String>>,
-    /// Tag updates: `(asset, partition_key, tags)`.
-    run_tag_updates: Vec<RunTagUpdate>,
+    /// Latest-run tag/asset-name updates, gated on materialization at apply.
+    last_run_updates: Vec<LastRunUpdate>,
     /// Tick tag updates: `(asset, partition_key, tags)`.
     tick_tag_updates: Vec<RunTagUpdate>,
-    /// Asset-names updates: `(asset, partition_key, asset_names)`.
-    asset_names_updates: Vec<AssetNamesUpdate>,
     /// Partition-status replacements (asset_key → fresh entry).
     partition_status: HashMap<String, PartitionStatusEntry>,
     /// Replacement `BackfillState`, if any backfill query happened.
@@ -191,6 +197,10 @@ pub struct AssetConditionCache {
     /// commit after a refresh are still delivered; this set keeps the
     /// re-delivered, already-applied ones from double-applying.
     applied_run_ids: HashMap<String, i64>,
+    /// run_ts of each latest-run map entry, keyed `(asset, partition_key)` —
+    /// guards overwrites so an earlier-finishing overlapping run can't clobber
+    /// a later one's tags/asset-names.
+    last_run_entry_ts: HashMap<(String, Option<PartitionKey>), i64>,
 }
 
 impl Default for AssetConditionCache {
@@ -236,6 +246,7 @@ impl AssetConditionCache {
             pending_runs: HashMap::new(),
             pending_grace_nanos: DEFAULT_PENDING_GRACE_NANOS,
             applied_run_ids: HashMap::new(),
+            last_run_entry_ts: HashMap::new(),
         }
     }
 
@@ -661,6 +672,7 @@ impl AssetConditionCache {
             Some(pk) => pk.members().into_iter().map(Some).collect(),
             None => vec![None],
         };
+        let unpartitioned = [None];
         let run_ts = run.end_time.unwrap_or(run.start_time);
         for asset in &run.node_names {
             if run.partition_key.is_none() || !self.is_partitioned(asset) {
@@ -686,14 +698,23 @@ impl AssetConditionCache {
                         .or_insert(run_ts);
                 }
             }
-            for partition_key in &run_partitions {
-                if !run_tags.is_empty() {
-                    delta.run_tag_updates.push((
-                        asset.clone(),
-                        partition_key.clone(),
-                        Arc::clone(&run_tags),
-                    ));
-                }
+            // Route by the ASSET's partitioning, not the run's key: a joint
+            // partition-keyed run still writes an unpartitioned asset's entry
+            // into the scalar maps the unpartitioned eval path reads.
+            let asset_partitions: &[Option<PartitionKey>] = if self.is_partitioned(asset) {
+                &run_partitions
+            } else {
+                &unpartitioned
+            };
+            for partition_key in asset_partitions {
+                delta.last_run_updates.push((
+                    asset.clone(),
+                    partition_key.clone(),
+                    run.run_id.clone(),
+                    run_ts,
+                    Arc::clone(&run_tags),
+                    Arc::clone(&run_asset_names),
+                ));
                 if !is_failure && self.needs_tick_tags {
                     delta.tick_tag_updates.push((
                         asset.clone(),
@@ -701,11 +722,6 @@ impl AssetConditionCache {
                         Arc::clone(&run_tags),
                     ));
                 }
-                delta.asset_names_updates.push((
-                    asset.clone(),
-                    partition_key.clone(),
-                    Arc::clone(&run_asset_names),
-                ));
             }
         }
         true
@@ -835,9 +851,8 @@ impl AssetConditionCache {
             failed_adds,
             failed_removes,
             materialized_overrides,
-            run_tag_updates,
+            last_run_updates,
             tick_tag_updates,
-            asset_names_updates,
             partition_status,
             backfill,
             new_last_seen_run_ts,
@@ -909,14 +924,23 @@ impl AssetConditionCache {
             }
         }
 
-        for (asset, pk, tags) in run_tag_updates {
-            self.update_run_tags(&asset, &pk, &tags);
+        for (asset, pk, run_id, run_ts, tags, names) in last_run_updates {
+            // LastExecutedWithTags/LastRunIncludesTarget reflect the latest run
+            // that MATERIALIZED the asset — mirror the failure-floor gate.
+            let materialized_here = self
+                .records
+                .get(asset.as_str())
+                .and_then(|r| r.last_run_id.as_deref())
+                == Some(run_id.as_str())
+                || materialized_overrides
+                    .get(&asset)
+                    .is_some_and(|runs| runs.contains(&run_id));
+            if materialized_here {
+                self.update_last_run_maps(&asset, &pk, run_ts, &tags, &names);
+            }
         }
         for (asset, pk, tags) in tick_tag_updates {
             self.update_tick_materialization_tags(&asset, &pk, &tags);
-        }
-        for (asset, pk, names) in asset_names_updates {
-            self.update_run_asset_names(&asset, &pk, &names);
         }
 
         for (key, entry) in partition_status {
@@ -1010,22 +1034,29 @@ impl AssetConditionCache {
             let last_runs = storage.get_runs_by_ids(&last_run_ids, None).await?;
             let runs_by_id: HashMap<&str, &crate::storage::RunRecord> =
                 last_runs.iter().map(|r| (r.run_id.as_str(), r)).collect();
-            type AssetRunRow = (String, Option<PartitionKey>, RunTags, Arc<[String]>);
+            type AssetRunRow = (String, Option<PartitionKey>, i64, RunTags, Arc<[String]>);
             let asset_runs: Vec<AssetRunRow> = self
                 .records
                 .values()
                 .filter_map(|record| {
                     let run = runs_by_id.get(record.last_run_id.as_deref()?)?;
-                    let partitions: Vec<Option<PartitionKey>> = match &run.partition_key {
-                        Some(pk) => pk.members().into_iter().map(Some).collect(),
-                        None => vec![None],
-                    };
+                    let run_ts = run.end_time.unwrap_or(run.start_time);
+                    let partitions: Vec<Option<PartitionKey>> =
+                        if self.is_partitioned(&record.asset_key) {
+                            match &run.partition_key {
+                                Some(pk) => pk.members().into_iter().map(Some).collect(),
+                                None => vec![None],
+                            }
+                        } else {
+                            vec![None]
+                        };
                     let rows: Vec<AssetRunRow> = partitions
                         .into_iter()
                         .map(|pk| {
                             (
                                 record.asset_key.clone(),
                                 pk,
+                                run_ts,
                                 Arc::from(run.tags.as_slice()),
                                 Arc::from(run.node_names.as_slice()),
                             )
@@ -1035,13 +1066,8 @@ impl AssetConditionCache {
                 })
                 .flatten()
                 .collect();
-            for (asset_key, partition_key, tags, asset_names) in &asset_runs {
-                if !tags.is_empty() {
-                    self.update_run_tags(asset_key, partition_key, tags);
-                }
-                if !asset_names.is_empty() {
-                    self.update_run_asset_names(asset_key, partition_key, asset_names);
-                }
+            for (asset_key, partition_key, run_ts, tags, asset_names) in &asset_runs {
+                self.update_last_run_maps(asset_key, partition_key, *run_ts, tags, asset_names);
             }
         }
 
@@ -1095,21 +1121,57 @@ impl AssetConditionCache {
         Ok(state)
     }
 
-    /// Update run tags for an asset after a completed run.
-    fn update_run_tags(
+    /// Update the latest-run tag/asset-name maps for one `(asset, partition)`
+    /// entry, keeping the entry from the newest run when entries race.
+    fn update_last_run_maps(
         &mut self,
         asset: &str,
         partition_key: &Option<PartitionKey>,
+        run_ts: i64,
         tags: &Arc<[(String, String)]>,
+        asset_names: &Arc<[String]>,
     ) {
+        match self
+            .last_run_entry_ts
+            .entry((asset.to_string(), partition_key.clone()))
+        {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if run_ts < *e.get() {
+                    return;
+                }
+                e.insert(run_ts);
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(run_ts);
+            }
+        }
+        // A newer tagless run CLEARS the entry rather than storing an empty
+        // vec — run_tags_match on an empty entry is vacuously true, so a
+        // stored empty would make no-arg LastExecutedWithTags fire everywhere.
         if let Some(pk) = partition_key {
-            self.partition_last_run_tags
+            if tags.is_empty() {
+                if let Some(m) = self.partition_last_run_tags.get_mut(asset) {
+                    m.remove(pk);
+                }
+            } else {
+                self.partition_last_run_tags
+                    .entry(asset.to_string())
+                    .or_default()
+                    .insert(pk.clone(), Arc::clone(tags));
+            }
+            self.partition_last_run_asset_names
                 .entry(asset.to_string())
                 .or_default()
-                .insert(pk.clone(), Arc::clone(tags));
+                .insert(pk.clone(), Arc::clone(asset_names));
         } else {
-            self.last_run_tags
-                .insert(asset.to_string(), Arc::clone(tags));
+            if tags.is_empty() {
+                self.last_run_tags.remove(asset);
+            } else {
+                self.last_run_tags
+                    .insert(asset.to_string(), Arc::clone(tags));
+            }
+            self.last_run_asset_names
+                .insert(asset.to_string(), Arc::clone(asset_names));
         }
     }
 
@@ -1132,24 +1194,6 @@ impl AssetConditionCache {
                 .entry(asset.to_string())
                 .or_default()
                 .push(Arc::clone(tags));
-        }
-    }
-
-    /// Update the asset_names for an asset after a completed run.
-    pub fn update_run_asset_names(
-        &mut self,
-        asset: &str,
-        partition_key: &Option<PartitionKey>,
-        asset_names: &Arc<[String]>,
-    ) {
-        if let Some(pk) = partition_key {
-            self.partition_last_run_asset_names
-                .entry(asset.to_string())
-                .or_default()
-                .insert(pk.clone(), Arc::clone(asset_names));
-        } else {
-            self.last_run_asset_names
-                .insert(asset.to_string(), Arc::clone(asset_names));
         }
     }
 
