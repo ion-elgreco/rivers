@@ -3791,6 +3791,9 @@ fn test_bitor_flattens_nested_or() {
     match tree {
         ConditionNode::Or(children) => {
             assert_eq!(children.len(), 3);
+            assert!(matches!(children[0], ConditionNode::Missing));
+            assert!(matches!(children[1], ConditionNode::InProgress));
+            assert!(matches!(children[2], ConditionNode::ExecutionFailed));
         }
         _ => panic!("expected flat Or"),
     }
@@ -6415,18 +6418,19 @@ async fn bench_condition_cache_memory() {
 async fn bench_condition_cache_embedded() {
     eprintln!("\n== Benchmark B: Condition cache + eval (embedded RocksDB) ==\n");
 
-    let tmp = std::env::temp_dir().join("rivers_bench_condition_cache");
-    let _ = std::fs::remove_dir_all(&tmp);
-    let storage =
-        crate::storage::surrealdb_backend::SurrealStorage::new_embedded(tmp.to_str().unwrap())
-            .await
-            .unwrap();
+    // Unique per-run dir: embedded RocksDB takes an exclusive single-process
+    // lock, so a fixed path collides across concurrent `cargo test` runs.
+    let tmp = test_temp_dir::test_temp_dir!();
+    let storage = crate::storage::surrealdb_backend::SurrealStorage::new_embedded(
+        tmp.as_path_untracked().to_str().unwrap(),
+    )
+    .await
+    .unwrap();
 
     let keys_100 = setup_storage_bench(&storage, 100).await;
     bench_cache_tick("embedded_100", &storage, &keys_100, 0).await;
     bench_cache_tick("embedded_100", &storage, &keys_100, 3).await;
 
-    let _ = std::fs::remove_dir_all(&tmp);
     eprintln!();
 }
 
