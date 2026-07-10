@@ -435,3 +435,9 @@ def test_specific_partitions_in_partition_mapping_dict():
 
     repo = rs.CodeRepository(assets=[upstream, downstream])
     repo.resolve()
+
+
+def test_time_window_offset_out_of_range_raises():
+    """An absurd offset would stall cron-grid shifts for minutes per key."""
+    with pytest.raises(rs.exceptions.PartitionValidationError, match="out of range"):
+        rs.PartitionMapping.time_window(offset=-10_000_000)

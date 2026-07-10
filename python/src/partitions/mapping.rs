@@ -1240,8 +1240,16 @@ impl PartitionMapping {
     }
 
     #[staticmethod]
-    fn time_window(offset: i64) -> Self {
-        Self::TimeWindow { offset }
+    fn time_window(offset: i64) -> PyResult<Self> {
+        // Cron-gridded shifts walk the schedule one occurrence at a time, so
+        // an absurd offset would stall the evaluator for minutes per key.
+        const MAX_TIME_WINDOW_OFFSET: i64 = 100_000;
+        if offset.abs() > MAX_TIME_WINDOW_OFFSET {
+            return Err(PartitionValidationError::new_err(format!(
+                "time_window offset {offset} out of range; |offset| must be <= {MAX_TIME_WINDOW_OFFSET}"
+            )));
+        }
+        Ok(Self::TimeWindow { offset })
     }
 
     /// Create a SpecificPartitions mapping that maps all downstream partitions to a specific set of upstream partition keys.
