@@ -100,8 +100,10 @@ condition = rs.AutomationCondition.code_version_changed().since(
     rs.AutomationCondition.newly_requested()
 )
 
-# "A dep updated and we haven't handled it yet"
-# This is what .since_last_handled() expands to internally.
+# "A dep updated and we haven't requested materialization yet."
+# Note: .since_last_handled() is NOT this expansion — it is a stateless
+# handled-cursor debounce (see the operators table); use an explicit
+# .since(...) latch like this when you need fire-once-then-wait semantics.
 condition = rs.AutomationCondition.any_deps_updated().since(
     rs.AutomationCondition.newly_requested()
     | rs.AutomationCondition.newly_updated()

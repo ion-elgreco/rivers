@@ -1,3 +1,5 @@
+from rivers._core.schedule import EvalMode as EvalMode
+
 class AutomationCondition:
     """Composable condition tree for declarative asset automation.
 
@@ -34,18 +36,25 @@ class AutomationCondition:
         Equivalent to::
 
             (missing().newly_true() | any_deps_updated()).since_last_handled()
-            & ~any_deps_missing() & ~any_deps_in_progress() & ~in_progress()
+            & ~any_deps_missing() & ~any_deps_in_progress() & ~in_flight()
             & ~execution_failed()
         """
         ...
     @staticmethod
     def on_cron(cron_schedule: str, timezone: str | None = None) -> AutomationCondition:
-        """Materialize on a cron schedule, after all deps have updated since the tick.
+        """Materialize once per cron period, after all deps have updated since the tick.
+
+        The cron gate latches at each boundary and stays armed until the asset
+        is requested or updated, so a dep updating any time within the period
+        fires the condition exactly once per period.
 
         Equivalent to::
 
-            cron_tick_passed(schedule, tz).since_last_handled()
+            cron_tick_passed(schedule, tz).since(
+                (newly_requested() | newly_updated()) & ~cron_tick_passed(schedule, tz)
+            )
             & all_deps_updated_since_cron(schedule, tz)
+            & ~in_flight()
 
         Args:
             cron_schedule: Cron expression (e.g. ``"0 * * * *"``).
@@ -334,4 +343,4 @@ class AutomationCondition:
     def __or__(self, other: AutomationCondition) -> AutomationCondition: ...
     def __invert__(self) -> AutomationCondition: ...
 
-__all__ = ["AutomationCondition"]
+__all__ = ["AutomationCondition", "EvalMode"]

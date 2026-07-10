@@ -154,10 +154,10 @@ impl ConditionTickEngine {
             .set_condition_eval_state(&self.pass.eval_state)
             .await
         {
-            tracing::warn!(
+            tracing::error!(
                 target: "rivers::daemon",
                 error = %e,
-                "failed to persist condition eval state; latches reset on restart"
+                "failed to persist condition eval state; a restart replays this tick's latches"
             );
         }
     }
