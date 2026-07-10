@@ -192,6 +192,16 @@ impl Default for AssetConditionCache {
     }
 }
 
+/// Statuses whose run effects the refresh applies (terminal). Queued is NOT
+/// terminal: classifying it as such makes a run that flips Queued→terminal
+/// between the refresh's two queries lose its effects permanently.
+pub(crate) fn run_status_is_terminal(status: &RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
+    )
+}
+
 impl AssetConditionCache {
     pub fn new(code_location_id: String) -> Self {
         Self {
@@ -374,9 +384,13 @@ impl AssetConditionCache {
             .await?;
         let mut invalidated_keys: Vec<String> = new_runs
             .iter()
-            .filter(|r| !matches!(r.status, RunStatus::Started | RunStatus::NotStarted))
+            .filter(|r| run_status_is_terminal(&r.status))
             .flat_map(|r| r.node_names.iter().cloned())
             .collect();
+
+        // Run ids the tracked-run sweep below observed as terminal this refresh;
+        // the new_runs loop must not re-track them from a stale Queued snapshot.
+        let mut swept_terminal: HashSet<String> = HashSet::new();
 
         if !self.in_progress_assets.is_empty() {
             let ip_keys: Vec<String> = self.in_progress_assets.keys().cloned().collect();
@@ -425,7 +439,7 @@ impl AssetConditionCache {
 
             let new_runs_terminal: HashSet<&str> = new_runs
                 .iter()
-                .filter(|r| !matches!(r.status, RunStatus::Started | RunStatus::NotStarted))
+                .filter(|r| run_status_is_terminal(&r.status))
                 .map(|r| r.run_id.as_str())
                 .collect();
 
@@ -438,12 +452,10 @@ impl AssetConditionCache {
             if !clearable.is_empty() {
                 let tracked_runs = storage.get_runs_by_ids(&clearable, None).await?;
                 for run in &tracked_runs {
-                    if !matches!(
-                        run.status,
-                        RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
-                    ) {
+                    if !run_status_is_terminal(&run.status) {
                         continue;
                     }
+                    swept_terminal.insert(run.run_id.clone());
                     delta.clear_run(run);
                     if !new_runs_terminal.contains(run.run_id.as_str())
                         && !completed_run_ids.contains(&run.run_id)
@@ -476,13 +488,15 @@ impl AssetConditionCache {
                 delta.confirmed_pending.push(run.run_id.clone());
 
                 match run.status {
-                    RunStatus::Started | RunStatus::NotStarted => {
-                        for asset in &run.node_names {
-                            delta.in_progress_changes.push(InProgressChange::Push {
-                                asset_key: asset.clone(),
-                                run_id: run.run_id.clone(),
-                                partition_key: run.partition_key.clone(),
-                            });
+                    RunStatus::Started | RunStatus::NotStarted | RunStatus::Queued => {
+                        if !swept_terminal.contains(&run.run_id) {
+                            for asset in &run.node_names {
+                                delta.in_progress_changes.push(InProgressChange::Push {
+                                    asset_key: asset.clone(),
+                                    run_id: run.run_id.clone(),
+                                    partition_key: run.partition_key.clone(),
+                                });
+                            }
                         }
                     }
                     RunStatus::Success | RunStatus::Failure => {
@@ -492,7 +506,6 @@ impl AssetConditionCache {
                     RunStatus::Canceled => {
                         delta.clear_run(run);
                     }
-                    RunStatus::Queued => {}
                 }
             }
 
@@ -905,16 +918,24 @@ impl AssetConditionCache {
         }
         self.build_adjacency();
 
-        let started_runs = scoped
-            .get_runs_since(0, Some(RunStatus::Started), crate::storage::SortOrder::Asc)
-            .await?;
-        for run in &started_runs {
-            for asset in &run.node_names {
-                self.track_in_progress_run(
-                    asset.clone(),
-                    run.run_id.clone(),
-                    run.partition_key.clone(),
-                );
+        // Every non-terminal status is in flight: NotStarted/Queued runs alive
+        // at restart must suppress duplicate dispatch just like Started ones.
+        for status in [
+            RunStatus::Started,
+            RunStatus::NotStarted,
+            RunStatus::Queued,
+        ] {
+            let live_runs = scoped
+                .get_runs_since(0, Some(status), crate::storage::SortOrder::Asc)
+                .await?;
+            for run in &live_runs {
+                for asset in &run.node_names {
+                    self.track_in_progress_run(
+                        asset.clone(),
+                        run.run_id.clone(),
+                        run.partition_key.clone(),
+                    );
+                }
             }
         }
 
