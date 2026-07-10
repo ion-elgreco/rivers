@@ -808,7 +808,7 @@ fn eval_backfill_in_progress_partitioned(
                 targeted.extend(pctx.all_keys.intersection(&bf_set).cloned());
             }
             _ => {
-                return PartitionSelection::Keys(pctx.all_keys.clone());
+                return PartitionSelection::All;
             }
         }
     }
@@ -1191,7 +1191,7 @@ fn eval_partitioned<O: PartEvalOutput>(
                 && ctx.target_record.code_version
                     != ctx.target_record.last_materialization_code_version;
             let sel = if changed {
-                PartitionSelection::Keys(pctx.all_keys.clone())
+                PartitionSelection::All
             } else {
                 PartitionSelection::Empty
             };
@@ -1263,7 +1263,7 @@ fn eval_partitioned<O: PartEvalOutput>(
             let prev_ts = root_last_tick(ctx).unwrap_or(ctx.now);
             let val = cron_tick_between(cron_schedule, prev_ts, ctx.now, timezone.as_deref());
             let sel = if val {
-                PartitionSelection::Keys(pctx.all_keys.clone())
+                PartitionSelection::All
             } else {
                 PartitionSelection::Empty
             };
@@ -1283,7 +1283,7 @@ fn eval_partitioned<O: PartEvalOutput>(
 
         ConditionNode::InitialEvaluation => {
             let sel = if ctx.is_initial {
-                PartitionSelection::Keys(pctx.all_keys.clone())
+                PartitionSelection::All
             } else {
                 PartitionSelection::Empty
             };
@@ -1300,7 +1300,7 @@ fn eval_partitioned<O: PartEvalOutput>(
                 _ => false,
             };
             let sel = if changed {
-                PartitionSelection::Keys(pctx.all_keys.clone())
+                PartitionSelection::All
             } else {
                 PartitionSelection::Empty
             };
@@ -1348,7 +1348,7 @@ fn eval_partitioned<O: PartEvalOutput>(
         ConditionNode::WillBeRequested => {
             let sel = match ctx.requested_this_tick.get(ctx.target_key) {
                 None | Some(PartitionSelection::Empty) => PartitionSelection::Empty,
-                Some(PartitionSelection::All) => PartitionSelection::Keys(pctx.all_keys.clone()),
+                Some(PartitionSelection::All) => PartitionSelection::All,
                 Some(s @ PartitionSelection::Keys(_)) => s.clone(),
             };
             O::leaf(sel, my_idx, node, total)
@@ -1398,7 +1398,7 @@ fn eval_partitioned<O: PartEvalOutput>(
         }
 
         ConditionNode::And(children) => {
-            let mut result = PartitionSelection::Keys(pctx.all_keys.clone());
+            let mut result = PartitionSelection::All;
             let mut child_parts = Vec::with_capacity(children.len());
             for child in children {
                 if result.is_empty() && !child.has_stateful_nodes() {
@@ -1555,7 +1555,7 @@ fn eval_partitioned_all_deps(
     let eval_all = condition.has_stateful_nodes();
     let result = match ctx.cache.upstream_deps.get(ctx.target_key) {
         Some(deps) if !deps.is_empty() => {
-            let mut result = PartitionSelection::Keys(pctx.all_keys.clone());
+            let mut result = PartitionSelection::All;
             for dep in deps {
                 *counter = base;
                 let dep_sel =
@@ -1567,10 +1567,17 @@ fn eval_partitioned_all_deps(
             }
             result
         }
-        _ => PartitionSelection::Keys(pctx.all_keys.clone()),
+        _ => PartitionSelection::All,
     };
     finalize_dep_counter(counter, base, condition);
     result
+}
+
+/// True if the tree contains `NewlyUpdated` — the only consumer of
+/// `dep_root_floor`, whose construction walks every upstream timestamp.
+fn contains_newly_updated(node: &ConditionNode) -> bool {
+    matches!(node, ConditionNode::NewlyUpdated)
+        || node.children().any(contains_newly_updated)
 }
 
 /// Whether a dep at `dep_ts` counts as newly-updated against a downstream
@@ -1717,7 +1724,8 @@ fn eval_partitioned_on_dep(
         return PartitionSelection::from_bool(val);
     }
 
-    let upstream_all_keys: HashSet<PartitionKey> = upstream_entry.cloned().unwrap_or_default();
+    // Borrow — cloning a 1M-key universe per dep evaluation is pure waste.
+    let upstream_all_keys = upstream_entry.expect("bridged branch returned above");
 
     let empty_status = crate::condition::cache::PartitionStatusEntry::default();
     let upstream_status = pctx
@@ -1730,9 +1738,11 @@ fn eval_partitioned_on_dep(
         mapping_kind,
         None | Some(crate::condition::partition::PartitionMappingKind::Identity)
     );
+    let needs_floor = contains_newly_updated(condition);
     let dep_root_floor = pctx
         .all_partition_statuses
         .get(ctx.root_key)
+        .filter(|_| needs_floor)
         .map(|root_status| {
             upstream_status
                 .timestamps

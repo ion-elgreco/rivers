@@ -1426,11 +1426,11 @@ fn test_backfill_in_progress_partitioned_empty_keys_selects_all() {
     };
     let result = evaluate(&ConditionNode::BackfillInProgress, &ctx);
     assert!(result.fired);
-    let selection = result.selection.unwrap();
-    match &selection {
-        PartitionSelection::Keys(keys) => assert_eq!(keys.len(), 3),
-        _ => panic!("expected Keys selection"),
-    }
+    assert_eq!(
+        result.selection.unwrap(),
+        PartitionSelection::All,
+        "a backfill with no recorded keys targets the whole universe"
+    );
 }
 
 #[test]
@@ -1598,10 +1598,11 @@ fn test_backfill_in_progress_one_backfill_empty_keys_short_circuits() {
     };
     let result = evaluate(&ConditionNode::BackfillInProgress, &ctx);
     assert!(result.fired);
-    match result.selection.unwrap() {
-        PartitionSelection::Keys(keys) => assert_eq!(keys.len(), 3),
-        _ => panic!("expected Keys selection"),
-    }
+    assert_eq!(
+        result.selection.unwrap(),
+        PartitionSelection::All,
+        "a backfill with no recorded keys targets the whole universe"
+    );
 }
 
 #[test]
@@ -8995,11 +8996,8 @@ fn test_partitioned_code_version_changed() {
     let ctx = make_partitioned_ctx("a", &record, &records, &deps, &pctx);
     let result = evaluate(&ConditionNode::CodeVersionChanged, &ctx);
     assert!(result.fired);
-    // Code version change affects ALL partitions
-    assert_eq!(
-        result.selection.unwrap(),
-        PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2")]))
-    );
+    // Code version change affects ALL partitions (the All sentinel).
+    assert_eq!(result.selection.unwrap(), PartitionSelection::All);
 }
 
 #[test]
@@ -10409,10 +10407,7 @@ fn test_partitioned_code_version_changed_all_partitions() {
     let ctx = make_partitioned_ctx("a", &record, &records, &deps, pctx_ref);
     let result = evaluate(&ConditionNode::CodeVersionChanged, &ctx);
     assert!(result.fired);
-    assert_eq!(
-        result.selection.unwrap(),
-        PartitionSelection::Keys(_ak.clone())
-    );
+    assert_eq!(result.selection.unwrap(), PartitionSelection::All);
 }
 
 #[test]
