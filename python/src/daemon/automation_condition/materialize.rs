@@ -21,6 +21,13 @@ impl ConditionTickEngine {
             return;
         }
 
+        handle.seed_assets(
+            plan.unpartitioned
+                .iter()
+                .chain(plan.single_partition_groups.values().flatten())
+                .chain(plan.multi_partition_backfills.iter().map(|(a, _)| a)),
+        );
+
         let now = handle.timestamp();
         let mut run_requests: Vec<MaterializationRequestData> = Vec::new();
 
@@ -31,7 +38,7 @@ impl ConditionTickEngine {
                     .cache
                     .register_dispatched_run(asset.clone(), run_id.clone(), now, None);
             }
-            handle.register_run(run_id.clone());
+            handle.note_run(&plan.unpartitioned, &run_id);
             run_requests.push(MaterializationRequestData {
                 run_id,
                 asset_selection: plan.unpartitioned,
@@ -51,7 +58,7 @@ impl ConditionTickEngine {
                     Some(pk.clone()),
                 );
             }
-            handle.register_run(run_id.clone());
+            handle.note_run(&assets, &run_id);
             run_requests.push(MaterializationRequestData {
                 run_id,
                 asset_selection: assets,
@@ -81,7 +88,11 @@ impl ConditionTickEngine {
                             for asset in &req.asset_selection {
                                 self.pass.cache.clear_dispatched_run(asset, &req.run_id);
                             }
-                            handle.unregister_run(&req.run_id);
+                            handle.unnote_run(
+                                &req.asset_selection,
+                                &req.run_id,
+                                "run was not created by the dispatcher",
+                            );
                         }
                     }
                 }
@@ -91,11 +102,12 @@ impl ConditionTickEngine {
                         error = %e,
                         "condition run dispatch failed"
                     );
+                    let error = format!("run dispatch failed: {e}");
                     for req in &run_requests {
                         for asset in &req.asset_selection {
                             self.pass.cache.clear_dispatched_run(asset, &req.run_id);
                         }
-                        handle.unregister_run(&req.run_id);
+                        handle.unnote_run(&req.asset_selection, &req.run_id, &error);
                     }
                 }
             }
@@ -144,21 +156,30 @@ impl ConditionTickEngine {
 
         match self.backfill_dispatcher.dispatch(&requests).await {
             Ok(outcome) => {
-                for result in outcome.results {
-                    if !result.backfill_id.is_empty() {
-                        handle.register_backfill_id(result.backfill_id);
-                    }
-                }
-                for err in outcome.errors {
+                for err in &outcome.errors {
                     tracing::error!(
                         target: "rivers::daemon",
                         error = %err,
                         "condition backfill dispatch error"
                     );
                 }
-                for target in &outcome.failed_targets {
-                    for asset_key in target {
+                let failed: HashSet<&str> = outcome
+                    .failed_targets
+                    .iter()
+                    .flatten()
+                    .map(String::as_str)
+                    .collect();
+                // `results` holds the successes in request order (one asset
+                // per condition backfill request).
+                let mut results = outcome.results.iter();
+                for asset_key in &backfill_asset_keys {
+                    if failed.contains(asset_key.as_str()) {
                         self.pass.cache.clear_predispatch_mark(asset_key);
+                        handle.note_backfill_error(asset_key, "backfill dispatch failed");
+                    } else if let Some(result) = results.next()
+                        && !result.backfill_id.is_empty()
+                    {
+                        handle.note_backfill(asset_key, &result.backfill_id);
                     }
                 }
             }
@@ -168,8 +189,10 @@ impl ConditionTickEngine {
                     error = %e,
                     "condition backfill dispatch failed"
                 );
+                let error = format!("backfill dispatch failed: {e}");
                 for asset_key in &backfill_asset_keys {
                     self.pass.cache.clear_predispatch_mark(asset_key);
+                    handle.note_backfill_error(asset_key, &error);
                 }
             }
         }
