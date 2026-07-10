@@ -6255,6 +6255,7 @@ fn test_invalidation_on_tree_change() {
             AssetConditionState {
                 previous_results: HashMap::from([(0, true), (1, false), (2, true)]),
                 dep_previous_results: HashMap::new(),
+                dep_baselines: HashMap::new(),
                 last_handled_timestamp: Some(5000),
                 last_materialized_timestamp: Some(3000),
                 last_data_version: None,
@@ -6307,6 +6308,7 @@ fn test_invalidation_noop_on_unchanged_tree() {
     let original_state = AssetConditionState {
         previous_results: HashMap::from([(0, true), (1, false)]),
         dep_previous_results: HashMap::new(),
+        dep_baselines: HashMap::new(),
         last_handled_timestamp: Some(5000),
         last_materialized_timestamp: Some(3000),
         last_data_version: None,
@@ -10947,6 +10949,7 @@ fn test_update_condition_state_basic() {
     let expected = AssetConditionState {
         previous_results: HashMap::from([(0, true), (1, false)]),
         dep_previous_results: HashMap::new(),
+        dep_baselines: HashMap::new(),
         last_handled_timestamp: None,
         last_materialized_timestamp: Some(500),
         last_data_version: Some("dv_a".to_string()),
@@ -12165,6 +12168,7 @@ fn test_update_dep_baselines_stores_partition_timestamps() {
 
     update_dep_baselines(
         &mut eval_state,
+        &["a".to_string()],
         &upstream_deps,
         &conditioned,
         &partition_statuses,
@@ -12201,6 +12205,7 @@ fn test_update_dep_baselines_skips_conditioned_assets() {
 
     update_dep_baselines(
         &mut eval_state,
+        &["a".to_string()],
         &upstream_deps,
         &conditioned,
         &partition_statuses,
@@ -12294,6 +12299,7 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
     let conditioned = HashSet::from(["a".to_string()]);
     update_dep_baselines(
         &mut baselined_states,
+        &["a".to_string()],
         &deps,
         &conditioned,
         &partition_statuses,
@@ -13849,7 +13855,7 @@ fn test_data_version_changed_baselines_unconditioned_dep() {
     assert!(result1.fired, "tick 1: first-seen dep data version → fires");
 
     // Baseline deps, as the daemon does after a fired/initial tick.
-    update_dep_baselines(&mut assets, &deps, &no_conditioned, &empty_ps, &records);
+    update_dep_baselines(&mut assets, &["r".to_string()], &deps, &no_conditioned, &empty_ps, &records);
 
     // ── Tick 2: `a`'s version is unchanged → must NOT re-fire ──
     let prev2 = AssetConditionState::default();

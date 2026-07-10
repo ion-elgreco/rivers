@@ -568,7 +568,7 @@ impl ConditionPass {
 
     fn apply_results(&mut self, results: &[EvalResultRow], now: i64) -> Vec<ToMaterialize> {
         let mut to_materialize: Vec<ToMaterialize> = Vec::new();
-        let mut needs_dep_baselines = false;
+        let mut baseline_roots: Vec<String> = Vec::new();
 
         for row in results {
             let info = &self.conditions[row.info_idx];
@@ -594,7 +594,9 @@ impl ConditionPass {
             };
             update_condition_state(prev, &update_ctx, &row.result);
 
-            needs_dep_baselines |= row.result.fired || was_initial;
+            if row.result.fired || was_initial {
+                baseline_roots.push(info.asset_key.clone());
+            }
 
             if row.result.fired {
                 to_materialize.push(ToMaterialize {
@@ -604,9 +606,10 @@ impl ConditionPass {
             }
         }
 
-        if needs_dep_baselines {
+        if !baseline_roots.is_empty() {
             update_dep_baselines(
                 &mut self.eval_state.assets,
+                &baseline_roots,
                 &self.cache.upstream_deps,
                 &self.active,
                 &self.cache.partition_status,
@@ -851,6 +854,84 @@ mod tests {
         let plan = pass.classify_materializations(to_mat);
         pass.stamp_dispatched_handled(&plan, 5000);
         pass.eval_state.assets["down"].last_handled_timestamp
+    }
+
+    /// One asset's fire must not consume dep-change evidence a gated sibling
+    /// hasn't acted on: dep baselines are per (downstream, dep), not global.
+    #[test]
+    fn dep_baseline_survives_unrelated_asset_fire() {
+        let mut cache = AssetConditionCache::default();
+        let mut c = test_record("c");
+        c.last_timestamp = Some(100);
+        cache.records.insert("c".to_string(), c);
+        let mut y = test_record("y");
+        y.last_timestamp = Some(50);
+        y.last_data_version = Some("v1".to_string());
+        cache.records.insert("y".to_string(), y.clone());
+        // d is missing → its condition fires every tick.
+        cache.records.insert("d".to_string(), test_record("d"));
+        cache
+            .upstream_deps
+            .insert("c".to_string(), vec!["y".to_string()]);
+
+        let mut pass = ConditionPass::new(
+            cache,
+            ConditionEvalState::default(),
+            vec![
+                AssetConditionInfo {
+                    asset_key: "c".to_string(),
+                    condition: ConditionNode::any_deps_match(ConditionNode::DataVersionChanged)
+                        & !ConditionNode::InProgress,
+                    partition_info: None,
+                    backfill_strategy: None,
+                },
+                AssetConditionInfo {
+                    asset_key: "d".to_string(),
+                    condition: ConditionNode::Missing,
+                    partition_info: None,
+                    backfill_strategy: None,
+                },
+            ],
+            HashMap::new(),
+        );
+
+        let fired = |out: &PassOutput, pass: &ConditionPass, key: &str| {
+            out.results.iter().any(|row| {
+                pass.conditions[row.info_idx].asset_key == key && row.result.fired
+            })
+        };
+
+        // Tick 1: y's version is first-seen → c fires and consumes it.
+        let out = pass.run(1000, false);
+        assert!(fired(&out, &pass, "c"), "tick 1: first-seen version fires c");
+
+        // Tick 2: y unchanged → no re-fire.
+        let out = pass.run(2000, false);
+        assert!(!fired(&out, &pass, "c"), "tick 2: stable version must not re-fire");
+
+        // y's version changes while c is gated; unrelated d keeps firing.
+        y.last_data_version = Some("v2".to_string());
+        y.last_timestamp = Some(60);
+        pass.cache.records.insert("y".to_string(), y);
+        pass.cache
+            .in_progress_assets
+            .entry("c".to_string())
+            .or_default();
+        let out = pass.run(3000, false);
+        assert!(!fired(&out, &pass, "c"), "tick 3: c is gated");
+        assert!(fired(&out, &pass, "d"), "tick 3: unrelated d fires");
+
+        // Tick 4: c ungated — the pending version change must still be visible.
+        pass.cache.in_progress_assets.remove("c");
+        let out = pass.run(4000, false);
+        assert!(
+            fired(&out, &pass, "c"),
+            "tick 4: an unrelated asset's fire must not consume c's dep-change trigger"
+        );
+
+        // Tick 5: c acted on it → consumed.
+        let out = pass.run(5000, false);
+        assert!(!fired(&out, &pass, "c"), "tick 5: c consumed the change");
     }
 
     #[test]
