@@ -144,13 +144,24 @@ impl ConditionNode {
         }
     }
 
-    /// Cron-based automation preset.
+    /// Cron-based automation preset. The gate latches at each cron boundary and
+    /// disarms once the asset is requested or updated, so a dep update any time
+    /// within the period can fire the condition (the dep-side evidence resets at
+    /// the boundary, which is the only tick a pulse gate would be true).
     pub fn on_cron(cron_schedule: String, timezone: Option<String>) -> Self {
-        ConditionNode::CronTickPassed {
+        let cron_tick = ConditionNode::CronTickPassed {
             cron_schedule: cron_schedule.clone(),
             timezone: timezone.clone(),
-        }
-        .since_last_handled()
+        };
+        // `& !cron_tick` keeps Since's reset priority from eating a boundary
+        // that lands on the same tick as a request/update — a new boundary
+        // must always re-arm the gate.
+        cron_tick
+            .clone()
+            .since(
+                (ConditionNode::NewlyRequested | ConditionNode::NewlyUpdated)
+                    & !cron_tick,
+            )
             & ConditionNode::all_deps_updated_since_cron(cron_schedule, timezone)
             & !ConditionNode::in_flight()
     }
