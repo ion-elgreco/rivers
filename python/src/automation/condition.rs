@@ -414,7 +414,10 @@ impl PyAutomationCondition {
         Self::new_junction(self.node.clone().since(reset_condition.node))
     }
 
-    /// Shorthand for `.since(newly_requested() | newly_updated() | initial_evaluation())`.
+    /// Debounce: true while the condition is true and the asset hasn't been
+    /// handled (materialization requested) since the previous tick. Suppresses
+    /// only the tick right after a request — for fire-once-then-wait latch
+    /// semantics use an explicit `.since(...)`.
     fn since_last_handled(&self) -> Self {
         Self::new_junction(self.node.clone().since_last_handled())
     }
@@ -422,7 +425,13 @@ impl PyAutomationCondition {
     /// Recursively replace sub-conditions matching `old` with `new`.
     fn replace(&self, old: &Bound<'_, PyAny>, new: PyAutomationCondition) -> PyResult<Self> {
         let node = if let Ok(s) = old.extract::<String>() {
-            self.node.replace_by_label(&s, &new.node)
+            // Match the same strings `without()` and `.description` use, and
+            // keep node_label strings working — a string valid in one method
+            // must never silently no-op in the other.
+            self.node.replace_matching(
+                &|child| description(child) == s || child.node_label() == s,
+                &new.node,
+            )
         } else {
             let cond = old.extract::<PyAutomationCondition>()?;
             self.node.replace_by_node(&cond.node, &new.node)
@@ -436,7 +445,8 @@ impl PyAutomationCondition {
     /// Remove an operand from an `And` condition.
     fn without(&self, condition: &Bound<'_, PyAny>) -> PyResult<Self> {
         let node = if let Ok(s) = condition.extract::<String>() {
-            self.node.without_matching(&|child| description(child) == s)
+            self.node
+                .without_matching(&|child| description(child) == s || child.node_label() == s)
         } else {
             let target = condition.extract::<PyAutomationCondition>()?.node;
             self.node.without_matching(&|child| *child == target)
