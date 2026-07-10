@@ -441,8 +441,9 @@ pub struct PartitionEvalContext<'a> {
     pub timestamps: &'a HashMap<PartitionKey, i64>,
     /// Partition mapping resolver for upstream deps.
     pub resolver: PartitionResolver<'a>,
-    /// Partition keys in the latest time window (for `InLatestTimeWindow` condition).
-    pub latest_time_window_keys: Option<&'a HashSet<PartitionKey>>,
+    /// Latest-time-window resolver for `InLatestTimeWindow`; `None` means no
+    /// window information is available and the filter selects nothing.
+    pub time_windows: Option<&'a crate::condition::pass::TimeWindowResolver<'a>>,
     /// Per-asset partition status for ALL assets in the cache (not just this asset).
     pub all_partition_statuses: &'a HashMap<String, crate::condition::cache::PartitionStatusEntry>,
     /// Staleness floor for `NewlyUpdated` in a dep pivot, keyed by upstream key.

@@ -255,6 +255,55 @@ pub struct PassOutput {
     pub plan: MaterializationPlan,
 }
 
+/// Lazily computes per-(asset, lookback) latest-time-window key sets during
+/// one evaluation tick. `fmts` spans every time-window-partitioned asset the
+/// pass knows about — conditioned assets AND upstream deps — so dep pivots
+/// resolve against the dep's own window instead of selecting everything.
+pub struct TimeWindowResolver<'a> {
+    fmts: &'a HashMap<String, String>,
+    now_local: NaiveDateTime,
+    #[allow(clippy::type_complexity)]
+    memo: std::cell::RefCell<HashMap<(String, u64), std::sync::Arc<HashSet<PartitionKey>>>>,
+}
+
+impl<'a> TimeWindowResolver<'a> {
+    pub fn new(fmts: &'a HashMap<String, String>, now_local: NaiveDateTime) -> Self {
+        Self {
+            fmts,
+            now_local,
+            memo: std::cell::RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Keys of `asset`'s latest time window (widened by `lookback_delta`);
+    /// `None` when the asset is not time-window partitioned.
+    pub fn keys_for(
+        &self,
+        asset: &str,
+        all_keys: &HashSet<PartitionKey>,
+        lookback_delta: Option<f64>,
+    ) -> Option<std::sync::Arc<HashSet<PartitionKey>>> {
+        let fmt = self.fmts.get(asset)?;
+        let memo_key = (
+            asset.to_string(),
+            lookback_delta.map(f64::to_bits).unwrap_or(u64::MAX),
+        );
+        if let Some(hit) = self.memo.borrow().get(&memo_key) {
+            return Some(std::sync::Arc::clone(hit));
+        }
+        let keys = std::sync::Arc::new(compute_latest_time_window_keys(
+            all_keys,
+            fmt,
+            self.now_local,
+            lookback_delta,
+        ));
+        self.memo
+            .borrow_mut()
+            .insert(memo_key, std::sync::Arc::clone(&keys));
+        Some(keys)
+    }
+}
+
 /// Compute partition keys that fall within the latest time window.
 pub fn compute_latest_time_window_keys(
     all_keys: &HashSet<PartitionKey>,
@@ -315,6 +364,9 @@ pub struct ConditionPass {
     pub upstream_partition_keys: HashMap<String, HashSet<PartitionKey>>,
     /// How each `upstream_partition_keys` entry evolves.
     pub upstream_universes: HashMap<String, PartitionUniverse>,
+    /// Time-window key format per time-window-partitioned asset (conditioned
+    /// assets and upstream deps), for `InLatestTimeWindow` resolution.
+    pub time_window_fmts: HashMap<String, String>,
 }
 
 impl ConditionPass {
@@ -354,6 +406,21 @@ impl ConditionPass {
                 .entry(asset.clone())
                 .or_insert(*ts);
         }
+        let mut time_window_fmts: HashMap<String, String> = HashMap::new();
+        for info in &conditions {
+            if let Some(pi) = &info.partition_info
+                && let Some(fmt) = &pi.time_window_fmt
+            {
+                time_window_fmts.insert(info.asset_key.clone(), fmt.clone());
+            }
+        }
+        for (asset, universe) in &universes_map {
+            if let PartitionUniverse::TimeWindow { grid, .. } = universe {
+                time_window_fmts
+                    .entry(asset.clone())
+                    .or_insert_with(|| grid.fmt.clone());
+            }
+        }
         Self {
             cache,
             eval_state,
@@ -364,6 +431,7 @@ impl ConditionPass {
             time_based_eval_set: None,
             upstream_partition_keys: keys_map,
             upstream_universes: universes_map,
+            time_window_fmts,
         }
     }
 
@@ -454,6 +522,7 @@ impl ConditionPass {
 
     fn evaluate(&self, now: i64, selective: bool) -> Vec<EvalResultRow> {
         let now_local = chrono::Local.timestamp_nanos(now).naive_local();
+        let time_windows = TimeWindowResolver::new(&self.time_window_fmts, now_local);
         let in_progress_keys: HashSet<String> =
             self.cache.in_progress_assets.keys().cloned().collect();
 
@@ -487,17 +556,6 @@ impl ConditionPass {
             };
             let prev = &self.eval_state.assets[&info.asset_key];
 
-            let latest_tw_keys = info.partition_info.as_ref().and_then(|pi| {
-                let fmt = pi.time_window_fmt.as_ref()?;
-                let lookback = info.condition.find_lookback_delta()?;
-                Some(compute_latest_time_window_keys(
-                    &pi.all_keys,
-                    fmt,
-                    now_local,
-                    lookback,
-                ))
-            });
-
             let pending = self.cache.in_progress_partition_keys(&info.asset_key);
             let partition_status = self.cache.partition_status.get(&info.asset_key);
             let merged_in_progress: Option<HashSet<PartitionKey>> = if pending.is_empty() {
@@ -517,7 +575,7 @@ impl ConditionPass {
                     failed: &status.failed,
                     timestamps: &status.timestamps,
                     resolver: PartitionResolver::new(&pi.mappings, &self.upstream_partition_keys),
-                    latest_time_window_keys: latest_tw_keys.as_ref(),
+                    time_windows: Some(&time_windows),
                     all_partition_statuses: &self.cache.partition_status,
                     dep_root_floor: None,
                 })
@@ -865,6 +923,161 @@ mod tests {
         let plan = pass.classify_materializations(to_mat);
         pass.stamp_dispatched_handled(&plan, 5000);
         pass.eval_state.assets["down"].last_handled_timestamp
+    }
+
+    /// Each InLatestTimeWindow node must select against its OWN lookback — not
+    /// a single set computed from the first node found in the tree.
+    #[test]
+    fn latest_time_window_respects_each_nodes_lookback() {
+        let mut cache = AssetConditionCache::default();
+        let mut rec = test_record("a");
+        rec.last_timestamp = Some(100);
+        cache.records.insert("a".to_string(), rec);
+        cache.partition_status.insert(
+            "a".to_string(),
+            crate::condition::cache::PartitionStatusEntry::default(),
+        );
+        let keys = make_daily_keys(&[
+            "2020-01-01",
+            "2020-01-02",
+            "2020-01-03",
+            "2020-01-04",
+            "2020-01-05",
+        ]);
+
+        let tree = ConditionNode::Or(vec![
+            ConditionNode::And(vec![
+                ConditionNode::InProgress,
+                ConditionNode::InLatestTimeWindow {
+                    lookback_delta: None,
+                },
+            ]),
+            ConditionNode::And(vec![
+                ConditionNode::Missing,
+                ConditionNode::InLatestTimeWindow {
+                    lookback_delta: Some(2.0 * 86_400.0),
+                },
+            ]),
+        ]);
+        let pass = ConditionPass::new(
+            cache,
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "a".to_string(),
+                condition: tree,
+                partition_info: Some(PartitionInfo {
+                    all_keys: keys,
+                    mappings: HashMap::new(),
+                    time_window_fmt: Some("%Y-%m-%d".to_string()),
+                    universe: PartitionUniverse::Frozen,
+                }),
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        );
+        let rows = pass.evaluate(1_700_000_000_000_000_000, false);
+        // Missing = all 5 keys; the 2-day lookback selects the latest 3.
+        assert_eq!(
+            rows[0].result.selection.clone().unwrap(),
+            PartitionSelection::Keys(make_daily_keys(&[
+                "2020-01-03",
+                "2020-01-04",
+                "2020-01-05"
+            ])),
+            "the 2-day-lookback node must select its own window, not the first node's"
+        );
+    }
+
+    /// in_latest_time_window() inside a dep pivot must filter against the
+    /// DEP's latest window, not silently select every dep partition.
+    #[test]
+    fn dep_pivot_latest_time_window_filters_dep_keys() {
+        let day_keys = make_daily_keys(&["2020-01-01", "2020-01-02", "2020-01-03"]);
+        let grid = crate::timegrid::TimeGrid {
+            cron_schedule: None,
+            interval_seconds: Some(86_400.0),
+            start: to_wall("2020-01-01 00:00"),
+            end: Some(to_wall("2020-01-04 00:00")),
+            fmt: "%Y-%m-%d".to_string(),
+        };
+
+        let build_pass = |a_ts: &[(&str, i64)]| {
+            let mut cache = AssetConditionCache::default();
+            let mut rec_b = test_record("b");
+            rec_b.last_timestamp = Some(100);
+            cache.records.insert("b".to_string(), rec_b);
+            let mut rec_a = test_record("a");
+            rec_a.last_timestamp = Some(200);
+            cache.records.insert("a".to_string(), rec_a);
+            cache
+                .upstream_deps
+                .insert("b".to_string(), vec!["a".to_string()]);
+            cache.partition_status.insert(
+                "b".to_string(),
+                crate::condition::cache::PartitionStatusEntry {
+                    materialized: day_keys.clone(),
+                    timestamps: day_keys.iter().map(|k| (k.clone(), 100)).collect(),
+                    ..Default::default()
+                },
+            );
+            cache.partition_status.insert(
+                "a".to_string(),
+                crate::condition::cache::PartitionStatusEntry {
+                    materialized: day_keys.clone(),
+                    timestamps: a_ts.iter().map(|(k, ts)| (spk(k), *ts)).collect(),
+                    ..Default::default()
+                },
+            );
+            let tree = ConditionNode::any_deps_match(
+                ConditionNode::NewlyUpdated
+                    & ConditionNode::InLatestTimeWindow {
+                        lookback_delta: None,
+                    },
+            );
+            ConditionPass::new(
+                cache,
+                ConditionEvalState::default(),
+                vec![AssetConditionInfo {
+                    asset_key: "b".to_string(),
+                    condition: tree,
+                    partition_info: Some(PartitionInfo {
+                        all_keys: day_keys.clone(),
+                        mappings: HashMap::new(),
+                        time_window_fmt: Some("%Y-%m-%d".to_string()),
+                        universe: PartitionUniverse::Frozen,
+                    }),
+                    backfill_strategy: None,
+                }],
+                HashMap::from([(
+                    "a".to_string(),
+                    (
+                        day_keys.clone(),
+                        PartitionUniverse::TimeWindow {
+                            grid: grid.clone(),
+                            enumerated_to: to_wall("2020-01-04 00:00"),
+                        },
+                    ),
+                )]),
+            )
+        };
+
+        // Only a's OLDEST key was re-materialized (200 > b's floor of 100).
+        let pass = build_pass(&[("2020-01-01", 200), ("2020-01-02", 100), ("2020-01-03", 100)]);
+        let rows = pass.evaluate(1_700_000_000_000_000_000, false);
+        assert!(
+            !rows[0].result.fired,
+            "an update to a NON-latest dep partition must not pass in_latest_time_window; got {:?}",
+            rows[0].result.selection
+        );
+
+        // Positive control: the dep's LATEST key updating passes the filter.
+        let pass = build_pass(&[("2020-01-01", 100), ("2020-01-02", 100), ("2020-01-03", 200)]);
+        let rows = pass.evaluate(1_700_000_000_000_000_000, false);
+        assert!(rows[0].result.fired, "latest-key update must fire");
+        assert_eq!(
+            rows[0].result.selection.clone().unwrap(),
+            PartitionSelection::Keys(make_daily_keys(&["2020-01-03"]))
+        );
     }
 
     /// One asset's fire must not consume dep-change evidence a gated sibling

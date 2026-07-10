@@ -2340,6 +2340,29 @@ impl PyCodeRepository {
             }
         }
 
+        // in_latest_time_window() at root scope filters the asset's own
+        // partitions, so it requires single-dimension time-window partitioning.
+        for node in node_map.values() {
+            if let ResolvedNode::Asset(asset_node) = node
+                && let Some(cond) = &asset_node.automation_condition
+                && cond.node.has_root_scope_latest_time_window()
+            {
+                let time_partitioned = matches!(
+                    node.partitions_def(),
+                    Some(PartitionsDefinition::TimeWindow { .. })
+                );
+                if !time_partitioned {
+                    return Err(AssetDefinitionError::new_err(format!(
+                        "Asset '{}' uses in_latest_time_window() but is not time-window \
+                         partitioned, so the filter would have nothing to select. Use it \
+                         on single-dimension time-window partitioned assets, or inside \
+                         any_deps_match/all_deps_match to filter a dep's partitions.",
+                        asset_node.name
+                    )));
+                }
+            }
+        }
+
         let mut inner_repo = CodeRepository::new(unresolved_graph);
         inner_repo
             .resolve_asset_graph()

@@ -524,23 +524,30 @@ impl ConditionNode {
         format!("{:016x}", self.fingerprint())
     }
 
-    /// Find the first `InLatestTimeWindow` node in the tree and return its `lookback_delta`.
-    pub fn find_lookback_delta(&self) -> Option<Option<f64>> {
+    /// True if an `InLatestTimeWindow` appears outside every dep-aggregate —
+    /// i.e. it filters THIS asset's own partitions, which requires the asset
+    /// to be time-window partitioned.
+    pub fn has_root_scope_latest_time_window(&self) -> bool {
         match self {
-            ConditionNode::InLatestTimeWindow { lookback_delta } => Some(*lookback_delta),
-            ConditionNode::And(children) | ConditionNode::Or(children) => {
-                children.iter().find_map(|c| c.find_lookback_delta())
-            }
+            ConditionNode::InLatestTimeWindow { .. } => true,
+            ConditionNode::And(children) | ConditionNode::Or(children) => children
+                .iter()
+                .any(|c| c.has_root_scope_latest_time_window()),
             ConditionNode::Not(child)
             | ConditionNode::NewlyTrue(child)
-            | ConditionNode::SinceLastHandled(child) => child.find_lookback_delta(),
-            ConditionNode::Since { trigger, reset } => trigger
-                .find_lookback_delta()
-                .or_else(|| reset.find_lookback_delta()),
-            ConditionNode::AnyDepsMatch { condition, .. }
-            | ConditionNode::AllDepsMatch { condition, .. }
-            | ConditionNode::AssetMatches { condition, .. } => condition.find_lookback_delta(),
-            _ => None,
+            | ConditionNode::SinceLastHandled(child) => {
+                child.has_root_scope_latest_time_window()
+            }
+            ConditionNode::Since { trigger, reset } => {
+                trigger.has_root_scope_latest_time_window()
+                    || reset.has_root_scope_latest_time_window()
+            }
+            // Dep aggregates evaluate their subtree against the deps' own key
+            // spaces, so a nested InLatestTimeWindow doesn't constrain the root.
+            ConditionNode::AnyDepsMatch { .. }
+            | ConditionNode::AllDepsMatch { .. }
+            | ConditionNode::AssetMatches { .. } => false,
+            _ => false,
         }
     }
 
