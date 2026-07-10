@@ -1815,12 +1815,23 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
-    async fn get_observations_since(&self, since_timestamp: i64) -> Result<Vec<StoredEvent>> {
+    async fn get_observations_since(
+        &self,
+        code_location_id: &str,
+        since_timestamp: i64,
+    ) -> Result<Vec<StoredEvent>> {
         super::retry::with_retry(&self.retry_config, || async {
+            // The NONE arm keeps events written before code_location_id
+            // existed visible; only pre-upgrade rows lack it.
             let mut result = self
                 .db
-                .query("SELECT * FROM events WHERE event_type = $etype AND timestamp > $since ORDER BY timestamp DESC")
+                .query(
+                    "SELECT * FROM events WHERE event_type = $etype \
+                     AND (code_location_id = $cl OR code_location_id = NONE) \
+                     AND timestamp > $since ORDER BY timestamp DESC",
+                )
                 .bind(("etype", "Observation".to_string()))
+                .bind(("cl", code_location_id.to_string()))
                 .bind(("since", since_timestamp))
                 .await?;
             let events: Vec<DbStoredEvent> = result.take(0)?;
@@ -6484,7 +6495,10 @@ mod tests {
 
         // Query observations since ts=0 — should return both observations, not the materialization
         // Ordered DESC by timestamp
-        let all = storage.get_observations_since(0).await.unwrap();
+        let all = storage
+            .get_observations_since(crate::storage::DEFAULT_CODE_LOCATION_ID, 0)
+            .await
+            .unwrap();
         assert_eq!(all.len(), 2);
         let expected_0 = StoredEvent {
             id: all[0].id.clone(),
@@ -6516,12 +6530,18 @@ mod tests {
         assert_eq!(all[1], expected_1);
 
         // Query observations since ts=1000 — should return only the one at ts=2000
-        let recent = storage.get_observations_since(1000).await.unwrap();
+        let recent = storage
+            .get_observations_since(crate::storage::DEFAULT_CODE_LOCATION_ID, 1000)
+            .await
+            .unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0], expected_0);
 
         // Query observations since ts=2000 — should return nothing
-        let none = storage.get_observations_since(2000).await.unwrap();
+        let none = storage
+            .get_observations_since(crate::storage::DEFAULT_CODE_LOCATION_ID, 2000)
+            .await
+            .unwrap();
         assert!(none.is_empty());
     }
 

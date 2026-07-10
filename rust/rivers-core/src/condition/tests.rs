@@ -7222,6 +7222,67 @@ async fn test_initial_load_tracks_queued_and_not_started_runs() {
 }
 
 #[tokio::test]
+async fn test_foreign_code_location_observations_do_not_clear_in_flight() {
+    // Code locations can share one SurrealDB; another location observing a
+    // SAME-NAMED asset must not wipe this location's in-flight run tracking.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{EventRecord, EventType, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let rec_x = make_materialized_record("x", 1000);
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new("cl-a"))
+        .register_assets(&[rec_x])
+        .await
+        .unwrap();
+    storage
+        .create_run(&RunRecord {
+            run_id: "run-x".to_string(),
+            code_location_id: "cl-a".to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["x".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new("cl-a".to_string());
+    cache.refresh(&storage, 3_000).await.unwrap();
+    assert!(cache.in_progress_assets.contains_key("x"));
+
+    // The OTHER code location observes its own asset named "x".
+    storage
+        .store_event(&EventRecord {
+            code_location_id: "cl-b".to_string(),
+            event_type: EventType::Observation {
+                data_version: Some("v1".to_string()),
+            },
+            asset_key: Some("x".to_string()),
+            run_id: String::new(),
+            partition_key: None,
+            timestamp: 4_000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        })
+        .await
+        .unwrap();
+    cache.refresh(&storage, 5_000).await.unwrap();
+
+    assert!(
+        cache.in_progress_assets.contains_key("x"),
+        "a foreign location's observation must not clear this location's tracking; got {:?}",
+        cache.in_progress_assets
+    );
+}
+
+#[tokio::test]
 async fn test_backfill_terminal_clears_predispatch_placeholder() {
     // A backfill-shaped dispatch inserts an empty in-flight placeholder; when
     // the backfill ends without any observed sub-run (e.g. canceled before its

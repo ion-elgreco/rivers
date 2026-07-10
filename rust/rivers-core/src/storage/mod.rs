@@ -2062,9 +2062,10 @@ pub trait StorageBackend: PerCodeLocationStorage {
     fn get_in_progress_runs(&self) -> impl Future<Output = Result<Vec<RunRecord>>> + Send;
 
     // Observations
-    /// Get all observation events stored after the given timestamp.
+    /// Get the code location's observation events stored after the given timestamp.
     fn get_observations_since(
         &self,
+        code_location_id: &str,
         since_timestamp: i64,
     ) -> impl Future<Output = Result<Vec<StoredEvent>>> + Send;
 

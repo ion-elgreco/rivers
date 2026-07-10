@@ -633,7 +633,7 @@ impl AssetConditionCache {
         delta: &mut RefreshDelta,
     ) -> anyhow::Result<()> {
         let observations = storage
-            .get_observations_since(self.last_observation_ts)
+            .get_observations_since(self.ctx.id(), self.last_observation_ts)
             .await?;
         if observations.is_empty() {
             return Ok(());
