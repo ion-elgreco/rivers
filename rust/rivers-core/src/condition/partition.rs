@@ -191,8 +191,20 @@ fn shift_selection(
 }
 
 impl PartitionMappingKind {
-    /// Map upstream partition keys to downstream partition keys.
+    /// Map upstream partition keys to downstream partition keys, without a
+    /// downstream universe: dimension fan-outs over-approximate to `All`.
     pub fn map_to_downstream(&self, upstream_keys: &PartitionSelection) -> PartitionSelection {
+        self.map_to_downstream_in(upstream_keys, None)
+    }
+
+    /// Map upstream partition keys to downstream partition keys. With a
+    /// downstream universe, a Multi mapping whose dimensions partially fan out
+    /// expands precisely against it instead of escalating to `All`.
+    pub fn map_to_downstream_in(
+        &self,
+        upstream_keys: &PartitionSelection,
+        downstream_universe: Option<&HashSet<PartitionKey>>,
+    ) -> PartitionSelection {
         match self {
             Self::Identity => upstream_keys.clone(),
             Self::AllPartitions => {
@@ -246,11 +258,10 @@ impl PartitionMappingKind {
                 PartitionSelection::Empty => PartitionSelection::Empty,
                 PartitionSelection::All => PartitionSelection::All,
                 PartitionSelection::Keys(keys) => {
-                    enum DimMapped {
-                        Keys(Vec<PartitionKey>),
-                        All,
-                    }
-                    let map_key_downstream = |pk: &PartitionKey| -> Option<DimMapped> {
+                    // Per-combo dim constraint; `None` = the per-dim mapping
+                    // fanned out to All (expanded against the universe below).
+                    type Combo = Vec<(String, Option<Vec<String>>)>;
+                    let map_key_downstream = |pk: &PartitionKey| -> Option<Vec<Combo>> {
                         let dims = match pk {
                             PartitionKey::Multi { dims } => dims,
                             _ => return None,
@@ -259,7 +270,7 @@ impl PartitionMappingKind {
                             .iter()
                             .map(|(d, v)| (d.as_str(), v.as_slice()))
                             .collect();
-                        let mut combos: Vec<Vec<(String, Vec<String>)>> = vec![Vec::new()];
+                        let mut combos: Vec<Combo> = vec![Vec::new()];
                         for (upstream_dim, (downstream_dim, per_dim_mapping)) in dimension_mappings
                         {
                             let val = upstream_dims.get(upstream_dim.as_str())?;
@@ -282,7 +293,7 @@ impl PartitionMappingKind {
                                     }
                                     if let [v] = values.as_slice() {
                                         for combo in &mut combos {
-                                            combo.push((downstream_dim.clone(), v.clone()));
+                                            combo.push((downstream_dim.clone(), Some(v.clone())));
                                         }
                                     } else {
                                         let mut next =
@@ -290,32 +301,64 @@ impl PartitionMappingKind {
                                         for combo in &combos {
                                             for v in &values {
                                                 let mut c = combo.clone();
-                                                c.push((downstream_dim.clone(), v.clone()));
+                                                c.push((
+                                                    downstream_dim.clone(),
+                                                    Some(v.clone()),
+                                                ));
                                                 next.push(c);
                                             }
                                         }
                                         combos = next;
                                     }
                                 }
-                                PartitionSelection::All => return Some(DimMapped::All),
+                                PartitionSelection::All => {
+                                    for combo in &mut combos {
+                                        combo.push((downstream_dim.clone(), None));
+                                    }
+                                }
                                 PartitionSelection::Empty => return None,
                             }
                         }
-                        Some(DimMapped::Keys(
-                            combos
-                                .into_iter()
-                                .map(|dims| PartitionKey::Multi { dims })
-                                .collect(),
-                        ))
+                        Some(combos)
                     };
                     let mut mapped: HashSet<PartitionKey> = HashSet::new();
+                    let mut wildcards: Vec<Combo> = Vec::new();
                     for pk in keys {
-                        match map_key_downstream(pk) {
-                            Some(DimMapped::All) => return PartitionSelection::All,
-                            Some(DimMapped::Keys(ks)) => {
-                                mapped.extend(ks);
+                        let Some(combos) = map_key_downstream(pk) else {
+                            continue;
+                        };
+                        for combo in combos {
+                            if combo.iter().all(|(_, v)| v.is_some()) {
+                                mapped.insert(PartitionKey::Multi {
+                                    dims: combo
+                                        .into_iter()
+                                        .map(|(d, v)| (d, v.expect("checked all Some")))
+                                        .collect(),
+                                });
+                            } else {
+                                wildcards.push(combo);
                             }
-                            None => {}
+                        }
+                    }
+                    if !wildcards.is_empty() {
+                        let Some(universe) = downstream_universe else {
+                            // No universe to expand against — over-approximate
+                            // rather than drop the key.
+                            return PartitionSelection::All;
+                        };
+                        for key in universe {
+                            let PartitionKey::Multi { dims } = key else {
+                                continue;
+                            };
+                            let matches = wildcards.iter().any(|combo| {
+                                combo.iter().all(|(d, want)| match want {
+                                    None => true,
+                                    Some(v) => dims.iter().any(|(kd, kv)| kd == d && kv == v),
+                                })
+                            });
+                            if matches {
+                                mapped.insert(key.clone());
+                            }
                         }
                     }
                     if mapped.is_empty() {
@@ -401,19 +444,21 @@ impl<'a> PartitionResolver<'a> {
         }
     }
 
-    /// Map upstream partition keys to downstream partition keys.
+    /// Map upstream partition keys to downstream partition keys, expanding
+    /// dimension fan-outs against the downstream universe when given.
     pub fn map_downstream(
         &self,
         upstream_asset: &str,
         downstream_asset: &str,
         upstream_keys: &PartitionSelection,
+        downstream_universe: Option<&HashSet<PartitionKey>>,
     ) -> PartitionSelection {
         let key = (downstream_asset.to_string(), upstream_asset.to_string());
         let mapping = match self.mappings.get(&key) {
             Some(m) => m,
             None => return upstream_keys.clone(),
         };
-        mapping.map_to_downstream(upstream_keys)
+        mapping.map_to_downstream_in(upstream_keys, downstream_universe)
     }
 
     /// The mapping kind for an edge, if one was declared (absent = Identity).

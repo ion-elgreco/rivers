@@ -9539,7 +9539,7 @@ fn test_partition_resolver_identity_passthrough() {
         HashMap::from([("a".into(), HashSet::from([spk("p1"), spk("p2"), spk("p3")]))]);
     let resolver = PartitionResolver::new(&mappings, &upstream_keys);
     let sel = PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2")]));
-    assert_eq!(resolver.map_downstream("a", "b", &sel), sel);
+    assert_eq!(resolver.map_downstream("a", "b", &sel, None), sel);
 }
 
 #[test]
@@ -9547,7 +9547,7 @@ fn test_partition_resolver_no_mapping_is_identity() {
     // No mapping registered for edge (c, d) → identity passthrough
     let resolver = PartitionResolver::empty();
     let sel = PartitionSelection::Keys(HashSet::from([spk("p1")]));
-    assert_eq!(resolver.map_downstream("d", "c", &sel), sel);
+    assert_eq!(resolver.map_downstream("d", "c", &sel, None), sel);
 }
 
 #[test]
@@ -9808,9 +9808,11 @@ fn test_partition_mapping_multi_empty_and_all() {
 }
 
 #[test]
-fn test_partition_mapping_multi_all_sub_overapproximates_to_all() {
-    // A per-dimension AllPartitions sub-mapping can't be a single downstream Multi key,
-    // so it must over-approximate to `All`, not drop the key.
+fn test_partition_mapping_multi_all_sub_expands_against_universe() {
+    // A per-dimension AllPartitions sub-mapping fans that dimension out; with
+    // the downstream universe available the mapping expands precisely instead
+    // of escalating the whole selection to `All` (which over-materialized
+    // every unrelated date).
     let m = PartitionMappingKind::Multi {
         dimension_mappings: HashMap::from([
             (
@@ -9830,6 +9832,21 @@ fn test_partition_mapping_multi_all_sub_overapproximates_to_all() {
         ("date", "2024-01-01"),
         ("region", "us"),
     ])]));
+    let universe = HashSet::from([
+        mpk(&[("date", "2024-01-01"), ("region", "us")]),
+        mpk(&[("date", "2024-01-01"), ("region", "eu")]),
+        mpk(&[("date", "2024-01-02"), ("region", "us")]),
+        mpk(&[("date", "2024-01-02"), ("region", "eu")]),
+    ]);
+    assert_eq!(
+        m.map_to_downstream_in(&up, Some(&universe)),
+        PartitionSelection::Keys(HashSet::from([
+            mpk(&[("date", "2024-01-01"), ("region", "us")]),
+            mpk(&[("date", "2024-01-01"), ("region", "eu")]),
+        ])),
+        "the constrained date must limit the fan-out to that date's regions"
+    );
+    // Without a universe the over-approximation remains (never drop the key).
     assert_eq!(m.map_to_downstream(&up), PartitionSelection::All);
 }
 
@@ -9960,7 +9977,7 @@ fn test_resolver_multi_mapping() {
         ("date", "2024-01-01"),
         ("region", "us"),
     ])]));
-    assert_eq!(resolver.map_downstream("up", "down", &sel), sel);
+    assert_eq!(resolver.map_downstream("up", "down", &sel, None), sel);
 }
 
 #[test]
@@ -9982,7 +9999,7 @@ fn test_resolver_multi_to_single_mapping() {
         ("date", "2024-01-01"),
         ("region", "us"),
     ])]));
-    let downstream = resolver.map_downstream("multi_up", "single_down", &upstream);
+    let downstream = resolver.map_downstream("multi_up", "single_down", &upstream, None);
     assert_eq!(
         downstream,
         PartitionSelection::Keys(HashSet::from([spk("2024-01-01")]))

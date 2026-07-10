@@ -1787,6 +1787,7 @@ fn eval_partitioned_on_dep(
                         dep_key,
                         ctx.target_key,
                         &PartitionSelection::Keys(HashSet::from([uk.clone()])),
+                        Some(pctx.all_keys),
                     );
                     let floor = match &mapped {
                         PartitionSelection::Empty => return None,
@@ -1863,7 +1864,7 @@ fn eval_partitioned_on_dep(
     collect_dep_latch(dep_selections, dep_key, local);
 
     pctx.resolver
-        .map_downstream(dep_key, ctx.target_key, &upstream_result)
+        .map_downstream(dep_key, ctx.target_key, &upstream_result, Some(pctx.all_keys))
 }
 
 #[cfg(test)]
