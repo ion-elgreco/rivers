@@ -99,43 +99,6 @@ impl ConditionTickEngine {
             );
         }
 
-        let placeholder_keys = output
-            .plan
-            .unpartitioned
-            .iter()
-            .cloned()
-            .chain(
-                output
-                    .plan
-                    .single_partition_groups
-                    .values()
-                    .flat_map(|assets| assets.iter().cloned()),
-            )
-            .chain(
-                output
-                    .plan
-                    .multi_partition_backfills
-                    .iter()
-                    .map(|(asset_key, _)| asset_key.clone()),
-            );
-        for asset_key in placeholder_keys {
-            let _ = self.tick_tx.send(TickWriteMsg {
-                record: TickRecord {
-                    code_location_id: self.code_location_id.clone(),
-                    automation_name: asset_key,
-                    automation_type: "AutomationCondition".into(),
-                    status: "Requested".into(),
-                    timestamp: now,
-                    run_ids: vec![],
-                    backfill_ids: vec![],
-                    skip_reason: None,
-                    error: None,
-                    cursor: None,
-                },
-                max_ticks_retained: self.max_ticks_retained,
-            });
-        }
-
         if !output.results.is_empty() {
             let mut handle = super::persist::ConditionTickHandle::new(
                 self.code_location_id.clone(),
@@ -144,6 +107,30 @@ impl ConditionTickEngine {
             );
             self.dispatch_materializations(output.plan, &mut handle)
                 .await;
+            // Per-asset tick history derives from the dispatch OUTCOME — a
+            // pre-written "Requested" row can't show a failed or dropped
+            // dispatch.
+            for (asset_key, outcome) in handle.outcomes() {
+                let _ = self.tick_tx.send(TickWriteMsg {
+                    record: TickRecord {
+                        code_location_id: self.code_location_id.clone(),
+                        automation_name: asset_key.clone(),
+                        automation_type: "AutomationCondition".into(),
+                        status: if outcome.error.is_some() {
+                            "Failed".into()
+                        } else {
+                            "Requested".into()
+                        },
+                        timestamp: now,
+                        run_ids: outcome.run_ids.clone(),
+                        backfill_ids: outcome.backfill_ids.clone(),
+                        skip_reason: None,
+                        error: outcome.error.clone(),
+                        cursor: None,
+                    },
+                    max_ticks_retained: self.max_ticks_retained,
+                });
+            }
             let tick_id = handle.finalize(&self.storage).await;
             self.send_eval_records(&output.results, now, &tick_id);
         }
