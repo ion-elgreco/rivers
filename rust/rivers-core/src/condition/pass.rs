@@ -344,6 +344,16 @@ impl ConditionPass {
         for info in &conditions {
             eval_state.assets.entry(info.asset_key.clone()).or_default();
         }
+        // Rehydrate asset-level failure floors: the cache only maintains them
+        // in steady state, so a fresh cache would silently drop ExecutionFailed.
+        let mut cache = cache;
+        for (asset, ts) in &eval_state.failed_assets {
+            cache.failed_assets.insert(asset.clone());
+            cache
+                .failed_asset_timestamps
+                .entry(asset.clone())
+                .or_insert(*ts);
+        }
         Self {
             cache,
             eval_state,
@@ -438,6 +448,7 @@ impl ConditionPass {
         let to_materialize = self.apply_results(&results, now);
         let plan = self.classify_materializations(to_materialize);
         self.stamp_dispatched_handled(&plan, now);
+        self.eval_state.failed_assets = self.cache.failed_asset_timestamps.clone();
         PassOutput { results, plan }
     }
 

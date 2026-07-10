@@ -7207,6 +7207,82 @@ async fn test_initial_load_tracks_queued_and_not_started_runs() {
 }
 
 #[tokio::test]
+async fn test_failure_floor_survives_daemon_restart() {
+    // ExecutionFailed state is maintained by the steady-state refresh only;
+    // it must survive a restart via the persisted eval state or failed assets
+    // silently auto-retry after every daemon restart.
+    use crate::condition::pass::ConditionPass;
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let recs = [
+        make_materialized_record("a", 1000),
+        make_materialized_record("b", 1000),
+    ];
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&recs)
+        .await
+        .unwrap();
+
+    let mk_run = |id: &str, start: i64, asset: &str| RunRecord {
+        run_id: id.to_string(),
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        job_name: Some("test".to_string()),
+        status: RunStatus::Started,
+        start_time: start,
+        end_time: None,
+        tags: vec![],
+        node_names: vec![asset.to_string()],
+        priority: 0,
+        partition_key: None,
+        block_reason: None,
+        launched_by: LaunchedBy::Manual,
+    };
+
+    let mut pass = ConditionPass::new(
+        AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+        ConditionEvalState::default(),
+        vec![],
+        HashMap::new(),
+    );
+    pass.refresh_cache(&storage, 0).await.unwrap();
+
+    // a's run fails without materializing it → floor set by the steady path.
+    storage.create_run(&mk_run("run-fail", 2000, "a")).await.unwrap();
+    pass.refresh_cache(&storage, 0).await.unwrap();
+    storage
+        .update_run_status("run-fail", RunStatus::Failure, Some(3000))
+        .await
+        .unwrap();
+    pass.refresh_cache(&storage, 0).await.unwrap();
+    // A later unrelated run makes a's failure non-newest.
+    storage.create_run(&mk_run("run-b", 4000, "b")).await.unwrap();
+    pass.refresh_cache(&storage, 0).await.unwrap();
+    assert!(pass.cache.failed_assets.contains("a"), "precondition: floor set");
+
+    pass.run(5000, false);
+
+    // Restart: fresh cache, persisted eval state.
+    let mut pass2 = ConditionPass::new(
+        AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+        pass.eval_state.clone(),
+        vec![],
+        HashMap::new(),
+    );
+    pass2.refresh_cache(&storage, 6000).await.unwrap();
+    assert!(
+        pass2.cache.failed_assets.contains("a"),
+        "failure floor must survive a daemon restart; got {:?}",
+        pass2.cache.failed_assets
+    );
+    assert_eq!(pass2.cache.failed_asset_timestamps.get("a"), Some(&3000));
+}
+
+#[tokio::test]
 async fn test_initial_load_seeds_observation_cursor() {
     // Historical observation events must not be replayed by the first
     // steady-state refresh — the replay's AssetClear wipes live Started-run

@@ -75,6 +75,10 @@ pub struct ConditionEvalState {
     pub assets: HashMap<String, AssetConditionState>,
     /// Whether this is the very first evaluation (no previous tick).
     pub is_initial: bool,
+    /// Asset-level failure floors (latest still-current failure timestamp),
+    /// persisted so `ExecutionFailed` survives a daemon restart.
+    #[serde(default)]
+    pub failed_assets: HashMap<String, i64>,
 }
 
 impl Default for ConditionEvalState {
@@ -83,6 +87,7 @@ impl Default for ConditionEvalState {
             schema_version: EVAL_STATE_SCHEMA_VERSION,
             assets: HashMap::new(),
             is_initial: false,
+            failed_assets: HashMap::new(),
         }
     }
 }
