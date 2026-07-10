@@ -367,6 +367,17 @@ class TestWithout:
         pruned = cond.without(ac.any_deps_match(ac.missing()))
         assert [c.description for c in pruned.children] == ["in_progress"]
 
+    def test_replace_accepts_description_strings(self):
+        # A string harvested from .description must work in replace() exactly
+        # like it does in without() — no silent no-op between the two.
+        ac = rs.AutomationCondition
+        child = ac.missing().newly_true()
+        cond = child & ac.in_progress()
+        replaced = cond.replace(child.description, ac.execution_failed())
+        descs = " ".join(c.description for c in replaced.children)
+        assert "execution_failed" in descs
+        assert "newly_true" not in descs
+
 
 # ---------------------------------------------------------------------------
 # Asset integration

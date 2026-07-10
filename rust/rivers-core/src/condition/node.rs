@@ -295,6 +295,15 @@ impl ConditionNode {
         self.replace_inner(&|node| node.node_label() == old_label, replacement)
     }
 
+    /// Recursively replace nodes matching `pred`.
+    pub fn replace_matching(
+        &self,
+        pred: &dyn Fn(&ConditionNode) -> bool,
+        replacement: &ConditionNode,
+    ) -> ConditionNode {
+        self.replace_inner(pred, replacement)
+    }
+
     /// Recursively replace nodes. Matches by structural equality.
     pub fn replace_by_node(
         &self,
