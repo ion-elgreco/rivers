@@ -113,6 +113,11 @@ class TestScheduleTriggersEagerCondition:
         )
         repo2.resolve(storage=storage)
 
+        # Capture pre-daemon versions so the waits below can't return the
+        # original materialization and pass with a dead daemon.
+        prev_source_version = storage.get_asset_record("source").last_data_version
+        prev_processed_version = storage.get_asset_record("processed").last_data_version
+
         daemon = AutomationDaemon(
             repo=repo2,
             storage=storage,
@@ -122,7 +127,9 @@ class TestScheduleTriggersEagerCondition:
         try:
             # Wait for downstream to be re-materialized by condition eval
             # (schedule re-materializes source → processed becomes stale → eager fires)
-            record = _wait_for_asset_up_to_date(storage, "processed", timeout=20)
+            record = _wait_for_asset_up_to_date(
+                storage, "processed", timeout=20, prev_version=prev_processed_version
+            )
             assert record is not None
             status, causes = _stale(storage, "processed")
             assert status == "UpToDate", (
@@ -132,6 +139,9 @@ class TestScheduleTriggersEagerCondition:
 
             # Verify provenance: processed consumed source's latest data
             source_rec = storage.get_asset_record("source")
+            assert source_rec.last_data_version != prev_source_version, (
+                "the schedule must have re-materialized 'source'"
+            )
             assert len(record.last_input_data_versions) == 1
             assert record.last_input_data_versions[0][0] == "source"
             assert record.last_input_data_versions[0][1] == source_rec.last_data_version
