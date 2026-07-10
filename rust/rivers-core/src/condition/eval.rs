@@ -1021,6 +1021,39 @@ pub fn next_cron_occurrence_utc(
     }
 }
 
+/// The first real UTC instant of a wall-clock datetime in `tz`: the earlier
+/// instant when the wall time repeats (fall-back), the first instant after
+/// the gap when it does not exist (spring-forward).
+fn first_real_instant(
+    tz: &chrono_tz::Tz,
+    wall: chrono::NaiveDateTime,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::TimeZone;
+    match tz.from_local_datetime(&wall) {
+        chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&chrono::Utc)),
+        chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest.with_timezone(&chrono::Utc)),
+        chrono::LocalResult::None => {
+            let mut probe = wall;
+            for _ in 0..240 {
+                probe += chrono::Duration::minutes(1);
+                match tz.from_local_datetime(&probe) {
+                    chrono::LocalResult::Single(dt) => {
+                        return Some(dt.with_timezone(&chrono::Utc));
+                    }
+                    chrono::LocalResult::Ambiguous(earliest, _) => {
+                        return Some(earliest.with_timezone(&chrono::Utc));
+                    }
+                    chrono::LocalResult::None => {}
+                }
+            }
+            None
+        }
+    }
+}
+
+/// True when a cron occurrence falls within `(prev, now]`, compared as real
+/// UTC instants. A wall time that repeats during a DST fall-back counts once,
+/// at its first real instant — never twice.
 fn cron_tick_between(
     cron_schedule: &str,
     prev_nanos: i64,
@@ -1048,14 +1081,6 @@ fn cron_tick_between(
             cache[t]
         })
     });
-    let to_wall = |secs: i64| -> Option<chrono::DateTime<chrono::Utc>> {
-        let utc = chrono::DateTime::from_timestamp(secs, 0)?;
-        let naive = match tz {
-            Some(tz) => utc.with_timezone(&tz).naive_local(),
-            None => utc.naive_utc(),
-        };
-        Some(chrono::Utc.from_utc_datetime(&naive))
-    };
 
     CRON_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -1066,13 +1091,37 @@ fn cron_tick_between(
             );
         }
         let cron = &cache[cron_schedule];
-        match (to_wall(prev_secs), to_wall(now_secs)) {
-            (Some(prev), Some(now)) => cron
+        let (Some(prev), Some(now)) = (
+            chrono::DateTime::from_timestamp(prev_secs, 0),
+            chrono::DateTime::from_timestamp(now_secs, 0),
+        ) else {
+            return false;
+        };
+
+        let Some(tz) = tz else {
+            return cron
                 .find_next_occurrence(&prev, false)
                 .map(|next| next <= now)
-                .unwrap_or(false),
-            _ => false,
+                .unwrap_or(false);
+        };
+
+        // Walk wall-clock occurrences from prev's wall projection, mapping
+        // each to its first real instant; skip occurrences whose instant is
+        // already in the past (the repeated fall-back hour projects the wall
+        // clock behind real time).
+        let mut fake_cursor =
+            chrono::Utc.from_utc_datetime(&prev.with_timezone(&tz).naive_local());
+        for _ in 0..2000 {
+            let Ok(fake_next) = cron.find_next_occurrence(&fake_cursor, false) else {
+                return false;
+            };
+            match first_real_instant(&tz, fake_next.naive_utc()) {
+                Some(real) if real <= prev => fake_cursor = fake_next,
+                Some(real) => return real <= now,
+                None => fake_cursor = fake_next,
+            }
         }
+        false
     })
 }
 

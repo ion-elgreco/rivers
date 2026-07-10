@@ -11877,6 +11877,117 @@ fn test_on_cron_with_deps_fires_when_dep_updates_after_boundary() {
     assert!(r5.fired, "tick 5: gate re-armed at the new boundary must fire");
 }
 
+/// A wall time that repeats during a DST fall-back must fire once, at its
+/// first real instant — not again an hour later when the wall clock repeats.
+#[test]
+fn test_cron_tick_fall_back_repeated_hour_fires_once() {
+    let tree = ConditionNode::CronTickPassed {
+        cron_schedule: "30 1 * * *".to_string(),
+        timezone: Some("America/New_York".to_string()),
+    };
+    let r = make_materialized_record("r", 100);
+    let records = HashMap::from([("r".to_string(), r.clone())]);
+    let deps: HashMap<String, Vec<String>> = HashMap::new();
+
+    let eval_window = |prev_secs: i64, now_secs: i64| {
+        let prev = AssetConditionState {
+            last_tick_timestamp: Some(prev_secs * 1_000_000_000),
+            ..Default::default()
+        };
+        let states: HashMap<String, AssetConditionState> = HashMap::new();
+        let ctx = EvalContext {
+            target_key: "r",
+            root_key: "r",
+            target_record: &r,
+            cache: CacheSnapshot {
+                records: &records,
+                upstream_deps: &deps,
+                in_progress_assets: &EMPTY_SET,
+                failed_assets: &EMPTY_SET,
+                failed_asset_timestamps: &EMPTY_FAILED_TS,
+                backfill: &EMPTY_BACKFILL,
+            },
+            tags: empty_tag_snapshot(),
+            prev_state: &prev,
+            all_asset_states: &states,
+            requested_this_tick: &EMPTY_REQUESTED,
+            now: now_secs * 1_000_000_000,
+            is_initial: false,
+            partitions: None,
+            root_partition_floor: None,
+        };
+        evaluate(&tree, &ctx).fired
+    };
+
+    // 2024-11-03 America/New_York: clocks fall back 02:00 EDT → 01:00 EST at
+    // 06:00Z; wall 01:30 maps to both 05:30Z (EDT) and 06:30Z (EST).
+    let first_pass_prev = 1_730_611_785; // 05:29:45Z = 01:29:45 EDT
+    assert!(
+        eval_window(first_pass_prev, first_pass_prev + 30),
+        "the first real instant of wall 01:30 must fire"
+    );
+    let second_pass_prev = first_pass_prev + 3600; // 06:29:45Z = 01:29:45 EST
+    assert!(
+        !eval_window(second_pass_prev, second_pass_prev + 30),
+        "the repeated wall 01:30 an hour later must not fire again"
+    );
+}
+
+/// A wall time skipped by spring-forward maps to the first valid instant
+/// after the gap instead of silently never firing.
+#[test]
+fn test_cron_tick_spring_forward_gap_fires_after_gap() {
+    let tree = ConditionNode::CronTickPassed {
+        cron_schedule: "30 2 * * *".to_string(),
+        timezone: Some("America/New_York".to_string()),
+    };
+    let r = make_materialized_record("r", 100);
+    let records = HashMap::from([("r".to_string(), r.clone())]);
+    let deps: HashMap<String, Vec<String>> = HashMap::new();
+
+    let eval_window = |prev_secs: i64, now_secs: i64| {
+        let prev = AssetConditionState {
+            last_tick_timestamp: Some(prev_secs * 1_000_000_000),
+            ..Default::default()
+        };
+        let states: HashMap<String, AssetConditionState> = HashMap::new();
+        let ctx = EvalContext {
+            target_key: "r",
+            root_key: "r",
+            target_record: &r,
+            cache: CacheSnapshot {
+                records: &records,
+                upstream_deps: &deps,
+                in_progress_assets: &EMPTY_SET,
+                failed_assets: &EMPTY_SET,
+                failed_asset_timestamps: &EMPTY_FAILED_TS,
+                backfill: &EMPTY_BACKFILL,
+            },
+            tags: empty_tag_snapshot(),
+            prev_state: &prev,
+            all_asset_states: &states,
+            requested_this_tick: &EMPTY_REQUESTED,
+            now: now_secs * 1_000_000_000,
+            is_initial: false,
+            partitions: None,
+            root_partition_floor: None,
+        };
+        evaluate(&tree, &ctx).fired
+    };
+
+    // 2024-03-10 America/New_York: 02:00 EST → 03:00 EDT at 07:00Z; wall 02:30
+    // does not exist — the occurrence lands at 03:00 EDT = 07:00Z.
+    let prev = 1_710_053_985; // 06:59:45Z = 01:59:45 EST
+    assert!(
+        eval_window(prev, prev + 30),
+        "the gap occurrence must fire at the first valid instant after the gap"
+    );
+    assert!(
+        !eval_window(prev - 3600, prev - 3600 + 30),
+        "no occurrence lands in the pre-gap window"
+    );
+}
+
 #[test]
 fn test_partitioned_on_cron_partial_dep_update() {
     // Production-shaped: after the boundary tick, only a:p1 updates → on_cron
