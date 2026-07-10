@@ -509,10 +509,12 @@ impl ConditionPass {
 
     /// One full tick: evaluate conditions, apply state mutations, and return the materialization plan.
     pub fn run(&mut self, now: i64, selective: bool) -> PassOutput {
+        let results = self.evaluate(now, selective);
+        // Consume the very-first-evaluation flag only AFTER the evaluation
+        // that is supposed to see it.
         if self.eval_state.is_initial {
             self.eval_state.is_initial = false;
         }
-        let results = self.evaluate(now, selective);
         let to_materialize = self.apply_results(&results, now);
         let plan = self.classify_materializations(to_materialize);
         self.stamp_dispatched_handled(&plan, now);
