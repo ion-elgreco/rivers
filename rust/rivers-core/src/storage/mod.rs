@@ -1431,6 +1431,15 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         asset_key: &str,
     ) -> impl Future<Output = Result<Vec<(PartitionKey, i64)>>> + Send;
 
+    /// Partition timestamps that advanced past `since_timestamp` — the
+    /// incremental complement of [`Self::get_partition_timestamps`].
+    fn get_partition_timestamps_since(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        since_timestamp: i64,
+    ) -> impl Future<Output = Result<Vec<(PartitionKey, i64)>>> + Send;
+
     fn get_in_progress_partitions(
         &self,
         code_location_id: &str,
@@ -1790,6 +1799,16 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
     ) -> Result<Vec<(PartitionKey, i64)>> {
         self.backend
             .get_partition_timestamps(self.code_location_id, asset_key)
+            .await
+    }
+
+    pub async fn get_partition_timestamps_since(
+        &self,
+        asset_key: &str,
+        since_timestamp: i64,
+    ) -> Result<Vec<(PartitionKey, i64)>> {
+        self.backend
+            .get_partition_timestamps_since(self.code_location_id, asset_key, since_timestamp)
             .await
     }
 

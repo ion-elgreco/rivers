@@ -2948,6 +2948,37 @@ impl PerCodeLocationStorage for SurrealStorage {
             .collect())
     }
 
+    async fn get_partition_timestamps_since(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        since_timestamp: i64,
+    ) -> Result<Vec<(PartitionKey, i64)>> {
+        let mut result = self
+            .db
+            .query(
+                "SELECT partition_key, last_timestamp FROM asset_partitions \
+                 WHERE code_location_id = $cl AND asset_key = $asset_key \
+                 AND last_timestamp > $since",
+            )
+            .bind(("cl", code_location_id.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .bind(("since", since_timestamp))
+            .await?;
+
+        #[derive(Debug, SurrealValue)]
+        struct PartTsRow {
+            partition_key: PartitionKey,
+            last_timestamp: i64,
+        }
+
+        let rows: Vec<PartTsRow> = result.take(0)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.partition_key, r.last_timestamp))
+            .collect())
+    }
+
     async fn get_in_progress_partitions(
         &self,
         code_location_id: &str,
