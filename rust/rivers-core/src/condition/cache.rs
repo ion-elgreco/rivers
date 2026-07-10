@@ -56,6 +56,14 @@ pub struct PartitionStatusEntry {
     pub timestamps: HashMap<PartitionKey, i64>,
 }
 
+/// Incremental partition-status update for one asset: fresh timestamp rows
+/// plus full (cheap) in-progress/failed views, merged into the live entry.
+struct PartitionStatusPatch {
+    fresh_timestamps: Vec<(PartitionKey, i64)>,
+    in_progress: HashSet<PartitionKey>,
+    failed: HashMap<PartitionKey, i64>,
+}
+
 /// Backfill tracking state — which assets are in active backfills and which partitions they target.
 #[derive(Default, PartialEq)]
 pub struct BackfillState {
@@ -117,8 +125,8 @@ struct RefreshDelta {
     last_run_updates: Vec<LastRunUpdate>,
     /// Tick tag updates: `(asset, partition_key, tags)`.
     tick_tag_updates: Vec<RunTagUpdate>,
-    /// Partition-status replacements (asset_key → fresh entry).
-    partition_status: HashMap<String, PartitionStatusEntry>,
+    /// Incremental partition-status patches (asset_key → patch).
+    partition_status: HashMap<String, PartitionStatusPatch>,
     /// Replacement `BackfillState`, if any backfill query happened.
     backfill: Option<BackfillState>,
     /// New cursor values; `None` means don't advance.
@@ -766,30 +774,39 @@ impl AssetConditionCache {
         &self,
         storage: &S,
         invalidated_keys: &[String],
-    ) -> anyhow::Result<HashMap<String, PartitionStatusEntry>> {
+    ) -> anyhow::Result<HashMap<String, PartitionStatusPatch>> {
         let scoped = storage.for_code_location(&self.ctx);
-        let mut out: HashMap<String, PartitionStatusEntry> = HashMap::new();
-        for asset_key in invalidated_keys {
-            if !self.partition_status.contains_key(asset_key) {
+        let mut out: HashMap<String, PartitionStatusPatch> = HashMap::new();
+        let unique: HashSet<&String> = invalidated_keys.iter().collect();
+        for asset_key in unique {
+            let Some(current) = self.partition_status.get(asset_key.as_str()) else {
                 continue;
-            }
-            let mut entry = PartitionStatusEntry::default();
-            let timestamps = scoped.get_partition_timestamps(asset_key).await?;
-            for (pk, ts) in &timestamps {
-                entry.materialized.insert(pk.clone());
-                entry.timestamps.insert(pk.clone(), *ts);
-            }
-            entry.in_progress = scoped
+            };
+            // Incremental: only rows whose last_timestamp advanced past what
+            // the cache already knows — a full asset_partitions scan here was
+            // the dominant per-tick cost at large partition counts.
+            let since = current.timestamps.values().copied().max().unwrap_or(0);
+            let fresh_timestamps = scoped
+                .get_partition_timestamps_since(asset_key, since)
+                .await?;
+            let in_progress: HashSet<PartitionKey> = scoped
                 .get_in_progress_partitions(asset_key)
                 .await?
                 .into_iter()
                 .collect();
+            // Supersession against fresh timestamps is reconciled at apply
+            // (timestamps only grow, so recomputing there is sound).
             let failed = scoped
-                .get_failed_partitions(asset_key, &entry.timestamps)
+                .get_failed_partitions(asset_key, &current.timestamps)
                 .await?;
-            entry.failed = failed.keys().cloned().collect();
-            entry.failed_timestamps = failed;
-            out.insert(asset_key.clone(), entry);
+            out.insert(
+                asset_key.clone(),
+                PartitionStatusPatch {
+                    fresh_timestamps,
+                    in_progress,
+                    failed,
+                },
+            );
         }
         Ok(out)
     }
@@ -897,8 +914,23 @@ impl AssetConditionCache {
             self.update_tick_materialization_tags(&asset, &pk, &tags);
         }
 
-        for (key, entry) in partition_status {
-            self.partition_status.insert(key, entry);
+        for (key, patch) in partition_status {
+            let entry = self.partition_status.entry(key).or_default();
+            for (pk, ts) in patch.fresh_timestamps {
+                entry.materialized.insert(pk.clone());
+                entry.timestamps.insert(pk, ts);
+            }
+            entry.in_progress = patch.in_progress;
+            // Drop failures superseded by the freshly merged timestamps (the
+            // plan-phase supersession ran against the pre-merge view).
+            entry.failed_timestamps = patch
+                .failed
+                .into_iter()
+                .filter(|(pk, fail_ts)| {
+                    entry.timestamps.get(pk).is_none_or(|mat| fail_ts > mat)
+                })
+                .collect();
+            entry.failed = entry.failed_timestamps.keys().cloned().collect();
         }
 
         if let Some(bf) = backfill {
