@@ -255,21 +255,30 @@ pub struct PassOutput {
     pub plan: MaterializationPlan,
 }
 
+/// How an asset's latest time window is resolved: its key format, plus the
+/// grid when the universe is grid-enumerated (enabling O(window) derivation
+/// instead of parsing and sorting every key).
+pub struct TimeWindowSource {
+    pub fmt: String,
+    pub grid: Option<crate::timegrid::TimeGrid>,
+}
+
 /// Lazily computes per-(asset, lookback) latest-time-window key sets during
-/// one evaluation tick. `fmts` spans every time-window-partitioned asset the
-/// pass knows about — conditioned assets AND upstream deps — so dep pivots
-/// resolve against the dep's own window instead of selecting everything.
+/// one evaluation tick. `sources` spans every time-window-partitioned asset
+/// the pass knows about — conditioned assets AND upstream deps — so dep
+/// pivots resolve against the dep's own window instead of selecting
+/// everything.
 pub struct TimeWindowResolver<'a> {
-    fmts: &'a HashMap<String, String>,
+    sources: &'a HashMap<String, TimeWindowSource>,
     now_local: NaiveDateTime,
     #[allow(clippy::type_complexity)]
     memo: std::cell::RefCell<HashMap<(String, u64), std::sync::Arc<HashSet<PartitionKey>>>>,
 }
 
 impl<'a> TimeWindowResolver<'a> {
-    pub fn new(fmts: &'a HashMap<String, String>, now_local: NaiveDateTime) -> Self {
+    pub fn new(sources: &'a HashMap<String, TimeWindowSource>, now_local: NaiveDateTime) -> Self {
         Self {
-            fmts,
+            sources,
             now_local,
             memo: std::cell::RefCell::new(HashMap::new()),
         }
@@ -283,7 +292,7 @@ impl<'a> TimeWindowResolver<'a> {
         all_keys: &HashSet<PartitionKey>,
         lookback_delta: Option<f64>,
     ) -> Option<std::sync::Arc<HashSet<PartitionKey>>> {
-        let fmt = self.fmts.get(asset)?;
+        let source = self.sources.get(asset)?;
         let memo_key = (
             asset.to_string(),
             lookback_delta.map(f64::to_bits).unwrap_or(u64::MAX),
@@ -291,17 +300,65 @@ impl<'a> TimeWindowResolver<'a> {
         if let Some(hit) = self.memo.borrow().get(&memo_key) {
             return Some(std::sync::Arc::clone(hit));
         }
-        let keys = std::sync::Arc::new(compute_latest_time_window_keys(
-            all_keys,
-            fmt,
-            self.now_local,
-            lookback_delta,
-        ));
+        let keys = source
+            .grid
+            .as_ref()
+            .and_then(|grid| {
+                derive_window_keys_from_grid(grid, all_keys, self.now_local, lookback_delta)
+            })
+            .unwrap_or_else(|| {
+                compute_latest_time_window_keys(
+                    all_keys,
+                    &source.fmt,
+                    self.now_local,
+                    lookback_delta,
+                )
+            });
+        let keys = std::sync::Arc::new(keys);
         self.memo
             .borrow_mut()
             .insert(memo_key, std::sync::Arc::clone(&keys));
         Some(keys)
     }
+}
+
+/// Derive the latest-window key set in O(window) from the grid instead of
+/// parsing and sorting the whole universe. `None` falls back to the scan.
+fn derive_window_keys_from_grid(
+    grid: &crate::timegrid::TimeGrid,
+    all_keys: &HashSet<PartitionKey>,
+    now_local: NaiveDateTime,
+    lookback_delta: Option<f64>,
+) -> Option<HashSet<PartitionKey>> {
+    let (latest, _) = grid.nearest_keys(now_local);
+    let latest = latest?;
+    let latest_dt = parse_key_datetime(&latest, &grid.fmt).ok()?;
+    let mut out = HashSet::new();
+    let mut insert_if_known = |key: String| {
+        let pk = PartitionKey::Single { keys: vec![key] };
+        if all_keys.contains(&pk) {
+            out.insert(pk);
+        }
+    };
+    match lookback_delta {
+        None => insert_if_known(latest),
+        Some(delta_secs) => {
+            let cutoff = latest_dt
+                .checked_sub_signed(chrono::Duration::nanoseconds(
+                    (delta_secs * 1_000_000_000.0) as i64,
+                ))?;
+            for key in grid.keys_in_range(cutoff, latest_dt).ok()? {
+                // keys_in_range brackets the window straddling `cutoff`; the
+                // scan keeps only keys whose window START is at/after it.
+                let dt = parse_key_datetime(&key, &grid.fmt).ok()?;
+                if dt >= cutoff {
+                    insert_if_known(key);
+                }
+            }
+            insert_if_known(latest);
+        }
+    }
+    Some(out)
 }
 
 /// Compute partition keys that fall within the latest time window.
@@ -364,9 +421,9 @@ pub struct ConditionPass {
     pub upstream_partition_keys: HashMap<String, HashSet<PartitionKey>>,
     /// How each `upstream_partition_keys` entry evolves.
     pub upstream_universes: HashMap<String, PartitionUniverse>,
-    /// Time-window key format per time-window-partitioned asset (conditioned
-    /// assets and upstream deps), for `InLatestTimeWindow` resolution.
-    pub time_window_fmts: HashMap<String, String>,
+    /// Time-window resolution source per time-window-partitioned asset
+    /// (conditioned assets and upstream deps), for `InLatestTimeWindow`.
+    pub time_window_sources: HashMap<String, TimeWindowSource>,
 }
 
 impl ConditionPass {
@@ -406,19 +463,32 @@ impl ConditionPass {
                 .entry(asset.clone())
                 .or_insert(*ts);
         }
-        let mut time_window_fmts: HashMap<String, String> = HashMap::new();
+        let mut time_window_sources: HashMap<String, TimeWindowSource> = HashMap::new();
         for info in &conditions {
             if let Some(pi) = &info.partition_info
                 && let Some(fmt) = &pi.time_window_fmt
             {
-                time_window_fmts.insert(info.asset_key.clone(), fmt.clone());
+                let grid = match &pi.universe {
+                    PartitionUniverse::TimeWindow { grid, .. } => Some(grid.clone()),
+                    _ => None,
+                };
+                time_window_sources.insert(
+                    info.asset_key.clone(),
+                    TimeWindowSource {
+                        fmt: fmt.clone(),
+                        grid,
+                    },
+                );
             }
         }
         for (asset, universe) in &universes_map {
             if let PartitionUniverse::TimeWindow { grid, .. } = universe {
-                time_window_fmts
+                time_window_sources
                     .entry(asset.clone())
-                    .or_insert_with(|| grid.fmt.clone());
+                    .or_insert_with(|| TimeWindowSource {
+                        fmt: grid.fmt.clone(),
+                        grid: Some(grid.clone()),
+                    });
             }
         }
         Self {
@@ -431,7 +501,7 @@ impl ConditionPass {
             time_based_eval_set: None,
             upstream_partition_keys: keys_map,
             upstream_universes: universes_map,
-            time_window_fmts,
+            time_window_sources,
         }
     }
 
@@ -524,7 +594,7 @@ impl ConditionPass {
 
     fn evaluate(&self, now: i64, selective: bool) -> Vec<EvalResultRow> {
         let now_local = chrono::Local.timestamp_nanos(now).naive_local();
-        let time_windows = TimeWindowResolver::new(&self.time_window_fmts, now_local);
+        let time_windows = TimeWindowResolver::new(&self.time_window_sources, now_local);
         let in_progress_keys: HashSet<String> =
             self.cache.in_progress_assets.keys().cloned().collect();
 
@@ -925,6 +995,40 @@ mod tests {
         let plan = pass.classify_materializations(to_mat);
         pass.stamp_dispatched_handled(&plan, 5000);
         pass.eval_state.assets["down"].last_handled_timestamp
+    }
+
+    /// The O(window) grid derivation must produce exactly what the full-scan
+    /// fallback produces for grid-enumerated universes.
+    #[test]
+    fn grid_derivation_matches_the_scan() {
+        let keys = make_daily_keys(&[
+            "2020-01-01",
+            "2020-01-02",
+            "2020-01-03",
+            "2020-01-04",
+            "2020-01-05",
+        ]);
+        let grid = crate::timegrid::TimeGrid {
+            cron_schedule: None,
+            interval_seconds: Some(86_400.0),
+            start: to_wall("2020-01-01 00:00"),
+            end: Some(to_wall("2020-01-06 00:00")),
+            fmt: "%Y-%m-%d".to_string(),
+        };
+        let now = to_wall("2020-01-05 12:00");
+        for lookback in [None, Some(86_400.0), Some(2.5 * 86_400.0)] {
+            let scanned = compute_latest_time_window_keys(&keys, "%Y-%m-%d", now, lookback);
+            let sources = HashMap::from([(
+                "a".to_string(),
+                TimeWindowSource {
+                    fmt: "%Y-%m-%d".to_string(),
+                    grid: Some(grid.clone()),
+                },
+            )]);
+            let tw = TimeWindowResolver::new(&sources, now);
+            let derived = tw.keys_for("a", &keys, lookback).unwrap();
+            assert_eq!(*derived, scanned, "lookback {lookback:?}");
+        }
     }
 
     /// Each InLatestTimeWindow node must select against its OWN lookback — not
