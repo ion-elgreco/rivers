@@ -355,7 +355,16 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
     }
 }
 
-/// Recursive inner evaluator.
+/// Recursive inner evaluator (unpartitioned / bool semantics).
+///
+/// UNIFICATION: this match and [`eval_partitioned`] are parallel 25-arm
+/// evaluators reconciled by the `DepScope::bridged` machinery; a semantics
+/// change landing on only one side makes partitioned and unpartitioned assets
+/// take different fire decisions. Bool is a `PartitionSelection` over a unit
+/// universe (`from_bool`/`to_bool`), so a single selection-based evaluator can
+/// subsume both — that refactor needs a persisted-latch migration
+/// (`previous_results` → selections) and an output-trait merge; until then,
+/// mirror every semantic change in BOTH matches.
 fn eval_inner<O: EvalOutput>(
     node: &ConditionNode,
     ctx: &EvalContext,
@@ -1135,6 +1144,9 @@ fn eval_on_dep(
 
 /// Recursive partition-aware evaluator. Returns an `O` indicating which
 /// partitions satisfy the condition.
+///
+/// UNIFICATION: parallel twin of [`eval_inner`] — see the note there; mirror
+/// every semantic change in BOTH matches.
 fn eval_partitioned<O: PartEvalOutput>(
     node: &ConditionNode,
     ctx: &EvalContext,
