@@ -20,7 +20,7 @@ pub(crate) fn launch_started_run(
     gil_threads: &GilThreads,
 ) {
     gil_threads.spawn(move || {
-        Python::try_attach(|py| {
+        let attached = Python::try_attach(|py| {
             let job = match handle.get_job(py, &job_name) {
                 Ok(j) => j,
                 Err(e) => {
@@ -47,6 +47,13 @@ pub(crate) fn launch_started_run(
                 );
             }
         });
+        if attached.is_none() {
+            // The Started record is already durable; without this the phantom
+            // run reads as in-flight forever after the next daemon start.
+            crate::runtime::rt().block_on(
+                handle.mark_run_launch_failed(&run_id, "interpreter unavailable at launch"),
+            );
+        }
     });
 }
 
