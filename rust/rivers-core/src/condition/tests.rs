@@ -2523,7 +2523,7 @@ fn test_last_run_includes_target_partitioned() {
         failed: &HashSet::new(),
         timestamps: &timestamps,
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_status,
         dep_root_floor: None,
     };
@@ -2629,7 +2629,7 @@ fn test_last_run_includes_target_partitioned_joint_run_suppresses_newly_updated(
         failed: &HashSet::new(),
         timestamps: &timestamps,
         resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -2702,7 +2702,7 @@ fn dep_updated_requires_dep_newer_than_target_key() {
         failed: &HashSet::new(),
         timestamps: &a_timestamps,
         resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -2768,7 +2768,7 @@ fn partitioned_root_unpartitioned_dep_refires_stale_older_partitions() {
         failed: &HashSet::new(),
         timestamps: &a_timestamps,
         resolver: PartitionResolver::new(&empty_mappings, &no_upstream_keys),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -2849,7 +2849,7 @@ fn all_partitions_dep_frontier_key_does_not_refire_whole_universe() {
         failed: &HashSet::new(),
         timestamps: &a_timestamps,
         resolver: PartitionResolver::new(&mappings, &upstream_b),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -2893,7 +2893,7 @@ fn test_empty_partitioned_dep_universe_does_not_bridge_latch_to_all() {
         failed: &HashSet::new(),
         timestamps: &HashMap::new(),
         resolver: PartitionResolver::new(&mappings, &upstream_u),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -2965,7 +2965,7 @@ fn all_partitions_dep_genuine_update_still_fires() {
         failed: &HashSet::new(),
         timestamps: &a_timestamps,
         resolver: PartitionResolver::new(&mappings, &upstream_b),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -3022,7 +3022,7 @@ fn all_partitions_dep_initial_population_fires() {
         failed: &HashSet::new(),
         timestamps: &empty_ts,
         resolver: PartitionResolver::new(&mappings, &upstream_b),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -3110,7 +3110,7 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
         failed: &HashSet::new(),
         timestamps: &a_timestamps,
         resolver: PartitionResolver::new(&mappings, &upstream_b),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -3151,7 +3151,7 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
         failed: &HashSet::new(),
         timestamps: &a_timestamps_stale,
         resolver: PartitionResolver::new(&mappings, &upstream_b),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &statuses_stale,
         dep_root_floor: None,
     };
@@ -3239,7 +3239,7 @@ fn will_be_requested_carries_the_upstream_fired_selection() {
         failed: &HashSet::new(),
         timestamps: &ts,
         resolver: PartitionResolver::new(&empty_mappings, &upstream_up),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -3308,7 +3308,7 @@ fn dep_updated_retries_once_per_dep_update_after_failure() {
         failed: &keys,
         timestamps: &a_timestamps,
         resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -3349,7 +3349,7 @@ fn dep_updated_retries_once_per_dep_update_after_failure() {
         failed: &keys,
         timestamps: &a_timestamps,
         resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &statuses_retry,
         dep_root_floor: None,
     };
@@ -3420,7 +3420,7 @@ fn dep_updated_ignores_dep_keys_outside_root_universe() {
         failed: &HashSet::new(),
         timestamps: &a_timestamps,
         resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -3460,7 +3460,7 @@ fn dep_updated_ignores_dep_keys_outside_root_universe() {
         failed: &HashSet::new(),
         timestamps: &a_timestamps,
         resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &statuses_new,
         dep_root_floor: None,
     };
@@ -3533,7 +3533,7 @@ fn test_last_run_includes_target_partitioned_solo_run_allows_newly_updated() {
         failed: &HashSet::new(),
         timestamps: &timestamps,
         resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -3609,7 +3609,7 @@ fn test_last_run_includes_target_partitioned_mixed_joint_and_solo() {
         failed: &HashSet::new(),
         timestamps: &timestamps,
         resolver: PartitionResolver::new(&empty_mappings, &upstream_b),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -4721,27 +4721,25 @@ fn test_in_latest_time_window_unpartitioned_materialized() {
 }
 
 #[test]
-fn test_find_lookback_delta() {
-    let cond = ConditionNode::eager(); // eager() doesn't include InLatestTimeWindow
-    assert!(cond.find_lookback_delta().is_none());
+fn test_has_root_scope_latest_time_window() {
+    assert!(!ConditionNode::eager().has_root_scope_latest_time_window());
 
-    let cond = ConditionNode::InLatestTimeWindow {
-        lookback_delta: Some(3600.0),
-    };
-    assert_eq!(cond.find_lookback_delta(), Some(Some(3600.0)));
-
-    let cond = ConditionNode::InLatestTimeWindow {
-        lookback_delta: None,
-    };
-    assert_eq!(cond.find_lookback_delta(), Some(None));
-
-    let nested = ConditionNode::And(vec![
+    let root_level = ConditionNode::And(vec![
         ConditionNode::Missing,
         ConditionNode::InLatestTimeWindow {
             lookback_delta: Some(7200.0),
         },
     ]);
-    assert_eq!(nested.find_lookback_delta(), Some(Some(7200.0)));
+    assert!(root_level.has_root_scope_latest_time_window());
+
+    // Inside a dep aggregate the node filters the DEP's partitions.
+    let dep_scoped = ConditionNode::any_deps_match(ConditionNode::And(vec![
+        ConditionNode::NewlyUpdated,
+        ConditionNode::InLatestTimeWindow {
+            lookback_delta: None,
+        },
+    ]));
+    assert!(!dep_scoped.has_root_scope_latest_time_window());
 }
 
 #[test]
@@ -8084,7 +8082,7 @@ impl OwnedPartitionData {
             failed: &self.failed,
             timestamps: &self.timestamps,
             resolver: PartitionResolver::empty(),
-            latest_time_window_keys: None,
+            time_windows: None,
             all_partition_statuses: &self.all_partition_statuses,
             dep_root_floor: None,
         }
@@ -8305,16 +8303,27 @@ fn test_partitioned_missing_all_materialized() {
 #[test]
 fn test_partitioned_in_latest_time_window_selects_recent_keys() {
     let empty_partition_statuses = HashMap::new();
-    // 5 daily partitions, latest_time_window_keys = {p4, p5}; InLatestTimeWindow selects only those.
+    // 5 daily partitions; a 1-day lookback selects the latest two.
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".into(), record.clone())]);
     let deps = HashMap::new();
     let pdata = OwnedPartitionData::new(
-        &["p1", "p2", "p3", "p4", "p5"],
-        &["p1", "p2"],
-        &[("p1", 100), ("p2", 100)],
+        &[
+            "2020-01-01",
+            "2020-01-02",
+            "2020-01-03",
+            "2020-01-04",
+            "2020-01-05",
+        ],
+        &["2020-01-01", "2020-01-02"],
+        &[("2020-01-01", 100), ("2020-01-02", 100)],
     );
-    let latest = HashSet::from([spk("p4"), spk("p5")]);
+    let fmts = HashMap::from([("a".to_string(), "%Y-%m-%d".to_string())]);
+    let now_local = chrono::NaiveDate::from_ymd_opt(2020, 1, 5)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap();
+    let tw = TimeWindowResolver::new(&fmts, now_local);
     let pctx = PartitionEvalContext {
         all_keys: &pdata.all_keys,
         materialized: &pdata.materialized,
@@ -8322,31 +8331,36 @@ fn test_partitioned_in_latest_time_window_selects_recent_keys() {
         failed: &pdata.failed,
         timestamps: &pdata.timestamps,
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: Some(&latest),
+        time_windows: Some(&tw),
         all_partition_statuses: &empty_partition_statuses,
         dep_root_floor: None,
     };
     let ctx = make_partitioned_ctx("a", &record, &records, &deps, &pctx);
     let cond = ConditionNode::InLatestTimeWindow {
-        lookback_delta: None,
+        lookback_delta: Some(86_400.0),
     };
     let result = evaluate(&cond, &ctx);
     assert!(result.fired);
     assert_eq!(
         result.selection.unwrap(),
-        PartitionSelection::Keys(HashSet::from([spk("p4"), spk("p5")]))
+        PartitionSelection::Keys(HashSet::from([spk("2020-01-04"), spk("2020-01-05")]))
     );
 }
 
 #[test]
 fn test_partitioned_in_latest_time_window_empty_when_no_recent() {
     let empty_partition_statuses = HashMap::new();
-    // Time-partitioned asset with empty latest_time_window_keys (e.g. all partitions in the future).
+    // All partitions are in the future relative to `now` → nothing selected.
     let record = make_record("a");
     let records = HashMap::from([("a".into(), record.clone())]);
     let deps = HashMap::new();
-    let pdata = OwnedPartitionData::new(&["p1", "p2", "p3"], &[], &[]);
-    let latest: HashSet<PartitionKey> = HashSet::new();
+    let pdata = OwnedPartitionData::new(&["2020-02-01", "2020-02-02", "2020-02-03"], &[], &[]);
+    let fmts = HashMap::from([("a".to_string(), "%Y-%m-%d".to_string())]);
+    let now_local = chrono::NaiveDate::from_ymd_opt(2020, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    let tw = TimeWindowResolver::new(&fmts, now_local);
     let pctx = PartitionEvalContext {
         all_keys: &pdata.all_keys,
         materialized: &pdata.materialized,
@@ -8354,7 +8368,7 @@ fn test_partitioned_in_latest_time_window_empty_when_no_recent() {
         failed: &pdata.failed,
         timestamps: &pdata.timestamps,
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: Some(&latest),
+        time_windows: Some(&tw),
         all_partition_statuses: &empty_partition_statuses,
         dep_root_floor: None,
     };
@@ -8368,35 +8382,20 @@ fn test_partitioned_in_latest_time_window_empty_when_no_recent() {
 }
 
 #[test]
-fn test_partitioned_in_latest_time_window_static_partitions_selects_all() {
-    // Static (non-time) partitions: latest_time_window_keys is None → all keys.
+fn test_partitioned_in_latest_time_window_static_partitions_selects_none() {
+    // Static (non-time) partitions have no latest window: the filter selects
+    // nothing instead of silently selecting every partition.
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".into(), record.clone())]);
     let deps = HashMap::new();
     let pdata = OwnedPartitionData::new(&["us", "eu", "ap"], &["us"], &[("us", 100)]);
-    let pctx = pdata.as_eval_ctx(); // latest_time_window_keys = None
-    let ctx = make_partitioned_ctx("a", &record, &records, &deps, &pctx);
-    let cond = ConditionNode::InLatestTimeWindow {
-        lookback_delta: Some(3600.0),
-    };
-    let result = evaluate(&cond, &ctx);
-    assert!(result.fired);
-    assert_eq!(
-        result.selection.unwrap(),
-        PartitionSelection::Keys(pdata.all_keys.clone())
-    );
-}
-
-#[test]
-fn test_partitioned_in_latest_time_window_combined_with_missing() {
+    let fmts: HashMap<String, String> = HashMap::new(); // "a" is not time-partitioned
+    let now_local = chrono::NaiveDate::from_ymd_opt(2020, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    let tw = TimeWindowResolver::new(&fmts, now_local);
     let empty_partition_statuses = HashMap::new();
-    // InLatestTimeWindow & Missing over 5 daily partitions (p1 materialized, latest = {p4,p5}):
-    // Missing={p2,p3,p4,p5} ∩ latest={p4,p5} → {p4,p5}.
-    let record = make_materialized_record("a", 100);
-    let records = HashMap::from([("a".into(), record.clone())]);
-    let deps = HashMap::new();
-    let pdata = OwnedPartitionData::new(&["p1", "p2", "p3", "p4", "p5"], &["p1"], &[("p1", 100)]);
-    let latest = HashSet::from([spk("p4"), spk("p5")]);
     let pctx = PartitionEvalContext {
         all_keys: &pdata.all_keys,
         materialized: &pdata.materialized,
@@ -8404,24 +8403,67 @@ fn test_partitioned_in_latest_time_window_combined_with_missing() {
         failed: &pdata.failed,
         timestamps: &pdata.timestamps,
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: Some(&latest),
+        time_windows: Some(&tw),
         all_partition_statuses: &empty_partition_statuses,
         dep_root_floor: None,
     };
     let ctx = make_partitioned_ctx("a", &record, &records, &deps, &pctx);
-    // InLatestTimeWindow & Missing — only the latest missing partitions
+    let cond = ConditionNode::InLatestTimeWindow {
+        lookback_delta: Some(3600.0),
+    };
+    let result = evaluate(&cond, &ctx);
+    assert!(!result.fired);
+    assert_eq!(result.selection.unwrap(), PartitionSelection::Empty);
+}
+
+#[test]
+fn test_partitioned_in_latest_time_window_combined_with_missing() {
+    let empty_partition_statuses = HashMap::new();
+    // InLatestTimeWindow(1d) & Missing over 5 daily partitions (01 materialized):
+    // Missing={02..05} ∩ latest={04,05} → {04,05}.
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".into(), record.clone())]);
+    let deps = HashMap::new();
+    let pdata = OwnedPartitionData::new(
+        &[
+            "2020-01-01",
+            "2020-01-02",
+            "2020-01-03",
+            "2020-01-04",
+            "2020-01-05",
+        ],
+        &["2020-01-01"],
+        &[("2020-01-01", 100)],
+    );
+    let fmts = HashMap::from([("a".to_string(), "%Y-%m-%d".to_string())]);
+    let now_local = chrono::NaiveDate::from_ymd_opt(2020, 1, 5)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap();
+    let tw = TimeWindowResolver::new(&fmts, now_local);
+    let pctx = PartitionEvalContext {
+        all_keys: &pdata.all_keys,
+        materialized: &pdata.materialized,
+        in_progress: &pdata.in_progress,
+        failed: &pdata.failed,
+        timestamps: &pdata.timestamps,
+        resolver: PartitionResolver::empty(),
+        time_windows: Some(&tw),
+        all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
+    };
+    let ctx = make_partitioned_ctx("a", &record, &records, &deps, &pctx);
     let cond = ConditionNode::And(vec![
         ConditionNode::InLatestTimeWindow {
-            lookback_delta: None,
+            lookback_delta: Some(86_400.0),
         },
         ConditionNode::Missing,
     ]);
     let result = evaluate(&cond, &ctx);
     assert!(result.fired);
-    // p4 and p5 are both in the latest window AND missing
     assert_eq!(
         result.selection.unwrap(),
-        PartitionSelection::Keys(HashSet::from([spk("p4"), spk("p5")]))
+        PartitionSelection::Keys(HashSet::from([spk("2020-01-04"), spk("2020-01-05")]))
     );
 }
 
@@ -8835,7 +8877,7 @@ fn test_partitioned_any_deps_missing_with_identity() {
         failed: &_fail,
         timestamps: &_ts,
         resolver,
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -8914,7 +8956,7 @@ fn test_partitioned_all_deps_match_not_missing() {
         failed: &_fail2,
         timestamps: &_ts2,
         resolver,
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -9099,7 +9141,7 @@ fn test_partitioned_eager_selects_new_partition() {
         failed: &_fail3,
         timestamps: &_ts3,
         resolver,
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -9536,7 +9578,7 @@ fn test_partitioned_eager_partial_upstream_update() {
         failed: &_fail,
         timestamps: &_ts,
         resolver,
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -9624,7 +9666,7 @@ fn test_partitioned_eager_only_fires_for_partitions_with_upstream_data() {
         failed: &empty_fail,
         timestamps: &empty_ts,
         resolver,
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -9732,7 +9774,7 @@ fn test_partitioned_on_missing_only_missing_partitions() {
         failed: &_fail,
         timestamps: &_ts,
         resolver,
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -9799,7 +9841,7 @@ fn test_partitioned_in_progress_excludes_from_and() {
         failed: &_fail,
         timestamps: &_ts,
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &empty_partition_statuses,
         dep_root_floor: None,
     };
@@ -9867,7 +9909,7 @@ fn test_partitioned_code_version_changed_all_partitions() {
         failed: &_fail,
         timestamps: &_ts,
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &empty_partition_statuses,
         dep_root_floor: None,
     };
@@ -9904,7 +9946,7 @@ fn test_partitioned_since_latch_per_partition() {
         failed: &_fail,
         timestamps: &_ts1,
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &empty_partition_statuses,
         dep_root_floor: None,
     };
@@ -9957,7 +9999,7 @@ fn test_partitioned_since_latch_per_partition() {
         failed: &_fail,
         timestamps: &_ts2,
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &empty_partition_statuses,
         dep_root_floor: None,
     };
@@ -10159,7 +10201,7 @@ fn test_partitioned_execution_failed_subset() {
         failed: &_fail,
         timestamps: &_ts,
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &empty_partition_statuses,
         dep_root_floor: None,
     };
@@ -10193,7 +10235,7 @@ fn test_partitioned_complex_or_and_not() {
         failed: &_fail,
         timestamps: &_ts,
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &empty_partition_statuses,
         dep_root_floor: None,
     };
@@ -11063,14 +11105,14 @@ fn test_node_label_distinguishes_unlabeled_aggregate_inner_condition() {
 }
 
 #[test]
-fn find_lookback_delta_recurses_into_asset_matches() {
-    // find_lookback_delta must recurse into AssetMatches like the other tree-walks,
-    // or a nested lookback skips the latest-time-window computation.
+fn root_scope_latest_time_window_stops_at_asset_matches() {
+    // AssetMatches pivots evaluation onto OTHER assets, so a nested
+    // InLatestTimeWindow doesn't constrain the root's own partitioning.
     let inner = ConditionNode::InLatestTimeWindow {
         lookback_delta: Some(3600.0),
     };
     let tree = ConditionNode::asset_matches(vec!["x".into()], inner);
-    assert_eq!(tree.find_lookback_delta(), Some(Some(3600.0)));
+    assert!(!tree.has_root_scope_latest_time_window());
 }
 
 #[test]
@@ -11516,7 +11558,7 @@ fn test_partitioned_on_cron_no_deps_fires_all_partitions() {
         failed: &_fail,
         timestamps: &_ts,
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &empty_partition_statuses,
         dep_root_floor: None,
     };
@@ -11669,7 +11711,7 @@ fn test_partitioned_newly_requested_is_per_partition() {
         failed: &empty_pk,
         timestamps: &ts,
         resolver: PartitionResolver::new(&empty_mappings, &no_upstream_keys),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &empty_partition_statuses,
         dep_root_floor: None,
     };
@@ -11728,7 +11770,7 @@ fn test_partitioned_on_cron_does_not_fire_without_tick() {
         failed: &_fail,
         timestamps: &_ts,
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &empty_partition_statuses,
         dep_root_floor: None,
     };
@@ -11828,7 +11870,7 @@ fn test_partitioned_on_cron_waits_for_dep_update() {
         failed: &_fail,
         timestamps: &_ts,
         resolver,
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -11928,7 +11970,7 @@ fn test_partitioned_on_cron_fires_after_dep_update() {
         failed: &_fail,
         timestamps: &_ts,
         resolver: PartitionResolver::new(&mappings, &upstream_keys),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &statuses_t1,
         dep_root_floor: None,
     };
@@ -11980,7 +12022,7 @@ fn test_partitioned_on_cron_fires_after_dep_update() {
         failed: &_fail,
         timestamps: &_ts,
         resolver: PartitionResolver::new(&mappings, &upstream_keys),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &statuses_t2,
         dep_root_floor: None,
     };
@@ -12312,7 +12354,7 @@ fn test_partitioned_on_cron_partial_dep_update() {
         failed: &_fail,
         timestamps: &_ts,
         resolver: PartitionResolver::new(&mappings, &upstream_keys),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &statuses_t1,
         dep_root_floor: None,
     };
@@ -12364,7 +12406,7 @@ fn test_partitioned_on_cron_partial_dep_update() {
         failed: &_fail,
         timestamps: &_ts,
         resolver: PartitionResolver::new(&mappings, &upstream_keys),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &statuses_t2,
         dep_root_floor: None,
     };
@@ -12464,7 +12506,7 @@ fn test_nested_dep_pivot_floor_uses_root_universe() {
             failed: &_fail,
             timestamps: &_ts,
             resolver: PartitionResolver::new(&mappings, &upstream_keys),
-            latest_time_window_keys: None,
+            time_windows: None,
             all_partition_statuses: &statuses,
             dep_root_floor: None,
         };
@@ -12637,7 +12679,7 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
         failed: &_fail,
         timestamps: &timestamps,
         resolver,
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -12689,7 +12731,7 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
         failed: &_fail,
         timestamps: &timestamps,
         resolver: resolver2,
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -13386,7 +13428,7 @@ fn test_dep_aggregate_partitioned_since_latch_persists_per_dep() {
         failed: &empty_set,
         timestamps: &empty_ts,
         resolver: PartitionResolver::new(&mappings, &upstream_keys),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &statuses1,
         dep_root_floor: None,
     };
@@ -13426,7 +13468,7 @@ fn test_dep_aggregate_partitioned_since_latch_persists_per_dep() {
         failed: &empty_set,
         timestamps: &b_ts,
         resolver: PartitionResolver::new(&mappings, &upstream_keys),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &statuses2,
         dep_root_floor: None,
     };
@@ -13689,7 +13731,7 @@ fn test_nested_dep_aggregate_under_unpartitioned_dep_persists_latch() {
         failed: &empty_pk,
         timestamps: &r_timestamps,
         resolver: PartitionResolver::new(&empty_mappings, &no_upstream_keys),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_statuses,
         dep_root_floor: None,
     };
@@ -14024,7 +14066,7 @@ fn test_partitioned_newly_updated_ignores_keys_outside_universe() {
         failed: &HashSet::new(),
         timestamps: &timestamps,
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_status,
         dep_root_floor: None,
     };
@@ -14142,7 +14184,7 @@ fn test_partitioned_data_version_changed_suppressed_for_pre_versioning_state() {
         failed: &HashSet::new(),
         timestamps: &timestamps,
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_status,
         dep_root_floor: None,
     };
@@ -14739,7 +14781,7 @@ fn test_partitioned_execution_failed_ignores_keys_outside_universe() {
         failed: &failed,
         timestamps: &HashMap::new(),
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: None,
+        time_windows: None,
         all_partition_statuses: &partition_status,
         dep_root_floor: None,
     };

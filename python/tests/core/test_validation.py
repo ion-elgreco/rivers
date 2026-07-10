@@ -110,6 +110,38 @@ def test_external_asset_observe_no_fn_skipped():
     assert "x" not in result
 
 
+def test_in_latest_time_window_requires_time_partitioning():
+    """Root-scope in_latest_time_window() on a non-time-partitioned asset fails resolve."""
+
+    @rs.Asset(
+        partitions_def=rs.PartitionsDefinition.Static(["us", "eu"]),
+        automation_condition=rs.AutomationCondition.missing()
+        & rs.AutomationCondition.in_latest_time_window(),
+    )
+    def static_asset():
+        return 1
+
+    repo = rs.CodeRepository(assets=[static_asset])
+    with pytest.raises(AssetDefinitionError, match="in_latest_time_window"):
+        repo.resolve()
+
+
+def test_in_latest_time_window_allowed_inside_dep_aggregate():
+    """Dep-scoped in_latest_time_window() filters the dep's partitions and resolves fine."""
+
+    @rs.Asset(
+        automation_condition=rs.AutomationCondition.any_deps_match(
+            rs.AutomationCondition.newly_updated()
+            & rs.AutomationCondition.in_latest_time_window()
+        ),
+    )
+    def watcher():
+        return 1
+
+    repo = rs.CodeRepository(assets=[watcher])
+    repo.resolve()
+
+
 # ---------------------------------------------------------------------------
 # Job validation
 # ---------------------------------------------------------------------------

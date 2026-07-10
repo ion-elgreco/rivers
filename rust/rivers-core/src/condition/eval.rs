@@ -1306,16 +1306,13 @@ fn eval_partitioned<O: PartEvalOutput>(
             O::leaf(sel, my_idx, node, total)
         }
 
-        ConditionNode::InLatestTimeWindow { .. } => {
-            let sel = match &pctx.latest_time_window_keys {
-                Some(keys) => {
-                    if keys.is_empty() {
-                        PartitionSelection::Empty
-                    } else {
-                        PartitionSelection::Keys(keys.iter().cloned().collect())
-                    }
-                }
-                None => PartitionSelection::Keys(pctx.all_keys.clone()),
+        ConditionNode::InLatestTimeWindow { lookback_delta } => {
+            let sel = match pctx
+                .time_windows
+                .and_then(|tw| tw.keys_for(ctx.target_key, pctx.all_keys, *lookback_delta))
+            {
+                Some(keys) if !keys.is_empty() => PartitionSelection::Keys((*keys).clone()),
+                _ => PartitionSelection::Empty,
             };
             O::leaf(sel, my_idx, node, total)
         }
@@ -1817,7 +1814,7 @@ fn eval_partitioned_on_dep(
         failed: &upstream_status.failed,
         timestamps: &upstream_status.timestamps,
         resolver: PartitionResolver::empty(),
-        latest_time_window_keys: None,
+        time_windows: pctx.time_windows,
         all_partition_statuses: pctx.all_partition_statuses,
         dep_root_floor: dep_root_floor.as_ref(),
     };
