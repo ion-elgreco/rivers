@@ -130,6 +130,8 @@ struct RefreshDelta {
     evicted_pending: Vec<(String, Vec<String>)>,
     /// Runs whose effects were applied this refresh: `(run_id, start_time)`.
     applied_runs: Vec<(String, i64)>,
+    /// Assets whose last active backfill reached a terminal state.
+    backfill_ended_assets: Vec<String>,
 }
 
 impl RefreshDelta {
@@ -585,9 +587,20 @@ impl AssetConditionCache {
                 .await?;
         }
 
-        let new_backfill = self.fetch_updated_backfill_state(storage).await?;
+        // BackfillStatus has two live states and load_active_backfills returns
+        // every backfill in them, so the fresh query IS the new state — a
+        // tracked id that is terminal (or deleted) simply stops appearing.
+        let new_backfill = Self::load_active_backfills(storage, &self.ctx).await?;
         if new_backfill != self.backfill {
             delta.changed = true;
+            // Assets whose last active backfill ended may still carry the
+            // empty pre-dispatch in-flight placeholder (a canceled backfill
+            // never produces an observed sub-run to clear it).
+            for asset in self.backfill.assets.keys() {
+                if !new_backfill.assets.contains_key(asset) {
+                    delta.backfill_ended_assets.push(asset.clone());
+                }
+            }
             delta.backfill = Some(new_backfill);
         }
 
@@ -781,66 +794,6 @@ impl AssetConditionCache {
         Ok(out)
     }
 
-    /// Plan-phase helper: compute the new backfill state.
-    async fn fetch_updated_backfill_state<S: StorageBackend>(
-        &self,
-        storage: &S,
-    ) -> anyhow::Result<BackfillState> {
-        let mut tracked_ids: HashSet<String> = self
-            .backfill
-            .assets
-            .values()
-            .flat_map(|ids| ids.iter().cloned())
-            .collect();
-
-        let mut completed_ids: HashSet<String> = HashSet::new();
-        for bf_id in &tracked_ids {
-            if let Ok(Some(bf)) = storage.get_backfill(bf_id).await {
-                match bf.status {
-                    BackfillStatus::CompletedSuccess
-                    | BackfillStatus::CompletedFailed
-                    | BackfillStatus::Canceled => {
-                        completed_ids.insert(bf_id.clone());
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let mut new_state = BackfillState {
-            assets: self.backfill.assets.clone(),
-            partition_keys: self.backfill.partition_keys.clone(),
-        };
-        if !completed_ids.is_empty() {
-            new_state.assets.retain(|_, ids| {
-                ids.retain(|id| !completed_ids.contains(id));
-                !ids.is_empty()
-            });
-            for id in &completed_ids {
-                new_state.partition_keys.remove(id);
-                tracked_ids.remove(id);
-            }
-        }
-
-        let fresh = Self::load_active_backfills(storage, &self.ctx).await?;
-        for (bf_id, pk) in &fresh.partition_keys {
-            if !tracked_ids.contains(bf_id) {
-                for (asset, ids) in &fresh.assets {
-                    if ids.contains(bf_id) {
-                        new_state
-                            .assets
-                            .entry(asset.clone())
-                            .or_default()
-                            .push(bf_id.clone());
-                    }
-                }
-                new_state.partition_keys.insert(bf_id.clone(), pk.clone());
-            }
-        }
-
-        Ok(new_state)
-    }
-
     /// Apply phase: replay the planned delta against the cache. Returns `delta.changed`.
     fn apply_refresh_delta(&mut self, delta: RefreshDelta) -> bool {
         let RefreshDelta {
@@ -860,6 +813,7 @@ impl AssetConditionCache {
             confirmed_pending,
             evicted_pending,
             applied_runs,
+            backfill_ended_assets,
         } = delta;
 
         if clear_tick_accumulators {
@@ -949,6 +903,9 @@ impl AssetConditionCache {
 
         if let Some(bf) = backfill {
             self.backfill = bf;
+        }
+        for asset in backfill_ended_assets {
+            self.clear_predispatch_mark(&asset);
         }
 
         for (run_id, start_time) in applied_runs {

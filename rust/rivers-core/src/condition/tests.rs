@@ -7222,6 +7222,74 @@ async fn test_initial_load_tracks_queued_and_not_started_runs() {
 }
 
 #[tokio::test]
+async fn test_backfill_terminal_clears_predispatch_placeholder() {
+    // A backfill-shaped dispatch inserts an empty in-flight placeholder; when
+    // the backfill ends without any observed sub-run (e.g. canceled before its
+    // first wave) the asset must not stay in-flight forever.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        BackfillFailurePolicy, BackfillRecord, BackfillStatus, BackfillStrategy,
+        DEFAULT_CODE_LOCATION_ID, StorageBackend,
+    };
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let rec_p = make_materialized_record("P", 1000);
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_p])
+        .await
+        .unwrap();
+    storage
+        .create_backfill(&BackfillRecord {
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            backfill_id: "bf1".to_string(),
+            status: BackfillStatus::Requested,
+            strategy: BackfillStrategy::MultiRun,
+            failure_policy: BackfillFailurePolicy::Continue,
+            asset_selection: vec!["P".to_string()],
+            job_name: None,
+            partition_keys: vec![spk("k1"), spk("k2")],
+            run_ids: vec![],
+            completed_partitions: vec![],
+            failed_partitions: vec![],
+            canceled_partitions: vec![],
+            max_concurrency: 1,
+            tags: vec![],
+            create_time: 1000,
+            end_time: None,
+            error: None,
+        })
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(cache.backfill.assets.contains_key("P"), "precondition");
+
+    // The dispatch path's pre-dispatch placeholder.
+    cache.in_progress_assets.entry("P".to_string()).or_default();
+
+    // Canceled before any sub-run was ever observed.
+    storage
+        .update_backfill_status("bf1", BackfillStatus::Canceled, Some(2000))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+
+    assert!(
+        !cache.backfill.assets.contains_key("P"),
+        "terminal backfill untracked"
+    );
+    assert!(
+        !cache.in_progress_assets.contains_key("P"),
+        "the empty placeholder must be cleared when the backfill ends; got {:?}",
+        cache.in_progress_assets
+    );
+}
+
+#[tokio::test]
 async fn test_joint_partitioned_run_updates_unpartitioned_assets_scalar_tags() {
     // A partition-keyed joint run spanning a partitioned and an unpartitioned
     // asset must write the unpartitioned asset's tags into the SCALAR maps the
