@@ -124,12 +124,46 @@ impl BatchWriter for TickWriter {
 
     async fn flush(&mut self) {
         if !self.batch.is_empty() {
-            let _ = self.handle.backend().store_ticks_batch(&self.batch).await;
-            self.batch.clear();
+            match self.handle.backend().store_ticks_batch(&self.batch).await {
+                Ok(_) => self.batch.clear(),
+                Err(e) => {
+                    // Keep the batch for the next flush — sensor cursors are
+                    // restored from stored ticks, so silent loss regresses them.
+                    tracing::error!(
+                        target: "rivers::daemon",
+                        error = %e,
+                        pending = self.batch.len(),
+                        "failed to store tick batch; retrying next flush"
+                    );
+                    trim_backlog(&mut self.batch, self.max_batch, "tick");
+                    return;
+                }
+            }
         }
         for (name, max) in self.prune_names.drain() {
-            let _ = self.handle.scoped().prune_ticks(&name, max).await;
+            if let Err(e) = self.handle.scoped().prune_ticks(&name, max).await {
+                tracing::warn!(
+                    target: "rivers::daemon",
+                    automation = %name,
+                    error = %e,
+                    "failed to prune ticks"
+                );
+            }
         }
+    }
+}
+
+/// Bound a failed-flush backlog to 8 full batches, dropping the oldest.
+fn trim_backlog<T>(batch: &mut Vec<T>, max_batch: usize, what: &str) {
+    let cap = max_batch.saturating_mul(8).max(1);
+    if batch.len() > cap {
+        let dropped = batch.len() - cap;
+        batch.drain(..dropped);
+        tracing::error!(
+            target: "rivers::daemon",
+            dropped,
+            "{what} backlog exceeded retry cap; dropping oldest records"
+        );
     }
 }
 
@@ -160,7 +194,7 @@ pub(crate) struct ConditionEvalWriter {
 
 impl ConditionEvalWriter {
     fn new(handle: ScopedStorageHandle<SurrealStorage>, max_evals_retained: Option<usize>) -> Self {
-        let max_batch: usize = std::env::var("o")
+        let max_batch: usize = std::env::var("RIVERS_CONDITION_EVAL_BATCH_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(256);
@@ -193,19 +227,50 @@ impl BatchWriter for ConditionEvalWriter {
     }
 
     async fn flush(&mut self) {
+        let mut flushed_evals = false;
         if !self.batch.is_empty() {
-            let _ = self
+            match self
                 .handle
                 .backend()
                 .store_condition_evals_batch(&self.batch)
-                .await;
-            self.batch.clear();
+                .await
+            {
+                Ok(_) => {
+                    self.batch.clear();
+                    flushed_evals = true;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "rivers::daemon",
+                        error = %e,
+                        pending = self.batch.len(),
+                        "failed to store condition eval batch; retrying next flush"
+                    );
+                    trim_backlog(&mut self.batch, self.max_batch, "condition eval");
+                    return;
+                }
+            }
         }
         for (key, max) in self.prune_keys.drain() {
-            let _ = self.handle.scoped().prune_condition_evals(&key, max).await;
+            if let Err(e) = self.handle.scoped().prune_condition_evals(&key, max).await {
+                tracing::warn!(
+                    target: "rivers::daemon",
+                    asset = %key,
+                    error = %e,
+                    "failed to prune condition evals"
+                );
+            }
         }
-        if let Some(max) = self.max_evals_retained {
-            let _ = self.handle.scoped().prune_condition_ticks(max).await;
+        // Ticks only grow when evals do — an idle daemon must not run the
+        // prune query every 2s forever.
+        if flushed_evals && let Some(max) = self.max_evals_retained {
+            if let Err(e) = self.handle.scoped().prune_condition_ticks(max).await {
+                tracing::warn!(
+                    target: "rivers::daemon",
+                    error = %e,
+                    "failed to prune condition ticks"
+                );
+            }
         }
     }
 }
