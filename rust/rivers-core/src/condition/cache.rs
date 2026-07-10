@@ -359,7 +359,7 @@ impl AssetConditionCache {
         now: i64,
     ) -> anyhow::Result<bool> {
         if !self.initialized {
-            return self.initial_load(storage).await.map(|_| true);
+            return self.initial_load(storage, now).await.map(|_| true);
         }
 
         let delta = self.fetch_refresh_delta(storage, now).await?;
@@ -903,9 +903,13 @@ impl AssetConditionCache {
     }
 
     /// Full initial load — populates everything from scratch.
-    async fn initial_load<S: StorageBackend>(&mut self, storage: &S) -> anyhow::Result<()> {
+    async fn initial_load<S: StorageBackend>(&mut self, storage: &S, now: i64) -> anyhow::Result<()> {
         let ctx = self.ctx.clone();
         let scoped = storage.for_code_location(&ctx);
+
+        // Records loaded below already reflect past observations; replaying
+        // the observation history would AssetClear live run tracking.
+        self.last_observation_ts = now;
 
         let records = scoped.get_asset_records().await?;
         self.records = records
