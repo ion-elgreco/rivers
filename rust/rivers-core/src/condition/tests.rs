@@ -11393,7 +11393,17 @@ fn test_partitioned_on_cron_waits_for_dep_update() {
         }),
         ..Default::default()
     };
-    let asset_states = HashMap::from([("a".into(), a_state)]);
+    let asset_states = HashMap::from([
+        ("a".into(), a_state),
+        (
+            "b".into(),
+            AssetConditionState {
+                last_tick_timestamp: Some(prev_tick_nanos),
+                last_materialized_timestamp: Some(100),
+                ..Default::default()
+            },
+        ),
+    ]);
 
     let _ak = HashSet::from([spk("p1"), spk("p2")]);
     let _mat: HashSet<PartitionKey> = HashSet::from([spk("p1"), spk("p2")]);
@@ -11447,7 +11457,10 @@ fn test_partitioned_on_cron_waits_for_dep_update() {
 
 #[test]
 fn test_partitioned_on_cron_fires_after_dep_update() {
-    // b depends on a (both partitioned); cron tick passes and dep a updated → on_cron fires for updated partitions.
+    // Production-shaped: BOTH root and dep are seeded in `all_asset_states`.
+    // Tick 1 crosses the boundary with the dep unchanged (no fire); the dep
+    // then updates and tick 2 fires for the updated partitions off the
+    // still-armed gate.
     let cond = ConditionNode::on_cron("30 16 * * 1-5".to_string(), None);
 
     let a = make_materialized_record("a", 200);
@@ -11455,27 +11468,14 @@ fn test_partitioned_on_cron_fires_after_dep_update() {
     let records = HashMap::from([("a".into(), a.clone()), ("b".into(), b.clone())]);
     let deps = HashMap::from([("b".into(), vec!["a".into()])]);
 
-    let prev_tick_nanos = 1_699_977_600_000_000_000_i64; // 16:00
-    let now_nanos = 1_699_979_460_000_000_000_i64; // 16:31
+    let t0 = 1_699_977_600_000_000_000_i64; // 16:00
+    let t1 = 1_699_979_460_000_000_000_i64; // 16:31 — boundary tick
+    let t2 = t1 + 60_000_000_000; // 16:32
 
     let upstream_keys: HashMap<String, HashSet<PartitionKey>> =
         HashMap::from([("a".into(), HashSet::from([spk("p1"), spk("p2")]))]);
     let mappings = HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]);
-    let resolver = PartitionResolver::new(&mappings, &upstream_keys);
 
-    // a's partitions have new timestamps (updated after cron tick)
-    let partition_statuses = HashMap::from([(
-        "a".to_string(),
-        crate::condition::cache::PartitionStatusEntry {
-            materialized: HashSet::from([spk("p1"), spk("p2")]),
-            in_progress: HashSet::new(),
-            failed: HashSet::new(),
-            failed_timestamps: HashMap::new(),
-            timestamps: HashMap::from([(spk("p1"), 200), (spk("p2"), 200)]),
-        },
-    )]);
-
-    // Dep "a" has previous partition state with old timestamps → NewlyUpdated detects change
     let a_state = AssetConditionState {
         partition_state: Some(PartitionState {
             timestamps: HashMap::from([(spk("p1"), 100), (spk("p2"), 100)]),
@@ -11483,30 +11483,49 @@ fn test_partitioned_on_cron_fires_after_dep_update() {
         }),
         ..Default::default()
     };
-    let asset_states = HashMap::from([("a".into(), a_state)]);
+    let mut state_b = AssetConditionState {
+        last_tick_timestamp: Some(t0),
+        last_materialized_timestamp: Some(100),
+        ..Default::default()
+    };
 
     let _ak = HashSet::from([spk("p1"), spk("p2")]);
     let _mat: HashSet<PartitionKey> = HashSet::from([spk("p1"), spk("p2")]);
     let _ip: HashSet<PartitionKey> = HashSet::new();
     let _fail: HashSet<PartitionKey> = HashSet::new();
     let _ts = HashMap::from([(spk("p1"), 100_i64), (spk("p2"), 100)]);
-    let pctx = PartitionEvalContext {
+
+    let statuses = |ts: i64| {
+        HashMap::from([(
+            "a".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                materialized: HashSet::from([spk("p1"), spk("p2")]),
+                in_progress: HashSet::new(),
+                failed: HashSet::new(),
+                failed_timestamps: HashMap::new(),
+                timestamps: HashMap::from([(spk("p1"), ts), (spk("p2"), ts)]),
+            },
+        )])
+    };
+
+    // Tick 1 (boundary): a's partitions unchanged → no fire.
+    let statuses_t1 = statuses(100);
+    let pctx1 = PartitionEvalContext {
         all_keys: &_ak,
         materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
-        resolver,
+        resolver: PartitionResolver::new(&mappings, &upstream_keys),
         latest_time_window_keys: None,
-        all_partition_statuses: &partition_statuses,
+        all_partition_statuses: &statuses_t1,
         dep_root_floor: None,
     };
-
-    let prev = AssetConditionState {
-        last_tick_timestamp: Some(prev_tick_nanos),
-        ..Default::default()
-    };
-    let ctx = EvalContext {
+    let all1 = HashMap::from([
+        ("a".to_string(), a_state.clone()),
+        ("b".to_string(), state_b.clone()),
+    ]);
+    let ctx1 = EvalContext {
         target_key: "b",
         root_key: "b",
         target_record: &b,
@@ -11519,29 +11538,202 @@ fn test_partitioned_on_cron_fires_after_dep_update() {
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
-        prev_state: &prev,
-        all_asset_states: &asset_states,
+        prev_state: &state_b,
+        all_asset_states: &all1,
         requested_this_tick: &EMPTY_REQUESTED,
-        now: now_nanos,
+        now: t1,
         is_initial: false,
-        partitions: Some(&pctx),
+        partitions: Some(&pctx1),
         root_partition_floor: None,
     };
+    let r1 = evaluate(&cond, &ctx1);
+    assert!(!r1.fired, "boundary tick: dep not updated since the boundary");
+    update_condition_state(
+        &mut state_b,
+        &StateUpdateContext {
+            target_record_timestamp: b.last_timestamp,
+            target_data_version: b.last_data_version.as_ref(),
+            now: t1,
+            is_initial: false,
+            partition_timestamps: Some(&_ts),
+        },
+        &r1,
+    );
 
-    let result = evaluate(&cond, &ctx);
+    // Tick 2: a's partitions update after the boundary → fire for p1 and p2.
+    let statuses_t2 = statuses(200);
+    let pctx2 = PartitionEvalContext {
+        all_keys: &_ak,
+        materialized: &_mat,
+        in_progress: &_ip,
+        failed: &_fail,
+        timestamps: &_ts,
+        resolver: PartitionResolver::new(&mappings, &upstream_keys),
+        latest_time_window_keys: None,
+        all_partition_statuses: &statuses_t2,
+        dep_root_floor: None,
+    };
+    let all2 = HashMap::from([
+        ("a".to_string(), a_state.clone()),
+        ("b".to_string(), state_b.clone()),
+    ]);
+    let ctx2 = EvalContext {
+        target_key: "b",
+        root_key: "b",
+        target_record: &b,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &EMPTY_SET,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &state_b,
+        all_asset_states: &all2,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: t2,
+        is_initial: false,
+        partitions: Some(&pctx2),
+        root_partition_floor: None,
+    };
+    let r2 = evaluate(&cond, &ctx2);
     assert!(
-        result.fired,
-        "partitioned on_cron should fire when dep updated after cron tick"
+        r2.fired,
+        "gate stays armed past the boundary; dep update fires on_cron"
     );
     assert_eq!(
-        result.selection.unwrap(),
+        r2.selection.unwrap(),
         PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2")]))
     );
 }
 
+/// Production-shaped on_cron with deps: BOTH root and dep are seeded in
+/// `all_asset_states` and the root's `last_tick_timestamp` advances every tick,
+/// exactly as `ConditionPass` wires it. The cron gate must stay armed after the
+/// boundary tick so a dep update later in the period fires the condition, then
+/// disarm once the root is requested/updated (once per period), and re-arm at
+/// the next boundary.
+#[test]
+fn test_on_cron_with_deps_fires_when_dep_updates_after_boundary() {
+    let tree = ConditionNode::on_cron("30 16 * * 1-5".to_string(), None);
+
+    // b (root, on_cron) depends on a. b last ran at ts=100, a at ts=90 → b starts up to date.
+    let mut a = make_materialized_record("a", 90);
+    let mut b = make_materialized_record("b", 100);
+    let deps: HashMap<String, Vec<String>> = HashMap::from([("b".into(), vec!["a".into()])]);
+
+    let t0 = 1_699_977_600_000_000_000_i64; // 2023-11-14 16:00 — before the 16:30 boundary
+    let t1 = 1_699_979_460_000_000_000_i64; // 16:31 — first tick past the boundary
+    let step = 60_000_000_000_i64;
+    let t2 = t1 + step; // 16:32
+    let t3 = t2 + step; // 16:33
+    let day = 86_400_000_000_000_i64;
+    let t4 = t1 + day; // next day 16:31 — next boundary tick
+    let t5 = t4 + step; // next day 16:32
+
+    let mut state_b = AssetConditionState {
+        last_tick_timestamp: Some(t0),
+        last_materialized_timestamp: Some(100),
+        ..Default::default()
+    };
+    let state_a = AssetConditionState {
+        last_materialized_timestamp: Some(90),
+        ..Default::default()
+    };
+
+    let eval_tick = |a: &AssetRecord,
+                     b: &AssetRecord,
+                     state_b: &AssetConditionState,
+                     now: i64| {
+        let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
+        let all = HashMap::from([
+            ("a".to_string(), state_a.clone()),
+            ("b".to_string(), state_b.clone()),
+        ]);
+        let ctx = EvalContext {
+            target_key: "b",
+            root_key: "b",
+            target_record: b,
+            cache: CacheSnapshot {
+                records: &records,
+                upstream_deps: &deps,
+                in_progress_assets: &EMPTY_SET,
+                failed_assets: &EMPTY_SET,
+                failed_asset_timestamps: &EMPTY_FAILED_TS,
+                backfill: &EMPTY_BACKFILL,
+            },
+            tags: empty_tag_snapshot(),
+            prev_state: state_b,
+            all_asset_states: &all,
+            requested_this_tick: &EMPTY_REQUESTED,
+            now,
+            is_initial: false,
+            partitions: None,
+            root_partition_floor: None,
+        };
+        evaluate(&tree, &ctx)
+    };
+    let advance = |state_b: &mut AssetConditionState, b: &AssetRecord, now: i64, r: &EvalResult| {
+        update_condition_state(
+            state_b,
+            &StateUpdateContext {
+                target_record_timestamp: b.last_timestamp,
+                target_data_version: b.last_data_version.as_ref(),
+                now,
+                is_initial: false,
+                partition_timestamps: None,
+            },
+            r,
+        );
+    };
+
+    // Tick 1 (boundary): the gate arms, but a hasn't updated since b's last run.
+    let r1 = eval_tick(&a, &b, &state_b, t1);
+    assert!(!r1.fired, "tick 1 (boundary): deps not updated yet");
+    advance(&mut state_b, &b, t1, &r1);
+
+    // Tick 2: a materializes after the boundary → the still-armed gate + dep update fire.
+    a.last_timestamp = Some(200);
+    let r2 = eval_tick(&a, &b, &state_b, t2);
+    assert!(
+        r2.fired,
+        "tick 2: the cron gate must stay armed past the boundary tick so the dep update fires"
+    );
+    advance(&mut state_b, &b, t2, &r2);
+    // Production stamps the handled cursor when the fire is dispatched.
+    state_b.last_handled_timestamp = Some(t2);
+
+    // Tick 3: b's run completed (record advanced) → once per period, no re-fire.
+    b.last_timestamp = Some(300);
+    let r3 = eval_tick(&a, &b, &state_b, t3);
+    assert!(
+        !r3.fired,
+        "tick 3: period already handled — on_cron fires once per cron tick"
+    );
+    advance(&mut state_b, &b, t3, &r3);
+
+    // Next period: a updates again before the boundary tick.
+    a.last_timestamp = Some(400);
+
+    // Tick 4 (next boundary): dep evidence from before the boundary is reset → no fire yet.
+    let r4 = eval_tick(&a, &b, &state_b, t4);
+    assert!(
+        !r4.fired,
+        "tick 4 (next boundary): dep must update since THIS boundary before firing"
+    );
+    advance(&mut state_b, &b, t4, &r4);
+
+    // Tick 5: a is still newer than b → the latch re-arms and the new period fires.
+    let r5 = eval_tick(&a, &b, &state_b, t5);
+    assert!(r5.fired, "tick 5: gate re-armed at the new boundary must fire");
+}
+
 #[test]
 fn test_partitioned_on_cron_partial_dep_update() {
-    // b depends on a (partitioned p1,p2); cron tick passes but only a:p1 updated.
+    // Production-shaped: after the boundary tick, only a:p1 updates → on_cron
+    // fires for p1 only (identity mapping b:pN ↔ a:pN).
     let cond = ConditionNode::on_cron("30 16 * * 1-5".to_string(), None);
 
     let a = make_materialized_record("a", 200);
@@ -11549,27 +11741,14 @@ fn test_partitioned_on_cron_partial_dep_update() {
     let records = HashMap::from([("a".into(), a.clone()), ("b".into(), b.clone())]);
     let deps = HashMap::from([("b".into(), vec!["a".into()])]);
 
-    let prev_tick_nanos = 1_699_977_600_000_000_000_i64;
-    let now_nanos = 1_699_979_460_000_000_000_i64;
+    let t0 = 1_699_977_600_000_000_000_i64; // 16:00
+    let t1 = 1_699_979_460_000_000_000_i64; // 16:31 — boundary tick
+    let t2 = t1 + 60_000_000_000; // 16:32
 
     let upstream_keys: HashMap<String, HashSet<PartitionKey>> =
         HashMap::from([("a".into(), HashSet::from([spk("p1"), spk("p2")]))]);
     let mappings = HashMap::from([(("b".into(), "a".into()), PartitionMappingKind::Identity)]);
-    let resolver = PartitionResolver::new(&mappings, &upstream_keys);
 
-    // Only p1 updated (ts=200), p2 not updated (ts=100, same as prev)
-    let partition_statuses = HashMap::from([(
-        "a".to_string(),
-        crate::condition::cache::PartitionStatusEntry {
-            materialized: HashSet::from([spk("p1"), spk("p2")]),
-            in_progress: HashSet::new(),
-            failed: HashSet::new(),
-            failed_timestamps: HashMap::new(),
-            timestamps: HashMap::from([(spk("p1"), 200), (spk("p2"), 100)]),
-        },
-    )]);
-
-    // Dep "a" has previous partition state with old timestamps
     let a_state = AssetConditionState {
         partition_state: Some(PartitionState {
             timestamps: HashMap::from([(spk("p1"), 100), (spk("p2"), 100)]),
@@ -11577,30 +11756,49 @@ fn test_partitioned_on_cron_partial_dep_update() {
         }),
         ..Default::default()
     };
-    let asset_states = HashMap::from([("a".into(), a_state)]);
+    let mut state_b = AssetConditionState {
+        last_tick_timestamp: Some(t0),
+        last_materialized_timestamp: Some(100),
+        ..Default::default()
+    };
 
     let _ak = HashSet::from([spk("p1"), spk("p2")]);
     let _mat: HashSet<PartitionKey> = HashSet::from([spk("p1"), spk("p2")]);
     let _ip: HashSet<PartitionKey> = HashSet::new();
     let _fail: HashSet<PartitionKey> = HashSet::new();
     let _ts = HashMap::from([(spk("p1"), 100_i64), (spk("p2"), 100)]);
-    let pctx = PartitionEvalContext {
+
+    let statuses = |p1_ts: i64, p2_ts: i64| {
+        HashMap::from([(
+            "a".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                materialized: HashSet::from([spk("p1"), spk("p2")]),
+                in_progress: HashSet::new(),
+                failed: HashSet::new(),
+                failed_timestamps: HashMap::new(),
+                timestamps: HashMap::from([(spk("p1"), p1_ts), (spk("p2"), p2_ts)]),
+            },
+        )])
+    };
+
+    // Tick 1 (boundary): nothing updated yet.
+    let statuses_t1 = statuses(100, 100);
+    let pctx1 = PartitionEvalContext {
         all_keys: &_ak,
         materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
-        resolver,
+        resolver: PartitionResolver::new(&mappings, &upstream_keys),
         latest_time_window_keys: None,
-        all_partition_statuses: &partition_statuses,
+        all_partition_statuses: &statuses_t1,
         dep_root_floor: None,
     };
-
-    let prev = AssetConditionState {
-        last_tick_timestamp: Some(prev_tick_nanos),
-        ..Default::default()
-    };
-    let ctx = EvalContext {
+    let all1 = HashMap::from([
+        ("a".to_string(), a_state.clone()),
+        ("b".to_string(), state_b.clone()),
+    ]);
+    let ctx1 = EvalContext {
         target_key: "b",
         root_key: "b",
         target_record: &b,
@@ -11613,17 +11811,67 @@ fn test_partitioned_on_cron_partial_dep_update() {
             backfill: &EMPTY_BACKFILL,
         },
         tags: empty_tag_snapshot(),
-        prev_state: &prev,
-        all_asset_states: &asset_states,
+        prev_state: &state_b,
+        all_asset_states: &all1,
         requested_this_tick: &EMPTY_REQUESTED,
-        now: now_nanos,
+        now: t1,
         is_initial: false,
-        partitions: Some(&pctx),
+        partitions: Some(&pctx1),
         root_partition_floor: None,
     };
+    let r1 = evaluate(&cond, &ctx1);
+    assert!(!r1.fired, "boundary tick: nothing updated yet");
+    update_condition_state(
+        &mut state_b,
+        &StateUpdateContext {
+            target_record_timestamp: b.last_timestamp,
+            target_data_version: b.last_data_version.as_ref(),
+            now: t1,
+            is_initial: false,
+            partition_timestamps: Some(&_ts),
+        },
+        &r1,
+    );
 
-    let result = evaluate(&cond, &ctx);
-    // Identity mapping b:pN ↔ a:pN; a:p1 updated, a:p2 not → on_cron fires for p1 only.
+    // Tick 2: only a:p1 updated (ts=200); p2 unchanged.
+    let statuses_t2 = statuses(200, 100);
+    let pctx2 = PartitionEvalContext {
+        all_keys: &_ak,
+        materialized: &_mat,
+        in_progress: &_ip,
+        failed: &_fail,
+        timestamps: &_ts,
+        resolver: PartitionResolver::new(&mappings, &upstream_keys),
+        latest_time_window_keys: None,
+        all_partition_statuses: &statuses_t2,
+        dep_root_floor: None,
+    };
+    let all2 = HashMap::from([
+        ("a".to_string(), a_state.clone()),
+        ("b".to_string(), state_b.clone()),
+    ]);
+    let ctx2 = EvalContext {
+        target_key: "b",
+        root_key: "b",
+        target_record: &b,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &EMPTY_SET,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &state_b,
+        all_asset_states: &all2,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: t2,
+        is_initial: false,
+        partitions: Some(&pctx2),
+        root_partition_floor: None,
+    };
+    let result = evaluate(&cond, &ctx2);
     assert!(result.fired, "on_cron should fire for p1 whose dep updated");
     assert_eq!(
         result.selection.unwrap(),
