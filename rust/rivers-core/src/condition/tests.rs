@@ -7061,6 +7061,150 @@ async fn test_cache_clears_in_progress_when_run_canceled_after_cursor_advanced()
 }
 
 #[tokio::test]
+async fn test_queued_run_from_scheduler_is_tracked_and_applies_effects() {
+    // A run first observed while Queued (schedule/sensor dispatch — never
+    // registered via register_dispatched_run) must be tracked as in-flight and
+    // its completion effects applied, even though the cursor advances past its
+    // immutable start_time on first sight.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let rec_a = make_materialized_record("a", 1000);
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_a])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let run_id = "run-queued".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Queued,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![("team".to_string(), "x".to_string())],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        cache.in_progress_assets.contains_key("a"),
+        "a queued run must suppress in_flight-gated conditions; got {:?}",
+        cache.in_progress_assets
+    );
+
+    // The run completes; start_time never changes, so only the tracked-run
+    // sweep can observe the transition.
+    storage
+        .update_run_status(&run_id, RunStatus::Success, Some(3000))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        !cache.in_progress_assets.contains_key("a"),
+        "completion must clear in-flight tracking; got {:?}",
+        cache.in_progress_assets
+    );
+    assert!(
+        cache
+            .last_run_tags
+            .get("a")
+            .is_some_and(|t| t.contains(&("team".to_string(), "x".to_string()))),
+        "completion effects (run tags) must be applied; got {:?}",
+        cache.last_run_tags
+    );
+}
+
+#[tokio::test]
+async fn test_initial_load_tracks_queued_and_not_started_runs() {
+    // Runs alive as Queued/NotStarted at daemon restart must be reloaded into
+    // in-flight tracking; loading only Started runs re-dispatches their assets.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let recs = [
+        make_materialized_record("a", 1000),
+        make_materialized_record("b", 1000),
+        make_materialized_record("c", 1000),
+    ];
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&recs)
+        .await
+        .unwrap();
+
+    let mk_run = |id: &str, status: RunStatus, start: i64, asset: &str| RunRecord {
+        run_id: id.to_string(),
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        job_name: Some("test".to_string()),
+        status,
+        start_time: start,
+        end_time: None,
+        tags: vec![],
+        node_names: vec![asset.to_string()],
+        priority: 0,
+        partition_key: None,
+        block_reason: None,
+        launched_by: LaunchedBy::Manual,
+    };
+    // run-s is the newest, so the seeded cursor sits above run-q / run-n.
+    storage
+        .create_run(&mk_run("run-q", RunStatus::Queued, 2000, "a"))
+        .await
+        .unwrap();
+    storage
+        .create_run(&mk_run("run-n", RunStatus::NotStarted, 2100, "b"))
+        .await
+        .unwrap();
+    storage
+        .create_run(&mk_run("run-s", RunStatus::Started, 3000, "c"))
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 0).await.unwrap();
+    for asset in ["a", "b", "c"] {
+        assert!(
+            cache.in_progress_assets.contains_key(asset),
+            "{asset} has a live run at restart and must be tracked in-flight; got {:?}",
+            cache.in_progress_assets
+        );
+    }
+
+    // The queued run's completion must be observed via the tracked-run sweep.
+    storage
+        .update_run_status("run-q", RunStatus::Success, Some(4000))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        !cache.in_progress_assets.contains_key("a"),
+        "queued run's completion must clear tracking; got {:?}",
+        cache.in_progress_assets
+    );
+    assert!(cache.in_progress_assets.contains_key("b"));
+    assert!(cache.in_progress_assets.contains_key("c"));
+}
+
+#[tokio::test]
 async fn test_clearable_sweep_sets_failure_floor_on_missed_terminal_failure() {
     // A Started run reported once fails with no materialization and no StepFailure event;
     // only the clearable sweep catches it. That sweep must also set the failure floor,
