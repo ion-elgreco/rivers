@@ -10,6 +10,15 @@ use crate::storage::AssetRecord;
 use super::cache::BackfillState;
 use super::partition::{PartitionEvalContext, PartitionSelection, PartitionState};
 
+/// Baseline of an upstream dep as of the last tick the OBSERVING asset fired
+/// (or was initial). Scoped per downstream so one asset's fire cannot consume
+/// a dep-change trigger a gated sibling has not acted on yet.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct DepBaseline {
+    pub last_materialized_timestamp: Option<i64>,
+    pub last_data_version: Option<String>,
+}
+
 /// Per-asset state persisted across daemon ticks.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -19,6 +28,9 @@ pub struct AssetConditionState {
     /// Previous tick's results for stateful operators evaluated inside a dep-aggregate.
     #[serde(default)]
     pub dep_previous_results: HashMap<String, HashMap<u32, bool>>,
+    /// Per-dep baselines consumed by this asset's own fires (see [`DepBaseline`]).
+    #[serde(default)]
+    pub dep_baselines: HashMap<String, DepBaseline>,
     /// Timestamp of the last tick where this asset's condition was "handled".
     pub last_handled_timestamp: Option<i64>,
     /// The asset's `last_timestamp` as seen on the previous tick.
@@ -268,9 +280,12 @@ pub fn update_condition_state(
 }
 
 /// Establish timestamp / data-version baselines for upstream deps that don't
-/// have their own automation condition.
+/// have their own automation condition — scoped to the roots that fired (or
+/// were initial) this tick, so an unrelated asset's fire cannot consume a
+/// pending dep-change trigger.
 pub fn update_dep_baselines(
     eval_state: &mut HashMap<String, AssetConditionState>,
+    fired_or_initial: &[String],
     upstream_deps: &HashMap<String, Vec<String>>,
     conditioned_assets: &HashSet<String>,
     partition_statuses: &HashMap<String, super::cache::PartitionStatusEntry>,
@@ -282,29 +297,48 @@ pub fn update_dep_baselines(
         Option<String>,
         Option<HashMap<crate::storage::PartitionKey, i64>>,
     );
-    let mut updates: Vec<DepBaselineUpdate> = Vec::new();
 
-    for deps in upstream_deps.values() {
-        for dep in deps {
-            if conditioned_assets.contains(dep) {
-                continue;
+    for root in fired_or_initial {
+        let Some(deps) = upstream_deps.get(root) else {
+            continue;
+        };
+        let updates: Vec<DepBaselineUpdate> = deps
+            .iter()
+            .filter(|dep| !conditioned_assets.contains(*dep))
+            .map(|dep| {
+                (
+                    dep.clone(),
+                    records.get(dep).and_then(|r| r.last_timestamp),
+                    records.get(dep).and_then(|r| r.last_data_version.clone()),
+                    partition_statuses.get(dep).map(|ps| ps.timestamps.clone()),
+                )
+            })
+            .collect();
+
+        if let Some(root_state) = eval_state.get_mut(root) {
+            for (dep, record_ts, data_version, _) in &updates {
+                root_state.dep_baselines.insert(
+                    dep.clone(),
+                    DepBaseline {
+                        last_materialized_timestamp: *record_ts,
+                        last_data_version: data_version.clone(),
+                    },
+                );
             }
-            let record_ts = records.get(dep).and_then(|r| r.last_timestamp);
-            let data_version = records.get(dep).and_then(|r| r.last_data_version.clone());
-            let partition_ts = partition_statuses.get(dep).map(|ps| ps.timestamps.clone());
-            updates.push((dep.clone(), record_ts, data_version, partition_ts));
         }
-    }
 
-    for (dep, record_ts, data_version, partition_ts) in updates {
-        let dep_state = eval_state.entry(dep).or_default();
-        dep_state.last_materialized_timestamp = record_ts;
-        dep_state.last_data_version = data_version;
-        if let Some(ts) = partition_ts {
-            let ps = dep_state
-                .partition_state
-                .get_or_insert_with(Default::default);
-            ps.timestamps = ts;
+        // The dep's global entry still carries partition timestamps (and the
+        // scalar fallback for state written before per-dep baselines existed).
+        for (dep, record_ts, data_version, partition_ts) in updates {
+            let dep_state = eval_state.entry(dep).or_default();
+            dep_state.last_materialized_timestamp = record_ts;
+            dep_state.last_data_version = data_version;
+            if let Some(ts) = partition_ts {
+                let ps = dep_state
+                    .partition_state
+                    .get_or_insert_with(Default::default);
+                ps.timestamps = ts;
+            }
         }
     }
 }

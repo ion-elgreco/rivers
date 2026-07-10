@@ -37,6 +37,27 @@ fn root_dep_selections<'a>(
         .unwrap_or(&EMPTY_DEP_SELECTIONS)
 }
 
+/// The (data version, materialized ts) baseline `DataVersionChanged` compares
+/// against: in a dep pivot, the ROOT's per-dep baseline (so one asset's fire
+/// can't consume another's pending trigger), falling back to the dep's global
+/// state for blobs written before per-dep baselines existed; at root level,
+/// the asset's own previous-tick state.
+fn data_version_baseline<'a>(ctx: &'a EvalContext) -> (Option<&'a String>, Option<i64>) {
+    if ctx.target_key != ctx.root_key {
+        if let Some(b) = ctx
+            .all_asset_states
+            .get(ctx.root_key)
+            .and_then(|s| s.dep_baselines.get(ctx.target_key))
+        {
+            return (b.last_data_version.as_ref(), b.last_materialized_timestamp);
+        }
+    }
+    (
+        ctx.prev_state.last_data_version.as_ref(),
+        ctx.prev_state.last_materialized_timestamp,
+    )
+}
+
 /// The root asset's previous-tick evaluation time.
 fn root_last_tick(ctx: &EvalContext) -> Option<i64> {
     ctx.all_asset_states
@@ -446,15 +467,11 @@ fn eval_inner<O: EvalOutput>(
         ConditionNode::InitialEvaluation => O::leaf(ctx.is_initial, my_idx, node),
 
         ConditionNode::DataVersionChanged => {
-            let expr = match (
-                ctx.target_record.last_data_version.as_ref(),
-                ctx.prev_state.last_data_version.as_ref(),
-            ) {
+            let (prev_dv, prev_ts) = data_version_baseline(ctx);
+            let expr = match (ctx.target_record.last_data_version.as_ref(), prev_dv) {
                 (Some(current), Some(prev)) => current != prev,
                 (Some(_), None) => {
-                    !ctx.is_initial
-                        && ctx.prev_state.last_materialized_timestamp
-                            != ctx.target_record.last_timestamp
+                    !ctx.is_initial && prev_ts != ctx.target_record.last_timestamp
                 }
                 _ => false,
             };
@@ -1264,15 +1281,11 @@ fn eval_partitioned<O: PartEvalOutput>(
         }
 
         ConditionNode::DataVersionChanged => {
-            let changed = match (
-                ctx.target_record.last_data_version.as_ref(),
-                ctx.prev_state.last_data_version.as_ref(),
-            ) {
+            let (prev_dv, prev_ts) = data_version_baseline(ctx);
+            let changed = match (ctx.target_record.last_data_version.as_ref(), prev_dv) {
                 (Some(current), Some(prev)) => current != prev,
                 (Some(_), None) => {
-                    !ctx.is_initial
-                        && ctx.prev_state.last_materialized_timestamp
-                            != ctx.target_record.last_timestamp
+                    !ctx.is_initial && prev_ts != ctx.target_record.last_timestamp
                 }
                 _ => false,
             };
