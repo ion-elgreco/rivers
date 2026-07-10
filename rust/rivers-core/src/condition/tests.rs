@@ -7205,6 +7205,83 @@ async fn test_initial_load_tracks_queued_and_not_started_runs() {
 }
 
 #[tokio::test]
+async fn test_stale_eval_state_with_live_queued_run_does_not_redispatch() {
+    // Crash window: a condition fired and its run was durably enqueued, but
+    // the daemon died before persisting eval state. On restart with the stale
+    // (pre-fire) latches, the live queued run must suppress a re-dispatch.
+    use crate::condition::pass::{AssetConditionInfo, ConditionPass};
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let rec_a = make_record("a"); // missing → eager's missing arm fires
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_a])
+        .await
+        .unwrap();
+
+    let conditions = || {
+        vec![AssetConditionInfo {
+            asset_key: "a".to_string(),
+            condition: ConditionNode::eager(),
+            partition_info: None,
+            backfill_strategy: None,
+        }]
+    };
+
+    let mut pass1 = ConditionPass::new(
+        AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+        ConditionEvalState::default(),
+        conditions(),
+        HashMap::new(),
+    );
+    pass1.refresh_cache(&storage, 1_000).await.unwrap();
+    let out = pass1.run(1_000, false);
+    assert!(
+        out.plan.unpartitioned.contains(&"a".to_string()),
+        "precondition: eager fires for the missing asset"
+    );
+
+    // Dispatch durably enqueued the run; the daemon crashed before
+    // set_condition_eval_state, so pass1.eval_state is never persisted.
+    storage
+        .create_run(&RunRecord {
+            run_id: "run-crash".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Queued,
+            start_time: 2_000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+
+    // Restart with the STALE (pre-fire) eval state.
+    let mut pass2 = ConditionPass::new(
+        AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+        ConditionEvalState::default(),
+        conditions(),
+        HashMap::new(),
+    );
+    pass2.refresh_cache(&storage, 3_000).await.unwrap();
+    let out2 = pass2.run(3_000, false);
+    assert!(
+        out2.plan.unpartitioned.is_empty(),
+        "the live queued run must suppress a duplicate dispatch; got {:?}",
+        out2.plan.unpartitioned
+    );
+}
+
+#[tokio::test]
 async fn test_restart_does_not_replay_newest_run_tick_tags() {
     // The newest pre-restart run must not repopulate the tick-scoped tag
     // accumulators on the first steady refresh — HasRunWithTags would report

@@ -1845,19 +1845,18 @@ impl StorageBackend for SurrealStorage {
 
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(%key))]
     async fn kv_set(&self, key: &str, value: &[u8]) -> Result<()> {
+        // Single atomic upsert on the UNIQUE `kv.key` index — a crash must
+        // never leave the key deleted (the old DELETE+CREATE pair could).
         super::retry::with_retry(&self.retry_config, || async {
             self.db
-                .query("DELETE FROM kv WHERE key = $key")
+                .query(
+                    "INSERT INTO kv { key: $key, value: $value } \
+                     ON DUPLICATE KEY UPDATE value = $input.value",
+                )
                 .bind(("key", key.to_string()))
-                .await?;
-            let _: Option<DbKv> = self
-                .db
-                .create("kv")
-                .content(DbKv {
-                    key: key.to_string(),
-                    value: Bytes::from(value.to_vec()),
-                })
-                .await?;
+                .bind(("value", Bytes::from(value.to_vec())))
+                .await?
+                .check()?;
             Ok(())
         })
         .await
@@ -5257,6 +5256,26 @@ mod tests {
 
         assert_eq!(storage.kv_get("a").await.unwrap().unwrap(), b"1");
         assert_eq!(storage.kv_get("b").await.unwrap().unwrap(), b"2");
+    }
+
+    #[tokio::test]
+    async fn test_kv_set_upserts_single_row() {
+        // kv_set must be a single-statement upsert on the UNIQUE key index —
+        // repeated writes keep exactly one row, and a crash can never observe
+        // the key deleted (unlike the old DELETE+CREATE pair).
+        let storage = make_storage().await;
+        storage.kv_set("k", b"v1").await.unwrap();
+        storage.kv_set("k", b"v2").await.unwrap();
+        storage.kv_set("k", b"v3").await.unwrap();
+        assert_eq!(storage.kv_get("k").await.unwrap().unwrap(), b"v3");
+        let mut res = storage
+            .db
+            .query("SELECT * FROM kv WHERE key = $key")
+            .bind(("key", "k".to_string()))
+            .await
+            .unwrap();
+        let rows: Vec<DbKv> = res.take(0).unwrap();
+        assert_eq!(rows.len(), 1, "upsert must keep exactly one row per key");
     }
 
     #[tokio::test]
