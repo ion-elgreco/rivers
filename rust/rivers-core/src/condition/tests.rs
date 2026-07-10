@@ -12023,6 +12023,124 @@ fn test_partitioned_on_cron_partial_dep_update() {
     );
 }
 
+/// Nested dep-of-dep pivot with mismatched key spaces: the bridge floor for an
+/// unpartitioned dep must come from the ROOT's own universe, not from the
+/// intermediate dep's keys looked up in the root's status (which collapses the
+/// floor to None and fires forever).
+#[test]
+fn test_nested_dep_pivot_floor_uses_root_universe() {
+    let cond = ConditionNode::any_deps_match(ConditionNode::any_deps_match(
+        ConditionNode::NewlyUpdated,
+    ));
+
+    // r (date keys) ← m (region keys, AllPartitions mapping) ← u (unpartitioned).
+    let r = make_materialized_record("r", 500);
+    let m = make_materialized_record("m", 400);
+    let mut u = make_materialized_record("u", 100); // older than r's floor of 500
+    let deps: HashMap<String, Vec<String>> = HashMap::from([
+        ("r".into(), vec!["m".into()]),
+        ("m".into(), vec!["u".into()]),
+    ]);
+
+    let upstream_keys: HashMap<String, HashSet<PartitionKey>> =
+        HashMap::from([("m".into(), HashSet::from([spk("eu"), spk("us")]))]);
+    let mappings = HashMap::from([(
+        ("r".into(), "m".into()),
+        PartitionMappingKind::AllPartitions,
+    )]);
+
+    let statuses = HashMap::from([
+        (
+            "r".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                materialized: HashSet::from([spk("d1"), spk("d2")]),
+                in_progress: HashSet::new(),
+                failed: HashSet::new(),
+                failed_timestamps: HashMap::new(),
+                timestamps: HashMap::from([(spk("d1"), 500), (spk("d2"), 500)]),
+            },
+        ),
+        (
+            "m".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                materialized: HashSet::from([spk("eu"), spk("us")]),
+                in_progress: HashSet::new(),
+                failed: HashSet::new(),
+                failed_timestamps: HashMap::new(),
+                timestamps: HashMap::from([(spk("eu"), 400), (spk("us"), 400)]),
+            },
+        ),
+    ]);
+
+    let _ak = HashSet::from([spk("d1"), spk("d2")]);
+    let _mat: HashSet<PartitionKey> = HashSet::from([spk("d1"), spk("d2")]);
+    let _ip: HashSet<PartitionKey> = HashSet::new();
+    let _fail: HashSet<PartitionKey> = HashSet::new();
+    let _ts = HashMap::from([(spk("d1"), 500_i64), (spk("d2"), 500)]);
+
+    let eval_with = |records: HashMap<String, AssetRecord>| {
+        let pctx = PartitionEvalContext {
+            all_keys: &_ak,
+            materialized: &_mat,
+            in_progress: &_ip,
+            failed: &_fail,
+            timestamps: &_ts,
+            resolver: PartitionResolver::new(&mappings, &upstream_keys),
+            latest_time_window_keys: None,
+            all_partition_statuses: &statuses,
+            dep_root_floor: None,
+        };
+        let prev = AssetConditionState::default();
+        let states: HashMap<String, AssetConditionState> = HashMap::new();
+        let ctx = EvalContext {
+            target_key: "r",
+            root_key: "r",
+            target_record: records.get("r").unwrap(),
+            cache: CacheSnapshot {
+                records: &records,
+                upstream_deps: &deps,
+                in_progress_assets: &EMPTY_SET,
+                failed_assets: &EMPTY_SET,
+                failed_asset_timestamps: &EMPTY_FAILED_TS,
+                backfill: &EMPTY_BACKFILL,
+            },
+            tags: empty_tag_snapshot(),
+            prev_state: &prev,
+            all_asset_states: &states,
+            requested_this_tick: &EMPTY_REQUESTED,
+            now: 1_000_000_000,
+            is_initial: false,
+            partitions: Some(&pctx),
+            root_partition_floor: None,
+        };
+        evaluate(&cond, &ctx)
+    };
+
+    let records = HashMap::from([
+        ("r".to_string(), r.clone()),
+        ("m".to_string(), m.clone()),
+        ("u".to_string(), u.clone()),
+    ]);
+    let result = eval_with(records);
+    assert!(
+        !result.fired,
+        "u (ts=100) is older than r's floor (500): nested newly_updated must not fire"
+    );
+
+    // Positive control: u genuinely newer than the root's floor must fire.
+    u.last_timestamp = Some(600);
+    let records = HashMap::from([
+        ("r".to_string(), r.clone()),
+        ("m".to_string(), m.clone()),
+        ("u".to_string(), u.clone()),
+    ]);
+    let result = eval_with(records);
+    assert!(
+        result.fired,
+        "u (ts=600) newer than r's floor (500) must fire the nested condition"
+    );
+}
+
 #[test]
 fn test_update_dep_baselines_stores_partition_timestamps() {
     // update_dep_baselines populates partition_state.timestamps for non-conditioned deps, so NewlyUpdated has a baseline next tick.

@@ -217,6 +217,25 @@ impl ConditionNode {
         }
     }
 
+    /// True if the tree contains a dep-aggregate (`AnyDepsMatch`/`AllDepsMatch`/`AssetMatches`).
+    pub fn has_dep_aggregate(&self) -> bool {
+        match self {
+            ConditionNode::AnyDepsMatch { .. }
+            | ConditionNode::AllDepsMatch { .. }
+            | ConditionNode::AssetMatches { .. } => true,
+            ConditionNode::And(children) | ConditionNode::Or(children) => {
+                children.iter().any(|c| c.has_dep_aggregate())
+            }
+            ConditionNode::Not(child)
+            | ConditionNode::NewlyTrue(child)
+            | ConditionNode::SinceLastHandled(child) => child.has_dep_aggregate(),
+            ConditionNode::Since { trigger, reset } => {
+                trigger.has_dep_aggregate() || reset.has_dep_aggregate()
+            }
+            _ => false,
+        }
+    }
+
     /// Returns true if this condition tree contains `HasRunWithTags` or `AllRunsHaveTags`.
     pub fn uses_tick_tags(&self) -> bool {
         match self {
