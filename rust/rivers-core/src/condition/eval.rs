@@ -285,35 +285,10 @@ impl PartEvalOutput for (PartitionSelection, EvalNodeResult) {
 fn build_skipped_subtree(node: &ConditionNode, counter: &mut u32) -> EvalNodeResult {
     let my_idx = *counter;
     *counter += 1;
-
-    let children = match node {
-        ConditionNode::And(children) | ConditionNode::Or(children) => children
-            .iter()
-            .map(|c| build_skipped_subtree(c, counter))
-            .collect(),
-        ConditionNode::Not(child)
-        | ConditionNode::NewlyTrue(child)
-        | ConditionNode::SinceLastHandled(child)
-        | ConditionNode::AnyDepsMatch {
-            condition: child, ..
-        }
-        | ConditionNode::AllDepsMatch {
-            condition: child, ..
-        }
-        | ConditionNode::AssetMatches {
-            condition: child, ..
-        } => {
-            vec![build_skipped_subtree(child, counter)]
-        }
-        ConditionNode::Since { trigger, reset } => {
-            vec![
-                build_skipped_subtree(trigger, counter),
-                build_skipped_subtree(reset, counter),
-            ]
-        }
-        _ => vec![],
-    };
-
+    let children = node
+        .children()
+        .map(|c| build_skipped_subtree(c, counter))
+        .collect();
     EvalNodeResult::new(node, my_idx, NodeStatus::Skipped, children, None)
 }
 
@@ -733,31 +708,8 @@ fn eval_inner<O: EvalOutput>(
 /// Increment the counter for every node in a subtree without evaluating.
 fn count_nodes(node: &ConditionNode, counter: &mut u32) {
     *counter += 1;
-    match node {
-        ConditionNode::And(children) | ConditionNode::Or(children) => {
-            for child in children {
-                count_nodes(child, counter);
-            }
-        }
-        ConditionNode::Not(child)
-        | ConditionNode::NewlyTrue(child)
-        | ConditionNode::SinceLastHandled(child)
-        | ConditionNode::AnyDepsMatch {
-            condition: child, ..
-        }
-        | ConditionNode::AllDepsMatch {
-            condition: child, ..
-        }
-        | ConditionNode::AssetMatches {
-            condition: child, ..
-        } => {
-            count_nodes(child, counter);
-        }
-        ConditionNode::Since { trigger, reset } => {
-            count_nodes(trigger, counter);
-            count_nodes(reset, counter);
-        }
-        _ => {}
+    for child in node.children() {
+        count_nodes(child, counter);
     }
 }
 

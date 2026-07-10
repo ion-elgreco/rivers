@@ -89,6 +89,44 @@ pub enum ConditionNode {
 }
 
 impl ConditionNode {
+    /// Child subtrees in evaluation order. Deliberately wildcard-free: adding
+    /// a composite variant MUST extend this match, which keeps every generic
+    /// traversal (including the evaluators' pre-order node-index bookkeeping)
+    /// in sync — a missed variant there silently corrupts persisted latches.
+    pub fn children(&self) -> impl Iterator<Item = &ConditionNode> {
+        let out: Vec<&ConditionNode> = match self {
+            ConditionNode::And(children) | ConditionNode::Or(children) => {
+                children.iter().collect()
+            }
+            ConditionNode::Not(child)
+            | ConditionNode::NewlyTrue(child)
+            | ConditionNode::SinceLastHandled(child) => vec![child.as_ref()],
+            ConditionNode::Since { trigger, reset } => {
+                vec![trigger.as_ref(), reset.as_ref()]
+            }
+            ConditionNode::AnyDepsMatch { condition, .. }
+            | ConditionNode::AllDepsMatch { condition, .. }
+            | ConditionNode::AssetMatches { condition, .. } => vec![condition.as_ref()],
+            ConditionNode::Missing
+            | ConditionNode::InProgress
+            | ConditionNode::ExecutionFailed
+            | ConditionNode::NewlyUpdated
+            | ConditionNode::NewlyRequested
+            | ConditionNode::CodeVersionChanged
+            | ConditionNode::CronTickPassed { .. }
+            | ConditionNode::InLatestTimeWindow { .. }
+            | ConditionNode::InitialEvaluation
+            | ConditionNode::DataVersionChanged
+            | ConditionNode::BackfillInProgress
+            | ConditionNode::LastExecutedWithTags { .. }
+            | ConditionNode::LastRunIncludesTarget
+            | ConditionNode::WillBeRequested
+            | ConditionNode::HasRunWithTags { .. }
+            | ConditionNode::AllRunsHaveTags { .. } => Vec::new(),
+        };
+        out.into_iter()
+    }
+
     /// Eager materialization preset.
     pub fn eager() -> Self {
         (ConditionNode::Missing.newly_true() | ConditionNode::any_deps_updated())
@@ -175,85 +213,34 @@ impl ConditionNode {
 
     /// Returns true if this condition tree contains any time-based nodes.
     pub fn has_time_based_conditions(&self) -> bool {
-        match self {
-            ConditionNode::CronTickPassed { .. } => true,
-            ConditionNode::And(children) | ConditionNode::Or(children) => {
-                children.iter().any(|c| c.has_time_based_conditions())
-            }
-            ConditionNode::Not(child)
-            | ConditionNode::NewlyTrue(child)
-            | ConditionNode::SinceLastHandled(child) => child.has_time_based_conditions(),
-            ConditionNode::Since { trigger, reset } => {
-                trigger.has_time_based_conditions() || reset.has_time_based_conditions()
-            }
-            ConditionNode::AnyDepsMatch { condition, .. }
-            | ConditionNode::AllDepsMatch { condition, .. }
-            | ConditionNode::AssetMatches { condition, .. } => {
-                condition.has_time_based_conditions()
-            }
-            _ => false,
-        }
+        matches!(self, ConditionNode::CronTickPassed { .. })
+            || self.children().any(|c| c.has_time_based_conditions())
     }
 
     /// True if the tree contains a stateful operator (`Since`/`NewlyTrue`).
     pub fn has_stateful_nodes(&self) -> bool {
-        match self {
-            ConditionNode::Since { .. } | ConditionNode::NewlyTrue(_) => true,
-            ConditionNode::And(children) | ConditionNode::Or(children) => {
-                children.iter().any(|c| c.has_stateful_nodes())
-            }
-            ConditionNode::Not(child)
-            | ConditionNode::SinceLastHandled(child)
-            | ConditionNode::AnyDepsMatch {
-                condition: child, ..
-            }
-            | ConditionNode::AllDepsMatch {
-                condition: child, ..
-            }
-            | ConditionNode::AssetMatches {
-                condition: child, ..
-            } => child.has_stateful_nodes(),
-            _ => false,
-        }
+        matches!(
+            self,
+            ConditionNode::Since { .. } | ConditionNode::NewlyTrue(_)
+        ) || self.children().any(|c| c.has_stateful_nodes())
     }
 
     /// True if the tree contains a dep-aggregate (`AnyDepsMatch`/`AllDepsMatch`/`AssetMatches`).
     pub fn has_dep_aggregate(&self) -> bool {
-        match self {
+        matches!(
+            self,
             ConditionNode::AnyDepsMatch { .. }
-            | ConditionNode::AllDepsMatch { .. }
-            | ConditionNode::AssetMatches { .. } => true,
-            ConditionNode::And(children) | ConditionNode::Or(children) => {
-                children.iter().any(|c| c.has_dep_aggregate())
-            }
-            ConditionNode::Not(child)
-            | ConditionNode::NewlyTrue(child)
-            | ConditionNode::SinceLastHandled(child) => child.has_dep_aggregate(),
-            ConditionNode::Since { trigger, reset } => {
-                trigger.has_dep_aggregate() || reset.has_dep_aggregate()
-            }
-            _ => false,
-        }
+                | ConditionNode::AllDepsMatch { .. }
+                | ConditionNode::AssetMatches { .. }
+        ) || self.children().any(|c| c.has_dep_aggregate())
     }
 
     /// Returns true if this condition tree contains `HasRunWithTags` or `AllRunsHaveTags`.
     pub fn uses_tick_tags(&self) -> bool {
-        match self {
-            ConditionNode::HasRunWithTags { .. } | ConditionNode::AllRunsHaveTags { .. } => true,
-            ConditionNode::And(children) | ConditionNode::Or(children) => {
-                children.iter().any(|c| c.uses_tick_tags())
-            }
-            ConditionNode::Not(child)
-            | ConditionNode::NewlyTrue(child)
-            | ConditionNode::SinceLastHandled(child) => child.uses_tick_tags(),
-            ConditionNode::Since { trigger, reset } => {
-                trigger.uses_tick_tags() || reset.uses_tick_tags()
-            }
-            ConditionNode::AnyDepsMatch { condition, .. }
-            | ConditionNode::AllDepsMatch { condition, .. }
-            | ConditionNode::AssetMatches { condition, .. } => condition.uses_tick_tags(),
-            _ => false,
-        }
+        matches!(
+            self,
+            ConditionNode::HasRunWithTags { .. } | ConditionNode::AllRunsHaveTags { .. }
+        ) || self.children().any(|c| c.uses_tick_tags())
     }
 
     /// True if any upstream dep matches the given condition.
@@ -369,28 +356,6 @@ impl ConditionNode {
                 ConditionNode::And(children.iter().filter(|&c| !pred(c)).cloned().collect())
             }
             other => other.clone(),
-        }
-    }
-
-    /// Returns true if this node or any descendant has the given label.
-    pub fn contains_label(&self, label: &str) -> bool {
-        if self.node_label() == label {
-            return true;
-        }
-        match self {
-            ConditionNode::And(children) | ConditionNode::Or(children) => {
-                children.iter().any(|c| c.contains_label(label))
-            }
-            ConditionNode::Not(child)
-            | ConditionNode::NewlyTrue(child)
-            | ConditionNode::SinceLastHandled(child) => child.contains_label(label),
-            ConditionNode::Since { trigger, reset } => {
-                trigger.contains_label(label) || reset.contains_label(label)
-            }
-            ConditionNode::AnyDepsMatch { condition, .. }
-            | ConditionNode::AllDepsMatch { condition, .. }
-            | ConditionNode::AssetMatches { condition, .. } => condition.contains_label(label),
-            _ => false,
         }
     }
 
@@ -539,24 +504,14 @@ impl ConditionNode {
     pub fn has_root_scope_latest_time_window(&self) -> bool {
         match self {
             ConditionNode::InLatestTimeWindow { .. } => true,
-            ConditionNode::And(children) | ConditionNode::Or(children) => children
-                .iter()
-                .any(|c| c.has_root_scope_latest_time_window()),
-            ConditionNode::Not(child)
-            | ConditionNode::NewlyTrue(child)
-            | ConditionNode::SinceLastHandled(child) => {
-                child.has_root_scope_latest_time_window()
-            }
-            ConditionNode::Since { trigger, reset } => {
-                trigger.has_root_scope_latest_time_window()
-                    || reset.has_root_scope_latest_time_window()
-            }
             // Dep aggregates evaluate their subtree against the deps' own key
             // spaces, so a nested InLatestTimeWindow doesn't constrain the root.
             ConditionNode::AnyDepsMatch { .. }
             | ConditionNode::AllDepsMatch { .. }
             | ConditionNode::AssetMatches { .. } => false,
-            _ => false,
+            _ => self
+                .children()
+                .any(|c| c.has_root_scope_latest_time_window()),
         }
     }
 
