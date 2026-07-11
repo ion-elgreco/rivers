@@ -2119,6 +2119,12 @@ pub trait StorageBackend: PerCodeLocationStorage {
         since_timestamp: i64,
     ) -> impl Future<Output = Result<Vec<StoredEvent>>> + Send;
 
+    /// Timestamp of the code location's newest observation event, if any.
+    fn get_latest_observation_ts(
+        &self,
+        code_location_id: &str,
+    ) -> impl Future<Output = Result<Option<i64>>> + Send;
+
     // KV
     fn kv_get(&self, key: &str) -> impl Future<Output = Result<Option<Vec<u8>>>> + Send;
     fn kv_set(&self, key: &str, value: &[u8]) -> impl Future<Output = Result<()>> + Send;

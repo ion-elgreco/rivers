@@ -388,7 +388,7 @@ impl AssetConditionCache {
         now: i64,
     ) -> anyhow::Result<bool> {
         if !self.initialized {
-            return self.initial_load(storage, now).await.map(|_| true);
+            return self.initial_load(storage).await.map(|_| true);
         }
 
         let delta = self.fetch_refresh_delta(storage, now).await?;
@@ -660,17 +660,29 @@ impl AssetConditionCache {
             }
         }
 
-        delta.changed = true;
         if !observed_keys.is_empty() {
             let records = self
                 .fetch_records_with_downstream(storage, &observed_keys)
                 .await?;
-            delta.record_updates.extend(records);
-
-            for key in &observed_keys {
-                delta
-                    .in_progress_changes
-                    .push(InProgressChange::AssetClear(key.clone()));
+            // Replayed observations (the cursor trails the newest by 1) must
+            // be no-ops: only assets whose record actually moved are cleared
+            // and count as change — an AssetClear for an unchanged record
+            // would wipe live run tracking seeded at initial_load.
+            for record in records {
+                let unchanged = self
+                    .records
+                    .get(&record.asset_key)
+                    .is_some_and(|cached| *cached == record);
+                if unchanged {
+                    continue;
+                }
+                delta.changed = true;
+                if observed_keys.contains(&record.asset_key) {
+                    delta
+                        .in_progress_changes
+                        .push(InProgressChange::AssetClear(record.asset_key.clone()));
+                }
+                delta.record_updates.push(record);
             }
         }
 
@@ -982,13 +994,21 @@ impl AssetConditionCache {
     }
 
     /// Full initial load — populates everything from scratch.
-    async fn initial_load<S: StorageBackend>(&mut self, storage: &S, now: i64) -> anyhow::Result<()> {
+    async fn initial_load<S: StorageBackend>(&mut self, storage: &S) -> anyhow::Result<()> {
         let ctx = self.ctx.clone();
         let scoped = storage.for_code_location(&ctx);
 
         // Records loaded below already reflect past observations; replaying
-        // the observation history would AssetClear live run tracking.
-        self.last_observation_ts = now;
+        // the observation history would AssetClear live run tracking. The
+        // cursor therefore trails the NEWEST stored observation by 1 (not
+        // wall clock): an observation stamped earlier whose write lands after
+        // this load must still be seen, and re-processing the newest one is
+        // an idempotent record re-fetch.
+        self.last_observation_ts = storage
+            .get_latest_observation_ts(ctx.id())
+            .await?
+            .map(|ts| ts - 1)
+            .unwrap_or(-1);
 
         let records = scoped.get_asset_records().await?;
         self.records = records
