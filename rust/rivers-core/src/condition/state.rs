@@ -308,8 +308,14 @@ pub fn update_condition_state(
             let ps = state
                 .partition_state
                 .get_or_insert_with(PartitionState::default);
-            ps.previous_selections = sub_selections.clone();
-            if let Some(dep_sub_selections) = &result.dep_sub_selections {
+            // Latches are stable on most ticks; comparing first skips a
+            // potentially 1M-key deep clone (equality is allocation-free).
+            if ps.previous_selections != *sub_selections {
+                ps.previous_selections = sub_selections.clone();
+            }
+            if let Some(dep_sub_selections) = &result.dep_sub_selections
+                && ps.dep_previous_selections != *dep_sub_selections
+            {
                 ps.dep_previous_selections = dep_sub_selections.clone();
             }
             ps.timestamps.retain(|key, _| timestamps.contains_key(key));
