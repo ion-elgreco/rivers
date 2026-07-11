@@ -6728,6 +6728,92 @@ async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completio
     );
 }
 
+#[tokio::test]
+async fn test_incremental_partition_refresh_keeps_equal_timestamp_partitions() {
+    // Materialization events can share one stamped `now`. A partition whose
+    // row lands in a later refresh with a timestamp EQUAL to the cache's
+    // current max must still be picked up — the incremental cursor has to
+    // trail the max like the run cursor does, not query strictly past it.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, PartitionKey, RunRecord, RunStatus,
+        StorageBackend,
+    };
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[make_materialized_record("dst", 1000)])
+        .await
+        .unwrap();
+
+    let part = |k: &str| PartitionKey::Single {
+        keys: vec![k.to_string()],
+    };
+    let mk_run = |id: &str, k: &str, start: i64| RunRecord {
+        run_id: id.to_string(),
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        job_name: Some("test".to_string()),
+        status: RunStatus::Started,
+        start_time: start,
+        end_time: None,
+        tags: vec![],
+        node_names: vec!["dst".to_string()],
+        priority: 0,
+        partition_key: Some(part(k)),
+        block_reason: None,
+        launched_by: LaunchedBy::Manual,
+    };
+    let mk_event = |run_id: &str, k: &str, ts: i64| EventRecord {
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        event_type: EventType::Materialization { data_version: None },
+        asset_key: Some("dst".to_string()),
+        run_id: run_id.to_string(),
+        partition_key: Some(part(k)),
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.set_partitioned_assets(vec!["dst".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    // Partition a: run + materialization stamped 3000, observed by one refresh.
+    storage.create_run(&mk_run("run_a", "a", 2000)).await.unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    storage
+        .update_run_status("run_a", RunStatus::Success, Some(3000))
+        .await
+        .unwrap();
+    storage.store_events(&[mk_event("run_a", "a", 3000)]).await.unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    assert_eq!(
+        cache.partition_status["dst"].timestamps.get(&part("a")),
+        Some(&3000),
+        "precondition: partition a's timestamp is cached"
+    );
+
+    // Partition b: a separate run whose materialization carries the SAME
+    // stamped timestamp, landing in a later refresh.
+    storage.create_run(&mk_run("run_b", "b", 4000)).await.unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    storage
+        .update_run_status("run_b", RunStatus::Success, Some(5000))
+        .await
+        .unwrap();
+    storage.store_events(&[mk_event("run_b", "b", 3000)]).await.unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+
+    assert_eq!(
+        cache.partition_status["dst"].timestamps.get(&part("b")),
+        Some(&3000),
+        "a partition update equal to the cached max timestamp must not be dropped"
+    );
+    assert!(cache.partition_status["dst"].materialized.contains(&part("b")));
+}
+
 #[test]
 fn test_clear_predispatch_mark_drops_empty_entry_only() {
     // A multi-partition backfill pre-marks an empty in_progress entry (classify) with no
