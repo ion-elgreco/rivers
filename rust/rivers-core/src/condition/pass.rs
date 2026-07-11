@@ -475,10 +475,27 @@ impl ConditionPass {
         for info in &conditions {
             eval_state.assets.entry(info.asset_key.clone()).or_default();
         }
+        let mut cache = cache;
+        // The pass owns "which assets are partitioned": the conditioned
+        // partitioned assets plus every mapping upstream.
+        let mut partitioned: Vec<String> = conditions
+            .iter()
+            .filter_map(|c| c.partition_info.as_ref().map(|_| c.asset_key.clone()))
+            .collect();
+        for info in &conditions {
+            if let Some(pi) = &info.partition_info {
+                for (_, upstream) in pi.mappings.keys() {
+                    if !partitioned.contains(upstream) {
+                        partitioned.push(upstream.clone());
+                    }
+                }
+            }
+        }
+        cache.set_partitioned_assets(partitioned);
+        cache.set_needs_tick_tags(conditions.iter().map(|c| &c.condition));
         // Rehydrate asset-level failure floors from persisted eval-state;
         // initial_load independently derives them from run history, so this
         // is a fast path, not the only source.
-        let mut cache = cache;
         for (asset, ts) in &eval_state.failed_assets {
             cache.failed_assets.insert(asset.clone());
             cache

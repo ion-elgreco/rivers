@@ -375,31 +375,14 @@ pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
         .assets
         .retain(|k, v| active.contains(k) || v.last_materialized_timestamp.is_some());
 
-    let mut partitioned_asset_keys: Vec<String> = conditions
-        .iter()
-        .filter_map(|c| c.partition_info.as_ref().map(|_| c.asset_key.clone()))
-        .collect();
-    for cond in &conditions {
-        if let Some(ref pi) = cond.partition_info {
-            for (_, upstream) in pi.mappings.keys() {
-                if !partitioned_asset_keys.contains(upstream) {
-                    partitioned_asset_keys.push(upstream.clone());
-                }
-            }
-        }
-    }
-    cache.set_partitioned_assets(partitioned_asset_keys.clone());
-    let cond_nodes: Vec<_> = conditions.iter().map(|c| c.condition.clone()).collect();
-    cache.set_needs_tick_tags(&cond_nodes);
+    let pass = ConditionPass::new(cache, eval_state, conditions, upstream_partition_keys);
 
     tracing::info!(
         target: "rivers::daemon",
-        count = conditions.len(),
-        partitioned = partitioned_asset_keys.len(),
+        count = pass.conditions.len(),
+        partitioned = pass.cache.partitioned_asset_count(),
         "condition eval loop started"
     );
-
-    let pass = ConditionPass::new(cache, eval_state, conditions, upstream_partition_keys);
 
     let mut engine = ConditionTickEngine {
         pass,

@@ -356,9 +356,14 @@ impl AssetConditionCache {
         self.partitioned_asset_keys.contains(asset)
     }
 
+    /// How many assets are registered partitioned.
+    pub fn partitioned_asset_count(&self) -> usize {
+        self.partitioned_asset_keys.len()
+    }
+
     /// Enable tick-level tag tracking if any tree uses `HasRunWithTags`/`AllRunsHaveTags`.
-    pub fn set_needs_tick_tags(&mut self, conditions: &[ConditionNode]) {
-        self.needs_tick_tags = conditions.iter().any(|c| c.uses_tick_tags());
+    pub fn set_needs_tick_tags<'a>(&mut self, conditions: impl IntoIterator<Item = &'a ConditionNode>) {
+        self.needs_tick_tags = conditions.into_iter().any(|c| c.uses_tick_tags());
     }
 
     /// Load partition status for all registered partitioned assets.
