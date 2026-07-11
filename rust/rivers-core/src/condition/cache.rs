@@ -784,8 +784,16 @@ impl AssetConditionCache {
             };
             // Incremental: only rows whose last_timestamp advanced past what
             // the cache already knows — a full asset_partitions scan here was
-            // the dominant per-tick cost at large partition counts.
-            let since = current.timestamps.values().copied().max().unwrap_or(0);
+            // the dominant per-tick cost at large partition counts. The cursor
+            // trails the max by 1 (like the run cursor): equal stamps from one
+            // batched `now` can land in a later refresh.
+            let since = current
+                .timestamps
+                .values()
+                .copied()
+                .max()
+                .map(|m| m - 1)
+                .unwrap_or(-1);
             let fresh_timestamps = scoped
                 .get_partition_timestamps_since(asset_key, since)
                 .await?;
