@@ -1707,10 +1707,13 @@ fn eval_partitioned_on_dep(
         .get(ctx.root_key)
         .filter(|_| needs_floor)
         .map(|root_status| {
+            // Reused across keys: a fresh single-element set per upstream
+            // partition is pure allocator churn at large partition counts.
+            let mut scratch = PartitionSelection::Keys(HashSet::with_capacity(1));
             upstream_status
                 .timestamps
                 .keys()
-                .filter_map(|uk| {
+                .filter_map(move |uk| {
                     if is_identity {
                         if !pctx.all_keys.contains(uk) {
                             return None;
@@ -1720,10 +1723,14 @@ fn eval_partitioned_on_dep(
                             root_floor_over(std::iter::once(uk), root_status),
                         ));
                     }
+                    if let PartitionSelection::Keys(s) = &mut scratch {
+                        s.clear();
+                        s.insert(uk.clone());
+                    }
                     let mapped = pctx.resolver.map_downstream(
                         dep_key,
                         ctx.target_key,
-                        &PartitionSelection::Keys(HashSet::from([uk.clone()])),
+                        &scratch,
                         Some(pctx.all_keys),
                     );
                     let floor = match &mapped {
