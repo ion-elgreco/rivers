@@ -237,6 +237,7 @@ fn eval_inner<O: EvalOutput>(
                 .tags
                 .last_run_tags
                 .get(ctx.target_key)
+                .and_then(|slots| slots.get(&None))
                 .map(|run_tags| run_tags_match(run_tags, tag_keys, tag_values))
                 .unwrap_or(false);
             O::leaf(expr, my_idx, node)
@@ -249,6 +250,7 @@ fn eval_inner<O: EvalOutput>(
                 ctx.tags
                     .last_run_asset_names
                     .get(ctx.target_key)
+                    .and_then(|slots| slots.get(&None))
                     .map(|names| names.iter().any(|n| n == ctx.root_key))
                     .unwrap_or(false)
             };
@@ -760,11 +762,9 @@ fn eval_partitioned<O: PartEvalOutput>(
             tag_keys,
             tag_values,
         } => O::leaf(
-            partition_filter_select(
-                ctx.tags.partition_last_run_tags.get(ctx.target_key),
-                pctx,
-                |tags| run_tags_match(tags, tag_keys, tag_values),
-            ),
+            partition_filter_select(ctx.tags.last_run_tags.get(ctx.target_key), pctx, |tags| {
+                run_tags_match(tags, tag_keys, tag_values)
+            }),
             my_idx,
             node,
             total,
@@ -776,7 +776,7 @@ fn eval_partitioned<O: PartEvalOutput>(
             } else {
                 O::leaf(
                     partition_filter_select(
-                        ctx.tags.partition_last_run_asset_names.get(ctx.target_key),
+                        ctx.tags.last_run_asset_names.get(ctx.target_key),
                         pctx,
                         |names| names.iter().any(|n| n == ctx.root_key),
                     ),

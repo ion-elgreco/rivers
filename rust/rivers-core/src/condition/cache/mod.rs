@@ -43,24 +43,12 @@ pub struct AssetConditionCache {
     pub partition_status: HashMap<String, PartitionStatusEntry>,
     /// Active backfill tracking: which assets are in backfills and which partitions they target.
     pub backfill: BackfillState,
-    // UNIFICATION (review9 F29): the three scalar/partitioned map pairs below
-    // model "unpartitioned" as a parallel field family instead of one
-    // Option<PartitionKey>-slotted family. Collapsing them halves this
-    // surface, but rewrites the RunTagSnapshot read paths and ~570 test
-    // fixture references — do it as a dedicated change, and until then keep
-    // each pair's write paths in lockstep.
-    /// Tags from the latest completed run per asset (unpartitioned). Used by `LastExecutedWithTags`.
-    pub last_run_tags: HashMap<String, Arc<[(String, String)]>>,
-    /// Tags from the latest completed run per asset+partition.
-    pub partition_last_run_tags: PartitionLastRunTagsMap,
-    /// Run tag sets from materializations completed this tick (unpartitioned).
-    pub tick_materialization_tags: TickMaterializationTagsMap,
-    /// Run tag sets from materializations completed this tick, per partition.
-    pub tick_partition_materialization_tags: TickPartitionMaterializationTagsMap,
-    /// Full `asset_names` from the latest completed run per asset.
-    pub last_run_asset_names: HashMap<String, Arc<[String]>>,
-    /// Full `asset_names` from the latest completed run per asset+partition.
-    pub partition_last_run_asset_names: PartitionLastRunAssetNamesMap,
+    /// Tags from the latest completed run per (asset, slot). Used by `LastExecutedWithTags`.
+    pub last_run_tags: SlotMap<RunTags>,
+    /// Run tag sets from materializations completed this tick, per (asset, slot).
+    pub tick_materialization_tags: SlotMap<Vec<RunTags>>,
+    /// Full `asset_names` from the latest completed run per (asset, slot).
+    pub last_run_asset_names: SlotMap<Arc<[String]>>,
     /// Asset keys that are partitioned.
     partitioned_asset_keys: HashSet<String>,
     /// Whether any condition tree uses HasRunWithTags/AllRunsHaveTags.
@@ -114,11 +102,8 @@ impl AssetConditionCache {
             partition_status: HashMap::new(),
             backfill: BackfillState::default(),
             last_run_tags: HashMap::new(),
-            partition_last_run_tags: HashMap::new(),
             tick_materialization_tags: HashMap::new(),
-            tick_partition_materialization_tags: HashMap::new(),
             last_run_asset_names: HashMap::new(),
-            partition_last_run_asset_names: HashMap::new(),
             partitioned_asset_keys: HashSet::new(),
             needs_tick_tags: false,
             ctx: crate::storage::CodeLocationContext::new(code_location_id),
@@ -473,34 +458,23 @@ impl AssetConditionCache {
                 e.insert(run_ts);
             }
         }
-        // A newer tagless run CLEARS the entry rather than storing an empty
+        // A newer tagless run CLEARS the slot rather than storing an empty
         // vec — run_tags_match on an empty entry is vacuously true, so a
         // stored empty would make no-arg LastExecutedWithTags fire everywhere.
-        if let Some(pk) = partition_key {
-            if tags.is_empty() {
-                if let Some(m) = self.partition_last_run_tags.get_mut(asset) {
-                    m.remove(pk);
-                }
-            } else {
-                self.partition_last_run_tags
-                    .entry(asset.to_string())
-                    .or_default()
-                    .insert(pk.clone(), Arc::clone(tags));
+        if tags.is_empty() {
+            if let Some(slots) = self.last_run_tags.get_mut(asset) {
+                slots.remove(partition_key);
             }
-            self.partition_last_run_asset_names
+        } else {
+            self.last_run_tags
                 .entry(asset.to_string())
                 .or_default()
-                .insert(pk.clone(), Arc::clone(asset_names));
-        } else {
-            if tags.is_empty() {
-                self.last_run_tags.remove(asset);
-            } else {
-                self.last_run_tags
-                    .insert(asset.to_string(), Arc::clone(tags));
-            }
-            self.last_run_asset_names
-                .insert(asset.to_string(), Arc::clone(asset_names));
+                .insert(partition_key.clone(), Arc::clone(tags));
         }
+        self.last_run_asset_names
+            .entry(asset.to_string())
+            .or_default()
+            .insert(partition_key.clone(), Arc::clone(asset_names));
     }
 
     /// Track a materialization's run tags for the current tick.
@@ -510,19 +484,12 @@ impl AssetConditionCache {
         partition_key: &Option<PartitionKey>,
         tags: &Arc<[(String, String)]>,
     ) {
-        if let Some(pk) = partition_key {
-            self.tick_partition_materialization_tags
-                .entry(asset.to_string())
-                .or_default()
-                .entry(pk.clone())
-                .or_default()
-                .push(Arc::clone(tags));
-        } else {
-            self.tick_materialization_tags
-                .entry(asset.to_string())
-                .or_default()
-                .push(Arc::clone(tags));
-        }
+        self.tick_materialization_tags
+            .entry(asset.to_string())
+            .or_default()
+            .entry(partition_key.clone())
+            .or_default()
+            .push(Arc::clone(tags));
     }
 
     /// Build upstream/downstream adjacency maps from edges.

@@ -287,21 +287,24 @@ pub(crate) fn eval_backfill_in_progress_partitioned(
     PartitionSelection::from_keys(targeted)
 }
 
-/// Filter a per-partition map, selecting partitions that match a predicate
-/// and are in the asset's partition space.
+/// Filter an asset's slotted map, selecting the `Some(partition)` slots that
+/// match a predicate and are in the asset's partition space (the `None` slot
+/// belongs to the unpartitioned eval path).
 pub(crate) fn partition_filter_select<V>(
-    map: Option<&HashMap<PartitionKey, V>>,
+    slots: Option<&HashMap<Option<PartitionKey>, V>>,
     pctx: &PartitionEvalContext,
     pred: impl Fn(&V) -> bool,
 ) -> PartitionSelection {
-    let data = match map {
+    let data = match slots {
         Some(d) => d,
         None => return PartitionSelection::Empty,
     };
     let matching: HashSet<PartitionKey> = data
         .iter()
-        .filter(|(pk, val)| pctx.all_keys.contains(pk) && pred(val))
-        .map(|(pk, _)| pk.clone())
+        .filter_map(|(pk, val)| match pk {
+            Some(pk) if pctx.all_keys.contains(pk) && pred(val) => Some(pk.clone()),
+            _ => None,
+        })
         .collect();
     PartitionSelection::from_keys(matching)
 }
@@ -316,6 +319,7 @@ pub(crate) fn eval_new_update_tags(
     ctx.tags
         .tick_materialization_tags
         .get(ctx.target_key)
+        .and_then(|slots| slots.get(&None))
         .map(|tag_sets| {
             !tag_sets.is_empty()
                 && if require_all {
@@ -340,19 +344,11 @@ pub(crate) fn eval_new_update_tags_partitioned(
     tag_values: &[(String, String)],
     require_all: bool,
 ) -> PartitionSelection {
-    let pk_tag_sets = match ctx
-        .tags
-        .tick_partition_materialization_tags
-        .get(ctx.target_key)
-    {
-        Some(tags) => tags,
-        None => return PartitionSelection::Empty,
-    };
-    let matching: HashSet<PartitionKey> = pk_tag_sets
-        .iter()
-        .filter(|(pk, tag_sets)| {
-            pctx.all_keys.contains(pk)
-                && !tag_sets.is_empty()
+    partition_filter_select(
+        ctx.tags.tick_materialization_tags.get(ctx.target_key),
+        pctx,
+        |tag_sets| {
+            !tag_sets.is_empty()
                 && if require_all {
                     tag_sets
                         .iter()
@@ -362,10 +358,8 @@ pub(crate) fn eval_new_update_tags_partitioned(
                         .iter()
                         .any(|tags| run_tags_match(tags, tag_keys, tag_values))
                 }
-        })
-        .map(|(pk, _)| pk.clone())
-        .collect();
-    PartitionSelection::from_keys(matching)
+        },
+    )
 }
 
 /// Check if `run_tags` satisfies the `tag_keys` (key-presence) and `tag_values` (exact k-v match).

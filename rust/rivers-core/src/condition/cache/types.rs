@@ -7,20 +7,10 @@ use crate::storage::{AssetRecord, PartitionKey, RunRecord};
 /// Tag pairs from a run, shared by Arc reference for cheap clones.
 pub type RunTags = Arc<[(String, String)]>;
 
-/// Latest-run tags per asset (unpartitioned).
-pub type LastRunTagsMap = HashMap<String, RunTags>;
-
-/// Latest-run tags per asset+partition.
-pub type PartitionLastRunTagsMap = HashMap<String, HashMap<PartitionKey, RunTags>>;
-
-/// Tick-scoped accumulator of materialization tag sets per asset (unpartitioned).
-pub type TickMaterializationTagsMap = HashMap<String, Vec<RunTags>>;
-
-/// Tick-scoped accumulator of materialization tag sets per asset+partition.
-pub type TickPartitionMaterializationTagsMap = HashMap<String, HashMap<PartitionKey, Vec<RunTags>>>;
-
-/// `asset_names` from the latest completed run per asset+partition.
-pub type PartitionLastRunAssetNamesMap = HashMap<String, HashMap<PartitionKey, Arc<[String]>>>;
+/// One value per `(asset, slot)`, where a slot is `Some(partition)` or the
+/// unpartitioned/unkeyed `None` slot — one family serves partitioned and
+/// unpartitioned assets alike.
+pub type SlotMap<V> = HashMap<String, HashMap<Option<PartitionKey>, V>>;
 
 /// Tag-update entry: `(asset_key, optional partition, tags)`.
 type RunTagUpdate = (String, Option<PartitionKey>, RunTags);

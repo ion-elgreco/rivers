@@ -588,13 +588,8 @@ impl ConditionPass {
                 },
                 tags: RunTagSnapshot {
                     last_run_tags: &self.cache.last_run_tags,
-                    partition_last_run_tags: &self.cache.partition_last_run_tags,
                     tick_materialization_tags: &self.cache.tick_materialization_tags,
-                    tick_partition_materialization_tags: &self
-                        .cache
-                        .tick_partition_materialization_tags,
                     last_run_asset_names: &self.cache.last_run_asset_names,
-                    partition_last_run_asset_names: &self.cache.partition_last_run_asset_names,
                 },
                 prev_state: prev,
                 all_asset_states: &self.eval_state.assets,
