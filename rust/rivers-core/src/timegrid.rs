@@ -87,7 +87,25 @@ impl TimeGrid {
                 bail!("TimeWindow interval must be positive");
             }
             let step = chrono::Duration::nanoseconds(interval_ns);
-            let mut t = from;
+            // Grid ticks are start + n*step; snap `from` up to the next tick
+            // so a raw endpoint can't shift the whole walk off-grid (the cron
+            // branch snaps inherently).
+            let mut t = if from <= self.start {
+                self.start
+            } else {
+                let offset_ns = (from - self.start).num_nanoseconds().unwrap_or(0);
+                let rem = offset_ns.rem_euclid(interval_ns);
+                if rem == 0 {
+                    from
+                } else {
+                    match self.start.checked_add_signed(chrono::Duration::nanoseconds(
+                        offset_ns - rem + interval_ns,
+                    )) {
+                        Some(next) => next,
+                        None => return Ok(out),
+                    }
+                }
+            };
             while t <= to {
                 out.push(t.format(&self.fmt).to_string());
                 match t.checked_add_signed(step) {
@@ -396,6 +414,30 @@ mod tests {
             .keys_in_range(dt("2024-01-01T09:00:00"), dt("2024-01-01T07:00:00"))
             .unwrap();
         assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn interval_keys_in_range_snaps_off_grid_from_to_the_grid() {
+        // A raw `from` between ticks must not shift the whole walk off-grid.
+        let keys = hourly_jan1()
+            .keys_in_range(dt("2024-01-01T07:30:00"), dt("2024-01-01T10:00:00"))
+            .unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                "2024-01-01T08:00:00",
+                "2024-01-01T09:00:00",
+                "2024-01-01T10:00:00",
+            ]
+        );
+    }
+
+    #[test]
+    fn interval_keys_in_range_clamps_from_before_grid_start() {
+        let keys = hourly_jan1()
+            .keys_in_range(dt("2023-12-31T22:15:00"), dt("2024-01-01T01:00:00"))
+            .unwrap();
+        assert_eq!(keys, vec!["2024-01-01T00:00:00", "2024-01-01T01:00:00"]);
     }
 
     #[test]

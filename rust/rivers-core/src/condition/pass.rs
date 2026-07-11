@@ -1084,6 +1084,42 @@ mod tests {
         pass.eval_state.assets["down"].last_handled_timestamp
     }
 
+    /// Sub-daily grids expose off-grid stepping: a lookback that isn't a
+    /// whole multiple of the interval must still mirror the scan (daily
+    /// grids mask this because the date-only fmt truncates the misaligned
+    /// time-of-day away).
+    #[test]
+    fn grid_derivation_matches_the_scan_sub_daily_lookback() {
+        let fmt = "%Y-%m-%dT%H:%M:%S";
+        let parse = |s: &str| chrono::NaiveDateTime::parse_from_str(s, fmt).unwrap();
+        let keys = make_daily_keys(&[
+            "2024-01-01T07:00:00",
+            "2024-01-01T08:00:00",
+            "2024-01-01T09:00:00",
+            "2024-01-01T10:00:00",
+        ]);
+        let grid = crate::timegrid::TimeGrid {
+            cron_schedule: None,
+            interval_seconds: Some(3600.0),
+            start: parse("2024-01-01T00:00:00"),
+            end: None,
+            fmt: fmt.to_string(),
+        };
+        let now = parse("2024-01-01T10:30:00");
+        // 90-minute lookback: not a multiple of the hourly interval.
+        let scanned = compute_latest_time_window_keys(&keys, fmt, now, Some(5400.0));
+        let derived =
+            derive_window_keys_from_grid(&grid, &keys, now, Some(5400.0)).expect("grid derivation");
+        assert_eq!(
+            derived, scanned,
+            "grid fast-path must mirror the scan for non-multiple lookbacks"
+        );
+        assert_eq!(
+            scanned,
+            make_daily_keys(&["2024-01-01T09:00:00", "2024-01-01T10:00:00"])
+        );
+    }
+
     /// The O(window) grid derivation must produce exactly what the full-scan
     /// fallback produces for grid-enumerated universes.
     #[test]
