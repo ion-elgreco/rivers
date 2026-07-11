@@ -340,54 +340,46 @@ pub fn update_dep_baselines(
     partition_statuses: &HashMap<String, super::cache::PartitionStatusEntry>,
     records: &HashMap<String, crate::storage::AssetRecord>,
 ) {
-    type DepBaselineUpdate = (
-        String,
-        Option<i64>,
-        Option<String>,
-        Option<HashMap<crate::storage::PartitionKey, i64>>,
-    );
-
+    let mut touched_deps: HashSet<&String> = HashSet::new();
     for root in fired_or_initial {
         let Some(deps) = upstream_deps.get(root) else {
             continue;
         };
-        let updates: Vec<DepBaselineUpdate> = deps
+        let eligible: Vec<&String> = deps
             .iter()
             .filter(|dep| !conditioned_assets.contains(*dep))
-            .map(|dep| {
-                (
-                    dep.clone(),
-                    records.get(dep).and_then(|r| r.last_timestamp),
-                    records.get(dep).and_then(|r| r.last_data_version.clone()),
-                    partition_statuses.get(dep).map(|ps| ps.timestamps.clone()),
-                )
-            })
             .collect();
-
         if let Some(root_state) = eval_state.get_mut(root) {
-            for (dep, record_ts, data_version, _) in &updates {
+            for dep in &eligible {
                 root_state.dep_baselines.insert(
-                    dep.clone(),
+                    (*dep).clone(),
                     DepBaseline {
-                        last_materialized_timestamp: *record_ts,
-                        last_data_version: data_version.clone(),
+                        last_materialized_timestamp: records
+                            .get(*dep)
+                            .and_then(|r| r.last_timestamp),
+                        last_data_version: records
+                            .get(*dep)
+                            .and_then(|r| r.last_data_version.clone()),
                     },
                 );
             }
         }
+        touched_deps.extend(eligible);
+    }
 
-        // The dep's global entry still carries partition timestamps (and the
-        // scalar fallback for state written before per-dep baselines existed).
-        for (dep, record_ts, data_version, partition_ts) in updates {
-            let dep_state = eval_state.entry(dep).or_default();
-            dep_state.last_materialized_timestamp = record_ts;
-            dep_state.last_data_version = data_version;
-            if let Some(ts) = partition_ts {
-                let ps = dep_state
-                    .partition_state
-                    .get_or_insert_with(Default::default);
-                ps.timestamps = ts;
-            }
+    // The dep's global entry still carries partition timestamps (and the
+    // scalar fallback for state written before per-dep baselines existed) —
+    // written once per dep, not once per root sharing it: the timestamp map
+    // can hold a million entries.
+    for dep in touched_deps {
+        let dep_state = eval_state.entry(dep.clone()).or_default();
+        dep_state.last_materialized_timestamp = records.get(dep).and_then(|r| r.last_timestamp);
+        dep_state.last_data_version = records.get(dep).and_then(|r| r.last_data_version.clone());
+        if let Some(entry) = partition_statuses.get(dep) {
+            let ps = dep_state
+                .partition_state
+                .get_or_insert_with(Default::default);
+            ps.timestamps = entry.timestamps.clone();
         }
     }
 }
