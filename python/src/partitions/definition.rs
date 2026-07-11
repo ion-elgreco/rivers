@@ -1011,13 +1011,8 @@ impl PartitionsDefinition {
 }
 
 fn parse_cron(expr: &str) -> PyResult<Cron> {
-    croner::parser::CronParser::builder()
-        .seconds(croner::parser::Seconds::Optional)
-        .build()
-        .parse(expr)
-        .map_err(|e| {
-            PartitionDefinitionError::new_err(format!("Invalid cron expression '{expr}': {e}"))
-        })
+    rivers_core::timegrid::parse_cron(expr)
+        .map_err(|e| PartitionDefinitionError::new_err(e.to_string()))
 }
 
 /// A TimeWindow fmt must round-trip the grid's window starts.

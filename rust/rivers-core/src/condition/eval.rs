@@ -921,13 +921,9 @@ fn eval_new_update_tags_partitioned(
     }
 }
 
-/// Parse a cron schedule (seconds optional).
+/// Parse a cron schedule (seconds optional) in the shared rivers dialect.
 fn build_cron(schedule: &str) -> Result<croner::Cron, String> {
-    croner::parser::CronParser::builder()
-        .seconds(croner::parser::Seconds::Optional)
-        .build()
-        .parse(schedule)
-        .map_err(|e| e.to_string())
+    crate::timegrid::parse_cron(schedule).map_err(|e| e.to_string())
 }
 
 /// Validate a cron schedule at construction so bad input is rejected up front.

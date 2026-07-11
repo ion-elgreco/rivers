@@ -398,11 +398,7 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
     let mut automations: Vec<AutomationEntry> = Vec::new();
 
     for info in schedule_infos {
-        match croner::parser::CronParser::builder()
-            .seconds(croner::parser::Seconds::Optional)
-            .build()
-            .parse(&info.cron_schedule)
-        {
+        match rivers_core::timegrid::parse_cron(&info.cron_schedule) {
             Ok(cron) => {
                 let cron = Box::new(cron);
                 let next = rivers_core::condition::next_cron_occurrence_utc(
