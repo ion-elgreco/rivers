@@ -7934,6 +7934,76 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
 }
 
 #[tokio::test]
+async fn test_initial_evaluation_fires_once_not_per_restart() {
+    // Pins initial_evaluation()'s documented semantics: it fires on the very
+    // first evaluation tick (fresh eval state) and NOT again after a normal
+    // restart with intact persisted state.
+    use crate::condition::pass::{AssetConditionInfo, ConditionPass};
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[make_materialized_record("a", 1_000)])
+        .await
+        .unwrap();
+
+    let conditions = || {
+        vec![AssetConditionInfo {
+            asset_key: "a".to_string(),
+            condition: ConditionNode::InitialEvaluation,
+            partition_info: None,
+            backfill_strategy: None,
+        }]
+    };
+
+    let mut pass1 = ConditionPass::new(
+        AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+        ConditionEvalState {
+            is_initial: true,
+            ..Default::default()
+        },
+        conditions(),
+        HashMap::new(),
+    );
+    pass1.refresh_cache(&storage, 2_000).await.unwrap();
+    let out = pass1.run(2_000, false);
+    assert!(
+        out.plan.unpartitioned.contains(&"a".to_string()),
+        "the very first evaluation must fire initial_evaluation()"
+    );
+    storage
+        .for_code_location(&ctx)
+        .set_condition_eval_state(&pass1.eval_state)
+        .await
+        .unwrap();
+
+    // Normal restart: intact persisted state, same condition tree.
+    let mut eval_state = storage
+        .for_code_location(&ctx)
+        .get_condition_eval_state()
+        .await
+        .unwrap()
+        .expect("persisted");
+    eval_state.migrate_loaded();
+    let mut pass2 = ConditionPass::new(
+        AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+        eval_state,
+        conditions(),
+        HashMap::new(),
+    );
+    pass2.refresh_cache(&storage, 3_000).await.unwrap();
+    let out2 = pass2.run(3_000, false);
+    assert!(
+        out2.plan.unpartitioned.is_empty(),
+        "a restart with intact persisted state must not re-fire initial_evaluation(); got {:?}",
+        out2.plan.unpartitioned
+    );
+}
+
+#[tokio::test]
 async fn test_initial_load_derives_failure_floor_from_run_history() {
     // First-ever daemon start (no persisted eval state to rehydrate from):
     // an asset whose most recent run failed must still be visible to
