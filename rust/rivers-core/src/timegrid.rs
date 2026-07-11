@@ -256,7 +256,10 @@ fn cron_tick_naive(tick: chrono::DateTime<Utc>) -> NaiveDateTime {
     naive.with_nanosecond(0).unwrap_or(naive)
 }
 
-fn parse_cron(expr: &str) -> Result<croner::Cron> {
+/// Parse a cron expression in the ONE dialect rivers accepts (5 or 6 fields,
+/// seconds optional). Every cron consumer must go through this so conditions,
+/// schedules, and time-window grids can never diverge on what parses.
+pub fn parse_cron(expr: &str) -> Result<croner::Cron> {
     croner::parser::CronParser::builder()
         .seconds(croner::parser::Seconds::Optional)
         .build()
