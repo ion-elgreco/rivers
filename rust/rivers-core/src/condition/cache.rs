@@ -1022,6 +1022,41 @@ impl AssetConditionCache {
             }
         }
 
+        // Failure floors: a pre-existing failed run must be visible to
+        // ExecutionFailed on a fresh cache — persisted eval-state floors are
+        // only a rehydration shortcut, not the source of truth. Mirrors the
+        // steady-state gates (materialized-by-the-failed-run, or outranked by
+        // a newer materialization, clears the floor).
+        let failed_runs = scoped
+            .get_runs_since(
+                0,
+                Some(RunStatus::Failure),
+                crate::storage::SortOrder::Asc,
+            )
+            .await?;
+        for run in &failed_runs {
+            let run_ts = run.end_time.unwrap_or(run.start_time);
+            for asset in &run.node_names {
+                if run.partition_key.is_some() && self.is_partitioned(asset) {
+                    continue;
+                }
+                let record = self.records.get(asset.as_str());
+                let materialized_here = record.and_then(|r| r.last_run_id.as_deref())
+                    == Some(run.run_id.as_str());
+                let outranked = record
+                    .and_then(|r| r.last_timestamp)
+                    .is_some_and(|mat| mat >= run_ts);
+                if materialized_here || outranked {
+                    continue;
+                }
+                self.failed_assets.insert(asset.clone());
+                self.failed_asset_timestamps
+                    .entry(asset.clone())
+                    .and_modify(|t| *t = (*t).max(run_ts))
+                    .or_insert(run_ts);
+            }
+        }
+
         let last_run_ids: Vec<String> = self
             .records
             .values()

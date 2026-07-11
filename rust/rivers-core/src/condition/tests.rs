@@ -7934,6 +7934,88 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
 }
 
 #[tokio::test]
+async fn test_initial_load_derives_failure_floor_from_run_history() {
+    // First-ever daemon start (no persisted eval state to rehydrate from):
+    // an asset whose most recent run failed must still be visible to
+    // ExecutionFailed — the floor has to come from run history, not only
+    // from persisted eval-state. A failure outranked by a newer
+    // materialization must NOT floor.
+    use crate::condition::pass::{AssetConditionInfo, ConditionPass};
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[make_record("a"), make_materialized_record("b", 5_000)])
+        .await
+        .unwrap();
+
+    let mk_run = |id: &str, asset: &str, start: i64| RunRecord {
+        run_id: id.to_string(),
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        job_name: Some("test".to_string()),
+        status: RunStatus::Started,
+        start_time: start,
+        end_time: None,
+        tags: vec![],
+        node_names: vec![asset.to_string()],
+        priority: 0,
+        partition_key: None,
+        block_reason: None,
+        launched_by: LaunchedBy::Manual,
+    };
+    // a: failed, never materialized afterwards → floor stands.
+    storage.create_run(&mk_run("run-fail-a", "a", 2_000)).await.unwrap();
+    storage
+        .update_run_status("run-fail-a", RunStatus::Failure, Some(2_500))
+        .await
+        .unwrap();
+    // b: failed at 2_500 but re-materialized at 5_000 → floor cleared.
+    storage.create_run(&mk_run("run-fail-b", "b", 2_000)).await.unwrap();
+    storage
+        .update_run_status("run-fail-b", RunStatus::Failure, Some(2_500))
+        .await
+        .unwrap();
+
+    let conditions = vec![
+        AssetConditionInfo {
+            asset_key: "a".to_string(),
+            condition: ConditionNode::ExecutionFailed,
+            partition_info: None,
+            backfill_strategy: None,
+        },
+        AssetConditionInfo {
+            asset_key: "b".to_string(),
+            condition: ConditionNode::ExecutionFailed,
+            partition_info: None,
+            backfill_strategy: None,
+        },
+    ];
+    let mut pass = ConditionPass::new(
+        AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+        ConditionEvalState {
+            is_initial: true,
+            ..Default::default()
+        },
+        conditions,
+        HashMap::new(),
+    );
+    pass.refresh_cache(&storage, 10_000).await.unwrap();
+    let out = pass.run(10_000, false);
+    assert!(
+        out.plan.unpartitioned.contains(&"a".to_string()),
+        "a pre-existing failure must fire ExecutionFailed on first start; got {:?}",
+        out.plan.unpartitioned
+    );
+    assert!(
+        !out.plan.unpartitioned.contains(&"b".to_string()),
+        "a failure outranked by a newer materialization must not fire"
+    );
+}
+
+#[tokio::test]
 async fn test_crash_after_dispatch_recovers_latches_from_intent() {
     // Crash window: a tick's run was durably dispatched (and even completed),
     // but the daemon died before persisting eval state. The pre-dispatch
