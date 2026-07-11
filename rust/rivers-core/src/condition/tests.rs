@@ -2868,6 +2868,48 @@ fn all_partitions_dep_frontier_key_does_not_refire_whole_universe() {
 }
 
 #[test]
+fn empty_universe_all_selection_does_not_fire() {
+    // `All` of an empty partition universe selects nothing; reporting
+    // fired=true would leak a full WillBeRequested signal to downstreams
+    // evaluated later in the same tick.
+    let a = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), a.clone())]);
+    let deps = HashMap::new();
+    let all_keys: HashSet<PartitionKey> = HashSet::new();
+    let timestamps: HashMap<PartitionKey, i64> = HashMap::new();
+    let partition_statuses = HashMap::from([(
+        "a".to_string(),
+        crate::condition::cache::PartitionStatusEntry::default(),
+    )]);
+    let all_states = HashMap::new();
+    let mut ctx = make_ctx("a", &a, &records, &deps);
+    ctx.all_asset_states = &all_states;
+    ctx.is_initial = true; // InitialEvaluation yields `All` independent of the universe
+
+    let empty_mappings = HashMap::new();
+    let no_upstream = HashMap::new();
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &all_keys,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &timestamps,
+        resolver: PartitionResolver::new(&empty_mappings, &no_upstream),
+        time_windows: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let result = evaluate(&ConditionNode::InitialEvaluation, &ctx);
+    assert!(
+        !result.fired,
+        "All over an empty universe must not fire; got {:?}",
+        result.selection
+    );
+}
+
+#[test]
 fn unpartitioned_dep_frontier_key_does_not_refire_whole_universe() {
     // The bridged (unpartitioned-dep) path floors the dep against the whole
     // root universe like an AllPartitions edge; the floor must ignore
