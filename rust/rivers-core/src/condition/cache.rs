@@ -1056,6 +1056,18 @@ impl AssetConditionCache {
                     .or_insert(run_ts);
             }
         }
+        // Floors rehydrated from persisted eval-state predate this load; drop
+        // any outranked by a newer materialization (the asset recovered while
+        // the daemon was down — steady state would have cleared them).
+        let records = &self.records;
+        self.failed_asset_timestamps.retain(|asset, ts| {
+            records
+                .get(asset)
+                .and_then(|r| r.last_timestamp)
+                .is_none_or(|mat| mat < *ts)
+        });
+        let floors = &self.failed_asset_timestamps;
+        self.failed_assets.retain(|asset| floors.contains_key(asset));
 
         let last_run_ids: Vec<String> = self
             .records
