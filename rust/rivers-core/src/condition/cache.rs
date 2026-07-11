@@ -102,6 +102,19 @@ struct FailedRun {
     run_id: String,
 }
 
+/// The `(asset, partition)` slots a run's effects write to: a partitioned
+/// asset gets the run key's members (the unpartitioned slot for unkeyed
+/// runs); an unpartitioned asset always the single scalar slot.
+fn run_partition_slots(is_partitioned: bool, run: &RunRecord) -> Vec<Option<PartitionKey>> {
+    if !is_partitioned {
+        return vec![None];
+    }
+    match &run.partition_key {
+        Some(pk) => pk.members().into_iter().map(Some).collect(),
+        None => vec![None],
+    }
+}
+
 /// Every mutation a single steady-state refresh wants to make to the cache.
 #[derive(Default)]
 struct RefreshDelta {
@@ -697,11 +710,6 @@ impl AssetConditionCache {
         let run_asset_names: Arc<[String]> = Arc::from(run.node_names.as_slice());
         let run_tags: Arc<[(String, String)]> = Arc::from(run.tags.as_slice());
         let is_failure = matches!(run.status, RunStatus::Failure);
-        let run_partitions: Vec<Option<PartitionKey>> = match &run.partition_key {
-            Some(pk) => pk.members().into_iter().map(Some).collect(),
-            None => vec![None],
-        };
-        let unpartitioned = [None];
         let run_ts = run.end_time.unwrap_or(run.start_time);
         for asset in &run.node_names {
             if run.partition_key.is_none() || !self.is_partitioned(asset) {
@@ -730,12 +738,7 @@ impl AssetConditionCache {
             // Route by the ASSET's partitioning, not the run's key: a joint
             // partition-keyed run still writes an unpartitioned asset's entry
             // into the scalar maps the unpartitioned eval path reads.
-            let asset_partitions: &[Option<PartitionKey>] = if self.is_partitioned(asset) {
-                &run_partitions
-            } else {
-                &unpartitioned
-            };
-            for partition_key in asset_partitions {
+            for partition_key in run_partition_slots(self.is_partitioned(asset), run) {
                 delta.last_run_updates.push((
                     asset.clone(),
                     partition_key.clone(),
@@ -1091,15 +1094,8 @@ impl AssetConditionCache {
                 .filter_map(|record| {
                     let run = runs_by_id.get(record.last_run_id.as_deref()?)?;
                     let run_ts = run.end_time.unwrap_or(run.start_time);
-                    let partitions: Vec<Option<PartitionKey>> =
-                        if self.is_partitioned(&record.asset_key) {
-                            match &run.partition_key {
-                                Some(pk) => pk.members().into_iter().map(Some).collect(),
-                                None => vec![None],
-                            }
-                        } else {
-                            vec![None]
-                        };
+                    let partitions =
+                        run_partition_slots(self.is_partitioned(&record.asset_key), run);
                     let rows: Vec<AssetRunRow> = partitions
                         .into_iter()
                         .map(|pk| {
