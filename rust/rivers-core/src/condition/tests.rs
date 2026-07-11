@@ -6771,6 +6771,65 @@ async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completio
 }
 
 #[tokio::test]
+async fn test_observation_committing_after_load_is_still_seen() {
+    // The observation cursor must derive from storage, not wall clock: an
+    // observation stamped before daemon start whose write commits only after
+    // the initial load must still trigger a refresh (re-processing is an
+    // idempotent record re-fetch).
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[make_record("ext")])
+        .await
+        .unwrap();
+
+    let mk_obs = |run_id: &str, ts: i64| EventRecord {
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        event_type: EventType::Observation {
+            data_version: Some(format!("dv-{ts}")),
+        },
+        asset_key: Some("ext".to_string()),
+        run_id: run_id.to_string(),
+        partition_key: None,
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+
+    // Prior observation history, committed before the load.
+    storage.store_events(&[mk_obs("obs-1", 1_000)]).await.unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.refresh(&storage, 5_000).await.unwrap(); // wall clock well past the stamp
+
+    // An equal-stamped observation carrying a NEW data version (batched
+    // `now`, lagging write) commits only after the load.
+    let mut late = mk_obs("obs-2", 1_000);
+    late.event_type = EventType::Observation {
+        data_version: Some("dv-late".to_string()),
+    };
+    storage.store_events(&[late]).await.unwrap();
+
+    let changed = cache.refresh(&storage, 6_000).await.unwrap();
+    assert!(
+        changed,
+        "an observation whose write landed after the initial load must still be seen"
+    );
+    assert_eq!(
+        cache
+            .records
+            .get("ext")
+            .and_then(|r| r.last_data_version.as_deref()),
+        Some("dv-late"),
+        "the late observation's data version must reach the cached record"
+    );
+}
+
+#[tokio::test]
 async fn test_incremental_partition_refresh_keeps_equal_timestamp_partitions() {
     // Materialization events can share one stamped `now`. A partition whose
     // row lands in a later refresh with a timestamp EQUAL to the cache's

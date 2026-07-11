@@ -1840,6 +1840,29 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
+    async fn get_latest_observation_ts(&self, code_location_id: &str) -> Result<Option<i64>> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(
+                    "SELECT timestamp FROM events WHERE event_type = $etype \
+                     AND (code_location_id = $cl OR code_location_id = NONE) \
+                     ORDER BY timestamp DESC LIMIT 1",
+                )
+                .bind(("etype", "Observation".to_string()))
+                .bind(("cl", code_location_id.to_string()))
+                .await?;
+
+            #[derive(Debug, SurrealValue)]
+            struct TsRow {
+                timestamp: i64,
+            }
+            let rows: Vec<TsRow> = result.take(0)?;
+            Ok(rows.into_iter().next().map(|r| r.timestamp))
+        })
+        .await
+    }
+
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(%key))]
     async fn kv_get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         super::retry::with_retry(&self.retry_config, || async {
