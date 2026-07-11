@@ -12378,7 +12378,7 @@ fn test_node_label_exhaustive() {
             lookback_delta: Some(3600.0),
         }
         .node_label(),
-        "in_latest_time_window(3600s)"
+        "in_latest_time_window(lookback=3600)"
     );
     assert_eq!(
         ConditionNode::InLatestTimeWindow {

@@ -34,100 +34,10 @@ fn require_tag_filter(
     Ok(())
 }
 
-/// Human-readable description of a condition node (for Python display).
+/// Human-readable description of a condition node (for Python display) —
+/// the single recursive describer lives on `ConditionNode`.
 pub(crate) fn description(node: &ConditionNode) -> String {
-    match node {
-        ConditionNode::Missing => "missing".to_string(),
-        ConditionNode::InProgress => "in_progress".to_string(),
-        ConditionNode::ExecutionFailed => "execution_failed".to_string(),
-        ConditionNode::NewlyUpdated => "newly_updated".to_string(),
-        ConditionNode::NewlyRequested => "newly_requested".to_string(),
-        ConditionNode::CodeVersionChanged => "code_version_changed".to_string(),
-        ConditionNode::CronTickPassed {
-            cron_schedule,
-            timezone,
-        } => {
-            if let Some(tz) = timezone {
-                format!("cron_tick_passed('{}', tz='{}')", cron_schedule, tz)
-            } else {
-                format!("cron_tick_passed('{}')", cron_schedule)
-            }
-        }
-        ConditionNode::InLatestTimeWindow { lookback_delta } => {
-            if let Some(d) = lookback_delta {
-                format!("in_latest_time_window(lookback={})", d)
-            } else {
-                "in_latest_time_window".to_string()
-            }
-        }
-        ConditionNode::InitialEvaluation => "initial_evaluation".to_string(),
-        ConditionNode::DataVersionChanged => "data_version_changed".to_string(),
-        ConditionNode::BackfillInProgress => "backfill_in_progress".to_string(),
-        ConditionNode::LastExecutedWithTags {
-            tag_keys,
-            tag_values,
-        } => rivers_core::condition::node::format_tag_label(
-            "last_executed_with_tags",
-            tag_keys,
-            tag_values,
-        ),
-        ConditionNode::LastRunIncludesTarget => "last_run_includes_target".to_string(),
-        ConditionNode::WillBeRequested => "will_be_requested".to_string(),
-        ConditionNode::HasRunWithTags {
-            tag_keys,
-            tag_values,
-        } => rivers_core::condition::node::format_tag_label(
-            "has_run_with_tags",
-            tag_keys,
-            tag_values,
-        ),
-        ConditionNode::AllRunsHaveTags {
-            tag_keys,
-            tag_values,
-        } => rivers_core::condition::node::format_tag_label(
-            "all_runs_have_tags",
-            tag_keys,
-            tag_values,
-        ),
-        ConditionNode::AnyDepsMatch { condition, label } => match label {
-            Some(l) => l.clone(),
-            None => format!("any_deps_match({})", description(condition)),
-        },
-        ConditionNode::AllDepsMatch { condition, label } => match label {
-            Some(l) => l.clone(),
-            None => format!("all_deps_match({})", description(condition)),
-        },
-        ConditionNode::AssetMatches { keys, condition } => {
-            if keys.len() == 1 {
-                format!("asset_matches('{}', {})", keys[0], description(condition))
-            } else {
-                let joined: Vec<_> = keys.iter().map(|k| format!("'{}'", k)).collect();
-                format!(
-                    "asset_matches([{}], {})",
-                    joined.join(", "),
-                    description(condition)
-                )
-            }
-        }
-        ConditionNode::And(children) => {
-            let parts: Vec<String> = children.iter().map(description).collect();
-            format!("({})", parts.join(" & "))
-        }
-        ConditionNode::Or(children) => {
-            let parts: Vec<String> = children.iter().map(description).collect();
-            format!("({})", parts.join(" | "))
-        }
-        ConditionNode::Not(child) => format!("~{}", description(child)),
-        ConditionNode::NewlyTrue(child) => {
-            format!("{}.newly_true()", description(child))
-        }
-        ConditionNode::Since { trigger, reset } => {
-            format!("{}.since({})", description(trigger), description(reset))
-        }
-        ConditionNode::SinceLastHandled(child) => {
-            format!("{}.since_last_handled()", description(child))
-        }
-    }
+    node.describe()
 }
 
 /// Extract `str | list[str]` into `Vec<String>`.

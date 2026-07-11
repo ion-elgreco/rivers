@@ -382,7 +382,7 @@ impl ConditionNode {
                 None => format!("cron_tick_passed('{}')", cron_schedule),
             },
             ConditionNode::InLatestTimeWindow { lookback_delta } => match lookback_delta {
-                Some(d) => format!("in_latest_time_window({}s)", d),
+                Some(d) => format!("in_latest_time_window(lookback={})", d),
                 None => "in_latest_time_window".into(),
             },
             ConditionNode::InitialEvaluation => "initial_evaluation".into(),
@@ -454,12 +454,12 @@ impl ConditionNode {
                 format!("({})", parts.join(" | "))
             }
             ConditionNode::Not(child) => format!("~{}", child.describe()),
-            ConditionNode::NewlyTrue(child) => format!("newly_true({})", child.describe()),
+            ConditionNode::NewlyTrue(child) => format!("{}.newly_true()", child.describe()),
             ConditionNode::Since { trigger, reset } => {
-                format!("since({}, {})", trigger.describe(), reset.describe())
+                format!("{}.since({})", trigger.describe(), reset.describe())
             }
             ConditionNode::SinceLastHandled(child) => {
-                format!("since_last_handled({})", child.describe())
+                format!("{}.since_last_handled()", child.describe())
             }
             ConditionNode::AnyDepsMatch { condition, label } => match label {
                 Some(l) => l.clone(),
