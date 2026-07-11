@@ -2868,6 +2868,61 @@ fn all_partitions_dep_frontier_key_does_not_refire_whole_universe() {
 }
 
 #[test]
+fn unpartitioned_dep_frontier_key_does_not_refire_whole_universe() {
+    // The bridged (unpartitioned-dep) path floors the dep against the whole
+    // root universe like an AllPartitions edge; the floor must ignore
+    // never-attempted frontier keys, else a freshly-minted key drags the
+    // floor to None and the dep refires every partition each tick.
+    let d1 = spk("d1");
+    let d2 = spk("d2");
+    let d3 = spk("d3"); // freshly minted, never attempted
+    let all_keys = HashSet::from([d1.clone(), d2.clone(), d3.clone()]);
+
+    let a = make_materialized_record("a", 100);
+    let b = make_materialized_record("b", 90); // older than every attempted key
+    let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
+    let deps = HashMap::from([("a".to_string(), vec!["b".to_string()])]);
+
+    let a_timestamps = HashMap::from([(d1.clone(), 100i64), (d2.clone(), 100)]);
+    let a_mat = HashSet::from([d1.clone(), d2.clone()]);
+    let a_status = crate::condition::cache::PartitionStatusEntry {
+        materialized: a_mat.clone(),
+        timestamps: a_timestamps.clone(),
+        ..Default::default()
+    };
+    let partition_statuses = HashMap::from([("a".to_string(), a_status)]);
+
+    let all_states = HashMap::new();
+    let mut ctx = make_ctx("a", &a, &records, &deps);
+    ctx.all_asset_states = &all_states;
+
+    let empty_mappings = HashMap::new();
+    // "b" absent from upstream_partition_keys → unpartitioned dep → bridged bool path.
+    let no_upstream_keys = HashMap::new();
+    let pctx = PartitionEvalContext {
+        all_keys: &all_keys,
+        materialized: &a_mat,
+        in_progress: &HashSet::new(),
+        failed: &HashSet::new(),
+        timestamps: &a_timestamps,
+        resolver: PartitionResolver::new(&empty_mappings, &no_upstream_keys),
+        time_windows: None,
+        all_partition_statuses: &partition_statuses,
+        dep_root_floor: None,
+    };
+    ctx.partitions = Some(&pctx);
+
+    let result = evaluate(&ConditionNode::any_deps_updated(), &ctx);
+
+    assert!(
+        !result.fired,
+        "a never-attempted frontier key must not make the unpartitioned dep \
+         (@90, older than every attempted key @100) refire the universe, got {:?}",
+        result.selection
+    );
+}
+
+#[test]
 fn test_empty_partitioned_dep_universe_does_not_bridge_latch_to_all() {
     // An empty-universe partitioned dep (present with empty set, unlike an absent
     // unpartitioned dep) must take the partitioned path, not the bool fallback that

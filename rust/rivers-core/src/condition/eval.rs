@@ -1658,10 +1658,13 @@ fn eval_partitioned_on_dep(
         // pivot over the true root universe.
         let root_floor = match ctx.root_partition_floor {
             Some(f) => f,
+            // Fan-out over the whole root universe: ignore never-attempted
+            // frontier keys like an AllPartitions edge, or a freshly-minted
+            // key drags the floor to None and refires everything.
             None => pctx
                 .all_partition_statuses
                 .get(ctx.root_key)
-                .and_then(|status| root_floor_over(pctx.all_keys.iter(), status)),
+                .and_then(|status| root_floor_over_attempted(pctx.all_keys.iter(), status)),
         };
         let dep_state = ctx
             .all_asset_states
@@ -1805,7 +1808,7 @@ fn eval_partitioned_on_dep(
         ctx.root_partition_floor.unwrap_or_else(|| {
             pctx.all_partition_statuses
                 .get(ctx.root_key)
-                .and_then(|status| root_floor_over(pctx.all_keys.iter(), status))
+                .and_then(|status| root_floor_over_attempted(pctx.all_keys.iter(), status))
         })
     });
     let dep_ctx = EvalContext {
