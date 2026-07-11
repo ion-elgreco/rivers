@@ -97,8 +97,13 @@ impl ConditionTickHandle {
         &self.asset_outcomes
     }
 
-    /// Write the `ConditionTickRecord` once with all ids populated.
-    pub(super) async fn finalize(self, storage: &ScopedStorageHandle<SurrealStorage>) -> String {
+    /// Write the `ConditionTickRecord` once with all ids populated. `None`
+    /// when the store failed — there is no tick row for eval records to
+    /// reference, and a fabricated id would orphan them.
+    pub(super) async fn finalize(
+        self,
+        storage: &ScopedStorageHandle<SurrealStorage>,
+    ) -> Option<String> {
         let record = ConditionTickRecord {
             code_location_id: self.code_location_id,
             timestamp: self.timestamp,
@@ -110,10 +115,10 @@ impl ConditionTickHandle {
         };
 
         match storage.backend().store_condition_tick(&record).await {
-            Ok(id) => id,
+            Ok(id) => Some(id),
             Err(e) => {
                 tracing::error!(target: "rivers::daemon", error = %e, "failed to store condition tick");
-                format!("tick_{}", record.timestamp)
+                None
             }
         }
     }
