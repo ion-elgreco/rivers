@@ -235,6 +235,7 @@ pub struct ToMaterialize {
 }
 
 /// Materializations classified into the three dispatch shapes.
+#[derive(Clone)]
 pub struct MaterializationPlan {
     pub unpartitioned: Vec<String>,
     pub single_partition_groups: HashMap<PartitionKey, Vec<String>>,
@@ -424,6 +425,10 @@ pub struct ConditionPass {
     /// Time-window resolution source per time-window-partitioned asset
     /// (conditioned assets and upstream deps), for `InLatestTimeWindow`.
     pub time_window_sources: HashMap<String, TimeWindowSource>,
+    /// Set when the last committed tick had to skip fired assets (failed or
+    /// fully-dropped dispatch); forces the next tick to re-evaluate so their
+    /// un-consumed triggers can re-fire.
+    pub needs_retry: bool,
 }
 
 impl ConditionPass {
@@ -502,6 +507,7 @@ impl ConditionPass {
             upstream_partition_keys: keys_map,
             upstream_universes: universes_map,
             time_window_sources,
+            needs_retry: false,
         }
     }
 
@@ -571,25 +577,164 @@ impl ConditionPass {
 
     /// Skip this tick when nothing changed, we're past the initial tick, and no time-based conditions need re-eval.
     pub fn should_skip(&self, has_changes: bool) -> bool {
-        !has_changes
+        !self.needs_retry
+            && !has_changes
             && self.cache.initialized
             && !self.eval_state.is_initial
             && !self.has_time_based
     }
 
     /// One full tick: evaluate conditions, apply state mutations, and return the materialization plan.
+    ///
+    /// Equivalent to [`plan_tick`](Self::plan_tick) followed by an
+    /// all-successful [`commit_tick`](Self::commit_tick); dispatching callers
+    /// use the split so a failed dispatch never consumes eval-state latches.
     pub fn run(&mut self, now: i64, selective: bool) -> PassOutput {
+        let output = self.plan_tick(now, selective);
+        self.commit_tick(&output, &HashSet::new(), now);
+        output
+    }
+
+    /// Evaluate conditions and build the dispatch plan without advancing any
+    /// eval-state latches.
+    pub fn plan_tick(&mut self, now: i64, selective: bool) -> PassOutput {
         let results = self.evaluate(now, selective);
         // Consume the very-first-evaluation flag only AFTER the evaluation
-        // that is supposed to see it.
+        // that is supposed to see it (per-asset flags persist until their
+        // tick commits).
         if self.eval_state.is_initial {
             self.eval_state.is_initial = false;
         }
-        let to_materialize = self.apply_results(&results, now);
+        let to_materialize: Vec<ToMaterialize> = results
+            .iter()
+            .filter(|row| row.result.fired)
+            .map(|row| ToMaterialize {
+                asset_key: self.conditions[row.info_idx].asset_key.clone(),
+                selection: row.result.selection.clone(),
+            })
+            .collect();
+        for tm in &to_materialize {
+            if let Some(PartitionSelection::Keys(keys)) = &tm.selection {
+                tracing::info!(
+                    target: "rivers::daemon",
+                    asset_key = %tm.asset_key,
+                    partitions = keys.len(),
+                    "condition fired, triggering partition materialization"
+                );
+            } else {
+                tracing::info!(
+                    target: "rivers::daemon",
+                    asset_key = %tm.asset_key,
+                    "condition fired, triggering materialization"
+                );
+            }
+        }
         let plan = self.classify_materializations(to_materialize);
-        self.stamp_dispatched_handled(&plan, now);
-        self.eval_state.failed_assets = self.cache.failed_asset_timestamps.clone();
         PassOutput { results, plan }
+    }
+
+    /// Advance eval-state latches for a planned tick. Fired assets named in
+    /// `dispatch_failed` — and fired assets whose selection classified to
+    /// nothing dispatchable — keep their pre-tick state so their trigger
+    /// re-fires on the retry evaluation this schedules.
+    pub fn commit_tick(
+        &mut self,
+        output: &PassOutput,
+        dispatch_failed: &HashSet<String>,
+        now: i64,
+    ) {
+        let planned: HashSet<&str> = output
+            .plan
+            .unpartitioned
+            .iter()
+            .map(String::as_str)
+            .chain(
+                output
+                    .plan
+                    .single_partition_groups
+                    .values()
+                    .flatten()
+                    .map(String::as_str),
+            )
+            .chain(
+                output
+                    .plan
+                    .multi_partition_backfills
+                    .iter()
+                    .map(|(asset, _)| asset.as_str()),
+            )
+            .collect();
+        let mut skip: HashSet<String> = dispatch_failed.clone();
+        for row in &output.results {
+            if row.result.fired {
+                let key = &self.conditions[row.info_idx].asset_key;
+                if !planned.contains(key.as_str()) {
+                    skip.insert(key.clone());
+                }
+            }
+        }
+
+        let mut baseline_roots: Vec<String> = Vec::new();
+        for row in &output.results {
+            let info = &self.conditions[row.info_idx];
+            if skip.contains(&info.asset_key) {
+                continue;
+            }
+            let record = match self.cache.records.get(&info.asset_key) {
+                Some(r) => r,
+                None => continue,
+            };
+            let prev = self.eval_state.assets.get_mut(&info.asset_key).unwrap();
+
+            let partition_timestamps = info.partition_info.as_ref().and_then(|_| {
+                self.cache
+                    .partition_status
+                    .get(&info.asset_key)
+                    .map(|status| &status.timestamps)
+            });
+            let was_initial = prev.is_initial;
+            let update_ctx = StateUpdateContext {
+                target_record_timestamp: record.last_timestamp,
+                target_data_version: record.last_data_version.as_ref(),
+                now,
+                is_initial: was_initial,
+                partition_timestamps,
+            };
+            update_condition_state(prev, &update_ctx, &row.result);
+
+            if row.result.fired || was_initial {
+                baseline_roots.push(info.asset_key.clone());
+            }
+        }
+
+        if !baseline_roots.is_empty() {
+            update_dep_baselines(
+                &mut self.eval_state.assets,
+                &baseline_roots,
+                &self.cache.upstream_deps,
+                &self.active,
+                &self.cache.partition_status,
+                &self.cache.records,
+            );
+        }
+
+        // Handled marks and the handled cursor advance only for assets whose
+        // dispatch actually went out.
+        for (pk, assets) in &output.plan.single_partition_groups {
+            for asset in assets {
+                if !skip.contains(asset) {
+                    self.mark_partitions_handled(asset, std::slice::from_ref(pk));
+                }
+            }
+        }
+        for (asset, keys) in &output.plan.multi_partition_backfills {
+            if !skip.contains(asset) {
+                self.mark_partitions_handled(asset, keys);
+            }
+        }
+        self.stamp_dispatched_handled(&output.plan, &skip, now);
+        self.eval_state.failed_assets = self.cache.failed_asset_timestamps.clone();
+        self.needs_retry = !skip.is_empty();
     }
 
     fn evaluate(&self, now: i64, selective: bool) -> Vec<EvalResultRow> {
@@ -707,77 +852,6 @@ impl ConditionPass {
         results
     }
 
-    fn apply_results(&mut self, results: &[EvalResultRow], now: i64) -> Vec<ToMaterialize> {
-        let mut to_materialize: Vec<ToMaterialize> = Vec::new();
-        let mut baseline_roots: Vec<String> = Vec::new();
-
-        for row in results {
-            let info = &self.conditions[row.info_idx];
-            let record = match self.cache.records.get(&info.asset_key) {
-                Some(r) => r,
-                None => continue,
-            };
-            let prev = self.eval_state.assets.get_mut(&info.asset_key).unwrap();
-
-            let partition_timestamps = info.partition_info.as_ref().and_then(|_| {
-                self.cache
-                    .partition_status
-                    .get(&info.asset_key)
-                    .map(|status| &status.timestamps)
-            });
-            let was_initial = prev.is_initial;
-            let update_ctx = StateUpdateContext {
-                target_record_timestamp: record.last_timestamp,
-                target_data_version: record.last_data_version.as_ref(),
-                now,
-                is_initial: was_initial,
-                partition_timestamps,
-            };
-            update_condition_state(prev, &update_ctx, &row.result);
-
-            if row.result.fired || was_initial {
-                baseline_roots.push(info.asset_key.clone());
-            }
-
-            if row.result.fired {
-                to_materialize.push(ToMaterialize {
-                    asset_key: info.asset_key.clone(),
-                    selection: row.result.selection.clone(),
-                });
-            }
-        }
-
-        if !baseline_roots.is_empty() {
-            update_dep_baselines(
-                &mut self.eval_state.assets,
-                &baseline_roots,
-                &self.cache.upstream_deps,
-                &self.active,
-                &self.cache.partition_status,
-                &self.cache.records,
-            );
-        }
-
-        for tm in &to_materialize {
-            if let Some(PartitionSelection::Keys(keys)) = &tm.selection {
-                tracing::info!(
-                    target: "rivers::daemon",
-                    asset_key = %tm.asset_key,
-                    partitions = keys.len(),
-                    "condition fired, triggering partition materialization"
-                );
-            } else {
-                tracing::info!(
-                    target: "rivers::daemon",
-                    asset_key = %tm.asset_key,
-                    "condition fired, triggering materialization"
-                );
-            }
-        }
-
-        to_materialize
-    }
-
     /// Record dispatched partition keys in the asset's `handled` set.
     fn mark_partitions_handled(&mut self, asset_key: &str, keys: &[PartitionKey]) {
         if let Some(prev) = self.eval_state.assets.get_mut(asset_key) {
@@ -825,7 +899,6 @@ impl ConditionPass {
                             .in_progress_assets
                             .entry(tm.asset_key.clone())
                             .or_default();
-                        self.mark_partitions_handled(&tm.asset_key, &surviving);
                         partitioned_mats.push((tm.asset_key, surviving));
                     }
                 }
@@ -842,7 +915,6 @@ impl ConditionPass {
                                 .in_progress_assets
                                 .entry(tm.asset_key.clone())
                                 .or_default();
-                            self.mark_partitions_handled(&tm.asset_key, &all_keys);
                             partitioned_mats.push((tm.asset_key, all_keys));
                         }
                         Some(_) => {}
@@ -887,7 +959,12 @@ impl ConditionPass {
     }
 
     /// Advance the asset-level handled cursor only for assets the plan actually dispatched.
-    fn stamp_dispatched_handled(&mut self, plan: &MaterializationPlan, now: i64) {
+    fn stamp_dispatched_handled(
+        &mut self,
+        plan: &MaterializationPlan,
+        skip: &HashSet<String>,
+        now: i64,
+    ) {
         let dispatched: HashSet<&str> = plan
             .unpartitioned
             .iter()
@@ -905,6 +982,9 @@ impl ConditionPass {
             )
             .collect();
         for asset_key in dispatched {
+            if skip.contains(asset_key) {
+                continue;
+            }
             if let Some(prev) = self.eval_state.assets.get_mut(asset_key) {
                 prev.last_handled_timestamp = Some(now);
             }
@@ -991,9 +1071,16 @@ mod tests {
             ),
             duration_us: 0,
         };
-        let to_mat = pass.apply_results(&[row], 5000);
+        let to_mat = vec![ToMaterialize {
+            asset_key: "down".to_string(),
+            selection: row.result.selection.clone(),
+        }];
         let plan = pass.classify_materializations(to_mat);
-        pass.stamp_dispatched_handled(&plan, 5000);
+        let output = PassOutput {
+            results: vec![row],
+            plan,
+        };
+        pass.commit_tick(&output, &HashSet::new(), 5000);
         pass.eval_state.assets["down"].last_handled_timestamp
     }
 
@@ -1769,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_marks_only_surviving_keys_handled() {
+    fn commit_marks_only_surviving_keys_handled() {
         let mut pass = ConditionPass::new(
             AssetConditionCache::default(),
             ConditionEvalState::default(),
@@ -1790,12 +1877,20 @@ mod tests {
             "down".to_string(),
             crate::condition::state::AssetConditionState::default(),
         );
-        pass.classify_materializations(vec![ToMaterialize {
+        let plan = pass.classify_materializations(vec![ToMaterialize {
             asset_key: "down".to_string(),
             selection: Some(PartitionSelection::Keys(
                 [spk("2024-01-02"), spk("2024-08-16")].into_iter().collect(),
             )),
         }]);
+        pass.commit_tick(
+            &PassOutput {
+                results: vec![],
+                plan,
+            },
+            &HashSet::new(),
+            2,
+        );
         let handled = pass.eval_state.assets["down"]
             .partition_state
             .as_ref()
@@ -2051,7 +2146,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_marks_all_selection_keys_handled() {
+    fn commit_marks_all_selection_keys_handled() {
         let mut pass = ConditionPass::new(
             AssetConditionCache::default(),
             ConditionEvalState::default(),
@@ -2076,7 +2171,12 @@ mod tests {
             asset_key: "down".to_string(),
             selection: Some(PartitionSelection::All),
         }]);
-        let mut backfills = plan.multi_partition_backfills;
+        let output = PassOutput {
+            results: vec![],
+            plan,
+        };
+        pass.commit_tick(&output, &HashSet::new(), 2);
+        let mut backfills = output.plan.multi_partition_backfills;
         assert_eq!(
             backfills.len(),
             1,
