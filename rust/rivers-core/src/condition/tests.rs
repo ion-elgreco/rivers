@@ -7993,12 +7993,17 @@ async fn test_initial_load_derives_failure_floor_from_run_history() {
             backfill_strategy: None,
         },
     ];
+    // b also carries a stale PERSISTED floor (from an eval-state snapshot
+    // taken before it recovered while the daemon was down) — the load must
+    // drop it, not trust it.
+    let mut eval_state = ConditionEvalState {
+        is_initial: true,
+        ..Default::default()
+    };
+    eval_state.failed_assets.insert("b".to_string(), 2_500);
     let mut pass = ConditionPass::new(
         AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
-        ConditionEvalState {
-            is_initial: true,
-            ..Default::default()
-        },
+        eval_state,
         conditions,
         HashMap::new(),
     );
@@ -8011,7 +8016,8 @@ async fn test_initial_load_derives_failure_floor_from_run_history() {
     );
     assert!(
         !out.plan.unpartitioned.contains(&"b".to_string()),
-        "a failure outranked by a newer materialization must not fire"
+        "a failure outranked by a newer materialization must not fire, even when \
+         a stale persisted floor rehydrated it"
     );
 }
 
