@@ -8008,7 +8008,8 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
     pass.cache.clear_dispatched_run("dst", "run-fail");
     // …and commit the tick with dst's dispatch marked failed.
     let failed: HashSet<String> = ["dst".to_string()].into_iter().collect();
-    pass.commit_tick(&out, &failed, 4_000);
+    let dirty = pass.commit_tick(&out, &failed, 4_000);
+    assert!(!dirty, "an all-failed tick leaves no latch state to persist");
 
     assert!(
         !pass.should_skip(false),
@@ -8019,7 +8020,8 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
         retry.plan.unpartitioned.contains(&"dst".to_string()),
         "the un-consumed dep trigger must re-fire on the retry tick"
     );
-    pass.commit_tick(&retry, &HashSet::new(), 5_000);
+    let dirty = pass.commit_tick(&retry, &HashSet::new(), 5_000);
+    assert!(dirty, "a committed fire consumes latches and must persist");
 
     assert!(
         pass.should_skip(false),
@@ -8031,7 +8033,8 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
         "the trigger must be consumed exactly once after a successful dispatch; got {:?}",
         done.plan.unpartitioned
     );
-    pass.commit_tick(&done, &HashSet::new(), 6_000);
+    let dirty = pass.commit_tick(&done, &HashSet::new(), 6_000);
+    assert!(!dirty, "a passive tick has nothing latch-bearing to persist");
 }
 
 #[tokio::test]

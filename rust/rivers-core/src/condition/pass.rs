@@ -639,12 +639,17 @@ impl ConditionPass {
     /// `dispatch_failed` — and fired assets whose selection classified to
     /// nothing dispatchable — keep their pre-tick state so their trigger
     /// re-fires on the retry evaluation this schedules.
+    ///
+    /// Returns whether the state materially advanced (latches consumed via a
+    /// fire or initial baseline seeding, or failure floors moved) — passive
+    /// ticks only refresh derivable views and callers may throttle their
+    /// persistence.
     pub fn commit_tick(
         &mut self,
         output: &PassOutput,
         dispatch_failed: &HashSet<String>,
         now: i64,
-    ) {
+    ) -> bool {
         let planned: HashSet<&str> = output
             .plan
             .unpartitioned
@@ -735,8 +740,10 @@ impl ConditionPass {
             }
         }
         self.stamp_dispatched_handled(&output.plan, &skip, now);
+        let floors_moved = self.eval_state.failed_assets != self.cache.failed_asset_timestamps;
         self.eval_state.failed_assets = self.cache.failed_asset_timestamps.clone();
         self.needs_retry = !skip.is_empty();
+        !baseline_roots.is_empty() || floors_moved
     }
 
     /// Post-commit scalar states for the planned fired assets of `output`,
