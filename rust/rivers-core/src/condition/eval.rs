@@ -312,7 +312,13 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
             &mut sub_selections,
             &mut dep_scope,
         );
-        let fired = !selection.is_empty();
+        // `All` of an empty universe selects nothing (mirrors
+        // `evaluate_with_tree`): reporting fired would leak a full
+        // WillBeRequested signal downstream.
+        let fired = match &selection {
+            PartitionSelection::All => !pctx.all_keys.is_empty(),
+            other => !other.is_empty(),
+        };
         tracing::debug!(
             target: "rivers::condition",
             asset_key = %ctx.target_key,
@@ -750,7 +756,13 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
             &mut sub_selections,
             &mut dep_scope,
         );
-        let fired = !selection.is_empty();
+        // `All` of an empty universe selects nothing: reporting fired would
+        // leak a full WillBeRequested signal downstream with nothing to
+        // materialize behind it.
+        let fired = match &selection {
+            PartitionSelection::All => !pctx.all_keys.is_empty(),
+            other => !other.is_empty(),
+        };
         (
             EvalResult {
                 fired,
