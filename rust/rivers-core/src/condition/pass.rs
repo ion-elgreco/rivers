@@ -93,74 +93,51 @@ fn refresh_universe(
         PartitionUniverse::TimeWindow {
             grid,
             enumerated_to,
-        } => {
-            let bound = grid.end.map_or(now, |e| e.min(now));
-            if bound <= *enumerated_to {
-                return false;
-            }
-            let mut changed = false;
-            match grid.window_starts_in(*enumerated_to, bound) {
-                Ok(new_keys) => {
-                    for k in new_keys {
-                        changed |= all_keys.insert(PartitionKey::Single { keys: vec![k] });
-                    }
-                    *enumerated_to = bound;
-                }
-                Err(e) => {
-                    tracing::warn!(target: "rivers::daemon", error = %e, "time-window universe refresh failed");
-                }
-            }
-            changed
-        }
+        } => advance_time_window_axis(grid, enumerated_to, now, |k| {
+            all_keys.insert(PartitionKey::Single { keys: vec![k] })
+        }),
         PartitionUniverse::Dynamic { namespace } => {
             let Some(keys) = dynamic_keys.get(namespace) else {
                 return false;
             };
-            let new_set: HashSet<PartitionKey> = keys
+            if !dynamic_axis_changed(keys, all_keys.len(), |k| {
+                all_keys.contains(&PartitionKey::Single {
+                    keys: vec![k.to_string()],
+                })
+            }) {
+                return false;
+            }
+            *all_keys = keys
                 .iter()
                 .map(|k| PartitionKey::Single {
                     keys: vec![k.clone()],
                 })
                 .collect();
-            if new_set == *all_keys {
-                return false;
-            }
-            *all_keys = new_set;
             true
         }
         PartitionUniverse::Multi { dims } => {
             let mut changed = false;
             for (_, du) in dims.iter_mut() {
-                match &mut du.kind {
+                let DimensionUniverse { keys: dim_keys, kind } = du;
+                match kind {
                     DimensionKind::Frozen => {}
                     DimensionKind::TimeWindow {
                         grid,
                         enumerated_to,
                     } => {
-                        let bound = grid.end.map_or(now, |e| e.min(now));
-                        if bound <= *enumerated_to {
-                            continue;
-                        }
-                        match grid.window_starts_in(*enumerated_to, bound) {
-                            Ok(new_keys) => {
-                                for k in new_keys {
-                                    changed |= du.keys.insert(k);
-                                }
-                                *enumerated_to = bound;
-                            }
-                            Err(e) => {
-                                tracing::warn!(target: "rivers::daemon", error = %e, "time-window dimension refresh failed");
-                            }
-                        }
+                        changed |= advance_time_window_axis(grid, enumerated_to, now, |k| {
+                            dim_keys.insert(k)
+                        });
                     }
                     DimensionKind::Dynamic { namespace } => {
                         if let Some(keys) = dynamic_keys.get(namespace)
-                            && (keys.len() != du.keys.len()
-                                || !du.keys.iter().all(|k| keys.contains(k)))
+                            && dynamic_axis_changed(keys, dim_keys.len(), |k| {
+                                dim_keys.contains(k)
+                            })
                         {
                             let mut sorted: Vec<String> = keys.iter().cloned().collect();
                             sorted.sort();
-                            du.keys = sorted.into_iter().collect();
+                            *dim_keys = sorted.into_iter().collect();
                             changed = true;
                         }
                     }
@@ -172,6 +149,45 @@ fn refresh_universe(
             changed
         }
     }
+}
+
+/// Advance one time-window axis: enumerate window starts in
+/// `(enumerated_to, min(grid.end, now)]` and offer each new key to `insert`.
+/// Owned by every axis shape — the top-level universe and each `Multi`
+/// dimension — so window-enumeration fixes can't drift between them.
+fn advance_time_window_axis(
+    grid: &TimeGrid,
+    enumerated_to: &mut NaiveDateTime,
+    now: NaiveDateTime,
+    mut insert: impl FnMut(String) -> bool,
+) -> bool {
+    let bound = grid.end.map_or(now, |e| e.min(now));
+    if bound <= *enumerated_to {
+        return false;
+    }
+    let mut changed = false;
+    match grid.window_starts_in(*enumerated_to, bound) {
+        Ok(new_keys) => {
+            for k in new_keys {
+                changed |= insert(k);
+            }
+            *enumerated_to = bound;
+        }
+        Err(e) => {
+            tracing::warn!(target: "rivers::daemon", error = %e, "time-window axis refresh failed");
+        }
+    }
+    changed
+}
+
+/// Whether a dynamic axis' membership differs from the freshly fetched
+/// namespace keys (equal length and full containment ⇒ equal sets).
+fn dynamic_axis_changed(
+    fresh: &HashSet<String>,
+    current_len: usize,
+    contains: impl Fn(&str) -> bool,
+) -> bool {
+    fresh.len() != current_len || !fresh.iter().all(|k| contains(k.as_str()))
 }
 
 /// Cartesian product of dimension key lists as `Multi` keys (def order).
