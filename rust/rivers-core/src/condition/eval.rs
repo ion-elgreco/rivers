@@ -1157,9 +1157,11 @@ fn eval_partitioned<O: PartEvalOutput>(
 
     match node {
         ConditionNode::Missing => {
+            // Materialized == has a timestamp; the cache keeps them in lockstep.
             let missing: HashSet<PartitionKey> = pctx
                 .all_keys
-                .difference(pctx.materialized)
+                .iter()
+                .filter(|k| !pctx.timestamps.contains_key(*k))
                 .cloned()
                 .collect();
             let sel = if missing.is_empty() {
@@ -1778,7 +1780,6 @@ fn eval_partitioned_on_dep(
 
     let upstream_pctx = PartitionEvalContext {
         all_keys: &upstream_all_keys,
-        materialized: &upstream_status.materialized,
         in_progress: &upstream_status.in_progress,
         failed: &upstream_status.failed,
         timestamps: &upstream_status.timestamps,
