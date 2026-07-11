@@ -10109,6 +10109,42 @@ fn test_partition_mapping_multi_to_single_empty_and_all() {
     );
 }
 
+#[test]
+fn test_partition_mapping_single_to_multi_expands_against_universe() {
+    // MultiToSingle's other orientation: a Single-partitioned upstream feeding
+    // a Multi-partitioned downstream. The upstream key constrains the named
+    // dimension; the remaining dimensions expand against the downstream
+    // universe.
+    let m = PartitionMappingKind::MultiToSingle {
+        dimension_name: "date".into(),
+        inner: Box::new(PartitionMappingKind::Identity),
+    };
+    let universe = HashSet::from([
+        mpk(&[("date", "2024-01-05"), ("region", "us")]),
+        mpk(&[("date", "2024-01-05"), ("region", "eu")]),
+        mpk(&[("date", "2024-01-06"), ("region", "us")]),
+    ]);
+    let upstream = PartitionSelection::Keys(HashSet::from([spk("2024-01-05")]));
+    assert_eq!(
+        m.map_to_downstream_in(&upstream, Some(&universe)),
+        PartitionSelection::Keys(HashSet::from([
+            mpk(&[("date", "2024-01-05"), ("region", "us")]),
+            mpk(&[("date", "2024-01-05"), ("region", "eu")]),
+        ])),
+        "a Single upstream key must select every downstream Multi key matching the named dimension"
+    );
+    // Without a universe the fan-out must over-approximate, not drop the update.
+    assert_eq!(m.map_to_downstream(&upstream), PartitionSelection::All);
+    // An upstream key matching nothing downstream maps to Empty.
+    assert_eq!(
+        m.map_to_downstream_in(
+            &PartitionSelection::Keys(HashSet::from([spk("2020-12-31")])),
+            Some(&universe)
+        ),
+        PartitionSelection::Empty
+    );
+}
+
 // ── Partition resolver with Multi/MultiToSingle ─────────────────────────
 
 #[test]
