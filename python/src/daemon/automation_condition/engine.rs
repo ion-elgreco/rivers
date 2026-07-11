@@ -1,7 +1,7 @@
 //! Per-tick orchestration of automation conditions on the Python side.
 use std::sync::Arc;
 
-use rivers_core::condition::{ConditionPass, EvalResultRow};
+use rivers_core::condition::{ConditionPass, EvalResultRow, PendingDispatch, PendingDispatchEntry};
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{ConditionEvalRecord, ScopedStorageHandle, TickRecord};
 
@@ -102,13 +102,56 @@ impl ConditionTickEngine {
         }
 
         let mut dispatch_failed: std::collections::HashSet<String> = Default::default();
+        let mut intent_written = false;
         if !output.results.is_empty() {
             let mut handle = super::persist::ConditionTickHandle::new(
                 self.code_location_id.clone(),
                 now,
                 &output.results,
             );
-            self.dispatch_materializations(output.plan.clone(), &mut handle)
+            let run_requests = self.prepare_run_requests(&output.plan, &mut handle);
+            // Persist the dispatch intent BEFORE anything goes out: a crash
+            // between dispatch and the eval-state persist below would
+            // otherwise replay the tick's consumed latches on restart and
+            // double-materialize.
+            let scalar_states = self.pass.pending_dispatch_states(&output, now);
+            if !scalar_states.is_empty() {
+                let mut run_ids_by_asset: std::collections::HashMap<String, Vec<String>> =
+                    Default::default();
+                for req in &run_requests {
+                    for asset in &req.asset_selection {
+                        run_ids_by_asset
+                            .entry(asset.clone())
+                            .or_default()
+                            .push(req.run_id.clone());
+                    }
+                }
+                let pending = PendingDispatch {
+                    tick_timestamp: now,
+                    entries: scalar_states
+                        .into_iter()
+                        .map(|(asset_key, committed)| PendingDispatchEntry {
+                            run_ids: run_ids_by_asset.remove(&asset_key).unwrap_or_default(),
+                            asset_key,
+                            committed,
+                        })
+                        .collect(),
+                };
+                match self
+                    .storage
+                    .scoped()
+                    .set_condition_pending_dispatch(&pending)
+                    .await
+                {
+                    Ok(()) => intent_written = true,
+                    Err(e) => tracing::warn!(
+                        target: "rivers::daemon",
+                        error = %e,
+                        "failed to persist dispatch intent; a crash before the eval-state persist may double-fire"
+                    ),
+                }
+            }
+            self.dispatch_materializations(output.plan.clone(), run_requests, &mut handle)
                 .await;
             // Per-asset tick history derives from the dispatch OUTCOME — a
             // pre-written "Requested" row can't show a failed or dropped
@@ -144,17 +187,35 @@ impl ConditionTickEngine {
         // ones stay armed and force a retry evaluation next tick.
         self.pass.commit_tick(&output, &dispatch_failed, now);
 
-        if let Err(e) = self
+        match self
             .storage
             .scoped()
             .set_condition_eval_state(&self.pass.eval_state)
             .await
         {
-            tracing::error!(
+            Ok(()) => {
+                if intent_written {
+                    // Cleared only after the state landed — the intent is the
+                    // crash guard for the window in between.
+                    if let Err(e) = self
+                        .storage
+                        .scoped()
+                        .set_condition_pending_dispatch(&PendingDispatch::default())
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "rivers::daemon",
+                            error = %e,
+                            "failed to clear dispatch intent; restart re-runs an idempotent recovery"
+                        );
+                    }
+                }
+            }
+            Err(e) => tracing::error!(
                 target: "rivers::daemon",
                 error = %e,
                 "failed to persist condition eval state; a restart replays this tick's latches"
-            );
+            ),
         }
     }
 

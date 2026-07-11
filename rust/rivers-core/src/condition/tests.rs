@@ -7934,6 +7934,349 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
 }
 
 #[tokio::test]
+async fn test_crash_after_dispatch_recovers_latches_from_intent() {
+    // Crash window: a tick's run was durably dispatched (and even completed),
+    // but the daemon died before persisting eval state. The pre-dispatch
+    // intent must replay the consumed latches on restart so the tick's
+    // trigger doesn't re-fire and double-materialize.
+    use crate::condition::pass::{AssetConditionInfo, ConditionPass, recover_pending_dispatch};
+    use crate::condition::state::PendingDispatch;
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, ScopedStorageHandle, StorageBackend,
+    };
+
+    let storage = std::sync::Arc::new(SurrealStorage::new_memory().await.unwrap());
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[
+            make_materialized_record("raw", 1_000),
+            make_materialized_record("dst", 1_000),
+        ])
+        .await
+        .unwrap();
+    use crate::assets::graph::TopologyNode;
+    let topo = GraphTopology {
+        nodes: vec![
+            TopologyNode {
+                name: "raw".into(),
+                kind: crate::assets::graph::NodeKind::Asset,
+                group: None,
+                parent_graph: None,
+            },
+            TopologyNode {
+                name: "dst".into(),
+                kind: crate::assets::graph::NodeKind::Asset,
+                group: None,
+                parent_graph: None,
+            },
+        ],
+        edges: vec![("dst".to_string(), "raw".to_string())],
+    };
+    storage
+        .kv_set(
+            &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
+            &serde_json::to_vec(&topo).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let conditions = || {
+        vec![AssetConditionInfo {
+            asset_key: "dst".to_string(),
+            condition: ConditionNode::any_deps_match(ConditionNode::DataVersionChanged),
+            partition_info: None,
+            backfill_strategy: None,
+        }]
+    };
+    let mk_run = |id: &str, asset: &str, start: i64| RunRecord {
+        run_id: id.to_string(),
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        job_name: Some("test".to_string()),
+        status: RunStatus::Started,
+        start_time: start,
+        end_time: None,
+        tags: vec![],
+        node_names: vec![asset.to_string()],
+        priority: 0,
+        partition_key: None,
+        block_reason: None,
+        launched_by: LaunchedBy::Condition,
+    };
+    let mk_event = |run_id: &str, asset: &str, dv: &str, ts: i64| crate::storage::EventRecord {
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        event_type: crate::storage::EventType::Materialization {
+            data_version: Some(dv.to_string()),
+        },
+        asset_key: Some(asset.to_string()),
+        run_id: run_id.to_string(),
+        partition_key: None,
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+
+    let mut pass1 = ConditionPass::new(
+        AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+        ConditionEvalState {
+            is_initial: true,
+            ..Default::default()
+        },
+        conditions(),
+        HashMap::new(),
+    );
+    pass1.refresh_cache(storage.as_ref(), 2_000).await.unwrap();
+    let out0 = pass1.run(2_000, false);
+    assert!(out0.plan.is_empty(), "initial tick must not fire");
+    // The pre-fire eval state is what a restart will load.
+    storage
+        .for_code_location(&ctx)
+        .set_condition_eval_state(&pass1.eval_state)
+        .await
+        .unwrap();
+
+    // raw's data version changes → dst fires.
+    storage.create_run(&mk_run("run-raw", "raw", 2_500)).await.unwrap();
+    storage
+        .update_run_status("run-raw", RunStatus::Success, Some(3_000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[mk_event("run-raw", "raw", "v2", 3_000)])
+        .await
+        .unwrap();
+    pass1.refresh_cache(storage.as_ref(), 4_000).await.unwrap();
+    let out = pass1.plan_tick(4_000, false);
+    assert!(
+        out.plan.unpartitioned.contains(&"dst".to_string()),
+        "precondition: the dep dv change must fire dst"
+    );
+
+    // The engine persists the intent, then dispatch goes out durably and the
+    // run even completes, materializing dst…
+    let pending = PendingDispatch {
+        tick_timestamp: 4_000,
+        entries: pass1
+            .pending_dispatch_states(&out, 4_000)
+            .into_iter()
+            .map(
+                |(asset_key, committed)| crate::condition::state::PendingDispatchEntry {
+                    asset_key,
+                    run_ids: vec!["run-dst".to_string()],
+                    committed,
+                },
+            )
+            .collect(),
+    };
+    storage
+        .for_code_location(&ctx)
+        .set_condition_pending_dispatch(&pending)
+        .await
+        .unwrap();
+    storage.create_run(&mk_run("run-dst", "dst", 4_500)).await.unwrap();
+    storage
+        .update_run_status("run-dst", RunStatus::Success, Some(5_000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[mk_event("run-dst", "dst", "dst-v2", 5_000)])
+        .await
+        .unwrap();
+    // …and the daemon dies before set_condition_eval_state. pass1 is gone.
+
+    // Restart: load the STALE eval state, recover from the intent.
+    let mut eval_state2 = storage
+        .for_code_location(&ctx)
+        .get_condition_eval_state()
+        .await
+        .unwrap()
+        .expect("pre-fire state was persisted");
+    eval_state2.migrate_loaded();
+    let handle = ScopedStorageHandle::new(std::sync::Arc::clone(&storage), ctx.clone());
+    recover_pending_dispatch(&mut eval_state2, &handle).await.unwrap();
+
+    let mut pass2 = ConditionPass::new(
+        AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+        eval_state2,
+        conditions(),
+        HashMap::new(),
+    );
+    pass2.refresh_cache(storage.as_ref(), 6_000).await.unwrap();
+    let out2 = pass2.plan_tick(6_000, false);
+    assert!(
+        out2.plan.unpartitioned.is_empty(),
+        "recovered latches must suppress the replayed fire; got {:?}",
+        out2.plan.unpartitioned
+    );
+
+    let cleared = storage
+        .for_code_location(&ctx)
+        .get_condition_pending_dispatch()
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    assert!(cleared.entries.is_empty(), "the intent must be cleared after recovery");
+}
+
+#[tokio::test]
+async fn test_crash_before_dispatch_leaves_trigger_armed() {
+    // The symmetric case: the intent was written but the run never reached
+    // storage (crash before dispatch). Recovery must NOT consume the latches
+    // — the next tick re-fires as the retry.
+    use crate::condition::pass::{AssetConditionInfo, ConditionPass, recover_pending_dispatch};
+    use crate::condition::state::{PendingDispatch, PendingDispatchEntry};
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, ScopedStorageHandle, StorageBackend,
+    };
+
+    let storage = std::sync::Arc::new(SurrealStorage::new_memory().await.unwrap());
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[
+            make_materialized_record("raw", 1_000),
+            make_materialized_record("dst", 1_000),
+        ])
+        .await
+        .unwrap();
+    use crate::assets::graph::TopologyNode;
+    let topo = GraphTopology {
+        nodes: vec![
+            TopologyNode {
+                name: "raw".into(),
+                kind: crate::assets::graph::NodeKind::Asset,
+                group: None,
+                parent_graph: None,
+            },
+            TopologyNode {
+                name: "dst".into(),
+                kind: crate::assets::graph::NodeKind::Asset,
+                group: None,
+                parent_graph: None,
+            },
+        ],
+        edges: vec![("dst".to_string(), "raw".to_string())],
+    };
+    storage
+        .kv_set(
+            &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
+            &serde_json::to_vec(&topo).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let conditions = || {
+        vec![AssetConditionInfo {
+            asset_key: "dst".to_string(),
+            condition: ConditionNode::any_deps_match(ConditionNode::DataVersionChanged),
+            partition_info: None,
+            backfill_strategy: None,
+        }]
+    };
+
+    let mut pass1 = ConditionPass::new(
+        AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+        ConditionEvalState {
+            is_initial: true,
+            ..Default::default()
+        },
+        conditions(),
+        HashMap::new(),
+    );
+    pass1.refresh_cache(storage.as_ref(), 2_000).await.unwrap();
+    pass1.run(2_000, false);
+    storage
+        .for_code_location(&ctx)
+        .set_condition_eval_state(&pass1.eval_state)
+        .await
+        .unwrap();
+
+    storage
+        .create_run(&RunRecord {
+            run_id: "run-raw".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2_500,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["raw".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    storage
+        .update_run_status("run-raw", RunStatus::Success, Some(3_000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[crate::storage::EventRecord {
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            event_type: crate::storage::EventType::Materialization {
+                data_version: Some("v2".to_string()),
+            },
+            asset_key: Some("raw".to_string()),
+            run_id: "run-raw".to_string(),
+            partition_key: None,
+            timestamp: 3_000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        }])
+        .await
+        .unwrap();
+    pass1.refresh_cache(storage.as_ref(), 4_000).await.unwrap();
+    let out = pass1.plan_tick(4_000, false);
+    assert!(out.plan.unpartitioned.contains(&"dst".to_string()));
+
+    // Intent written; the run never reached storage (crash before dispatch).
+    let pending = PendingDispatch {
+        tick_timestamp: 4_000,
+        entries: pass1
+            .pending_dispatch_states(&out, 4_000)
+            .into_iter()
+            .map(|(asset_key, committed)| PendingDispatchEntry {
+                asset_key,
+                run_ids: vec!["run-never-created".to_string()],
+                committed,
+            })
+            .collect(),
+    };
+    storage
+        .for_code_location(&ctx)
+        .set_condition_pending_dispatch(&pending)
+        .await
+        .unwrap();
+
+    let mut eval_state2 = storage
+        .for_code_location(&ctx)
+        .get_condition_eval_state()
+        .await
+        .unwrap()
+        .expect("pre-fire state was persisted");
+    eval_state2.migrate_loaded();
+    let handle = ScopedStorageHandle::new(std::sync::Arc::clone(&storage), ctx.clone());
+    recover_pending_dispatch(&mut eval_state2, &handle).await.unwrap();
+
+    let mut pass2 = ConditionPass::new(
+        AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+        eval_state2,
+        conditions(),
+        HashMap::new(),
+    );
+    pass2.refresh_cache(storage.as_ref(), 6_000).await.unwrap();
+    let out2 = pass2.plan_tick(6_000, false);
+    assert!(
+        out2.plan.unpartitioned.contains(&"dst".to_string()),
+        "a dispatch that never happened must stay armed and re-fire"
+    );
+}
+
+#[tokio::test]
 async fn test_restart_does_not_replay_newest_run_tick_tags() {
     // The newest pre-restart run must not repopulate the tick-scoped tag
     // accumulators on the first steady refresh — HasRunWithTags would report

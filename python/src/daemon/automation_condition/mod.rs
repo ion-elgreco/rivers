@@ -342,6 +342,18 @@ pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
         }
     };
 
+    // Replay latches consumed by a tick whose dispatch went out but whose
+    // eval-state persist never landed (crash window).
+    if let Err(e) =
+        rivers_core::condition::recover_pending_dispatch(&mut eval_state, &storage).await
+    {
+        tracing::warn!(
+            target: "rivers::daemon",
+            error = %e,
+            "failed to recover pending dispatch intent; a crash-interrupted tick may re-fire"
+        );
+    }
+
     for info in &conditions {
         let current_fp = info.condition.fingerprint_hex();
         let state = eval_state.assets.entry(info.asset_key.clone()).or_default();

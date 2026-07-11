@@ -12,8 +12,9 @@ use crate::condition::partition::{
     PartitionState,
 };
 use crate::condition::state::{
-    CacheSnapshot, ConditionEvalState, EvalContext, EvalNodeResult, EvalResult, RunTagSnapshot,
-    StateUpdateContext, update_condition_state, update_dep_baselines,
+    AssetConditionState, CacheSnapshot, ConditionEvalState, DepBaseline, EvalContext,
+    EvalNodeResult, EvalResult, PendingDispatch, RunTagSnapshot, StateUpdateContext,
+    update_condition_state, update_dep_baselines,
 };
 use crate::storage::{BackfillStrategy, PartitionKey, StorageBackend};
 use crate::timegrid::TimeGrid;
@@ -737,6 +738,82 @@ impl ConditionPass {
         self.needs_retry = !skip.is_empty();
     }
 
+    /// Post-commit scalar states for the planned fired assets of `output`,
+    /// computed without mutating the pass — persisted as dispatch intent
+    /// before the tick's runs go out (see [`PendingDispatch`]).
+    pub fn pending_dispatch_states(
+        &self,
+        output: &PassOutput,
+        now: i64,
+    ) -> Vec<(String, AssetConditionState)> {
+        let planned: HashSet<&str> = output
+            .plan
+            .unpartitioned
+            .iter()
+            .map(String::as_str)
+            .chain(
+                output
+                    .plan
+                    .single_partition_groups
+                    .values()
+                    .flatten()
+                    .map(String::as_str),
+            )
+            .chain(
+                output
+                    .plan
+                    .multi_partition_backfills
+                    .iter()
+                    .map(|(asset, _)| asset.as_str()),
+            )
+            .collect();
+        let mut out = Vec::new();
+        for row in &output.results {
+            if !row.result.fired {
+                continue;
+            }
+            let info = &self.conditions[row.info_idx];
+            if !planned.contains(info.asset_key.as_str()) {
+                continue;
+            }
+            let Some(record) = self.cache.records.get(&info.asset_key) else {
+                continue;
+            };
+            let Some(prev) = self.eval_state.assets.get(&info.asset_key) else {
+                continue;
+            };
+            let mut state = prev.scalar_clone();
+            let update_ctx = StateUpdateContext {
+                target_record_timestamp: record.last_timestamp,
+                target_data_version: record.last_data_version.as_ref(),
+                now,
+                is_initial: prev.is_initial,
+                partition_timestamps: None,
+            };
+            update_condition_state(&mut state, &update_ctx, &row.result);
+            if let Some(deps) = self.cache.upstream_deps.get(&info.asset_key) {
+                for dep in deps {
+                    if self.active.contains(dep) {
+                        continue;
+                    }
+                    let dep_record = self.cache.records.get(dep);
+                    state.dep_baselines.insert(
+                        dep.clone(),
+                        DepBaseline {
+                            last_materialized_timestamp: dep_record
+                                .and_then(|r| r.last_timestamp),
+                            last_data_version: dep_record
+                                .and_then(|r| r.last_data_version.clone()),
+                        },
+                    );
+                }
+            }
+            state.last_handled_timestamp = Some(now);
+            out.push((info.asset_key.clone(), state));
+        }
+        out
+    }
+
     fn evaluate(&self, now: i64, selective: bool) -> Vec<EvalResultRow> {
         let now_local = chrono::Local.timestamp_nanos(now).naive_local();
         let time_windows = TimeWindowResolver::new(&self.time_window_sources, now_local);
@@ -990,6 +1067,80 @@ impl ConditionPass {
             }
         }
     }
+}
+
+/// Recover a crash-interrupted tick at daemon start: splice the persisted
+/// intent's committed scalar states into `eval_state` for every entry whose
+/// dispatch demonstrably went out (its runs — or a covering backfill created
+/// at/after the tick — exist in storage), persist the result, then clear the
+/// intent. Entries without dispatch evidence stay un-consumed so the next
+/// tick re-fires them.
+pub async fn recover_pending_dispatch<S: StorageBackend>(
+    eval_state: &mut ConditionEvalState,
+    storage: &crate::storage::ScopedStorageHandle<S>,
+) -> Result<()> {
+    let scoped = storage.scoped();
+    let Some(pending) = scoped.get_condition_pending_dispatch().await? else {
+        return Ok(());
+    };
+    if pending.entries.is_empty() {
+        return Ok(());
+    }
+    let tick_ts = pending.tick_timestamp;
+    let run_ids: Vec<String> = pending
+        .entries
+        .iter()
+        .flat_map(|e| e.run_ids.iter().cloned())
+        .collect();
+    let existing_runs: HashSet<String> = if run_ids.is_empty() {
+        HashSet::new()
+    } else {
+        storage
+            .backend()
+            .get_runs_by_ids(&run_ids, None)
+            .await?
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect()
+    };
+    let backfills = if pending.entries.iter().any(|e| e.run_ids.is_empty()) {
+        scoped.get_backfills(None, None).await?
+    } else {
+        Vec::new()
+    };
+
+    let mut recovered = 0usize;
+    for entry in pending.entries {
+        let dispatched = if entry.run_ids.is_empty() {
+            backfills.iter().any(|b| {
+                b.create_time >= tick_ts && b.asset_selection.contains(&entry.asset_key)
+            })
+        } else {
+            entry.run_ids.iter().any(|id| existing_runs.contains(id))
+        };
+        if !dispatched {
+            continue;
+        }
+        let slot = eval_state.assets.entry(entry.asset_key).or_default();
+        let partition_state = slot.partition_state.take();
+        *slot = entry.committed;
+        slot.partition_state = partition_state;
+        recovered += 1;
+    }
+    if recovered > 0 {
+        tracing::info!(
+            target: "rivers::daemon",
+            recovered,
+            "recovered condition latches from a crash-interrupted tick"
+        );
+        // Persist BEFORE clearing the intent — dying between the two just
+        // re-runs this (idempotent) recovery.
+        scoped.set_condition_eval_state(eval_state).await?;
+    }
+    scoped
+        .set_condition_pending_dispatch(&PendingDispatch::default())
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]

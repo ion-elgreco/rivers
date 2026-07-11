@@ -11,14 +11,17 @@ use crate::partitions::PyPartitionKey;
 use crate::repository::tag_keys;
 
 impl ConditionTickEngine {
-    /// Dispatch materializations for the assets whose conditions fired this tick.
-    pub(super) async fn dispatch_materializations(
+    /// Mint run ids and build the run-shaped requests for a plan, registering
+    /// the pre-dispatch marks. Split from the dispatch so the ids can be
+    /// persisted as crash-recovery intent BEFORE any run goes out.
+    pub(super) fn prepare_run_requests(
         &mut self,
-        plan: MaterializationPlan,
+        plan: &MaterializationPlan,
         handle: &mut ConditionTickHandle,
-    ) {
+    ) -> Vec<MaterializationRequestData> {
+        let mut run_requests: Vec<MaterializationRequestData> = Vec::new();
         if plan.is_empty() {
-            return;
+            return run_requests;
         }
 
         handle.seed_assets(
@@ -29,7 +32,6 @@ impl ConditionTickEngine {
         );
 
         let now = handle.timestamp();
-        let mut run_requests: Vec<MaterializationRequestData> = Vec::new();
 
         if !plan.unpartitioned.is_empty() {
             let run_id = uuid::Uuid::new_v4().to_string();
@@ -41,16 +43,16 @@ impl ConditionTickEngine {
             handle.note_run(&plan.unpartitioned, &run_id);
             run_requests.push(MaterializationRequestData {
                 run_id,
-                asset_selection: plan.unpartitioned,
+                asset_selection: plan.unpartitioned.clone(),
                 partition_key: None,
                 tags: vec![],
                 launched_by: LaunchedBy::Condition,
             });
         }
 
-        for (pk, assets) in plan.single_partition_groups {
+        for (pk, assets) in &plan.single_partition_groups {
             let run_id = uuid::Uuid::new_v4().to_string();
-            for asset in &assets {
+            for asset in assets {
                 self.pass.cache.register_dispatched_run(
                     asset.clone(),
                     run_id.clone(),
@@ -58,16 +60,25 @@ impl ConditionTickEngine {
                     Some(pk.clone()),
                 );
             }
-            handle.note_run(&assets, &run_id);
+            handle.note_run(assets, &run_id);
             run_requests.push(MaterializationRequestData {
                 run_id,
-                asset_selection: assets,
-                partition_key: Some(pk),
+                asset_selection: assets.clone(),
+                partition_key: Some(pk.clone()),
                 tags: vec![],
                 launched_by: LaunchedBy::Condition,
             });
         }
+        run_requests
+    }
 
+    /// Dispatch the prepared run requests plus the plan's backfills.
+    pub(super) async fn dispatch_materializations(
+        &mut self,
+        plan: MaterializationPlan,
+        run_requests: Vec<MaterializationRequestData>,
+        handle: &mut ConditionTickHandle,
+    ) {
         if !run_requests.is_empty() {
             match self
                 .run_dispatcher

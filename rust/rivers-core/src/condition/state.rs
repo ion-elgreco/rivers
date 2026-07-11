@@ -59,6 +59,50 @@ impl AssetConditionState {
         self.is_initial = true;
         self.partition_state = None;
     }
+
+    /// Clone everything except `partition_state` (which can hold a
+    /// per-partition timestamp map far too large to copy around).
+    pub fn scalar_clone(&self) -> Self {
+        Self {
+            previous_results: self.previous_results.clone(),
+            dep_previous_results: self.dep_previous_results.clone(),
+            dep_baselines: self.dep_baselines.clone(),
+            last_handled_timestamp: self.last_handled_timestamp,
+            last_materialized_timestamp: self.last_materialized_timestamp,
+            last_data_version: self.last_data_version.clone(),
+            last_tick_timestamp: self.last_tick_timestamp,
+            condition_fingerprint: self.condition_fingerprint.clone(),
+            is_initial: self.is_initial,
+            partition_state: None,
+        }
+    }
+}
+
+/// Dispatch intent for one tick, persisted BEFORE its runs/backfills go out
+/// and cleared after the tick's eval state persists. If the daemon dies in
+/// between, restart recovery replays the consumed scalar latches for every
+/// entry whose dispatch demonstrably happened (its runs or a covering
+/// backfill exist in storage) — without it the stale latches re-fire and
+/// double-materialize (see `recover_pending_dispatch`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PendingDispatch {
+    pub tick_timestamp: i64,
+    pub entries: Vec<PendingDispatchEntry>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PendingDispatchEntry {
+    pub asset_key: String,
+    /// Run ids minted before dispatch; empty for backfill-shaped dispatches
+    /// (backfill ids are assigned by the dispatcher, so recovery matches
+    /// those by asset + create time instead).
+    pub run_ids: Vec<String>,
+    /// Scalar condition state as `commit_tick` would persist it. Partition
+    /// state is deliberately absent: after a restart the cache's own
+    /// in-progress/materialized view supersedes the handled marks.
+    pub committed: AssetConditionState,
 }
 
 /// Persisted eval-state schema version.
