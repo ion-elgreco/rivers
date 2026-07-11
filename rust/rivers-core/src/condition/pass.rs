@@ -459,8 +459,9 @@ impl ConditionPass {
         for info in &conditions {
             eval_state.assets.entry(info.asset_key.clone()).or_default();
         }
-        // Rehydrate asset-level failure floors: the cache only maintains them
-        // in steady state, so a fresh cache would silently drop ExecutionFailed.
+        // Rehydrate asset-level failure floors from persisted eval-state;
+        // initial_load independently derives them from run history, so this
+        // is a fast path, not the only source.
         let mut cache = cache;
         for (asset, ts) in &eval_state.failed_assets {
             cache.failed_assets.insert(asset.clone());
