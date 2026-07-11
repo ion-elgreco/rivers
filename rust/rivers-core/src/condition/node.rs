@@ -98,9 +98,7 @@ impl ConditionNode {
     /// in sync — a missed variant there silently corrupts persisted latches.
     pub fn children(&self) -> impl Iterator<Item = &ConditionNode> {
         let out: Vec<&ConditionNode> = match self {
-            ConditionNode::And(children) | ConditionNode::Or(children) => {
-                children.iter().collect()
-            }
+            ConditionNode::And(children) | ConditionNode::Or(children) => children.iter().collect(),
             ConditionNode::Not(child)
             | ConditionNode::NewlyTrue(child)
             | ConditionNode::SinceLastHandled(child) => vec![child.as_ref()],
@@ -199,10 +197,7 @@ impl ConditionNode {
         // must always re-arm the gate.
         cron_tick
             .clone()
-            .since(
-                (ConditionNode::NewlyRequested | ConditionNode::NewlyUpdated)
-                    & !cron_tick,
-            )
+            .since((ConditionNode::NewlyRequested | ConditionNode::NewlyUpdated) & !cron_tick)
             & ConditionNode::all_deps_updated_since_cron(cron_schedule, timezone)
             & !ConditionNode::in_flight()
     }

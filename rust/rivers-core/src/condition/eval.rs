@@ -136,11 +136,7 @@ fn select_in_universe(
         .filter(|k| pctx.all_keys.contains(*k))
         .cloned()
         .collect();
-    if live.is_empty() {
-        PartitionSelection::Empty
-    } else {
-        PartitionSelection::Keys(live)
-    }
+    PartitionSelection::from_keys(live)
 }
 
 /// Previous-tick selection for stateful node `my_idx`: the per-dep latch when
@@ -460,9 +456,7 @@ fn eval_inner<O: EvalOutput>(
             let (prev_dv, prev_ts) = data_version_baseline(ctx);
             let expr = match (ctx.target_record.last_data_version.as_ref(), prev_dv) {
                 (Some(current), Some(prev)) => current != prev,
-                (Some(_), None) => {
-                    !ctx.is_initial && prev_ts != ctx.target_record.last_timestamp
-                }
+                (Some(_), None) => !ctx.is_initial && prev_ts != ctx.target_record.last_timestamp,
                 _ => false,
             };
             O::leaf(expr, my_idx, node)
@@ -825,11 +819,7 @@ fn eval_backfill_in_progress_partitioned(
         }
     }
 
-    if targeted.is_empty() {
-        PartitionSelection::Empty
-    } else {
-        PartitionSelection::Keys(targeted)
-    }
+    PartitionSelection::from_keys(targeted)
 }
 
 /// Filter a per-partition map, selecting partitions that match a predicate
@@ -848,11 +838,7 @@ fn partition_filter_select<V>(
         .filter(|(pk, val)| pctx.all_keys.contains(pk) && pred(val))
         .map(|(pk, _)| pk.clone())
         .collect();
-    if matching.is_empty() {
-        PartitionSelection::Empty
-    } else {
-        PartitionSelection::Keys(matching)
-    }
+    PartitionSelection::from_keys(matching)
 }
 
 /// Unpartitioned HasRunWithTags / AllRunsHaveTags evaluator.
@@ -914,11 +900,7 @@ fn eval_new_update_tags_partitioned(
         })
         .map(|(pk, _)| pk.clone())
         .collect();
-    if matching.is_empty() {
-        PartitionSelection::Empty
-    } else {
-        PartitionSelection::Keys(matching)
-    }
+    PartitionSelection::from_keys(matching)
 }
 
 /// Parse a cron schedule (seconds optional) in the shared rivers dialect.
@@ -1065,8 +1047,7 @@ fn cron_tick_between(
         // each to its first real instant; skip occurrences whose instant is
         // already in the past (the repeated fall-back hour projects the wall
         // clock behind real time).
-        let mut fake_cursor =
-            chrono::Utc.from_utc_datetime(&prev.with_timezone(&tz).naive_local());
+        let mut fake_cursor = chrono::Utc.from_utc_datetime(&prev.with_timezone(&tz).naive_local());
         for _ in 0..2000 {
             let Ok(fake_next) = cron.find_next_occurrence(&fake_cursor, false) else {
                 return false;
@@ -1164,11 +1145,7 @@ fn eval_partitioned<O: PartEvalOutput>(
                 .filter(|k| !pctx.timestamps.contains_key(*k))
                 .cloned()
                 .collect();
-            let sel = if missing.is_empty() {
-                PartitionSelection::Empty
-            } else {
-                PartitionSelection::Keys(missing)
-            };
+            let sel = PartitionSelection::from_keys(missing);
             O::leaf(sel, my_idx, node, total)
         }
 
@@ -1219,11 +1196,7 @@ fn eval_partitioned<O: PartEvalOutput>(
                 })
                 .map(|(pk, _)| pk.clone())
                 .collect();
-            let sel = if updated.is_empty() {
-                PartitionSelection::Empty
-            } else {
-                PartitionSelection::Keys(updated)
-            };
+            let sel = PartitionSelection::from_keys(updated);
             O::leaf(sel, my_idx, node, total)
         }
 
@@ -1239,11 +1212,7 @@ fn eval_partitioned<O: PartEvalOutput>(
                             .filter(|k| pctx.all_keys.contains(*k))
                             .cloned()
                             .collect();
-                        if keys.is_empty() {
-                            PartitionSelection::Empty
-                        } else {
-                            PartitionSelection::Keys(keys)
-                        }
+                        PartitionSelection::from_keys(keys)
                     }
                     None => PartitionSelection::Empty,
                 }
@@ -1291,9 +1260,7 @@ fn eval_partitioned<O: PartEvalOutput>(
             let (prev_dv, prev_ts) = data_version_baseline(ctx);
             let changed = match (ctx.target_record.last_data_version.as_ref(), prev_dv) {
                 (Some(current), Some(prev)) => current != prev,
-                (Some(_), None) => {
-                    !ctx.is_initial && prev_ts != ctx.target_record.last_timestamp
-                }
+                (Some(_), None) => !ctx.is_initial && prev_ts != ctx.target_record.last_timestamp,
                 _ => false,
             };
             let sel = if changed {
@@ -1573,8 +1540,7 @@ fn eval_partitioned_all_deps(
 /// True if the tree contains `NewlyUpdated` — the only consumer of
 /// `dep_root_floor`, whose construction walks every upstream timestamp.
 fn contains_newly_updated(node: &ConditionNode) -> bool {
-    matches!(node, ConditionNode::NewlyUpdated)
-        || node.children().any(contains_newly_updated)
+    matches!(node, ConditionNode::NewlyUpdated) || node.children().any(contains_newly_updated)
 }
 
 /// Whether a dep at `dep_ts` counts as newly-updated against a downstream
@@ -1623,7 +1589,8 @@ fn root_floor_over_attempted<'k>(
     keys: impl Iterator<Item = &'k PartitionKey>,
     root_status: &crate::condition::cache::PartitionStatusEntry,
 ) -> Option<i64> {
-    keys.filter_map(|k| effective_attempt_ts(root_status, k)).min()
+    keys.filter_map(|k| effective_attempt_ts(root_status, k))
+        .min()
 }
 
 /// Evaluate a condition on an upstream dep in partition-aware mode.
@@ -1832,8 +1799,12 @@ fn eval_partitioned_on_dep(
     dep_selections.cur_prev = saved;
     collect_dep_latch(dep_selections, dep_key, local);
 
-    pctx.resolver
-        .map_downstream(dep_key, ctx.target_key, &upstream_result, Some(pctx.all_keys))
+    pctx.resolver.map_downstream(
+        dep_key,
+        ctx.target_key,
+        &upstream_result,
+        Some(pctx.all_keys),
+    )
 }
 
 #[cfg(test)]

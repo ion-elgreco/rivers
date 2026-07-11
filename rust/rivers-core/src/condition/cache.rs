@@ -411,8 +411,7 @@ impl AssetConditionCache {
         let mut invalidated_keys: Vec<String> = new_runs
             .iter()
             .filter(|r| {
-                run_status_is_terminal(&r.status)
-                    && !self.applied_run_ids.contains_key(&r.run_id)
+                run_status_is_terminal(&r.status) && !self.applied_run_ids.contains_key(&r.run_id)
             })
             .flat_map(|r| r.node_names.iter().cloned())
             .collect();
@@ -942,9 +941,7 @@ impl AssetConditionCache {
             entry.failed_timestamps = patch
                 .failed
                 .into_iter()
-                .filter(|(pk, fail_ts)| {
-                    entry.timestamps.get(pk).is_none_or(|mat| fail_ts > mat)
-                })
+                .filter(|(pk, fail_ts)| entry.timestamps.get(pk).is_none_or(|mat| fail_ts > mat))
                 .collect();
             entry.failed = entry.failed_timestamps.keys().cloned().collect();
         }
@@ -1019,11 +1016,7 @@ impl AssetConditionCache {
 
         // Every non-terminal status is in flight: NotStarted/Queued runs alive
         // at restart must suppress duplicate dispatch just like Started ones.
-        for status in [
-            RunStatus::Started,
-            RunStatus::NotStarted,
-            RunStatus::Queued,
-        ] {
+        for status in [RunStatus::Started, RunStatus::NotStarted, RunStatus::Queued] {
             let live_runs = scoped
                 .get_runs_since(0, Some(status), crate::storage::SortOrder::Asc)
                 .await?;
@@ -1044,11 +1037,7 @@ impl AssetConditionCache {
         // steady-state gates (materialized-by-the-failed-run, or outranked by
         // a newer materialization, clears the floor).
         let failed_runs = scoped
-            .get_runs_since(
-                0,
-                Some(RunStatus::Failure),
-                crate::storage::SortOrder::Asc,
-            )
+            .get_runs_since(0, Some(RunStatus::Failure), crate::storage::SortOrder::Asc)
             .await?;
         for run in &failed_runs {
             let run_ts = run.end_time.unwrap_or(run.start_time);
@@ -1057,8 +1046,8 @@ impl AssetConditionCache {
                     continue;
                 }
                 let record = self.records.get(asset.as_str());
-                let materialized_here = record.and_then(|r| r.last_run_id.as_deref())
-                    == Some(run.run_id.as_str());
+                let materialized_here =
+                    record.and_then(|r| r.last_run_id.as_deref()) == Some(run.run_id.as_str());
                 let outranked = record
                     .and_then(|r| r.last_timestamp)
                     .is_some_and(|mat| mat >= run_ts);
@@ -1083,7 +1072,8 @@ impl AssetConditionCache {
                 .is_none_or(|mat| mat < *ts)
         });
         let floors = &self.failed_asset_timestamps;
-        self.failed_assets.retain(|asset| floors.contains_key(asset));
+        self.failed_assets
+            .retain(|asset| floors.contains_key(asset));
 
         let last_run_ids: Vec<String> = self
             .records
