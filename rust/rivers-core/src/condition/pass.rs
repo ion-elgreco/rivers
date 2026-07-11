@@ -118,7 +118,10 @@ fn refresh_universe(
         PartitionUniverse::Multi { dims } => {
             let mut changed = false;
             for (_, du) in dims.iter_mut() {
-                let DimensionUniverse { keys: dim_keys, kind } = du;
+                let DimensionUniverse {
+                    keys: dim_keys,
+                    kind,
+                } = du;
                 match kind {
                     DimensionKind::Frozen => {}
                     DimensionKind::TimeWindow {
@@ -131,9 +134,7 @@ fn refresh_universe(
                     }
                     DimensionKind::Dynamic { namespace } => {
                         if let Some(keys) = dynamic_keys.get(namespace)
-                            && dynamic_axis_changed(keys, dim_keys.len(), |k| {
-                                dim_keys.contains(k)
-                            })
+                            && dynamic_axis_changed(keys, dim_keys.len(), |k| dim_keys.contains(k))
                         {
                             let mut sorted: Vec<String> = keys.iter().cloned().collect();
                             sorted.sort();
@@ -361,10 +362,9 @@ fn derive_window_keys_from_grid(
     match lookback_delta {
         None => insert_if_known(latest),
         Some(delta_secs) => {
-            let cutoff = latest_dt
-                .checked_sub_signed(chrono::Duration::nanoseconds(
-                    (delta_secs * 1_000_000_000.0) as i64,
-                ))?;
+            let cutoff = latest_dt.checked_sub_signed(chrono::Duration::nanoseconds(
+                (delta_secs * 1_000_000_000.0) as i64,
+            ))?;
             for key in grid.keys_in_range(cutoff, latest_dt).ok()? {
                 // keys_in_range brackets the window straddling `cutoff`; the
                 // scan keeps only keys whose window START is at/after it.
@@ -824,10 +824,8 @@ impl ConditionPass {
                     state.dep_baselines.insert(
                         dep.clone(),
                         DepBaseline {
-                            last_materialized_timestamp: dep_record
-                                .and_then(|r| r.last_timestamp),
-                            last_data_version: dep_record
-                                .and_then(|r| r.last_data_version.clone()),
+                            last_materialized_timestamp: dep_record.and_then(|r| r.last_timestamp),
+                            last_data_version: dep_record.and_then(|r| r.last_data_version.clone()),
                         },
                     );
                 }
@@ -1135,9 +1133,9 @@ pub async fn recover_pending_dispatch<S: StorageBackend>(
     let mut recovered = 0usize;
     for entry in pending.entries {
         let dispatched = if entry.run_ids.is_empty() {
-            backfills.iter().any(|b| {
-                b.create_time >= tick_ts && b.asset_selection.contains(&entry.asset_key)
-            })
+            backfills
+                .iter()
+                .any(|b| b.create_time >= tick_ts && b.asset_selection.contains(&entry.asset_key))
         } else {
             entry.run_ids.iter().any(|id| existing_runs.contains(id))
         };
@@ -1382,11 +1380,7 @@ mod tests {
         // Missing = all 5 keys; the 2-day lookback selects the latest 3.
         assert_eq!(
             rows[0].result.selection.clone().unwrap(),
-            PartitionSelection::Keys(make_daily_keys(&[
-                "2020-01-03",
-                "2020-01-04",
-                "2020-01-05"
-            ])),
+            PartitionSelection::Keys(make_daily_keys(&["2020-01-03", "2020-01-04", "2020-01-05"])),
             "the 2-day-lookback node must select its own window, not the first node's"
         );
     }
@@ -1463,7 +1457,11 @@ mod tests {
         };
 
         // Only a's OLDEST key was re-materialized (200 > b's floor of 100).
-        let pass = build_pass(&[("2020-01-01", 200), ("2020-01-02", 100), ("2020-01-03", 100)]);
+        let pass = build_pass(&[
+            ("2020-01-01", 200),
+            ("2020-01-02", 100),
+            ("2020-01-03", 100),
+        ]);
         let rows = pass.evaluate(1_700_000_000_000_000_000, false);
         assert!(
             !rows[0].result.fired,
@@ -1472,7 +1470,11 @@ mod tests {
         );
 
         // Positive control: the dep's LATEST key updating passes the filter.
-        let pass = build_pass(&[("2020-01-01", 100), ("2020-01-02", 100), ("2020-01-03", 200)]);
+        let pass = build_pass(&[
+            ("2020-01-01", 100),
+            ("2020-01-02", 100),
+            ("2020-01-03", 200),
+        ]);
         let rows = pass.evaluate(1_700_000_000_000_000_000, false);
         assert!(rows[0].result.fired, "latest-key update must fire");
         assert_eq!(
@@ -1521,18 +1523,24 @@ mod tests {
         );
 
         let fired = |out: &PassOutput, pass: &ConditionPass, key: &str| {
-            out.results.iter().any(|row| {
-                pass.conditions[row.info_idx].asset_key == key && row.result.fired
-            })
+            out.results
+                .iter()
+                .any(|row| pass.conditions[row.info_idx].asset_key == key && row.result.fired)
         };
 
         // Tick 1: y's version is first-seen → c fires and consumes it.
         let out = pass.run(1000, false);
-        assert!(fired(&out, &pass, "c"), "tick 1: first-seen version fires c");
+        assert!(
+            fired(&out, &pass, "c"),
+            "tick 1: first-seen version fires c"
+        );
 
         // Tick 2: y unchanged → no re-fire.
         let out = pass.run(2000, false);
-        assert!(!fired(&out, &pass, "c"), "tick 2: stable version must not re-fire");
+        assert!(
+            !fired(&out, &pass, "c"),
+            "tick 2: stable version must not re-fire"
+        );
 
         // y's version changes while c is gated; unrelated d keeps firing.
         y.last_data_version = Some("v2".to_string());

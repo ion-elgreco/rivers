@@ -25,11 +25,7 @@ impl PartitionSelection {
             (Self::Empty, x) | (x, Self::Empty) => x.clone(),
             (Self::Keys(a), Self::Keys(b)) => {
                 let merged: HashSet<PartitionKey> = a.union(b).cloned().collect();
-                if merged.is_empty() {
-                    Self::Empty
-                } else {
-                    Self::Keys(merged)
-                }
+                Self::from_keys(merged)
             }
         }
     }
@@ -41,11 +37,7 @@ impl PartitionSelection {
             (Self::All, x) | (x, Self::All) => x.clone(),
             (Self::Keys(a), Self::Keys(b)) => {
                 let common: HashSet<PartitionKey> = a.intersection(b).cloned().collect();
-                if common.is_empty() {
-                    Self::Empty
-                } else {
-                    Self::Keys(common)
-                }
+                Self::from_keys(common)
             }
         }
     }
@@ -63,11 +55,7 @@ impl PartitionSelection {
             }
             Self::Keys(keys) => {
                 let diff: HashSet<PartitionKey> = all_keys.difference(keys).cloned().collect();
-                if diff.is_empty() {
-                    Self::Empty
-                } else {
-                    Self::Keys(diff)
-                }
+                Self::from_keys(diff)
             }
         }
     }
@@ -81,11 +69,7 @@ impl PartitionSelection {
             (Self::All, Self::Keys(_)) => other.complement(all_keys),
             (Self::Keys(a), Self::Keys(b)) => {
                 let diff: HashSet<PartitionKey> = a.difference(b).cloned().collect();
-                if diff.is_empty() {
-                    Self::Empty
-                } else {
-                    Self::Keys(diff)
-                }
+                Self::from_keys(diff)
             }
         }
     }
@@ -107,6 +91,15 @@ impl PartitionSelection {
     /// Convert a bool to a PartitionSelection (for unpartitioned assets).
     pub fn from_bool(val: bool) -> Self {
         if val { Self::All } else { Self::Empty }
+    }
+
+    /// Normalize a key set: an empty set is `Empty`, never `Keys({})`.
+    pub fn from_keys(keys: HashSet<PartitionKey>) -> Self {
+        if keys.is_empty() {
+            Self::Empty
+        } else {
+            Self::Keys(keys)
+        }
     }
 
     /// Number of partition keys in this selection.
@@ -181,11 +174,7 @@ fn shift_selection(
                     _ => None,
                 })
                 .collect();
-            if shifted.is_empty() {
-                PartitionSelection::Empty
-            } else {
-                PartitionSelection::Keys(shifted)
-            }
+            PartitionSelection::from_keys(shifted)
         }
     }
 }
@@ -237,11 +226,7 @@ impl PartitionMappingKind {
                             mapped.insert(uk.clone());
                         }
                     }
-                    if mapped.is_empty() {
-                        PartitionSelection::Empty
-                    } else {
-                        PartitionSelection::Keys(mapped)
-                    }
+                    PartitionSelection::from_keys(mapped)
                 }
             },
             Self::TimeWindow { offset, grid } => {
@@ -301,10 +286,7 @@ impl PartitionMappingKind {
                                         for combo in &combos {
                                             for v in &values {
                                                 let mut c = combo.clone();
-                                                c.push((
-                                                    downstream_dim.clone(),
-                                                    Some(v.clone()),
-                                                ));
+                                                c.push((downstream_dim.clone(), Some(v.clone())));
                                                 next.push(c);
                                             }
                                         }
@@ -361,11 +343,7 @@ impl PartitionMappingKind {
                             }
                         }
                     }
-                    if mapped.is_empty() {
-                        PartitionSelection::Empty
-                    } else {
-                        PartitionSelection::Keys(mapped)
-                    }
+                    PartitionSelection::from_keys(mapped)
                 }
             },
             Self::MultiToSingle {
@@ -433,11 +411,7 @@ impl PartitionMappingKind {
                             }
                         }
                     }
-                    if mapped.is_empty() {
-                        PartitionSelection::Empty
-                    } else {
-                        PartitionSelection::Keys(mapped)
-                    }
+                    PartitionSelection::from_keys(mapped)
                 }
             },
             Self::ForKeys => {

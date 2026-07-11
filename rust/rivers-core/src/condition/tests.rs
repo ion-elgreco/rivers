@@ -6753,7 +6753,10 @@ async fn test_observation_committing_after_load_is_still_seen() {
     };
 
     // Prior observation history, committed before the load.
-    storage.store_events(&[mk_obs("obs-1", 1_000)]).await.unwrap();
+    storage
+        .store_events(&[mk_obs("obs-1", 1_000)])
+        .await
+        .unwrap();
 
     let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
     cache.refresh(&storage, 5_000).await.unwrap(); // wall clock well past the stamp
@@ -6834,13 +6837,19 @@ async fn test_incremental_partition_refresh_keeps_equal_timestamp_partitions() {
     cache.refresh(&storage, 0).await.unwrap();
 
     // Partition a: run + materialization stamped 3000, observed by one refresh.
-    storage.create_run(&mk_run("run_a", "a", 2000)).await.unwrap();
+    storage
+        .create_run(&mk_run("run_a", "a", 2000))
+        .await
+        .unwrap();
     cache.refresh(&storage, 0).await.unwrap();
     storage
         .update_run_status("run_a", RunStatus::Success, Some(3000))
         .await
         .unwrap();
-    storage.store_events(&[mk_event("run_a", "a", 3000)]).await.unwrap();
+    storage
+        .store_events(&[mk_event("run_a", "a", 3000)])
+        .await
+        .unwrap();
     cache.refresh(&storage, 0).await.unwrap();
     assert_eq!(
         cache.partition_status["dst"].timestamps.get(&part("a")),
@@ -6850,13 +6859,19 @@ async fn test_incremental_partition_refresh_keeps_equal_timestamp_partitions() {
 
     // Partition b: a separate run whose materialization carries the SAME
     // stamped timestamp, landing in a later refresh.
-    storage.create_run(&mk_run("run_b", "b", 4000)).await.unwrap();
+    storage
+        .create_run(&mk_run("run_b", "b", 4000))
+        .await
+        .unwrap();
     cache.refresh(&storage, 0).await.unwrap();
     storage
         .update_run_status("run_b", RunStatus::Success, Some(5000))
         .await
         .unwrap();
-    storage.store_events(&[mk_event("run_b", "b", 3000)]).await.unwrap();
+    storage
+        .store_events(&[mk_event("run_b", "b", 3000)])
+        .await
+        .unwrap();
     cache.refresh(&storage, 0).await.unwrap();
 
     assert_eq!(
@@ -7960,7 +7975,10 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
     // …and commit the tick with dst's dispatch marked failed.
     let failed: HashSet<String> = ["dst".to_string()].into_iter().collect();
     let dirty = pass.commit_tick(&out, &failed, 4_000);
-    assert!(!dirty, "an all-failed tick leaves no latch state to persist");
+    assert!(
+        !dirty,
+        "an all-failed tick leaves no latch state to persist"
+    );
 
     assert!(
         !pass.should_skip(false),
@@ -7985,7 +8003,10 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
         done.plan.unpartitioned
     );
     let dirty = pass.commit_tick(&done, &HashSet::new(), 6_000);
-    assert!(!dirty, "a passive tick has nothing latch-bearing to persist");
+    assert!(
+        !dirty,
+        "a passive tick has nothing latch-bearing to persist"
+    );
 }
 
 #[tokio::test]
@@ -8092,13 +8113,19 @@ async fn test_initial_load_derives_failure_floor_from_run_history() {
         launched_by: LaunchedBy::Manual,
     };
     // a: failed, never materialized afterwards → floor stands.
-    storage.create_run(&mk_run("run-fail-a", "a", 2_000)).await.unwrap();
+    storage
+        .create_run(&mk_run("run-fail-a", "a", 2_000))
+        .await
+        .unwrap();
     storage
         .update_run_status("run-fail-a", RunStatus::Failure, Some(2_500))
         .await
         .unwrap();
     // b: failed at 2_500 but re-materialized at 5_000 → floor cleared.
-    storage.create_run(&mk_run("run-fail-b", "b", 2_000)).await.unwrap();
+    storage
+        .create_run(&mk_run("run-fail-b", "b", 2_000))
+        .await
+        .unwrap();
     storage
         .update_run_status("run-fail-b", RunStatus::Failure, Some(2_500))
         .await
@@ -8250,7 +8277,10 @@ async fn test_crash_after_dispatch_recovers_latches_from_intent() {
         .unwrap();
 
     // raw's data version changes → dst fires.
-    storage.create_run(&mk_run("run-raw", "raw", 2_500)).await.unwrap();
+    storage
+        .create_run(&mk_run("run-raw", "raw", 2_500))
+        .await
+        .unwrap();
     storage
         .update_run_status("run-raw", RunStatus::Success, Some(3_000))
         .await
@@ -8287,7 +8317,10 @@ async fn test_crash_after_dispatch_recovers_latches_from_intent() {
         .set_condition_pending_dispatch(&pending)
         .await
         .unwrap();
-    storage.create_run(&mk_run("run-dst", "dst", 4_500)).await.unwrap();
+    storage
+        .create_run(&mk_run("run-dst", "dst", 4_500))
+        .await
+        .unwrap();
     storage
         .update_run_status("run-dst", RunStatus::Success, Some(5_000))
         .await
@@ -8307,7 +8340,9 @@ async fn test_crash_after_dispatch_recovers_latches_from_intent() {
         .expect("pre-fire state was persisted");
     eval_state2.migrate_loaded();
     let handle = ScopedStorageHandle::new(std::sync::Arc::clone(&storage), ctx.clone());
-    recover_pending_dispatch(&mut eval_state2, &handle).await.unwrap();
+    recover_pending_dispatch(&mut eval_state2, &handle)
+        .await
+        .unwrap();
 
     let mut pass2 = ConditionPass::new(
         AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
@@ -8329,7 +8364,10 @@ async fn test_crash_after_dispatch_recovers_latches_from_intent() {
         .await
         .unwrap()
         .unwrap_or_default();
-    assert!(cleared.entries.is_empty(), "the intent must be cleared after recovery");
+    assert!(
+        cleared.entries.is_empty(),
+        "the intent must be cleared after recovery"
+    );
 }
 
 #[tokio::test]
@@ -8473,7 +8511,9 @@ async fn test_crash_before_dispatch_leaves_trigger_armed() {
         .expect("pre-fire state was persisted");
     eval_state2.migrate_loaded();
     let handle = ScopedStorageHandle::new(std::sync::Arc::clone(&storage), ctx.clone());
-    recover_pending_dispatch(&mut eval_state2, &handle).await.unwrap();
+    recover_pending_dispatch(&mut eval_state2, &handle)
+        .await
+        .unwrap();
 
     let mut pass2 = ConditionPass::new(
         AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
@@ -8602,7 +8642,10 @@ async fn test_same_timestamp_run_committed_after_refresh_is_seen() {
     cache.refresh(&storage, 0).await.unwrap();
     assert!(!cache.in_progress_assets.contains_key("a"));
     let first_report = cache.tick_materialization_tags.clone();
-    assert!(!first_report.is_empty(), "completion reports tick tags once");
+    assert!(
+        !first_report.is_empty(),
+        "completion reports tick tags once"
+    );
     cache.refresh(&storage, 0).await.unwrap();
     assert!(
         cache.tick_materialization_tags.is_empty(),
@@ -8657,7 +8700,10 @@ async fn test_failure_floor_survives_daemon_restart() {
     pass.refresh_cache(&storage, 0).await.unwrap();
 
     // a's run fails without materializing it → floor set by the steady path.
-    storage.create_run(&mk_run("run-fail", 2000, "a")).await.unwrap();
+    storage
+        .create_run(&mk_run("run-fail", 2000, "a"))
+        .await
+        .unwrap();
     pass.refresh_cache(&storage, 0).await.unwrap();
     storage
         .update_run_status("run-fail", RunStatus::Failure, Some(3000))
@@ -8665,9 +8711,15 @@ async fn test_failure_floor_survives_daemon_restart() {
         .unwrap();
     pass.refresh_cache(&storage, 0).await.unwrap();
     // A later unrelated run makes a's failure non-newest.
-    storage.create_run(&mk_run("run-b", 4000, "b")).await.unwrap();
+    storage
+        .create_run(&mk_run("run-b", 4000, "b"))
+        .await
+        .unwrap();
     pass.refresh_cache(&storage, 0).await.unwrap();
-    assert!(pass.cache.failed_assets.contains("a"), "precondition: floor set");
+    assert!(
+        pass.cache.failed_assets.contains("a"),
+        "precondition: floor set"
+    );
 
     pass.run(5000, false);
 
@@ -13355,7 +13407,10 @@ fn test_partitioned_on_cron_fires_after_dep_update() {
         root_partition_floor: None,
     };
     let r1 = evaluate(&cond, &ctx1);
-    assert!(!r1.fired, "boundary tick: dep not updated since the boundary");
+    assert!(
+        !r1.fired,
+        "boundary tick: dep not updated since the boundary"
+    );
     update_condition_state(
         &mut state_b,
         &StateUpdateContext {
@@ -13450,10 +13505,7 @@ fn test_on_cron_with_deps_fires_when_dep_updates_after_boundary() {
         ..Default::default()
     };
 
-    let eval_tick = |a: &AssetRecord,
-                     b: &AssetRecord,
-                     state_b: &AssetConditionState,
-                     now: i64| {
+    let eval_tick = |a: &AssetRecord, b: &AssetRecord, state_b: &AssetConditionState, now: i64| {
         let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
         let all = HashMap::from([
             ("a".to_string(), state_a.clone()),
@@ -13534,7 +13586,10 @@ fn test_on_cron_with_deps_fires_when_dep_updates_after_boundary() {
 
     // Tick 5: a is still newer than b → the latch re-arms and the new period fires.
     let r5 = eval_tick(&a, &b, &state_b, t5);
-    assert!(r5.fired, "tick 5: gate re-armed at the new boundary must fire");
+    assert!(
+        r5.fired,
+        "tick 5: gate re-armed at the new boundary must fire"
+    );
 }
 
 /// A wall time that repeats during a DST fall-back must fire once, at its
@@ -13800,9 +13855,8 @@ fn test_partitioned_on_cron_partial_dep_update() {
 /// floor to None and fires forever).
 #[test]
 fn test_nested_dep_pivot_floor_uses_root_universe() {
-    let cond = ConditionNode::any_deps_match(ConditionNode::any_deps_match(
-        ConditionNode::NewlyUpdated,
-    ));
+    let cond =
+        ConditionNode::any_deps_match(ConditionNode::any_deps_match(ConditionNode::NewlyUpdated));
 
     // r (date keys) ← m (region keys, AllPartitions mapping) ← u (unpartitioned).
     let r = make_materialized_record("r", 500);
@@ -15620,7 +15674,14 @@ fn test_data_version_changed_baselines_unconditioned_dep() {
     assert!(result1.fired, "tick 1: first-seen dep data version → fires");
 
     // Baseline deps, as the daemon does after a fired/initial tick.
-    update_dep_baselines(&mut assets, &["r".to_string()], &deps, &no_conditioned, &empty_ps, &records);
+    update_dep_baselines(
+        &mut assets,
+        &["r".to_string()],
+        &deps,
+        &no_conditioned,
+        &empty_ps,
+        &records,
+    );
 
     // ── Tick 2: `a`'s version is unchanged → must NOT re-fire ──
     let prev2 = AssetConditionState::default();
