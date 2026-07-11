@@ -888,7 +888,6 @@ impl ConditionPass {
             let pctx = info.partition_info.as_ref().and_then(|pi| {
                 partition_status.map(|status| PartitionEvalContext {
                     all_keys: &pi.all_keys,
-                    materialized: &status.materialized,
                     in_progress: merged_in_progress.as_ref().unwrap_or(&status.in_progress),
                     failed: &status.failed,
                     timestamps: &status.timestamps,
@@ -1419,7 +1418,6 @@ mod tests {
             cache.partition_status.insert(
                 "b".to_string(),
                 crate::condition::cache::PartitionStatusEntry {
-                    materialized: day_keys.clone(),
                     timestamps: day_keys.iter().map(|k| (k.clone(), 100)).collect(),
                     ..Default::default()
                 },
@@ -1427,7 +1425,6 @@ mod tests {
             cache.partition_status.insert(
                 "a".to_string(),
                 crate::condition::cache::PartitionStatusEntry {
-                    materialized: day_keys.clone(),
                     timestamps: a_ts.iter().map(|(k, ts)| (spk(k), *ts)).collect(),
                     ..Default::default()
                 },
@@ -2208,7 +2205,6 @@ mod tests {
         cache.partition_status.insert(
             "src".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                materialized: keys(&["a", "b", "c"]),
                 timestamps: HashMap::from([(spk("a"), 100i64), (spk("b"), 100), (spk("c"), 100)]),
                 ..Default::default()
             },
@@ -2216,7 +2212,6 @@ mod tests {
         cache.partition_status.insert(
             "dst".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                materialized: keys(&["a", "b"]),
                 timestamps: HashMap::from([(spk("a"), 200i64), (spk("b"), 200)]),
                 ..Default::default()
             },
@@ -2294,7 +2289,6 @@ mod tests {
         cache.partition_status.insert(
             "src".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                materialized: keys(&["a", "b", "c"]),
                 timestamps: HashMap::from([(spk("a"), 100i64), (spk("b"), 100), (spk("c"), 100)]),
                 ..Default::default()
             },
@@ -2302,7 +2296,6 @@ mod tests {
         cache.partition_status.insert(
             "dst".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                materialized: keys(&["a", "b"]),
                 timestamps: HashMap::from([(spk("a"), 200i64), (spk("b"), 200)]),
                 ..Default::default()
             },

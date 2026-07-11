@@ -44,8 +44,6 @@ type LastRunUpdate = (
 /// Per-asset partition status, loaded from storage and refreshed incrementally.
 #[derive(Debug, Default)]
 pub struct PartitionStatusEntry {
-    /// Which partitions have been materialized at least once.
-    pub materialized: HashSet<PartitionKey>,
     /// Which partitions are currently being materialized.
     pub in_progress: HashSet<PartitionKey>,
     /// Which partitions failed in latest execution.
@@ -176,7 +174,7 @@ pub struct AssetConditionCache {
     pub last_observation_ts: i64,
     /// Whether the cache has been initialized.
     pub initialized: bool,
-    /// Per-asset partition status (materialized, in-progress, failed, timestamps).
+    /// Per-asset partition status (in-progress, failed, timestamps).
     pub partition_status: HashMap<String, PartitionStatusEntry>,
     /// Active backfill tracking: which assets are in backfills and which partitions they target.
     pub backfill: BackfillState,
@@ -361,7 +359,6 @@ impl AssetConditionCache {
 
             let timestamps = scoped.get_partition_timestamps(asset_key).await?;
             for (pk, ts) in &timestamps {
-                entry.materialized.insert(pk.clone());
                 entry.timestamps.insert(pk.clone(), *ts);
             }
 
@@ -937,7 +934,6 @@ impl AssetConditionCache {
         for (key, patch) in partition_status {
             let entry = self.partition_status.entry(key).or_default();
             for (pk, ts) in patch.fresh_timestamps {
-                entry.materialized.insert(pk.clone());
                 entry.timestamps.insert(pk, ts);
             }
             entry.in_progress = patch.in_progress;

@@ -2498,7 +2498,6 @@ fn test_last_run_includes_target_partitioned() {
     let pk1 = spk("2024-01-01");
     let pk2 = spk("2024-01-02");
     let all_keys = HashSet::from([pk1.clone(), pk2.clone()]);
-    let materialized = HashSet::from([pk1.clone(), pk2.clone()]);
     let timestamps = HashMap::from([(pk1.clone(), 100i64), (pk2.clone(), 100)]);
 
     let partition_asset_names = HashMap::from([(
@@ -2519,7 +2518,6 @@ fn test_last_run_includes_target_partitioned() {
     let partition_status = HashMap::new();
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &materialized,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &timestamps,
@@ -2611,7 +2609,6 @@ fn test_last_run_includes_target_partitioned_joint_run_suppresses_newly_updated(
 
     // Dep "b" partition status: both partitions materialized with their timestamps
     let b_partition_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: HashSet::from([pk1.clone(), pk2.clone()]),
         timestamps: HashMap::from([(pk1.clone(), 200i64), (pk2.clone(), 100)]),
         ..Default::default()
     };
@@ -2625,7 +2622,6 @@ fn test_last_run_includes_target_partitioned_joint_run_suppresses_newly_updated(
     let upstream_b = HashMap::from([("b".to_string(), all_keys.clone())]);
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &all_keys,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &timestamps,
@@ -2668,12 +2664,10 @@ fn dep_updated_requires_dep_newer_than_target_key() {
     // empty eval-state baseline (drain-lag shape).
     let all_states = HashMap::new();
     let b_partition_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: HashSet::from([pk1.clone(), pk2.clone()]),
         timestamps: HashMap::from([(pk1.clone(), 100i64), (pk2.clone(), 200)]),
         ..Default::default()
     };
     let a_partition_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: HashSet::from([pk1.clone(), pk2.clone()]),
         timestamps: a_timestamps.clone(),
         ..Default::default()
     };
@@ -2698,7 +2692,6 @@ fn dep_updated_requires_dep_newer_than_target_key() {
     let upstream_b = HashMap::from([("b".to_string(), all_keys.clone())]);
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &all_keys,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &a_timestamps,
@@ -2749,7 +2742,6 @@ fn partitioned_root_unpartitioned_dep_refires_stale_older_partitions() {
         (pk_new.clone(), 50),
     ]);
     let a_partition_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: all_keys.clone(),
         timestamps: a_timestamps.clone(),
         ..Default::default()
     };
@@ -2764,7 +2756,6 @@ fn partitioned_root_unpartitioned_dep_refires_stale_older_partitions() {
     let no_upstream_keys = HashMap::new();
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &all_keys,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &a_timestamps,
@@ -2820,14 +2811,11 @@ fn all_partitions_dep_frontier_key_does_not_refire_whole_universe() {
 
     // Root "a": d1/d2 at 100, d3 never attempted. Dep "b": u1 at 90, older than every attempted key.
     let a_timestamps = HashMap::from([(d1.clone(), 100i64), (d2.clone(), 100)]);
-    let a_mat = HashSet::from([d1.clone(), d2.clone()]);
     let a_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: a_mat.clone(),
         timestamps: a_timestamps.clone(),
         ..Default::default()
     };
     let b_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: up_keys.clone(),
         timestamps: HashMap::from([(u1.clone(), 90i64)]),
         ..Default::default()
     };
@@ -2845,7 +2833,6 @@ fn all_partitions_dep_frontier_key_does_not_refire_whole_universe() {
     let upstream_b = HashMap::from([("b".to_string(), up_keys.clone())]);
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &a_mat,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &a_timestamps,
@@ -2890,7 +2877,6 @@ fn empty_universe_all_selection_does_not_fire() {
     let no_upstream = HashMap::new();
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &all_keys,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &timestamps,
@@ -2926,9 +2912,7 @@ fn unpartitioned_dep_frontier_key_does_not_refire_whole_universe() {
     let deps = HashMap::from([("a".to_string(), vec!["b".to_string()])]);
 
     let a_timestamps = HashMap::from([(d1.clone(), 100i64), (d2.clone(), 100)]);
-    let a_mat = HashSet::from([d1.clone(), d2.clone()]);
     let a_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: a_mat.clone(),
         timestamps: a_timestamps.clone(),
         ..Default::default()
     };
@@ -2943,7 +2927,6 @@ fn unpartitioned_dep_frontier_key_does_not_refire_whole_universe() {
     let no_upstream_keys = HashMap::new();
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &a_mat,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &a_timestamps,
@@ -2986,7 +2969,6 @@ fn test_empty_partitioned_dep_universe_does_not_bridge_latch_to_all() {
     let upstream_u = HashMap::from([("u".to_string(), HashSet::<PartitionKey>::new())]);
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &HashSet::new(),
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &HashMap::new(),
@@ -3033,14 +3015,11 @@ fn all_partitions_dep_genuine_update_still_fires() {
     let deps = HashMap::from([("a".to_string(), vec!["b".to_string()])]);
 
     let a_timestamps = HashMap::from([(d1.clone(), 100i64), (d2.clone(), 100)]);
-    let a_mat = HashSet::from([d1.clone(), d2.clone()]);
     let a_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: a_mat.clone(),
         timestamps: a_timestamps.clone(),
         ..Default::default()
     };
     let b_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: up_keys.clone(),
         timestamps: HashMap::from([(u1.clone(), 150i64)]),
         ..Default::default()
     };
@@ -3058,7 +3037,6 @@ fn all_partitions_dep_genuine_update_still_fires() {
     let upstream_b = HashMap::from([("b".to_string(), up_keys.clone())]);
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &a_mat,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &a_timestamps,
@@ -3095,7 +3073,6 @@ fn all_partitions_dep_initial_population_fires() {
     // Root "a": nothing attempted. Dep "b": u1 materialized at 100.
     let a_status = crate::condition::cache::PartitionStatusEntry::default();
     let b_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: up_keys.clone(),
         timestamps: HashMap::from([(u1.clone(), 100i64)]),
         ..Default::default()
     };
@@ -3112,10 +3089,8 @@ fn all_partitions_dep_initial_population_fires() {
     )]);
     let upstream_b = HashMap::from([("b".to_string(), up_keys.clone())]);
     let empty_ts: HashMap<PartitionKey, i64> = HashMap::new();
-    let empty_mat: HashSet<PartitionKey> = HashSet::new();
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &empty_mat,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &empty_ts,
@@ -3167,12 +3142,10 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
 
     let all_states = HashMap::new();
     let b_partition_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: b_keys.clone(),
         timestamps: HashMap::from([(spk("2024-01-04"), 50i64), (spk("2024-01-05"), 300)]),
         ..Default::default()
     };
     let a_partition_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: a_keys.clone(),
         timestamps: a_timestamps.clone(),
         ..Default::default()
     };
@@ -3203,7 +3176,6 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
     let upstream_b = HashMap::from([("b".to_string(), b_keys.clone())]);
     let pctx = PartitionEvalContext {
         all_keys: &a_keys,
-        materialized: &a_keys,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &a_timestamps,
@@ -3228,7 +3200,6 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
         (
             "a".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                materialized: a_keys.clone(),
                 timestamps: a_timestamps_stale.clone(),
                 ..Default::default()
             },
@@ -3236,7 +3207,6 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
         (
             "b".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                materialized: b_keys.clone(),
                 timestamps: HashMap::from([(spk("2024-01-04"), 50i64), (spk("2024-01-05"), 300)]),
                 ..Default::default()
             },
@@ -3244,7 +3214,6 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
     ]);
     let pctx_stale = PartitionEvalContext {
         all_keys: &a_keys,
-        materialized: &a_keys,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &a_timestamps_stale,
@@ -3296,7 +3265,6 @@ fn will_be_requested_carries_the_upstream_fired_selection() {
         (
             "down".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                materialized: keys.clone(),
                 timestamps: ts.clone(),
                 ..Default::default()
             },
@@ -3304,7 +3272,6 @@ fn will_be_requested_carries_the_upstream_fired_selection() {
         (
             "up".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                materialized: keys.clone(),
                 timestamps: ts.clone(),
                 ..Default::default()
             },
@@ -3332,7 +3299,6 @@ fn will_be_requested_carries_the_upstream_fired_selection() {
     let upstream_up = HashMap::from([("up".to_string(), keys.clone())]);
     let pctx = PartitionEvalContext {
         all_keys: &keys,
-        materialized: &keys,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &ts,
@@ -3375,7 +3341,6 @@ fn dep_updated_retries_once_per_dep_update_after_failure() {
 
     let all_states = HashMap::new();
     let b_partition_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: keys.clone(),
         timestamps: HashMap::from([(k.clone(), 300i64)]),
         ..Default::default()
     };
@@ -3401,7 +3366,6 @@ fn dep_updated_retries_once_per_dep_update_after_failure() {
     let upstream_b = HashMap::from([("b".to_string(), keys.clone())]);
     let pctx = PartitionEvalContext {
         all_keys: &keys,
-        materialized: &HashSet::new(),
         in_progress: &HashSet::new(),
         failed: &keys,
         timestamps: &a_timestamps,
@@ -3434,7 +3398,6 @@ fn dep_updated_retries_once_per_dep_update_after_failure() {
         (
             "b".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                materialized: keys.clone(),
                 timestamps: HashMap::from([(k.clone(), 500i64)]),
                 ..Default::default()
             },
@@ -3442,7 +3405,6 @@ fn dep_updated_retries_once_per_dep_update_after_failure() {
     ]);
     let pctx_retry = PartitionEvalContext {
         all_keys: &keys,
-        materialized: &HashSet::new(),
         in_progress: &HashSet::new(),
         failed: &keys,
         timestamps: &a_timestamps,
@@ -3484,12 +3446,10 @@ fn dep_updated_ignores_dep_keys_outside_root_universe() {
 
     let all_states = HashMap::new();
     let b_partition_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: b_keys.clone(),
         timestamps: HashMap::from([(old.clone(), 500i64), (shared.clone(), 100)]),
         ..Default::default()
     };
     let a_partition_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: a_keys.clone(),
         timestamps: a_timestamps.clone(),
         ..Default::default()
     };
@@ -3513,7 +3473,6 @@ fn dep_updated_ignores_dep_keys_outside_root_universe() {
     let upstream_b = HashMap::from([("b".to_string(), b_keys.clone())]);
     let pctx = PartitionEvalContext {
         all_keys: &a_keys,
-        materialized: &a_keys,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &a_timestamps,
@@ -3537,7 +3496,6 @@ fn dep_updated_ignores_dep_keys_outside_root_universe() {
         (
             "a".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                materialized: a_keys.clone(),
                 timestamps: a_timestamps.clone(),
                 ..Default::default()
             },
@@ -3545,7 +3503,6 @@ fn dep_updated_ignores_dep_keys_outside_root_universe() {
         (
             "b".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                materialized: b_keys.clone(),
                 timestamps: HashMap::from([(old.clone(), 500i64), (shared.clone(), 150)]),
                 ..Default::default()
             },
@@ -3553,7 +3510,6 @@ fn dep_updated_ignores_dep_keys_outside_root_universe() {
     ]);
     let pctx_new = PartitionEvalContext {
         all_keys: &a_keys,
-        materialized: &a_keys,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &a_timestamps,
@@ -3612,7 +3568,6 @@ fn test_last_run_includes_target_partitioned_solo_run_allows_newly_updated() {
     let all_states = HashMap::from([("b".to_string(), dep_b_state)]);
 
     let b_partition_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: HashSet::from([pk1.clone()]),
         timestamps: HashMap::from([(pk1.clone(), 200i64)]),
         ..Default::default()
     };
@@ -3626,7 +3581,6 @@ fn test_last_run_includes_target_partitioned_solo_run_allows_newly_updated() {
     let upstream_b = HashMap::from([("b".to_string(), all_keys.clone())]);
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &all_keys,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &timestamps,
@@ -3688,7 +3642,6 @@ fn test_last_run_includes_target_partitioned_mixed_joint_and_solo() {
     let all_states = HashMap::from([("b".to_string(), dep_b_state)]);
 
     let b_partition_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: HashSet::from([pk1.clone(), pk2.clone()]),
         timestamps: HashMap::from([(pk1.clone(), 200i64), (pk2.clone(), 200)]),
         ..Default::default()
     };
@@ -3702,7 +3655,6 @@ fn test_last_run_includes_target_partitioned_mixed_joint_and_solo() {
     let upstream_b = HashMap::from([("b".to_string(), all_keys.clone())]);
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &all_keys,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &timestamps,
@@ -6912,7 +6864,6 @@ async fn test_incremental_partition_refresh_keeps_equal_timestamp_partitions() {
         Some(&3000),
         "a partition update equal to the cached max timestamp must not be dropped"
     );
-    assert!(cache.partition_status["dst"].materialized.contains(&part("b")));
 }
 
 #[test]
@@ -9420,7 +9371,6 @@ async fn test_step_completion_single_pass() {
 /// Owned partition data for tests. Build this, then borrow from it to create PartitionEvalContext.
 struct OwnedPartitionData {
     all_keys: HashSet<PartitionKey>,
-    materialized: HashSet<PartitionKey>,
     in_progress: HashSet<PartitionKey>,
     failed: HashSet<PartitionKey>,
     timestamps: HashMap<PartitionKey, i64>,
@@ -9429,12 +9379,18 @@ struct OwnedPartitionData {
 
 impl OwnedPartitionData {
     fn new(all_keys: &[&str], materialized: &[&str], timestamps: &[(&str, i64)]) -> Self {
+        // Materialized == has a timestamp (the cache keeps them in lockstep);
+        // keys listed only in `materialized` get a placeholder ts.
+        let mut ts: HashMap<PartitionKey, i64> =
+            timestamps.iter().map(|(k, v)| (spk(k), *v)).collect();
+        for k in materialized {
+            ts.entry(spk(k)).or_insert(1);
+        }
         Self {
             all_keys: all_keys.iter().map(|s| spk(s)).collect(),
-            materialized: materialized.iter().map(|s| spk(s)).collect(),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
-            timestamps: timestamps.iter().map(|(k, v)| (spk(k), *v)).collect(),
+            timestamps: ts,
             all_partition_statuses: HashMap::new(),
         }
     }
@@ -9442,7 +9398,6 @@ impl OwnedPartitionData {
     fn as_eval_ctx(&self) -> PartitionEvalContext<'_> {
         PartitionEvalContext {
             all_keys: &self.all_keys,
-            materialized: &self.materialized,
             in_progress: &self.in_progress,
             failed: &self.failed,
             timestamps: &self.timestamps,
@@ -9697,7 +9652,6 @@ fn test_partitioned_in_latest_time_window_selects_recent_keys() {
     let tw = TimeWindowResolver::new(&fmts, now_local);
     let pctx = PartitionEvalContext {
         all_keys: &pdata.all_keys,
-        materialized: &pdata.materialized,
         in_progress: &pdata.in_progress,
         failed: &pdata.failed,
         timestamps: &pdata.timestamps,
@@ -9740,7 +9694,6 @@ fn test_partitioned_in_latest_time_window_empty_when_no_recent() {
     let tw = TimeWindowResolver::new(&fmts, now_local);
     let pctx = PartitionEvalContext {
         all_keys: &pdata.all_keys,
-        materialized: &pdata.materialized,
         in_progress: &pdata.in_progress,
         failed: &pdata.failed,
         timestamps: &pdata.timestamps,
@@ -9775,7 +9728,6 @@ fn test_partitioned_in_latest_time_window_static_partitions_selects_none() {
     let empty_partition_statuses = HashMap::new();
     let pctx = PartitionEvalContext {
         all_keys: &pdata.all_keys,
-        materialized: &pdata.materialized,
         in_progress: &pdata.in_progress,
         failed: &pdata.failed,
         timestamps: &pdata.timestamps,
@@ -9826,7 +9778,6 @@ fn test_partitioned_in_latest_time_window_combined_with_missing() {
     let tw = TimeWindowResolver::new(&fmts, now_local);
     let pctx = PartitionEvalContext {
         all_keys: &pdata.all_keys,
-        materialized: &pdata.materialized,
         in_progress: &pdata.in_progress,
         failed: &pdata.failed,
         timestamps: &pdata.timestamps,
@@ -10237,7 +10188,6 @@ fn test_partitioned_any_deps_missing_with_identity() {
     let partition_statuses = HashMap::from([(
         "a".to_string(),
         crate::condition::cache::PartitionStatusEntry {
-            materialized: HashSet::from([spk("p1"), spk("p2"), spk("p3")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
             failed_timestamps: HashMap::new(),
@@ -10252,7 +10202,6 @@ fn test_partitioned_any_deps_missing_with_identity() {
     let _ts = HashMap::from([(spk("p1"), 100), (spk("p2"), 100), (spk("p3"), 100)]);
     let pctx = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
@@ -10316,7 +10265,6 @@ fn test_partitioned_all_deps_match_not_missing() {
     let partition_statuses = HashMap::from([(
         "a".to_string(),
         crate::condition::cache::PartitionStatusEntry {
-            materialized: HashSet::from([spk("p1"), spk("p2")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
             failed_timestamps: HashMap::new(),
@@ -10331,7 +10279,6 @@ fn test_partitioned_all_deps_match_not_missing() {
     let _ts2: HashMap<PartitionKey, i64> = HashMap::new();
     let pctx = PartitionEvalContext {
         all_keys: &_ak2,
-        materialized: &_mat2,
         in_progress: &_ip2,
         failed: &_fail2,
         timestamps: &_ts2,
@@ -10501,7 +10448,6 @@ fn test_partitioned_eager_selects_new_partition() {
     let partition_statuses = HashMap::from([(
         "raw".to_string(),
         crate::condition::cache::PartitionStatusEntry {
-            materialized: HashSet::from([spk("p1"), spk("p2"), spk("p3")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
             failed_timestamps: HashMap::new(),
@@ -10516,7 +10462,6 @@ fn test_partitioned_eager_selects_new_partition() {
     let _ts3 = HashMap::from([(spk("p1"), 100), (spk("p2"), 100)]);
     let pctx = PartitionEvalContext {
         all_keys: &_ak3,
-        materialized: &_mat3,
         in_progress: &_ip3,
         failed: &_fail3,
         timestamps: &_ts3,
@@ -10991,7 +10936,6 @@ fn test_partitioned_eager_partial_upstream_update() {
     let partition_statuses = HashMap::from([(
         "raw".to_string(),
         crate::condition::cache::PartitionStatusEntry {
-            materialized: HashSet::from([spk("p1"), spk("p2"), spk("p3")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
             failed_timestamps: HashMap::new(),
@@ -11006,7 +10950,6 @@ fn test_partitioned_eager_partial_upstream_update() {
     let _ts = HashMap::from([(spk("p1"), 100_i64), (spk("p2"), 100)]);
     let pctx = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
@@ -11079,7 +11022,6 @@ fn test_partitioned_eager_only_fires_for_partitions_with_upstream_data() {
     let partition_statuses = HashMap::from([(
         "raw".to_string(),
         crate::condition::cache::PartitionStatusEntry {
-            materialized: HashSet::from([spk("p1"), spk("p2"), spk("p3")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
             failed_timestamps: HashMap::new(),
@@ -11088,13 +11030,11 @@ fn test_partitioned_eager_only_fires_for_partitions_with_upstream_data() {
     )]);
 
     // Downstream "processed" has never been materialized
-    let empty_mat: HashSet<PartitionKey> = HashSet::new();
     let empty_ip: HashSet<PartitionKey> = HashSet::new();
     let empty_fail: HashSet<PartitionKey> = HashSet::new();
     let empty_ts: HashMap<PartitionKey, i64> = HashMap::new();
     let pctx = PartitionEvalContext {
         all_keys: &all_partitions,
-        materialized: &empty_mat,
         in_progress: &empty_ip,
         failed: &empty_fail,
         timestamps: &empty_ts,
@@ -11186,7 +11126,6 @@ fn test_partitioned_on_missing_only_missing_partitions() {
     let partition_statuses = HashMap::from([(
         "a".to_string(),
         crate::condition::cache::PartitionStatusEntry {
-            materialized: HashSet::from([spk("p1"), spk("p2"), spk("p3")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
             failed_timestamps: HashMap::new(),
@@ -11202,7 +11141,6 @@ fn test_partitioned_on_missing_only_missing_partitions() {
     let _ts = HashMap::from([(spk("p1"), 100_i64)]);
     let pctx = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
@@ -11269,7 +11207,6 @@ fn test_partitioned_in_progress_excludes_from_and() {
     let _ts = HashMap::from([(spk("p1"), 100_i64)]);
     let pctx = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
@@ -11337,7 +11274,6 @@ fn test_partitioned_code_version_changed_all_partitions() {
     let _ts: HashMap<PartitionKey, i64> = HashMap::new();
     let pctx = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
@@ -11371,7 +11307,6 @@ fn test_partitioned_since_latch_per_partition() {
     let _ts1 = HashMap::from([(spk("p1"), 100_i64)]);
     let pctx1 = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat1,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts1,
@@ -11424,7 +11359,6 @@ fn test_partitioned_since_latch_per_partition() {
     let _ts2 = HashMap::from([(spk("p1"), 100_i64), (spk("p2"), 200)]);
     let pctx2 = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat2,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts2,
@@ -11626,7 +11560,6 @@ fn test_partitioned_execution_failed_subset() {
     let _ts: HashMap<PartitionKey, i64> = HashMap::new();
     let pctx = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
@@ -11654,13 +11587,12 @@ fn test_partitioned_complex_or_and_not() {
     let deps = HashMap::new();
 
     let _ak = HashSet::from([spk("p1"), spk("p2"), spk("p3"), spk("p4")]);
-    let _mat = HashSet::from([spk("p1"), spk("p3")]);
     let _ip = HashSet::from([spk("p4")]);
     let _fail = HashSet::from([spk("p3")]);
-    let _ts: HashMap<PartitionKey, i64> = HashMap::new();
+    // p1 and p3 materialized (timestamps ARE the materialized set).
+    let _ts: HashMap<PartitionKey, i64> = HashMap::from([(spk("p1"), 50), (spk("p3"), 50)]);
     let pctx = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
@@ -12983,7 +12915,6 @@ fn test_partitioned_on_cron_no_deps_fires_all_partitions() {
     let _ts = HashMap::from([(spk("p1"), 100_i64), (spk("p2"), 100), (spk("p3"), 100)]);
     let pctx = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
@@ -13136,7 +13067,6 @@ fn test_partitioned_newly_requested_is_per_partition() {
     let no_upstream_keys = HashMap::new();
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &all_keys,
         in_progress: &empty_pk,
         failed: &empty_pk,
         timestamps: &ts,
@@ -13195,7 +13125,6 @@ fn test_partitioned_on_cron_does_not_fire_without_tick() {
     let _ts = HashMap::from([(spk("p1"), 100_i64), (spk("p2"), 100)]);
     let pctx = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
@@ -13260,7 +13189,6 @@ fn test_partitioned_on_cron_waits_for_dep_update() {
     let partition_statuses = HashMap::from([(
         "a".to_string(),
         crate::condition::cache::PartitionStatusEntry {
-            materialized: HashSet::from([spk("p1"), spk("p2")]),
             in_progress: HashSet::new(),
             failed: HashSet::new(),
             failed_timestamps: HashMap::new(),
@@ -13295,7 +13223,6 @@ fn test_partitioned_on_cron_waits_for_dep_update() {
     let _ts = HashMap::from([(spk("p1"), 100_i64), (spk("p2"), 100)]);
     let pctx = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
@@ -13382,7 +13309,6 @@ fn test_partitioned_on_cron_fires_after_dep_update() {
         HashMap::from([(
             "a".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                materialized: HashSet::from([spk("p1"), spk("p2")]),
                 in_progress: HashSet::new(),
                 failed: HashSet::new(),
                 failed_timestamps: HashMap::new(),
@@ -13395,7 +13321,6 @@ fn test_partitioned_on_cron_fires_after_dep_update() {
     let statuses_t1 = statuses(100);
     let pctx1 = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
@@ -13447,7 +13372,6 @@ fn test_partitioned_on_cron_fires_after_dep_update() {
     let statuses_t2 = statuses(200);
     let pctx2 = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
@@ -13766,7 +13690,6 @@ fn test_partitioned_on_cron_partial_dep_update() {
         HashMap::from([(
             "a".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                materialized: HashSet::from([spk("p1"), spk("p2")]),
                 in_progress: HashSet::new(),
                 failed: HashSet::new(),
                 failed_timestamps: HashMap::new(),
@@ -13779,7 +13702,6 @@ fn test_partitioned_on_cron_partial_dep_update() {
     let statuses_t1 = statuses(100, 100);
     let pctx1 = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
@@ -13831,7 +13753,6 @@ fn test_partitioned_on_cron_partial_dep_update() {
     let statuses_t2 = statuses(200, 100);
     let pctx2 = PartitionEvalContext {
         all_keys: &_ak,
-        materialized: &_mat,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &_ts,
@@ -13903,7 +13824,6 @@ fn test_nested_dep_pivot_floor_uses_root_universe() {
         (
             "r".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                materialized: HashSet::from([spk("d1"), spk("d2")]),
                 in_progress: HashSet::new(),
                 failed: HashSet::new(),
                 failed_timestamps: HashMap::new(),
@@ -13913,7 +13833,6 @@ fn test_nested_dep_pivot_floor_uses_root_universe() {
         (
             "m".to_string(),
             crate::condition::cache::PartitionStatusEntry {
-                materialized: HashSet::from([spk("eu"), spk("us")]),
                 in_progress: HashSet::new(),
                 failed: HashSet::new(),
                 failed_timestamps: HashMap::new(),
@@ -13931,7 +13850,6 @@ fn test_nested_dep_pivot_floor_uses_root_universe() {
     let eval_with = |records: HashMap<String, AssetRecord>| {
         let pctx = PartitionEvalContext {
             all_keys: &_ak,
-            materialized: &_mat,
             in_progress: &_ip,
             failed: &_fail,
             timestamps: &_ts,
@@ -14003,7 +13921,6 @@ fn test_update_dep_baselines_stores_partition_timestamps() {
     let partition_statuses = HashMap::from([(
         "b".to_string(),
         crate::condition::cache::PartitionStatusEntry {
-            materialized: HashSet::from([pk1.clone(), pk2.clone()]),
             timestamps: HashMap::from([(pk1.clone(), 200_i64), (pk2.clone(), 300)]),
             ..Default::default()
         },
@@ -14075,7 +13992,6 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
     let deps = HashMap::from([("a".into(), vec!["b".into()])]);
 
     let b_partition_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: HashSet::from([pk1.clone(), pk2.clone()]),
         timestamps: HashMap::from([(pk1.clone(), 200_i64), (pk2.clone(), 200)]),
         ..Default::default()
     };
@@ -14104,7 +14020,6 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
     let _fail: HashSet<PartitionKey> = HashSet::new();
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &all_keys,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &timestamps,
@@ -14156,7 +14071,6 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
     let (resolver2, prev2) = build_ctx(&baselined_states);
     let pctx2 = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &all_keys,
         in_progress: &_ip,
         failed: &_fail,
         timestamps: &timestamps,
@@ -14855,7 +14769,6 @@ fn test_dep_aggregate_partitioned_since_latch_persists_per_dep() {
 
     // dep "a" materialized @200 on both ticks; "a" itself failing never (reset off).
     let a_status = || crate::condition::cache::PartitionStatusEntry {
-        materialized: HashSet::from([spk("p1"), spk("p2")]),
         in_progress: HashSet::new(),
         failed: HashSet::new(),
         failed_timestamps: HashMap::new(),
@@ -14868,7 +14781,6 @@ fn test_dep_aggregate_partitioned_since_latch_persists_per_dep() {
     let empty_set: HashSet<PartitionKey> = HashSet::new();
     let pctx1 = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &empty_set,
         in_progress: &empty_set,
         failed: &empty_set,
         timestamps: &empty_ts,
@@ -14897,7 +14809,6 @@ fn test_dep_aggregate_partitioned_since_latch_persists_per_dep() {
 
     // Tick 2: root b @300 (newer than a@200) → NewlyUpdated(a) false, reset false → per-partition latch must persist.
     let b_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: HashSet::from([spk("p1"), spk("p2")]),
         in_progress: HashSet::new(),
         failed: HashSet::new(),
         failed_timestamps: HashMap::new(),
@@ -14905,10 +14816,8 @@ fn test_dep_aggregate_partitioned_since_latch_persists_per_dep() {
     };
     let statuses2 = HashMap::from([("a".to_string(), a_status()), ("b".to_string(), b_status)]);
     let b_ts = HashMap::from([(spk("p1"), 300i64), (spk("p2"), 300)]);
-    let mat2 = HashSet::from([spk("p1"), spk("p2")]);
     let pctx2 = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &mat2,
         in_progress: &empty_set,
         failed: &empty_set,
         timestamps: &b_ts,
@@ -15159,7 +15068,6 @@ fn test_nested_dep_aggregate_under_unpartitioned_dep_persists_latch() {
 
     let r_timestamps = HashMap::from([(p1.clone(), 50i64)]);
     let r_status = crate::condition::cache::PartitionStatusEntry {
-        materialized: all_keys.clone(),
         timestamps: r_timestamps.clone(),
         ..Default::default()
     };
@@ -15171,7 +15079,6 @@ fn test_nested_dep_aggregate_under_unpartitioned_dep_persists_latch() {
 
     let make_pctx = || PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &all_keys,
         in_progress: &empty_pk,
         failed: &empty_pk,
         timestamps: &r_timestamps,
@@ -15501,12 +15408,10 @@ fn test_partitioned_newly_updated_ignores_keys_outside_universe() {
     ctx.prev_state = &prev;
 
     let all_keys = HashSet::from([live.clone()]);
-    let materialized = HashSet::from([live.clone(), retired.clone()]);
     let timestamps = HashMap::from([(live.clone(), 100i64), (retired.clone(), 50)]);
     let partition_status = HashMap::new();
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &materialized,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &timestamps,
@@ -15619,12 +15524,10 @@ fn test_partitioned_data_version_changed_suppressed_for_pre_versioning_state() {
 
     let k1 = spk("2024-01-01");
     let all_keys = HashSet::from([k1.clone()]);
-    let materialized = HashSet::from([k1.clone()]);
     let timestamps = HashMap::from([(k1.clone(), 100i64)]);
     let partition_status = HashMap::new();
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &materialized,
         in_progress: &HashSet::new(),
         failed: &HashSet::new(),
         timestamps: &timestamps,
@@ -16221,7 +16124,6 @@ fn test_partitioned_execution_failed_ignores_keys_outside_universe() {
     let in_progress = HashSet::from([retired.clone()]);
     let pctx = PartitionEvalContext {
         all_keys: &all_keys,
-        materialized: &HashSet::new(),
         in_progress: &in_progress,
         failed: &failed,
         timestamps: &HashMap::new(),

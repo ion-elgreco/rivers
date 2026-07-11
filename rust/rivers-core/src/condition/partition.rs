@@ -516,8 +516,6 @@ impl<'a> PartitionResolver<'a> {
 pub struct PartitionEvalContext<'a> {
     /// All valid partition keys for this asset.
     pub all_keys: &'a HashSet<PartitionKey>,
-    /// Which partitions have been materialized at least once.
-    pub materialized: &'a HashSet<PartitionKey>,
     /// Which partitions are currently being materialized.
     pub in_progress: &'a HashSet<PartitionKey>,
     /// Which partitions failed in latest execution.
