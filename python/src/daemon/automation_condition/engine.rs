@@ -8,6 +8,10 @@ use rivers_core::storage::{ConditionEvalRecord, ScopedStorageHandle, TickRecord}
 use crate::daemon::dispatchers::{BackfillDispatcherKind, RunDispatcherKind};
 use crate::daemon::types::{ConditionEvalWriteMsg, TickWriteMsg};
 
+/// Passive ticks flush eval state at most this often; ticks that consume
+/// latches always persist immediately.
+const STATE_PERSIST_INTERVAL_NANOS: i64 = 60 * 1_000_000_000;
+
 pub(super) struct ConditionTickEngine {
     pub(super) pass: ConditionPass,
 
@@ -20,6 +24,8 @@ pub(super) struct ConditionTickEngine {
     pub(super) eval_tx: tokio::sync::mpsc::UnboundedSender<ConditionEvalWriteMsg>,
     pub(super) max_ticks_retained: Option<usize>,
     pub(super) max_evals_retained: Option<usize>,
+    /// When eval state last persisted (throttles passive-tick flushes).
+    pub(super) last_state_persist: i64,
 }
 
 impl ConditionTickEngine {
@@ -190,8 +196,24 @@ impl ConditionTickEngine {
         }
         // Latches advance only for assets whose dispatch went out; failed
         // ones stay armed and force a retry evaluation next tick.
-        self.pass.commit_tick(&output, &dispatch_failed, now);
+        let dirty = self.pass.commit_tick(&output, &dispatch_failed, now);
 
+        // Latch-consuming ticks persist immediately; passive ticks only
+        // refresh derivable views, and the full-blob write is the dominant
+        // per-tick cost at large partition counts — flush those on a slow
+        // cadence instead (shutdown still persists unconditionally).
+        if !dirty && now - self.last_state_persist < STATE_PERSIST_INTERVAL_NANOS {
+            if intent_written {
+                // Nothing committed (every fired asset failed dispatch), so
+                // the intent guards nothing; drop it now.
+                let _ = self
+                    .storage
+                    .scoped()
+                    .set_condition_pending_dispatch(&PendingDispatch::default())
+                    .await;
+            }
+            return;
+        }
         match self
             .storage
             .scoped()
@@ -199,6 +221,7 @@ impl ConditionTickEngine {
             .await
         {
             Ok(()) => {
+                self.last_state_persist = now;
                 if intent_written {
                     // Cleared only after the state landed — the intent is the
                     // crash guard for the window in between.

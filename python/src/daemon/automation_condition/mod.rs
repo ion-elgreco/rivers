@@ -411,6 +411,7 @@ pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
         eval_tx,
         max_ticks_retained,
         max_evals_retained,
+        last_state_persist: 0,
     };
 
     loop {
