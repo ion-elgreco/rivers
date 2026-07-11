@@ -903,21 +903,16 @@ fn eval_new_update_tags_partitioned(
     PartitionSelection::from_keys(matching)
 }
 
-/// Parse a cron schedule (seconds optional) in the shared rivers dialect.
-fn build_cron(schedule: &str) -> Result<croner::Cron, String> {
-    crate::timegrid::parse_cron(schedule).map_err(|e| e.to_string())
-}
-
 /// Validate a cron schedule at construction so bad input is rejected up front.
-pub fn validate_cron(schedule: &str) -> Result<(), String> {
-    build_cron(schedule).map(|_| ())
+pub fn validate_cron(schedule: &str) -> anyhow::Result<()> {
+    crate::timegrid::parse_cron(schedule).map(|_| ())
 }
 
 /// Validate an IANA timezone name at construction (parsed via `chrono-tz`).
-pub fn validate_timezone(tz: &str) -> Result<(), String> {
+pub fn validate_timezone(tz: &str) -> anyhow::Result<()> {
     tz.parse::<chrono_tz::Tz>()
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Next cron occurrence strictly after `after`, as a real UTC instant, evaluated
@@ -1025,7 +1020,8 @@ fn cron_tick_between(
         if !cache.contains_key(cron_schedule) {
             cache.insert(
                 cron_schedule.to_string(),
-                build_cron(cron_schedule).expect("cron schedule validated at construction"),
+                crate::timegrid::parse_cron(cron_schedule)
+                    .expect("cron schedule validated at construction"),
             );
         }
         let cron = &cache[cron_schedule];
