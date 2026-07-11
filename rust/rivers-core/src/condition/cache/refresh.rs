@@ -460,7 +460,6 @@ impl AssetConditionCache {
 
         if clear_tick_accumulators {
             self.tick_materialization_tags.clear();
-            self.tick_partition_materialization_tags.clear();
         }
 
         for record in record_updates {

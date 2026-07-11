@@ -160,21 +160,17 @@ pub struct CacheSnapshot<'a> {
     pub backfill: &'a BackfillState,
 }
 
-/// Borrowed snapshot of run metadata from the cache.
+/// Borrowed snapshot of run metadata from the cache. Each map is slotted by
+/// `(asset, Option<PartitionKey>)` — the `None` slot carries unpartitioned
+/// assets and unkeyed runs.
 #[derive(Clone, Copy)]
 pub struct RunTagSnapshot<'a> {
-    /// Tags from the latest completed run per asset (unpartitioned).
-    pub last_run_tags: &'a super::cache::LastRunTagsMap,
-    /// Tags from the latest completed run per asset+partition.
-    pub partition_last_run_tags: &'a super::cache::PartitionLastRunTagsMap,
-    /// Run tag sets from materializations completed this tick (unpartitioned).
-    pub tick_materialization_tags: &'a super::cache::TickMaterializationTagsMap,
-    /// Run tag sets from materializations completed this tick, per partition.
-    pub tick_partition_materialization_tags: &'a super::cache::TickPartitionMaterializationTagsMap,
-    /// Full `asset_names` from the latest completed run per asset.
-    pub last_run_asset_names: &'a HashMap<String, Arc<[String]>>,
-    /// Full `asset_names` from the latest completed run per asset+partition.
-    pub partition_last_run_asset_names: &'a super::cache::PartitionLastRunAssetNamesMap,
+    /// Tags from the latest completed run per (asset, slot).
+    pub last_run_tags: &'a super::cache::SlotMap<super::cache::RunTags>,
+    /// Run tag sets from materializations completed this tick, per (asset, slot).
+    pub tick_materialization_tags: &'a super::cache::SlotMap<Vec<super::cache::RunTags>>,
+    /// Full `asset_names` from the latest completed run per (asset, slot).
+    pub last_run_asset_names: &'a super::cache::SlotMap<Arc<[String]>>,
 }
 
 /// Read-only context for evaluating conditions on a single asset during one tick.

@@ -45,31 +45,40 @@ static DEFAULT_STATE: std::sync::LazyLock<AssetConditionState> =
     std::sync::LazyLock::new(AssetConditionState::default);
 static EMPTY_ASSET_STATES: std::sync::LazyLock<HashMap<String, AssetConditionState>> =
     std::sync::LazyLock::new(HashMap::new);
-static EMPTY_RUN_TAGS: std::sync::LazyLock<HashMap<String, Arc<[(String, String)]>>> =
+static EMPTY_RUN_TAGS: std::sync::LazyLock<crate::condition::cache::SlotMap<RunTags>> =
     std::sync::LazyLock::new(HashMap::new);
-static EMPTY_PARTITION_RUN_TAGS: std::sync::LazyLock<
-    HashMap<String, HashMap<PartitionKey, Arc<[(String, String)]>>>,
-> = std::sync::LazyLock::new(HashMap::new);
-static EMPTY_TICK_MAT_TAGS: std::sync::LazyLock<HashMap<String, Vec<Arc<[(String, String)]>>>> =
+static EMPTY_TICK_MAT_TAGS: std::sync::LazyLock<crate::condition::cache::SlotMap<Vec<RunTags>>> =
     std::sync::LazyLock::new(HashMap::new);
-static EMPTY_TICK_PART_MAT_TAGS: std::sync::LazyLock<
-    HashMap<String, HashMap<PartitionKey, Vec<Arc<[(String, String)]>>>>,
-> = std::sync::LazyLock::new(HashMap::new);
-static EMPTY_RUN_ASSET_NAMES: std::sync::LazyLock<HashMap<String, Arc<[String]>>> =
+static EMPTY_RUN_ASSET_NAMES: std::sync::LazyLock<crate::condition::cache::SlotMap<Arc<[String]>>> =
     std::sync::LazyLock::new(HashMap::new);
-static EMPTY_PARTITION_RUN_ASSET_NAMES: std::sync::LazyLock<
-    HashMap<String, HashMap<PartitionKey, Arc<[String]>>>,
-> = std::sync::LazyLock::new(HashMap::new);
 
 fn empty_tag_snapshot() -> RunTagSnapshot<'static> {
     RunTagSnapshot {
         last_run_tags: &EMPTY_RUN_TAGS,
-        partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
         tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-        tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
         last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-        partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
     }
+}
+
+/// Adapt an unpartitioned fixture map to the slotted shape (`None` slot).
+fn slotted<V>(m: HashMap<String, V>) -> crate::condition::cache::SlotMap<V> {
+    m.into_iter()
+        .map(|(asset, v)| (asset, HashMap::from([(None, v)])))
+        .collect()
+}
+
+/// Adapt a per-partition fixture map to the slotted shape (`Some` slots).
+fn slotted_parts<V>(
+    m: HashMap<String, HashMap<PartitionKey, V>>,
+) -> crate::condition::cache::SlotMap<V> {
+    m.into_iter()
+        .map(|(asset, vals)| {
+            (
+                asset,
+                vals.into_iter().map(|(pk, v)| (Some(pk), v)).collect(),
+            )
+        })
+        .collect()
 }
 
 fn spk(s: &str) -> PartitionKey {
@@ -174,14 +183,7 @@ fn test_in_progress() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &AssetConditionState::default(),
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -211,14 +213,7 @@ fn test_execution_failed() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &AssetConditionState::default(),
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -274,14 +269,7 @@ fn test_newly_requested_after_firing() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -315,14 +303,7 @@ fn test_newly_requested_not_fired_last_tick() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -355,14 +336,7 @@ fn test_newly_requested_never_handled() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -395,14 +369,7 @@ fn test_newly_updated() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -435,14 +402,7 @@ fn test_newly_updated_no_change() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -475,14 +435,7 @@ fn test_newly_updated_self_suppressed_on_initial_tick() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -516,14 +469,7 @@ fn test_newly_updated_self_fires_when_appears_between_ticks() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -661,14 +607,7 @@ fn test_newly_true_does_not_refire_with_previous_true() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -773,14 +712,7 @@ fn test_data_version_changed_true_when_version_differs() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev_state,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -814,14 +746,7 @@ fn test_data_version_changed_false_when_same() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev_state,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -922,14 +847,7 @@ fn test_data_version_changed_false_version_disappeared() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev_state,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -963,14 +881,7 @@ fn test_data_version_changed_with_tree() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev_state,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -1016,14 +927,7 @@ fn test_data_version_changed_state_tracking() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &state,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -1051,14 +955,7 @@ fn test_data_version_changed_state_tracking() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &state,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -1092,14 +989,7 @@ fn test_backfill_in_progress_true_when_in_backfill() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -1143,14 +1033,7 @@ fn test_backfill_in_progress_only_matches_selected_assets() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -1171,14 +1054,7 @@ fn test_backfill_in_progress_only_matches_selected_assets() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -1212,14 +1088,7 @@ fn test_backfill_in_progress_with_tree() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -1256,14 +1125,7 @@ fn test_backfill_in_progress_composition_with_in_progress() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -1301,14 +1163,7 @@ fn test_backfill_in_progress_dep_aggregate() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -1349,14 +1204,7 @@ fn test_backfill_in_progress_partitioned_targets_subset() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -1408,14 +1256,7 @@ fn test_backfill_in_progress_partitioned_empty_keys_selects_all() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -1461,14 +1302,7 @@ fn test_backfill_in_progress_partitioned_disjoint_keys() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -1517,14 +1351,7 @@ fn test_backfill_in_progress_multiple_backfills_union_partitions() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -1580,14 +1407,7 @@ fn test_backfill_in_progress_one_backfill_empty_keys_short_circuits() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &bf,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -1618,6 +1438,7 @@ fn test_last_executed_with_tags_values_match() {
         ]),
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let run_tags = slotted(run_tags);
     ctx.tags.last_run_tags = &run_tags;
 
     let cond = ConditionNode::LastExecutedWithTags {
@@ -1637,6 +1458,7 @@ fn test_last_executed_with_tags_values_mismatch() {
         Arc::from(vec![("env".to_string(), "staging".to_string())]),
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let run_tags = slotted(run_tags);
     ctx.tags.last_run_tags = &run_tags;
 
     let cond = ConditionNode::LastExecutedWithTags {
@@ -1673,6 +1495,7 @@ fn test_last_executed_with_tags_key_only_match() {
         ]),
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let run_tags = slotted(run_tags);
     ctx.tags.last_run_tags = &run_tags;
 
     let cond = ConditionNode::LastExecutedWithTags {
@@ -1692,6 +1515,7 @@ fn test_last_executed_with_tags_key_missing() {
         Arc::from(vec![("env".to_string(), "prod".to_string())]),
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let run_tags = slotted(run_tags);
     ctx.tags.last_run_tags = &run_tags;
 
     let cond = ConditionNode::LastExecutedWithTags {
@@ -1714,6 +1538,7 @@ fn test_last_executed_with_tags_combined_keys_and_values() {
         ]),
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let run_tags = slotted(run_tags);
     ctx.tags.last_run_tags = &run_tags;
 
     let cond = ConditionNode::LastExecutedWithTags {
@@ -1743,6 +1568,7 @@ fn test_last_executed_with_tags_subset_containment() {
         ]),
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let run_tags = slotted(run_tags);
     ctx.tags.last_run_tags = &run_tags;
 
     let cond = ConditionNode::LastExecutedWithTags {
@@ -1769,6 +1595,7 @@ fn test_last_executed_with_tags_only_matches_target_asset() {
         Arc::from(vec![("env".to_string(), "prod".to_string())]),
     )]);
     let mut ctx = make_ctx("a", &record_a, &records, &deps);
+    let run_tags = slotted(run_tags);
     ctx.tags.last_run_tags = &run_tags;
 
     let cond = ConditionNode::LastExecutedWithTags {
@@ -1788,6 +1615,7 @@ fn test_last_executed_with_tags_tree_output() {
         Arc::from(vec![("env".to_string(), "prod".to_string())]),
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let run_tags = slotted(run_tags);
     ctx.tags.last_run_tags = &run_tags;
 
     let cond = ConditionNode::LastExecutedWithTags {
@@ -1810,6 +1638,7 @@ fn test_last_executed_with_tags_composition_with_not() {
         Arc::from(vec![("env".to_string(), "prod".to_string())]),
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let run_tags = slotted(run_tags);
     ctx.tags.last_run_tags = &run_tags;
 
     let cond = !ConditionNode::LastExecutedWithTags {
@@ -1840,7 +1669,8 @@ fn test_last_executed_with_tags_partitioned_per_partition() {
     );
     let pctx = data.as_eval_ctx();
     let mut ctx = make_partitioned_ctx("a", &record, &records, &deps, &pctx);
-    ctx.tags.partition_last_run_tags = &partition_run_tags;
+    let partition_run_tags = slotted_parts(partition_run_tags);
+    ctx.tags.last_run_tags = &partition_run_tags;
 
     let cond = ConditionNode::LastExecutedWithTags {
         tag_keys: vec![],
@@ -1901,7 +1731,8 @@ fn test_last_executed_with_tags_partitioned_key_only() {
     );
     let pctx = data.as_eval_ctx();
     let mut ctx = make_partitioned_ctx("a", &record, &records, &deps, &pctx);
-    ctx.tags.partition_last_run_tags = &partition_run_tags;
+    let partition_run_tags = slotted_parts(partition_run_tags);
+    ctx.tags.last_run_tags = &partition_run_tags;
 
     let cond = ConditionNode::LastExecutedWithTags {
         tag_keys: vec!["env".to_string()],
@@ -1928,6 +1759,7 @@ fn test_last_executed_with_tags_empty_tags_in_cache_does_not_match() {
     let run_tags: HashMap<String, Arc<[(String, String)]>> =
         HashMap::from([("a".to_string(), Arc::from(vec![]))]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let run_tags = slotted(run_tags);
     ctx.tags.last_run_tags = &run_tags;
 
     let cond = ConditionNode::LastExecutedWithTags {
@@ -1964,6 +1796,7 @@ fn test_has_run_with_tags_match() {
         ])],
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let tick_tags = slotted(tick_tags);
     ctx.tags.tick_materialization_tags = &tick_tags;
 
     let cond = ConditionNode::HasRunWithTags {
@@ -1983,6 +1816,7 @@ fn test_has_run_with_tags_mismatch() {
         vec![Arc::from(vec![("env".to_string(), "staging".to_string())])],
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let tick_tags = slotted(tick_tags);
     ctx.tags.tick_materialization_tags = &tick_tags;
 
     let cond = ConditionNode::HasRunWithTags {
@@ -2019,6 +1853,7 @@ fn test_has_run_with_tags_multiple_runs_one_matches() {
         ],
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let tick_tags = slotted(tick_tags);
     ctx.tags.tick_materialization_tags = &tick_tags;
 
     let cond = ConditionNode::HasRunWithTags {
@@ -2047,6 +1882,7 @@ fn test_all_runs_have_tags_all_match() {
         ],
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let tick_tags = slotted(tick_tags);
     ctx.tags.tick_materialization_tags = &tick_tags;
 
     let cond = ConditionNode::AllRunsHaveTags {
@@ -2069,6 +1905,7 @@ fn test_all_runs_have_tags_one_missing() {
         ],
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let tick_tags = slotted(tick_tags);
     ctx.tags.tick_materialization_tags = &tick_tags;
 
     let cond = ConditionNode::AllRunsHaveTags {
@@ -2103,6 +1940,7 @@ fn test_has_run_with_tags_key_only() {
         vec![Arc::from(vec![("env".to_string(), "staging".to_string())])],
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let tick_tags = slotted(tick_tags);
     ctx.tags.tick_materialization_tags = &tick_tags;
 
     let cond = ConditionNode::HasRunWithTags {
@@ -2125,6 +1963,7 @@ fn test_has_run_with_tags_combined_keys_and_values() {
         ])],
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let tick_tags = slotted(tick_tags);
     ctx.tags.tick_materialization_tags = &tick_tags;
 
     let cond = ConditionNode::HasRunWithTags {
@@ -2146,6 +1985,7 @@ fn test_new_update_tags_asset_selectivity() {
     )]);
 
     let mut ctx_a = make_ctx("a", &a, &records, &deps);
+    let tick_tags = slotted(tick_tags);
     ctx_a.tags.tick_materialization_tags = &tick_tags;
     let cond = ConditionNode::HasRunWithTags {
         tag_keys: vec![],
@@ -2179,6 +2019,7 @@ fn test_new_update_tags_in_any_deps_match_composition() {
     )]);
 
     let mut ctx = make_ctx("c", &c, &records, &deps);
+    let tick_tags = slotted(tick_tags);
     ctx.tags.tick_materialization_tags = &tick_tags;
 
     let cond = ConditionNode::any_deps_match(ConditionNode::HasRunWithTags {
@@ -2203,6 +2044,7 @@ fn test_new_update_tags_run_with_empty_tags() {
     let deps = HashMap::new();
     let tick_tags = HashMap::from([("a".to_string(), vec![Arc::from(vec![])])]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let tick_tags = slotted(tick_tags);
     ctx.tags.tick_materialization_tags = &tick_tags;
 
     let cond_any = ConditionNode::HasRunWithTags {
@@ -2228,6 +2070,7 @@ fn test_new_update_tags_tree_output() {
         vec![Arc::from(vec![("env".to_string(), "prod".to_string())])],
     )]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
+    let tick_tags = slotted(tick_tags);
     ctx.tags.tick_materialization_tags = &tick_tags;
 
     let cond = ConditionNode::HasRunWithTags {
@@ -2259,7 +2102,8 @@ fn test_has_run_with_tags_partitioned() {
     );
     let pctx = data.as_eval_ctx();
     let mut ctx = make_partitioned_ctx("a", &record, &records, &deps, &pctx);
-    ctx.tags.tick_partition_materialization_tags = &tick_part_tags;
+    let tick_part_tags = slotted_parts(tick_part_tags);
+    ctx.tags.tick_materialization_tags = &tick_part_tags;
 
     let cond = ConditionNode::HasRunWithTags {
         tag_keys: vec![],
@@ -2306,7 +2150,8 @@ fn test_all_runs_have_tags_partitioned() {
     );
     let pctx = data.as_eval_ctx();
     let mut ctx = make_partitioned_ctx("a", &record, &records, &deps, &pctx);
-    ctx.tags.tick_partition_materialization_tags = &tick_part_tags;
+    let tick_part_tags = slotted_parts(tick_part_tags);
+    ctx.tags.tick_materialization_tags = &tick_part_tags;
 
     let cond = ConditionNode::AllRunsHaveTags {
         tag_keys: vec![],
@@ -2356,6 +2201,7 @@ fn test_last_run_includes_target_true_when_run_includes_root() {
     )]);
     let mut ctx = make_ctx("b", &record, &records, &deps);
     ctx.root_key = "c"; // evaluating on dep b, root is c
+    let asset_names = slotted(asset_names);
     ctx.tags.last_run_asset_names = &asset_names;
 
     assert!(evaluate(&ConditionNode::LastRunIncludesTarget, &ctx).fired);
@@ -2370,6 +2216,7 @@ fn test_last_run_includes_target_false_when_run_excludes_root() {
     let asset_names = HashMap::from([("b".to_string(), Arc::from(vec!["b".to_string()]))]);
     let mut ctx = make_ctx("b", &record, &records, &deps);
     ctx.root_key = "c";
+    let asset_names = slotted(asset_names);
     ctx.tags.last_run_asset_names = &asset_names;
 
     assert!(!evaluate(&ConditionNode::LastRunIncludesTarget, &ctx).fired);
@@ -2396,6 +2243,7 @@ fn test_last_run_includes_target_false_when_self_referential() {
     let asset_names = HashMap::from([("a".to_string(), Arc::from(vec!["a".to_string()]))]);
     let mut ctx = make_ctx("a", &record, &records, &deps);
     // root_key defaults to target_key ("a") via make_ctx
+    let asset_names = slotted(asset_names);
     ctx.tags.last_run_asset_names = &asset_names;
 
     assert!(!evaluate(&ConditionNode::LastRunIncludesTarget, &ctx).fired);
@@ -2413,6 +2261,7 @@ fn test_last_run_includes_target_not_composition() {
     )]);
     let mut ctx = make_ctx("b", &record, &records, &deps);
     ctx.root_key = "c";
+    let asset_names = slotted(asset_names);
     ctx.tags.last_run_asset_names = &asset_names;
 
     let cond = !ConditionNode::LastRunIncludesTarget;
@@ -2452,6 +2301,7 @@ fn test_last_run_includes_target_in_any_deps_match() {
         ("c".to_string(), dep_c_state),
     ]);
     let mut ctx = make_ctx("a", &a, &records, &deps);
+    let asset_names = slotted(asset_names);
     ctx.tags.last_run_asset_names = &asset_names;
     ctx.all_asset_states = &all_states;
 
@@ -2479,6 +2329,7 @@ fn test_last_run_includes_target_tree_output() {
     )]);
     let mut ctx = make_ctx("b", &record, &records, &deps);
     ctx.root_key = "c";
+    let asset_names = slotted(asset_names);
     ctx.tags.last_run_asset_names = &asset_names;
 
     let (result, tree) = evaluate_with_tree(&ConditionNode::LastRunIncludesTarget, &ctx);
@@ -2513,7 +2364,8 @@ fn test_last_run_includes_target_partitioned() {
 
     let mut ctx = make_ctx("b", &record, &records, &deps);
     ctx.root_key = "c";
-    ctx.tags.partition_last_run_asset_names = &partition_asset_names;
+    let partition_asset_names = slotted_parts(partition_asset_names);
+    ctx.tags.last_run_asset_names = &partition_asset_names;
 
     let partition_status = HashMap::new();
     let pctx = PartitionEvalContext {
@@ -2562,6 +2414,7 @@ fn test_last_run_includes_target_only_checks_target_not_root() {
     ]);
     let mut ctx = make_ctx("b", &record_b, &records, &deps);
     ctx.root_key = "c";
+    let asset_names = slotted(asset_names);
     ctx.tags.last_run_asset_names = &asset_names;
 
     // b's run = [b], does not contain root "c" → false
@@ -2615,7 +2468,8 @@ fn test_last_run_includes_target_partitioned_joint_run_suppresses_newly_updated(
     let partition_statuses = HashMap::from([("b".to_string(), b_partition_status)]);
 
     let mut ctx = make_ctx("a", &a, &records, &deps);
-    ctx.tags.partition_last_run_asset_names = &partition_asset_names;
+    let partition_asset_names = slotted_parts(partition_asset_names);
+    ctx.tags.last_run_asset_names = &partition_asset_names;
     ctx.all_asset_states = &all_states;
 
     let empty_mappings = HashMap::new();
@@ -2685,7 +2539,8 @@ fn dep_updated_requires_dep_newer_than_target_key() {
     )]);
 
     let mut ctx = make_ctx("a", &a, &records, &deps);
-    ctx.tags.partition_last_run_asset_names = &partition_asset_names;
+    let partition_asset_names = slotted_parts(partition_asset_names);
+    ctx.tags.last_run_asset_names = &partition_asset_names;
     ctx.all_asset_states = &all_states;
 
     let empty_mappings = HashMap::new();
@@ -3163,7 +3018,8 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
     )]);
 
     let mut ctx = make_ctx("a", &a, &records, &deps);
-    ctx.tags.partition_last_run_asset_names = &partition_asset_names;
+    let partition_asset_names = slotted_parts(partition_asset_names);
+    ctx.tags.last_run_asset_names = &partition_asset_names;
     ctx.all_asset_states = &all_states;
 
     let mappings = HashMap::from([(
@@ -3223,7 +3079,7 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
         dep_root_floor: None,
     };
     let mut ctx2 = make_ctx("a", &a, &records, &deps);
-    ctx2.tags.partition_last_run_asset_names = &partition_asset_names;
+    ctx2.tags.last_run_asset_names = &partition_asset_names;
     ctx2.all_asset_states = &all_states;
     ctx2.partitions = Some(&pctx_stale);
     let result = evaluate(&cond, &ctx2);
@@ -3291,7 +3147,8 @@ fn will_be_requested_carries_the_upstream_fired_selection() {
     )]);
 
     let mut ctx = make_ctx("down", &down, &records, &deps);
-    ctx.tags.partition_last_run_asset_names = &partition_asset_names;
+    let partition_asset_names = slotted_parts(partition_asset_names);
+    ctx.tags.last_run_asset_names = &partition_asset_names;
     ctx.all_asset_states = &all_states;
     ctx.requested_this_tick = &requested;
 
@@ -3359,7 +3216,8 @@ fn dep_updated_retries_once_per_dep_update_after_failure() {
     )]);
 
     let mut ctx = make_ctx("a", &a, &records, &deps);
-    ctx.tags.partition_last_run_asset_names = &partition_asset_names;
+    let partition_asset_names = slotted_parts(partition_asset_names);
+    ctx.tags.last_run_asset_names = &partition_asset_names;
     ctx.all_asset_states = &all_states;
 
     let empty_mappings = HashMap::new();
@@ -3414,7 +3272,7 @@ fn dep_updated_retries_once_per_dep_update_after_failure() {
         dep_root_floor: None,
     };
     let mut ctx2 = make_ctx("a", &a, &records, &deps);
-    ctx2.tags.partition_last_run_asset_names = &partition_asset_names;
+    ctx2.tags.last_run_asset_names = &partition_asset_names;
     ctx2.all_asset_states = &all_states;
     ctx2.partitions = Some(&pctx_retry);
     let result = evaluate(&cond, &ctx2);
@@ -3466,7 +3324,8 @@ fn dep_updated_ignores_dep_keys_outside_root_universe() {
     )]);
 
     let mut ctx = make_ctx("a", &a, &records, &deps);
-    ctx.tags.partition_last_run_asset_names = &partition_asset_names;
+    let partition_asset_names = slotted_parts(partition_asset_names);
+    ctx.tags.last_run_asset_names = &partition_asset_names;
     ctx.all_asset_states = &all_states;
 
     let empty_mappings = HashMap::new();
@@ -3519,7 +3378,7 @@ fn dep_updated_ignores_dep_keys_outside_root_universe() {
         dep_root_floor: None,
     };
     let mut ctx2 = make_ctx("a", &a, &records, &deps);
-    ctx2.tags.partition_last_run_asset_names = &partition_asset_names;
+    ctx2.tags.last_run_asset_names = &partition_asset_names;
     ctx2.all_asset_states = &all_states;
     ctx2.partitions = Some(&pctx_new);
     let result = evaluate(&cond, &ctx2);
@@ -3574,7 +3433,8 @@ fn test_last_run_includes_target_partitioned_solo_run_allows_newly_updated() {
     let partition_statuses = HashMap::from([("b".to_string(), b_partition_status)]);
 
     let mut ctx = make_ctx("a", &a, &records, &deps);
-    ctx.tags.partition_last_run_asset_names = &partition_asset_names;
+    let partition_asset_names = slotted_parts(partition_asset_names);
+    ctx.tags.last_run_asset_names = &partition_asset_names;
     ctx.all_asset_states = &all_states;
 
     let empty_mappings = HashMap::new();
@@ -3648,7 +3508,8 @@ fn test_last_run_includes_target_partitioned_mixed_joint_and_solo() {
     let partition_statuses = HashMap::from([("b".to_string(), b_partition_status)]);
 
     let mut ctx = make_ctx("a", &a, &records, &deps);
-    ctx.tags.partition_last_run_asset_names = &partition_asset_names;
+    let partition_asset_names = slotted_parts(partition_asset_names);
+    ctx.tags.last_run_asset_names = &partition_asset_names;
     ctx.all_asset_states = &all_states;
 
     let empty_mappings = HashMap::new();
@@ -3763,6 +3624,7 @@ fn test_asset_matches_preserves_root_key() {
         Arc::from(vec!["a".to_string(), "b".to_string()]),
     )]);
     let mut ctx = make_ctx("a", &a, &records, &deps);
+    let asset_names = slotted(asset_names);
     ctx.tags.last_run_asset_names = &asset_names;
 
     // LastRunIncludesTarget on "b" should check if root "a" is in b's run
@@ -3984,14 +3846,7 @@ fn test_any_deps_in_progress() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4022,14 +3877,7 @@ fn test_any_deps_in_progress_none() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4062,14 +3910,7 @@ fn test_any_deps_updated() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4171,14 +4012,7 @@ fn test_any_deps_updated_no_change() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &all_states,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4260,14 +4094,7 @@ fn test_newly_true_transition() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4294,14 +4121,7 @@ fn test_newly_true_transition() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev2,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4328,14 +4148,7 @@ fn test_newly_true_transition() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev3,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4386,14 +4199,7 @@ fn test_counter_stability_and_short_circuit() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev2,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4422,14 +4228,7 @@ fn test_counter_stability_and_short_circuit() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev2,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4483,14 +4282,7 @@ fn test_on_missing_does_not_fire_when_in_progress() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &AssetConditionState::default(),
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4539,14 +4331,7 @@ fn test_eager_fires_on_deps_updated() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &all_states,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4586,14 +4371,7 @@ fn test_eager_does_not_fire_when_up_to_date() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &all_states,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4652,14 +4430,7 @@ fn test_bug_cron_tick_always_fires_on_first_eval() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &AssetConditionState::default(),
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4704,14 +4475,7 @@ fn test_cron_tick_fires_when_tick_passes_between_evals() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4822,14 +4586,7 @@ fn test_bug_since_last_handled_refires_after_own_materialization() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev1,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4864,14 +4621,7 @@ fn test_bug_since_last_handled_refires_after_own_materialization() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev2,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4916,14 +4666,7 @@ fn test_newly_requested_any_deps_match_cross_asset_signaling() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev1,
         all_asset_states: &all_states_1,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -4969,14 +4712,7 @@ fn test_newly_requested_any_deps_match_cross_asset_signaling() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &all_states_2["downstream"],
         all_asset_states: &all_states_2,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -5015,14 +4751,7 @@ fn test_newly_requested_any_deps_match_cross_asset_signaling() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev3,
         all_asset_states: &all_states_3,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -5067,14 +4796,7 @@ fn test_newly_requested_as_since_reset() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev1,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -5111,14 +4833,7 @@ fn test_newly_requested_as_since_reset() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev2,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -5164,14 +4879,7 @@ fn test_newly_requested_as_since_reset_fast_ticks() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev1,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -5202,14 +4910,7 @@ fn test_newly_requested_as_since_reset_fast_ticks() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev2,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -5243,14 +4944,7 @@ fn test_newly_requested_as_since_reset_fast_ticks() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev3,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -5293,14 +4987,7 @@ fn test_newly_requested_in_since_last_handled() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev1,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -5329,14 +5016,7 @@ fn test_newly_requested_in_since_last_handled() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev2,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -5368,14 +5048,7 @@ fn test_newly_requested_in_since_last_handled() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev3,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -5562,14 +5235,7 @@ fn bench_eval(
                     failed_asset_timestamps: &EMPTY_FAILED_TS,
                     backfill: &EMPTY_BACKFILL,
                 },
-                tags: RunTagSnapshot {
-                    last_run_tags: &EMPTY_RUN_TAGS,
-                    partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-                    tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-                    tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-                    last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-                    partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-                },
+                tags: empty_tag_snapshot(),
                 prev_state: &prev,
                 all_asset_states: &EMPTY_ASSET_STATES,
                 requested_this_tick: &EMPTY_REQUESTED,
@@ -5599,14 +5265,7 @@ fn bench_eval(
                     failed_asset_timestamps: &EMPTY_FAILED_TS,
                     backfill: &EMPTY_BACKFILL,
                 },
-                tags: RunTagSnapshot {
-                    last_run_tags: &EMPTY_RUN_TAGS,
-                    partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-                    tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-                    tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-                    last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-                    partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-                },
+                tags: empty_tag_snapshot(),
                 prev_state: &prev,
                 all_asset_states: &EMPTY_ASSET_STATES,
                 requested_this_tick: &EMPTY_REQUESTED,
@@ -5926,14 +5585,7 @@ fn bench_selective_vs_full_eval() {
                         failed_asset_timestamps: &EMPTY_FAILED_TS,
                         backfill: &EMPTY_BACKFILL,
                     },
-                    tags: RunTagSnapshot {
-                        last_run_tags: &EMPTY_RUN_TAGS,
-                        partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-                        tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-                        tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-                        last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-                        partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-                    },
+                    tags: empty_tag_snapshot(),
                     prev_state: &prev,
                     all_asset_states: &EMPTY_ASSET_STATES,
                     requested_this_tick: &EMPTY_REQUESTED,
@@ -5968,14 +5620,7 @@ fn bench_selective_vs_full_eval() {
                         failed_asset_timestamps: &EMPTY_FAILED_TS,
                         backfill: &EMPTY_BACKFILL,
                     },
-                    tags: RunTagSnapshot {
-                        last_run_tags: &EMPTY_RUN_TAGS,
-                        partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-                        tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-                        tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-                        last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-                        partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-                    },
+                    tags: empty_tag_snapshot(),
                     prev_state: &prev,
                     all_asset_states: &EMPTY_ASSET_STATES,
                     requested_this_tick: &EMPTY_REQUESTED,
@@ -6193,14 +5838,7 @@ async fn bench_cache_tick<S: StorageBackend>(
                         failed_asset_timestamps: &EMPTY_FAILED_TS,
                         backfill: &EMPTY_BACKFILL,
                     },
-                    tags: RunTagSnapshot {
-                        last_run_tags: &EMPTY_RUN_TAGS,
-                        partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-                        tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-                        tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-                        last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-                        partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-                    },
+                    tags: empty_tag_snapshot(),
                     prev_state: &prev,
                     all_asset_states: &EMPTY_ASSET_STATES,
                     requested_this_tick: &EMPTY_REQUESTED,
@@ -6987,15 +6625,15 @@ async fn test_cache_completion_fallback_skips_still_started_sibling_effects() {
     assert!(!tracked.contains_key("run_a"), "completed run a is cleared");
     assert!(tracked.contains_key("run_b"), "still-running run b stays");
 
-    let dst_tags = cache.partition_last_run_tags.get("dst");
+    let dst_tags = cache.last_run_tags.get("dst");
     assert!(
-        dst_tags.is_some_and(|m| m.contains_key(&part("a"))),
+        dst_tags.is_some_and(|m| m.contains_key(&Some(part("a")))),
         "partition a (completed) should have recorded tags"
     );
     assert!(
-        dst_tags.is_none_or(|m| !m.contains_key(&part("b"))),
+        dst_tags.is_none_or(|m| !m.contains_key(&Some(part("b")))),
         "partition b is still running — its tags must NOT be recorded yet, got: {:?}",
-        dst_tags.and_then(|m| m.get(&part("b"))),
+        dst_tags.and_then(|m| m.get(&Some(part("b")))),
     );
 }
 
@@ -7354,6 +6992,7 @@ async fn test_queued_run_from_scheduler_is_tracked_and_applies_effects() {
         cache
             .last_run_tags
             .get("a")
+            .and_then(|slots| slots.get(&None))
             .is_some_and(|t| t.contains(&("team".to_string(), "x".to_string()))),
         "completion effects (run tags) must be applied; got {:?}",
         cache.last_run_tags
@@ -7614,17 +7253,18 @@ async fn test_joint_partitioned_run_updates_unpartitioned_assets_scalar_tags() {
 
     assert!(
         cache
-            .partition_last_run_tags
+            .last_run_tags
             .get("P")
-            .and_then(|m| m.get(&spk("2024-01-01")))
+            .and_then(|m| m.get(&Some(spk("2024-01-01"))))
             .is_some_and(|t| t.contains(&("team".to_string(), "x".to_string()))),
         "partitioned asset keeps per-partition tags; got {:?}",
-        cache.partition_last_run_tags
+        cache.last_run_tags
     );
     assert!(
         cache
             .last_run_tags
             .get("D")
+            .and_then(|slots| slots.get(&None))
             .is_some_and(|t| t.contains(&("team".to_string(), "x".to_string()))),
         "unpartitioned asset must get scalar tags; got {:?}",
         cache.last_run_tags
@@ -7683,6 +7323,7 @@ async fn test_failed_run_does_not_clobber_latest_materializing_tags() {
         cache
             .last_run_tags
             .get("A")
+            .and_then(|slots| slots.get(&None))
             .is_some_and(|t| t.contains(&("env".to_string(), "prod".to_string()))),
         "precondition: r1's tags recorded"
     );
@@ -7703,6 +7344,7 @@ async fn test_failed_run_does_not_clobber_latest_materializing_tags() {
         cache
             .last_run_tags
             .get("A")
+            .and_then(|slots| slots.get(&None))
             .is_some_and(|t| t.contains(&("env".to_string(), "prod".to_string()))),
         "a failed non-materializing run must not clobber the tags; got {:?}",
         cache.last_run_tags
@@ -7773,6 +7415,7 @@ async fn test_later_finishing_run_keeps_latest_tags() {
         cache
             .last_run_tags
             .get("X")
+            .and_then(|slots| slots.get(&None))
             .is_some_and(|t| t.contains(&("who".to_string(), "a".to_string()))),
         "the later-finishing materializing run's tags must win; got {:?}",
         cache.last_run_tags
@@ -9098,7 +8741,10 @@ async fn test_cache_does_not_store_empty_run_tags() {
     cache.refresh(&storage, 0).await.unwrap();
 
     assert_eq!(
-        cache.last_run_tags.get("a"),
+        cache
+            .last_run_tags
+            .get("a")
+            .and_then(|slots| slots.get(&None)),
         Some(&Arc::from(vec![("env".to_string(), "prod".to_string())])),
     );
 }
@@ -9150,7 +8796,10 @@ async fn test_cache_tick_materialization_tags() {
 
     // tick_materialization_tags should have the run's tags
     assert_eq!(
-        cache.tick_materialization_tags.get("a"),
+        cache
+            .tick_materialization_tags
+            .get("a")
+            .and_then(|slots| slots.get(&None)),
         Some(&vec![Arc::from(vec![(
             "env".to_string(),
             "prod".to_string()
@@ -9210,7 +8859,10 @@ async fn test_cache_tick_materialization_tags_includes_empty_tags() {
     cache.refresh(&storage, 0).await.unwrap();
 
     // tick_materialization_tags should have an entry with empty tags
-    let tick_tags = cache.tick_materialization_tags.get("a");
+    let tick_tags = cache
+        .tick_materialization_tags
+        .get("a")
+        .and_then(|slots| slots.get(&None));
     assert!(
         tick_tags.is_some(),
         "should record materializations even with empty tags"
@@ -9942,14 +9594,7 @@ fn test_partitioned_newly_updated() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -10124,14 +9769,7 @@ fn test_partitioned_newly_true() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -10174,14 +9812,7 @@ fn test_partitioned_newly_true() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -10275,14 +9906,7 @@ fn test_partitioned_any_deps_missing_with_identity() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &asset_states,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -10352,14 +9976,7 @@ fn test_partitioned_all_deps_match_not_missing() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &asset_states,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -10535,14 +10152,7 @@ fn test_partitioned_eager_selects_new_partition() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &asset_states,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -11023,14 +10633,7 @@ fn test_partitioned_eager_partial_upstream_update() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &asset_states,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -11108,14 +10711,7 @@ fn test_partitioned_eager_only_fires_for_partitions_with_upstream_data() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &HashMap::new(),
         requested_this_tick: &EMPTY_REQUESTED,
@@ -11214,14 +10810,7 @@ fn test_partitioned_on_missing_only_missing_partitions() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &asset_states,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -11280,14 +10869,7 @@ fn test_partitioned_in_progress_excludes_from_and() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -11380,14 +10962,7 @@ fn test_partitioned_since_latch_per_partition() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -11440,14 +11015,7 @@ fn test_partitioned_since_latch_per_partition() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev2,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -11489,14 +11057,7 @@ fn test_partitioned_newly_true_only_new_partitions() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &DEFAULT_STATE,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -11532,14 +11093,7 @@ fn test_partitioned_newly_true_only_new_partitions() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev2,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -11573,14 +11127,7 @@ fn test_partitioned_newly_true_only_new_partitions() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev3,
         all_asset_states: &EMPTY_ASSET_STATES,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -11749,14 +11296,7 @@ fn test_eager_does_not_fire_when_all_up_to_date_first_tick() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &state_b,
         all_asset_states: &all_states,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -11874,14 +11414,7 @@ fn test_eager_fires_after_upstream_observed_on_second_tick() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &state_agg,
         all_asset_states: &all_states_tick1,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -11947,14 +11480,7 @@ fn test_eager_fires_after_upstream_observed_on_second_tick() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev_state_rep,
         all_asset_states: &all_states_tick1,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -11983,14 +11509,7 @@ fn test_eager_fires_after_upstream_observed_on_second_tick() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &state_rep,
         all_asset_states: &all_states_tick1,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -12097,14 +11616,7 @@ fn test_eager_fires_after_dep_in_progress_clears() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev_state2,
         all_asset_states: &all_states,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -12147,14 +11659,7 @@ fn test_eager_fires_after_dep_in_progress_clears() {
             failed_asset_timestamps: &EMPTY_FAILED_TS,
             backfill: &EMPTY_BACKFILL,
         },
-        tags: RunTagSnapshot {
-            last_run_tags: &EMPTY_RUN_TAGS,
-            partition_last_run_tags: &EMPTY_PARTITION_RUN_TAGS,
-            tick_materialization_tags: &EMPTY_TICK_MAT_TAGS,
-            tick_partition_materialization_tags: &EMPTY_TICK_PART_MAT_TAGS,
-            last_run_asset_names: &EMPTY_RUN_ASSET_NAMES,
-            partition_last_run_asset_names: &EMPTY_PARTITION_RUN_ASSET_NAMES,
-        },
+        tags: empty_tag_snapshot(),
         prev_state: &prev_state3,
         all_asset_states: &all_states,
         requested_this_tick: &EMPTY_REQUESTED,
@@ -14557,6 +14062,7 @@ async fn test_asc_iteration_makes_newest_run_win_per_asset_state() {
         cache
             .last_run_asset_names
             .get("a")
+            .and_then(|slots| slots.get(&None))
             .map(|n| n.iter().cloned().collect::<Vec<_>>())
             .unwrap_or_default(),
         vec!["a".to_string(), "b".to_string()],
@@ -14588,6 +14094,7 @@ async fn test_asc_iteration_makes_newest_run_win_per_asset_state() {
     let names_for_a = cache
         .last_run_asset_names
         .get("a")
+        .and_then(|slots| slots.get(&None))
         .map(|n| n.iter().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
     assert_eq!(
