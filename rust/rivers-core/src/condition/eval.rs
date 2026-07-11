@@ -1582,50 +1582,46 @@ fn dep_newer_than_floor(dep_ts: i64, floor: Option<i64>) -> bool {
     floor.is_none_or(|f| dep_ts > f)
 }
 
+/// A key's effective attempt timestamp: the later of its last
+/// materialization and last (still-current) failure; `None` if never attempted.
+fn effective_attempt_ts(
+    root_status: &crate::condition::cache::PartitionStatusEntry,
+    k: &PartitionKey,
+) -> Option<i64> {
+    match (
+        root_status.timestamps.get(k),
+        root_status.failed_timestamps.get(k),
+    ) {
+        (None, None) => None,
+        (Some(&m), None) => Some(m),
+        (None, Some(&f)) => Some(f),
+        (Some(&m), Some(&f)) => Some(m.max(f)),
+    }
+}
+
 /// The staleness floor across the downstream keys a dep key maps to: the
-/// minimum per-key effective timestamp, where effective = the later of the
-/// last materialization and the last (still-current) failure.
+/// minimum per-key effective timestamp. Any never-attempted key collapses
+/// the floor to `None` (that key must be built, so the dep counts as newer).
 fn root_floor_over<'k>(
     keys: impl Iterator<Item = &'k PartitionKey>,
     root_status: &crate::condition::cache::PartitionStatusEntry,
 ) -> Option<i64> {
     let mut floor: Option<i64> = None;
     for k in keys {
-        let effective = match (
-            root_status.timestamps.get(k),
-            root_status.failed_timestamps.get(k),
-        ) {
-            (None, None) => return None,
-            (Some(&m), None) => m,
-            (None, Some(&f)) => f,
-            (Some(&m), Some(&f)) => m.max(f),
-        };
+        let effective = effective_attempt_ts(root_status, k)?;
         floor = Some(floor.map_or(effective, |fl| fl.min(effective)));
     }
     floor
 }
 
-/// Like `root_floor_over` but for fan-out (`AllPartitions`) edges: floor only
-/// over keys actually attempted, ignoring never-attempted ones instead of
-/// collapsing to `None`.
+/// Like `root_floor_over` but for fan-out (`AllPartitions` and bridged
+/// unpartitioned-dep) edges: floor only over keys actually attempted,
+/// ignoring never-attempted ones instead of collapsing to `None`.
 fn root_floor_over_attempted<'k>(
     keys: impl Iterator<Item = &'k PartitionKey>,
     root_status: &crate::condition::cache::PartitionStatusEntry,
 ) -> Option<i64> {
-    let mut floor: Option<i64> = None;
-    for k in keys {
-        let effective = match (
-            root_status.timestamps.get(k),
-            root_status.failed_timestamps.get(k),
-        ) {
-            (None, None) => continue,
-            (Some(&m), None) => m,
-            (None, Some(&f)) => f,
-            (Some(&m), Some(&f)) => m.max(f),
-        };
-        floor = Some(floor.map_or(effective, |fl| fl.min(effective)));
-    }
-    floor
+    keys.filter_map(|k| effective_attempt_ts(root_status, k)).min()
 }
 
 /// Evaluate a condition on an upstream dep in partition-aware mode.
