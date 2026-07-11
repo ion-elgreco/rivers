@@ -7649,6 +7649,150 @@ async fn test_stale_eval_state_with_live_queued_run_does_not_redispatch() {
 }
 
 #[tokio::test]
+async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
+    // A fired root's edge-trigger latches (dep baselines, previous_results,
+    // handled cursor) must survive a failed dispatch: the tick commits only
+    // for assets that actually dispatched, and the failure forces a retry
+    // evaluation on the next tick even with no new upstream changes.
+    use crate::condition::pass::{AssetConditionInfo, ConditionPass};
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[
+            make_materialized_record("raw", 1_000),
+            make_materialized_record("dst", 1_000),
+        ])
+        .await
+        .unwrap();
+    use crate::assets::graph::TopologyNode;
+    let topo = GraphTopology {
+        nodes: vec![
+            TopologyNode {
+                name: "raw".into(),
+                kind: crate::assets::graph::NodeKind::Asset,
+                group: None,
+                parent_graph: None,
+            },
+            TopologyNode {
+                name: "dst".into(),
+                kind: crate::assets::graph::NodeKind::Asset,
+                group: None,
+                parent_graph: None,
+            },
+        ],
+        edges: vec![("dst".to_string(), "raw".to_string())],
+    };
+    storage
+        .kv_set(
+            &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
+            &serde_json::to_vec(&topo).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let mut pass = ConditionPass::new(
+        AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+        ConditionEvalState {
+            is_initial: true,
+            ..Default::default()
+        },
+        vec![AssetConditionInfo {
+            asset_key: "dst".to_string(),
+            condition: ConditionNode::any_deps_match(ConditionNode::DataVersionChanged),
+            partition_info: None,
+            backfill_strategy: None,
+        }],
+        HashMap::new(),
+    );
+
+    // Initial tick seeds the dep baselines; nothing fires.
+    pass.refresh_cache(&storage, 2_000).await.unwrap();
+    let out = pass.run(2_000, false);
+    assert!(out.plan.is_empty(), "initial tick must not fire");
+
+    // raw re-materializes.
+    storage
+        .create_run(&RunRecord {
+            run_id: "run-raw".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2_500,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["raw".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    storage
+        .update_run_status("run-raw", RunStatus::Success, Some(3_000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[crate::storage::EventRecord {
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            event_type: crate::storage::EventType::Materialization {
+                data_version: Some("v2".to_string()),
+            },
+            asset_key: Some("raw".to_string()),
+            run_id: "run-raw".to_string(),
+            partition_key: None,
+            timestamp: 3_000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        }])
+        .await
+        .unwrap();
+    pass.refresh_cache(&storage, 4_000).await.unwrap();
+
+    // The dep update fires dst, but its dispatch fails.
+    let out = pass.plan_tick(4_000, false);
+    assert!(
+        out.plan.unpartitioned.contains(&"dst".to_string()),
+        "precondition: the dep update must fire dst"
+    );
+    // Mimic the daemon's failure path on the shared cache…
+    pass.cache
+        .register_dispatched_run("dst".to_string(), "run-fail".to_string(), 4_000, None);
+    pass.cache.clear_dispatched_run("dst", "run-fail");
+    // …and commit the tick with dst's dispatch marked failed.
+    let failed: HashSet<String> = ["dst".to_string()].into_iter().collect();
+    pass.commit_tick(&out, &failed, 4_000);
+
+    assert!(
+        !pass.should_skip(false),
+        "a failed dispatch must force a retry evaluation even with no new changes"
+    );
+    let retry = pass.plan_tick(5_000, false);
+    assert!(
+        retry.plan.unpartitioned.contains(&"dst".to_string()),
+        "the un-consumed dep trigger must re-fire on the retry tick"
+    );
+    pass.commit_tick(&retry, &HashSet::new(), 5_000);
+
+    assert!(
+        pass.should_skip(false),
+        "after a successful commit the pass may skip no-change ticks again"
+    );
+    let done = pass.plan_tick(6_000, false);
+    assert!(
+        done.plan.is_empty(),
+        "the trigger must be consumed exactly once after a successful dispatch; got {:?}",
+        done.plan.unpartitioned
+    );
+    pass.commit_tick(&done, &HashSet::new(), 6_000);
+}
+
+#[tokio::test]
 async fn test_restart_does_not_replay_newest_run_tick_tags() {
     // The newest pre-restart run must not repopulate the tick-scoped tag
     // accumulators on the first steady refresh — HasRunWithTags would report

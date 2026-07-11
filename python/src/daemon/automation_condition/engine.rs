@@ -74,9 +74,11 @@ impl ConditionTickEngine {
             return;
         }
 
-        let selective =
-            !has_changes && self.pass.has_time_based && self.pass.time_based_eval_set.is_some();
-        let output = self.pass.run(now, selective);
+        let selective = !has_changes
+            && !self.pass.needs_retry
+            && self.pass.has_time_based
+            && self.pass.time_based_eval_set.is_some();
+        let output = self.pass.plan_tick(now, selective);
 
         if tracing::enabled!(target: "rivers::dbg::cond", tracing::Level::TRACE) {
             let mut fired: Vec<&str> = Vec::new();
@@ -99,18 +101,22 @@ impl ConditionTickEngine {
             );
         }
 
+        let mut dispatch_failed: std::collections::HashSet<String> = Default::default();
         if !output.results.is_empty() {
             let mut handle = super::persist::ConditionTickHandle::new(
                 self.code_location_id.clone(),
                 now,
                 &output.results,
             );
-            self.dispatch_materializations(output.plan, &mut handle)
+            self.dispatch_materializations(output.plan.clone(), &mut handle)
                 .await;
             // Per-asset tick history derives from the dispatch OUTCOME — a
             // pre-written "Requested" row can't show a failed or dropped
             // dispatch.
             for (asset_key, outcome) in handle.outcomes() {
+                if outcome.error.is_some() {
+                    dispatch_failed.insert(asset_key.clone());
+                }
                 let _ = self.tick_tx.send(TickWriteMsg {
                     record: TickRecord {
                         code_location_id: self.code_location_id.clone(),
@@ -134,6 +140,9 @@ impl ConditionTickEngine {
             let tick_id = handle.finalize(&self.storage).await;
             self.send_eval_records(&output.results, now, &tick_id);
         }
+        // Latches advance only for assets whose dispatch went out; failed
+        // ones stay armed and force a retry evaluation next tick.
+        self.pass.commit_tick(&output, &dispatch_failed, now);
 
         if let Err(e) = self
             .storage
