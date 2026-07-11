@@ -48,7 +48,7 @@ Fine-grained conditions for building custom rules. All are static methods on `Au
 | `.execution_failed()` | Latest execution of this asset failed. |
 | `.newly_updated()` | Asset's materialization timestamp changed since the previous tick. |
 | `.newly_requested()` | Asset was requested for materialization on the previous tick. |
-| `.code_version_changed()` | Code version differs from the last materialized version. |
+| `.code_version_changed()` | Code version differs from the last materialized version. Stays true (level, not an edge) until the asset re-materializes — pair with a dispatch guard like `~in_flight()`. |
 | `.data_version_changed()` | Data version differs from the previous tick. |
 | `.cron_tick_passed(cron_schedule, timezone=None)` | A cron tick has passed since the last evaluation. `cron_schedule` accepts 5 or 6 fields (seconds optional). |
 | `.in_latest_time_window(lookback_delta=None)` | Partition falls within the latest time window (`lookback_delta` in seconds, measured back from the latest window's start; must be positive and finite or `ValueError` is raised). |

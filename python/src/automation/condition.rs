@@ -230,7 +230,10 @@ impl PyAutomationCondition {
         Self::new_node(ConditionNode::NewlyRequested)
     }
 
-    /// True when the asset's code version changed since the last tick.
+    /// True when the asset's code version differs from the one recorded by
+    /// its latest materialization; stays true (level, not an edge) until the
+    /// asset re-materializes, so pair it with a dispatch guard like
+    /// `~in_flight()`.
     #[staticmethod]
     fn code_version_changed() -> Self {
         Self::new_node(ConditionNode::CodeVersionChanged)
