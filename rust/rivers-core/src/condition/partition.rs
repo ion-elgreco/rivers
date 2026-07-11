@@ -375,6 +375,9 @@ impl PartitionMappingKind {
                 PartitionSelection::Empty => PartitionSelection::Empty,
                 PartitionSelection::All => PartitionSelection::All,
                 PartitionSelection::Keys(keys) => {
+                    let mut mapped: HashSet<PartitionKey> = HashSet::new();
+                    // Multi upstream → Single downstream: the named dimension's
+                    // value feeds `inner`, landing in the downstream key space.
                     let dim_vals = keys.iter().filter_map(|k| {
                         if let PartitionKey::Multi { dims } = k {
                             dims.iter()
@@ -384,13 +387,50 @@ impl PartitionMappingKind {
                             None
                         }
                     });
-                    let mut mapped: HashSet<PartitionKey> = HashSet::new();
                     for dim_val in dim_vals {
                         let sel = PartitionSelection::Keys(std::iter::once(dim_val).collect());
                         match inner.map_to_downstream(&sel) {
                             PartitionSelection::Keys(ks) => mapped.extend(ks),
                             PartitionSelection::All => return PartitionSelection::All,
                             PartitionSelection::Empty => {}
+                        }
+                    }
+                    // Single upstream → Multi downstream: the upstream key
+                    // constrains the named dimension; the remaining dimensions
+                    // expand against the downstream universe (over-approximate
+                    // without one, mirroring the `Multi` arm's wildcards).
+                    let mut wanted: HashSet<Vec<String>> = HashSet::new();
+                    for uk in keys {
+                        if !matches!(uk, PartitionKey::Single { .. }) {
+                            continue;
+                        }
+                        let sel = PartitionSelection::Keys(std::iter::once(uk.clone()).collect());
+                        match inner.map_to_downstream(&sel) {
+                            PartitionSelection::Keys(ks) => {
+                                for k in ks {
+                                    if let PartitionKey::Single { keys: vals } = k {
+                                        wanted.insert(vals);
+                                    }
+                                }
+                            }
+                            PartitionSelection::All => return PartitionSelection::All,
+                            PartitionSelection::Empty => {}
+                        }
+                    }
+                    if !wanted.is_empty() {
+                        let Some(universe) = downstream_universe else {
+                            return PartitionSelection::All;
+                        };
+                        for key in universe {
+                            let PartitionKey::Multi { dims } = key else {
+                                continue;
+                            };
+                            if dims
+                                .iter()
+                                .any(|(d, v)| d == dimension_name && wanted.contains(v))
+                            {
+                                mapped.insert(key.clone());
+                            }
                         }
                     }
                     if mapped.is_empty() {
