@@ -18,8 +18,6 @@ pub(super) struct ConditionTickHandle {
     total_evaluated: u32,
     total_fired: u32,
     eval_duration_us: u64,
-    run_ids: Vec<String>,
-    backfill_ids: Vec<String>,
     asset_outcomes: std::collections::HashMap<String, AssetOutcome>,
 }
 
@@ -34,8 +32,6 @@ impl ConditionTickHandle {
             total_evaluated,
             total_fired,
             eval_duration_us,
-            run_ids: Vec::new(),
-            backfill_ids: Vec::new(),
             asset_outcomes: std::collections::HashMap::new(),
         }
     }
@@ -54,7 +50,6 @@ impl ConditionTickHandle {
 
     /// Record a `run_id` minted synchronously during dispatch for `assets`.
     pub(super) fn note_run(&mut self, assets: &[String], run_id: &str) {
-        self.run_ids.push(run_id.to_string());
         for asset in assets {
             self.asset_outcomes
                 .entry(asset.clone())
@@ -66,7 +61,6 @@ impl ConditionTickHandle {
 
     /// Drop a `run_id` whose dispatch failed before its run record reached storage.
     pub(super) fn unnote_run(&mut self, assets: &[String], run_id: &str, error: &str) {
-        self.run_ids.retain(|id| id != run_id);
         for asset in assets {
             let outcome = self.asset_outcomes.entry(asset.clone()).or_default();
             outcome.run_ids.retain(|id| id != run_id);
@@ -76,7 +70,6 @@ impl ConditionTickHandle {
 
     /// Record a `backfill_id` produced by `BackfillDispatcherKind::dispatch`.
     pub(super) fn note_backfill(&mut self, asset: &str, backfill_id: &str) {
-        self.backfill_ids.push(backfill_id.to_string());
         self.asset_outcomes
             .entry(asset.to_string())
             .or_default()
@@ -97,6 +90,31 @@ impl ConditionTickHandle {
         &self.asset_outcomes
     }
 
+    /// The tick record with its id lists derived from the per-asset outcomes
+    /// (one run can cover many assets, so the union dedups; sorted for a
+    /// deterministic record).
+    fn build_record(&self) -> ConditionTickRecord {
+        let union = |ids: fn(&AssetOutcome) -> &Vec<String>| -> Vec<String> {
+            let mut out: Vec<String> = self
+                .asset_outcomes
+                .values()
+                .flat_map(|o| ids(o).iter().cloned())
+                .collect();
+            out.sort();
+            out.dedup();
+            out
+        };
+        ConditionTickRecord {
+            code_location_id: self.code_location_id.clone(),
+            timestamp: self.timestamp,
+            total_evaluated: self.total_evaluated,
+            total_fired: self.total_fired,
+            eval_duration_us: self.eval_duration_us,
+            run_ids: union(|o| &o.run_ids),
+            backfill_ids: union(|o| &o.backfill_ids),
+        }
+    }
+
     /// Write the `ConditionTickRecord` once with all ids populated. `None`
     /// when the store failed — there is no tick row for eval records to
     /// reference, and a fabricated id would orphan them.
@@ -104,16 +122,7 @@ impl ConditionTickHandle {
         self,
         storage: &ScopedStorageHandle<SurrealStorage>,
     ) -> Option<String> {
-        let record = ConditionTickRecord {
-            code_location_id: self.code_location_id,
-            timestamp: self.timestamp,
-            total_evaluated: self.total_evaluated,
-            total_fired: self.total_fired,
-            eval_duration_us: self.eval_duration_us,
-            run_ids: self.run_ids,
-            backfill_ids: self.backfill_ids,
-        };
-
+        let record = self.build_record();
         match storage.backend().store_condition_tick(&record).await {
             Ok(id) => Some(id),
             Err(e) => {
@@ -130,15 +139,17 @@ mod tests {
 
     #[test]
     fn unnote_run_drops_only_the_named_id() {
-        let assets = vec!["x".to_string()];
+        let assets = vec!["x".to_string(), "y".to_string()];
         let mut handle = ConditionTickHandle::new("cl".to_string(), 0, &[]);
         handle.note_run(&assets, "a");
         handle.note_run(&assets, "b");
         handle.unnote_run(&assets, "a", "dispatch failed");
+        let record = handle.build_record();
         assert_eq!(
-            handle.run_ids,
+            record.run_ids,
             vec!["b".to_string()],
-            "the finalized tick must not reference a run that never persisted"
+            "the finalized tick must not reference a run that never persisted, \
+             and a run shared by two assets appears once"
         );
         let outcome = &handle.outcomes()["x"];
         assert_eq!(outcome.run_ids, vec!["b".to_string()]);
