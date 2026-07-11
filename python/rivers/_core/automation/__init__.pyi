@@ -97,7 +97,10 @@ class AutomationCondition:
         ...
     @staticmethod
     def code_version_changed() -> AutomationCondition:
-        """True when the asset's code version differs from the last materialized version."""
+        """True when the asset's code version differs from the last materialized version.
+
+        Stays true (level, not an edge) until the asset re-materializes, so pair
+        it with a dispatch guard like ``~in_flight()``."""
         ...
     @staticmethod
     def cron_tick_passed(
