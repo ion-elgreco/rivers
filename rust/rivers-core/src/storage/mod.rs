@@ -1534,6 +1534,20 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         state: &crate::condition::ConditionEvalState,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// Read the condition-daemon dispatch intent for this CL (crash recovery).
+    fn get_condition_pending_dispatch(
+        &self,
+        code_location_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::condition::PendingDispatch>>> + Send;
+
+    /// Persist the condition-daemon dispatch intent for this CL; an empty
+    /// `entries` list clears it.
+    fn set_condition_pending_dispatch(
+        &self,
+        code_location_id: &str,
+        pending: &crate::condition::PendingDispatch,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     /// Read the persisted graph topology blob for this CL.
     fn get_graph_topology(
         &self,
@@ -1931,6 +1945,23 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
     ) -> Result<()> {
         self.backend
             .set_condition_eval_state(self.code_location_id, state)
+            .await
+    }
+
+    pub async fn get_condition_pending_dispatch(
+        &self,
+    ) -> Result<Option<crate::condition::PendingDispatch>> {
+        self.backend
+            .get_condition_pending_dispatch(self.code_location_id)
+            .await
+    }
+
+    pub async fn set_condition_pending_dispatch(
+        &self,
+        pending: &crate::condition::PendingDispatch,
+    ) -> Result<()> {
+        self.backend
+            .set_condition_pending_dispatch(self.code_location_id, pending)
             .await
     }
 

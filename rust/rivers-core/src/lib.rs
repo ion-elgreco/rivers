@@ -33,6 +33,14 @@ pub fn condition_eval_state_key(code_location_id: &str) -> String {
     format!("{CONDITION_EVAL_STATE_KEY_PREFIX}{code_location_id}")
 }
 
+pub const CONDITION_PENDING_DISPATCH_KEY_PREFIX: &str = "condition_pending_dispatch:";
+
+/// KV key for the condition daemon's dispatch intent, written before a tick's
+/// runs go out and cleared after its eval state persists (crash recovery).
+pub fn condition_pending_dispatch_key(code_location_id: &str) -> String {
+    format!("{CONDITION_PENDING_DISPATCH_KEY_PREFIX}{code_location_id}")
+}
+
 pub const DYNAMIC_KEYS_KEY_PREFIX: &str = "dynamic_keys:";
 
 /// KV key for a fan-out source's mapping keys. Keyed by `data_version` so each

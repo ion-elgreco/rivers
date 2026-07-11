@@ -3359,6 +3359,26 @@ impl PerCodeLocationStorage for SurrealStorage {
             .await
     }
 
+    async fn get_condition_pending_dispatch(
+        &self,
+        code_location_id: &str,
+    ) -> Result<Option<crate::condition::PendingDispatch>> {
+        self.kv_get_json(&crate::condition_pending_dispatch_key(code_location_id))
+            .await
+    }
+
+    async fn set_condition_pending_dispatch(
+        &self,
+        code_location_id: &str,
+        pending: &crate::condition::PendingDispatch,
+    ) -> Result<()> {
+        self.kv_set_json(
+            &crate::condition_pending_dispatch_key(code_location_id),
+            pending,
+        )
+        .await
+    }
+
     async fn get_graph_topology(
         &self,
         code_location_id: &str,
