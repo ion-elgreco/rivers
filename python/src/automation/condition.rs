@@ -264,7 +264,9 @@ impl PyAutomationCondition {
         }))
     }
 
-    /// True on the first evaluation tick after daemon startup or condition tree change.
+    /// True on the asset's very first evaluation tick (fresh evaluation
+    /// state) or after its condition tree changes; a normal daemon restart
+    /// with intact persisted state does not re-fire it.
     #[staticmethod]
     fn initial_evaluation() -> Self {
         Self::new_node(ConditionNode::InitialEvaluation)

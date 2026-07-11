@@ -52,7 +52,7 @@ Fine-grained conditions for building custom rules. All are static methods on `Au
 | `.data_version_changed()` | Data version differs from the previous tick. |
 | `.cron_tick_passed(cron_schedule, timezone=None)` | A cron tick has passed since the last evaluation. `cron_schedule` accepts 5 or 6 fields (seconds optional). |
 | `.in_latest_time_window(lookback_delta=None)` | Partition falls within the latest time window (`lookback_delta` in seconds, measured back from the latest window's start; must be positive and finite or `ValueError` is raised). |
-| `.initial_evaluation()` | First evaluation tick after daemon startup or a condition tree change. |
+| `.initial_evaluation()` | The asset's very first evaluation tick (fresh evaluation state) or a condition tree change; a normal daemon restart with intact persisted state does not re-fire it. |
 | `.backfill_in_progress()` | Asset is part of an active backfill. |
 | `.in_flight()` | Asset is being materialized by anything — a run (`in_progress()`) **or** an active backfill (`backfill_in_progress()`). Negate it as a re-dispatch guard. |
 | `.will_be_requested()` | Asset's condition already fired earlier this tick (same-tick cascading). |

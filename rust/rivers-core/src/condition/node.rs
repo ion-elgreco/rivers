@@ -28,7 +28,10 @@ pub enum ConditionNode {
     InLatestTimeWindow {
         lookback_delta: Option<f64>,
     },
-    /// True on the first evaluation tick after daemon startup or condition tree change.
+    /// True on an asset's very first evaluation tick (fresh evaluation state:
+    /// first daemon start or an eval-state load failure) or after its
+    /// condition tree changes. A normal restart with intact persisted state
+    /// does NOT re-fire it.
     InitialEvaluation,
     /// True when the asset's `last_data_version` changed since the previous tick.
     DataVersionChanged,
