@@ -966,28 +966,35 @@ pub fn next_cron_occurrence_utc(
     let fake_next = cron.find_next_occurrence(&fake_after, false).ok()?;
     let wall_next = fake_next.naive_utc();
 
-    match tz.from_local_datetime(&wall_next) {
-        chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&chrono::Utc)),
-        chrono::LocalResult::Ambiguous(earliest, latest) => {
-            Some(resolve_ambiguous(earliest, latest))
-        }
-        chrono::LocalResult::None => {
-            let mut probe = wall_next;
-            for _ in 0..240 {
-                probe += chrono::Duration::minutes(1);
-                match tz.from_local_datetime(&probe) {
-                    chrono::LocalResult::Single(dt) => {
-                        return Some(dt.with_timezone(&chrono::Utc));
-                    }
-                    chrono::LocalResult::Ambiguous(earliest, latest) => {
-                        return Some(resolve_ambiguous(earliest, latest));
-                    }
-                    chrono::LocalResult::None => {}
-                }
+    resolve_wall_instant(&tz, wall_next, resolve_ambiguous)
+        .or_else(|| Some(fake_next.max(after + chrono::Duration::minutes(1))))
+}
+
+/// Resolve a wall-clock datetime in `tz` to a real UTC instant, walking
+/// forward minute-by-minute through a DST gap (up to 4h) when the wall time
+/// does not exist. `on_ambiguous` picks the instant when the wall time
+/// repeats (fall-back).
+fn resolve_wall_instant(
+    tz: &chrono_tz::Tz,
+    wall: chrono::NaiveDateTime,
+    mut on_ambiguous: impl FnMut(
+        chrono::DateTime<chrono_tz::Tz>,
+        chrono::DateTime<chrono_tz::Tz>,
+    ) -> chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::TimeZone;
+    let mut probe = wall;
+    for _ in 0..=240 {
+        match tz.from_local_datetime(&probe) {
+            chrono::LocalResult::Single(dt) => return Some(dt.with_timezone(&chrono::Utc)),
+            chrono::LocalResult::Ambiguous(earliest, latest) => {
+                return Some(on_ambiguous(earliest, latest));
             }
-            Some(fake_next.max(after + chrono::Duration::minutes(1)))
+            chrono::LocalResult::None => {}
         }
+        probe += chrono::Duration::minutes(1);
     }
+    None
 }
 
 /// The first real UTC instant of a wall-clock datetime in `tz`: the earlier
@@ -997,27 +1004,7 @@ fn first_real_instant(
     tz: &chrono_tz::Tz,
     wall: chrono::NaiveDateTime,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    use chrono::TimeZone;
-    match tz.from_local_datetime(&wall) {
-        chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&chrono::Utc)),
-        chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest.with_timezone(&chrono::Utc)),
-        chrono::LocalResult::None => {
-            let mut probe = wall;
-            for _ in 0..240 {
-                probe += chrono::Duration::minutes(1);
-                match tz.from_local_datetime(&probe) {
-                    chrono::LocalResult::Single(dt) => {
-                        return Some(dt.with_timezone(&chrono::Utc));
-                    }
-                    chrono::LocalResult::Ambiguous(earliest, _) => {
-                        return Some(earliest.with_timezone(&chrono::Utc));
-                    }
-                    chrono::LocalResult::None => {}
-                }
-            }
-            None
-        }
-    }
+    resolve_wall_instant(tz, wall, |earliest, _| earliest.with_timezone(&chrono::Utc))
 }
 
 /// True when a cron occurrence falls within `(prev, now]`, compared as real
