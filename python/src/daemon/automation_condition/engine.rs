@@ -43,9 +43,15 @@ impl ConditionTickEngine {
             }
         };
 
-        let mut dynamic_keys = std::collections::HashMap::new();
-        for ns in self.pass.dynamic_universe_namespaces() {
-            match self.storage.scoped().get_dynamic_partitions(&ns).await {
+        let namespaces = self.pass.dynamic_universe_namespaces();
+        let mut dynamic_keys = std::collections::HashMap::with_capacity(namespaces.len());
+        let scoped = self.storage.scoped();
+        let fetches = namespaces.into_iter().map(|ns| async {
+            let result = scoped.get_dynamic_partitions(&ns).await;
+            (ns, result)
+        });
+        for (ns, result) in futures_util::future::join_all(fetches).await {
+            match result {
                 Ok(keys) => {
                     dynamic_keys.insert(ns, keys.into_iter().collect());
                 }

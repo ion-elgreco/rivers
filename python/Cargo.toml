@@ -40,6 +40,7 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "signal"] }
 tokio-stream.workspace = true
 tokio-util.workspace = true
+futures-util.workspace = true
 uuid.workspace = true
 humantime.workspace = true
 ordermap = "1"

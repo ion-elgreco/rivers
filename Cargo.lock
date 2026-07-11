@@ -5609,6 +5609,7 @@ dependencies = [
  "arrow-schema",
  "chrono",
  "croner",
+ "futures-util",
  "humantime",
  "k8s-openapi",
  "kube-client",
