@@ -180,8 +180,13 @@ impl ConditionTickEngine {
                     max_ticks_retained: self.max_ticks_retained,
                 });
             }
-            let tick_id = handle.finalize(&self.storage).await;
-            self.send_eval_records(&output.results, now, &tick_id);
+            match handle.finalize(&self.storage).await {
+                Some(tick_id) => self.send_eval_records(&output.results, now, &tick_id),
+                None => tracing::warn!(
+                    target: "rivers::daemon",
+                    "skipping per-asset eval records: no tick row to reference"
+                ),
+            }
         }
         // Latches advance only for assets whose dispatch went out; failed
         // ones stay armed and force a retry evaluation next tick.
