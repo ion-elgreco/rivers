@@ -135,7 +135,7 @@ impl BatchWriter for TickWriter {
                         pending = self.batch.len(),
                         "failed to store tick batch; retrying next flush"
                     );
-                    trim_backlog(&mut self.batch, self.max_batch, "tick");
+                    trim_tick_backlog(&mut self.batch, self.max_batch);
                     return;
                 }
             }
@@ -150,6 +150,44 @@ impl BatchWriter for TickWriter {
                 );
             }
         }
+    }
+}
+
+/// Bound the tick backlog like [`trim_backlog`], but never evict an automation's
+/// NEWEST tick — that row carries the cursor restored on restart, so dropping it
+/// regresses the cursor and re-emits already-processed events. Superseded (older)
+/// ticks are dropped oldest-first; a genuine one-row-per-automation backlog is
+/// left over cap rather than regressing any cursor.
+fn trim_tick_backlog(batch: &mut Vec<TickRecord>, max_batch: usize) {
+    let cap = max_batch.saturating_mul(8).max(1);
+    if batch.len() <= cap {
+        return;
+    }
+    let protected: std::collections::HashSet<usize> = {
+        let mut latest: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (i, rec) in batch.iter().enumerate() {
+            latest.insert(rec.automation_name.as_str(), i);
+        }
+        latest.values().copied().collect()
+    };
+    let mut budget = batch.len() - cap;
+    let mut idx = 0usize;
+    let mut dropped = 0usize;
+    batch.retain(|_| {
+        let keep = budget == 0 || protected.contains(&idx);
+        if !keep {
+            budget -= 1;
+            dropped += 1;
+        }
+        idx += 1;
+        keep
+    });
+    if dropped > 0 {
+        tracing::error!(
+            target: "rivers::daemon",
+            dropped,
+            "tick backlog exceeded retry cap; dropped oldest superseded ticks (latest per automation kept)"
+        );
     }
 }
 
@@ -284,4 +322,45 @@ pub(crate) fn spawn_condition_eval_writer(
     tokio::task::JoinHandle<()>,
 ) {
     spawn_batch_writer(ConditionEvalWriter::new(handle, max_evals_retained), cancel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tick(name: &str, ts: i64, cursor: Option<&str>) -> TickRecord {
+        TickRecord {
+            code_location_id: "cl".into(),
+            automation_name: name.into(),
+            automation_type: "Sensor".into(),
+            status: "Success".into(),
+            timestamp: ts,
+            run_ids: vec![],
+            backfill_ids: vec![],
+            skip_reason: None,
+            error: None,
+            cursor: cursor.map(String::from),
+        }
+    }
+
+    #[test]
+    fn trim_tick_backlog_keeps_latest_per_automation() {
+        // max_batch=1 → cap=8. A sensor's cursor tick sits OLDEST, then a flood
+        // of condition ticks. Trimming must keep the sensor's tick (its cursor is
+        // restored on restart) instead of draining it as the oldest record.
+        let mut batch = vec![tick("sensor", 0, Some("cursor-1"))];
+        for i in 1..=20 {
+            batch.push(tick("cond", i, None));
+        }
+        assert_eq!(batch.len(), 21);
+        trim_tick_backlog(&mut batch, 1);
+        assert!(
+            batch
+                .iter()
+                .any(|r| r.automation_name == "sensor" && r.cursor.as_deref() == Some("cursor-1")),
+            "the sensor's cursor-bearing tick must survive the flood; got {:?}",
+            batch.iter().map(|r| &r.automation_name).collect::<Vec<_>>()
+        );
+        assert!(batch.len() <= 8, "backlog must be bounded to the cap");
+    }
 }
