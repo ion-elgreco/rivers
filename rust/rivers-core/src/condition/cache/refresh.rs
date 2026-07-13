@@ -346,6 +346,17 @@ impl AssetConditionCache {
                         .or_insert(run_ts);
                 }
             }
+            // A successful run materialized every asset it covered; record it
+            // so multiple runs of the same asset completing in one refresh each
+            // pass the materialization gate at apply — the scalar record credits
+            // only the newest, which would otherwise drop the others' slots.
+            if !is_failure {
+                delta
+                    .materialized_overrides
+                    .entry(asset.clone())
+                    .or_default()
+                    .insert(run.run_id.clone());
+            }
             // Route by the ASSET's partitioning, not the run's key: a joint
             // partition-keyed run still writes an unpartitioned asset's entry
             // into the scalar maps the unpartitioned eval path reads.
