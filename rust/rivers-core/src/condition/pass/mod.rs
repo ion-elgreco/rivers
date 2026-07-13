@@ -447,7 +447,7 @@ impl ConditionPass {
         &self,
         output: &PassOutput,
         now: i64,
-    ) -> Vec<(String, AssetConditionState)> {
+    ) -> Vec<(String, AssetConditionState, Vec<PartitionKey>)> {
         let planned: HashSet<&str> = output
             .plan
             .unpartitioned
@@ -509,7 +509,22 @@ impl ConditionPass {
                 }
             }
             state.last_handled_timestamp = Some(now);
-            out.push((info.asset_key.clone(), state));
+            // The keys this tick dispatched for the asset — the same keys
+            // commit_tick marks handled — so recovery can restore the handled
+            // set a SinceLastHandled latch depends on.
+            let mut dispatched_keys: Vec<PartitionKey> = output
+                .plan
+                .single_partition_groups
+                .iter()
+                .filter(|(_, assets)| assets.iter().any(|a| a == &info.asset_key))
+                .map(|(pk, _)| pk.clone())
+                .collect();
+            for (asset, keys) in &output.plan.multi_partition_backfills {
+                if asset == &info.asset_key {
+                    dispatched_keys.extend(keys.iter().cloned());
+                }
+            }
+            out.push((info.asset_key.clone(), state, dispatched_keys));
         }
         out
     }
@@ -834,10 +849,20 @@ pub async fn recover_pending_dispatch<S: StorageBackend>(
         if !dispatched {
             continue;
         }
+        let dispatched_keys = entry.dispatched_keys;
         let slot = eval_state.assets.entry(entry.asset_key).or_default();
         let partition_state = slot.partition_state.take();
         *slot = entry.committed;
         slot.partition_state = partition_state;
+        // Restore the handled marks consumed this tick. The preserved pre-crash
+        // partition state lacks them, so a SinceLastHandled latch (which keeps no
+        // previous_selections) would otherwise re-dispatch these keys.
+        if !dispatched_keys.is_empty() {
+            slot.partition_state
+                .get_or_insert_with(Default::default)
+                .handled
+                .extend(dispatched_keys);
+        }
         recovered += 1;
     }
     if recovered > 0 {

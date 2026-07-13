@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::storage::AssetRecord;
+use crate::storage::{AssetRecord, PartitionKey};
 
 use super::cache::BackfillState;
 use super::partition::{PartitionEvalContext, PartitionSelection, PartitionState};
@@ -99,10 +99,15 @@ pub struct PendingDispatchEntry {
     /// (backfill ids are assigned by the dispatcher, so recovery matches
     /// those by asset + create time instead).
     pub run_ids: Vec<String>,
-    /// Scalar condition state as `commit_tick` would persist it. Partition
-    /// state is deliberately absent: after a restart the cache's own
-    /// in-progress/materialized view supersedes the handled marks.
+    /// Scalar condition state as `commit_tick` would persist it. The large,
+    /// derivable partition timestamp map is deliberately absent.
     pub committed: AssetConditionState,
+    /// Partition keys dispatched this tick. Recovery merges these into the
+    /// asset's `partition_state.handled` so a `SinceLastHandled` latch (which
+    /// keeps no `previous_selections`) does not re-dispatch them — the
+    /// preserved pre-crash partition state lacks this tick's keys.
+    #[serde(default)]
+    pub dispatched_keys: Vec<PartitionKey>,
 }
 
 /// Persisted eval-state schema version.
