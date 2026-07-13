@@ -8197,6 +8197,79 @@ async fn test_recover_pending_dispatch_clears_is_initial() {
 }
 
 #[tokio::test]
+async fn test_recover_pending_dispatch_skips_stale_intent() {
+    // V-10: a failed intent-clear can survive an idle stretch while passive
+    // commits advance and persist newer self-state. On a later crash, recovery
+    // must NOT splice the stale intent's older committed state (which would
+    // regress last_materialized_timestamp and spuriously re-fire).
+    use crate::condition::pass::recover_pending_dispatch;
+    use crate::condition::state::{PendingDispatch, PendingDispatchEntry};
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, ScopedStorageHandle, StorageBackend,
+    };
+
+    let storage = std::sync::Arc::new(SurrealStorage::new_memory().await.unwrap());
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .create_run(&RunRecord {
+            run_id: "run-old".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("t".to_string()),
+            status: RunStatus::Started,
+            start_time: 100,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Condition,
+        })
+        .await
+        .unwrap();
+
+    // A STALE intent from tick 1_000 that was never cleared.
+    let mut committed = AssetConditionState::default();
+    committed.last_materialized_timestamp = Some(500);
+    committed.last_tick_timestamp = Some(1_000);
+    let pending = PendingDispatch {
+        tick_timestamp: 1_000,
+        entries: vec![PendingDispatchEntry {
+            asset_key: "a".to_string(),
+            run_ids: vec!["run-old".to_string()],
+            committed,
+        }],
+    };
+    storage
+        .for_code_location(&ctx)
+        .set_condition_pending_dispatch(&pending)
+        .await
+        .unwrap();
+
+    // The loaded state has since been passively advanced well past tick 1_000.
+    let mut advanced = AssetConditionState::default();
+    advanced.last_materialized_timestamp = Some(9_999);
+    advanced.last_tick_timestamp = Some(5_000);
+    let mut eval_state = ConditionEvalState::default();
+    eval_state.assets.insert("a".to_string(), advanced);
+
+    let handle = ScopedStorageHandle::new(std::sync::Arc::clone(&storage), ctx.clone());
+    recover_pending_dispatch(&mut eval_state, &handle)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        eval_state
+            .assets
+            .get("a")
+            .and_then(|s| s.last_materialized_timestamp),
+        Some(9_999),
+        "a stale intent must not regress the passively-advanced self-state"
+    );
+}
+
+#[tokio::test]
 async fn test_crash_after_dispatch_recovers_latches_from_intent() {
     // Crash window: a tick's run was durably dispatched (and even completed),
     // but the daemon died before persisting eval state. The pre-dispatch
