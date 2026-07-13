@@ -8172,6 +8172,7 @@ async fn test_recover_pending_dispatch_clears_is_initial() {
             asset_key: "a".to_string(),
             run_ids: vec!["run-1".to_string()],
             committed: AssetConditionState::default(),
+            dispatched_keys: vec![],
         }],
     };
     storage
@@ -8239,6 +8240,7 @@ async fn test_recover_pending_dispatch_skips_stale_intent() {
             asset_key: "a".to_string(),
             run_ids: vec!["run-old".to_string()],
             committed,
+            dispatched_keys: vec![],
         }],
     };
     storage
@@ -8266,6 +8268,79 @@ async fn test_recover_pending_dispatch_skips_stale_intent() {
             .and_then(|s| s.last_materialized_timestamp),
         Some(9_999),
         "a stale intent must not regress the passively-advanced self-state"
+    );
+}
+
+#[tokio::test]
+async fn test_recover_pending_dispatch_restores_handled_keys() {
+    // V-08: recovery must merge the tick's dispatched partition keys into the
+    // asset's handled set, or a partitioned SinceLastHandled latch (which keeps
+    // no previous_selections) re-dispatches them after a crash.
+    use crate::condition::partition::PartitionState;
+    use crate::condition::pass::recover_pending_dispatch;
+    use crate::condition::state::{PendingDispatch, PendingDispatchEntry};
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, ScopedStorageHandle, StorageBackend,
+    };
+
+    let storage = std::sync::Arc::new(SurrealStorage::new_memory().await.unwrap());
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .create_run(&RunRecord {
+            run_id: "run-k".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("t".to_string()),
+            status: RunStatus::Started,
+            start_time: 100,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: Some(spk("k")),
+            block_reason: None,
+            launched_by: LaunchedBy::Condition,
+        })
+        .await
+        .unwrap();
+
+    let pending = PendingDispatch {
+        tick_timestamp: 1_000,
+        entries: vec![PendingDispatchEntry {
+            asset_key: "a".to_string(),
+            run_ids: vec!["run-k".to_string()],
+            committed: AssetConditionState::default(),
+            dispatched_keys: vec![spk("k")],
+        }],
+    };
+    storage
+        .for_code_location(&ctx)
+        .set_condition_pending_dispatch(&pending)
+        .await
+        .unwrap();
+
+    // Loaded (pre-crash) state: a partition_state whose handled set lacks k.
+    let mut eval_state = ConditionEvalState::default();
+    eval_state.assets.insert(
+        "a".to_string(),
+        AssetConditionState {
+            partition_state: Some(PartitionState::default()),
+            ..Default::default()
+        },
+    );
+
+    let handle = ScopedStorageHandle::new(std::sync::Arc::clone(&storage), ctx.clone());
+    recover_pending_dispatch(&mut eval_state, &handle)
+        .await
+        .unwrap();
+
+    assert!(
+        eval_state
+            .assets
+            .get("a")
+            .and_then(|s| s.partition_state.as_ref())
+            .is_some_and(|ps| ps.handled.contains(&spk("k"))),
+        "recovery must restore the dispatched key into the handled set"
     );
 }
 
@@ -8400,10 +8475,13 @@ async fn test_crash_after_dispatch_recovers_latches_from_intent() {
             .pending_dispatch_states(&out, 4_000)
             .into_iter()
             .map(
-                |(asset_key, committed)| crate::condition::state::PendingDispatchEntry {
-                    asset_key,
-                    run_ids: vec!["run-dst".to_string()],
-                    committed,
+                |(asset_key, committed, dispatched_keys)| {
+                    crate::condition::state::PendingDispatchEntry {
+                        asset_key,
+                        run_ids: vec!["run-dst".to_string()],
+                        committed,
+                        dispatched_keys,
+                    }
                 },
             )
             .collect(),
@@ -8586,10 +8664,11 @@ async fn test_crash_before_dispatch_leaves_trigger_armed() {
         entries: pass1
             .pending_dispatch_states(&out, 4_000)
             .into_iter()
-            .map(|(asset_key, committed)| PendingDispatchEntry {
+            .map(|(asset_key, committed, dispatched_keys)| PendingDispatchEntry {
                 asset_key,
                 run_ids: vec!["run-never-created".to_string()],
                 committed,
+                dispatched_keys,
             })
             .collect(),
     };
