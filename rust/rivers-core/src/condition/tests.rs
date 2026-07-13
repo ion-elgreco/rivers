@@ -6423,6 +6423,71 @@ async fn test_observation_committing_after_load_is_still_seen() {
 }
 
 #[tokio::test]
+async fn test_steady_state_observation_cursor_trails_like_initial_load() {
+    // V-12: the steady-state refresh observation cursor must trail the newest
+    // stamp by 1 (like the run cursor and the initial-load cursor), or a
+    // co-timestamped observation committing after a refresh is lost forever.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[make_record("ext")])
+        .await
+        .unwrap();
+
+    let mk_obs = |run_id: &str, ts: i64, dv: &str| EventRecord {
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        event_type: EventType::Observation {
+            data_version: Some(dv.to_string()),
+        },
+        asset_key: Some("ext".to_string()),
+        run_id: run_id.to_string(),
+        partition_key: None,
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    // Initial load establishes the cursor trailing 1 behind obs-1@1000.
+    storage
+        .store_events(&[mk_obs("obs-1", 1_000, "dv-1")])
+        .await
+        .unwrap();
+    cache.refresh(&storage, 5_000).await.unwrap();
+
+    // First late equal-stamped observation: this is the STEADY-STATE refresh
+    // that must re-trail the cursor rather than jump to the exact max.
+    storage
+        .store_events(&[mk_obs("obs-2", 1_000, "dv-2")])
+        .await
+        .unwrap();
+    assert!(cache.refresh(&storage, 6_000).await.unwrap());
+
+    // A SECOND co-timestamped observation committing after that steady-state
+    // refresh must still be seen — only possible if the cursor trailed by 1.
+    storage
+        .store_events(&[mk_obs("obs-3", 1_000, "dv-3")])
+        .await
+        .unwrap();
+    let changed = cache.refresh(&storage, 7_000).await.unwrap();
+    assert!(
+        changed,
+        "a co-timestamped observation after a steady-state refresh must still be seen"
+    );
+    assert_eq!(
+        cache
+            .records
+            .get("ext")
+            .and_then(|r| r.last_data_version.as_deref()),
+        Some("dv-3"),
+    );
+}
+
+#[tokio::test]
 async fn test_incremental_partition_refresh_keeps_equal_timestamp_partitions() {
     // Materialization events can share one stamped `now`. A partition whose
     // row lands in a later refresh with a timestamp EQUAL to the cache's
