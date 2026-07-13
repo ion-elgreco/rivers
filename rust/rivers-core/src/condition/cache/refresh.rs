@@ -297,7 +297,12 @@ impl AssetConditionCache {
             }
         }
 
-        delta.new_last_observation_ts = Some(max_ts);
+        // Trail the newest stamp by 1ns, matching the run cursor (and the
+        // initial-load observation cursor): observations in one batch share a
+        // stamped `now` committed record-by-record, so a co-timestamped write
+        // can land after this refresh. The replay no-op guard above dedups the
+        // re-delivered ones.
+        delta.new_last_observation_ts = Some(max_ts.saturating_sub(1));
         Ok(())
     }
 
