@@ -691,6 +691,35 @@ fn test_initial_evaluation_with_tree() {
 }
 
 #[test]
+fn test_skipped_dep_aggregate_is_leaf_like_evaluated() {
+    // V-34: a short-circuited dep-aggregate must render as a childless leaf in
+    // the eval tree, exactly like an evaluated one — otherwise the persisted UI
+    // tree's arity flips between ticks (evaluated=leaf vs skipped=expanded).
+    let record = make_materialized_record("a", 100); // materialized → Missing is false
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let ctx = make_ctx("a", &record, &records, &deps);
+
+    // Missing is false and the inner condition is non-stateful, so And
+    // short-circuits and the dep-aggregate is emitted via build_skipped_subtree.
+    let cond = ConditionNode::And(vec![
+        ConditionNode::Missing,
+        ConditionNode::AnyDepsMatch {
+            condition: Box::new(ConditionNode::NewlyUpdated),
+            label: None,
+        },
+    ]);
+    let (_result, tree) = evaluate_with_tree(&cond, &ctx);
+    assert_eq!(tree.children.len(), 2, "And keeps both children in the tree");
+    assert_eq!(tree.children[1].status, NodeStatus::Skipped);
+    assert!(
+        tree.children[1].children.is_empty(),
+        "a skipped dep-aggregate must be a childless leaf like an evaluated one; got {} children",
+        tree.children[1].children.len()
+    );
+}
+
+#[test]
 fn test_data_version_changed_true_when_version_differs() {
     let mut record = make_materialized_record("a", 100);
     record.last_data_version = Some("v2".to_string());
