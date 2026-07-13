@@ -780,6 +780,12 @@ pub async fn recover_pending_dispatch<S: StorageBackend>(
     if pending.entries.is_empty() {
         return Ok(());
     }
+    // A persisted intent proves a tick already evaluated and dispatched, so
+    // this is not the initial evaluation. Clearing the global flag stops a
+    // first-tick crash (load None → fresh is_initial=true) from re-firing
+    // InitialEvaluation for every recovered asset; per-asset is_initial (set by
+    // reset_for_new_tree on un-recovered assets) still drives legitimate refires.
+    eval_state.is_initial = false;
     let tick_ts = pending.tick_timestamp;
     let run_ids: Vec<String> = pending
         .entries
