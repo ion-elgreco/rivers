@@ -1821,8 +1821,6 @@ impl StorageBackend for SurrealStorage {
         since_timestamp: i64,
     ) -> Result<Vec<StoredEvent>> {
         super::retry::with_retry(&self.retry_config, || async {
-            // The NONE arm keeps events written before code_location_id
-            // existed visible; only pre-upgrade rows lack it.
             let mut result = self
                 .db
                 .query(
