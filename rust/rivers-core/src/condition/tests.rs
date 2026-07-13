@@ -7437,6 +7437,77 @@ async fn test_joint_partitioned_run_updates_unpartitioned_assets_scalar_tags() {
 }
 
 #[tokio::test]
+async fn test_two_partition_runs_same_asset_both_update_slots() {
+    // V-14: when two runs of the SAME partitioned asset (different partitions)
+    // complete within one refresh, both partition slots must get their tags —
+    // not just the newest run the scalar record.last_run_id credits.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let mut rec_p = make_materialized_record("P", 1000);
+    rec_p.last_run_id = Some("R2".to_string()); // scalar credits only the newest
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[rec_p])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.set_partitioned_assets(vec!["P".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let mk = |id: &str, pk: &str, who: &str, start: i64| RunRecord {
+        run_id: id.to_string(),
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        job_name: Some("test".to_string()),
+        status: RunStatus::Started,
+        start_time: start,
+        end_time: None,
+        tags: vec![("who".to_string(), who.to_string())],
+        node_names: vec!["P".to_string()],
+        priority: 0,
+        partition_key: Some(spk(pk)),
+        block_reason: None,
+        launched_by: LaunchedBy::Manual,
+    };
+    storage.create_run(&mk("R1", "p1", "a", 2000)).await.unwrap();
+    storage.create_run(&mk("R2", "p2", "b", 2001)).await.unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+    // Both complete; applied in one refresh.
+    storage
+        .update_run_status("R1", RunStatus::Success, Some(3000))
+        .await
+        .unwrap();
+    storage
+        .update_run_status("R2", RunStatus::Success, Some(3001))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+
+    assert!(
+        cache
+            .last_run_tags
+            .get("P")
+            .and_then(|m| m.get(&Some(spk("p2"))))
+            .is_some_and(|t| t.contains(&("who".to_string(), "b".to_string()))),
+        "newest run's slot present; got {:?}",
+        cache.last_run_tags
+    );
+    assert!(
+        cache
+            .last_run_tags
+            .get("P")
+            .and_then(|m| m.get(&Some(spk("p1"))))
+            .is_some_and(|t| t.contains(&("who".to_string(), "a".to_string()))),
+        "older same-asset run's partition slot must NOT be dropped; got {:?}",
+        cache.last_run_tags
+    );
+}
+
+#[tokio::test]
 async fn test_failed_run_does_not_clobber_latest_materializing_tags() {
     // LastExecutedWithTags reflects the latest run that MATERIALIZED the
     // asset; a later run that failed without materializing it must not
