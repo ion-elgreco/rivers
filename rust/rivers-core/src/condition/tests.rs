@@ -15892,3 +15892,137 @@ fn test_partitioned_execution_failed_ignores_keys_outside_universe() {
         "an in-progress partition outside the universe must not fire InProgress"
     );
 }
+
+/// The root-universe staleness floor must reach a `NewlyUpdated` leaf nested
+/// behind ANY finite number of dep-aggregate levels, including a run of
+/// consecutive unpartitioned (bool-world) deps.
+///
+/// Two shapes, each parametrized by `n` unpartitioned tail levels:
+///   via_m=false: `r(part) ← u1(unpart) ← … ← u{n}` — bridge (B) recomputes the
+///                floor over the root's own keys, then `n−1` bool pivots (C).
+///   via_m=true:  `r(part) ← m(part, AllPartitions) ← u1 ← … ← u{n}` — a
+///                partitioned pivot (A) carries the floor into the bridge (B),
+///                then `n−1` bool pivots (C).
+/// Root `r` has STAGGERED timestamps, so its floor (min = 500) differs from its
+/// record scalar (max = 800). A leaf at ts=600 is newer than the floor (some
+/// root partition is stale) but older than the record scalar, so only a
+/// correctly-propagated floor fires it; a leaf at ts=400 must never fire.
+#[test]
+fn test_nested_dep_floor_propagates_to_every_depth() {
+    let eval_chain = |via_m: bool, n_unpart: usize, leaf_ts: i64| -> bool {
+        assert!(n_unpart >= 1);
+        // One aggregate per dependency edge in the chain.
+        let edges = n_unpart + usize::from(via_m);
+        let mut cond = ConditionNode::NewlyUpdated;
+        for _ in 0..edges {
+            cond = ConditionNode::any_deps_match(cond);
+        }
+
+        let mut records: HashMap<String, AssetRecord> = HashMap::new();
+        records.insert("r".into(), make_materialized_record("r", 800));
+        let mut deps: HashMap<String, Vec<String>> = HashMap::new();
+        if via_m {
+            records.insert("m".into(), make_materialized_record("m", 400));
+            deps.insert("r".into(), vec!["m".into()]);
+            deps.insert("m".into(), vec!["u1".into()]);
+        } else {
+            deps.insert("r".into(), vec!["u1".into()]);
+        }
+        for i in 1..=n_unpart {
+            let node = format!("u{i}");
+            // Only the leaf's timestamp feeds NewlyUpdated; intermediates just aggregate.
+            let ts = if i == n_unpart { leaf_ts } else { 100 };
+            records.insert(node.clone(), make_materialized_record(&node, ts));
+            if i < n_unpart {
+                deps.insert(node, vec![format!("u{}", i + 1)]);
+            }
+        }
+
+        // `m` (when present) is the only partitioned dep; every `u*` is absent
+        // from `upstream_keys` and so treated as unpartitioned (bridged).
+        let upstream_keys: HashMap<String, HashSet<PartitionKey>> = if via_m {
+            HashMap::from([("m".into(), HashSet::from([spk("eu"), spk("us")]))])
+        } else {
+            HashMap::new()
+        };
+        let mappings = if via_m {
+            HashMap::from([(
+                ("r".into(), "m".into()),
+                PartitionMappingKind::AllPartitions,
+            )])
+        } else {
+            HashMap::new()
+        };
+        let mut statuses = HashMap::from([(
+            "r".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                in_progress: HashSet::new(),
+                failed: HashSet::new(),
+                failed_timestamps: HashMap::new(),
+                timestamps: HashMap::from([(spk("d1"), 500), (spk("d2"), 800)]),
+            },
+        )]);
+        if via_m {
+            statuses.insert(
+                "m".to_string(),
+                crate::condition::cache::PartitionStatusEntry {
+                    in_progress: HashSet::new(),
+                    failed: HashSet::new(),
+                    failed_timestamps: HashMap::new(),
+                    timestamps: HashMap::from([(spk("eu"), 400), (spk("us"), 400)]),
+                },
+            );
+        }
+        let ak = HashSet::from([spk("d1"), spk("d2")]);
+        let ip: HashSet<PartitionKey> = HashSet::new();
+        let fail: HashSet<PartitionKey> = HashSet::new();
+        let ts = HashMap::from([(spk("d1"), 500_i64), (spk("d2"), 800)]);
+        let pctx = PartitionEvalContext {
+            all_keys: &ak,
+            in_progress: &ip,
+            failed: &fail,
+            timestamps: &ts,
+            resolver: PartitionResolver::new(&mappings, &upstream_keys),
+            time_windows: None,
+            all_partition_statuses: &statuses,
+            dep_root_floor: None,
+        };
+        let prev = AssetConditionState::default();
+        let states: HashMap<String, AssetConditionState> = HashMap::new();
+        let ctx = EvalContext {
+            target_key: "r",
+            root_key: "r",
+            target_record: records.get("r").unwrap(),
+            cache: CacheSnapshot {
+                records: &records,
+                upstream_deps: &deps,
+                in_progress_assets: &EMPTY_SET,
+                failed_assets: &EMPTY_SET,
+                failed_asset_timestamps: &EMPTY_FAILED_TS,
+                backfill: &EMPTY_BACKFILL,
+            },
+            tags: empty_tag_snapshot(),
+            prev_state: &prev,
+            all_asset_states: &states,
+            requested_this_tick: &EMPTY_REQUESTED,
+            now: 1_000_000_000,
+            is_initial: false,
+            partitions: Some(&pctx),
+            root_partition_floor: None,
+        };
+        evaluate(&cond, &ctx).fired
+    };
+
+    for via_m in [false, true] {
+        for n in 1..=5 {
+            assert!(
+                eval_chain(via_m, n, 600),
+                "via_m={via_m}, {n} unpartitioned levels: leaf ts=600 > floor(500) → stale, must fire"
+            );
+            assert!(
+                !eval_chain(via_m, n, 400),
+                "via_m={via_m}, {n} unpartitioned levels: leaf ts=400 < floor(500) → not stale, must not fire"
+            );
+        }
+    }
+}
