@@ -586,7 +586,14 @@ fn eval_on_dep(
         now: ctx.now,
         is_initial: ctx.is_initial,
         partitions: None,
-        root_partition_floor: None,
+        // Inherit the root-universe staleness floor unchanged. Once a partitioned
+        // pivot has bridged into the bool world there is no partition universe to
+        // recompute from, so a `NewlyUpdated` leaf nested behind any further run
+        // of unpartitioned dep-aggregates must keep comparing against the root's
+        // floor (seeded at the bridge) rather than falling back to the root
+        // record's scalar timestamp. `None` in → `None` out for a genuinely
+        // unpartitioned root, so this is a no-op there.
+        root_partition_floor: ctx.root_partition_floor,
     };
     let mut local = HashMap::new();
     let saved = dep_results.cur_prev;
