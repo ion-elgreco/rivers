@@ -95,10 +95,14 @@ pub struct PendingDispatch {
 #[serde(default)]
 pub struct PendingDispatchEntry {
     pub asset_key: String,
-    /// Run ids minted before dispatch; empty for backfill-shaped dispatches
-    /// (backfill ids are assigned by the dispatcher, so recovery matches
-    /// those by asset + create time instead).
+    /// Run ids minted before dispatch (run-shaped dispatches).
     pub run_ids: Vec<String>,
+    /// Backfill ids pre-minted before dispatch (backfill-shaped dispatches), so
+    /// recovery matches the tick's own backfill exactly instead of by asset +
+    /// create time — which would falsely match an unrelated concurrent backfill.
+    /// Empty for legacy intents, which fall back to the create-time heuristic.
+    #[serde(default)]
+    pub backfill_ids: Vec<String>,
     /// Scalar condition state as `commit_tick` would persist it. The large,
     /// derivable partition timestamp map is deliberately absent.
     pub committed: AssetConditionState,

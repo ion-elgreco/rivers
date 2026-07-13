@@ -154,6 +154,7 @@ pub(crate) fn extract_backfill_request_data(
                 max_concurrency: br.max_concurrency,
                 tags: br.tags.clone(),
                 dry_run: false,
+                backfill_id: None,
             }
         })
         .collect()

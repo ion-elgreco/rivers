@@ -1874,6 +1874,7 @@ impl RepoHandle {
             max_concurrency,
             tags: Some(tag_map),
             dry_run,
+            backfill_id: None,
         })
     }
 
@@ -2004,6 +2005,7 @@ impl RepoHandle {
             max_concurrency,
             tags: None,
             dry_run: false,
+            backfill_id: None,
         })
     }
 
@@ -3430,6 +3432,7 @@ impl PyCodeRepository {
                 config,
                 block,
                 dry_run,
+                None,
             )
         })
     }
@@ -3605,6 +3608,7 @@ impl PyCodeRepository {
                 None,
                 block,
                 dry_run,
+                None,
             )
         })
     }
@@ -3790,6 +3794,7 @@ impl PyCodeRepository {
         config: Option<HashMap<String, Py<PyAny>>>,
         block: bool,
         dry_run: bool,
+        preminted_id: Option<String>,
     ) -> PyResult<PyBackfillResult> {
         let guard = self.ensure_resolved()?;
         let state = guard.as_ref().unwrap();
@@ -3941,7 +3946,7 @@ impl PyCodeRepository {
             });
         }
 
-        let backfill_id = uuid::Uuid::new_v4().to_string();
+        let backfill_id = preminted_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let fp = match failure_policy {
             "stop_on_failure" => BackfillFailurePolicy::StopOnFailure,
             _ => BackfillFailurePolicy::Continue,

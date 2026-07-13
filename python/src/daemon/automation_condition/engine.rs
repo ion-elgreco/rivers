@@ -122,6 +122,15 @@ impl ConditionTickEngine {
                 &output.results,
             );
             let run_requests = self.prepare_run_requests(&output.plan, &mut handle);
+            // Pre-mint a backfill id per backfill-shaped dispatch so the crash
+            // intent records it and recovery matches the tick's own backfill
+            // exactly, not an unrelated concurrent one.
+            let backfill_ids_by_asset: std::collections::HashMap<String, String> = output
+                .plan
+                .multi_partition_backfills
+                .iter()
+                .map(|(asset, _)| (asset.clone(), uuid::Uuid::new_v4().to_string()))
+                .collect();
             // Persist the dispatch intent BEFORE anything goes out: a crash
             // between dispatch and the eval-state persist below would
             // otherwise replay the tick's consumed latches on restart and
@@ -144,6 +153,11 @@ impl ConditionTickEngine {
                         .into_iter()
                         .map(|(asset_key, committed, dispatched_keys)| PendingDispatchEntry {
                             run_ids: run_ids_by_asset.remove(&asset_key).unwrap_or_default(),
+                            backfill_ids: backfill_ids_by_asset
+                                .get(&asset_key)
+                                .cloned()
+                                .map(|id| vec![id])
+                                .unwrap_or_default(),
                             asset_key,
                             committed,
                             dispatched_keys,
@@ -164,8 +178,13 @@ impl ConditionTickEngine {
                     ),
                 }
             }
-            self.dispatch_materializations(output.plan.clone(), run_requests, &mut handle)
-                .await;
+            self.dispatch_materializations(
+                output.plan.clone(),
+                run_requests,
+                &backfill_ids_by_asset,
+                &mut handle,
+            )
+            .await;
             // Per-asset tick history derives from the dispatch OUTCOME — a
             // pre-written "Requested" row can't show a failed or dropped
             // dispatch.
