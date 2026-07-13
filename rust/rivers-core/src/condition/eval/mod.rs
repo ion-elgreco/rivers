@@ -1144,6 +1144,11 @@ fn eval_partitioned_on_dep(
             // Reused across keys: a fresh single-element set per upstream
             // partition is pure allocator churn at large partition counts.
             let mut scratch = PartitionSelection::Keys(HashSet::with_capacity(1));
+            // The fan-out (All-branch) floor is over the whole root universe and
+            // is key-independent; compute it at most once instead of once per
+            // upstream key (O(N*M) → O(N+M) — a 1M×1M dep otherwise never
+            // finishes a tick).
+            let all_floor: std::cell::OnceCell<Option<i64>> = std::cell::OnceCell::new();
             upstream_status
                 .timestamps
                 .keys()
@@ -1169,9 +1174,8 @@ fn eval_partitioned_on_dep(
                     );
                     let floor = match &mapped {
                         PartitionSelection::Empty => return None,
-                        PartitionSelection::All => {
-                            root_floor_over_attempted(pctx.all_keys.iter(), root_status)
-                        }
+                        PartitionSelection::All => *all_floor
+                            .get_or_init(|| root_floor_over_attempted(pctx.all_keys.iter(), root_status)),
                         PartitionSelection::Keys(ks) => {
                             let in_universe: Vec<&PartitionKey> =
                                 ks.iter().filter(|k| pctx.all_keys.contains(*k)).collect();
