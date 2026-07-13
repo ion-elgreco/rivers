@@ -10,7 +10,7 @@ dependencies = [
     "obstore>=0.11.0",
     "pydantic>=2.11.9",
     "pydantic-settings>=2.14.2",
-    "typer>=0.9",
+    "typer>=0.26.8",
 ]
 
 [project.optional-dependencies]
