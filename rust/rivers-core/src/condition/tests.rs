@@ -8135,6 +8135,68 @@ async fn test_initial_load_derives_failure_floor_from_run_history() {
 }
 
 #[tokio::test]
+async fn test_recover_pending_dispatch_clears_is_initial() {
+    // V-06: a first-tick crash restarts with a fresh state (is_initial=true) plus
+    // a persisted intent. Recovery must clear the global is_initial, or the next
+    // tick re-fires InitialEvaluation for every recovered asset (double-dispatch).
+    use crate::condition::pass::recover_pending_dispatch;
+    use crate::condition::state::{PendingDispatch, PendingDispatchEntry};
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, ScopedStorageHandle, StorageBackend,
+    };
+
+    let storage = std::sync::Arc::new(SurrealStorage::new_memory().await.unwrap());
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    // The run the intent references, so recovery sees dispatch evidence.
+    storage
+        .create_run(&RunRecord {
+            run_id: "run-1".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("t".to_string()),
+            status: RunStatus::Started,
+            start_time: 100,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Condition,
+        })
+        .await
+        .unwrap();
+    let pending = PendingDispatch {
+        tick_timestamp: 100,
+        entries: vec![PendingDispatchEntry {
+            asset_key: "a".to_string(),
+            run_ids: vec!["run-1".to_string()],
+            committed: AssetConditionState::default(),
+        }],
+    };
+    storage
+        .for_code_location(&ctx)
+        .set_condition_pending_dispatch(&pending)
+        .await
+        .unwrap();
+
+    // First-tick crash: restart loads None → fresh state with is_initial=true.
+    let mut eval_state = ConditionEvalState {
+        is_initial: true,
+        ..Default::default()
+    };
+    let handle = ScopedStorageHandle::new(std::sync::Arc::clone(&storage), ctx.clone());
+    recover_pending_dispatch(&mut eval_state, &handle)
+        .await
+        .unwrap();
+
+    assert!(
+        !eval_state.is_initial,
+        "an existing dispatch intent proves a tick ran; is_initial must be cleared"
+    );
+}
+
+#[tokio::test]
 async fn test_crash_after_dispatch_recovers_latches_from_intent() {
     // Crash window: a tick's run was durably dispatched (and even completed),
     // but the daemon died before persisting eval state. The pre-dispatch
