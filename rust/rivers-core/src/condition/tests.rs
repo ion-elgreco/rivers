@@ -11033,6 +11033,121 @@ fn test_partitioned_since_latch_per_partition() {
 }
 
 #[test]
+fn test_partitioned_since_latch_drops_retired_universe_key() {
+    // Regression (V-05): a Since latch must not re-emit a partition key that has
+    // been removed from the universe. Otherwise the retired key re-fires every
+    // tick, is dropped by classify, and drives a permanent needs_retry loop.
+    let empty_partition_statuses = HashMap::new();
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".into(), record.clone())]);
+    let deps = HashMap::new();
+    let cond = ConditionNode::Since {
+        trigger: Box::new(ConditionNode::Missing),
+        reset: Box::new(ConditionNode::NewlyUpdated),
+    };
+
+    // Tick 1: universe {p1,p2,p3}, only p1 materialized → Missing latches {p2,p3}.
+    let ak1 = HashSet::from([spk("p1"), spk("p2"), spk("p3")]);
+    let ip: HashSet<PartitionKey> = HashSet::new();
+    let fail: HashSet<PartitionKey> = HashSet::new();
+    let ts1 = HashMap::from([(spk("p1"), 100_i64)]);
+    let pctx1 = PartitionEvalContext {
+        all_keys: &ak1,
+        in_progress: &ip,
+        failed: &fail,
+        timestamps: &ts1,
+        resolver: PartitionResolver::empty(),
+        time_windows: None,
+        all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
+    };
+    let ctx1 = EvalContext {
+        target_key: "a",
+        root_key: "a",
+        target_record: &record,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &EMPTY_SET,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &DEFAULT_STATE,
+        all_asset_states: &EMPTY_ASSET_STATES,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: 1_000_000_000_000,
+        is_initial: false,
+        partitions: Some(&pctx1),
+        root_partition_floor: None,
+    };
+    let r1 = evaluate(&cond, &ctx1);
+    assert_eq!(
+        r1.selection.as_ref().unwrap(),
+        &PartitionSelection::Keys(HashSet::from([spk("p2"), spk("p3")]))
+    );
+
+    // Tick 2: p3 retired from the universe (now {p1,p2}); nothing resets.
+    let ak2 = HashSet::from([spk("p1"), spk("p2")]);
+    let pctx2 = PartitionEvalContext {
+        all_keys: &ak2,
+        in_progress: &ip,
+        failed: &fail,
+        timestamps: &ts1,
+        resolver: PartitionResolver::empty(),
+        time_windows: None,
+        all_partition_statuses: &empty_partition_statuses,
+        dep_root_floor: None,
+    };
+    let prev2 = AssetConditionState {
+        partition_state: Some(PartitionState {
+            previous_selections: r1.sub_selections.unwrap(),
+            timestamps: ts1.clone(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let ctx2 = EvalContext {
+        target_key: "a",
+        root_key: "a",
+        target_record: &record,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &EMPTY_SET,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &prev2,
+        all_asset_states: &EMPTY_ASSET_STATES,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: 2_000_000_000_000,
+        is_initial: false,
+        partitions: Some(&pctx2),
+        root_partition_floor: None,
+    };
+    let r2 = evaluate(&cond, &ctx2);
+    // p3 is gone from the universe → the latch must not re-emit it; only p2
+    // (still missing) survives.
+    assert_eq!(
+        r2.selection.unwrap(),
+        PartitionSelection::Keys(HashSet::from([spk("p2")]))
+    );
+    // And the stored latch must be pruned so the loop cannot persist.
+    for sel in r2.sub_selections.unwrap().values() {
+        if let PartitionSelection::Keys(ks) = sel {
+            assert!(
+                !ks.contains(&spk("p3")),
+                "retired key p3 must not remain latched"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_partitioned_newly_true_only_new_partitions() {
     // NewlyTrue(Missing): only partitions that became missing this tick.
     // Tick 1 {p2,p3}, Tick 2 {} (no change), Tick 3 p4 added → {p4}.

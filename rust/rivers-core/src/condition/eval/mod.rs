@@ -915,9 +915,14 @@ fn eval_partitioned<O: PartEvalOutput>(
             let (trigger_sel, trigger_part) = O::into_parts(trigger_out);
             let (reset_sel, reset_part) = O::into_parts(reset_out);
             let prev_latch = prev_partition_latch(dep_selections, ctx, my_idx);
+            // Restrict to the current universe: the accumulating latch must
+            // not carry forward keys retired from the partition set, or they
+            // re-fire every tick, get dropped by classify, and wedge the asset
+            // in a permanent needs_retry loop.
             let result = prev_latch
                 .union(&trigger_sel)
-                .difference(&reset_sel, pctx.all_keys);
+                .difference(&reset_sel, pctx.all_keys)
+                .restrict_to(pctx.all_keys);
             sub_selections.insert(my_idx, result.clone());
             O::composite(result, my_idx, node, total, vec![trigger_part, reset_part])
         }
