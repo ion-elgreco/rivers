@@ -34,15 +34,27 @@ fn rebuild_resources<'py>(
     let mut resources = HashMap::new();
     let mut order = Vec::with_capacity(resource_specs.len());
     for spec in resource_specs.iter() {
-        let tuple: &Bound<PyTuple> = spec.cast()?;
-        let name: String = tuple.get_item(0)?.extract()?;
-        let cls = tuple.get_item(1)?;
-        let json_data = tuple.get_item(2)?;
-        let resource = cls.call_method1("model_validate_json", (&json_data,))?;
-        resource.call_method0("setup")?;
-        let resource = resource.unbind();
-        order.push(resource.clone_ref(py));
-        resources.insert(name, resource);
+        // Build + setup one resource; on any failure tear down the ones already
+        // set up before propagating, so a mid-list failure can't leak them.
+        let built = (|| -> PyResult<(String, Py<PyAny>)> {
+            let tuple: &Bound<PyTuple> = spec.cast()?;
+            let name: String = tuple.get_item(0)?.extract()?;
+            let cls = tuple.get_item(1)?;
+            let json_data = tuple.get_item(2)?;
+            let resource = cls.call_method1("model_validate_json", (&json_data,))?;
+            resource.call_method0("setup")?;
+            Ok((name, resource.unbind()))
+        })();
+        match built {
+            Ok((name, resource)) => {
+                order.push(resource.clone_ref(py));
+                resources.insert(name, resource);
+            }
+            Err(e) => {
+                teardown_resources(py, &order);
+                return Err(e);
+            }
+        }
     }
     Ok((resources, order))
 }
@@ -87,20 +99,24 @@ fn run_eval(
 ) -> PyResult<Py<PyAny>> {
     let (resources, ordered) = rebuild_resources(py, resource_specs)?;
 
-    let PrecomputedArgs {
-        config_instance,
-        resource_args,
-    } = precompute_args(py, &eval_fn, &resources)
-        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    // Everything after setup must tear down on ANY exit — precompute_args,
+    // build_ctx, or the eval itself failing would otherwise leak the setup
+    // resources (open DB connections, sockets) in the reused loky worker.
+    let result = (|| {
+        let PrecomputedArgs {
+            config_instance,
+            resource_args,
+        } = precompute_args(py, &eval_fn, &resources)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
-    let ctx = build_ctx(py, config_instance)?;
-    let pre = PrecomputedArgs {
-        config_instance: None,
-        resource_args,
-    };
-    let call_args = assemble_call_args(py, ctx, &pre);
-
-    let result = invoke_eval_fn(py, &eval_fn, call_args);
+        let ctx = build_ctx(py, config_instance)?;
+        let pre = PrecomputedArgs {
+            config_instance: None,
+            resource_args,
+        };
+        let call_args = assemble_call_args(py, ctx, &pre);
+        invoke_eval_fn(py, &eval_fn, call_args)
+    })();
     teardown_resources(py, &ordered);
     result
 }
