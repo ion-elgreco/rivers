@@ -1684,3 +1684,89 @@ class TestSiblingDepAggregateLatch:
             "a sibling aggregate clobbered the other's per-dep latch: r stopped "
             f"firing after both triggers went false ({baseline} -> {after} runs)"
         )
+
+
+class TestOnCronWithDepsFiresMidPeriod:
+    def test_on_cron_fires_when_dep_updates_after_boundary(self, storage):
+        """``on_cron`` with a dependency must fire when the dep updates *after*
+        the cron boundary — anywhere within the period, not only on the single
+        tick the boundary is crossed.
+
+        Regression test for the one-tick-pulse bug (fix ``1c4bb76``). The gate
+        used to be ``CronTickPassed.since_last_handled()``, true only on the tick
+        the boundary was detected. But the dep-side evidence inside
+        ``all_deps_updated_since_cron`` (``newly_updated().since(cron_tick)``) is
+        *reset on that same boundary tick*, so the gate and the dep evidence were
+        never true together and ``on_cron``-with-deps could never fire in
+        production. The gate now latches from the boundary until the asset is
+        handled, so a dep update later in the period fires it.
+
+        Graph: a (plain) -> r (``on_cron`` every 15s, depends on a)
+        """
+        period = 15
+        cond = rs.AutomationCondition.on_cron(f"*/{period} * * * * *")
+
+        @rs.Asset(name="a", io_handler=rs.InMemoryIOHandler())
+        def a() -> int:
+            return 1
+
+        @rs.Asset(
+            name="r", io_handler=rs.InMemoryIOHandler(), automation_condition=cond
+        )
+        def r(a: int) -> int:
+            return a
+
+        repo = rs.CodeRepository(
+            assets=[a, r], default_executor=rs.Executor.in_process()
+        )
+        repo.resolve(storage=storage)
+        # Materialize in dep order so r's floor is newer than a: on_cron's dep
+        # evidence (newly_updated(a)) starts false, and the cron boundary alone
+        # must not fire r.
+        repo.materialize(selection=["a", "r"])
+
+        # Count only runs that materialize r — the dep bump below issues its own
+        # run for a, which must not be mistaken for r firing.
+        def r_run_count():
+            return sum(1 for run in storage.get_runs(limit=500) if "r" in run.node_names)
+
+        daemon = AutomationDaemon(
+            repo=repo, storage=storage, condition_eval_interval="300ms"
+        )
+        daemon.start()
+        try:
+            # Let the daemon take at least one baseline eval tick, then wait for a
+            # cron boundary to be crossed *while it is running* so the gate arms.
+            # (`time.time() // period` ticks over at each */period second mark,
+            # the same instants the seconds-field cron fires.)
+            time.sleep(1.0)
+            p0 = int(time.time() // period)
+            while int(time.time() // period) == p0:
+                time.sleep(0.05)
+            # A boundary just passed; give the daemon a couple of ticks to detect
+            # it and evaluate. We are now ~1.5s into a fresh period (~13s runway
+            # before the next boundary would reset the dep evidence).
+            time.sleep(1.5)
+
+            # The boundary alone, with a still up to date, must NOT have fired r.
+            baseline = r_run_count()
+            assert baseline == 1, (
+                "the cron boundary fired r even though its dep was not updated "
+                f"since the boundary ({baseline} runs materialized r)"
+            )
+
+            # Update the dep *after* the boundary, well within the period.
+            repo.materialize(selection=["a"])
+
+            # Latched gate + fresh dep evidence now overlap -> r fires within a
+            # tick or two. Under the old pulse gate the two were never true
+            # together, so r would never fire and this wait would time out.
+            _wait_until(lambda: r_run_count() > baseline, timeout=8.0)
+            after = r_run_count()
+            assert after > baseline, (
+                "on_cron did not fire for a dependency updated within the period "
+                f"after the boundary tick ({baseline} -> {after} runs materializing "
+                "r) — the cron gate must stay armed past the boundary tick"
+            )
+        finally:
+            daemon.stop()
