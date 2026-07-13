@@ -573,6 +573,7 @@ impl CodeLocationService for CodeLocationImpl {
             max_concurrency: req.max_concurrency,
             tags,
             dry_run: req.dry_run,
+            backfill_id: None,
         };
 
         let mut outcome = self

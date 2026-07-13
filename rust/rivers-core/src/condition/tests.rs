@@ -8173,6 +8173,7 @@ async fn test_recover_pending_dispatch_clears_is_initial() {
             run_ids: vec!["run-1".to_string()],
             committed: AssetConditionState::default(),
             dispatched_keys: vec![],
+            backfill_ids: vec![],
         }],
     };
     storage
@@ -8241,6 +8242,7 @@ async fn test_recover_pending_dispatch_skips_stale_intent() {
             run_ids: vec!["run-old".to_string()],
             committed,
             dispatched_keys: vec![],
+            backfill_ids: vec![],
         }],
     };
     storage
@@ -8311,6 +8313,7 @@ async fn test_recover_pending_dispatch_restores_handled_keys() {
             run_ids: vec!["run-k".to_string()],
             committed: AssetConditionState::default(),
             dispatched_keys: vec![spk("k")],
+            backfill_ids: vec![],
         }],
     };
     storage
@@ -8341,6 +8344,86 @@ async fn test_recover_pending_dispatch_restores_handled_keys() {
             .and_then(|s| s.partition_state.as_ref())
             .is_some_and(|ps| ps.handled.contains(&spk("k"))),
         "recovery must restore the dispatched key into the handled set"
+    );
+}
+
+#[tokio::test]
+async fn test_recover_pending_dispatch_backfill_id_no_false_match() {
+    // V-09: a backfill-shaped intent must match the tick's OWN pre-minted
+    // backfill id, not any backfill covering the asset — an unrelated concurrent
+    // backfill in the crash window must NOT count as dispatch evidence and
+    // consume the trigger.
+    use crate::condition::pass::recover_pending_dispatch;
+    use crate::condition::state::{PendingDispatch, PendingDispatchEntry};
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        BackfillFailurePolicy, BackfillRecord, BackfillStatus, BackfillStrategy,
+        DEFAULT_CODE_LOCATION_ID, ScopedStorageHandle, StorageBackend,
+    };
+
+    let storage = std::sync::Arc::new(SurrealStorage::new_memory().await.unwrap());
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    // An UNRELATED backfill covering "a", created within the crash window; the
+    // tick's own backfill ("bf-real") never dispatched.
+    storage
+        .create_backfill(&BackfillRecord {
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            backfill_id: "bf-user".to_string(),
+            status: BackfillStatus::Requested,
+            strategy: BackfillStrategy::MultiRun,
+            failure_policy: BackfillFailurePolicy::Continue,
+            asset_selection: vec!["a".to_string()],
+            job_name: None,
+            partition_keys: vec![spk("k1")],
+            run_ids: vec![],
+            completed_partitions: vec![],
+            failed_partitions: vec![],
+            canceled_partitions: vec![],
+            max_concurrency: 1,
+            tags: vec![],
+            create_time: 1_500,
+            end_time: None,
+            error: None,
+        })
+        .await
+        .unwrap();
+
+    let mut committed = AssetConditionState::default();
+    committed.last_materialized_timestamp = Some(999);
+    let pending = PendingDispatch {
+        tick_timestamp: 1_000,
+        entries: vec![PendingDispatchEntry {
+            asset_key: "a".to_string(),
+            run_ids: vec![],
+            backfill_ids: vec!["bf-real".to_string()],
+            committed,
+            dispatched_keys: vec![],
+        }],
+    };
+    storage
+        .for_code_location(&ctx)
+        .set_condition_pending_dispatch(&pending)
+        .await
+        .unwrap();
+
+    let mut pre = AssetConditionState::default();
+    pre.last_materialized_timestamp = Some(500);
+    pre.last_tick_timestamp = Some(50);
+    let mut eval_state = ConditionEvalState::default();
+    eval_state.assets.insert("a".to_string(), pre);
+
+    let handle = ScopedStorageHandle::new(std::sync::Arc::clone(&storage), ctx.clone());
+    recover_pending_dispatch(&mut eval_state, &handle)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        eval_state
+            .assets
+            .get("a")
+            .and_then(|s| s.last_materialized_timestamp),
+        Some(500),
+        "an unrelated backfill must not be treated as the tick's dispatch evidence"
     );
 }
 
@@ -8481,6 +8564,7 @@ async fn test_crash_after_dispatch_recovers_latches_from_intent() {
                         run_ids: vec!["run-dst".to_string()],
                         committed,
                         dispatched_keys,
+                        backfill_ids: vec![],
                     }
                 },
             )
@@ -8669,6 +8753,7 @@ async fn test_crash_before_dispatch_leaves_trigger_armed() {
                 run_ids: vec!["run-never-created".to_string()],
                 committed,
                 dispatched_keys,
+                backfill_ids: vec![],
             })
             .collect(),
     };

@@ -77,6 +77,7 @@ impl ConditionTickEngine {
         &mut self,
         plan: MaterializationPlan,
         run_requests: Vec<MaterializationRequestData>,
+        backfill_ids_by_asset: &HashMap<String, String>,
         handle: &mut ConditionTickHandle,
     ) {
         if !run_requests.is_empty() {
@@ -125,8 +126,12 @@ impl ConditionTickEngine {
         }
 
         if !plan.multi_partition_backfills.is_empty() {
-            self.dispatch_multi_partition_backfills(plan.multi_partition_backfills, handle)
-                .await;
+            self.dispatch_multi_partition_backfills(
+                plan.multi_partition_backfills,
+                backfill_ids_by_asset,
+                handle,
+            )
+            .await;
         }
     }
 
@@ -134,11 +139,13 @@ impl ConditionTickEngine {
     async fn dispatch_multi_partition_backfills(
         &mut self,
         mats: Vec<(String, Vec<CorePartitionKey>)>,
+        backfill_ids_by_asset: &HashMap<String, String>,
         handle: &mut ConditionTickHandle,
     ) {
         let backfill_asset_keys: Vec<String> = mats.iter().map(|(k, _)| k.clone()).collect();
         let mut requests: Vec<BackfillRequestData> = Vec::with_capacity(mats.len());
         for (asset_key, partition_keys) in mats {
+            let backfill_id = backfill_ids_by_asset.get(&asset_key).cloned();
             let strategy = self
                 .pass
                 .conditions_by_key
@@ -162,6 +169,7 @@ impl ConditionTickEngine {
                 max_concurrency: 4,
                 tags: Some(tags),
                 dry_run: false,
+                backfill_id,
             });
         }
 

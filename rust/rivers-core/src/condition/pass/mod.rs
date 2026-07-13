@@ -839,12 +839,20 @@ pub async fn recover_pending_dispatch<S: StorageBackend>(
         {
             continue;
         }
-        let dispatched = if entry.run_ids.is_empty() {
+        let dispatched = if !entry.run_ids.is_empty() {
+            entry.run_ids.iter().any(|id| existing_runs.contains(id))
+        } else if !entry.backfill_ids.is_empty() {
+            // Exact: the tick pre-minted these backfill ids.
+            entry
+                .backfill_ids
+                .iter()
+                .any(|bid| backfills.iter().any(|b| &b.backfill_id == bid))
+        } else {
+            // Legacy intent without pre-minted ids: fall back to the create-time
+            // heuristic (may match an unrelated concurrent backfill).
             backfills
                 .iter()
                 .any(|b| b.create_time >= tick_ts && b.asset_selection.contains(&entry.asset_key))
-        } else {
-            entry.run_ids.iter().any(|id| existing_runs.contains(id))
         };
         if !dispatched {
             continue;
