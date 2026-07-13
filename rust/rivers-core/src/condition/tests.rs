@@ -7537,6 +7537,59 @@ async fn test_two_partition_runs_same_asset_both_update_slots() {
 }
 
 #[tokio::test]
+async fn test_in_progress_partition_keys_expands_batched_members() {
+    // V-15: a run over a batched multi-member key (single_run backfill bundle_keys
+    // or a manual multi-key materialize) must mark each MEMBER partition in
+    // progress, not the composite key that select_in_universe would drop.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, PartitionKey, RunRecord, RunStatus, StorageBackend,
+    };
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[make_materialized_record("a", 1000)])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.set_partitioned_assets(vec!["a".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    // A single Started run bundling two partitions {p1, p2}.
+    storage
+        .create_run(&RunRecord {
+            run_id: "run-bundle".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: Some(PartitionKey::Single {
+                keys: vec!["p1".to_string(), "p2".to_string()],
+            }),
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let ip = cache.in_progress_partition_keys("a");
+    assert!(
+        ip.contains(&spk("p1")) && ip.contains(&spk("p2")),
+        "each member of a batched in-progress key must be marked in progress; got {:?}",
+        ip
+    );
+}
+
+#[tokio::test]
 async fn test_failed_run_does_not_clobber_latest_materializing_tags() {
     // LastExecutedWithTags reflects the latest run that MATERIALIZED the
     // asset; a later run that failed without materializing it must not
