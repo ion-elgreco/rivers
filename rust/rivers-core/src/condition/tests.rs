@@ -6910,6 +6910,106 @@ async fn test_step_success_clears_floor_for_lagging_record_in_joint_failed_run()
 }
 
 #[tokio::test]
+async fn test_failed_joint_run_step_success_records_tick_tags() {
+    // V-13: a step that succeeded inside an overall-Failure joint run still
+    // materialized its asset, so HasRunWithTags/AllRunsHaveTags must see the
+    // run's tags for that asset on the tick it materialized. y (StepFailure)
+    // must contribute nothing.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, RunRecord, RunStatus, StorageBackend,
+    };
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(&[
+            make_materialized_record("x", 1000),
+            make_materialized_record("y", 1000),
+        ])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
+    cache.set_needs_tick_tags(&[ConditionNode::HasRunWithTags {
+        tag_keys: vec![],
+        tag_values: vec![("team".to_string(), "x".to_string())],
+    }]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let run_id = "run-joint".to_string();
+    storage
+        .create_run(&RunRecord {
+            run_id: run_id.clone(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("test".to_string()),
+            status: RunStatus::Started,
+            start_time: 2000,
+            end_time: None,
+            tags: vec![("team".to_string(), "x".to_string())],
+            node_names: vec!["x".to_string(), "y".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual,
+        })
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+
+    // Run fails overall: x StepSuccess (materialized), y StepFailure; records lag.
+    storage
+        .update_run_status(&run_id, RunStatus::Failure, Some(3000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[
+            EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepSuccess,
+                asset_key: Some("x".to_string()),
+                run_id: run_id.clone(),
+                partition_key: None,
+                timestamp: 3000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            },
+            EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("y".to_string()),
+                run_id: run_id.clone(),
+                partition_key: None,
+                timestamp: 3000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            },
+        ])
+        .await
+        .unwrap();
+    cache.refresh(&storage, 0).await.unwrap();
+
+    assert!(
+        cache
+            .tick_materialization_tags
+            .get("x")
+            .and_then(|slots| slots.get(&None))
+            .is_some_and(|v| v
+                .iter()
+                .any(|t| t.contains(&("team".to_string(), "x".to_string())))),
+        "x materialized (StepSuccess) in the failed joint run → its tags must be \
+         recorded for tick-tag conditions; got {:?}",
+        cache.tick_materialization_tags
+    );
+    assert!(
+        !cache.tick_materialization_tags.contains_key("y"),
+        "y failed (StepFailure) → must not contribute tick tags"
+    );
+}
+
+#[tokio::test]
 async fn test_cache_clears_in_progress_when_run_canceled_after_cursor_advanced() {
     // A run reported once advances the cursor past its start_time; a later CANCEL changes
     // neither the record nor start_time, so get_runs_since (`>`) never re-delivers it.

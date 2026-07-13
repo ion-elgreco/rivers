@@ -358,10 +358,16 @@ impl AssetConditionCache {
                     Arc::clone(&run_tags),
                     Arc::clone(&run_asset_names),
                 ));
-                if !is_failure && self.needs_tick_tags {
+                // Push for every run, carrying the failure flag: a Success run
+                // materialized all its covered assets, but an overall-Failure
+                // joint run counts only for the assets whose step actually
+                // materialized here (resolved by the apply gate below).
+                if self.needs_tick_tags {
                     delta.tick_tag_updates.push((
                         asset.clone(),
                         partition_key.clone(),
+                        run.run_id.clone(),
+                        is_failure,
                         Arc::clone(&run_tags),
                     ));
                 }
@@ -539,8 +545,23 @@ impl AssetConditionCache {
                 self.update_last_run_maps(&asset, &pk, run_ts, &tags, &names);
             }
         }
-        for (asset, pk, tags) in tick_tag_updates {
-            self.update_tick_materialization_tags(&asset, &pk, &tags);
+        for (asset, pk, run_id, run_failed, tags) in tick_tag_updates {
+            // A Success run materialized every asset it covered. An overall-
+            // Failure joint run counts only for the assets it actually
+            // materialized (record credits this run, or its step succeeded per
+            // materialized_overrides) — mirroring the last_run gate.
+            let record_it = !run_failed
+                || self
+                    .records
+                    .get(asset.as_str())
+                    .and_then(|r| r.last_run_id.as_deref())
+                    == Some(run_id.as_str())
+                || materialized_overrides
+                    .get(&asset)
+                    .is_some_and(|runs| runs.contains(&run_id));
+            if record_it {
+                self.update_tick_materialization_tags(&asset, &pk, &tags);
+            }
         }
 
         for (key, patch) in partition_status {
