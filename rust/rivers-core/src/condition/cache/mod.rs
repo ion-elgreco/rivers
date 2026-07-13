@@ -137,7 +137,16 @@ impl AssetConditionCache {
     pub fn in_progress_partition_keys(&self, asset: &str) -> HashSet<PartitionKey> {
         self.in_progress_assets
             .get(asset)
-            .map(|runs| runs.values().flatten().cloned().collect())
+            .map(|runs| {
+                // Expand batched keys (bundle_keys / multi-key materialize) into
+                // their members, like run_partition_slots — a composite key is
+                // not in `all_keys`, so select_in_universe would otherwise drop
+                // it and every member would read as idle mid-flight.
+                runs.values()
+                    .flatten()
+                    .flat_map(|pk| pk.members())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
