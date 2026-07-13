@@ -185,6 +185,7 @@ impl DirectRunDispatcher {
             ids.push(req.run_id.clone());
 
             let repo = Arc::clone(&self.repo);
+            let handle = self.handle.clone();
             let assets = req.asset_selection.clone();
             let run_id = req.run_id.clone();
             let py_pk = req.partition_key.as_ref().map(PyPartitionKey::from);
@@ -196,7 +197,7 @@ impl DirectRunDispatcher {
                     None,
                     false,
                     None,
-                    Some(run_id),
+                    Some(run_id.clone()),
                     false,
                     false,
                     launched_by,
@@ -205,6 +206,13 @@ impl DirectRunDispatcher {
                         target: "rivers::daemon",
                         error = %e,
                         "materialize_with_launcher failed",
+                    );
+                    // Mark the pre-created Started record Failed so the condition
+                    // cache clears it from in-progress; an early return before
+                    // run_inner (validation/plan build) leaves it Started, and the
+                    // asset then reads in-flight forever, wedging its condition.
+                    crate::runtime::rt().block_on(
+                        handle.mark_run_launch_failed(&run_id, "materialization launch failed"),
                     );
                 }
             });
@@ -278,7 +286,6 @@ impl QueuedRunDispatcher {
         }
         let mut ids: Vec<String> = Vec::with_capacity(requests.len());
         let mut errors: Vec<anyhow::Error> = Vec::new();
-        let now = rivers_core::util::now_ts();
         for req in requests {
             let priority = priority_from_tags(&req.tags);
             let run_record = RunRecord {
@@ -286,7 +293,7 @@ impl QueuedRunDispatcher {
                 code_location_id: self.code_location_id.clone(),
                 job_name: None,
                 status: RunStatus::Queued,
-                start_time: now,
+                start_time: rivers_core::util::now_ts(),
                 end_time: None,
                 tags: req.tags.clone(),
                 node_names: req.asset_selection.clone(),
