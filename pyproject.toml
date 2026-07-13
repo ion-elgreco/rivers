@@ -18,9 +18,9 @@ dev = [
     "pytest-timeout>=2.4.0",
     "pyright>=1.1.411",
     "ruff>=0.15.20",
-    "typos>=1.46.0",
+    "typos>=1.48.0",
     "grpcio>=1.81.1",
     "grpcio-tools>=1.81.1",
     "kr8s>=0.20",
-    "rumdl>=0.2.26",
+    "rumdl>=0.2.28",
 ]
