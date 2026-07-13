@@ -811,6 +811,19 @@ pub async fn recover_pending_dispatch<S: StorageBackend>(
 
     let mut recovered = 0usize;
     for entry in pending.entries {
+        // Staleness guard: if the loaded state already reflects a tick at or
+        // after this intent's tick, the intent is stale — a failed clear that
+        // survived an idle stretch while passive commits advanced and persisted
+        // newer self-state. Splicing its older committed state would regress
+        // that state and spuriously re-fire; skip it.
+        if eval_state
+            .assets
+            .get(&entry.asset_key)
+            .and_then(|s| s.last_tick_timestamp)
+            .is_some_and(|lt| lt >= tick_ts)
+        {
+            continue;
+        }
         let dispatched = if entry.run_ids.is_empty() {
             backfills
                 .iter()
