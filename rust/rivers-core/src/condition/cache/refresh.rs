@@ -447,6 +447,21 @@ impl AssetConditionCache {
         Ok(out)
     }
 
+    /// Whether `run_id` is the run that materialized `asset` this refresh: the
+    /// asset's recorded last run, or a run an override flagged as materializing it.
+    fn run_materialized_asset(
+        &self,
+        asset: &str,
+        run_id: &str,
+        overrides: &HashMap<String, HashSet<String>>,
+    ) -> bool {
+        self.records
+            .get(asset)
+            .and_then(|r| r.last_run_id.as_deref())
+            == Some(run_id)
+            || overrides.get(asset).is_some_and(|runs| runs.contains(run_id))
+    }
+
     /// Apply phase: replay the planned delta against the cache. Returns `delta.changed`.
     pub(super) fn apply_refresh_delta(&mut self, delta: RefreshDelta) -> bool {
         let RefreshDelta {
@@ -494,14 +509,8 @@ impl AssetConditionCache {
         }
 
         for (asset, FailedRun { ts, run_id }) in failed_adds {
-            let materialized_here = self
-                .records
-                .get(asset.as_str())
-                .and_then(|r| r.last_run_id.as_deref())
-                == Some(run_id.as_str())
-                || materialized_overrides
-                    .get(&asset)
-                    .is_some_and(|runs| runs.contains(run_id.as_str()));
+            let materialized_here =
+                self.run_materialized_asset(&asset, &run_id, &materialized_overrides);
             if materialized_here {
                 if self
                     .failed_asset_timestamps
@@ -533,30 +542,15 @@ impl AssetConditionCache {
         for (asset, pk, run_id, run_ts, tags, names) in last_run_updates {
             // LastExecutedWithTags/LastRunIncludesTarget reflect the latest run
             // that MATERIALIZED the asset — mirror the failure-floor gate.
-            let materialized_here = self
-                .records
-                .get(asset.as_str())
-                .and_then(|r| r.last_run_id.as_deref())
-                == Some(run_id.as_str())
-                || materialized_overrides
-                    .get(&asset)
-                    .is_some_and(|runs| runs.contains(&run_id));
-            if materialized_here {
+            if self.run_materialized_asset(&asset, &run_id, &materialized_overrides) {
                 self.update_last_run_maps(&asset, &pk, run_ts, &tags, &names);
             }
         }
         for (asset, pk, run_id, run_failed, tags) in tick_tag_updates {
             // Success runs materialize all covered assets; a failed run counts only
             // where it actually materialized (mirrors the last_run gate).
-            let record_it = !run_failed
-                || self
-                    .records
-                    .get(asset.as_str())
-                    .and_then(|r| r.last_run_id.as_deref())
-                    == Some(run_id.as_str())
-                || materialized_overrides
-                    .get(&asset)
-                    .is_some_and(|runs| runs.contains(&run_id));
+            let record_it =
+                !run_failed || self.run_materialized_asset(&asset, &run_id, &materialized_overrides);
             if record_it {
                 self.update_tick_materialization_tags(&asset, &pk, &tags);
             }
