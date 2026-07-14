@@ -2,6 +2,7 @@
 //! selection, tag matching, staleness floors, and skipped-subtree construction.
 use std::collections::{HashMap, HashSet};
 
+use crate::condition::cache::RunTags;
 use crate::storage::PartitionKey;
 
 use super::super::node::ConditionNode;
@@ -203,6 +204,26 @@ pub(crate) fn partition_filter_select<V>(
     PartitionSelection::from_keys(matching)
 }
 
+/// True if `tag_sets` (a tick's materialization tag-sets) is non-empty and
+/// `all`/`any` (per `require_all`) of its sets satisfy the tag filter.
+fn tag_sets_match(
+    tag_sets: &[RunTags],
+    tag_keys: &[String],
+    tag_values: &[(String, String)],
+    require_all: bool,
+) -> bool {
+    !tag_sets.is_empty()
+        && if require_all {
+            tag_sets
+                .iter()
+                .all(|tags| run_tags_match(tags, tag_keys, tag_values))
+        } else {
+            tag_sets
+                .iter()
+                .any(|tags| run_tags_match(tags, tag_keys, tag_values))
+        }
+}
+
 /// Unpartitioned HasRunWithTags / AllRunsHaveTags evaluator.
 pub(crate) fn eval_new_update_tags(
     ctx: &EvalContext,
@@ -214,18 +235,7 @@ pub(crate) fn eval_new_update_tags(
         .tick_materialization_tags
         .get(ctx.target_key)
         .and_then(|slots| slots.get(&None))
-        .map(|tag_sets| {
-            !tag_sets.is_empty()
-                && if require_all {
-                    tag_sets
-                        .iter()
-                        .all(|tags| run_tags_match(tags, tag_keys, tag_values))
-                } else {
-                    tag_sets
-                        .iter()
-                        .any(|tags| run_tags_match(tags, tag_keys, tag_values))
-                }
-        })
+        .map(|tag_sets| tag_sets_match(tag_sets, tag_keys, tag_values, require_all))
         .unwrap_or(false)
 }
 
@@ -241,18 +251,7 @@ pub(crate) fn eval_new_update_tags_partitioned(
     partition_filter_select(
         ctx.tags.tick_materialization_tags.get(ctx.target_key),
         pctx,
-        |tag_sets| {
-            !tag_sets.is_empty()
-                && if require_all {
-                    tag_sets
-                        .iter()
-                        .all(|tags| run_tags_match(tags, tag_keys, tag_values))
-                } else {
-                    tag_sets
-                        .iter()
-                        .any(|tags| run_tags_match(tags, tag_keys, tag_values))
-                }
-        },
+        |tag_sets| tag_sets_match(tag_sets, tag_keys, tag_values, require_all),
     )
 }
 
