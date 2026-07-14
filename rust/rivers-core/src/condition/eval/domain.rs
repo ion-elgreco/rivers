@@ -332,10 +332,9 @@ impl EvalDomain for PartitionDomain {
             .filter(|&(pk, &ts)| {
                 pctx.all_keys.contains(pk)
                     && match pctx.dep_root_floor {
-                        Some(floor) => match floor.get(pk) {
-                            None => false,
-                            Some(&inner) => dep_newer_than_floor(ts, inner),
-                        },
+                        Some(floor) => {
+                            floor.get(pk).is_some_and(|&inner| dep_newer_than_floor(ts, inner))
+                        }
                         None => match prev_timestamps.and_then(|pt| pt.get(pk)) {
                             Some(&prev) => ts > prev,
                             None => !ctx.is_initial,
