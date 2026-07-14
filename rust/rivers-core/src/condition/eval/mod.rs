@@ -587,10 +587,7 @@ fn eval_partitioned_on_dep(
                         if !pctx.all_keys.contains(uk) {
                             return None;
                         }
-                        return Some((
-                            uk.clone(),
-                            root_floor_over(std::iter::once(uk), root_status),
-                        ));
+                        return Some((uk.clone(), effective_attempt_ts(root_status, uk)));
                     }
                     if let PartitionSelection::Keys(s) = &mut scratch {
                         s.clear();
