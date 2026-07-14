@@ -234,7 +234,7 @@ impl EvalDomain for BoolDomain {
         let (last_handled, last_tick) = root_handled_state(ctx);
         match last_handled {
             None => true,
-            Some(handled) => last_tick.map(|lt| handled < lt).unwrap_or(true),
+            Some(handled) => last_tick.is_none_or(|lt| handled < lt),
         }
     }
 
