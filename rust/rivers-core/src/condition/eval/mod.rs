@@ -506,9 +506,6 @@ fn eval_partitioned_on_dep(
         // pivot over the true root universe.
         let root_floor = bridge_floor(ctx, pctx);
         let dep_ctx = dep_eval_context(ctx, dep_key, dep_record, None, Some(root_floor));
-        let bool_latch: HashMap<u32, bool> = prev_dep_sel
-            .map(|m| m.iter().map(|(idx, sel)| (*idx, !sel.is_empty())).collect())
-            .unwrap_or_default();
         let mut local = HashMap::new();
         let nested_prev: HashMap<String, HashMap<u32, bool>> = dep_selections
             .prev
@@ -516,7 +513,7 @@ fn eval_partitioned_on_dep(
             .map(|(k, m)| {
                 (
                     k.clone(),
-                    m.iter().map(|(idx, sel)| (*idx, !sel.is_empty())).collect(),
+                    m.iter().map(|(idx, sel)| (*idx, sel.to_bool())).collect(),
                 )
             })
             .collect();
@@ -524,7 +521,7 @@ fn eval_partitioned_on_dep(
         let mut bool_scope = DepScope {
             prev: &nested_prev,
             acc: &mut nested_acc,
-            cur_prev: Some(&bool_latch),
+            cur_prev: Some(nested_prev.get(dep_key).unwrap_or(&EMPTY_BOOL_LATCH)),
             bridged: HashMap::new(),
         };
         let val = eval::<BoolDomain>(
