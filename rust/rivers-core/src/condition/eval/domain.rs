@@ -361,8 +361,8 @@ impl EvalDomain for PartitionDomain {
             .time_windows
             .and_then(|tw| tw.keys_for(ctx.target_key, pctx.all_keys, lookback))
         {
-            Some(keys) if !keys.is_empty() => PartitionSelection::Keys((*keys).clone()),
-            _ => PartitionSelection::Empty,
+            Some(keys) => PartitionSelection::from_keys((*keys).clone()),
+            None => PartitionSelection::Empty,
         }
     }
     fn backfill_in_progress(ctx: &EvalContext) -> PartitionSelection {
