@@ -205,58 +205,54 @@ fn eval<D: EvalDomain, O: EvalOut<D::Sel>>(
 
         // dep-aggregates
         ConditionNode::AnyDepsMatch { condition, .. } => {
-            let base = *counter;
-            let eval_all = condition.has_stateful_nodes();
-            let mut result = D::empty();
-            if let Some(deps) = ctx.cache.upstream_deps.get(ctx.target_key) {
-                for dep in deps {
-                    *counter = base;
-                    let dep_val = D::pivot_into_dep(dep, condition, ctx, counter, dep_scope);
-                    result = D::or(result, &dep_val);
-                    // Short-circuit once saturated (bool: first true) — but keep
-                    // evaluating when stateful so every per-dep latch is recorded.
-                    if result.is_all() && !eval_all {
-                        break;
-                    }
-                }
-            }
-            finalize_dep_counter(counter, base, condition);
+            let deps = ctx
+                .cache
+                .upstream_deps
+                .get(ctx.target_key)
+                .into_iter()
+                .flatten();
+            let result = fold_deps::<D>(
+                deps,
+                condition,
+                ctx,
+                counter,
+                dep_scope,
+                D::empty(),
+                D::or,
+                |s| s.is_all(),
+            );
             O::leaf(result, my_idx, node, total)
         }
         ConditionNode::AllDepsMatch { condition, .. } => {
-            let base = *counter;
-            let eval_all = condition.has_stateful_nodes();
-            let result = match ctx.cache.upstream_deps.get(ctx.target_key) {
-                Some(deps) if !deps.is_empty() => {
-                    let mut result = D::all(ctx);
-                    for dep in deps {
-                        *counter = base;
-                        let dep_val = D::pivot_into_dep(dep, condition, ctx, counter, dep_scope);
-                        result = D::and(result, &dep_val);
-                        if !result.is_true() && !eval_all {
-                            break;
-                        }
-                    }
-                    result
-                }
-                _ => D::all(ctx),
-            };
-            finalize_dep_counter(counter, base, condition);
+            let deps = ctx
+                .cache
+                .upstream_deps
+                .get(ctx.target_key)
+                .into_iter()
+                .flatten();
+            let result = fold_deps::<D>(
+                deps,
+                condition,
+                ctx,
+                counter,
+                dep_scope,
+                D::all(ctx),
+                D::and,
+                |s| !s.is_true(),
+            );
             O::leaf(result, my_idx, node, total)
         }
         ConditionNode::AssetMatches { keys, condition } => {
-            let base = *counter;
-            let eval_all = condition.has_stateful_nodes();
-            let mut result = D::empty();
-            for key in keys {
-                *counter = base;
-                let key_val = D::pivot_into_dep(key, condition, ctx, counter, dep_scope);
-                result = D::or(result, &key_val);
-                if result.is_all() && !eval_all {
-                    break;
-                }
-            }
-            finalize_dep_counter(counter, base, condition);
+            let result = fold_deps::<D>(
+                keys.iter(),
+                condition,
+                ctx,
+                counter,
+                dep_scope,
+                D::empty(),
+                D::or,
+                |s| s.is_all(),
+            );
             O::leaf(result, my_idx, node, total)
         }
 
@@ -366,6 +362,37 @@ pub(crate) fn count_nodes(node: &ConditionNode, counter: &mut u32) {
 fn finalize_dep_counter(counter: &mut u32, base: u32, condition: &ConditionNode) {
     *counter = base;
     count_nodes(condition, counter);
+}
+
+/// Fold a dep-aggregate: pivot `condition` into each dep/key and combine the
+/// results from `init` with `combine`, short-circuiting once `saturated` — but
+/// evaluating every dep when a stateful child needs its per-dep latch recorded.
+/// An empty `deps` iterator returns `init` (so an all-quantifier over no deps is
+/// vacuously true).
+#[allow(clippy::too_many_arguments)]
+fn fold_deps<'a, D: EvalDomain>(
+    deps: impl IntoIterator<Item = &'a String>,
+    condition: &ConditionNode,
+    ctx: &EvalContext,
+    counter: &mut u32,
+    dep_scope: &mut DepScope<D::Sel>,
+    init: D::Sel,
+    combine: fn(D::Sel, &D::Sel) -> D::Sel,
+    saturated: impl Fn(&D::Sel) -> bool,
+) -> D::Sel {
+    let base = *counter;
+    let eval_all = condition.has_stateful_nodes();
+    let mut result = init;
+    for dep in deps {
+        *counter = base;
+        let dep_val = D::pivot_into_dep(dep, condition, ctx, counter, dep_scope);
+        result = combine(result, &dep_val);
+        if saturated(&result) && !eval_all {
+            break;
+        }
+    }
+    finalize_dep_counter(counter, base, condition);
+    result
 }
 
 /// Evaluate a `ConditionNode` tree and return both the compact result (for
