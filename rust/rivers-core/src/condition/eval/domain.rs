@@ -460,11 +460,7 @@ impl EvalDomain for PartitionDomain {
             {
                 None => current,
                 Some(handled_set) => {
-                    let handled_sel = if handled_set.is_empty() {
-                        PartitionSelection::Empty
-                    } else {
-                        PartitionSelection::Keys(handled_set.clone())
-                    };
+                    let handled_sel = PartitionSelection::from_keys(handled_set.clone());
                     current.difference(&handled_sel, pctx.all_keys)
                 }
             }
