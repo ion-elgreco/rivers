@@ -723,8 +723,6 @@ impl Asset {
         }
     }
 
-    // Consumed by resolution/ResolvedNode threading (landing next).
-    #[allow(dead_code)]
     pub fn retry(&self) -> Option<&rivers_core::execution::retry::RetryRef> {
         match self {
             Asset::Single(a) => a.retry.as_ref(),
@@ -741,6 +739,28 @@ impl Asset {
 
     /// Resolve all ResourceRef io_handlers to Instance variants using the resources dict.
     /// `io_handler_keys` contains resource keys that are validated IOHandler instances.
+    /// Resolve a `retry="name"` reference against the repository `retries`
+    /// registry, replacing `Named` with the concrete `Inline` policy. Errors on
+    /// an unknown name.
+    pub fn resolve_retry_refs(
+        &mut self,
+        retries: &HashMap<String, rivers_core::execution::retry::RetryPolicy>,
+    ) -> PyResult<()> {
+        use rivers_core::execution::retry::RetryRef;
+        if let Asset::Single(a) = self {
+            if let Some(RetryRef::Named(key)) = &a.retry {
+                let policy = retries.get(key).ok_or_else(|| {
+                    crate::errors::ConfigurationError::new_err(format!(
+                        "unknown retry policy '{key}' referenced by asset; registered: {:?}",
+                        retries.keys().collect::<Vec<_>>()
+                    ))
+                })?;
+                a.retry = Some(RetryRef::Inline(policy.clone()));
+            }
+        }
+        Ok(())
+    }
+
     pub fn resolve_io_handler_refs(
         &mut self,
         py: Python,
