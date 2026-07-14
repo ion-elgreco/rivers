@@ -877,12 +877,13 @@ impl PartitionMapping {
                     PartitionsDefinition::Dynamic { name: down_name },
                     PartitionsDefinition::Dynamic { name: up_name },
                 ) = (down, up)
-                    && down_name != up_name {
-                        return Err(MappingValidationError::DefinitionError(format!(
-                            "Identity mapping requires matching dynamic namespaces: \
+                    && down_name != up_name
+                {
+                    return Err(MappingValidationError::DefinitionError(format!(
+                        "Identity mapping requires matching dynamic namespaces: \
                              downstream '{down_name}' != upstream '{up_name}'"
-                        )));
-                    }
+                    )));
+                }
                 if let (
                     PartitionsDefinition::Static { keys: down_keys },
                     PartitionsDefinition::Static { keys: up_keys },

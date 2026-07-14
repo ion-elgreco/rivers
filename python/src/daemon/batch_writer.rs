@@ -298,14 +298,16 @@ impl BatchWriter for ConditionEvalWriter {
         }
         // Ticks only grow when evals do — an idle daemon must not run the
         // prune query every 2s forever.
-        if flushed_evals && let Some(max) = self.max_evals_retained
-            && let Err(e) = self.handle.scoped().prune_condition_ticks(max).await {
-                tracing::warn!(
-                    target: "rivers::daemon",
-                    error = %e,
-                    "failed to prune condition ticks"
-                );
-            }
+        if flushed_evals
+            && let Some(max) = self.max_evals_retained
+            && let Err(e) = self.handle.scoped().prune_condition_ticks(max).await
+        {
+            tracing::warn!(
+                target: "rivers::daemon",
+                error = %e,
+                "failed to prune condition ticks"
+            );
+        }
     }
 }
 

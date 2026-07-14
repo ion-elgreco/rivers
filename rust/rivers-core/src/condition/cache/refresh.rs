@@ -459,7 +459,9 @@ impl AssetConditionCache {
             .get(asset)
             .and_then(|r| r.last_run_id.as_deref())
             == Some(run_id)
-            || overrides.get(asset).is_some_and(|runs| runs.contains(run_id))
+            || overrides
+                .get(asset)
+                .is_some_and(|runs| runs.contains(run_id))
     }
 
     /// Apply phase: replay the planned delta against the cache. Returns `delta.changed`.
@@ -549,8 +551,8 @@ impl AssetConditionCache {
         for (asset, pk, run_id, run_failed, tags) in tick_tag_updates {
             // Success runs materialize all covered assets; a failed run counts only
             // where it actually materialized (mirrors the last_run gate).
-            let record_it =
-                !run_failed || self.run_materialized_asset(&asset, &run_id, &materialized_overrides);
+            let record_it = !run_failed
+                || self.run_materialized_asset(&asset, &run_id, &materialized_overrides);
             if record_it {
                 self.update_tick_materialization_tags(&asset, &pk, &tags);
             }

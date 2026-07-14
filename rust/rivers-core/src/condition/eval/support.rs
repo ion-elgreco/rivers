@@ -21,9 +21,9 @@ pub(crate) fn data_version_baseline<'a>(ctx: &'a EvalContext) -> (Option<&'a Str
             .all_asset_states
             .get(ctx.root_key)
             .and_then(|s| s.dep_baselines.get(ctx.target_key))
-        {
-            return (b.last_data_version.as_ref(), b.last_materialized_timestamp);
-        }
+    {
+        return (b.last_data_version.as_ref(), b.last_materialized_timestamp);
+    }
     (
         ctx.prev_state.last_data_version.as_ref(),
         ctx.prev_state.last_materialized_timestamp,

@@ -174,8 +174,7 @@ pub(crate) trait EvalDomain {
     ) -> Self::Sel;
 
     /// Previous-tick per-dep latches to seed the root `DepScope` with.
-    fn root_dep_prev<'a>(ctx: &'a EvalContext)
-    -> &'a HashMap<String, HashMap<u32, Self::Sel>>;
+    fn root_dep_prev<'a>(ctx: &'a EvalContext) -> &'a HashMap<String, HashMap<u32, Self::Sel>>;
 
     /// Assemble the tick's `EvalResult` from the root result plus the per-node
     /// (`sub`) and per-dep (`dep`) latches this domain populated.
