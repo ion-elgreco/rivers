@@ -49,7 +49,7 @@ pub(crate) trait EvalDomain {
     type Sel: DomainVal;
 
     // algebra
-    fn all(ctx: &EvalContext) -> Self::Sel;
+    fn all() -> Self::Sel;
     fn empty() -> Self::Sel;
     fn from_bool(b: bool) -> Self::Sel;
     fn and(a: Self::Sel, b: &Self::Sel) -> Self::Sel;
@@ -112,7 +112,7 @@ pub(crate) struct BoolDomain;
 impl EvalDomain for BoolDomain {
     type Sel = bool;
 
-    fn all(_ctx: &EvalContext) -> bool {
+    fn all() -> bool {
         true
     }
     fn empty() -> bool {
@@ -286,7 +286,7 @@ impl PartitionDomain {
 impl EvalDomain for PartitionDomain {
     type Sel = PartitionSelection;
 
-    fn all(_ctx: &EvalContext) -> PartitionSelection {
+    fn all() -> PartitionSelection {
         PartitionSelection::All
     }
     fn empty() -> PartitionSelection {

@@ -225,7 +225,7 @@ fn eval<D: EvalDomain>(
                 ctx,
                 counter,
                 dep_scope,
-                D::all(ctx),
+                D::all(),
                 D::and,
                 |s| !s.is_true(),
             );
@@ -254,7 +254,7 @@ fn eval<D: EvalDomain>(
                 sub,
                 dep_scope,
                 build_tree,
-                D::all(ctx),
+                D::all(),
                 D::and,
                 |s| !s.is_true(),
             );
