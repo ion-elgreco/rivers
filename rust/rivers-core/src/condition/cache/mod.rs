@@ -6,7 +6,7 @@ use std::sync::Arc;
 use super::node::ConditionNode;
 
 use crate::storage::{
-    AssetRecord, BackfillStatus, PartitionKey, RunRecord, RunStatus, StorageBackend,
+    AssetRecord, BackfillStatus, PartitionKey, RunStatus, StorageBackend,
 };
 
 mod refresh;
@@ -163,11 +163,10 @@ impl AssetConditionCache {
 
     /// Drop a pre-dispatch placeholder `in_progress_assets` entry when dispatch failed before any run registered.
     pub fn clear_predispatch_mark(&mut self, asset_key: &str) {
-        if let Some(runs) = self.in_progress_assets.get(asset_key) {
-            if runs.is_empty() {
+        if let Some(runs) = self.in_progress_assets.get(asset_key)
+            && runs.is_empty() {
                 self.in_progress_assets.remove(asset_key);
             }
-        }
     }
 
     /// Roll back a `register_dispatched_run` whose dispatch failed synchronously.

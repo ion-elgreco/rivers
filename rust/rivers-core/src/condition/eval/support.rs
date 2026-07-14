@@ -15,15 +15,14 @@ use super::{DepScope, count_nodes};
 /// state for blobs written before per-dep baselines existed; at root level,
 /// the asset's own previous-tick state.
 pub(crate) fn data_version_baseline<'a>(ctx: &'a EvalContext) -> (Option<&'a String>, Option<i64>) {
-    if ctx.target_key != ctx.root_key {
-        if let Some(b) = ctx
+    if ctx.target_key != ctx.root_key
+        && let Some(b) = ctx
             .all_asset_states
             .get(ctx.root_key)
             .and_then(|s| s.dep_baselines.get(ctx.target_key))
         {
             return (b.last_data_version.as_ref(), b.last_materialized_timestamp);
         }
-    }
     (
         ctx.prev_state.last_data_version.as_ref(),
         ctx.prev_state.last_materialized_timestamp,

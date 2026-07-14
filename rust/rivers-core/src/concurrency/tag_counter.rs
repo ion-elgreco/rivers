@@ -153,17 +153,15 @@ impl<'a> TagConcurrencyCounter<'a> {
                         });
                     }
                 }
-            } else {
-                if run.tags().iter().any(|(k, _)| k == &limit.key) {
-                    let current = self.key_counts.get(&limit.key).copied().unwrap_or(0);
-                    if current >= limit.limit {
-                        return Some(BlockReason::TagLimit {
-                            key: limit.key.clone(),
-                            value: None,
-                            current,
-                            limit: limit.limit,
-                        });
-                    }
+            } else if run.tags().iter().any(|(k, _)| k == &limit.key) {
+                let current = self.key_counts.get(&limit.key).copied().unwrap_or(0);
+                if current >= limit.limit {
+                    return Some(BlockReason::TagLimit {
+                        key: limit.key.clone(),
+                        value: None,
+                        current,
+                        limit: limit.limit,
+                    });
                 }
             }
         }

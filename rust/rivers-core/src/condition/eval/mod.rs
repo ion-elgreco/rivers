@@ -1185,7 +1185,7 @@ fn eval_partitioned_on_dep(
         });
 
     let upstream_pctx = PartitionEvalContext {
-        all_keys: &upstream_all_keys,
+        all_keys: upstream_all_keys,
         in_progress: &upstream_status.in_progress,
         failed: &upstream_status.failed,
         timestamps: &upstream_status.timestamps,
