@@ -1,3 +1,4 @@
+pub mod compute;
 pub mod crd;
 pub mod defaults;
 pub mod env;
