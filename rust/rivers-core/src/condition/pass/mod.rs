@@ -77,6 +77,24 @@ impl MaterializationPlan {
             && self.single_partition_groups.is_empty()
             && self.multi_partition_backfills.is_empty()
     }
+
+    /// Every asset key this plan dispatches, across all three dispatch shapes.
+    pub fn dispatched_asset_keys(&self) -> impl Iterator<Item = &str> {
+        self.unpartitioned
+            .iter()
+            .map(String::as_str)
+            .chain(
+                self.single_partition_groups
+                    .values()
+                    .flatten()
+                    .map(String::as_str),
+            )
+            .chain(
+                self.multi_partition_backfills
+                    .iter()
+                    .map(|(asset, _)| asset.as_str()),
+            )
+    }
 }
 
 /// Output of [`ConditionPass::run`]: per-asset eval rows plus the dispatch plan.
@@ -344,27 +362,7 @@ impl ConditionPass {
         dispatch_failed: &HashSet<String>,
         now: i64,
     ) -> bool {
-        let planned: HashSet<&str> = output
-            .plan
-            .unpartitioned
-            .iter()
-            .map(String::as_str)
-            .chain(
-                output
-                    .plan
-                    .single_partition_groups
-                    .values()
-                    .flatten()
-                    .map(String::as_str),
-            )
-            .chain(
-                output
-                    .plan
-                    .multi_partition_backfills
-                    .iter()
-                    .map(|(asset, _)| asset.as_str()),
-            )
-            .collect();
+        let planned: HashSet<&str> = output.plan.dispatched_asset_keys().collect();
         let mut skip: HashSet<String> = dispatch_failed.clone();
         for row in &output.results {
             if row.result.fired {
@@ -448,27 +446,7 @@ impl ConditionPass {
         output: &PassOutput,
         now: i64,
     ) -> Vec<(String, AssetConditionState, Vec<PartitionKey>)> {
-        let planned: HashSet<&str> = output
-            .plan
-            .unpartitioned
-            .iter()
-            .map(String::as_str)
-            .chain(
-                output
-                    .plan
-                    .single_partition_groups
-                    .values()
-                    .flatten()
-                    .map(String::as_str),
-            )
-            .chain(
-                output
-                    .plan
-                    .multi_partition_backfills
-                    .iter()
-                    .map(|(asset, _)| asset.as_str()),
-            )
-            .collect();
+        let planned: HashSet<&str> = output.plan.dispatched_asset_keys().collect();
         let mut out = Vec::new();
         for row in &output.results {
             if !row.result.fired {
@@ -748,22 +726,7 @@ impl ConditionPass {
         skip: &HashSet<String>,
         now: i64,
     ) {
-        let dispatched: HashSet<&str> = plan
-            .unpartitioned
-            .iter()
-            .map(String::as_str)
-            .chain(
-                plan.single_partition_groups
-                    .values()
-                    .flatten()
-                    .map(String::as_str),
-            )
-            .chain(
-                plan.multi_partition_backfills
-                    .iter()
-                    .map(|(asset, _)| asset.as_str()),
-            )
-            .collect();
+        let dispatched: HashSet<&str> = plan.dispatched_asset_keys().collect();
         for asset_key in dispatched {
             if skip.contains(asset_key) {
                 continue;
