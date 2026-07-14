@@ -134,16 +134,6 @@ fn eval<D: EvalDomain>(
         });
         (sel, tree)
     };
-    // Advance the counter past a short-circuited subtree, building its skipped
-    // tree only when needed.
-    let skipped = |child: &ConditionNode, counter: &mut u32| -> Option<EvalNodeResult> {
-        if build_tree {
-            Some(build_skipped_subtree(child, counter))
-        } else {
-            count_nodes(child, counter);
-            None
-        }
-    };
 
     match node {
         // leaves
@@ -257,37 +247,31 @@ fn eval<D: EvalDomain>(
 
         // combinators
         ConditionNode::And(children) => {
-            let mut result = D::all(ctx);
-            let mut child_parts = Vec::with_capacity(if build_tree { children.len() } else { 0 });
-            for child in children {
-                if !result.is_true() && !child.has_stateful_nodes() {
-                    child_parts.extend(skipped(child, counter));
-                } else {
-                    let (child_sel, child_tree) =
-                        eval::<D>(child, ctx, counter, sub, dep_scope, build_tree);
-                    if result.is_true() {
-                        result = D::and(result, &child_sel);
-                    }
-                    child_parts.extend(child_tree);
-                }
-            }
+            let (result, child_parts) = fold_combinator::<D>(
+                children,
+                ctx,
+                counter,
+                sub,
+                dep_scope,
+                build_tree,
+                D::all(ctx),
+                D::and,
+                |s| !s.is_true(),
+            );
             finish(result, child_parts)
         }
         ConditionNode::Or(children) => {
-            let mut result = D::empty();
-            let mut child_parts = Vec::with_capacity(if build_tree { children.len() } else { 0 });
-            for child in children {
-                if result.is_all() && !child.has_stateful_nodes() {
-                    child_parts.extend(skipped(child, counter));
-                } else {
-                    let (child_sel, child_tree) =
-                        eval::<D>(child, ctx, counter, sub, dep_scope, build_tree);
-                    if !result.is_all() {
-                        result = D::or(result, &child_sel);
-                    }
-                    child_parts.extend(child_tree);
-                }
-            }
+            let (result, child_parts) = fold_combinator::<D>(
+                children,
+                ctx,
+                counter,
+                sub,
+                dep_scope,
+                build_tree,
+                D::empty(),
+                D::or,
+                |s| s.is_all(),
+            );
             finish(result, child_parts)
         }
         ConditionNode::Not(child) => {
@@ -373,6 +357,45 @@ fn fold_deps<'a, D: EvalDomain>(
     }
     finalize_dep_counter(counter, base, condition);
     result
+}
+
+/// Fold a combinator (`And`/`Or`) over its `children`: combine each child's
+/// result into the accumulator (from `init`) with `combine`, short-circuiting
+/// once `saturated` — but still evaluating a saturated-past child when it has a
+/// stateful node whose per-tick latch must be recorded. A skipped child only
+/// advances the node counter (and builds a skipped tree when `build_tree`), so
+/// node indices stay aligned regardless of short-circuiting.
+#[allow(clippy::too_many_arguments)]
+fn fold_combinator<D: EvalDomain>(
+    children: &[ConditionNode],
+    ctx: &EvalContext,
+    counter: &mut u32,
+    sub: &mut HashMap<u32, D::Sel>,
+    dep_scope: &mut DepScope<D::Sel>,
+    build_tree: bool,
+    init: D::Sel,
+    combine: fn(D::Sel, &D::Sel) -> D::Sel,
+    saturated: impl Fn(&D::Sel) -> bool,
+) -> (D::Sel, Vec<EvalNodeResult>) {
+    let mut result = init;
+    let mut child_parts = Vec::with_capacity(if build_tree { children.len() } else { 0 });
+    for child in children {
+        if saturated(&result) && !child.has_stateful_nodes() {
+            if build_tree {
+                child_parts.push(build_skipped_subtree(child, counter));
+            } else {
+                count_nodes(child, counter);
+            }
+        } else {
+            let (child_sel, child_tree) =
+                eval::<D>(child, ctx, counter, sub, dep_scope, build_tree);
+            if !saturated(&result) {
+                result = combine(result, &child_sel);
+            }
+            child_parts.extend(child_tree);
+        }
+    }
+    (result, child_parts)
 }
 
 /// Evaluate a `ConditionNode` tree and return both the compact result (for
