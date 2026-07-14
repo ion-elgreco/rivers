@@ -2,11 +2,11 @@
 
 use std::time::Duration;
 
-use pyo3::exceptions::{PyBaseException, PyTypeError};
+use pyo3::exceptions::{PyBaseException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 use rivers_core::execution::retry::{
-    Backoff, ComputeEscalation, FailureReason, RetryOn, RetryPolicy,
+    Backoff, ComputeEscalation, FailureReason, RetryOn, RetryPolicy, RetryRef,
 };
 
 use crate::errors::ConfigurationError;
@@ -323,4 +323,22 @@ impl PyRetryPolicy {
     fn __repr__(&self) -> String {
         format!("RetryPolicy(max_retries={})", self.inner.max_retries)
     }
+}
+
+/// Extract a `retry=RetryPolicy | str | None` argument into a [`RetryRef`]. A
+/// string is a name resolved against the repository `retries` registry at
+/// `resolve()`; a `RetryPolicy` is inlined.
+pub(crate) fn extract_retry_ref(val: Option<Bound<'_, PyAny>>) -> PyResult<Option<RetryRef>> {
+    let Some(val) = val else {
+        return Ok(None);
+    };
+    if let Ok(policy) = val.extract::<PyRetryPolicy>() {
+        return Ok(Some(RetryRef::Inline(policy.inner)));
+    }
+    if let Ok(name) = val.extract::<String>() {
+        return Ok(Some(RetryRef::Named(name)));
+    }
+    Err(PyValueError::new_err(
+        "retry must be a RetryPolicy or a str naming a registered policy",
+    ))
 }
