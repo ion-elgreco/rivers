@@ -656,10 +656,14 @@ fn eval_partitioned_on_dep(
     dep_selections.cur_prev = saved;
     collect_dep_latch(dep_selections, dep_key, local);
 
-    pctx.resolver.map_downstream(
-        dep_key,
-        ctx.target_key,
-        &upstream_result,
-        Some(pctx.all_keys),
-    )
+    if is_identity {
+        upstream_result
+    } else {
+        pctx.resolver.map_downstream(
+            dep_key,
+            ctx.target_key,
+            &upstream_result,
+            Some(pctx.all_keys),
+        )
+    }
 }
