@@ -417,9 +417,7 @@ impl EvalDomain for PartitionDomain {
         }
         let pctx = require_pctx(ctx);
         let (last_handled, last_tick) = root_handled_state(ctx);
-        let was_just_handled = last_handled
-            .map(|h| last_tick.map(|lt| h >= lt).unwrap_or(false))
-            .unwrap_or(false);
+        let was_just_handled = last_handled.zip(last_tick).is_some_and(|(h, lt)| h >= lt);
         if !was_just_handled {
             current
         } else if ctx.target_key != ctx.root_key {
