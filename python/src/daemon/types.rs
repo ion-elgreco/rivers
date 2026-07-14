@@ -96,8 +96,7 @@ pub(crate) struct BackfillRequestData {
     /// resolves partitions and reports counts without writing a record;
     /// the resulting `PyBackfillResult.backfill_id` is empty.
     pub(crate) dry_run: bool,
-    /// Pre-minted backfill id (condition dispatch persists it in the crash
-    /// intent before dispatch); `None` lets the repository generate one.
+    /// Pre-minted backfill id; `None` lets the repository generate one.
     pub(crate) backfill_id: Option<String>,
 }
 

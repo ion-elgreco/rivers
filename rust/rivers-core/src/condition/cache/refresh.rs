@@ -297,11 +297,8 @@ impl AssetConditionCache {
             }
         }
 
-        // Trail the newest stamp by 1ns, matching the run cursor (and the
-        // initial-load observation cursor): observations in one batch share a
-        // stamped `now` committed record-by-record, so a co-timestamped write
-        // can land after this refresh. The replay no-op guard above dedups the
-        // re-delivered ones.
+        // Trail by 1ns like the run cursor: a co-timestamped write can land after
+        // this refresh; the replay no-op guard above makes re-delivery idempotent.
         delta.new_last_observation_ts = Some(max_ts.saturating_sub(1));
         Ok(())
     }
@@ -346,10 +343,6 @@ impl AssetConditionCache {
                         .or_insert(run_ts);
                 }
             }
-            // A successful run materialized every asset it covered; record it
-            // so multiple runs of the same asset completing in one refresh each
-            // pass the materialization gate at apply — the scalar record credits
-            // only the newest, which would otherwise drop the others' slots.
             if !is_failure {
                 delta
                     .materialized_overrides
@@ -369,10 +362,6 @@ impl AssetConditionCache {
                     Arc::clone(&run_tags),
                     Arc::clone(&run_asset_names),
                 ));
-                // Push for every run, carrying the failure flag: a Success run
-                // materialized all its covered assets, but an overall-Failure
-                // joint run counts only for the assets whose step actually
-                // materialized here (resolved by the apply gate below).
                 if self.needs_tick_tags {
                     delta.tick_tag_updates.push((
                         asset.clone(),
@@ -557,10 +546,8 @@ impl AssetConditionCache {
             }
         }
         for (asset, pk, run_id, run_failed, tags) in tick_tag_updates {
-            // A Success run materialized every asset it covered. An overall-
-            // Failure joint run counts only for the assets it actually
-            // materialized (record credits this run, or its step succeeded per
-            // materialized_overrides) — mirroring the last_run gate.
+            // Success runs materialize all covered assets; a failed run counts only
+            // where it actually materialized (mirrors the last_run gate).
             let record_it = !run_failed
                 || self
                     .records

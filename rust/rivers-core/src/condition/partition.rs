@@ -42,9 +42,7 @@ impl PartitionSelection {
         }
     }
 
-    /// Drop keys no longer in the current universe. `All`/`Empty` are already
-    /// universe-relative; only an explicit `Keys` set can carry retired keys
-    /// (e.g. an accumulating `Since` latch across a universe shrink).
+    /// Drop keys no longer in the universe (`All`/`Empty` pass through).
     pub fn restrict_to(&self, all_keys: &HashSet<PartitionKey>) -> Self {
         match self {
             Self::All | Self::Empty => self.clone(),

@@ -12,9 +12,7 @@ pub fn format_tag_label(
     format!("{}({})", name, parts.join(", "))
 }
 
-/// Format an `AssetMatches` key list: `'k'` for one key, `['a', 'b']` for many.
-/// Shared by `node_label` and `describe` so the two surfaces (which the
-/// `replace()`/`without()` matchers rely on agreeing) can't drift.
+/// Format an `AssetMatches` key list, shared by `node_label` and `describe`.
 fn keys_label(keys: &[String]) -> String {
     if keys.len() == 1 {
         format!("'{}'", keys[0])

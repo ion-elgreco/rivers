@@ -23,8 +23,7 @@ mod persist;
 
 use engine::ConditionTickEngine;
 
-/// Snapshot a partition def's current key universe: the capped key set plus how
-/// it evolves after this snapshot, from a single `now` reading.
+/// A partition def's capped key set plus how it evolves, from one `now`.
 fn def_keys_and_universe(
     def: &PartitionsDefinition,
 ) -> (HashSet<CorePartitionKey>, PartitionUniverse) {

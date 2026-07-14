@@ -253,11 +253,8 @@ impl PartEvalOutput for (PartitionSelection, EvalNodeResult) {
 pub(crate) fn build_skipped_subtree(node: &ConditionNode, counter: &mut u32) -> EvalNodeResult {
     let my_idx = *counter;
     *counter += 1;
-    // A dep-aggregate evaluates its inner condition per-dep and emits a childless
-    // leaf (see the AnyDepsMatch/AllDepsMatch/AssetMatches arms of eval_inner),
-    // advancing the counter past the inner nodes. Mirror that when skipped so the
-    // node's arity and indexing match the evaluated form — otherwise the persisted
-    // tree's shape flips by tick status and pre-order latch indices drift.
+    // Dep-aggregates emit a childless leaf but advance the counter past the
+    // inner nodes; mirror that when skipped so node indices stay aligned.
     let is_dep_aggregate = matches!(
         node,
         ConditionNode::AnyDepsMatch { .. }
@@ -266,7 +263,6 @@ pub(crate) fn build_skipped_subtree(node: &ConditionNode, counter: &mut u32) -> 
     );
     let children = if is_dep_aggregate {
         for child in node.children() {
-            // Advance the counter through the inner condition without emitting nodes.
             let _ = build_skipped_subtree(child, counter);
         }
         Vec::new()

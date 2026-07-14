@@ -207,10 +207,8 @@ impl DirectRunDispatcher {
                         error = %e,
                         "materialize_with_launcher failed",
                     );
-                    // Mark the pre-created Started record Failed so the condition
-                    // cache clears it from in-progress; an early return before
-                    // run_inner (validation/plan build) leaves it Started, and the
-                    // asset then reads in-flight forever, wedging its condition.
+                    // Mark the pre-created Started record Failed, else the asset reads
+                    // in-flight forever (an early return leaves it Started).
                     crate::runtime::rt().block_on(
                         handle.mark_run_launch_failed(&run_id, "materialization launch failed"),
                     );
