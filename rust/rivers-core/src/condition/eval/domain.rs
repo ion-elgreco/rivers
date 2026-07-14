@@ -425,11 +425,10 @@ impl EvalDomain for PartitionDomain {
         )
     }
     fn will_be_requested(ctx: &EvalContext) -> PartitionSelection {
-        match ctx.requested_this_tick.get(ctx.target_key) {
-            None | Some(PartitionSelection::Empty) => PartitionSelection::Empty,
-            Some(PartitionSelection::All) => PartitionSelection::All,
-            Some(s @ PartitionSelection::Keys(_)) => s.clone(),
-        }
+        ctx.requested_this_tick
+            .get(ctx.target_key)
+            .cloned()
+            .unwrap_or(PartitionSelection::Empty)
     }
 
     fn prev_latch(
