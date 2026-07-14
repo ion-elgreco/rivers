@@ -293,15 +293,11 @@ pub(crate) fn effective_attempt_ts(
     root_status: &crate::condition::cache::PartitionStatusEntry,
     k: &PartitionKey,
 ) -> Option<i64> {
-    match (
-        root_status.timestamps.get(k),
-        root_status.failed_timestamps.get(k),
-    ) {
-        (None, None) => None,
-        (Some(&m), None) => Some(m),
-        (None, Some(&f)) => Some(f),
-        (Some(&m), Some(&f)) => Some(m.max(f)),
-    }
+    root_status
+        .timestamps
+        .get(k)
+        .copied()
+        .max(root_status.failed_timestamps.get(k).copied())
 }
 
 /// The staleness floor across the downstream keys a dep key maps to: the
