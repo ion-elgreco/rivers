@@ -54,6 +54,13 @@ pub(crate) fn root_handled_state(ctx: &EvalContext) -> (Option<i64>, Option<i64>
     }
 }
 
+/// True if the asset was requested on the previous tick: its last-handled
+/// timestamp exists and coincides with its last evaluation tick.
+pub(crate) fn requested_last_tick(ctx: &EvalContext) -> bool {
+    ctx.prev_state.last_handled_timestamp.is_some()
+        && ctx.prev_state.last_handled_timestamp == ctx.prev_state.last_tick_timestamp
+}
+
 /// Merge (not replace) a dep's stateful-node results into the per-dep accumulator.
 pub(crate) fn collect_dep_latch<V>(scope: &mut DepScope<V>, dep_key: &str, local: HashMap<u32, V>) {
     if local.is_empty() {
