@@ -220,7 +220,7 @@ impl ConditionNode {
     }
 
     /// True if any node in the tree (including `self`) satisfies `pred`.
-    pub(crate) fn any_node(&self, pred: &dyn Fn(&ConditionNode) -> bool) -> bool {
+    pub(crate) fn any_node<F: Fn(&ConditionNode) -> bool>(&self, pred: &F) -> bool {
         pred(self) || self.children().any(|c| c.any_node(pred))
     }
 
