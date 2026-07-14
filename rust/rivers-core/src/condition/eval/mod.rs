@@ -380,7 +380,8 @@ fn fold_combinator<D: EvalDomain>(
     let mut result = init;
     let mut child_parts = Vec::with_capacity(if build_tree { children.len() } else { 0 });
     for child in children {
-        if saturated(&result) && !child.has_stateful_nodes() {
+        let sat = saturated(&result);
+        if sat && !child.has_stateful_nodes() {
             if build_tree {
                 child_parts.push(build_skipped_subtree(child, counter));
             } else {
@@ -389,7 +390,7 @@ fn fold_combinator<D: EvalDomain>(
         } else {
             let (child_sel, child_tree) =
                 eval::<D>(child, ctx, counter, sub, dep_scope, build_tree);
-            if !saturated(&result) {
+            if !sat {
                 result = combine(result, &child_sel);
             }
             child_parts.extend(child_tree);
