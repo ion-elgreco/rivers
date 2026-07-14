@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use rivers_core::execution::retry::{RetryPolicy, RetryRef};
 
 use crate::assets::decorator::{Asset, PyAsset};
 use crate::assets::io_handler::IOHandler;
@@ -45,6 +46,8 @@ pub(crate) struct ResolvedAsset {
     pub group: Option<String>,
     pub code_version: Option<String>,
     pub pool: Vec<(String, u32)>,
+    /// Resolved retry policy (registry names collapsed to concrete at resolve()).
+    pub retry: Option<RetryPolicy>,
     pub metadata: Option<HashMap<String, String>>,
     pub backfill_strategy: Option<PyBackfillStrategy>,
     /// Flattened pure-Rust partition definition. The originating
@@ -167,6 +170,11 @@ impl ResolvedAsset {
         let group = asset.group().cloned();
         let code_version = asset.code_version().cloned();
         let pool = asset.pool().clone();
+        // Registry names are collapsed to Inline by resolve_retry_refs before this.
+        let retry = asset.retry().and_then(|r| match r {
+            RetryRef::Inline(p) => Some(p.clone()),
+            RetryRef::Named(_) => None,
+        });
         let metadata = asset.metadata().cloned();
         let backfill_strategy = asset.backfill_strategy().cloned();
 
@@ -258,6 +266,7 @@ impl ResolvedAsset {
             group,
             code_version,
             pool,
+            retry,
             metadata,
             backfill_strategy,
             partitions_def,
@@ -286,6 +295,7 @@ impl ResolvedAsset {
             group: self.group.clone(),
             code_version: self.code_version.clone(),
             pool: self.pool.clone(),
+            retry: self.retry.clone(),
             metadata: self.metadata.clone(),
             backfill_strategy: self.backfill_strategy.clone(),
             partitions_def: self.partitions_def.clone(),
@@ -710,6 +720,15 @@ impl ResolvedNode {
         match self {
             ResolvedNode::Asset(node) => node.pool.clone(),
             ResolvedNode::Task(_) | ResolvedNode::BashTask(_) => Vec::new(),
+        }
+    }
+
+    // Consumed by the executor retry loop (landing in a later increment).
+    #[allow(dead_code)]
+    pub fn retry(&self) -> Option<&RetryPolicy> {
+        match self {
+            ResolvedNode::Asset(node) => node.retry.as_ref(),
+            _ => None,
         }
     }
 
