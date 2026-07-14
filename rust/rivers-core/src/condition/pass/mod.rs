@@ -651,8 +651,12 @@ impl ConditionPass {
             match tm.selection {
                 Some(PartitionSelection::Keys(keys)) if !keys.is_empty() => {
                     let total = keys.len();
-                    let surviving: Vec<PartitionKey> = match self.partition_info_for(&tm.asset_key) {
-                        Some(pi) => keys.into_iter().filter(|k| pi.all_keys.contains(k)).collect(),
+                    let surviving: Vec<PartitionKey> = match self.partition_info_for(&tm.asset_key)
+                    {
+                        Some(pi) => keys
+                            .into_iter()
+                            .filter(|k| pi.all_keys.contains(k))
+                            .collect(),
                         None => keys.into_iter().collect(),
                     };
                     if surviving.len() < total {

@@ -92,7 +92,14 @@ fn run<D: EvalDomain>(
             cur_prev: None,
             bridged: HashMap::new(),
         };
-        eval::<D>(node, ctx, &mut counter, &mut sub, &mut dep_scope, build_tree)
+        eval::<D>(
+            node,
+            ctx,
+            &mut counter,
+            &mut sub,
+            &mut dep_scope,
+            build_tree,
+        )
     };
     (D::assemble(top, ctx, sub, dep), tree)
 }
@@ -284,7 +291,8 @@ fn eval<D: EvalDomain>(
             finish(result, child_parts)
         }
         ConditionNode::Not(child) => {
-            let (child_sel, child_tree) = eval::<D>(child, ctx, counter, sub, dep_scope, build_tree);
+            let (child_sel, child_tree) =
+                eval::<D>(child, ctx, counter, sub, dep_scope, build_tree);
             let result = D::not(child_sel, ctx);
             finish(result, child_tree.into_iter().collect())
         }
@@ -300,12 +308,15 @@ fn eval<D: EvalDomain>(
         ConditionNode::Since { trigger, reset } => {
             let (trigger_sel, trigger_tree) =
                 eval::<D>(trigger, ctx, counter, sub, dep_scope, build_tree);
-            let (reset_sel, reset_tree) = eval::<D>(reset, ctx, counter, sub, dep_scope, build_tree);
+            let (reset_sel, reset_tree) =
+                eval::<D>(reset, ctx, counter, sub, dep_scope, build_tree);
             let prev = D::prev_latch(dep_scope, ctx, my_idx);
             // Restrict to the current universe so a latch can't carry forward
             // keys retired from the partition set (unpartitioned: a no-op).
-            let result =
-                D::restrict(D::difference(D::or(prev, &trigger_sel), &reset_sel, ctx), ctx);
+            let result = D::restrict(
+                D::difference(D::or(prev, &trigger_sel), &reset_sel, ctx),
+                ctx,
+            );
             sub.insert(my_idx, result.clone());
             let children = [trigger_tree, reset_tree].into_iter().flatten().collect();
             finish(result, children)
@@ -372,7 +383,10 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
     } else {
         run::<BoolDomain>(node, ctx, true)
     };
-    (result, tree.expect("build_tree=true always yields a root tree node"))
+    (
+        result,
+        tree.expect("build_tree=true always yields a root tree node"),
+    )
 }
 
 /// Build an `EvalContext` for evaluating a condition as if `dep_key` were the
@@ -487,8 +501,15 @@ fn eval_partitioned_on_dep(
             cur_prev: Some(&bool_latch),
             bridged: HashMap::new(),
         };
-        let val =
-            eval::<BoolDomain>(condition, &dep_ctx, counter, &mut local, &mut bool_scope, false).0;
+        let val = eval::<BoolDomain>(
+            condition,
+            &dep_ctx,
+            counter,
+            &mut local,
+            &mut bool_scope,
+            false,
+        )
+        .0;
         collect_bridged_latch(
             dep_selections,
             dep_key,
