@@ -200,8 +200,7 @@ fn eval<D: EvalDomain>(
                 .get(ctx.target_key)
                 .into_iter()
                 .flatten();
-            let result =
-                fold_deps::<D>(deps, condition, ctx, counter, dep_scope, Quantifier::Any);
+            let result = fold_deps::<D>(deps, condition, ctx, counter, dep_scope, Quantifier::Any);
             finish(result, Vec::new())
         }
         ConditionNode::AllDepsMatch { condition, .. } => {
@@ -211,13 +210,18 @@ fn eval<D: EvalDomain>(
                 .get(ctx.target_key)
                 .into_iter()
                 .flatten();
-            let result =
-                fold_deps::<D>(deps, condition, ctx, counter, dep_scope, Quantifier::All);
+            let result = fold_deps::<D>(deps, condition, ctx, counter, dep_scope, Quantifier::All);
             finish(result, Vec::new())
         }
         ConditionNode::AssetMatches { keys, condition } => {
-            let result =
-                fold_deps::<D>(keys.iter(), condition, ctx, counter, dep_scope, Quantifier::Any);
+            let result = fold_deps::<D>(
+                keys.iter(),
+                condition,
+                ctx,
+                counter,
+                dep_scope,
+                Quantifier::Any,
+            );
             finish(result, Vec::new())
         }
 
@@ -632,7 +636,9 @@ fn eval_partitioned_on_dep(
     // Nested dep-aggregates lose sight of the root's universe; carry the
     // bridge floor computed over it so their unpartitioned-dep pivots don't
     // recompute it over this dep's key space.
-    let nested_bridge_floor = condition.has_dep_aggregate().then(|| bridge_floor(ctx, pctx));
+    let nested_bridge_floor = condition
+        .has_dep_aggregate()
+        .then(|| bridge_floor(ctx, pctx));
     let dep_ctx = dep_eval_context(
         ctx,
         dep_key,
