@@ -23,6 +23,21 @@ mod persist;
 
 use engine::ConditionTickEngine;
 
+/// Snapshot a partition def's current key universe: the capped key set plus how
+/// it evolves after this snapshot, from a single `now` reading.
+fn def_keys_and_universe(
+    def: &PartitionsDefinition,
+) -> (HashSet<CorePartitionKey>, PartitionUniverse) {
+    let now = chrono::Local::now().naive_local();
+    let universe = partition_universe_for(def, now);
+    let keys = def
+        .get_partition_keys_capped(now)
+        .ok()
+        .map(|keys| keys.iter().map(CorePartitionKey::from).collect())
+        .unwrap_or_default();
+    (keys, universe)
+}
+
 /// Build a [`PartitionInfo`] from a graph node. Returns `None` if unpartitioned.
 fn partition_info_from_node(
     asset_name: &str,
@@ -31,17 +46,7 @@ fn partition_info_from_node(
     deps: &[NodeRef],
 ) -> Option<PartitionInfo> {
     let def = node.partitions_def()?;
-    let now = chrono::Local::now().naive_local();
-    let universe = partition_universe_for(def, now);
-    let all_keys = def
-        .get_partition_keys_capped(now)
-        .ok()
-        .map(|keys| {
-            keys.iter()
-                .map(CorePartitionKey::from)
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default();
+    let (all_keys, universe) = def_keys_and_universe(def);
     let time_window_fmt = match def {
         PartitionsDefinition::TimeWindow { fmt, .. } => Some(fmt.clone()),
         _ => None,
@@ -173,13 +178,7 @@ impl PyCodeRepository {
                         && let Some(node) = state.node_map.get(upstream_key)
                         && let Some(def) = node.partitions_def()
                     {
-                        let now = chrono::Local::now().naive_local();
-                        let universe = partition_universe_for(def, now);
-                        let core_keys: HashSet<CorePartitionKey> = def
-                            .get_partition_keys_capped(now)
-                            .ok()
-                            .map(|keys| keys.iter().map(CorePartitionKey::from).collect())
-                            .unwrap_or_default();
+                        let (core_keys, universe) = def_keys_and_universe(def);
                         map.insert(upstream_key.clone(), (core_keys, universe));
                     }
                 }
