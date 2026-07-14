@@ -10622,8 +10622,8 @@ fn test_partitioned_all_deps_match_not_missing() {
 
 // ── Characterization: partitioned AssetMatches + SinceLastHandled ─────────
 // These two arms had full bool-side coverage (7 and 4 tests) but *zero*
-// partitioned tests. They pin current partition-aware behavior before the
-// twin-evaluator merge (`eval_inner` / `eval_partitioned` unification).
+// partitioned tests. They pinned partition-aware behavior for the evaluator
+// merge and now guard the PartitionDomain impl of these arms.
 
 /// A partition status entry carrying only materialization timestamps.
 fn pstatus_materialized(ts: &[(&str, i64)]) -> crate::condition::cache::PartitionStatusEntry {
@@ -10770,7 +10770,8 @@ fn test_partitioned_asset_matches_multi_key_unions_dep_selections() {
 fn test_partitioned_asset_matches_unmapped_key_bridges_to_bool() {
     // A named asset with no partition mapping bridges into the bool evaluator:
     // an unmaterialized b makes Missing true → from_bool(true) = All. Pins the
-    // bridge path the twin-evaluator merge collapses.
+    // bridge path retained inside the partitioned dep pivot (`eval::<BoolDomain>`
+    // for an unpartitioned dep under a partitioned root).
     let a = make_materialized_record("a", 100);
     let b = make_record("b"); // unmaterialized → last_run_id None → Missing true in bool world
     let records = HashMap::from([("a".into(), a.clone()), ("b".into(), b.clone())]);
@@ -10883,15 +10884,15 @@ fn test_partitioned_since_last_handled_passes_through_when_handled_before_last_t
     );
 }
 
-// ── Differential parity: bool evaluator vs unit-universe partition evaluator ──
-// The load-bearing safety net for deduplicating the twin evaluators. The claim
-// (verified against Dagster's single-evaluator design) is that bool is exactly a
-// `PartitionSelection` over a one-partition universe. This harness evaluates a
-// corpus of trees BOTH ways over field-for-field mirrored fixtures and asserts
+// ── Differential parity: BoolDomain vs unit-universe PartitionDomain ──
+// The load-bearing guard on the unified `eval<D>`: its two `EvalDomain` impls
+// must never diverge. The claim (verified against Dagster's single-evaluator
+// design) is that bool is exactly a `PartitionSelection` over a one-partition
+// universe. This harness evaluates a corpus of trees BOTH ways over
+// field-for-field mirrored fixtures and asserts
 //   (1) `fired` parity every tick, and
 //   (2) stateful-latch node indices stay aligned (bookkeeping is load-bearing —
 //       persisted latches key off node index, so drift corrupts silently).
-// It passes on the current twins and must keep passing through the merge.
 //
 // Excluded from the auto-corpus (their bool/partition fixtures don't correspond
 // under a trivial unit universe; covered by targeted tests instead): tag leaves,

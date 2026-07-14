@@ -6,7 +6,7 @@ use crate::storage::PartitionKey;
 
 use super::node::ConditionNode;
 use super::partition::{PartitionEvalContext, PartitionResolver, PartitionSelection};
-use super::state::{AssetConditionState, EvalContext, EvalNodeResult, EvalResult, NodeStatus};
+use super::state::{AssetConditionState, EvalContext, EvalNodeResult, EvalResult};
 
 /// Per-dep latch state for stateful ops inside dep-aggregates, keyed by dep then node index.
 pub(crate) struct DepScope<'a, V> {
@@ -38,9 +38,11 @@ fn root_dep_selections<'a>(
 }
 
 mod cron;
+mod domain;
 mod support;
 
 pub use cron::*;
+use domain::{BoolDomain, DomainVal, EvalDomain, EvalOut, PartitionDomain};
 pub(crate) use support::*;
 
 #[cfg(test)]
@@ -51,7 +53,7 @@ static EMPTY_CONDITION_STATE: std::sync::LazyLock<AssetConditionState> =
     std::sync::LazyLock::new(AssetConditionState::default);
 
 pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
-    if let Some(pctx) = ctx.partitions {
+    if ctx.partitions.is_some() {
         let mut counter = 0u32;
         let mut sub_selections = HashMap::new();
         let mut dep_selections = HashMap::new();
@@ -61,21 +63,14 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
             cur_prev: None,
             bridged: HashMap::new(),
         };
-        let selection: PartitionSelection = eval_partitioned(
+        let selection: PartitionSelection = eval::<PartitionDomain, PartitionSelection>(
             node,
             ctx,
-            pctx,
             &mut counter,
             &mut sub_selections,
             &mut dep_scope,
         );
-        // `All` of an empty universe selects nothing (mirrors
-        // `evaluate_with_tree`): reporting fired would leak a full
-        // WillBeRequested signal downstream.
-        let fired = match &selection {
-            PartitionSelection::All => !pctx.all_keys.is_empty(),
-            other => !other.is_empty(),
-        };
+        let fired = PartitionDomain::fired(&selection, ctx);
         tracing::debug!(
             target: "rivers::condition",
             asset_key = %ctx.target_key,
@@ -100,7 +95,8 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
             cur_prev: None,
             bridged: HashMap::new(),
         };
-        let fired: bool = eval_inner(node, ctx, &mut counter, &mut sub_results, &mut dep_scope);
+        let fired: bool =
+            eval::<BoolDomain, bool>(node, ctx, &mut counter, &mut sub_results, &mut dep_scope);
         tracing::debug!(
             target: "rivers::condition",
             asset_key = %ctx.target_key,
@@ -118,361 +114,244 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
     }
 }
 
-/// Recursive inner evaluator (unpartitioned / bool semantics).
-///
-/// UNIFICATION: this match and [`eval_partitioned`] are parallel 25-arm
-/// evaluators reconciled by the `DepScope::bridged` machinery; a semantics
-/// change landing on only one side makes partitioned and unpartitioned assets
-/// take different fire decisions. Bool is a `PartitionSelection` over a unit
-/// universe (`from_bool`/`to_bool`), so a single selection-based evaluator can
-/// subsume both — that refactor needs a persisted-latch migration
-/// (`previous_results` → selections) and an output-trait merge; until then,
-/// mirror every semantic change in BOTH matches.
-fn eval_inner<O: EvalOutput>(
+/// The single condition evaluator, generic over the [`EvalDomain`] (bool vs
+/// partition selection) and the [`EvalOut`] mode (fast vs tree). Every arm is
+/// written once; the two representations differ only in the `D` impl methods it
+/// calls. Node indices are allocated identically across domains (via
+/// [`count_nodes`]) so persisted latches keyed by index stay aligned.
+fn eval<D: EvalDomain, O: EvalOut<D::Sel>>(
     node: &ConditionNode,
     ctx: &EvalContext,
     counter: &mut u32,
-    sub_results: &mut HashMap<u32, bool>,
-    dep_results: &mut DepScope<bool>,
+    sub: &mut HashMap<u32, D::Sel>,
+    dep_scope: &mut DepScope<D::Sel>,
 ) -> O {
     let my_idx = *counter;
     *counter += 1;
+    let total = ctx.partitions.map(|p| p.all_keys.len()).unwrap_or(0);
 
     match node {
-        ConditionNode::Missing => O::leaf(ctx.target_record.last_run_id.is_none(), my_idx, node),
-        ConditionNode::InProgress => O::leaf(
-            ctx.cache.in_progress_assets.contains(ctx.target_key),
+        // ── leaves reading structurally different data per domain ──
+        ConditionNode::Missing => O::leaf(D::missing(ctx), my_idx, node, total),
+        ConditionNode::InProgress => O::leaf(D::in_progress(ctx), my_idx, node, total),
+        ConditionNode::ExecutionFailed => O::leaf(D::failed(ctx), my_idx, node, total),
+        ConditionNode::NewlyUpdated => O::leaf(D::newly_updated(ctx), my_idx, node, total),
+        ConditionNode::NewlyRequested => O::leaf(D::newly_requested(ctx), my_idx, node, total),
+        ConditionNode::InLatestTimeWindow { lookback_delta } => O::leaf(
+            D::in_latest_window(ctx, *lookback_delta),
             my_idx,
             node,
+            total,
         ),
-        ConditionNode::ExecutionFailed => O::leaf(
-            ctx.cache.failed_assets.contains(ctx.target_key),
+        ConditionNode::BackfillInProgress => {
+            O::leaf(D::backfill_in_progress(ctx), my_idx, node, total)
+        }
+        ConditionNode::LastExecutedWithTags {
+            tag_keys,
+            tag_values,
+        } => O::leaf(
+            D::last_executed_with_tags(ctx, tag_keys, tag_values),
             my_idx,
             node,
+            total,
         ),
+        ConditionNode::LastRunIncludesTarget => {
+            O::leaf(D::last_run_includes_target(ctx), my_idx, node, total)
+        }
+        ConditionNode::WillBeRequested => O::leaf(D::will_be_requested(ctx), my_idx, node, total),
+        ConditionNode::HasRunWithTags {
+            tag_keys,
+            tag_values,
+        } => O::leaf(
+            D::update_tags(ctx, tag_keys, tag_values, false),
+            my_idx,
+            node,
+            total,
+        ),
+        ConditionNode::AllRunsHaveTags {
+            tag_keys,
+            tag_values,
+        } => O::leaf(
+            D::update_tags(ctx, tag_keys, tag_values, true),
+            my_idx,
+            node,
+            total,
+        ),
+
+        // ── scalar predicates lifted into the domain ──
         ConditionNode::CodeVersionChanged => {
-            let expr = ctx.target_record.code_version.is_some()
+            let changed = ctx.target_record.code_version.is_some()
                 && ctx.target_record.code_version
                     != ctx.target_record.last_materialization_code_version;
-            O::leaf(expr, my_idx, node)
+            O::leaf(D::from_bool(changed), my_idx, node, total)
         }
-        ConditionNode::NewlyUpdated => {
-            if ctx.target_key != ctx.root_key {
-                let expr = match ctx.target_record.last_timestamp {
-                    None => false,
-                    Some(dep_ts) => match ctx.root_partition_floor {
-                        Some(floor) => dep_newer_than_floor(dep_ts, floor),
-                        None => {
-                            let root_mat = ctx
-                                .cache
-                                .records
-                                .get(ctx.root_key)
-                                .and_then(|r| r.last_timestamp);
-                            let root_failed =
-                                ctx.cache.failed_asset_timestamps.get(ctx.root_key).copied();
-                            match (root_mat, root_failed) {
-                                (None, None) => true,
-                                (Some(m), None) => dep_ts > m,
-                                (None, Some(f)) => dep_ts > f,
-                                (Some(m), Some(f)) => dep_ts > m.max(f),
-                            }
-                        }
-                    },
-                };
-                return O::leaf(expr, my_idx, node);
-            }
-            let expr = match (
-                ctx.target_record.last_timestamp,
-                ctx.prev_state.last_materialized_timestamp,
-            ) {
-                (Some(current), Some(prev)) => current > prev,
-                (Some(_), None) => !ctx.is_initial,
+        ConditionNode::DataVersionChanged => {
+            let (prev_dv, prev_ts) = data_version_baseline(ctx);
+            let changed = match (ctx.target_record.last_data_version.as_ref(), prev_dv) {
+                (Some(current), Some(prev)) => current != prev,
+                (Some(_), None) => !ctx.is_initial && prev_ts != ctx.target_record.last_timestamp,
                 _ => false,
             };
-            O::leaf(expr, my_idx, node)
+            O::leaf(D::from_bool(changed), my_idx, node, total)
         }
-        ConditionNode::NewlyRequested => {
-            let expr = ctx.prev_state.last_handled_timestamp.is_some()
-                && ctx.prev_state.last_handled_timestamp == ctx.prev_state.last_tick_timestamp;
-            O::leaf(expr, my_idx, node)
+        ConditionNode::InitialEvaluation => {
+            O::leaf(D::from_bool(ctx.is_initial), my_idx, node, total)
         }
-
         ConditionNode::CronTickPassed {
             cron_schedule,
             timezone,
         } => {
             let prev_ts = root_last_tick(ctx).unwrap_or(ctx.now);
-            O::leaf(
-                cron_tick_between(cron_schedule, prev_ts, ctx.now, timezone.as_deref()),
-                my_idx,
-                node,
-            )
+            let val = cron_tick_between(cron_schedule, prev_ts, ctx.now, timezone.as_deref());
+            O::leaf(D::from_bool(val), my_idx, node, total)
         }
 
-        ConditionNode::InLatestTimeWindow { .. } => O::leaf(true, my_idx, node),
-
-        ConditionNode::InitialEvaluation => O::leaf(ctx.is_initial, my_idx, node),
-
-        ConditionNode::DataVersionChanged => {
-            let (prev_dv, prev_ts) = data_version_baseline(ctx);
-            let expr = match (ctx.target_record.last_data_version.as_ref(), prev_dv) {
-                (Some(current), Some(prev)) => current != prev,
-                (Some(_), None) => !ctx.is_initial && prev_ts != ctx.target_record.last_timestamp,
-                _ => false,
-            };
-            O::leaf(expr, my_idx, node)
-        }
-
-        ConditionNode::BackfillInProgress => O::leaf(
-            ctx.cache.backfill.assets.contains_key(ctx.target_key),
-            my_idx,
-            node,
-        ),
-
-        ConditionNode::LastExecutedWithTags {
-            tag_keys,
-            tag_values,
-        } => {
-            let expr = ctx
-                .tags
-                .last_run_tags
-                .get(ctx.target_key)
-                .and_then(|slots| slots.get(&None))
-                .map(|run_tags| run_tags_match(run_tags, tag_keys, tag_values))
-                .unwrap_or(false);
-            O::leaf(expr, my_idx, node)
-        }
-
-        ConditionNode::LastRunIncludesTarget => {
-            let expr = if ctx.target_key == ctx.root_key {
-                false
-            } else {
-                ctx.tags
-                    .last_run_asset_names
-                    .get(ctx.target_key)
-                    .and_then(|slots| slots.get(&None))
-                    .map(|names| names.iter().any(|n| n == ctx.root_key))
-                    .unwrap_or(false)
-            };
-            O::leaf(expr, my_idx, node)
-        }
-
-        ConditionNode::WillBeRequested => O::leaf(
-            ctx.requested_this_tick.contains_key(ctx.target_key),
-            my_idx,
-            node,
-        ),
-
-        ConditionNode::HasRunWithTags {
-            tag_keys,
-            tag_values,
-        } => O::leaf(
-            eval_new_update_tags(ctx, tag_keys, tag_values, false),
-            my_idx,
-            node,
-        ),
-
-        ConditionNode::AllRunsHaveTags {
-            tag_keys,
-            tag_values,
-        } => O::leaf(
-            eval_new_update_tags(ctx, tag_keys, tag_values, true),
-            my_idx,
-            node,
-        ),
-
+        // ── dep-aggregates: union/intersect over per-dep pivots ──
         ConditionNode::AnyDepsMatch { condition, .. } => {
             let base = *counter;
             let eval_all = condition.has_stateful_nodes();
-            let val = ctx
-                .cache
-                .upstream_deps
-                .get(ctx.target_key)
-                .map(|deps| {
-                    let mut any = false;
-                    for dep in deps {
-                        *counter = base;
-                        if eval_on_dep(dep, condition, ctx, counter, dep_results) {
-                            any = true;
-                            if !eval_all {
-                                break;
-                            }
-                        }
-                    }
-                    any
-                })
-                .unwrap_or(false);
-            finalize_dep_counter(counter, base, condition);
-            O::leaf(val, my_idx, node)
-        }
-
-        ConditionNode::AllDepsMatch { condition, .. } => {
-            let base = *counter;
-            let eval_all = condition.has_stateful_nodes();
-            let val = ctx
-                .cache
-                .upstream_deps
-                .get(ctx.target_key)
-                .map(|deps| {
-                    let mut all = true;
-                    for dep in deps {
-                        *counter = base;
-                        if !eval_on_dep(dep, condition, ctx, counter, dep_results) {
-                            all = false;
-                            if !eval_all {
-                                break;
-                            }
-                        }
-                    }
-                    all
-                })
-                .unwrap_or(true);
-            finalize_dep_counter(counter, base, condition);
-            O::leaf(val, my_idx, node)
-        }
-
-        ConditionNode::AssetMatches { keys, condition } => {
-            let base = *counter;
-            let eval_all = condition.has_stateful_nodes();
-            let mut val = false;
-            for key in keys {
-                *counter = base;
-                if eval_on_dep(key, condition, ctx, counter, dep_results) {
-                    val = true;
-                    if !eval_all {
+            let mut result = D::empty();
+            if let Some(deps) = ctx.cache.upstream_deps.get(ctx.target_key) {
+                for dep in deps {
+                    *counter = base;
+                    let dep_val = D::pivot_into_dep(dep, condition, ctx, counter, dep_scope);
+                    result = D::or(result, &dep_val);
+                    // Short-circuit once saturated (bool: first true) — but keep
+                    // evaluating when stateful so every per-dep latch is recorded.
+                    if result.is_all() && !eval_all {
                         break;
                     }
                 }
             }
             finalize_dep_counter(counter, base, condition);
-            O::leaf(val, my_idx, node)
+            O::leaf(result, my_idx, node, total)
+        }
+        ConditionNode::AllDepsMatch { condition, .. } => {
+            let base = *counter;
+            let eval_all = condition.has_stateful_nodes();
+            let result = match ctx.cache.upstream_deps.get(ctx.target_key) {
+                Some(deps) if !deps.is_empty() => {
+                    let mut result = D::all(ctx);
+                    for dep in deps {
+                        *counter = base;
+                        let dep_val = D::pivot_into_dep(dep, condition, ctx, counter, dep_scope);
+                        result = D::and(result, &dep_val);
+                        if !result.is_true() && !eval_all {
+                            break;
+                        }
+                    }
+                    result
+                }
+                _ => D::all(ctx),
+            };
+            finalize_dep_counter(counter, base, condition);
+            O::leaf(result, my_idx, node, total)
+        }
+        ConditionNode::AssetMatches { keys, condition } => {
+            let base = *counter;
+            let eval_all = condition.has_stateful_nodes();
+            let mut result = D::empty();
+            for key in keys {
+                *counter = base;
+                let key_val = D::pivot_into_dep(key, condition, ctx, counter, dep_scope);
+                result = D::or(result, &key_val);
+                if result.is_all() && !eval_all {
+                    break;
+                }
+            }
+            finalize_dep_counter(counter, base, condition);
+            O::leaf(result, my_idx, node, total)
         }
 
+        // ── combinators ──
         ConditionNode::And(children) => {
-            let mut result = true;
-            let mut child_outs = if O::COLLECTS_CHILDREN {
+            let mut result = D::all(ctx);
+            let mut child_parts = if O::COLLECTS_CHILDREN {
                 Vec::with_capacity(children.len())
             } else {
                 Vec::new()
             };
             for child in children {
-                if result {
-                    let out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
-                    result = out.val();
+                if !result.is_true() && !child.has_stateful_nodes() {
+                    let skipped = O::skipped_child(child, counter);
                     if O::COLLECTS_CHILDREN {
-                        child_outs.push(out);
+                        child_parts.push(skipped);
                     }
-                } else if child.has_stateful_nodes() {
-                    let out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
-                    if O::COLLECTS_CHILDREN {
-                        child_outs.push(out);
-                    }
-                } else if O::COLLECTS_CHILDREN {
-                    child_outs.push(O::skipped(child, counter));
                 } else {
-                    count_nodes(child, counter);
+                    let child_out: O = eval::<D, O>(child, ctx, counter, sub, dep_scope);
+                    let (child_sel, child_part) = child_out.into_parts();
+                    if result.is_true() {
+                        result = D::and(result, &child_sel);
+                    }
+                    if O::COLLECTS_CHILDREN {
+                        child_parts.push(child_part);
+                    }
                 }
             }
-            O::composite(result, my_idx, node, child_outs)
+            O::composite(result, my_idx, node, total, child_parts)
         }
-
         ConditionNode::Or(children) => {
-            let mut result = false;
-            let mut child_outs = if O::COLLECTS_CHILDREN {
+            let mut result = D::empty();
+            let mut child_parts = if O::COLLECTS_CHILDREN {
                 Vec::with_capacity(children.len())
             } else {
                 Vec::new()
             };
             for child in children {
-                if !result {
-                    let out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
-                    result = out.val();
+                if result.is_all() && !child.has_stateful_nodes() {
+                    let skipped = O::skipped_child(child, counter);
                     if O::COLLECTS_CHILDREN {
-                        child_outs.push(out);
+                        child_parts.push(skipped);
                     }
-                } else if child.has_stateful_nodes() {
-                    let out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
-                    if O::COLLECTS_CHILDREN {
-                        child_outs.push(out);
-                    }
-                } else if O::COLLECTS_CHILDREN {
-                    child_outs.push(O::skipped(child, counter));
                 } else {
-                    count_nodes(child, counter);
+                    let child_out: O = eval::<D, O>(child, ctx, counter, sub, dep_scope);
+                    let (child_sel, child_part) = child_out.into_parts();
+                    if !result.is_all() {
+                        result = D::or(result, &child_sel);
+                    }
+                    if O::COLLECTS_CHILDREN {
+                        child_parts.push(child_part);
+                    }
                 }
             }
-            O::composite(result, my_idx, node, child_outs)
+            O::composite(result, my_idx, node, total, child_parts)
         }
-
         ConditionNode::Not(child) => {
-            let child_out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
-            let val = !child_out.val();
-            if O::COLLECTS_CHILDREN {
-                O::composite(val, my_idx, node, vec![child_out])
-            } else {
-                O::leaf(val, my_idx, node)
-            }
+            let child_out: O = eval::<D, O>(child, ctx, counter, sub, dep_scope);
+            let (child_sel, child_part) = child_out.into_parts();
+            let result = D::not(child_sel, ctx);
+            O::composite(result, my_idx, node, total, vec![child_part])
         }
 
+        // ── stateful ops (latch keyed by my_idx) ──
         ConditionNode::NewlyTrue(child) => {
-            let child_out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
-            let current = child_out.val();
-            let previous = dep_results
-                .cur_prev
-                .unwrap_or(&ctx.prev_state.previous_results)
-                .get(&my_idx)
-                .copied()
-                .unwrap_or(false);
-            let result = current && !previous;
-            sub_results.insert(my_idx, current);
-            if O::COLLECTS_CHILDREN {
-                O::composite(result, my_idx, node, vec![child_out])
-            } else {
-                O::leaf(result, my_idx, node)
-            }
+            let child_out: O = eval::<D, O>(child, ctx, counter, sub, dep_scope);
+            let (current, child_part) = child_out.into_parts();
+            let previous = D::prev_latch(dep_scope, ctx, my_idx);
+            let result = D::difference(current.clone(), &previous, ctx);
+            sub.insert(my_idx, current);
+            O::composite(result, my_idx, node, total, vec![child_part])
         }
-
         ConditionNode::Since { trigger, reset } => {
-            let trigger_out = eval_inner::<O>(trigger, ctx, counter, sub_results, dep_results);
-            let reset_out = eval_inner::<O>(reset, ctx, counter, sub_results, dep_results);
-            let trigger_val = trigger_out.val();
-            let reset_val = reset_out.val();
-            let prev_latch = dep_results
-                .cur_prev
-                .unwrap_or(&ctx.prev_state.previous_results)
-                .get(&my_idx)
-                .copied()
-                .unwrap_or(false);
-            let result = if reset_val {
-                false
-            } else {
-                trigger_val || prev_latch
-            };
-            sub_results.insert(my_idx, result);
-            if O::COLLECTS_CHILDREN {
-                O::composite(result, my_idx, node, vec![trigger_out, reset_out])
-            } else {
-                O::leaf(result, my_idx, node)
-            }
+            let trigger_out: O = eval::<D, O>(trigger, ctx, counter, sub, dep_scope);
+            let reset_out: O = eval::<D, O>(reset, ctx, counter, sub, dep_scope);
+            let (trigger_sel, trigger_part) = trigger_out.into_parts();
+            let (reset_sel, reset_part) = reset_out.into_parts();
+            let prev = D::prev_latch(dep_scope, ctx, my_idx);
+            // Restrict to the current universe so a latch can't carry forward
+            // keys retired from the partition set (unpartitioned: a no-op).
+            let result = D::restrict(
+                D::difference(D::or(prev, &trigger_sel), &reset_sel, ctx),
+                ctx,
+            );
+            sub.insert(my_idx, result.clone());
+            O::composite(result, my_idx, node, total, vec![trigger_part, reset_part])
         }
-
         ConditionNode::SinceLastHandled(child) => {
-            let child_out = eval_inner::<O>(child, ctx, counter, sub_results, dep_results);
-            let current = child_out.val();
-            let result = if !current {
-                false
-            } else {
-                let (last_handled, last_tick) = root_handled_state(ctx);
-                match last_handled {
-                    None => true,
-                    Some(handled) => last_tick.map(|lt| handled < lt).unwrap_or(true),
-                }
-            };
-            if O::COLLECTS_CHILDREN {
-                O::composite(result, my_idx, node, vec![child_out])
-            } else {
-                O::leaf(result, my_idx, node)
-            }
+            let child_out: O = eval::<D, O>(child, ctx, counter, sub, dep_scope);
+            let (current, child_part) = child_out.into_parts();
+            let result = D::since_last_handled(current, ctx);
+            O::composite(result, my_idx, node, total, vec![child_part])
         }
     }
 }
@@ -495,7 +374,7 @@ fn finalize_dep_counter(counter: &mut u32, base: u32, condition: &ConditionNode)
 /// Evaluate a `ConditionNode` tree and return both the compact result (for
 /// state tracking) and a full evaluation tree (for UI visualization).
 pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResult, EvalNodeResult) {
-    if let Some(pctx) = ctx.partitions {
+    if ctx.partitions.is_some() {
         let mut counter = 0u32;
         let mut sub_selections = HashMap::new();
         let mut dep_selections = HashMap::new();
@@ -505,21 +384,15 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
             cur_prev: None,
             bridged: HashMap::new(),
         };
-        let (selection, tree): (PartitionSelection, EvalNodeResult) = eval_partitioned(
-            node,
-            ctx,
-            pctx,
-            &mut counter,
-            &mut sub_selections,
-            &mut dep_scope,
-        );
-        // `All` of an empty universe selects nothing: reporting fired would
-        // leak a full WillBeRequested signal downstream with nothing to
-        // materialize behind it.
-        let fired = match &selection {
-            PartitionSelection::All => !pctx.all_keys.is_empty(),
-            other => !other.is_empty(),
-        };
+        let (selection, tree): (PartitionSelection, EvalNodeResult) =
+            eval::<PartitionDomain, (PartitionSelection, EvalNodeResult)>(
+                node,
+                ctx,
+                &mut counter,
+                &mut sub_selections,
+                &mut dep_scope,
+            );
+        let fired = PartitionDomain::fired(&selection, ctx);
         (
             EvalResult {
                 fired,
@@ -541,9 +414,13 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
             cur_prev: None,
             bridged: HashMap::new(),
         };
-        let tree =
-            eval_inner::<EvalNodeResult>(node, ctx, &mut counter, &mut sub_results, &mut dep_scope);
-        let fired = tree.status == NodeStatus::True;
+        let (fired, tree): (bool, EvalNodeResult) = eval::<BoolDomain, (bool, EvalNodeResult)>(
+            node,
+            ctx,
+            &mut counter,
+            &mut sub_results,
+            &mut dep_scope,
+        );
         (
             EvalResult {
                 fired,
@@ -599,428 +476,10 @@ fn eval_on_dep(
     let saved = dep_results.cur_prev;
     let latch = dep_results.prev.get(dep_key).unwrap_or(&EMPTY_BOOL_LATCH);
     dep_results.cur_prev = Some(latch);
-    let val = eval_inner(condition, &dep_ctx, counter, &mut local, dep_results);
+    let val = eval::<BoolDomain, bool>(condition, &dep_ctx, counter, &mut local, dep_results);
     dep_results.cur_prev = saved;
     collect_dep_latch(dep_results, dep_key, local);
     val
-}
-
-/// Recursive partition-aware evaluator. Returns an `O` indicating which
-/// partitions satisfy the condition.
-///
-/// UNIFICATION: parallel twin of [`eval_inner`] — see the note there; mirror
-/// every semantic change in BOTH matches.
-fn eval_partitioned<O: PartEvalOutput>(
-    node: &ConditionNode,
-    ctx: &EvalContext,
-    pctx: &PartitionEvalContext,
-    counter: &mut u32,
-    sub_selections: &mut HashMap<u32, PartitionSelection>,
-    dep_selections: &mut DepScope<PartitionSelection>,
-) -> O {
-    let my_idx = *counter;
-    *counter += 1;
-
-    let total = pctx.all_keys.len();
-
-    match node {
-        ConditionNode::Missing => {
-            // Materialized == has a timestamp; the cache keeps them in lockstep.
-            let missing: HashSet<PartitionKey> = pctx
-                .all_keys
-                .iter()
-                .filter(|k| !pctx.timestamps.contains_key(*k))
-                .cloned()
-                .collect();
-            let sel = PartitionSelection::from_keys(missing);
-            O::leaf(sel, my_idx, node, total)
-        }
-
-        ConditionNode::InProgress => O::leaf(
-            select_in_universe(pctx.in_progress, pctx),
-            my_idx,
-            node,
-            total,
-        ),
-
-        ConditionNode::ExecutionFailed => {
-            O::leaf(select_in_universe(pctx.failed, pctx), my_idx, node, total)
-        }
-
-        ConditionNode::CodeVersionChanged => {
-            let changed = ctx.target_record.code_version.is_some()
-                && ctx.target_record.code_version
-                    != ctx.target_record.last_materialization_code_version;
-            let sel = if changed {
-                PartitionSelection::All
-            } else {
-                PartitionSelection::Empty
-            };
-            O::leaf(sel, my_idx, node, total)
-        }
-
-        ConditionNode::NewlyUpdated => {
-            let prev_timestamps = ctx
-                .prev_state
-                .partition_state
-                .as_ref()
-                .map(|ps| &ps.timestamps);
-            let updated: HashSet<PartitionKey> = pctx
-                .timestamps
-                .iter()
-                .filter(|&(pk, &ts)| {
-                    pctx.all_keys.contains(pk)
-                        && match pctx.dep_root_floor {
-                            Some(floor) => match floor.get(pk) {
-                                None => false,
-                                Some(&inner) => dep_newer_than_floor(ts, inner),
-                            },
-                            None => match prev_timestamps.and_then(|pt| pt.get(pk)) {
-                                Some(&prev) => ts > prev,
-                                None => !ctx.is_initial,
-                            },
-                        }
-                })
-                .map(|(pk, _)| pk.clone())
-                .collect();
-            let sel = PartitionSelection::from_keys(updated);
-            O::leaf(sel, my_idx, node, total)
-        }
-
-        ConditionNode::NewlyRequested => {
-            let requested_last_tick = ctx.prev_state.last_handled_timestamp.is_some()
-                && ctx.prev_state.last_handled_timestamp == ctx.prev_state.last_tick_timestamp;
-            let sel = if requested_last_tick {
-                match ctx.prev_state.partition_state.as_ref() {
-                    Some(ps) => {
-                        let keys: HashSet<PartitionKey> = ps
-                            .handled
-                            .iter()
-                            .filter(|k| pctx.all_keys.contains(*k))
-                            .cloned()
-                            .collect();
-                        PartitionSelection::from_keys(keys)
-                    }
-                    None => PartitionSelection::Empty,
-                }
-            } else {
-                PartitionSelection::Empty
-            };
-            O::leaf(sel, my_idx, node, total)
-        }
-
-        ConditionNode::CronTickPassed {
-            cron_schedule,
-            timezone,
-        } => {
-            let prev_ts = root_last_tick(ctx).unwrap_or(ctx.now);
-            let val = cron_tick_between(cron_schedule, prev_ts, ctx.now, timezone.as_deref());
-            let sel = if val {
-                PartitionSelection::All
-            } else {
-                PartitionSelection::Empty
-            };
-            O::leaf(sel, my_idx, node, total)
-        }
-
-        ConditionNode::InLatestTimeWindow { lookback_delta } => {
-            let sel = match pctx
-                .time_windows
-                .and_then(|tw| tw.keys_for(ctx.target_key, pctx.all_keys, *lookback_delta))
-            {
-                Some(keys) if !keys.is_empty() => PartitionSelection::Keys((*keys).clone()),
-                _ => PartitionSelection::Empty,
-            };
-            O::leaf(sel, my_idx, node, total)
-        }
-
-        ConditionNode::InitialEvaluation => {
-            let sel = if ctx.is_initial {
-                PartitionSelection::All
-            } else {
-                PartitionSelection::Empty
-            };
-            O::leaf(sel, my_idx, node, total)
-        }
-
-        ConditionNode::DataVersionChanged => {
-            let (prev_dv, prev_ts) = data_version_baseline(ctx);
-            let changed = match (ctx.target_record.last_data_version.as_ref(), prev_dv) {
-                (Some(current), Some(prev)) => current != prev,
-                (Some(_), None) => !ctx.is_initial && prev_ts != ctx.target_record.last_timestamp,
-                _ => false,
-            };
-            let sel = if changed {
-                PartitionSelection::All
-            } else {
-                PartitionSelection::Empty
-            };
-            O::leaf(sel, my_idx, node, total)
-        }
-
-        ConditionNode::BackfillInProgress => O::leaf(
-            eval_backfill_in_progress_partitioned(ctx, pctx),
-            my_idx,
-            node,
-            total,
-        ),
-
-        ConditionNode::LastExecutedWithTags {
-            tag_keys,
-            tag_values,
-        } => O::leaf(
-            partition_filter_select(ctx.tags.last_run_tags.get(ctx.target_key), pctx, |tags| {
-                run_tags_match(tags, tag_keys, tag_values)
-            }),
-            my_idx,
-            node,
-            total,
-        ),
-
-        ConditionNode::LastRunIncludesTarget => {
-            if ctx.target_key == ctx.root_key {
-                O::leaf(PartitionSelection::Empty, my_idx, node, total)
-            } else {
-                O::leaf(
-                    partition_filter_select(
-                        ctx.tags.last_run_asset_names.get(ctx.target_key),
-                        pctx,
-                        |names| names.iter().any(|n| n == ctx.root_key),
-                    ),
-                    my_idx,
-                    node,
-                    total,
-                )
-            }
-        }
-
-        ConditionNode::WillBeRequested => {
-            let sel = match ctx.requested_this_tick.get(ctx.target_key) {
-                None | Some(PartitionSelection::Empty) => PartitionSelection::Empty,
-                Some(PartitionSelection::All) => PartitionSelection::All,
-                Some(s @ PartitionSelection::Keys(_)) => s.clone(),
-            };
-            O::leaf(sel, my_idx, node, total)
-        }
-
-        ConditionNode::HasRunWithTags {
-            tag_keys,
-            tag_values,
-        } => O::leaf(
-            eval_new_update_tags_partitioned(ctx, pctx, tag_keys, tag_values, false),
-            my_idx,
-            node,
-            total,
-        ),
-
-        ConditionNode::AllRunsHaveTags {
-            tag_keys,
-            tag_values,
-        } => O::leaf(
-            eval_new_update_tags_partitioned(ctx, pctx, tag_keys, tag_values, true),
-            my_idx,
-            node,
-            total,
-        ),
-
-        ConditionNode::AnyDepsMatch { condition, .. } => {
-            let sel = eval_partitioned_any_deps(ctx, pctx, condition, counter, dep_selections);
-            O::leaf(sel, my_idx, node, total)
-        }
-
-        ConditionNode::AllDepsMatch { condition, .. } => {
-            let sel = eval_partitioned_all_deps(ctx, pctx, condition, counter, dep_selections);
-            O::leaf(sel, my_idx, node, total)
-        }
-
-        ConditionNode::AssetMatches { keys, condition } => {
-            let base = *counter;
-            let mut sel = PartitionSelection::Empty;
-            for key in keys {
-                *counter = base;
-                let key_sel =
-                    eval_partitioned_on_dep(key, condition, ctx, pctx, counter, dep_selections);
-                sel = sel.union(&key_sel);
-            }
-            finalize_dep_counter(counter, base, condition);
-            O::leaf(sel, my_idx, node, total)
-        }
-
-        ConditionNode::And(children) => {
-            let mut result = PartitionSelection::All;
-            let mut child_parts = Vec::with_capacity(children.len());
-            for child in children {
-                if result.is_empty() && !child.has_stateful_nodes() {
-                    child_parts.push(O::skipped_child(child, counter));
-                } else {
-                    let child_out = eval_partitioned::<O>(
-                        child,
-                        ctx,
-                        pctx,
-                        counter,
-                        sub_selections,
-                        dep_selections,
-                    );
-                    let (child_sel, child_part) = O::into_parts(child_out);
-                    if !result.is_empty() {
-                        result = result.intersect(&child_sel);
-                    }
-                    child_parts.push(child_part);
-                }
-            }
-            O::composite(result, my_idx, node, total, child_parts)
-        }
-
-        ConditionNode::Or(children) => {
-            let mut result = PartitionSelection::Empty;
-            let mut child_parts = Vec::with_capacity(children.len());
-            for child in children {
-                if result.is_all() && !child.has_stateful_nodes() {
-                    child_parts.push(O::skipped_child(child, counter));
-                } else {
-                    let child_out = eval_partitioned::<O>(
-                        child,
-                        ctx,
-                        pctx,
-                        counter,
-                        sub_selections,
-                        dep_selections,
-                    );
-                    let (child_sel, child_part) = O::into_parts(child_out);
-                    if !result.is_all() {
-                        result = result.union(&child_sel);
-                    }
-                    child_parts.push(child_part);
-                }
-            }
-            O::composite(result, my_idx, node, total, child_parts)
-        }
-
-        ConditionNode::Not(child) => {
-            let child_out =
-                eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
-            let (child_sel, child_part) = O::into_parts(child_out);
-            let result = child_sel.complement(pctx.all_keys);
-            O::composite(result, my_idx, node, total, vec![child_part])
-        }
-
-        ConditionNode::NewlyTrue(child) => {
-            let child_out =
-                eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
-            let (current, child_part) = O::into_parts(child_out);
-            let previous = prev_partition_latch(dep_selections, ctx, my_idx);
-            let result = current.difference(&previous, pctx.all_keys);
-            sub_selections.insert(my_idx, current);
-            O::composite(result, my_idx, node, total, vec![child_part])
-        }
-
-        ConditionNode::Since { trigger, reset } => {
-            let trigger_out =
-                eval_partitioned::<O>(trigger, ctx, pctx, counter, sub_selections, dep_selections);
-            let reset_out =
-                eval_partitioned::<O>(reset, ctx, pctx, counter, sub_selections, dep_selections);
-            let (trigger_sel, trigger_part) = O::into_parts(trigger_out);
-            let (reset_sel, reset_part) = O::into_parts(reset_out);
-            let prev_latch = prev_partition_latch(dep_selections, ctx, my_idx);
-            let result = prev_latch
-                .union(&trigger_sel)
-                .difference(&reset_sel, pctx.all_keys)
-                .restrict_to(pctx.all_keys);
-            sub_selections.insert(my_idx, result.clone());
-            O::composite(result, my_idx, node, total, vec![trigger_part, reset_part])
-        }
-
-        ConditionNode::SinceLastHandled(child) => {
-            let child_out =
-                eval_partitioned::<O>(child, ctx, pctx, counter, sub_selections, dep_selections);
-            let (current, child_part) = O::into_parts(child_out);
-            let result = if current.is_empty() {
-                PartitionSelection::Empty
-            } else {
-                let (last_handled, last_tick) = root_handled_state(ctx);
-                let was_just_handled = last_handled
-                    .map(|h| last_tick.map(|lt| h >= lt).unwrap_or(false))
-                    .unwrap_or(false);
-                if !was_just_handled {
-                    current
-                } else if ctx.target_key != ctx.root_key {
-                    PartitionSelection::Empty
-                } else {
-                    match ctx
-                        .prev_state
-                        .partition_state
-                        .as_ref()
-                        .map(|ps| &ps.handled)
-                    {
-                        None => current,
-                        Some(handled_set) => {
-                            let handled_sel = if handled_set.is_empty() {
-                                PartitionSelection::Empty
-                            } else {
-                                PartitionSelection::Keys(handled_set.clone())
-                            };
-                            current.difference(&handled_sel, pctx.all_keys)
-                        }
-                    }
-                }
-            };
-            O::composite(result, my_idx, node, total, vec![child_part])
-        }
-    }
-}
-
-/// Partition-aware AnyDeps: evaluate condition on each upstream dep,
-/// map result back to downstream partition space, union all.
-fn eval_partitioned_any_deps(
-    ctx: &EvalContext,
-    pctx: &PartitionEvalContext,
-    condition: &ConditionNode,
-    counter: &mut u32,
-    dep_selections: &mut DepScope<PartitionSelection>,
-) -> PartitionSelection {
-    let base = *counter;
-    let mut result = PartitionSelection::Empty;
-    if let Some(deps) = ctx.cache.upstream_deps.get(ctx.target_key) {
-        for dep in deps {
-            *counter = base;
-            let dep_sel =
-                eval_partitioned_on_dep(dep, condition, ctx, pctx, counter, dep_selections);
-            result = result.union(&dep_sel);
-        }
-    }
-    finalize_dep_counter(counter, base, condition);
-    result
-}
-
-/// Partition-aware AllDeps: evaluate condition on each upstream dep,
-/// map result back to downstream partition space, intersect all.
-fn eval_partitioned_all_deps(
-    ctx: &EvalContext,
-    pctx: &PartitionEvalContext,
-    condition: &ConditionNode,
-    counter: &mut u32,
-    dep_selections: &mut DepScope<PartitionSelection>,
-) -> PartitionSelection {
-    let base = *counter;
-    let eval_all = condition.has_stateful_nodes();
-    let result = match ctx.cache.upstream_deps.get(ctx.target_key) {
-        Some(deps) if !deps.is_empty() => {
-            let mut result = PartitionSelection::All;
-            for dep in deps {
-                *counter = base;
-                let dep_sel =
-                    eval_partitioned_on_dep(dep, condition, ctx, pctx, counter, dep_selections);
-                result = result.intersect(&dep_sel);
-                if result.is_empty() && !eval_all {
-                    break;
-                }
-            }
-            result
-        }
-        _ => PartitionSelection::All,
-    };
-    finalize_dep_counter(counter, base, condition);
-    result
 }
 
 /// Evaluate a condition on an upstream dep in partition-aware mode.
@@ -1095,7 +554,8 @@ fn eval_partitioned_on_dep(
             cur_prev: Some(&bool_latch),
             bridged: HashMap::new(),
         };
-        let val = eval_inner(condition, &dep_ctx, counter, &mut local, &mut bool_scope);
+        let val =
+            eval::<BoolDomain, bool>(condition, &dep_ctx, counter, &mut local, &mut bool_scope);
         collect_bridged_latch(
             dep_selections,
             dep_key,
@@ -1227,10 +687,9 @@ fn eval_partitioned_on_dep(
     let mut local = HashMap::new();
     let saved = dep_selections.cur_prev;
     dep_selections.cur_prev = Some(prev_dep_sel.unwrap_or(&EMPTY_SELECTION_LATCH));
-    let upstream_result: PartitionSelection = eval_partitioned(
+    let upstream_result: PartitionSelection = eval::<PartitionDomain, PartitionSelection>(
         condition,
         &dep_ctx,
-        &upstream_pctx,
         counter,
         &mut local,
         dep_selections,

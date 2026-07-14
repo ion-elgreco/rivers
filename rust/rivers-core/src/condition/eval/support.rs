@@ -1,5 +1,5 @@
-//! Leaf and context helpers shared by both twin evaluators, plus the
-//! output abstractions that let one match serve bool and tree modes.
+//! Leaf and context helpers the `EvalDomain` impls build on: partition-status
+//! selection, tag matching, staleness floors, and skipped-subtree construction.
 use std::collections::{HashMap, HashSet};
 
 use crate::storage::PartitionKey;
@@ -7,7 +7,7 @@ use crate::storage::PartitionKey;
 use super::super::node::ConditionNode;
 use super::super::partition::{PartitionEvalContext, PartitionSelection};
 use super::super::state::{EvalContext, EvalNodeResult, NodeStatus};
-use super::{DepScope, count_nodes};
+use super::DepScope;
 
 /// The (data version, materialized ts) baseline `DataVersionChanged` compares
 /// against: in a dep pivot, the ROOT's per-dep baseline (so one asset's fire
@@ -127,125 +127,6 @@ pub(crate) fn prev_partition_latch(
             .cloned(),
     }
     .unwrap_or(PartitionSelection::Empty)
-}
-
-/// Output mode for the unpartitioned evaluator.
-pub(crate) trait EvalOutput: Sized {
-    /// Whether composite nodes should collect child outputs into a Vec.
-    /// False for bool mode (zero-allocation), true for tree mode.
-    const COLLECTS_CHILDREN: bool;
-    fn leaf(val: bool, idx: u32, node: &ConditionNode) -> Self;
-    fn val(&self) -> bool;
-    fn composite(val: bool, idx: u32, node: &ConditionNode, children: Vec<Self>) -> Self;
-    fn skipped(node: &ConditionNode, counter: &mut u32) -> Self;
-}
-
-impl EvalOutput for bool {
-    const COLLECTS_CHILDREN: bool = false;
-    fn leaf(val: bool, _idx: u32, _node: &ConditionNode) -> Self {
-        val
-    }
-    fn val(&self) -> bool {
-        *self
-    }
-    fn composite(val: bool, _idx: u32, _node: &ConditionNode, _children: Vec<Self>) -> Self {
-        val
-    }
-    fn skipped(node: &ConditionNode, counter: &mut u32) -> Self {
-        count_nodes(node, counter);
-        false
-    }
-}
-
-impl EvalOutput for EvalNodeResult {
-    const COLLECTS_CHILDREN: bool = true;
-    fn leaf(val: bool, idx: u32, node: &ConditionNode) -> Self {
-        EvalNodeResult::new(node, idx, NodeStatus::from_bool(val), vec![], None)
-    }
-    fn val(&self) -> bool {
-        self.status == NodeStatus::True
-    }
-    fn composite(val: bool, idx: u32, node: &ConditionNode, children: Vec<Self>) -> Self {
-        EvalNodeResult::new(node, idx, NodeStatus::from_bool(val), children, None)
-    }
-    fn skipped(node: &ConditionNode, counter: &mut u32) -> Self {
-        build_skipped_subtree(node, counter)
-    }
-}
-
-/// Output mode for the partition-aware evaluator.
-pub(crate) trait PartEvalOutput: Sized {
-    type Child;
-    fn leaf(sel: PartitionSelection, idx: u32, node: &ConditionNode, total: usize) -> Self;
-    fn into_parts(self) -> (PartitionSelection, Self::Child);
-    fn composite(
-        sel: PartitionSelection,
-        idx: u32,
-        node: &ConditionNode,
-        total: usize,
-        children: Vec<Self::Child>,
-    ) -> Self;
-    fn skipped_child(node: &ConditionNode, counter: &mut u32) -> Self::Child;
-}
-
-impl PartEvalOutput for PartitionSelection {
-    type Child = ();
-    fn leaf(sel: PartitionSelection, _idx: u32, _node: &ConditionNode, _total: usize) -> Self {
-        sel
-    }
-    fn into_parts(self) -> (PartitionSelection, ()) {
-        (self, ())
-    }
-    fn composite(
-        sel: PartitionSelection,
-        _idx: u32,
-        _node: &ConditionNode,
-        _total: usize,
-        _children: Vec<()>,
-    ) -> Self {
-        sel
-    }
-    fn skipped_child(node: &ConditionNode, counter: &mut u32) {
-        count_nodes(node, counter);
-    }
-}
-
-impl PartEvalOutput for (PartitionSelection, EvalNodeResult) {
-    type Child = EvalNodeResult;
-    fn leaf(sel: PartitionSelection, idx: u32, node: &ConditionNode, total: usize) -> Self {
-        let n = sel.key_count(total);
-        let tree = EvalNodeResult::new(
-            node,
-            idx,
-            NodeStatus::from_bool(!sel.is_empty()),
-            vec![],
-            Some(n),
-        );
-        (sel, tree)
-    }
-    fn into_parts(self) -> (PartitionSelection, EvalNodeResult) {
-        self
-    }
-    fn composite(
-        sel: PartitionSelection,
-        idx: u32,
-        node: &ConditionNode,
-        total: usize,
-        children: Vec<EvalNodeResult>,
-    ) -> Self {
-        let n = sel.key_count(total);
-        let tree = EvalNodeResult::new(
-            node,
-            idx,
-            NodeStatus::from_bool(!sel.is_empty()),
-            children,
-            Some(n),
-        );
-        (sel, tree)
-    }
-    fn skipped_child(node: &ConditionNode, counter: &mut u32) -> EvalNodeResult {
-        build_skipped_subtree(node, counter)
-    }
 }
 
 /// Build a skipped tree for a subtree that was not evaluated due to short-circuiting.
