@@ -370,15 +370,7 @@ impl EvalDomain for PartitionDomain {
             return PartitionSelection::Empty;
         }
         match ctx.prev_state.partition_state.as_ref() {
-            Some(ps) => {
-                let keys: HashSet<PartitionKey> = ps
-                    .handled
-                    .iter()
-                    .filter(|k| pctx.all_keys.contains(*k))
-                    .cloned()
-                    .collect();
-                PartitionSelection::from_keys(keys)
-            }
+            Some(ps) => select_in_universe(&ps.handled, pctx),
             None => PartitionSelection::Empty,
         }
     }
