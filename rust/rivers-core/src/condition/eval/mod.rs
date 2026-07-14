@@ -123,7 +123,7 @@ fn eval<D: EvalDomain>(
     // tree; leaves pass an empty `children`.
     let finish = |sel: D::Sel, children: Vec<EvalNodeResult>| -> (D::Sel, Option<EvalNodeResult>) {
         let tree = build_tree.then(|| {
-            let total = ctx.partitions.map(|p| p.all_keys.len()).unwrap_or(0);
+            let total = ctx.partitions.map_or(0, |p| p.all_keys.len());
             EvalNodeResult::new(
                 node,
                 my_idx,
