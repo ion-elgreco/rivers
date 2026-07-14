@@ -6,9 +6,9 @@ use crate::storage::PartitionKey;
 
 use super::super::node::ConditionNode;
 use super::super::partition::{PartitionEvalContext, PartitionSelection};
-use super::super::state::{EvalContext, EvalNodeResult, EvalResult, NodeStatus};
+use super::super::state::{EvalContext, EvalResult};
 use super::support::*;
-use super::{DepScope, count_nodes, eval_on_dep, eval_partitioned_on_dep};
+use super::{DepScope, eval_on_dep, eval_partitioned_on_dep};
 
 fn require_pctx<'a>(ctx: &EvalContext<'a>) -> &'a PartitionEvalContext<'a> {
     ctx.partitions
@@ -42,84 +42,6 @@ impl DomainVal for PartitionSelection {
     }
     fn num_partitions(&self, total: usize) -> Option<usize> {
         Some(self.key_count(total))
-    }
-}
-
-/// Fast (just the domain value) or tree (value plus an `EvalNodeResult`) output.
-pub(crate) trait EvalOut<S: DomainVal>: Sized {
-    type Child;
-    const COLLECTS_CHILDREN: bool;
-    fn leaf(sel: S, idx: u32, node: &ConditionNode, total: usize) -> Self;
-    fn into_parts(self) -> (S, Self::Child);
-    fn composite(
-        sel: S,
-        idx: u32,
-        node: &ConditionNode,
-        total: usize,
-        children: Vec<Self::Child>,
-    ) -> Self;
-    fn skipped_child(node: &ConditionNode, counter: &mut u32) -> Self::Child;
-}
-
-macro_rules! impl_fast_out {
-    ($sel:ty) => {
-        impl EvalOut<$sel> for $sel {
-            type Child = ();
-            const COLLECTS_CHILDREN: bool = false;
-            fn leaf(sel: $sel, _idx: u32, _node: &ConditionNode, _total: usize) -> Self {
-                sel
-            }
-            fn into_parts(self) -> ($sel, ()) {
-                (self, ())
-            }
-            fn composite(
-                sel: $sel,
-                _idx: u32,
-                _node: &ConditionNode,
-                _total: usize,
-                _children: Vec<()>,
-            ) -> Self {
-                sel
-            }
-            fn skipped_child(node: &ConditionNode, counter: &mut u32) {
-                count_nodes(node, counter);
-            }
-        }
-    };
-}
-impl_fast_out!(bool);
-impl_fast_out!(PartitionSelection);
-
-impl<S: DomainVal> EvalOut<S> for (S, EvalNodeResult) {
-    type Child = EvalNodeResult;
-    const COLLECTS_CHILDREN: bool = true;
-    fn leaf(sel: S, idx: u32, node: &ConditionNode, total: usize) -> Self {
-        let np = sel.num_partitions(total);
-        let tree = EvalNodeResult::new(node, idx, NodeStatus::from_bool(sel.is_true()), vec![], np);
-        (sel, tree)
-    }
-    fn into_parts(self) -> (S, EvalNodeResult) {
-        self
-    }
-    fn composite(
-        sel: S,
-        idx: u32,
-        node: &ConditionNode,
-        total: usize,
-        children: Vec<EvalNodeResult>,
-    ) -> Self {
-        let np = sel.num_partitions(total);
-        let tree = EvalNodeResult::new(
-            node,
-            idx,
-            NodeStatus::from_bool(sel.is_true()),
-            children,
-            np,
-        );
-        (sel, tree)
-    }
-    fn skipped_child(node: &ConditionNode, counter: &mut u32) -> EvalNodeResult {
-        build_skipped_subtree(node, counter)
     }
 }
 
