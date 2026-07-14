@@ -35,7 +35,7 @@ impl DomainVal for bool {
 
 impl DomainVal for PartitionSelection {
     fn is_true(&self) -> bool {
-        !self.is_empty()
+        self.to_bool()
     }
     fn is_all(&self) -> bool {
         self.is_all()
