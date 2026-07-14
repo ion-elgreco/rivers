@@ -114,11 +114,8 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
     }
 }
 
-/// The single condition evaluator, generic over the [`EvalDomain`] (bool vs
-/// partition selection) and the [`EvalOut`] mode (fast vs tree). Every arm is
-/// written once; the two representations differ only in the `D` impl methods it
-/// calls. Node indices are allocated identically across domains (via
-/// [`count_nodes`]) so persisted latches keyed by index stay aligned.
+/// The single evaluator, generic over the domain `D` and output mode `O`. Node
+/// indices must advance identically across domains — persisted latches key off them.
 fn eval<D: EvalDomain, O: EvalOut<D::Sel>>(
     node: &ConditionNode,
     ctx: &EvalContext,
@@ -131,7 +128,7 @@ fn eval<D: EvalDomain, O: EvalOut<D::Sel>>(
     let total = ctx.partitions.map(|p| p.all_keys.len()).unwrap_or(0);
 
     match node {
-        // ── leaves reading structurally different data per domain ──
+        // leaves
         ConditionNode::Missing => O::leaf(D::missing(ctx), my_idx, node, total),
         ConditionNode::InProgress => O::leaf(D::in_progress(ctx), my_idx, node, total),
         ConditionNode::ExecutionFailed => O::leaf(D::failed(ctx), my_idx, node, total),
@@ -178,7 +175,7 @@ fn eval<D: EvalDomain, O: EvalOut<D::Sel>>(
             total,
         ),
 
-        // ── scalar predicates lifted into the domain ──
+        // scalar predicates
         ConditionNode::CodeVersionChanged => {
             let changed = ctx.target_record.code_version.is_some()
                 && ctx.target_record.code_version
@@ -206,7 +203,7 @@ fn eval<D: EvalDomain, O: EvalOut<D::Sel>>(
             O::leaf(D::from_bool(val), my_idx, node, total)
         }
 
-        // ── dep-aggregates: union/intersect over per-dep pivots ──
+        // dep-aggregates
         ConditionNode::AnyDepsMatch { condition, .. } => {
             let base = *counter;
             let eval_all = condition.has_stateful_nodes();
@@ -263,7 +260,7 @@ fn eval<D: EvalDomain, O: EvalOut<D::Sel>>(
             O::leaf(result, my_idx, node, total)
         }
 
-        // ── combinators ──
+        // combinators
         ConditionNode::And(children) => {
             let mut result = D::all(ctx);
             let mut child_parts = if O::COLLECTS_CHILDREN {
@@ -323,7 +320,7 @@ fn eval<D: EvalDomain, O: EvalOut<D::Sel>>(
             O::composite(result, my_idx, node, total, vec![child_part])
         }
 
-        // ── stateful ops (latch keyed by my_idx) ──
+        // stateful ops
         ConditionNode::NewlyTrue(child) => {
             let child_out: O = eval::<D, O>(child, ctx, counter, sub, dep_scope);
             let (current, child_part) = child_out.into_parts();
