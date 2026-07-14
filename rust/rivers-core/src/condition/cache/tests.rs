@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::RunRecord;
 
 fn mk_run(run_id: &str, status: RunStatus, assets: &[&str], ts: i64) -> RunRecord {
     RunRecord {

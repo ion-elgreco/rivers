@@ -88,7 +88,7 @@ pub fn bundle_keys(keys: &[PartitionKey]) -> PartitionKey {
         candidate
     } else {
         let mut members = keys.to_vec();
-        members.sort_by(|a, b| a.to_json().cmp(&b.to_json()));
+        members.sort_by_key(|a| a.to_json());
         PartitionKey::Set { keys: members }
     }
 }

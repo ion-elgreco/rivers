@@ -317,7 +317,7 @@ pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
     } = config;
 
     let code_location_id = storage.code_location_id().to_string();
-    let mut cache = AssetConditionCache::new(code_location_id.clone());
+    let cache = AssetConditionCache::new(code_location_id.clone());
 
     let fresh = || ConditionEvalState {
         is_initial: true,

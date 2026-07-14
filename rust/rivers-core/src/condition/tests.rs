@@ -1,6 +1,7 @@
 //! Tests for the condition evaluation engine.
 
 #![allow(clippy::type_complexity)] // test scaffolding LazyLocks mirror cache types verbatim
+#![allow(clippy::field_reassign_with_default)] // reads clearly in test record setup
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
