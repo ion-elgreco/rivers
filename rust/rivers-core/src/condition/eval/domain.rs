@@ -150,9 +150,8 @@ impl EvalDomain for BoolDomain {
         if ctx.target_key != ctx.root_key {
             return match ctx.target_record.last_timestamp {
                 None => false,
-                Some(dep_ts) => match ctx.root_partition_floor {
-                    Some(floor) => dep_newer_than_floor(dep_ts, floor),
-                    None => {
+                Some(dep_ts) => {
+                    let floor = ctx.root_partition_floor.unwrap_or_else(|| {
                         let root_mat = ctx
                             .cache
                             .records
@@ -160,14 +159,10 @@ impl EvalDomain for BoolDomain {
                             .and_then(|r| r.last_timestamp);
                         let root_failed =
                             ctx.cache.failed_asset_timestamps.get(ctx.root_key).copied();
-                        match (root_mat, root_failed) {
-                            (None, None) => true,
-                            (Some(m), None) => dep_ts > m,
-                            (None, Some(f)) => dep_ts > f,
-                            (Some(m), Some(f)) => dep_ts > m.max(f),
-                        }
-                    }
-                },
+                        root_mat.max(root_failed)
+                    });
+                    dep_newer_than_floor(dep_ts, floor)
+                }
             };
         }
         match (
