@@ -118,12 +118,12 @@ fn eval<D: EvalDomain>(
 ) -> (D::Sel, Option<EvalNodeResult>) {
     let my_idx = *counter;
     *counter += 1;
-    let total = ctx.partitions.map(|p| p.all_keys.len()).unwrap_or(0);
 
     // Attach a tree node (with `children`) to `sel`, but only when building the
     // tree; leaves pass an empty `children`.
     let finish = |sel: D::Sel, children: Vec<EvalNodeResult>| -> (D::Sel, Option<EvalNodeResult>) {
         let tree = build_tree.then(|| {
+            let total = ctx.partitions.map(|p| p.all_keys.len()).unwrap_or(0);
             EvalNodeResult::new(
                 node,
                 my_idx,
