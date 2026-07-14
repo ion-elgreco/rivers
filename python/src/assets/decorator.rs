@@ -723,6 +723,15 @@ impl Asset {
         }
     }
 
+    // Consumed by resolution/ResolvedNode threading (landing next).
+    #[allow(dead_code)]
+    pub fn retry(&self) -> Option<&rivers_core::execution::retry::RetryRef> {
+        match self {
+            Asset::Single(a) => a.retry.as_ref(),
+            _ => None,
+        }
+    }
+
     pub fn observe_fn(&self) -> Option<&Py<PyAny>> {
         match self {
             Asset::External(a) => a.observe_fn.as_ref(),
@@ -942,6 +951,7 @@ impl PyAsset {
         backfill_strategy = None,
         pool = None,
         pool_slots = None,
+        retry = None,
     ))]
     #[allow(clippy::too_many_arguments, clippy::new_ret_no_self)]
     fn new<'py>(
@@ -961,6 +971,7 @@ impl PyAsset {
         backfill_strategy: Option<PyBackfillStrategy>,
         pool: Option<&Bound<'py, PyAny>>,
         pool_slots: Option<&Bound<'py, PyAny>>,
+        retry: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let py = cls.py();
 
@@ -971,6 +982,7 @@ impl PyAsset {
         name = name_or_fn_name(py, name, &wraps);
 
         let pool = normalize_pool(pool, pool_slots)?;
+        let retry = crate::retry::extract_retry_ref(retry)?;
 
         let deps: Vec<&DepDef> = deps.iter().map(|d| d.get()).collect();
         let pd = process_deps(py, &deps);
@@ -996,6 +1008,7 @@ impl PyAsset {
             automation_condition,
             backfill_strategy,
             pool,
+            retry,
         });
 
         let base = PyAsset { inner: py_asset };
@@ -1103,6 +1116,7 @@ impl PyAsset {
                 hooks: None,
                 automation_condition: None,
                 pool: borrow_asset_def.pool.clone(),
+                retry: None,
             });
         }
 
