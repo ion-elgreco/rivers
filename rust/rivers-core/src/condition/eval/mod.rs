@@ -54,64 +54,47 @@ static EMPTY_CONDITION_STATE: std::sync::LazyLock<AssetConditionState> =
 
 pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
     if ctx.partitions.is_some() {
-        let mut counter = 0u32;
-        let mut sub_selections = HashMap::new();
-        let mut dep_selections = HashMap::new();
-        let mut dep_scope = DepScope {
-            prev: root_dep_selections(ctx),
-            acc: &mut dep_selections,
-            cur_prev: None,
-            bridged: HashMap::new(),
-        };
-        let selection: PartitionSelection = eval::<PartitionDomain, PartitionSelection>(
-            node,
-            ctx,
-            &mut counter,
-            &mut sub_selections,
-            &mut dep_scope,
-        );
-        let fired = PartitionDomain::fired(&selection, ctx);
+        let result = run::<PartitionDomain, PartitionSelection>(node, ctx).0;
         tracing::debug!(
             target: "rivers::condition",
             asset_key = %ctx.target_key,
-            fired,
+            fired = result.fired,
             "partition condition evaluated"
         );
-        EvalResult {
-            fired,
-            sub_results: HashMap::new(),
-            selection: Some(selection),
-            sub_selections: Some(sub_selections),
-            dep_sub_results: HashMap::new(),
-            dep_sub_selections: Some(dep_selections),
-        }
+        result
     } else {
-        let mut counter = 0u32;
-        let mut sub_results = HashMap::new();
-        let mut dep_results = HashMap::new();
-        let mut dep_scope = DepScope {
-            prev: &ctx.prev_state.dep_previous_results,
-            acc: &mut dep_results,
-            cur_prev: None,
-            bridged: HashMap::new(),
-        };
-        let fired: bool =
-            eval::<BoolDomain, bool>(node, ctx, &mut counter, &mut sub_results, &mut dep_scope);
+        let result = run::<BoolDomain, bool>(node, ctx).0;
         tracing::debug!(
             target: "rivers::condition",
             asset_key = %ctx.target_key,
-            fired,
+            fired = result.fired,
             "condition evaluated"
         );
-        EvalResult {
-            fired,
-            sub_results,
-            selection: None,
-            sub_selections: None,
-            dep_sub_results: dep_results,
-            dep_sub_selections: None,
-        }
+        result
     }
+}
+
+/// Set up the counter and root dep-latch scope, run the evaluator over `node`,
+/// and assemble the domain's `EvalResult`. The second tuple element is the
+/// eval tree for the tree output, `()` for the fast path.
+fn run<D: EvalDomain, O: EvalOut<D::Sel>>(
+    node: &ConditionNode,
+    ctx: &EvalContext,
+) -> (EvalResult, O::Child) {
+    let mut counter = 0u32;
+    let mut sub = HashMap::new();
+    let mut dep = HashMap::new();
+    let out: O = {
+        let mut dep_scope = DepScope {
+            prev: D::root_dep_prev(ctx),
+            acc: &mut dep,
+            cur_prev: None,
+            bridged: HashMap::new(),
+        };
+        eval::<D, O>(node, ctx, &mut counter, &mut sub, &mut dep_scope)
+    };
+    let (top, child) = out.into_parts();
+    (D::assemble(top, ctx, sub, dep), child)
 }
 
 /// The single evaluator, generic over the domain `D` and output mode `O`. Node
@@ -399,63 +382,9 @@ fn fold_deps<'a, D: EvalDomain>(
 /// state tracking) and a full evaluation tree (for UI visualization).
 pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResult, EvalNodeResult) {
     if ctx.partitions.is_some() {
-        let mut counter = 0u32;
-        let mut sub_selections = HashMap::new();
-        let mut dep_selections = HashMap::new();
-        let mut dep_scope = DepScope {
-            prev: root_dep_selections(ctx),
-            acc: &mut dep_selections,
-            cur_prev: None,
-            bridged: HashMap::new(),
-        };
-        let (selection, tree): (PartitionSelection, EvalNodeResult) =
-            eval::<PartitionDomain, (PartitionSelection, EvalNodeResult)>(
-                node,
-                ctx,
-                &mut counter,
-                &mut sub_selections,
-                &mut dep_scope,
-            );
-        let fired = PartitionDomain::fired(&selection, ctx);
-        (
-            EvalResult {
-                fired,
-                sub_results: HashMap::new(),
-                selection: Some(selection),
-                sub_selections: Some(sub_selections),
-                dep_sub_results: HashMap::new(),
-                dep_sub_selections: Some(dep_selections),
-            },
-            tree,
-        )
+        run::<PartitionDomain, (PartitionSelection, EvalNodeResult)>(node, ctx)
     } else {
-        let mut counter = 0u32;
-        let mut sub_results = HashMap::new();
-        let mut dep_results = HashMap::new();
-        let mut dep_scope = DepScope {
-            prev: &ctx.prev_state.dep_previous_results,
-            acc: &mut dep_results,
-            cur_prev: None,
-            bridged: HashMap::new(),
-        };
-        let (fired, tree): (bool, EvalNodeResult) = eval::<BoolDomain, (bool, EvalNodeResult)>(
-            node,
-            ctx,
-            &mut counter,
-            &mut sub_results,
-            &mut dep_scope,
-        );
-        (
-            EvalResult {
-                fired,
-                sub_results,
-                selection: None,
-                sub_selections: None,
-                dep_sub_results: dep_results,
-                dep_sub_selections: None,
-            },
-            tree,
-        )
+        run::<BoolDomain, (bool, EvalNodeResult)>(node, ctx)
     }
 }
 
