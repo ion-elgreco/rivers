@@ -710,7 +710,11 @@ fn test_skipped_dep_aggregate_is_leaf_like_evaluated() {
         },
     ]);
     let (_result, tree) = evaluate_with_tree(&cond, &ctx);
-    assert_eq!(tree.children.len(), 2, "And keeps both children in the tree");
+    assert_eq!(
+        tree.children.len(),
+        2,
+        "And keeps both children in the tree"
+    );
     assert_eq!(tree.children[1].status, NodeStatus::Skipped);
     assert!(
         tree.children[1].children.is_empty(),
@@ -7502,8 +7506,14 @@ async fn test_two_partition_runs_same_asset_both_update_slots() {
         block_reason: None,
         launched_by: LaunchedBy::Manual,
     };
-    storage.create_run(&mk("R1", "p1", "a", 2000)).await.unwrap();
-    storage.create_run(&mk("R2", "p2", "b", 2001)).await.unwrap();
+    storage
+        .create_run(&mk("R1", "p1", "a", 2000))
+        .await
+        .unwrap();
+    storage
+        .create_run(&mk("R2", "p2", "b", 2001))
+        .await
+        .unwrap();
     cache.refresh(&storage, 0).await.unwrap();
     // Both complete; applied in one refresh.
     storage
@@ -8557,17 +8567,15 @@ async fn test_crash_after_dispatch_recovers_latches_from_intent() {
         entries: pass1
             .pending_dispatch_states(&out, 4_000)
             .into_iter()
-            .map(
-                |(asset_key, committed, dispatched_keys)| {
-                    crate::condition::state::PendingDispatchEntry {
-                        asset_key,
-                        run_ids: vec!["run-dst".to_string()],
-                        committed,
-                        dispatched_keys,
-                        backfill_ids: vec![],
-                    }
-                },
-            )
+            .map(|(asset_key, committed, dispatched_keys)| {
+                crate::condition::state::PendingDispatchEntry {
+                    asset_key,
+                    run_ids: vec!["run-dst".to_string()],
+                    committed,
+                    dispatched_keys,
+                    backfill_ids: vec![],
+                }
+            })
             .collect(),
     };
     storage
@@ -8748,13 +8756,15 @@ async fn test_crash_before_dispatch_leaves_trigger_armed() {
         entries: pass1
             .pending_dispatch_states(&out, 4_000)
             .into_iter()
-            .map(|(asset_key, committed, dispatched_keys)| PendingDispatchEntry {
-                asset_key,
-                run_ids: vec!["run-never-created".to_string()],
-                committed,
-                dispatched_keys,
-                backfill_ids: vec![],
-            })
+            .map(
+                |(asset_key, committed, dispatched_keys)| PendingDispatchEntry {
+                    asset_key,
+                    run_ids: vec!["run-never-created".to_string()],
+                    committed,
+                    dispatched_keys,
+                    backfill_ids: vec![],
+                },
+            )
             .collect(),
     };
     storage

@@ -1728,7 +1728,9 @@ class TestOnCronWithDepsFiresMidPeriod:
         # Count only runs that materialize r — the dep bump below issues its own
         # run for a, which must not be mistaken for r firing.
         def r_run_count():
-            return sum(1 for run in storage.get_runs(limit=500) if "r" in run.node_names)
+            return sum(
+                1 for run in storage.get_runs(limit=500) if "r" in run.node_names
+            )
 
         daemon = AutomationDaemon(
             repo=repo, storage=storage, condition_eval_interval="300ms"

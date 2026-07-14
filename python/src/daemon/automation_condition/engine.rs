@@ -148,17 +148,19 @@ impl ConditionTickEngine {
                     tick_timestamp: now,
                     entries: scalar_states
                         .into_iter()
-                        .map(|(asset_key, committed, dispatched_keys)| PendingDispatchEntry {
-                            run_ids: run_ids_by_asset.remove(&asset_key).unwrap_or_default(),
-                            backfill_ids: backfill_ids_by_asset
-                                .get(&asset_key)
-                                .cloned()
-                                .map(|id| vec![id])
-                                .unwrap_or_default(),
-                            asset_key,
-                            committed,
-                            dispatched_keys,
-                        })
+                        .map(
+                            |(asset_key, committed, dispatched_keys)| PendingDispatchEntry {
+                                run_ids: run_ids_by_asset.remove(&asset_key).unwrap_or_default(),
+                                backfill_ids: backfill_ids_by_asset
+                                    .get(&asset_key)
+                                    .cloned()
+                                    .map(|id| vec![id])
+                                    .unwrap_or_default(),
+                                asset_key,
+                                committed,
+                                dispatched_keys,
+                            },
+                        )
                         .collect(),
                 };
                 match self
