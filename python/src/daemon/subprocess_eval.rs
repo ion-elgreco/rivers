@@ -34,8 +34,7 @@ fn rebuild_resources<'py>(
     let mut resources = HashMap::new();
     let mut order = Vec::with_capacity(resource_specs.len());
     for spec in resource_specs.iter() {
-        // Build + setup one resource; on any failure tear down the ones already
-        // set up before propagating, so a mid-list failure can't leak them.
+        // Tear down already-setup resources if a later one fails to build/setup.
         let built = (|| -> PyResult<(String, Py<PyAny>)> {
             let tuple: &Bound<PyTuple> = spec.cast()?;
             let name: String = tuple.get_item(0)?.extract()?;
@@ -99,9 +98,8 @@ fn run_eval(
 ) -> PyResult<Py<PyAny>> {
     let (resources, ordered) = rebuild_resources(py, resource_specs)?;
 
-    // Everything after setup must tear down on ANY exit — precompute_args,
-    // build_ctx, or the eval itself failing would otherwise leak the setup
-    // resources (open DB connections, sockets) in the reused loky worker.
+    // Tear down on ANY exit — a failure below would otherwise leak setup
+    // resources in the reused loky worker.
     let result = (|| {
         let PrecomputedArgs {
             config_instance,

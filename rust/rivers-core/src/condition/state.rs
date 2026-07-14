@@ -97,19 +97,15 @@ pub struct PendingDispatchEntry {
     pub asset_key: String,
     /// Run ids minted before dispatch (run-shaped dispatches).
     pub run_ids: Vec<String>,
-    /// Backfill ids pre-minted before dispatch (backfill-shaped dispatches), so
-    /// recovery matches the tick's own backfill exactly instead of by asset +
-    /// create time — which would falsely match an unrelated concurrent backfill.
-    /// Empty for legacy intents, which fall back to the create-time heuristic.
+    /// Backfill ids pre-minted before dispatch so recovery matches the tick's
+    /// own backfill exactly. Empty for legacy intents (create-time heuristic).
     #[serde(default)]
     pub backfill_ids: Vec<String>,
     /// Scalar condition state as `commit_tick` would persist it. The large,
     /// derivable partition timestamp map is deliberately absent.
     pub committed: AssetConditionState,
-    /// Partition keys dispatched this tick. Recovery merges these into the
-    /// asset's `partition_state.handled` so a `SinceLastHandled` latch (which
-    /// keeps no `previous_selections`) does not re-dispatch them — the
-    /// preserved pre-crash partition state lacks this tick's keys.
+    /// Partition keys dispatched this tick; recovery merges them into
+    /// `partition_state.handled` (for `SinceLastHandled`, which keeps no latch).
     #[serde(default)]
     pub dispatched_keys: Vec<PartitionKey>,
 }

@@ -509,9 +509,6 @@ impl ConditionPass {
                 }
             }
             state.last_handled_timestamp = Some(now);
-            // The keys this tick dispatched for the asset — the same keys
-            // commit_tick marks handled — so recovery can restore the handled
-            // set a SinceLastHandled latch depends on.
             let mut dispatched_keys: Vec<PartitionKey> = output
                 .plan
                 .single_partition_groups
@@ -795,11 +792,7 @@ pub async fn recover_pending_dispatch<S: StorageBackend>(
     if pending.entries.is_empty() {
         return Ok(());
     }
-    // A persisted intent proves a tick already evaluated and dispatched, so
-    // this is not the initial evaluation. Clearing the global flag stops a
-    // first-tick crash (load None → fresh is_initial=true) from re-firing
-    // InitialEvaluation for every recovered asset; per-asset is_initial (set by
-    // reset_for_new_tree on un-recovered assets) still drives legitimate refires.
+    // An existing intent proves a tick ran, so this isn't the initial evaluation.
     eval_state.is_initial = false;
     let tick_ts = pending.tick_timestamp;
     let run_ids: Vec<String> = pending
@@ -826,11 +819,8 @@ pub async fn recover_pending_dispatch<S: StorageBackend>(
 
     let mut recovered = 0usize;
     for entry in pending.entries {
-        // Staleness guard: if the loaded state already reflects a tick at or
-        // after this intent's tick, the intent is stale — a failed clear that
-        // survived an idle stretch while passive commits advanced and persisted
-        // newer self-state. Splicing its older committed state would regress
-        // that state and spuriously re-fire; skip it.
+        // Skip a stale intent (older than the loaded per-asset tick); splicing it
+        // would regress passively-advanced state.
         if eval_state
             .assets
             .get(&entry.asset_key)
@@ -862,9 +852,8 @@ pub async fn recover_pending_dispatch<S: StorageBackend>(
         let partition_state = slot.partition_state.take();
         *slot = entry.committed;
         slot.partition_state = partition_state;
-        // Restore the handled marks consumed this tick. The preserved pre-crash
-        // partition state lacks them, so a SinceLastHandled latch (which keeps no
-        // previous_selections) would otherwise re-dispatch these keys.
+        // Restore the handled marks consumed this tick (SinceLastHandled keeps no
+        // previous_selections to fall back on).
         if !dispatched_keys.is_empty() {
             slot.partition_state
                 .get_or_insert_with(Default::default)

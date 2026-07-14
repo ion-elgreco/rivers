@@ -138,10 +138,8 @@ impl AssetConditionCache {
         self.in_progress_assets
             .get(asset)
             .map(|runs| {
-                // Expand batched keys (bundle_keys / multi-key materialize) into
-                // their members, like run_partition_slots — a composite key is
-                // not in `all_keys`, so select_in_universe would otherwise drop
-                // it and every member would read as idle mid-flight.
+                // Expand batched keys to members (like run_partition_slots); a composite
+                // key isn't in all_keys, so its members would otherwise read as idle.
                 runs.values()
                     .flatten()
                     .flat_map(|pk| pk.members())

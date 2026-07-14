@@ -102,8 +102,7 @@ pub(crate) async fn process_tick_result(
                     automation_name: auto_name.clone(),
                     automation_type: auto_type.into(),
                     status,
-                    // Stamped at emit time: dispatch above awaits (run + backfill),
-                    // so the pre-dispatch capture would drift for this branch.
+                    // Stamp at emit time — dispatch above awaits, so a pre-dispatch capture drifts.
                     timestamp: now_ts(),
                     run_ids,
                     backfill_ids,

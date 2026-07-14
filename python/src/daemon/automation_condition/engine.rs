@@ -122,9 +122,6 @@ impl ConditionTickEngine {
                 &output.results,
             );
             let run_requests = self.prepare_run_requests(&output.plan, &mut handle);
-            // Pre-mint a backfill id per backfill-shaped dispatch so the crash
-            // intent records it and recovery matches the tick's own backfill
-            // exactly, not an unrelated concurrent one.
             let backfill_ids_by_asset: std::collections::HashMap<String, String> = output
                 .plan
                 .multi_partition_backfills

@@ -922,10 +922,6 @@ fn eval_partitioned<O: PartEvalOutput>(
             let (trigger_sel, trigger_part) = O::into_parts(trigger_out);
             let (reset_sel, reset_part) = O::into_parts(reset_out);
             let prev_latch = prev_partition_latch(dep_selections, ctx, my_idx);
-            // Restrict to the current universe: the accumulating latch must
-            // not carry forward keys retired from the partition set, or they
-            // re-fire every tick, get dropped by classify, and wedge the asset
-            // in a permanent needs_retry loop.
             let result = prev_latch
                 .union(&trigger_sel)
                 .difference(&reset_sel, pctx.all_keys)
@@ -1144,10 +1140,7 @@ fn eval_partitioned_on_dep(
             // Reused across keys: a fresh single-element set per upstream
             // partition is pure allocator churn at large partition counts.
             let mut scratch = PartitionSelection::Keys(HashSet::with_capacity(1));
-            // The fan-out (All-branch) floor is over the whole root universe and
-            // is key-independent; compute it at most once instead of once per
-            // upstream key (O(N*M) → O(N+M) — a 1M×1M dep otherwise never
-            // finishes a tick).
+            // Key-independent across upstream keys: compute the fan-out floor once.
             let all_floor: std::cell::OnceCell<Option<i64>> = std::cell::OnceCell::new();
             upstream_status
                 .timestamps

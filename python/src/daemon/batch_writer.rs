@@ -153,11 +153,8 @@ impl BatchWriter for TickWriter {
     }
 }
 
-/// Bound the tick backlog like [`trim_backlog`], but never evict an automation's
-/// NEWEST tick — that row carries the cursor restored on restart, so dropping it
-/// regresses the cursor and re-emits already-processed events. Superseded (older)
-/// ticks are dropped oldest-first; a genuine one-row-per-automation backlog is
-/// left over cap rather than regressing any cursor.
+/// Bound the tick backlog, keeping each automation's newest (cursor) tick —
+/// dropping it regresses the cursor on restart. Drops oldest superseded first.
 fn trim_tick_backlog(batch: &mut Vec<TickRecord>, max_batch: usize) {
     let cap = max_batch.saturating_mul(8).max(1);
     if batch.len() <= cap {
@@ -345,9 +342,7 @@ mod tests {
 
     #[test]
     fn trim_tick_backlog_keeps_latest_per_automation() {
-        // max_batch=1 → cap=8. A sensor's cursor tick sits OLDEST, then a flood
-        // of condition ticks. Trimming must keep the sensor's tick (its cursor is
-        // restored on restart) instead of draining it as the oldest record.
+        // A sensor's cursor tick sits oldest amid a flood of condition ticks; it must survive.
         let mut batch = vec![tick("sensor", 0, Some("cursor-1"))];
         for i in 1..=20 {
             batch.push(tick("cond", i, None));
