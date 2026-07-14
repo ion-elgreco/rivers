@@ -758,12 +758,13 @@ impl PartitionsDefinition {
                     ));
                 }
                 if let Some(secs) = interval_seconds
-                    && (!secs.is_finite() || *secs <= 0.0 || (secs * 1_000_000_000.0) as i64 == 0) {
-                        return Err(PartitionDefinitionError::new_err(format!(
-                            "interval_seconds must be positive and at least 1 nanosecond, \
+                    && (!secs.is_finite() || *secs <= 0.0 || (secs * 1_000_000_000.0) as i64 == 0)
+                {
+                    return Err(PartitionDefinitionError::new_err(format!(
+                        "interval_seconds must be positive and at least 1 nanosecond, \
                              got {secs}"
-                        )));
-                    }
+                    )));
+                }
                 validate_time_window_fmt(cron_schedule, interval_seconds, start, end, fmt)
             }
             Self::Multi { dimensions } => {
