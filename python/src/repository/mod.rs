@@ -2078,6 +2078,8 @@ pub struct PyCodeRepository {
     pub(crate) raw_sensors: HashMap<String, Py<PySensorDefinition>>,
     default_executor: Option<Executor>,
     raw_resources: HashMap<String, ResourceVariant>,
+    /// Named retry policies referenced by `retry="name"` on assets/jobs.
+    raw_retries: HashMap<String, rivers_core::execution::retry::RetryPolicy>,
     pub(crate) run_queue_config: Option<Py<crate::concurrency::PyRunQueueConfig>>,
     pub(crate) run_backend_config: Option<Py<crate::concurrency::PyRunBackendConfig>>,
     pool_limits: Option<HashMap<String, i32>>,
@@ -2543,6 +2545,7 @@ impl PyCodeRepository {
                     &handlers,
                     &resource_keys_excluding_io_handlers,
                 )?;
+                asset.inner_mut().resolve_retry_refs(&self.raw_retries)?;
             }
             let asset = asset_py.borrow(py);
             if let Asset::Graph(graph_asset) = asset.inner() {
@@ -2919,7 +2922,7 @@ struct BuiltGraph {
 #[pymethods]
 impl PyCodeRepository {
     #[new]
-    #[pyo3(signature = (assets, tasks=None, jobs=None, schedules=None, sensors=None, default_executor=None, resources=None, run_queue=None, run_backend=None, pool_limits=None))]
+    #[pyo3(signature = (assets, tasks=None, jobs=None, schedules=None, sensors=None, default_executor=None, resources=None, retries=None, run_queue=None, run_backend=None, pool_limits=None))]
     fn new(
         assets: Vec<Py<PyAsset>>,
         tasks: Option<Vec<Py<PyAny>>>,
@@ -2928,6 +2931,7 @@ impl PyCodeRepository {
         sensors: Option<Vec<Py<PySensorDefinition>>>,
         default_executor: Option<Executor>,
         resources: Option<HashMap<String, ResourceVariant>>,
+        retries: Option<HashMap<String, crate::retry::PyRetryPolicy>>,
         run_queue: Option<Py<crate::concurrency::PyRunQueueConfig>>,
         run_backend: Option<Py<crate::concurrency::PyRunBackendConfig>>,
         pool_limits: Option<HashMap<String, i32>>,
@@ -2954,6 +2958,11 @@ impl PyCodeRepository {
                 .collect(),
             default_executor,
             raw_resources: resources.unwrap_or_default(),
+            raw_retries: retries
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(k, v)| (k, v.inner))
+                .collect(),
             run_queue_config: run_queue,
             run_backend_config: run_backend,
             pool_limits,
