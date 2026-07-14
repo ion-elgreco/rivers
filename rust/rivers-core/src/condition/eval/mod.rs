@@ -301,7 +301,7 @@ fn eval<D: EvalDomain>(
         ConditionNode::NewlyTrue(child) => {
             let (current, child_tree) = eval::<D>(child, ctx, counter, sub, dep_scope, build_tree);
             let previous = D::prev_latch(dep_scope, ctx, my_idx);
-            let result = D::difference(current.clone(), &previous, ctx);
+            let result = D::difference(&current, &previous, ctx);
             sub.insert(my_idx, current);
             finish(result, child_tree.into_iter().collect())
         }
@@ -314,7 +314,7 @@ fn eval<D: EvalDomain>(
             // Restrict to the current universe so a latch can't carry forward
             // keys retired from the partition set (unpartitioned: a no-op).
             let result = D::restrict(
-                D::difference(D::or(prev, &trigger_sel), &reset_sel, ctx),
+                D::difference(&D::or(prev, &trigger_sel), &reset_sel, ctx),
                 ctx,
             );
             sub.insert(my_idx, result.clone());

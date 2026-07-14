@@ -55,7 +55,7 @@ pub(crate) trait EvalDomain {
     fn and(a: Self::Sel, b: &Self::Sel) -> Self::Sel;
     fn or(a: Self::Sel, b: &Self::Sel) -> Self::Sel;
     fn not(a: Self::Sel, ctx: &EvalContext) -> Self::Sel;
-    fn difference(a: Self::Sel, b: &Self::Sel, ctx: &EvalContext) -> Self::Sel;
+    fn difference(a: &Self::Sel, b: &Self::Sel, ctx: &EvalContext) -> Self::Sel;
     fn restrict(a: Self::Sel, ctx: &EvalContext) -> Self::Sel;
     fn fired(sel: &Self::Sel, ctx: &EvalContext) -> bool;
 
@@ -131,8 +131,8 @@ impl EvalDomain for BoolDomain {
     fn not(a: bool, _ctx: &EvalContext) -> bool {
         !a
     }
-    fn difference(a: bool, b: &bool, _ctx: &EvalContext) -> bool {
-        a && !*b
+    fn difference(a: &bool, b: &bool, _ctx: &EvalContext) -> bool {
+        *a && !*b
     }
     fn restrict(a: bool, _ctx: &EvalContext) -> bool {
         a
@@ -300,7 +300,7 @@ impl EvalDomain for PartitionDomain {
         a.complement(require_pctx(ctx).all_keys)
     }
     fn difference(
-        a: PartitionSelection,
+        a: &PartitionSelection,
         b: &PartitionSelection,
         ctx: &EvalContext,
     ) -> PartitionSelection {
