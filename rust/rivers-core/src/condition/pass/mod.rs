@@ -623,6 +623,22 @@ impl ConditionPass {
         }
     }
 
+    /// The `PartitionInfo` for `key`, if that asset is partitioned.
+    fn partition_info_for(&self, key: &str) -> Option<&PartitionInfo> {
+        self.conditions_by_key
+            .get(key)
+            .map(|&idx| &self.conditions[idx])
+            .and_then(|info| info.partition_info.as_ref())
+    }
+
+    /// Register a pre-dispatch in-flight placeholder for `key`.
+    fn mark_in_progress(&mut self, key: &str) {
+        self.cache
+            .in_progress_assets
+            .entry(key.to_string())
+            .or_default();
+    }
+
     /// Split the materialization list into the three dispatch shapes.
     fn classify_materializations(
         &mut self,
@@ -635,16 +651,8 @@ impl ConditionPass {
             match tm.selection {
                 Some(PartitionSelection::Keys(keys)) if !keys.is_empty() => {
                     let total = keys.len();
-                    let surviving: Vec<PartitionKey> = match self
-                        .conditions_by_key
-                        .get(tm.asset_key.as_str())
-                        .map(|&idx| &self.conditions[idx])
-                        .and_then(|info| info.partition_info.as_ref())
-                    {
-                        Some(pi) => keys
-                            .into_iter()
-                            .filter(|k| pi.all_keys.contains(k))
-                            .collect(),
+                    let surviving: Vec<PartitionKey> = match self.partition_info_for(&tm.asset_key) {
+                        Some(pi) => keys.into_iter().filter(|k| pi.all_keys.contains(k)).collect(),
                         None => keys.into_iter().collect(),
                     };
                     if surviving.len() < total {
@@ -656,43 +664,28 @@ impl ConditionPass {
                         );
                     }
                     if !surviving.is_empty() {
-                        self.cache
-                            .in_progress_assets
-                            .entry(tm.asset_key.clone())
-                            .or_default();
+                        self.mark_in_progress(&tm.asset_key);
                         partitioned_mats.push((tm.asset_key, surviving));
                     }
                 }
                 Some(PartitionSelection::All) | None => {
                     let resolved = self
-                        .conditions_by_key
-                        .get(tm.asset_key.as_str())
-                        .map(|&idx| &self.conditions[idx])
-                        .and_then(|info| info.partition_info.as_ref())
+                        .partition_info_for(&tm.asset_key)
                         .map(|pi| pi.all_keys.iter().cloned().collect::<Vec<_>>());
                     match resolved {
                         Some(all_keys) if !all_keys.is_empty() => {
-                            self.cache
-                                .in_progress_assets
-                                .entry(tm.asset_key.clone())
-                                .or_default();
+                            self.mark_in_progress(&tm.asset_key);
                             partitioned_mats.push((tm.asset_key, all_keys));
                         }
                         Some(_) => {}
                         None => {
-                            self.cache
-                                .in_progress_assets
-                                .entry(tm.asset_key.clone())
-                                .or_default();
+                            self.mark_in_progress(&tm.asset_key);
                             unpartitioned.push(tm.asset_key);
                         }
                     }
                 }
                 _ => {
-                    self.cache
-                        .in_progress_assets
-                        .entry(tm.asset_key.clone())
-                        .or_default();
+                    self.mark_in_progress(&tm.asset_key);
                     unpartitioned.push(tm.asset_key);
                 }
             }
