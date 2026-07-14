@@ -76,7 +76,7 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
 
 /// Set up the counter and root dep-latch scope, run the evaluator over `node`,
 /// and assemble the domain's `EvalResult`. The second tuple element is the
-/// eval tree for the tree output, `()` for the fast path.
+/// eval tree when `build_tree`, `None` on the fast path.
 fn run<D: EvalDomain>(
     node: &ConditionNode,
     ctx: &EvalContext,
