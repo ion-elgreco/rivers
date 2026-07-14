@@ -1,12 +1,4 @@
-//! Domain abstraction that lets one evaluator serve both the unpartitioned
-//! (`bool`) and partition-aware (`PartitionSelection`) worlds.
-//!
-//! `bool` is exactly a `PartitionSelection` over a one-partition universe, so
-//! the 21-arm evaluator is written once, generic over an [`EvalDomain`]. The
-//! unpartitioned domain keeps `Sel = bool`, so the persisted latch format is
-//! byte-identical (no migration). The residue that genuinely differs between
-//! the two — the leaf status sources and the dep pivot — lives in the two
-//! `EvalDomain` impls, compiler-checked instead of hand-mirrored.
+//! One condition evaluator over the bool and `PartitionSelection` domains.
 
 use std::collections::HashSet;
 
@@ -18,20 +10,14 @@ use super::super::state::{EvalContext, EvalNodeResult, NodeStatus};
 use super::support::*;
 use super::{DepScope, count_nodes, eval_on_dep, eval_partitioned_on_dep};
 
-/// The partition context, which is always present when [`PartitionDomain`] runs.
 fn require_pctx<'a>(ctx: &EvalContext<'a>) -> &'a PartitionEvalContext<'a> {
     ctx.partitions
         .expect("PartitionDomain evaluated without a PartitionEvalContext")
 }
 
-/// A domain value: the per-node result of one evaluation arm.
 pub(crate) trait DomainVal: Clone {
-    /// Whether this value "fired" at this node (drives short-circuit and tree status).
     fn is_true(&self) -> bool;
-    /// Whether this value saturates its universe (`true` / `All`) — lets
-    /// `AnyDeps`/`Or` short-circuit once nothing more can be added.
     fn is_all(&self) -> bool;
-    /// Partition count for tree display; `None` for the unpartitioned domain.
     fn num_partitions(&self, total: usize) -> Option<usize>;
 }
 
@@ -59,12 +45,9 @@ impl DomainVal for PartitionSelection {
     }
 }
 
-/// Output mode for the unified evaluator: fast (just the domain value) or tree
-/// (value plus an `EvalNodeResult` for the UI). Orthogonal to the domain axis.
+/// Fast (just the domain value) or tree (value plus an `EvalNodeResult`) output.
 pub(crate) trait EvalOut<S: DomainVal>: Sized {
-    /// Per-child artifact collected by composites (`()` fast, `EvalNodeResult` tree).
     type Child;
-    /// Whether composites should collect children (compiles the tree away in fast mode).
     const COLLECTS_CHILDREN: bool;
     fn leaf(sel: S, idx: u32, node: &ConditionNode, total: usize) -> Self;
     fn into_parts(self) -> (S, Self::Child);
@@ -78,7 +61,6 @@ pub(crate) trait EvalOut<S: DomainVal>: Sized {
     fn skipped_child(node: &ConditionNode, counter: &mut u32) -> Self::Child;
 }
 
-/// Fast mode carries only the domain value.
 macro_rules! impl_fast_out {
     ($sel:ty) => {
         impl EvalOut<$sel> for $sel {
@@ -108,7 +90,6 @@ macro_rules! impl_fast_out {
 impl_fast_out!(bool);
 impl_fast_out!(PartitionSelection);
 
-/// Tree mode pairs the domain value with an `EvalNodeResult`, generic over the domain.
 impl<S: DomainVal> EvalOut<S> for (S, EvalNodeResult) {
     type Child = EvalNodeResult;
     const COLLECTS_CHILDREN: bool = true;
@@ -142,29 +123,21 @@ impl<S: DomainVal> EvalOut<S> for (S, EvalNodeResult) {
     }
 }
 
-/// The evaluation algebra + leaf status sources for one representation. The
-/// unified `eval<D, O>` calls only these; the two impls are the whole residue
-/// that genuinely differs between bool and partition worlds.
 pub(crate) trait EvalDomain {
     type Sel: DomainVal;
 
-    // ── algebra ──
-    /// Everything (`true` / `All`).
+    // algebra
     fn all(ctx: &EvalContext) -> Self::Sel;
-    /// Nothing (`false` / `Empty`).
     fn empty() -> Self::Sel;
-    /// Lift a scalar predicate (shared arms compute a bool then lift it).
     fn from_bool(b: bool) -> Self::Sel;
     fn and(a: Self::Sel, b: &Self::Sel) -> Self::Sel;
     fn or(a: Self::Sel, b: &Self::Sel) -> Self::Sel;
     fn not(a: Self::Sel, ctx: &EvalContext) -> Self::Sel;
     fn difference(a: Self::Sel, b: &Self::Sel, ctx: &EvalContext) -> Self::Sel;
-    /// Drop retired keys from an accumulating latch (no-op unpartitioned).
     fn restrict(a: Self::Sel, ctx: &EvalContext) -> Self::Sel;
-    /// Project the root result to the fired flag (guards `All` of an empty universe).
     fn fired(sel: &Self::Sel, ctx: &EvalContext) -> bool;
 
-    // ── leaves that read structurally different data ──
+    // leaf status sources
     fn missing(ctx: &EvalContext) -> Self::Sel;
     fn in_progress(ctx: &EvalContext) -> Self::Sel;
     fn failed(ctx: &EvalContext) -> Self::Sel;
@@ -186,16 +159,12 @@ pub(crate) trait EvalDomain {
     fn last_run_includes_target(ctx: &EvalContext) -> Self::Sel;
     fn will_be_requested(ctx: &EvalContext) -> Self::Sel;
 
-    // ── stateful ──
-    /// Previous-tick latch for stateful node `idx` (per-dep when pivoting).
+    // stateful
     fn prev_latch(dep_scope: &DepScope<Self::Sel>, ctx: &EvalContext, idx: u32) -> Self::Sel;
-    /// `SinceLastHandled` debounce applied to the child's `current`.
     fn since_last_handled(current: Self::Sel, ctx: &EvalContext) -> Self::Sel;
 
-    // ── dep pivot ──
-    /// Evaluate `condition` as if `dep_key` were the target, mapping the result
-    /// back into this domain (the partition impl still bridges an unpartitioned
-    /// dep through the bool evaluator).
+    // Evaluate `condition` as if `dep_key` were the target. The partition impl
+    // bridges an unpartitioned dep through the bool evaluator.
     fn pivot_into_dep(
         dep_key: &str,
         condition: &ConditionNode,
@@ -205,7 +174,6 @@ pub(crate) trait EvalDomain {
     ) -> Self::Sel;
 }
 
-/// Unpartitioned evaluation: `Sel = bool`.
 pub(crate) struct BoolDomain;
 
 impl EvalDomain for BoolDomain {
@@ -357,7 +325,6 @@ impl EvalDomain for BoolDomain {
     }
 }
 
-/// Partition-aware evaluation: `Sel = PartitionSelection`.
 pub(crate) struct PartitionDomain;
 
 impl EvalDomain for PartitionDomain {
