@@ -1167,8 +1167,9 @@ fn eval_partitioned_on_dep(
                     );
                     let floor = match &mapped {
                         PartitionSelection::Empty => return None,
-                        PartitionSelection::All => *all_floor
-                            .get_or_init(|| root_floor_over_attempted(pctx.all_keys.iter(), root_status)),
+                        PartitionSelection::All => *all_floor.get_or_init(|| {
+                            root_floor_over_attempted(pctx.all_keys.iter(), root_status)
+                        }),
                         PartitionSelection::Keys(ks) => {
                             let in_universe: Vec<&PartitionKey> =
                                 ks.iter().filter(|k| pctx.all_keys.contains(*k)).collect();

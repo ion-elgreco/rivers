@@ -46,9 +46,12 @@ impl PartitionSelection {
     pub fn restrict_to(&self, all_keys: &HashSet<PartitionKey>) -> Self {
         match self {
             Self::All | Self::Empty => self.clone(),
-            Self::Keys(keys) => {
-                Self::from_keys(keys.iter().filter(|k| all_keys.contains(*k)).cloned().collect())
-            }
+            Self::Keys(keys) => Self::from_keys(
+                keys.iter()
+                    .filter(|k| all_keys.contains(*k))
+                    .cloned()
+                    .collect(),
+            ),
         }
     }
 

@@ -3369,7 +3369,10 @@ impl PerCodeLocationStorage for SurrealStorage {
     ) -> Result<Option<crate::condition::ConditionEvalState>> {
         // Retry: the caller resets to fresh state on error, discarding all latches.
         let key = crate::condition_eval_state_key(code_location_id);
-        super::retry::with_retry(&self.retry_config, || async { self.kv_get_json(&key).await }).await
+        super::retry::with_retry(&self.retry_config, || async {
+            self.kv_get_json(&key).await
+        })
+        .await
     }
 
     async fn set_condition_eval_state(

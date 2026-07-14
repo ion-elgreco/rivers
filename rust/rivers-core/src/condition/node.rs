@@ -474,7 +474,11 @@ impl ConditionNode {
                 None => format!("all_deps_match({})", condition.describe()),
             },
             ConditionNode::AssetMatches { keys, condition } => {
-                format!("asset_matches({}, {})", keys_label(keys), condition.describe())
+                format!(
+                    "asset_matches({}, {})",
+                    keys_label(keys),
+                    condition.describe()
+                )
             }
             _ => self.node_label(),
         }
