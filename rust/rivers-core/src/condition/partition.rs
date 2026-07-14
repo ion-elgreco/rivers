@@ -128,6 +128,15 @@ impl PartitionSelection {
     pub fn to_bool(&self) -> bool {
         !self.is_empty()
     }
+
+    /// True if this selection fires over the given universe: non-empty, except
+    /// that `All` over an empty universe fires nothing (unlike `to_bool`).
+    pub fn fires_over(&self, all_keys: &HashSet<PartitionKey>) -> bool {
+        match self {
+            Self::All => !all_keys.is_empty(),
+            other => !other.is_empty(),
+        }
+    }
 }
 
 /// Serializable partition mapping for rivers-core (no PyO3 dependency).

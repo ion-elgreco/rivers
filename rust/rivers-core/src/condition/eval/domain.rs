@@ -274,15 +274,6 @@ impl EvalDomain for BoolDomain {
 
 pub(crate) struct PartitionDomain;
 
-impl PartitionDomain {
-    fn fired(sel: &PartitionSelection, ctx: &EvalContext) -> bool {
-        match sel {
-            PartitionSelection::All => !require_pctx(ctx).all_keys.is_empty(),
-            other => !other.is_empty(),
-        }
-    }
-}
-
 impl EvalDomain for PartitionDomain {
     type Sel = PartitionSelection;
 
@@ -484,7 +475,7 @@ impl EvalDomain for PartitionDomain {
         sub: HashMap<u32, PartitionSelection>,
         dep: HashMap<String, HashMap<u32, PartitionSelection>>,
     ) -> EvalResult {
-        let fired = Self::fired(&top, ctx);
+        let fired = top.fires_over(require_pctx(ctx).all_keys);
         EvalResult {
             fired,
             selection: Some(top),
