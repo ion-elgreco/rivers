@@ -321,43 +321,36 @@ impl ConditionNode {
         if matches(self) {
             return replacement.clone();
         }
+        self.map_children(|c| c.replace_inner(matches, replacement))
+    }
+
+    /// Rebuild this node with each direct child subtree replaced by `f(child)`;
+    /// leaves clone unchanged. The single owned-rebuild site for the tree shape,
+    /// mirroring the borrow-shape in [`children`](Self::children).
+    fn map_children(&self, f: impl Fn(&ConditionNode) -> ConditionNode) -> ConditionNode {
         match self {
-            ConditionNode::And(children) => ConditionNode::And(
-                children
-                    .iter()
-                    .map(|c| c.replace_inner(matches, replacement))
-                    .collect(),
-            ),
-            ConditionNode::Or(children) => ConditionNode::Or(
-                children
-                    .iter()
-                    .map(|c| c.replace_inner(matches, replacement))
-                    .collect(),
-            ),
-            ConditionNode::Not(child) => {
-                ConditionNode::Not(Box::new(child.replace_inner(matches, replacement)))
-            }
-            ConditionNode::NewlyTrue(child) => {
-                ConditionNode::NewlyTrue(Box::new(child.replace_inner(matches, replacement)))
-            }
+            ConditionNode::And(children) => ConditionNode::And(children.iter().map(&f).collect()),
+            ConditionNode::Or(children) => ConditionNode::Or(children.iter().map(&f).collect()),
+            ConditionNode::Not(child) => ConditionNode::Not(Box::new(f(child))),
+            ConditionNode::NewlyTrue(child) => ConditionNode::NewlyTrue(Box::new(f(child))),
             ConditionNode::SinceLastHandled(child) => {
-                ConditionNode::SinceLastHandled(Box::new(child.replace_inner(matches, replacement)))
+                ConditionNode::SinceLastHandled(Box::new(f(child)))
             }
             ConditionNode::Since { trigger, reset } => ConditionNode::Since {
-                trigger: Box::new(trigger.replace_inner(matches, replacement)),
-                reset: Box::new(reset.replace_inner(matches, replacement)),
+                trigger: Box::new(f(trigger)),
+                reset: Box::new(f(reset)),
             },
             ConditionNode::AnyDepsMatch { condition, label } => ConditionNode::AnyDepsMatch {
-                condition: Box::new(condition.replace_inner(matches, replacement)),
+                condition: Box::new(f(condition)),
                 label: label.clone(),
             },
             ConditionNode::AllDepsMatch { condition, label } => ConditionNode::AllDepsMatch {
-                condition: Box::new(condition.replace_inner(matches, replacement)),
+                condition: Box::new(f(condition)),
                 label: label.clone(),
             },
             ConditionNode::AssetMatches { keys, condition } => ConditionNode::AssetMatches {
                 keys: keys.clone(),
-                condition: Box::new(condition.replace_inner(matches, replacement)),
+                condition: Box::new(f(condition)),
             },
             other => other.clone(),
         }
