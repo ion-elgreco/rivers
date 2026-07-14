@@ -271,7 +271,7 @@ pub(crate) fn run_tags_match(
 /// True if the tree contains `NewlyUpdated` — the only consumer of
 /// `dep_root_floor`, whose construction walks every upstream timestamp.
 pub(crate) fn contains_newly_updated(node: &ConditionNode) -> bool {
-    matches!(node, ConditionNode::NewlyUpdated) || node.children().any(contains_newly_updated)
+    node.any_node(&|n| matches!(n, ConditionNode::NewlyUpdated))
 }
 
 /// Whether a dep at `dep_ts` counts as newly-updated against a downstream

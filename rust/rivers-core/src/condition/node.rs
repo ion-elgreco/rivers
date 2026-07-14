@@ -219,36 +219,41 @@ impl ConditionNode {
             & !ConditionNode::ExecutionFailed
     }
 
+    /// True if any node in the tree (including `self`) satisfies `pred`.
+    pub(crate) fn any_node(&self, pred: &dyn Fn(&ConditionNode) -> bool) -> bool {
+        pred(self) || self.children().any(|c| c.any_node(pred))
+    }
+
     /// Returns true if this condition tree contains any time-based nodes.
     pub fn has_time_based_conditions(&self) -> bool {
-        matches!(self, ConditionNode::CronTickPassed { .. })
-            || self.children().any(|c| c.has_time_based_conditions())
+        self.any_node(&|n| matches!(n, ConditionNode::CronTickPassed { .. }))
     }
 
     /// True if the tree contains a stateful operator (`Since`/`NewlyTrue`).
     pub fn has_stateful_nodes(&self) -> bool {
-        matches!(
-            self,
-            ConditionNode::Since { .. } | ConditionNode::NewlyTrue(_)
-        ) || self.children().any(|c| c.has_stateful_nodes())
+        self.any_node(&|n| matches!(n, ConditionNode::Since { .. } | ConditionNode::NewlyTrue(_)))
     }
 
     /// True if the tree contains a dep-aggregate (`AnyDepsMatch`/`AllDepsMatch`/`AssetMatches`).
     pub fn has_dep_aggregate(&self) -> bool {
-        matches!(
-            self,
-            ConditionNode::AnyDepsMatch { .. }
-                | ConditionNode::AllDepsMatch { .. }
-                | ConditionNode::AssetMatches { .. }
-        ) || self.children().any(|c| c.has_dep_aggregate())
+        self.any_node(&|n| {
+            matches!(
+                n,
+                ConditionNode::AnyDepsMatch { .. }
+                    | ConditionNode::AllDepsMatch { .. }
+                    | ConditionNode::AssetMatches { .. }
+            )
+        })
     }
 
     /// Returns true if this condition tree contains `HasRunWithTags` or `AllRunsHaveTags`.
     pub fn uses_tick_tags(&self) -> bool {
-        matches!(
-            self,
-            ConditionNode::HasRunWithTags { .. } | ConditionNode::AllRunsHaveTags { .. }
-        ) || self.children().any(|c| c.uses_tick_tags())
+        self.any_node(&|n| {
+            matches!(
+                n,
+                ConditionNode::HasRunWithTags { .. } | ConditionNode::AllRunsHaveTags { .. }
+            )
+        })
     }
 
     /// True if any upstream dep matches the given condition.
