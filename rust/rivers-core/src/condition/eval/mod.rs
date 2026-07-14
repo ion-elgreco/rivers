@@ -200,16 +200,8 @@ fn eval<D: EvalDomain>(
                 .get(ctx.target_key)
                 .into_iter()
                 .flatten();
-            let result = fold_deps::<D>(
-                deps,
-                condition,
-                ctx,
-                counter,
-                dep_scope,
-                D::empty(),
-                D::or,
-                |s| s.is_all(),
-            );
+            let result =
+                fold_deps::<D>(deps, condition, ctx, counter, dep_scope, Quantifier::Any);
             finish(result, Vec::new())
         }
         ConditionNode::AllDepsMatch { condition, .. } => {
@@ -219,29 +211,13 @@ fn eval<D: EvalDomain>(
                 .get(ctx.target_key)
                 .into_iter()
                 .flatten();
-            let result = fold_deps::<D>(
-                deps,
-                condition,
-                ctx,
-                counter,
-                dep_scope,
-                D::all(),
-                D::and,
-                |s| !s.is_true(),
-            );
+            let result =
+                fold_deps::<D>(deps, condition, ctx, counter, dep_scope, Quantifier::All);
             finish(result, Vec::new())
         }
         ConditionNode::AssetMatches { keys, condition } => {
-            let result = fold_deps::<D>(
-                keys.iter(),
-                condition,
-                ctx,
-                counter,
-                dep_scope,
-                D::empty(),
-                D::or,
-                |s| s.is_all(),
-            );
+            let result =
+                fold_deps::<D>(keys.iter(), condition, ctx, counter, dep_scope, Quantifier::Any);
             finish(result, Vec::new())
         }
 
@@ -254,9 +230,7 @@ fn eval<D: EvalDomain>(
                 sub,
                 dep_scope,
                 build_tree,
-                D::all(),
-                D::and,
-                |s| !s.is_true(),
+                Quantifier::All,
             );
             finish(result, child_parts)
         }
@@ -268,9 +242,7 @@ fn eval<D: EvalDomain>(
                 sub,
                 dep_scope,
                 build_tree,
-                D::empty(),
-                D::or,
-                |s| s.is_all(),
+                Quantifier::Any,
             );
             finish(result, child_parts)
         }
@@ -328,30 +300,58 @@ fn finalize_dep_counter(counter: &mut u32, base: u32, condition: &ConditionNode)
     count_nodes(condition, counter);
 }
 
+/// Whether a fold unions toward saturation-at-`All` (`Any`/`Or`) or intersects
+/// toward saturation-at-not-true (`All`/`And`). Bundles the identity, combine
+/// op, and saturation test so the two folds take one arg instead of three.
+#[derive(Clone, Copy)]
+enum Quantifier {
+    Any,
+    All,
+}
+
+impl Quantifier {
+    fn init<D: EvalDomain>(self) -> D::Sel {
+        match self {
+            Quantifier::Any => D::empty(),
+            Quantifier::All => D::all(),
+        }
+    }
+    fn combine<D: EvalDomain>(self) -> fn(D::Sel, &D::Sel) -> D::Sel {
+        match self {
+            Quantifier::Any => D::or,
+            Quantifier::All => D::and,
+        }
+    }
+    fn saturated<V: DomainVal>(self, value: &V) -> bool {
+        match self {
+            Quantifier::Any => value.is_all(),
+            Quantifier::All => !value.is_true(),
+        }
+    }
+}
+
 /// Fold a dep-aggregate: pivot `condition` into each dep/key and combine the
-/// results from `init` with `combine`, short-circuiting once `saturated` — but
-/// evaluating every dep when a stateful child needs its per-dep latch recorded.
-/// An empty `deps` iterator returns `init` (so an all-quantifier over no deps is
-/// vacuously true).
-#[allow(clippy::too_many_arguments)]
+/// results per `quant`, short-circuiting once saturated — but evaluating every
+/// dep when a stateful child needs its per-dep latch recorded. An empty `deps`
+/// iterator returns the quantifier's identity (so an all-quantifier over no
+/// deps is vacuously true).
 fn fold_deps<'a, D: EvalDomain>(
     deps: impl IntoIterator<Item = &'a String>,
     condition: &ConditionNode,
     ctx: &EvalContext,
     counter: &mut u32,
     dep_scope: &mut DepScope<D::Sel>,
-    init: D::Sel,
-    combine: fn(D::Sel, &D::Sel) -> D::Sel,
-    saturated: impl Fn(&D::Sel) -> bool,
+    quant: Quantifier,
 ) -> D::Sel {
     let base = *counter;
     let eval_all = condition.has_stateful_nodes();
-    let mut result = init;
+    let combine = quant.combine::<D>();
+    let mut result = quant.init::<D>();
     for dep in deps {
         *counter = base;
         let dep_val = D::pivot_into_dep(dep, condition, ctx, counter, dep_scope);
         result = combine(result, &dep_val);
-        if saturated(&result) && !eval_all {
+        if quant.saturated(&result) && !eval_all {
             break;
         }
     }
@@ -365,7 +365,6 @@ fn fold_deps<'a, D: EvalDomain>(
 /// stateful node whose per-tick latch must be recorded. A skipped child only
 /// advances the node counter (and builds a skipped tree when `build_tree`), so
 /// node indices stay aligned regardless of short-circuiting.
-#[allow(clippy::too_many_arguments)]
 fn fold_combinator<D: EvalDomain>(
     children: &[ConditionNode],
     ctx: &EvalContext,
@@ -373,14 +372,13 @@ fn fold_combinator<D: EvalDomain>(
     sub: &mut HashMap<u32, D::Sel>,
     dep_scope: &mut DepScope<D::Sel>,
     build_tree: bool,
-    init: D::Sel,
-    combine: fn(D::Sel, &D::Sel) -> D::Sel,
-    saturated: impl Fn(&D::Sel) -> bool,
+    quant: Quantifier,
 ) -> (D::Sel, Vec<EvalNodeResult>) {
-    let mut result = init;
+    let combine = quant.combine::<D>();
+    let mut result = quant.init::<D>();
     let mut child_parts = Vec::with_capacity(if build_tree { children.len() } else { 0 });
     for child in children {
-        let sat = saturated(&result);
+        let sat = quant.saturated(&result);
         if sat && !child.has_stateful_nodes() {
             if build_tree {
                 child_parts.push(build_skipped_subtree(child, counter));
