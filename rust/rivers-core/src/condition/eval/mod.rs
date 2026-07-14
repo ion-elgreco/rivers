@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::storage::PartitionKey;
+use crate::storage::{AssetRecord, PartitionKey};
 
 use super::node::ConditionNode;
 use super::partition::{PartitionEvalContext, PartitionResolver, PartitionSelection};
@@ -432,6 +432,35 @@ pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResul
     }
 }
 
+/// Build an `EvalContext` for evaluating a condition as if `dep_key` were the
+/// target, inheriting the root-invariant fields from `ctx`. Only `partitions`
+/// and `root_partition_floor` vary per pivot kind.
+fn dep_eval_context<'a>(
+    ctx: &EvalContext<'a>,
+    dep_key: &'a str,
+    dep_record: &'a AssetRecord,
+    partitions: Option<&'a PartitionEvalContext<'a>>,
+    root_partition_floor: Option<Option<i64>>,
+) -> EvalContext<'a> {
+    EvalContext {
+        target_key: dep_key,
+        root_key: ctx.root_key,
+        target_record: dep_record,
+        cache: ctx.cache,
+        tags: ctx.tags,
+        prev_state: ctx
+            .all_asset_states
+            .get(dep_key)
+            .unwrap_or(&EMPTY_CONDITION_STATE),
+        all_asset_states: ctx.all_asset_states,
+        requested_this_tick: ctx.requested_this_tick,
+        now: ctx.now,
+        is_initial: ctx.is_initial,
+        partitions,
+        root_partition_floor,
+    }
+}
+
 /// Evaluate `condition` as if `dep_key` were the target asset.
 fn eval_on_dep(
     dep_key: &str,
@@ -444,31 +473,12 @@ fn eval_on_dep(
         Some(r) => r,
         None => return false,
     };
-    let dep_state = ctx
-        .all_asset_states
-        .get(dep_key)
-        .unwrap_or(&EMPTY_CONDITION_STATE);
-    let dep_ctx = EvalContext {
-        target_key: dep_key,
-        root_key: ctx.root_key,
-        target_record: dep_record,
-        cache: ctx.cache,
-        tags: ctx.tags,
-        prev_state: dep_state,
-        all_asset_states: ctx.all_asset_states,
-        requested_this_tick: ctx.requested_this_tick,
-        now: ctx.now,
-        is_initial: ctx.is_initial,
-        partitions: None,
-        // Inherit the root-universe staleness floor unchanged. Once a partitioned
-        // pivot has bridged into the bool world there is no partition universe to
-        // recompute from, so a `NewlyUpdated` leaf nested behind any further run
-        // of unpartitioned dep-aggregates must keep comparing against the root's
-        // floor (seeded at the bridge) rather than falling back to the root
-        // record's scalar timestamp. `None` in → `None` out for a genuinely
-        // unpartitioned root, so this is a no-op there.
-        root_partition_floor: ctx.root_partition_floor,
-    };
+    // Inherit the root-universe staleness floor unchanged: once a partitioned
+    // pivot has bridged into the bool world there is no partition universe to
+    // recompute from, so a `NewlyUpdated` leaf behind further unpartitioned
+    // dep-aggregates keeps comparing against the root's floor (seeded at the
+    // bridge). `None` in → `None` out for a genuinely unpartitioned root.
+    let dep_ctx = dep_eval_context(ctx, dep_key, dep_record, None, ctx.root_partition_floor);
     let mut local = HashMap::new();
     let saved = dep_results.cur_prev;
     let latch = dep_results.prev.get(dep_key).unwrap_or(&EMPTY_BOOL_LATCH);
@@ -512,24 +522,7 @@ fn eval_partitioned_on_dep(
                 .get(ctx.root_key)
                 .and_then(|status| root_floor_over_attempted(pctx.all_keys.iter(), status)),
         };
-        let dep_state = ctx
-            .all_asset_states
-            .get(dep_key)
-            .unwrap_or(&EMPTY_CONDITION_STATE);
-        let dep_ctx = EvalContext {
-            target_key: dep_key,
-            root_key: ctx.root_key,
-            target_record: dep_record,
-            cache: ctx.cache,
-            tags: ctx.tags,
-            prev_state: dep_state,
-            all_asset_states: ctx.all_asset_states,
-            requested_this_tick: ctx.requested_this_tick,
-            now: ctx.now,
-            is_initial: ctx.is_initial,
-            partitions: None,
-            root_partition_floor: Some(root_floor),
-        };
+        let dep_ctx = dep_eval_context(ctx, dep_key, dep_record, None, Some(root_floor));
         let bool_latch: HashMap<u32, bool> = prev_dep_sel
             .map(|m| m.iter().map(|(idx, sel)| (*idx, !sel.is_empty())).collect())
             .unwrap_or_default();
@@ -652,10 +645,6 @@ fn eval_partitioned_on_dep(
         dep_root_floor: dep_root_floor.as_ref(),
     };
 
-    let dep_state = ctx
-        .all_asset_states
-        .get(dep_key)
-        .unwrap_or(&EMPTY_CONDITION_STATE);
     // Nested dep-aggregates lose sight of the root's universe; carry the
     // bridge floor computed over it so their unpartitioned-dep pivots don't
     // recompute it over this dep's key space.
@@ -666,20 +655,13 @@ fn eval_partitioned_on_dep(
                 .and_then(|status| root_floor_over_attempted(pctx.all_keys.iter(), status))
         })
     });
-    let dep_ctx = EvalContext {
-        target_key: dep_key,
-        root_key: ctx.root_key,
-        target_record: dep_record,
-        cache: ctx.cache,
-        tags: ctx.tags,
-        prev_state: dep_state,
-        all_asset_states: ctx.all_asset_states,
-        requested_this_tick: ctx.requested_this_tick,
-        now: ctx.now,
-        is_initial: ctx.is_initial,
-        partitions: Some(&upstream_pctx),
-        root_partition_floor: nested_bridge_floor,
-    };
+    let dep_ctx = dep_eval_context(
+        ctx,
+        dep_key,
+        dep_record,
+        Some(&upstream_pctx),
+        nested_bridge_floor,
+    );
 
     let mut local = HashMap::new();
     let saved = dep_selections.cur_prev;
