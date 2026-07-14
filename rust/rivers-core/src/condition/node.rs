@@ -12,6 +12,18 @@ pub fn format_tag_label(
     format!("{}({})", name, parts.join(", "))
 }
 
+/// Format an `AssetMatches` key list: `'k'` for one key, `['a', 'b']` for many.
+/// Shared by `node_label` and `describe` so the two surfaces (which the
+/// `replace()`/`without()` matchers rely on agreeing) can't drift.
+fn keys_label(keys: &[String]) -> String {
+    if keys.len() == 1 {
+        format!("'{}'", keys[0])
+    } else {
+        let joined: Vec<_> = keys.iter().map(|k| format!("'{}'", k)).collect();
+        format!("[{}]", joined.join(", "))
+    }
+}
+
 /// A condition tree node describing when an asset should be auto-materialized.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ConditionNode {
@@ -411,15 +423,9 @@ impl ConditionNode {
                 None => format!("all_deps_match({})", condition.fingerprint_hex()),
             },
             ConditionNode::AssetMatches { keys, condition } => {
-                let keys_label = if keys.len() == 1 {
-                    format!("'{}'", keys[0])
-                } else {
-                    let joined: Vec<_> = keys.iter().map(|k| format!("'{}'", k)).collect();
-                    format!("[{}]", joined.join(", "))
-                };
                 format!(
                     "asset_matches({}, {})",
-                    keys_label,
+                    keys_label(keys),
                     condition.fingerprint_hex()
                 )
             }
@@ -470,13 +476,7 @@ impl ConditionNode {
                 None => format!("all_deps_match({})", condition.describe()),
             },
             ConditionNode::AssetMatches { keys, condition } => {
-                let keys_label = if keys.len() == 1 {
-                    format!("'{}'", keys[0])
-                } else {
-                    let joined: Vec<_> = keys.iter().map(|k| format!("'{}'", k)).collect();
-                    format!("[{}]", joined.join(", "))
-                };
-                format!("asset_matches({}, {})", keys_label, condition.describe())
+                format!("asset_matches({}, {})", keys_label(keys), condition.describe())
             }
             _ => self.node_label(),
         }
