@@ -208,8 +208,8 @@ impl PartitionMappingKind {
         downstream_universe: Option<&HashSet<PartitionKey>>,
     ) -> PartitionSelection {
         match self {
-            Self::Identity => upstream_keys.clone(),
-            Self::AllPartitions => {
+            Self::Identity | Self::Subset => upstream_keys.clone(),
+            Self::AllPartitions | Self::SpecificPartitions { .. } | Self::ForKeys => {
                 if upstream_keys.is_empty() {
                     PartitionSelection::Empty
                 } else {
@@ -244,13 +244,6 @@ impl PartitionMappingKind {
             },
             Self::TimeWindow { offset, grid } => {
                 shift_selection(upstream_keys, -*offset, grid.as_ref())
-            }
-            Self::SpecificPartitions { .. } => {
-                if upstream_keys.is_empty() {
-                    PartitionSelection::Empty
-                } else {
-                    PartitionSelection::All
-                }
             }
             Self::Multi { dimension_mappings } => match upstream_keys {
                 PartitionSelection::Empty => PartitionSelection::Empty,
@@ -427,14 +420,6 @@ impl PartitionMappingKind {
                     PartitionSelection::from_keys(mapped)
                 }
             },
-            Self::ForKeys => {
-                if upstream_keys.is_empty() {
-                    PartitionSelection::Empty
-                } else {
-                    PartitionSelection::All
-                }
-            }
-            Self::Subset => upstream_keys.clone(),
         }
     }
 }
