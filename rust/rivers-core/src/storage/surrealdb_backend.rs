@@ -6399,6 +6399,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_step_retry_event_round_trips_with_metadata() {
+        use crate::execution::retry::meta;
+        let storage = make_storage().await;
+        register(&storage, &["flaky"]).await;
+
+        let events = vec![
+            EventRecord {
+                code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("flaky".to_string()),
+                run_id: "retry_run".to_string(),
+                partition_key: None,
+                timestamp: 1000,
+                metadata: vec![
+                    (meta::ATTEMPT.to_string(), "1".to_string()),
+                    (meta::REASON.to_string(), "out_of_memory".to_string()),
+                    (meta::RETRIABLE.to_string(), "true".to_string()),
+                ],
+                input_data_versions: vec![],
+            },
+            EventRecord {
+                code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepRetry,
+                asset_key: Some("flaky".to_string()),
+                run_id: "retry_run".to_string(),
+                partition_key: None,
+                timestamp: 1001,
+                metadata: vec![
+                    (meta::ATTEMPT.to_string(), "1".to_string()),
+                    (meta::REASON.to_string(), "out_of_memory".to_string()),
+                    (meta::NEXT_DELAY_MS.to_string(), "5000".to_string()),
+                    (
+                        meta::NEXT_COMPUTE.to_string(),
+                        r#"{"memory":"16Gi"}"#.to_string(),
+                    ),
+                ],
+                input_data_versions: vec![],
+            },
+        ];
+        storage.store_events(&events).await.unwrap();
+
+        let read = storage.get_events_for_run("retry_run").await.unwrap();
+        assert_eq!(read.len(), 2);
+        let retry = read
+            .iter()
+            .find(|e| e.event_type == EventType::StepRetry)
+            .expect("StepRetry event must survive the SurrealDB + RocksDB round-trip");
+        let get = |k: &str| {
+            retry
+                .metadata
+                .iter()
+                .find(|(mk, _)| mk == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get(meta::NEXT_DELAY_MS), Some("5000"));
+        assert_eq!(get(meta::NEXT_COMPUTE), Some(r#"{"memory":"16Gi"}"#));
+        assert_eq!(get(meta::REASON), Some("out_of_memory"));
+    }
+
+    #[tokio::test]
     async fn test_input_versions_from_event_not_storage() {
         let storage = make_storage().await;
         register(&storage, &["upstream", "downstream"]).await;

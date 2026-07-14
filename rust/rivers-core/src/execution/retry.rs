@@ -148,6 +148,23 @@ pub enum RetryRef {
     Named(String),
 }
 
+/// Metadata keys carried on `StepFailure` / `StepRetry` event records.
+/// Shared by the emitter (executor) and readers (resume reconstruction, UI).
+pub mod meta {
+    /// 1-indexed attempt number of the attempt that failed.
+    pub const ATTEMPT: &str = "rivers/attempt";
+    /// [`super::FailureReason`] (snake_case) that classified the failure.
+    pub const REASON: &str = "rivers/failure_reason";
+    /// Fully-qualified class of the raised exception, if any.
+    pub const EXC_TYPE: &str = "rivers/exc_type";
+    /// `"true"`/`"false"` — did the policy admit another attempt.
+    pub const RETRIABLE: &str = "rivers/retriable";
+    /// Delay in milliseconds before the next attempt (on a `StepRetry`).
+    pub const NEXT_DELAY_MS: &str = "rivers/next_delay_ms";
+    /// JSON-encoded next-attempt `Compute` when a `StepRetry` escalated resources.
+    pub const NEXT_COMPUTE: &str = "rivers/next_compute";
+}
+
 /// Does `policy.retry_on` admit a failure classified as `reason` whose raised
 /// exception has MRO class names `exc_types` (empty when there is no exception,
 /// e.g. an OOM pod-kill)? Does *not* apply the budget or the `Cancelled` guard —

@@ -126,6 +126,9 @@ pub enum EventType {
     StepStart,
     StepSuccess,
     StepFailure,
+    /// A failed attempt is about to be retried. Metadata carries the attempt
+    /// number, classified reason, and next delay/resources.
+    StepRetry,
     /// Captured stdout/stderr output from a step execution.
     LogOutput,
     // ── Concurrency observability events ──
@@ -162,6 +165,7 @@ impl EventType {
             Self::StepStart => "StepStart",
             Self::StepSuccess => "StepSuccess",
             Self::StepFailure => "StepFailure",
+            Self::StepRetry => "StepRetry",
             Self::LogOutput => "LogOutput",
             Self::RunQueued => "RunQueued",
             Self::RunDequeued => "RunDequeued",
@@ -183,6 +187,7 @@ impl EventType {
             "StepStart" => Ok(Self::StepStart),
             "StepSuccess" => Ok(Self::StepSuccess),
             "StepFailure" => Ok(Self::StepFailure),
+            "StepRetry" => Ok(Self::StepRetry),
             "LogOutput" => Ok(Self::LogOutput),
             "RunQueued" => Ok(Self::RunQueued),
             "RunDequeued" => Ok(Self::RunDequeued),
@@ -209,7 +214,7 @@ impl EventType {
             Self::LogOutput => 1,
             Self::Observation { .. } => 2,
             Self::Materialization { .. } => 3,
-            Self::StepSuccess | Self::StepFailure => 4,
+            Self::StepSuccess | Self::StepFailure | Self::StepRetry => 4,
             Self::RunQueued | Self::RunDequeued => 5,
             Self::StepSlotClaimed
             | Self::StepSlotWaiting
@@ -2243,6 +2248,57 @@ pub trait StorageBackend: PerCodeLocationStorage {
         &self,
         run_id: &str,
     ) -> impl Future<Output = Result<HashMap<String, String>>> + Send;
+}
+
+#[cfg(test)]
+mod event_type_tests {
+    use super::EventType;
+
+    #[test]
+    fn all_variants_round_trip_by_type_name() {
+        let variants = [
+            EventType::Materialization {
+                data_version: Some("v1".into()),
+            },
+            EventType::Observation { data_version: None },
+            EventType::StepStart,
+            EventType::StepSuccess,
+            EventType::StepFailure,
+            EventType::StepRetry,
+            EventType::LogOutput,
+            EventType::RunQueued,
+            EventType::RunDequeued,
+            EventType::StepSlotClaimed,
+            EventType::StepSlotWaiting,
+            EventType::StepSlotRenewed,
+            EventType::StepSlotReleased,
+        ];
+        for ev in variants {
+            let name = ev.type_name();
+            let dv = ev.data_version().map(String::from);
+            let back = EventType::from_type_name(name, dv).unwrap();
+            assert_eq!(back, ev, "round-trip failed for {name}");
+        }
+    }
+
+    #[test]
+    fn step_retry_names_and_sorts() {
+        assert_eq!(EventType::StepRetry.type_name(), "StepRetry");
+        assert_eq!(
+            EventType::from_type_name("StepRetry", None).unwrap(),
+            EventType::StepRetry
+        );
+        // sorts alongside the other step-terminal events within a tick
+        assert_eq!(
+            EventType::StepRetry.sort_order(),
+            EventType::StepFailure.sort_order()
+        );
+    }
+
+    #[test]
+    fn unknown_type_name_errors() {
+        assert!(EventType::from_type_name("Nope", None).is_err());
+    }
 }
 
 #[cfg(test)]
