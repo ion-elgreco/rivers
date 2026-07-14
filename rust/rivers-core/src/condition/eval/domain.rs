@@ -1,12 +1,12 @@
 //! One condition evaluator over the bool and `PartitionSelection` domains.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::storage::PartitionKey;
 
 use super::super::node::ConditionNode;
 use super::super::partition::{PartitionEvalContext, PartitionSelection};
-use super::super::state::{EvalContext, EvalNodeResult, NodeStatus};
+use super::super::state::{EvalContext, EvalNodeResult, EvalResult, NodeStatus};
 use super::support::*;
 use super::{DepScope, count_nodes, eval_on_dep, eval_partitioned_on_dep};
 
@@ -172,6 +172,19 @@ pub(crate) trait EvalDomain {
         counter: &mut u32,
         dep_scope: &mut DepScope<Self::Sel>,
     ) -> Self::Sel;
+
+    /// Previous-tick per-dep latches to seed the root `DepScope` with.
+    fn root_dep_prev<'a>(ctx: &'a EvalContext)
+    -> &'a HashMap<String, HashMap<u32, Self::Sel>>;
+
+    /// Assemble the tick's `EvalResult` from the root result plus the per-node
+    /// (`sub`) and per-dep (`dep`) latches this domain populated.
+    fn assemble(
+        top: Self::Sel,
+        ctx: &EvalContext,
+        sub: HashMap<u32, Self::Sel>,
+        dep: HashMap<String, HashMap<u32, Self::Sel>>,
+    ) -> EvalResult;
 }
 
 pub(crate) struct BoolDomain;
@@ -322,6 +335,24 @@ impl EvalDomain for BoolDomain {
         dep_scope: &mut DepScope<bool>,
     ) -> bool {
         eval_on_dep(dep_key, condition, ctx, counter, dep_scope)
+    }
+
+    fn root_dep_prev<'a>(ctx: &'a EvalContext) -> &'a HashMap<String, HashMap<u32, bool>> {
+        &ctx.prev_state.dep_previous_results
+    }
+
+    fn assemble(
+        top: bool,
+        _ctx: &EvalContext,
+        sub: HashMap<u32, bool>,
+        dep: HashMap<String, HashMap<u32, bool>>,
+    ) -> EvalResult {
+        EvalResult {
+            fired: top,
+            sub_results: sub,
+            dep_sub_results: dep,
+            ..Default::default()
+        }
     }
 }
 
@@ -535,5 +566,27 @@ impl EvalDomain for PartitionDomain {
             counter,
             dep_scope,
         )
+    }
+
+    fn root_dep_prev<'a>(
+        ctx: &'a EvalContext,
+    ) -> &'a HashMap<String, HashMap<u32, PartitionSelection>> {
+        super::root_dep_selections(ctx)
+    }
+
+    fn assemble(
+        top: PartitionSelection,
+        ctx: &EvalContext,
+        sub: HashMap<u32, PartitionSelection>,
+        dep: HashMap<String, HashMap<u32, PartitionSelection>>,
+    ) -> EvalResult {
+        let fired = Self::fired(&top, ctx);
+        EvalResult {
+            fired,
+            selection: Some(top),
+            sub_selections: Some(sub),
+            dep_sub_selections: Some(dep),
+            ..Default::default()
+        }
     }
 }
