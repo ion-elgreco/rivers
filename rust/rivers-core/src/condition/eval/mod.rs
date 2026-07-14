@@ -468,6 +468,19 @@ fn eval_on_dep(
     val
 }
 
+/// The staleness floor for a bridge into the unpartitioned bool world: inherit
+/// the precomputed root-universe floor, else compute it over the root's
+/// attempted keys. Fan-out ignores never-attempted frontier keys (like an
+/// AllPartitions edge) instead of letting a freshly-minted key drag the floor to
+/// None and refire everything.
+fn bridge_floor(ctx: &EvalContext, pctx: &PartitionEvalContext) -> Option<i64> {
+    ctx.root_partition_floor.unwrap_or_else(|| {
+        pctx.all_partition_statuses
+            .get(ctx.root_key)
+            .and_then(|status| root_floor_over_attempted(pctx.all_keys.iter(), status))
+    })
+}
+
 /// Evaluate a condition on an upstream dep in partition-aware mode.
 /// Maps partitions: downstream → upstream, evaluate, upstream → downstream.
 fn eval_partitioned_on_dep(
@@ -491,16 +504,7 @@ fn eval_partitioned_on_dep(
         // In a nested pivot `pctx.all_keys` is the intermediate dep's key
         // space, not the root's — use the floor precomputed at the outer
         // pivot over the true root universe.
-        let root_floor = match ctx.root_partition_floor {
-            Some(f) => f,
-            // Fan-out over the whole root universe: ignore never-attempted
-            // frontier keys like an AllPartitions edge, or a freshly-minted
-            // key drags the floor to None and refires everything.
-            None => pctx
-                .all_partition_statuses
-                .get(ctx.root_key)
-                .and_then(|status| root_floor_over_attempted(pctx.all_keys.iter(), status)),
-        };
+        let root_floor = bridge_floor(ctx, pctx);
         let dep_ctx = dep_eval_context(ctx, dep_key, dep_record, None, Some(root_floor));
         let bool_latch: HashMap<u32, bool> = prev_dep_sel
             .map(|m| m.iter().map(|(idx, sel)| (*idx, !sel.is_empty())).collect())
@@ -634,13 +638,7 @@ fn eval_partitioned_on_dep(
     // Nested dep-aggregates lose sight of the root's universe; carry the
     // bridge floor computed over it so their unpartitioned-dep pivots don't
     // recompute it over this dep's key space.
-    let nested_bridge_floor = condition.has_dep_aggregate().then(|| {
-        ctx.root_partition_floor.unwrap_or_else(|| {
-            pctx.all_partition_statuses
-                .get(ctx.root_key)
-                .and_then(|status| root_floor_over_attempted(pctx.all_keys.iter(), status))
-        })
-    });
+    let nested_bridge_floor = condition.has_dep_aggregate().then(|| bridge_floor(ctx, pctx));
     let dep_ctx = dep_eval_context(
         ctx,
         dep_key,
