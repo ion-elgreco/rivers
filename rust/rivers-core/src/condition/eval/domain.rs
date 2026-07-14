@@ -57,7 +57,6 @@ pub(crate) trait EvalDomain {
     fn not(a: Self::Sel, ctx: &EvalContext) -> Self::Sel;
     fn difference(a: &Self::Sel, b: &Self::Sel, ctx: &EvalContext) -> Self::Sel;
     fn restrict(a: Self::Sel, ctx: &EvalContext) -> Self::Sel;
-    fn fired(sel: &Self::Sel, ctx: &EvalContext) -> bool;
 
     // leaf status sources
     fn missing(ctx: &EvalContext) -> Self::Sel;
@@ -136,9 +135,6 @@ impl EvalDomain for BoolDomain {
     }
     fn restrict(a: bool, _ctx: &EvalContext) -> bool {
         a
-    }
-    fn fired(sel: &bool, _ctx: &EvalContext) -> bool {
-        *sel
     }
 
     fn missing(ctx: &EvalContext) -> bool {
@@ -278,6 +274,15 @@ impl EvalDomain for BoolDomain {
 
 pub(crate) struct PartitionDomain;
 
+impl PartitionDomain {
+    fn fired(sel: &PartitionSelection, ctx: &EvalContext) -> bool {
+        match sel {
+            PartitionSelection::All => !require_pctx(ctx).all_keys.is_empty(),
+            other => !other.is_empty(),
+        }
+    }
+}
+
 impl EvalDomain for PartitionDomain {
     type Sel = PartitionSelection;
 
@@ -308,12 +313,6 @@ impl EvalDomain for PartitionDomain {
     }
     fn restrict(a: PartitionSelection, ctx: &EvalContext) -> PartitionSelection {
         a.restrict_to(require_pctx(ctx).all_keys)
-    }
-    fn fired(sel: &PartitionSelection, ctx: &EvalContext) -> bool {
-        match sel {
-            PartitionSelection::All => !require_pctx(ctx).all_keys.is_empty(),
-            other => !other.is_empty(),
-        }
     }
 
     fn missing(ctx: &EvalContext) -> PartitionSelection {
