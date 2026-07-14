@@ -6,7 +6,7 @@ use crate::storage::{AssetRecord, PartitionKey};
 
 use super::node::ConditionNode;
 use super::partition::{PartitionEvalContext, PartitionResolver, PartitionSelection};
-use super::state::{AssetConditionState, EvalContext, EvalNodeResult, EvalResult};
+use super::state::{AssetConditionState, EvalContext, EvalNodeResult, EvalResult, NodeStatus};
 
 /// Per-dep latch state for stateful ops inside dep-aggregates, keyed by dep then node index.
 pub(crate) struct DepScope<'a, V> {
@@ -42,7 +42,7 @@ mod domain;
 mod support;
 
 pub use cron::*;
-use domain::{BoolDomain, DomainVal, EvalDomain, EvalOut, PartitionDomain};
+use domain::{BoolDomain, DomainVal, EvalDomain, PartitionDomain};
 pub(crate) use support::*;
 
 #[cfg(test)]
@@ -54,7 +54,7 @@ static EMPTY_CONDITION_STATE: std::sync::LazyLock<AssetConditionState> =
 
 pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
     if ctx.partitions.is_some() {
-        let result = run::<PartitionDomain, PartitionSelection>(node, ctx).0;
+        let result = run::<PartitionDomain>(node, ctx, false).0;
         tracing::debug!(
             target: "rivers::condition",
             asset_key = %ctx.target_key,
@@ -63,7 +63,7 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
         );
         result
     } else {
-        let result = run::<BoolDomain, bool>(node, ctx).0;
+        let result = run::<BoolDomain>(node, ctx, false).0;
         tracing::debug!(
             target: "rivers::condition",
             asset_key = %ctx.target_key,
@@ -77,93 +77,104 @@ pub fn evaluate(node: &ConditionNode, ctx: &EvalContext) -> EvalResult {
 /// Set up the counter and root dep-latch scope, run the evaluator over `node`,
 /// and assemble the domain's `EvalResult`. The second tuple element is the
 /// eval tree for the tree output, `()` for the fast path.
-fn run<D: EvalDomain, O: EvalOut<D::Sel>>(
+fn run<D: EvalDomain>(
     node: &ConditionNode,
     ctx: &EvalContext,
-) -> (EvalResult, O::Child) {
+    build_tree: bool,
+) -> (EvalResult, Option<EvalNodeResult>) {
     let mut counter = 0u32;
     let mut sub = HashMap::new();
     let mut dep = HashMap::new();
-    let out: O = {
+    let (top, tree) = {
         let mut dep_scope = DepScope {
             prev: D::root_dep_prev(ctx),
             acc: &mut dep,
             cur_prev: None,
             bridged: HashMap::new(),
         };
-        eval::<D, O>(node, ctx, &mut counter, &mut sub, &mut dep_scope)
+        eval::<D>(node, ctx, &mut counter, &mut sub, &mut dep_scope, build_tree)
     };
-    let (top, child) = out.into_parts();
-    (D::assemble(top, ctx, sub, dep), child)
+    (D::assemble(top, ctx, sub, dep), tree)
 }
 
-/// The single evaluator, generic over the domain `D` and output mode `O`. Node
-/// indices must advance identically across domains — persisted latches key off them.
-fn eval<D: EvalDomain, O: EvalOut<D::Sel>>(
+/// The single evaluator, generic over the domain `D`. When `build_tree` it also
+/// returns the UI eval tree; the fast path passes `false` and never allocates an
+/// `EvalNodeResult`. Node indices must advance identically regardless of
+/// `build_tree` and domain — persisted latches key off them.
+fn eval<D: EvalDomain>(
     node: &ConditionNode,
     ctx: &EvalContext,
     counter: &mut u32,
     sub: &mut HashMap<u32, D::Sel>,
     dep_scope: &mut DepScope<D::Sel>,
-) -> O {
+    build_tree: bool,
+) -> (D::Sel, Option<EvalNodeResult>) {
     let my_idx = *counter;
     *counter += 1;
     let total = ctx.partitions.map(|p| p.all_keys.len()).unwrap_or(0);
 
+    // Attach a tree node (with `children`) to `sel`, but only when building the
+    // tree; leaves pass an empty `children`.
+    let finish = |sel: D::Sel, children: Vec<EvalNodeResult>| -> (D::Sel, Option<EvalNodeResult>) {
+        let tree = build_tree.then(|| {
+            EvalNodeResult::new(
+                node,
+                my_idx,
+                NodeStatus::from_bool(sel.is_true()),
+                children,
+                sel.num_partitions(total),
+            )
+        });
+        (sel, tree)
+    };
+    // Advance the counter past a short-circuited subtree, building its skipped
+    // tree only when needed.
+    let skipped = |child: &ConditionNode, counter: &mut u32| -> Option<EvalNodeResult> {
+        if build_tree {
+            Some(build_skipped_subtree(child, counter))
+        } else {
+            count_nodes(child, counter);
+            None
+        }
+    };
+
     match node {
         // leaves
-        ConditionNode::Missing => O::leaf(D::missing(ctx), my_idx, node, total),
-        ConditionNode::InProgress => O::leaf(D::in_progress(ctx), my_idx, node, total),
-        ConditionNode::ExecutionFailed => O::leaf(D::failed(ctx), my_idx, node, total),
-        ConditionNode::NewlyUpdated => O::leaf(D::newly_updated(ctx), my_idx, node, total),
-        ConditionNode::NewlyRequested => O::leaf(D::newly_requested(ctx), my_idx, node, total),
-        ConditionNode::InLatestTimeWindow { lookback_delta } => O::leaf(
-            D::in_latest_window(ctx, *lookback_delta),
-            my_idx,
-            node,
-            total,
-        ),
-        ConditionNode::BackfillInProgress => {
-            O::leaf(D::backfill_in_progress(ctx), my_idx, node, total)
+        ConditionNode::Missing => finish(D::missing(ctx), Vec::new()),
+        ConditionNode::InProgress => finish(D::in_progress(ctx), Vec::new()),
+        ConditionNode::ExecutionFailed => finish(D::failed(ctx), Vec::new()),
+        ConditionNode::NewlyUpdated => finish(D::newly_updated(ctx), Vec::new()),
+        ConditionNode::NewlyRequested => finish(D::newly_requested(ctx), Vec::new()),
+        ConditionNode::InLatestTimeWindow { lookback_delta } => {
+            finish(D::in_latest_window(ctx, *lookback_delta), Vec::new())
         }
+        ConditionNode::BackfillInProgress => finish(D::backfill_in_progress(ctx), Vec::new()),
         ConditionNode::LastExecutedWithTags {
             tag_keys,
             tag_values,
-        } => O::leaf(
+        } => finish(
             D::last_executed_with_tags(ctx, tag_keys, tag_values),
-            my_idx,
-            node,
-            total,
+            Vec::new(),
         ),
         ConditionNode::LastRunIncludesTarget => {
-            O::leaf(D::last_run_includes_target(ctx), my_idx, node, total)
+            finish(D::last_run_includes_target(ctx), Vec::new())
         }
-        ConditionNode::WillBeRequested => O::leaf(D::will_be_requested(ctx), my_idx, node, total),
+        ConditionNode::WillBeRequested => finish(D::will_be_requested(ctx), Vec::new()),
         ConditionNode::HasRunWithTags {
             tag_keys,
             tag_values,
-        } => O::leaf(
-            D::update_tags(ctx, tag_keys, tag_values, false),
-            my_idx,
-            node,
-            total,
-        ),
+        } => finish(D::update_tags(ctx, tag_keys, tag_values, false), Vec::new()),
         ConditionNode::AllRunsHaveTags {
             tag_keys,
             tag_values,
-        } => O::leaf(
-            D::update_tags(ctx, tag_keys, tag_values, true),
-            my_idx,
-            node,
-            total,
-        ),
+        } => finish(D::update_tags(ctx, tag_keys, tag_values, true), Vec::new()),
 
         // scalar predicates
         ConditionNode::CodeVersionChanged => {
             let changed = ctx.target_record.code_version.is_some()
                 && ctx.target_record.code_version
                     != ctx.target_record.last_materialization_code_version;
-            O::leaf(D::from_bool(changed), my_idx, node, total)
+            finish(D::from_bool(changed), Vec::new())
         }
         ConditionNode::DataVersionChanged => {
             let (prev_dv, prev_ts) = data_version_baseline(ctx);
@@ -172,18 +183,16 @@ fn eval<D: EvalDomain, O: EvalOut<D::Sel>>(
                 (Some(_), None) => !ctx.is_initial && prev_ts != ctx.target_record.last_timestamp,
                 _ => false,
             };
-            O::leaf(D::from_bool(changed), my_idx, node, total)
+            finish(D::from_bool(changed), Vec::new())
         }
-        ConditionNode::InitialEvaluation => {
-            O::leaf(D::from_bool(ctx.is_initial), my_idx, node, total)
-        }
+        ConditionNode::InitialEvaluation => finish(D::from_bool(ctx.is_initial), Vec::new()),
         ConditionNode::CronTickPassed {
             cron_schedule,
             timezone,
         } => {
             let prev_ts = root_last_tick(ctx).unwrap_or(ctx.now);
             let val = cron_tick_between(cron_schedule, prev_ts, ctx.now, timezone.as_deref());
-            O::leaf(D::from_bool(val), my_idx, node, total)
+            finish(D::from_bool(val), Vec::new())
         }
 
         // dep-aggregates
@@ -204,7 +213,7 @@ fn eval<D: EvalDomain, O: EvalOut<D::Sel>>(
                 D::or,
                 |s| s.is_all(),
             );
-            O::leaf(result, my_idx, node, total)
+            finish(result, Vec::new())
         }
         ConditionNode::AllDepsMatch { condition, .. } => {
             let deps = ctx
@@ -223,7 +232,7 @@ fn eval<D: EvalDomain, O: EvalOut<D::Sel>>(
                 D::and,
                 |s| !s.is_true(),
             );
-            O::leaf(result, my_idx, node, total)
+            finish(result, Vec::new())
         }
         ConditionNode::AssetMatches { keys, condition } => {
             let result = fold_deps::<D>(
@@ -236,98 +245,75 @@ fn eval<D: EvalDomain, O: EvalOut<D::Sel>>(
                 D::or,
                 |s| s.is_all(),
             );
-            O::leaf(result, my_idx, node, total)
+            finish(result, Vec::new())
         }
 
         // combinators
         ConditionNode::And(children) => {
             let mut result = D::all(ctx);
-            let mut child_parts = if O::COLLECTS_CHILDREN {
-                Vec::with_capacity(children.len())
-            } else {
-                Vec::new()
-            };
+            let mut child_parts = Vec::with_capacity(if build_tree { children.len() } else { 0 });
             for child in children {
                 if !result.is_true() && !child.has_stateful_nodes() {
-                    let skipped = O::skipped_child(child, counter);
-                    if O::COLLECTS_CHILDREN {
-                        child_parts.push(skipped);
-                    }
+                    child_parts.extend(skipped(child, counter));
                 } else {
-                    let child_out: O = eval::<D, O>(child, ctx, counter, sub, dep_scope);
-                    let (child_sel, child_part) = child_out.into_parts();
+                    let (child_sel, child_tree) =
+                        eval::<D>(child, ctx, counter, sub, dep_scope, build_tree);
                     if result.is_true() {
                         result = D::and(result, &child_sel);
                     }
-                    if O::COLLECTS_CHILDREN {
-                        child_parts.push(child_part);
-                    }
+                    child_parts.extend(child_tree);
                 }
             }
-            O::composite(result, my_idx, node, total, child_parts)
+            finish(result, child_parts)
         }
         ConditionNode::Or(children) => {
             let mut result = D::empty();
-            let mut child_parts = if O::COLLECTS_CHILDREN {
-                Vec::with_capacity(children.len())
-            } else {
-                Vec::new()
-            };
+            let mut child_parts = Vec::with_capacity(if build_tree { children.len() } else { 0 });
             for child in children {
                 if result.is_all() && !child.has_stateful_nodes() {
-                    let skipped = O::skipped_child(child, counter);
-                    if O::COLLECTS_CHILDREN {
-                        child_parts.push(skipped);
-                    }
+                    child_parts.extend(skipped(child, counter));
                 } else {
-                    let child_out: O = eval::<D, O>(child, ctx, counter, sub, dep_scope);
-                    let (child_sel, child_part) = child_out.into_parts();
+                    let (child_sel, child_tree) =
+                        eval::<D>(child, ctx, counter, sub, dep_scope, build_tree);
                     if !result.is_all() {
                         result = D::or(result, &child_sel);
                     }
-                    if O::COLLECTS_CHILDREN {
-                        child_parts.push(child_part);
-                    }
+                    child_parts.extend(child_tree);
                 }
             }
-            O::composite(result, my_idx, node, total, child_parts)
+            finish(result, child_parts)
         }
         ConditionNode::Not(child) => {
-            let child_out: O = eval::<D, O>(child, ctx, counter, sub, dep_scope);
-            let (child_sel, child_part) = child_out.into_parts();
+            let (child_sel, child_tree) = eval::<D>(child, ctx, counter, sub, dep_scope, build_tree);
             let result = D::not(child_sel, ctx);
-            O::composite(result, my_idx, node, total, vec![child_part])
+            finish(result, child_tree.into_iter().collect())
         }
 
         // stateful ops
         ConditionNode::NewlyTrue(child) => {
-            let child_out: O = eval::<D, O>(child, ctx, counter, sub, dep_scope);
-            let (current, child_part) = child_out.into_parts();
+            let (current, child_tree) = eval::<D>(child, ctx, counter, sub, dep_scope, build_tree);
             let previous = D::prev_latch(dep_scope, ctx, my_idx);
             let result = D::difference(current.clone(), &previous, ctx);
             sub.insert(my_idx, current);
-            O::composite(result, my_idx, node, total, vec![child_part])
+            finish(result, child_tree.into_iter().collect())
         }
         ConditionNode::Since { trigger, reset } => {
-            let trigger_out: O = eval::<D, O>(trigger, ctx, counter, sub, dep_scope);
-            let reset_out: O = eval::<D, O>(reset, ctx, counter, sub, dep_scope);
-            let (trigger_sel, trigger_part) = trigger_out.into_parts();
-            let (reset_sel, reset_part) = reset_out.into_parts();
+            let (trigger_sel, trigger_tree) =
+                eval::<D>(trigger, ctx, counter, sub, dep_scope, build_tree);
+            let (reset_sel, reset_tree) = eval::<D>(reset, ctx, counter, sub, dep_scope, build_tree);
             let prev = D::prev_latch(dep_scope, ctx, my_idx);
             // Restrict to the current universe so a latch can't carry forward
             // keys retired from the partition set (unpartitioned: a no-op).
-            let result = D::restrict(
-                D::difference(D::or(prev, &trigger_sel), &reset_sel, ctx),
-                ctx,
-            );
+            let result =
+                D::restrict(D::difference(D::or(prev, &trigger_sel), &reset_sel, ctx), ctx);
             sub.insert(my_idx, result.clone());
-            O::composite(result, my_idx, node, total, vec![trigger_part, reset_part])
+            let children = [trigger_tree, reset_tree].into_iter().flatten().collect();
+            finish(result, children)
         }
         ConditionNode::SinceLastHandled(child) => {
-            let child_out: O = eval::<D, O>(child, ctx, counter, sub, dep_scope);
-            let (current, child_part) = child_out.into_parts();
+            let (current, child_tree) = eval::<D>(child, ctx, counter, sub, dep_scope, build_tree);
             let result = D::since_last_handled(current, ctx);
-            O::composite(result, my_idx, node, total, vec![child_part])
+            finish(result, child_tree.into_iter().collect())
         }
     }
 }
@@ -381,11 +367,12 @@ fn fold_deps<'a, D: EvalDomain>(
 /// Evaluate a `ConditionNode` tree and return both the compact result (for
 /// state tracking) and a full evaluation tree (for UI visualization).
 pub fn evaluate_with_tree(node: &ConditionNode, ctx: &EvalContext) -> (EvalResult, EvalNodeResult) {
-    if ctx.partitions.is_some() {
-        run::<PartitionDomain, (PartitionSelection, EvalNodeResult)>(node, ctx)
+    let (result, tree) = if ctx.partitions.is_some() {
+        run::<PartitionDomain>(node, ctx, true)
     } else {
-        run::<BoolDomain, (bool, EvalNodeResult)>(node, ctx)
-    }
+        run::<BoolDomain>(node, ctx, true)
+    };
+    (result, tree.expect("build_tree=true always yields a root tree node"))
 }
 
 /// Build an `EvalContext` for evaluating a condition as if `dep_key` were the
@@ -439,7 +426,7 @@ fn eval_on_dep(
     let saved = dep_results.cur_prev;
     let latch = dep_results.prev.get(dep_key).unwrap_or(&EMPTY_BOOL_LATCH);
     dep_results.cur_prev = Some(latch);
-    let val = eval::<BoolDomain, bool>(condition, &dep_ctx, counter, &mut local, dep_results);
+    let val = eval::<BoolDomain>(condition, &dep_ctx, counter, &mut local, dep_results, false).0;
     dep_results.cur_prev = saved;
     collect_dep_latch(dep_results, dep_key, local);
     val
@@ -501,7 +488,7 @@ fn eval_partitioned_on_dep(
             bridged: HashMap::new(),
         };
         let val =
-            eval::<BoolDomain, bool>(condition, &dep_ctx, counter, &mut local, &mut bool_scope);
+            eval::<BoolDomain>(condition, &dep_ctx, counter, &mut local, &mut bool_scope, false).0;
         collect_bridged_latch(
             dep_selections,
             dep_key,
@@ -622,13 +609,15 @@ fn eval_partitioned_on_dep(
     let mut local = HashMap::new();
     let saved = dep_selections.cur_prev;
     dep_selections.cur_prev = Some(prev_dep_sel.unwrap_or(&EMPTY_SELECTION_LATCH));
-    let upstream_result: PartitionSelection = eval::<PartitionDomain, PartitionSelection>(
+    let upstream_result: PartitionSelection = eval::<PartitionDomain>(
         condition,
         &dep_ctx,
         counter,
         &mut local,
         dep_selections,
-    );
+        false,
+    )
+    .0;
     dep_selections.cur_prev = saved;
     collect_dep_latch(dep_selections, dep_key, local);
 
