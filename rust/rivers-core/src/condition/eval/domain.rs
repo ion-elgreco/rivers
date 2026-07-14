@@ -184,8 +184,7 @@ impl EvalDomain for BoolDomain {
         }
     }
     fn newly_requested(ctx: &EvalContext) -> bool {
-        ctx.prev_state.last_handled_timestamp.is_some()
-            && ctx.prev_state.last_handled_timestamp == ctx.prev_state.last_tick_timestamp
+        requested_last_tick(ctx)
     }
     fn in_latest_window(_ctx: &EvalContext, _lookback: Option<f64>) -> bool {
         true
@@ -364,9 +363,7 @@ impl EvalDomain for PartitionDomain {
     }
     fn newly_requested(ctx: &EvalContext) -> PartitionSelection {
         let pctx = require_pctx(ctx);
-        let requested_last_tick = ctx.prev_state.last_handled_timestamp.is_some()
-            && ctx.prev_state.last_handled_timestamp == ctx.prev_state.last_tick_timestamp;
-        if !requested_last_tick {
+        if !requested_last_tick(ctx) {
             return PartitionSelection::Empty;
         }
         match ctx.prev_state.partition_state.as_ref() {
