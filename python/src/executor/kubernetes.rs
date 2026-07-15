@@ -272,13 +272,15 @@ async fn classify_failed_pod(
     }
 }
 
-/// Wait for attempt `attempt` (1-indexed) of a step to reach a terminal state.
+/// Wait for the current attempt of a step to reach a terminal state.
 ///
-/// Primary signal: the step pod's own `StepSuccess`/`StepFailure` events — the
-/// attempt's outcome is the `attempt`-th terminal event for this step key.
-/// Fallback: the Job's status. A pod killed before it could write an event
-/// (OOMKilled) would otherwise hang this poll forever; when the Job reports
-/// failed and no new event lands within a grace window, classify from the pod.
+/// Primary signal: the step pod's own events — any `StepSuccess` settles the
+/// ladder (a step succeeds at most once), and a `StepFailure` beyond
+/// `baseline_failures` (the count when this attempt started) is this attempt's
+/// failure. Counting new-since-baseline rather than indexing by attempt number
+/// matters because an OOM-killed pod writes *no* event. Fallback: the Job's
+/// status — when the Job reports failed and no new event lands within a grace
+/// window, classify from the pod instead of hanging forever.
 async fn poll_step_attempt(
     client: &kube_client::Client,
     namespace: &str,
@@ -286,7 +288,7 @@ async fn poll_step_attempt(
     run_id: &str,
     poll_key: &str,
     job_name: &str,
-    attempt: u32,
+    baseline_failures: usize,
 ) -> StepPollOutcome {
     const EVENT_GRACE_CYCLES: u32 = 3;
     let jobs_api: kube_client::Api<Job> = kube_client::Api::namespaced(client.clone(), namespace);
@@ -294,31 +296,29 @@ async fn poll_step_attempt(
     loop {
         match storage.get_events_for_step(run_id, poll_key).await {
             Ok(events) => {
-                let terminal: Vec<_> = events
+                if events
                     .iter()
-                    .filter(|ev| {
-                        matches!(
-                            ev.event_type,
-                            EventType::StepSuccess | EventType::StepFailure
-                        )
-                    })
+                    .any(|ev| matches!(ev.event_type, EventType::StepSuccess))
+                {
+                    return StepPollOutcome::Success;
+                }
+                let failures: Vec<_> = events
+                    .iter()
+                    .filter(|ev| matches!(ev.event_type, EventType::StepFailure))
                     .collect();
-                if terminal.len() >= attempt as usize {
-                    let ev = terminal[attempt as usize - 1];
-                    return match ev.event_type {
-                        EventType::StepSuccess => StepPollOutcome::Success,
-                        _ => {
-                            // The pod records a reason when it can; absent =
-                            // ordinary user error.
-                            let reason = ev
-                                .metadata
+                if failures.len() > baseline_failures {
+                    // The pod records a reason when it can; absent = ordinary
+                    // user error.
+                    let reason = failures
+                        .last()
+                        .and_then(|ev| {
+                            ev.metadata
                                 .iter()
                                 .find(|(k, _)| k == retry_meta::REASON)
                                 .and_then(|(_, v)| FailureReason::parse(v))
-                                .unwrap_or(FailureReason::Error);
-                            StepPollOutcome::Failed { reason }
-                        }
-                    };
+                        })
+                        .unwrap_or(FailureReason::Error);
+                    return StepPollOutcome::Failed { reason };
                 }
             }
             Err(e) => {
@@ -423,6 +423,18 @@ async fn run_step_with_retries(
         .unwrap_or(0);
     let mut attempt: u32 = 1;
     loop {
+        // Failure events recorded before this attempt started; only a failure
+        // beyond this count belongs to this attempt (an OOM-killed attempt
+        // records none at all — the Job-status fallback covers it).
+        let baseline_failures = storage
+            .get_events_for_step(&run_id, &spec.instance_name)
+            .await
+            .map(|evs| {
+                evs.iter()
+                    .filter(|e| matches!(e.event_type, EventType::StepFailure))
+                    .count()
+            })
+            .unwrap_or(0);
         let overrides = StepJobOverrides {
             attempt,
             compute: Some(&compute),
@@ -455,7 +467,7 @@ async fn run_step_with_retries(
             &run_id,
             &spec.instance_name,
             &job_name,
-            attempt,
+            baseline_failures,
         )
         .await;
         let reason = match outcome {

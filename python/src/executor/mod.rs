@@ -55,6 +55,13 @@ fn default_max_workers() -> usize {
         .unwrap_or(1)
 }
 
+/// True inside a K8s step-worker pod (`RIVERS_STEP_POD=1`, stamped by the
+/// step Job builder).
+pub(crate) fn in_step_pod() -> bool {
+    static IN_STEP_POD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IN_STEP_POD.get_or_init(|| std::env::var("RIVERS_STEP_POD").is_ok_and(|v| v == "1"))
+}
+
 #[pyclass(name = "Executor", frozen, from_py_object, module = "rivers._core")]
 #[derive(Clone, Debug)]
 pub enum Executor {

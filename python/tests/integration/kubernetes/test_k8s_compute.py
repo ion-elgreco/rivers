@@ -19,10 +19,14 @@ from .test_k8s_integration import (
     _wait_for_run_cr,
 )
 
-pytestmark = pytest.mark.skipif(
-    not _cluster_reachable(),
-    reason=f"k3d cluster '{KUBECTL_CONTEXT}' not reachable or namespace '{NAMESPACE}' missing",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not _cluster_reachable(),
+        reason=f"k3d cluster '{KUBECTL_CONTEXT}' not reachable or namespace '{NAMESPACE}' missing",
+    ),
+    # Runs real pods to completion; exempt from the repo-wide 60s timeout.
+    pytest.mark.timeout(600),
+]
 
 
 class TestK8sCompute:
