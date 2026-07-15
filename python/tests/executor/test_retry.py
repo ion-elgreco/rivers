@@ -254,6 +254,91 @@ def test_parallel_executor_retry(tmp_path, storage):
     assert "StepFailure" not in types
 
 
+def test_job_level_retry_default(storage):
+    calls = {"n": 0}
+
+    @rs.Asset
+    def job_flaky() -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("once")
+        return 1
+
+    job = rs.Job(
+        name="retry_job",
+        assets=[job_flaky],
+        executor=rs.Executor.in_process(),
+        retry=rs.RetryPolicy(max_retries=2, retry_on=[ValueError]),
+    )
+    repo = rs.CodeRepository(assets=[job_flaky], jobs=[job])
+    repo.resolve(storage=storage)
+    result = repo.get_job("retry_job").execute()
+    assert result.success
+    assert calls["n"] == 2
+
+
+def test_asset_policy_overrides_job_policy(storage):
+    calls = {"n": 0}
+
+    @rs.Asset(retry=rs.RetryPolicy(max_retries=0))
+    def stubborn() -> int:
+        calls["n"] += 1
+        raise ValueError("always")
+
+    job = rs.Job(
+        name="override_job",
+        assets=[stubborn],
+        executor=rs.Executor.in_process(),
+        retry=rs.RetryPolicy(max_retries=5, retry_on=[ValueError]),
+    )
+    repo = rs.CodeRepository(assets=[stubborn], jobs=[job])
+    repo.resolve(storage=storage)
+    result = repo.get_job("override_job").execute(raise_on_error=False)
+    assert not result.success
+    assert calls["n"] == 1  # asset's max_retries=0 wins over the job's 5
+
+
+def test_repo_default_retry_policy(storage):
+    calls = {"n": 0}
+
+    @rs.Asset
+    def repo_flaky() -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("once")
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[repo_flaky],
+        default_retry_policy=rs.RetryPolicy(max_retries=2, retry_on=[ValueError]),
+        default_executor=rs.Executor.in_process(),
+    )
+    repo.resolve(storage=storage)
+    assert repo.materialize().success
+    assert calls["n"] == 2
+
+
+def test_materialize_retry_kwarg(storage):
+    calls = {"n": 0}
+
+    @rs.Asset
+    def kw_flaky() -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("once")
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[kw_flaky], default_executor=rs.Executor.in_process()
+    )
+    repo.resolve(storage=storage)
+    result = repo.materialize(
+        retry=rs.RetryPolicy(max_retries=2, retry_on=[ValueError])
+    )
+    assert result.success
+    assert calls["n"] == 2
+
+
 def test_downstream_runs_after_upstream_retry_succeeds(storage):
     calls = {"n": 0}
 
