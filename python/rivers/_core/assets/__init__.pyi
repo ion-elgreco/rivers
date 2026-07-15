@@ -4,7 +4,7 @@ import datetime
 import logging
 from typing import Any, Callable, Generic, List, Optional, Type, TypeVar, overload
 
-from rivers._core import IOHandler, MetadataValue
+from rivers._core import IOHandler, MetadataValue, RetryPolicy
 from rivers._core.automation import AutomationCondition
 from rivers._core.hooks import Hook
 from rivers._core.partitions import (
@@ -53,6 +53,7 @@ class Asset:
         backfill_strategy: BackfillStrategy | None = ...,
         pool: str | list[str] | None = ...,
         pool_slots: int | dict[str, int] | None = ...,
+        retry: "RetryPolicy | str | None" = ...,
     ) -> Callable[[Callable[..., Any]], "SingleAsset"]: ...
     # @overload
     def __new__(
@@ -72,6 +73,7 @@ class Asset:
         backfill_strategy: BackfillStrategy | None = None,
         pool: str | list[str] | None = None,
         pool_slots: int | dict[str, int] | None = None,
+        retry: "RetryPolicy | str | None" = None,
     ) -> Callable[[Callable[..., Any]], "SingleAsset"]: ...
 
     # from_multi: used as decorator (no wraps) or direct call (with wraps)

@@ -13,9 +13,11 @@ use rivers_core::execution::plan::{ExecutionPlan, StepKind};
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{LaunchedBy, ScopedStorageHandle};
 
+use rivers_core::execution::retry::{RetryPolicy, RetryRef};
+
 use crate::assets::io_handler_registry::IOHandlerRegistry;
 use crate::config::ResourceVariant;
-use crate::errors::{ExecutionError, GraphValidationError, NodeNotFoundError};
+use crate::errors::{ConfigurationError, ExecutionError, GraphValidationError, NodeNotFoundError};
 use crate::executor::run_lifecycle::{RunInit, RunPlanArgs, run_plan};
 
 use crate::assets::decorator::PyAsset;
@@ -30,6 +32,8 @@ pub struct PyJob {
     pub(crate) name: String,
     pub(crate) node_names: Vec<String>,
     pub(crate) executor: Option<Executor>,
+    /// Job-level retry default; assets with their own policy keep it.
+    retry: Option<RetryRef>,
     allow_incomplete_deps: bool,
     /// `true` for the synthetic job built by `materialize_with_launcher`. The
     /// `name` field still holds an internal label for error messages, but the
@@ -115,6 +119,7 @@ impl PyJob {
             name,
             node_names,
             executor,
+            retry: None,
             allow_incomplete_deps,
             synthetic: false,
             plan: None,
@@ -131,6 +136,7 @@ impl PyJob {
         node_names: Vec<String>,
         executor: Executor,
         allow_incomplete_deps: bool,
+        retry: Option<RetryRef>,
     ) -> Self {
         let mut job = Self::base(
             "<materialize>".to_string(),
@@ -139,7 +145,48 @@ impl PyJob {
             allow_incomplete_deps,
         );
         job.synthetic = true;
+        job.retry = retry;
         job
+    }
+
+    /// Resolve a `retry="name"` job-level reference against the repository
+    /// `retries` registry; errors on an unknown name.
+    pub(crate) fn resolve_retry_ref(
+        &mut self,
+        retries: &HashMap<String, RetryPolicy>,
+    ) -> PyResult<()> {
+        if let Some(RetryRef::Named(key)) = &self.retry {
+            let policy = retries.get(key).ok_or_else(|| {
+                ConfigurationError::new_err(format!(
+                    "unknown retry policy '{key}' referenced by job '{}'; registered: {:?}",
+                    self.name,
+                    retries.keys().collect::<Vec<_>>()
+                ))
+            })?;
+            self.retry = Some(RetryRef::Inline(policy.clone()));
+        }
+        Ok(())
+    }
+
+    /// Nearest-wins retry fill over this job's node subset: an asset keeps its
+    /// own policy; otherwise the job's; otherwise `fallback` (the repo default).
+    pub(crate) fn fill_retry_defaults(&mut self, fallback: Option<&RetryPolicy>) {
+        let default = self
+            .retry
+            .as_ref()
+            .and_then(|r| r.as_inline())
+            .cloned()
+            .or_else(|| fallback.cloned());
+        let Some(policy) = default else { return };
+        if let Some(map) = &mut self.node_map {
+            for node in map.values_mut() {
+                if let ResolvedNode::Asset(a) = node
+                    && a.retry.is_none()
+                {
+                    a.retry = Some(policy.clone());
+                }
+            }
+        }
     }
 
     /// Validate the job's nodes against the repository graph and build the execution plan.
@@ -279,13 +326,14 @@ impl PyJob {
 #[pymethods]
 impl PyJob {
     #[new]
-    #[pyo3(signature = (name, assets, executor=None, allow_incomplete_deps=false))]
-    fn new(
-        py: Python,
+    #[pyo3(signature = (name, assets, executor=None, allow_incomplete_deps=false, retry=None))]
+    fn new<'py>(
+        py: Python<'py>,
         name: String,
         assets: Vec<Py<PyAny>>,
         executor: Option<Executor>,
         allow_incomplete_deps: bool,
+        retry: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Self> {
         let mut node_names = Vec::new();
         for obj in &assets {
@@ -324,12 +372,9 @@ impl PyJob {
             }
         }
 
-        Ok(Self::base(
-            name,
-            node_names,
-            executor,
-            allow_incomplete_deps,
-        ))
+        let mut job = Self::base(name, node_names, executor, allow_incomplete_deps);
+        job.retry = crate::retry::extract_retry_ref(retry)?;
+        Ok(job)
     }
 
     #[pyo3(signature = (
