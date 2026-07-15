@@ -19,7 +19,11 @@ Example::
 
 from rivers import exceptions
 from rivers._core import (
+    Backoff,
+    Compute,
+    ComputeEscalation,
     DynamicOutput,
+    FailureReason,
     InputContext,
     InvokedNodeOutput,
     Job,
@@ -28,6 +32,8 @@ from rivers._core import (
     Observation,
     Output,
     OutputContext,
+    RetryOn,
+    RetryPolicy,
     RunBackendConfig,
     RunQueueConfig,
     Schema,
@@ -119,6 +125,12 @@ __all__ = [
     "InvokedNodeOutput",
     "Job",
     "Executor",
+    "Backoff",
+    "Compute",
+    "ComputeEscalation",
+    "FailureReason",
+    "RetryOn",
+    "RetryPolicy",
     "Hook",
     "HookContext",
     "OutputContext",

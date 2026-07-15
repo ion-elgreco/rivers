@@ -26,19 +26,21 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::errors::ExecutionError;
 
+use rivers_core::execution::retry::{compute_delay, should_retry};
+
 use super::super::ops::{self, now_ts};
 use super::context::BatchContext;
+use super::failure::{classify_pyerr, rng01};
 use super::pool_claim::PoolGuard;
-use super::results::process_outcome;
+use super::results::{emit_captured_logs, process_outcome};
 use super::types::WorkOutcome;
 
 /// Phase-4 work supplied by an in-process backend. Runs synchronously with
 /// the GIL held; the lifecycle hands `&BatchContext` so the worker can read
-/// resolved repo state during invocation.
+/// resolved repo state during invocation. Takes `&self` so the retry loop can
+/// re-run the same work for a later attempt.
 pub(crate) trait SyncWorker {
-    fn run_work(self, py: Python, ctx: &BatchContext) -> WorkOutcome
-    where
-        Self: Sized;
+    fn run_work(&self, py: Python, ctx: &BatchContext) -> WorkOutcome;
 }
 
 /// Phase-4 work supplied by a backend that schedules onto a tokio task
@@ -90,7 +92,53 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
         ctx.emit_start(name, now_ts());
     }
 
-    let outcome = worker.run_work(py, ctx);
+    // Pool slots stay claimed across retry attempts and backoff sleeps.
+    let policy = ctx.retry_policy(&step.name);
+    let mut attempt: u32 = 1;
+    let outcome = loop {
+        let outcome = worker.run_work(py, ctx);
+        let WorkOutcome::Error {
+            error,
+            captured_logs,
+            failure_config,
+        } = outcome
+        else {
+            break outcome;
+        };
+        let Some(policy) = &policy else {
+            break WorkOutcome::Error {
+                error,
+                captured_logs,
+                failure_config,
+            };
+        };
+        let (reason, exc_types) = classify_pyerr(py, &error);
+        if !should_retry(policy, reason, &exc_types, attempt) {
+            break WorkOutcome::Error {
+                error,
+                captured_logs,
+                failure_config,
+            };
+        }
+        emit_captured_logs(ctx, step_name, captured_logs);
+        let delay = compute_delay(policy, attempt, rng01());
+        for name in event_names {
+            ctx.emit_step_retry(name, attempt, reason, delay);
+        }
+        tracing::info!(
+            step = step_name,
+            attempt,
+            reason = reason.as_str(),
+            delay_ms = delay.as_millis() as u64,
+            "step failed, retrying"
+        );
+        py.detach(|| std::thread::sleep(delay));
+        attempt += 1;
+        let ts = now_ts();
+        for name in event_names {
+            ctx.emit_start(name, ts);
+        }
+    };
 
     if let Some(g) = guard {
         g.release_blocking(py);

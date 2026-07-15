@@ -28,6 +28,19 @@ pub enum FailureReason {
     Cancelled,
 }
 
+impl FailureReason {
+    /// Snake-case name, matching the serde representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FailureReason::Error => "error",
+            FailureReason::OutOfMemory => "out_of_memory",
+            FailureReason::Timeout => "timeout",
+            FailureReason::Infrastructure => "infrastructure",
+            FailureReason::Cancelled => "cancelled",
+        }
+    }
+}
+
 /// The wait schedule between attempts. Built via the [`Backoff::constant`],
 /// [`Backoff::linear`], [`Backoff::exponential`], [`Backoff::fixed`]
 /// constructors. `jitter` is a relative fraction (0..=1) of the computed wait;
@@ -146,6 +159,16 @@ pub struct RetryPolicy {
 pub enum RetryRef {
     Inline(RetryPolicy),
     Named(String),
+}
+
+impl RetryRef {
+    /// The concrete policy if already inline; `None` for an unresolved name.
+    pub fn as_inline(&self) -> Option<&RetryPolicy> {
+        match self {
+            RetryRef::Inline(p) => Some(p),
+            RetryRef::Named(_) => None,
+        }
+    }
 }
 
 /// Metadata keys carried on `StepFailure` / `StepRetry` event records.

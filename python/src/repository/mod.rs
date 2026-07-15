@@ -2585,6 +2585,18 @@ impl PyCodeRepository {
             }
         }
 
+        // ResolvedAssets were constructed inside build_unresolved_graph (before
+        // resolve_retry_refs ran), so re-pull the now-concrete policy per node.
+        for node in node_map.values_mut() {
+            if let ResolvedNode::Asset(a) = node {
+                let resolved = {
+                    let asset = a.inner.borrow(py);
+                    asset.inner().retry().and_then(|r| r.as_inline().cloned())
+                };
+                a.retry = resolved;
+            }
+        }
+
         // Shared default for nodes without an explicit handler. The in-process executor
         // uses this as a fallback; the parallel executor rejects nodes without handlers
         // (since in-memory can't cross process boundaries).
