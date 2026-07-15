@@ -2116,7 +2116,7 @@ impl PyCodeRepository {
     }
 
     fn effective_executor(&self) -> Executor {
-        if std::env::var("RIVERS_STEP_POD").is_ok_and(|v| v == "1") {
+        if crate::executor::in_step_pod() {
             return Executor::InProcess {};
         }
         self.default_executor.clone().unwrap_or(Executor::Parallel {

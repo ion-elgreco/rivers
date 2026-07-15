@@ -29,6 +29,25 @@ pub async fn handle_executor_failure(
     let max_restarts = run.spec.max_restarts;
     let storage = ctx.storage.as_ref();
 
+    // A stored outcome means the executor COMPLETED the run before exiting —
+    // a deliberate failure/cancellation, not a crash. Honor it; restarting
+    // would replay the whole run.
+    if let Ok(Some(outcome)) = storage.get_run_outcome(run_id).await {
+        let mut new_status = status.clone();
+        new_status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        apply_outcome_to_status(&mut new_status, outcome);
+        patch_status(runs_api, name, &new_status).await?;
+        if let Some(ref phase) = new_status.phase {
+            sync_run_status_to_storage(storage, run_id, phase).await;
+        }
+        tracing::info!(
+            run = %name,
+            phase = ?new_status.phase,
+            "executor exited after completing the run; honoring stored outcome"
+        );
+        return Ok(Action::await_change());
+    }
+
     let progress = storage.get_run_progress(run_id).await.ok();
     let current_completed = progress.as_ref().map(|p| p.completed_steps).unwrap_or(0);
     let last_known_completed = status.completed_steps.unwrap_or(0);
@@ -259,6 +278,50 @@ mod tests {
         assert_eq!(
             status.message.as_deref(),
             Some("Executor failed 3 time(s) without progress (max: 2)")
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_outcome_is_honored_without_restart() {
+        let api_state = Arc::new(Mutex::new(MockApiState::default()));
+        let client = mock_client(api_state.clone());
+        let runs_api: Api<Run> = Api::namespaced(client.clone(), "default");
+        let pods_api: Api<Pod> = Api::namespaced(client.clone(), "default");
+
+        let storage = memory_storage().await;
+        let ctx = make_context(client, storage.clone());
+        seed_run_record(&storage, "run-1").await;
+        storage
+            .set_run_outcome(
+                "run-1",
+                &RunOutcome::Failure {
+                    message: "all attempts exhausted".to_string(),
+                    completed_steps: 0,
+                    total_steps: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        let run = test_run_running("run-1", Some(0));
+        handle_executor_failure(&runs_api, &pods_api, &ctx, &run, "test-run")
+            .await
+            .unwrap();
+
+        let state = api_state.lock().unwrap();
+        let status = last_status_patch(&state);
+        // The deliberate failure is honored as-is: no restart accounting, no
+        // replacement executor pod.
+        assert_eq!(status.phase, Some(RunPhase::Failed));
+        assert_eq!(status.message.as_deref(), Some("all attempts exhausted"));
+        assert_eq!(status.restarts_without_progress, 0);
+        assert!(status.completed_at.is_some());
+        assert!(
+            !state
+                .requests
+                .iter()
+                .any(|r| r.method == "POST" && r.path.contains("/pods")),
+            "must not create a restart pod when the run completed"
         );
     }
 

@@ -30,10 +30,15 @@ from .test_k8s_integration import (
     _wait_for_run_cr,
 )
 
-pytestmark = pytest.mark.skipif(
-    not _cluster_reachable(),
-    reason=f"k3d cluster '{KUBECTL_CONTEXT}' not reachable or namespace '{NAMESPACE}' missing",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not _cluster_reachable(),
+        reason=f"k3d cluster '{KUBECTL_CONTEXT}' not reachable or namespace '{NAMESPACE}' missing",
+    ),
+    # Retry ladders run several pods to completion; the repo-wide 60s
+    # pytest-timeout (thread method: kills the whole session) is far too tight.
+    pytest.mark.timeout(600),
+]
 
 
 def _events_with_metadata(run_id: str) -> list[dict]:

@@ -18,10 +18,10 @@ use crate::metadata::MetadataValue;
 use crate::partitions::PyPartitionKey;
 use crate::repository::resolved_node::ResolvedNode;
 
-use super::super::GraphNodeMap;
 use super::super::async_exec::AsyncBridge;
 use super::super::event_writer::EventWriter;
 use super::super::ops::{self, now_ts};
+use super::super::{GraphNodeMap, in_step_pod};
 
 /// Immutable run-scope identity: who/what/when this batch is executing.
 pub(crate) struct RunScope<'a> {
@@ -169,11 +169,17 @@ impl<'a> BatchContext<'a> {
             .or_else(|| step.outputs.iter().find_map(|n| self.retry_policy(n)))
     }
 
-    /// Retry policy of one resolved node (asset-level).
+    /// Retry policy of one resolved node (asset-level). Inside a K8s step pod
+    /// this is always `None`: the orchestrator owns the attempt ladder there,
+    /// and the pod re-applying the policy would nest retries (N pods × N
+    /// in-process attempts).
     pub(crate) fn retry_policy(
         &self,
         step_name: &str,
     ) -> Option<rivers_core::execution::retry::RetryPolicy> {
+        if in_step_pod() {
+            return None;
+        }
         self.repo
             .node_map
             .get(step_name)

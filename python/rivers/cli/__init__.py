@@ -308,10 +308,13 @@ def execute(
         completed = len(result.materialized_assets) - len(result.failed_assets)
         total = len(result.materialized_assets)
 
+        # A run that COMPLETED — even as a failure or cancellation — exits 0:
+        # the outcome travels via storage and the operator honors it. A
+        # non-zero exit means "crashed" and triggers the operator's
+        # restart-with-resume, which must not fire for a deliberate failure.
         if storage.is_cancelled(run_id):
             storage.set_run_outcome(run_id, "Cancelled", completed, total)
             typer.echo(f"Run {run_id} cancelled: {completed}/{total} steps completed")
-            raise typer.Exit(2)
         elif result.success:
             storage.set_run_outcome(run_id, "Success", completed, total)
             typer.echo(
@@ -322,11 +325,12 @@ def execute(
             msg = f"Failed assets: {', '.join(failed_names)}"
             storage.set_run_outcome(run_id, "Failure", completed, total, message=msg)
             typer.echo(f"Run {run_id} failed: {msg}", err=True)
-            raise typer.Exit(1)
     except SystemExit:
         raise
     except BaseException as exc:
-        storage.set_run_outcome(run_id, "Failure", 0, 0, message=str(exc))
+        # Crash path: no outcome is written — the operator restarts the
+        # executor with resume. (Writing one here would make the operator
+        # honor it and skip the restart.)
         typer.echo(f"Run {run_id} failed: {exc}", err=True)
         raise typer.Exit(1)
 
