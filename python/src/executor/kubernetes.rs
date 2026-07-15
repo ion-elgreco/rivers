@@ -380,6 +380,9 @@ struct StepJobSpec {
     step_name: String,
     mapping_key: Option<String>,
     policy: Option<RetryPolicy>,
+    /// Per-asset compute; axes left unset fall back to the executor's
+    /// worker_cpu / worker_memory.
+    compute: Option<Compute>,
 }
 
 /// Run one step instance to completion, re-creating its Job per retry attempt
@@ -397,11 +400,16 @@ async fn run_step_with_retries(
     config: Arc<rivers_k8s::executor::K8sStepExecutorConfig>,
     spec: StepJobSpec,
 ) -> (String, bool) {
-    let mut compute = Compute {
+    let executor_base = Compute {
         cpu: Some(config.worker_cpu.clone()),
         memory: Some(config.worker_memory.clone()),
         gpu: None,
     };
+    let mut compute = spec
+        .compute
+        .as_ref()
+        .map(|c| c.or_default(&executor_base))
+        .unwrap_or(executor_base);
     // StepRetry events already recorded for this step (an orchestrator restart
     // replays earlier attempts; don't re-emit their retry events).
     let prior_retries = storage
@@ -604,6 +612,7 @@ impl ExecutorBackend for KubernetesBackend {
                 StepJobSpec {
                     instance_name: inst.instance_name.clone(),
                     policy: ctx.retry_policy_for(step),
+                    compute: ctx.compute_for(step),
                     step_name: step.name.clone(),
                     mapping_key: inst.mapping_key.clone(),
                 }

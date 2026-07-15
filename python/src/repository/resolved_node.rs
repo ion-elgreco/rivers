@@ -48,6 +48,8 @@ pub(crate) struct ResolvedAsset {
     pub pool: Vec<(String, u32)>,
     /// Resolved retry policy (registry names collapsed to concrete at resolve()).
     pub retry: Option<RetryPolicy>,
+    /// Per-asset compute request; axes left unset inherit the executor default.
+    pub compute: Option<rivers_core::execution::compute::Compute>,
     pub metadata: Option<HashMap<String, String>>,
     pub backfill_strategy: Option<PyBackfillStrategy>,
     /// Flattened pure-Rust partition definition. The originating
@@ -176,6 +178,7 @@ impl ResolvedAsset {
         let retry = asset
             .retry_for_output(output_name.as_deref())
             .and_then(|r| r.as_inline().cloned());
+        let compute = asset.compute_for_output(output_name.as_deref()).cloned();
         let metadata = asset.metadata().cloned();
         let backfill_strategy = asset.backfill_strategy().cloned();
 
@@ -268,6 +271,7 @@ impl ResolvedAsset {
             code_version,
             pool,
             retry,
+            compute,
             metadata,
             backfill_strategy,
             partitions_def,
@@ -297,6 +301,7 @@ impl ResolvedAsset {
             code_version: self.code_version.clone(),
             pool: self.pool.clone(),
             retry: self.retry.clone(),
+            compute: self.compute.clone(),
             metadata: self.metadata.clone(),
             backfill_strategy: self.backfill_strategy.clone(),
             partitions_def: self.partitions_def.clone(),
@@ -727,6 +732,13 @@ impl ResolvedNode {
     pub fn retry(&self) -> Option<&RetryPolicy> {
         match self {
             ResolvedNode::Asset(node) => node.retry.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn compute(&self) -> Option<&rivers_core::execution::compute::Compute> {
+        match self {
+            ResolvedNode::Asset(node) => node.compute.as_ref(),
             _ => None,
         }
     }

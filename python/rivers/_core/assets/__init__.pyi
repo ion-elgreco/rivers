@@ -4,7 +4,7 @@ import datetime
 import logging
 from typing import Any, Callable, Generic, List, Optional, Type, TypeVar, overload
 
-from rivers._core import IOHandler, MetadataValue, RetryPolicy
+from rivers._core import Compute, IOHandler, MetadataValue, RetryPolicy
 from rivers._core.automation import AutomationCondition
 from rivers._core.hooks import Hook
 from rivers._core.partitions import (
@@ -54,6 +54,7 @@ class Asset:
         pool: str | list[str] | None = ...,
         pool_slots: int | dict[str, int] | None = ...,
         retry: "RetryPolicy | str | None" = ...,
+        compute: Compute | None = ...,
     ) -> Callable[[Callable[..., Any]], "SingleAsset"]: ...
     # @overload
     def __new__(
@@ -74,6 +75,7 @@ class Asset:
         pool: str | list[str] | None = None,
         pool_slots: int | dict[str, int] | None = None,
         retry: "RetryPolicy | str | None" = None,
+        compute: Compute | None = None,
     ) -> Callable[[Callable[..., Any]], "SingleAsset"]: ...
 
     # from_multi: used as decorator (no wraps) or direct call (with wraps)
@@ -336,12 +338,14 @@ class AssetDef:
         pool: str | list[str] | None = ...,
         pool_slots: int | dict[str, int] | None = ...,
         retry: "RetryPolicy | str | None" = ...,
+        compute: Compute | None = ...,
         deps: list["DepDef"] = ...,
     ) -> None:
         """Build an asset definition shared between multi-asset outputs and deps.
 
         A multi-asset retries as one unit: every output that sets ``retry``
-        must set the same policy.
+        must set the same policy. Likewise one multi-asset step is one pod:
+        the first output that sets ``compute`` provides the step's resources.
         """
         ...
 

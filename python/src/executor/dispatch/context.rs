@@ -180,6 +180,21 @@ impl<'a> BatchContext<'a> {
             .and_then(|n| n.retry().cloned())
     }
 
+    /// Per-asset compute for a plan step; multi steps read their outputs'
+    /// nodes (first output that sets one wins — one step is one pod).
+    pub(crate) fn compute_for(
+        &self,
+        step: &rivers_core::execution::plan::ExecutionStep,
+    ) -> Option<rivers_core::execution::compute::Compute> {
+        let lookup = |name: &str| {
+            self.repo
+                .node_map
+                .get(name)
+                .and_then(|n| n.compute().cloned())
+        };
+        lookup(&step.name).or_else(|| step.outputs.iter().find_map(|n| lookup(n)))
+    }
+
     /// A failed partitioned step materialized none of its partitions, so record
     /// them all with one StepFailure carrying the whole key (a `Set` for a batched
     /// run); `get_failed_partitions` expands it. The None-keyed step-level failure

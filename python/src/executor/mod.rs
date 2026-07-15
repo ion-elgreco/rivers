@@ -229,6 +229,21 @@ impl Executor {
         io_handler_registry: &IOHandlerRegistry,
         resume: bool,
     ) -> Vec<(String, PyErr)> {
+        if !matches!(self, Executor::Kubernetes { .. }) {
+            let ignored: Vec<&str> = node_map
+                .iter()
+                .filter(|(_, n)| n.compute().is_some())
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if !ignored.is_empty() {
+                tracing::warn!(
+                    assets = ?ignored,
+                    "compute= is ignored by the in_process/parallel executors; \
+                     it applies on Kubernetes"
+                );
+            }
+        }
+
         let needs_bridge = plan
             .steps
             .iter()
