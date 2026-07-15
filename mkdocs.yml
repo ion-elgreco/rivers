@@ -56,6 +56,7 @@ nav:
       - Backfills: concepts/backfills.md
       - Scheduling & Automation: concepts/scheduling.md
       - Concurrency: concepts/concurrency.md
+      - Retries: concepts/retries.md
   - Installation:
       - Overview: installation/overview.md
       - Kubernetes: installation/kubernetes.md
