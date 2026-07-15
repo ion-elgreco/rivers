@@ -23,6 +23,7 @@ import obstore.store
 from rivers import (
     Asset,
     CodeRepository,
+    Compute,
     ComputeEscalation,
     Executor,
     InMemoryIOHandler,
@@ -224,12 +225,27 @@ k8s_oom_no_retry_job = Job(
 )
 
 
+# --- Per-asset compute (step pod sized by the asset, not the executor) ---
+
+
+@Asset(io_handler=s3_io, compute=Compute(cpu="300m", memory="384Mi"))
+def sized_step():
+    return Output(value={"sized": True})
+
+
+k8s_compute_job = Job(
+    name="k8s_compute_job",
+    assets=[sized_step],
+)
+
+
 all_assets = [
     source_data, transform_data, final_report,
     s3_source, s3_transform, s3_report,
     always_fails, slow_asset,
     graph_pipeline,
     retry_always_fails, oom_hungry, oom_no_retry,
+    sized_step,
 ]
 
 all_tasks = [graph_inner_load, graph_inner_transform]
@@ -240,6 +256,7 @@ repo = CodeRepository(
     jobs=[
         k8s_inprocess_job, k8s_step_job, k8s_failing_job, k8s_slow_job, k8s_graph_job,
         k8s_retry_exhausted_job, k8s_oom_escalation_job, k8s_oom_no_retry_job,
+        k8s_compute_job,
     ],
     default_executor=Executor.kubernetes(
         worker_cpu="250m",

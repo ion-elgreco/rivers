@@ -36,6 +36,8 @@ pub struct SingleAsset {
     pub pool: Vec<(String, u32)>,
     /// Retry policy: inline or a name into the repository `retries` registry.
     pub retry: Option<rivers_core::execution::retry::RetryRef>,
+    /// Per-asset compute request; axes left unset inherit the executor default.
+    pub compute: Option<rivers_core::execution::compute::Compute>,
 }
 
 /// Python-exposed marker subclass created by the `Asset(...)` decorator.
