@@ -3,10 +3,15 @@ use std::time::Duration;
 
 use anyhow::Context;
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::EnvVar;
+use k8s_openapi::api::core::v1::{EnvVar, Pod};
 use pyo3::prelude::*;
+use rivers_core::execution::compute::Compute;
+use rivers_core::execution::retry::{
+    FailureReason, RetryPolicy, compute_delay, meta as retry_meta, should_retry,
+};
 use rivers_core::storage::{EventType, StorageBackend};
 use rivers_k8s::crd::code_location::CodeLocation;
+use rivers_k8s::executor::StepJobOverrides;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -14,6 +19,7 @@ use crate::errors::ExecutionError;
 use crate::repository::resolved_node::ResolvedNode;
 use crate::runtime::rt;
 
+use super::dispatch::failure::rng01;
 use super::dispatch::{BatchContext, ExecutorBackend, StepInstance};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -210,27 +216,115 @@ async fn create_or_adopt_k8s_job(
     Ok(())
 }
 
-async fn poll_step_completion(
+enum StepPollOutcome {
+    Success,
+    Failed { reason: FailureReason },
+    Cancelled,
+}
+
+/// Terminal reason for a failed step pod. An OOM-killed pod dies before the
+/// `execute-step` CLI can write any event, so the pod's container status is
+/// the only signal (`OOMKilled` / exit 137).
+async fn classify_failed_pod(
+    client: &kube_client::Client,
+    namespace: &str,
+    job_name: &str,
+) -> FailureReason {
+    let pods: kube_client::Api<Pod> = kube_client::Api::namespaced(client.clone(), namespace);
+    let lp = kube_client::api::ListParams::default().labels(&format!("job-name={job_name}"));
+    match pods.list(&lp).await {
+        Ok(list) => {
+            for pod in &list.items {
+                let statuses = pod
+                    .status
+                    .iter()
+                    .flat_map(|s| s.container_statuses.iter().flatten());
+                for cs in statuses {
+                    let terminated = cs
+                        .state
+                        .as_ref()
+                        .and_then(|s| s.terminated.as_ref())
+                        .or_else(|| cs.last_state.as_ref().and_then(|s| s.terminated.as_ref()));
+                    if let Some(t) = terminated {
+                        if t.reason.as_deref() == Some("OOMKilled") || t.exit_code == 137 {
+                            return FailureReason::OutOfMemory;
+                        }
+                        if t.reason.as_deref() == Some("DeadlineExceeded") {
+                            return FailureReason::Timeout;
+                        }
+                        if t.exit_code != 0 {
+                            return FailureReason::Error;
+                        }
+                    }
+                }
+            }
+            FailureReason::Infrastructure
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "rivers::k8s",
+                job = %job_name,
+                error = %e,
+                "failed to list pods for failure classification"
+            );
+            FailureReason::Infrastructure
+        }
+    }
+}
+
+/// Wait for attempt `attempt` (1-indexed) of a step to reach a terminal state.
+///
+/// Primary signal: the step pod's own `StepSuccess`/`StepFailure` events — the
+/// attempt's outcome is the `attempt`-th terminal event for this step key.
+/// Fallback: the Job's status. A pod killed before it could write an event
+/// (OOMKilled) would otherwise hang this poll forever; when the Job reports
+/// failed and no new event lands within a grace window, classify from the pod.
+async fn poll_step_attempt(
+    client: &kube_client::Client,
+    namespace: &str,
     storage: &Arc<rivers_core::storage::surrealdb_backend::SurrealStorage>,
     run_id: &str,
-    step_key: &str,
-) -> bool {
+    poll_key: &str,
+    job_name: &str,
+    attempt: u32,
+) -> StepPollOutcome {
+    const EVENT_GRACE_CYCLES: u32 = 3;
+    let jobs_api: kube_client::Api<Job> = kube_client::Api::namespaced(client.clone(), namespace);
+    let mut job_failed_cycles: u32 = 0;
     loop {
-        match storage.get_events_for_step(run_id, step_key).await {
+        match storage.get_events_for_step(run_id, poll_key).await {
             Ok(events) => {
-                for ev in &events {
-                    if matches!(
-                        ev.event_type,
-                        EventType::StepSuccess | EventType::StepFailure
-                    ) {
-                        return matches!(ev.event_type, EventType::StepSuccess);
-                    }
+                let terminal: Vec<_> = events
+                    .iter()
+                    .filter(|ev| {
+                        matches!(
+                            ev.event_type,
+                            EventType::StepSuccess | EventType::StepFailure
+                        )
+                    })
+                    .collect();
+                if terminal.len() >= attempt as usize {
+                    let ev = terminal[attempt as usize - 1];
+                    return match ev.event_type {
+                        EventType::StepSuccess => StepPollOutcome::Success,
+                        _ => {
+                            // The pod records a reason when it can; absent =
+                            // ordinary user error.
+                            let reason = ev
+                                .metadata
+                                .iter()
+                                .find(|(k, _)| k == retry_meta::REASON)
+                                .and_then(|(_, v)| FailureReason::parse(v))
+                                .unwrap_or(FailureReason::Error);
+                            StepPollOutcome::Failed { reason }
+                        }
+                    };
                 }
             }
             Err(e) => {
                 tracing::warn!(
                     target: "rivers::k8s",
-                    step = %step_key,
+                    step = %poll_key,
                     error = %e,
                     "failed to poll step events"
                 );
@@ -239,37 +333,198 @@ async fn poll_step_completion(
         if storage.is_cancelled(run_id).await.unwrap_or(false) {
             tracing::info!(
                 target: "rivers::k8s",
-                step = %step_key,
+                step = %poll_key,
                 "run cancellation detected, aborting step poll"
             );
-            return false;
+            return StepPollOutcome::Cancelled;
+        }
+        match jobs_api.get_opt(job_name).await {
+            Ok(Some(job)) => {
+                let failed = job
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.failed)
+                    .unwrap_or_default()
+                    > 0;
+                if failed {
+                    job_failed_cycles += 1;
+                    if job_failed_cycles >= EVENT_GRACE_CYCLES {
+                        let reason = classify_failed_pod(client, namespace, job_name).await;
+                        tracing::warn!(
+                            target: "rivers::k8s",
+                            step = %poll_key,
+                            job = %job_name,
+                            reason = reason.as_str(),
+                            "step Job failed without a terminal event; classified from pod status"
+                        );
+                        return StepPollOutcome::Failed { reason };
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    target: "rivers::k8s",
+                    job = %job_name,
+                    error = %e,
+                    "failed to poll step Job status"
+                );
+            }
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
-/// Create the given step Jobs (adopting any that already exist) and poll each
-/// one to completion. Returns per-job `(poll_key, success)` once all monitor
-/// tasks have finished. Errors only on Job creation failure; per-step failures
-/// surface via the bool flag.
-async fn run_jobs_to_completion(
+struct StepJobSpec {
+    instance_name: String,
+    step_name: String,
+    mapping_key: Option<String>,
+    policy: Option<RetryPolicy>,
+}
+
+/// Run one step instance to completion, re-creating its Job per retry attempt
+/// (a finished K8s Job can't re-run, so attempt N gets a `-rN` name). On an
+/// escalating reason the next attempt's pod gets grown resources. Attempt
+/// numbering keys off the step's terminal-event count, so an orchestrator
+/// restart replays the ladder: prior attempts resolve instantly from their
+/// recorded events (409-adopting their Jobs) and the budget stays correct.
+async fn run_step_with_retries(
     client: kube_client::Client,
-    namespace: &str,
+    namespace: String,
     storage: Arc<rivers_core::storage::surrealdb_backend::SurrealStorage>,
     run_id: String,
+    code_location_id: String,
+    config: Arc<rivers_k8s::executor::K8sStepExecutorConfig>,
+    spec: StepJobSpec,
+) -> (String, bool) {
+    let mut compute = Compute {
+        cpu: Some(config.worker_cpu.clone()),
+        memory: Some(config.worker_memory.clone()),
+        gpu: None,
+    };
+    // StepRetry events already recorded for this step (an orchestrator restart
+    // replays earlier attempts; don't re-emit their retry events).
+    let prior_retries = storage
+        .get_events_for_step(&run_id, &spec.instance_name)
+        .await
+        .map(|evs| {
+            evs.iter()
+                .filter(|e| matches!(e.event_type, EventType::StepRetry))
+                .count() as u32
+        })
+        .unwrap_or(0);
+    let mut attempt: u32 = 1;
+    loop {
+        let overrides = StepJobOverrides {
+            attempt,
+            compute: Some(&compute),
+        };
+        let job = match &spec.mapping_key {
+            Some(key) => rivers_k8s::executor::build_mapped_step_job_with(
+                &config,
+                &spec.step_name,
+                key,
+                &overrides,
+            ),
+            None => {
+                rivers_k8s::executor::build_step_job_with(&config, &spec.instance_name, &overrides)
+            }
+        };
+        let job_name = job.metadata.name.clone().unwrap_or_default();
+        if let Err(e) = create_or_adopt_k8s_job(&client, &namespace, &job).await {
+            tracing::error!(
+                target: "rivers::k8s",
+                step = %spec.instance_name,
+                error = %e,
+                "failed to create step Job"
+            );
+            return (spec.instance_name, false);
+        }
+        let outcome = poll_step_attempt(
+            &client,
+            &namespace,
+            &storage,
+            &run_id,
+            &spec.instance_name,
+            &job_name,
+            attempt,
+        )
+        .await;
+        let reason = match outcome {
+            StepPollOutcome::Success => return (spec.instance_name, true),
+            StepPollOutcome::Cancelled => return (spec.instance_name, false),
+            StepPollOutcome::Failed { reason } => reason,
+        };
+        let Some(policy) = &spec.policy else {
+            return (spec.instance_name, false);
+        };
+        if !should_retry(policy, reason, &[], attempt) {
+            return (spec.instance_name, false);
+        }
+        if let Some(esc) = &policy.escalate {
+            compute = rivers_k8s::compute::escalate_compute(&compute, esc, reason);
+        }
+        let delay = compute_delay(policy, attempt, rng01());
+        if attempt > prior_retries {
+            let mut metadata = vec![
+                (retry_meta::ATTEMPT.to_string(), attempt.to_string()),
+                (retry_meta::REASON.to_string(), reason.as_str().to_string()),
+                (
+                    retry_meta::NEXT_DELAY_MS.to_string(),
+                    delay.as_millis().to_string(),
+                ),
+            ];
+            if let Ok(compute_json) = serde_json::to_string(&compute) {
+                metadata.push((retry_meta::NEXT_COMPUTE.to_string(), compute_json));
+            }
+            let _ = storage
+                .store_event(&rivers_core::storage::EventRecord {
+                    code_location_id: code_location_id.clone(),
+                    event_type: EventType::StepRetry,
+                    asset_key: Some(spec.instance_name.clone()),
+                    run_id: run_id.clone(),
+                    partition_key: None,
+                    timestamp: rivers_core::util::now_ts(),
+                    metadata,
+                    input_data_versions: vec![],
+                })
+                .await;
+        }
+        tracing::info!(
+            target: "rivers::k8s",
+            step = %spec.instance_name,
+            attempt,
+            reason = reason.as_str(),
+            delay_ms = delay.as_millis() as u64,
+            "step failed, retrying"
+        );
+        tokio::time::sleep(delay).await;
+        attempt += 1;
+    }
+}
+
+/// Run every step instance to completion, one monitor task each. The
+/// concurrency permit spans a step's whole retry ladder.
+async fn run_jobs_to_completion(
+    client: kube_client::Client,
+    namespace: String,
+    storage: Arc<rivers_core::storage::surrealdb_backend::SurrealStorage>,
+    run_id: String,
+    code_location_id: String,
+    config: Arc<rivers_k8s::executor::K8sStepExecutorConfig>,
     max_concurrent: Option<usize>,
-    jobs: Vec<(String, Job)>,
-) -> Result<Vec<(String, bool)>, String> {
+    specs: Vec<StepJobSpec>,
+) -> Vec<(String, bool)> {
     let semaphore = max_concurrent.map(|n| Arc::new(Semaphore::new(n)));
     let mut join_set = JoinSet::new();
 
-    for (poll_key, job) in jobs {
-        create_or_adopt_k8s_job(&client, namespace, &job)
-            .await
-            .map_err(|e| format!("failed to create step Job '{poll_key}': {e}"))?;
-
+    for spec in specs {
+        let client = client.clone();
+        let namespace = namespace.clone();
         let storage = storage.clone();
-        let rid = run_id.clone();
+        let run_id = run_id.clone();
+        let code_location_id = code_location_id.clone();
+        let config = Arc::clone(&config);
         let permit = match semaphore {
             Some(ref sem) => Some(
                 sem.clone()
@@ -281,9 +536,18 @@ async fn run_jobs_to_completion(
         };
 
         join_set.spawn(async move {
-            let success = poll_step_completion(&storage, &rid, &poll_key).await;
+            let result = run_step_with_retries(
+                client,
+                namespace,
+                storage,
+                run_id,
+                code_location_id,
+                config,
+                spec,
+            )
+            .await;
             drop(permit);
-            (poll_key, success)
+            result
         });
     }
 
@@ -300,7 +564,7 @@ async fn run_jobs_to_completion(
             }
         }
     }
-    Ok(results)
+    results
 }
 
 impl ExecutorBackend for KubernetesBackend {
@@ -333,43 +597,38 @@ impl ExecutorBackend for KubernetesBackend {
             }
         };
 
-        let jobs: Vec<(String, Job)> = instances
+        let specs: Vec<StepJobSpec> = instances
             .iter()
             .map(|inst| {
-                let job = if let Some(key) = &inst.mapping_key {
-                    let step_name = &ctx.scope.plan.steps[inst.idx].name;
-                    rivers_k8s::executor::build_mapped_step_job(&config, step_name, key)
-                } else {
-                    rivers_k8s::executor::build_step_job(&config, &inst.instance_name)
-                };
-                (inst.instance_name.clone(), job)
+                let step_name = ctx.scope.plan.steps[inst.idx].name.clone();
+                StepJobSpec {
+                    instance_name: inst.instance_name.clone(),
+                    policy: ctx.retry_policy(&step_name),
+                    step_name,
+                    mapping_key: inst.mapping_key.clone(),
+                }
             })
             .collect();
-        let instance_names_for_fallback: Vec<String> =
-            instances.iter().map(|i| i.instance_name.clone()).collect();
 
         let namespace = self.namespace.clone();
         let max_concurrent = self.max_concurrent_steps;
         let storage = Arc::clone(ctx.sink.storage.backend());
         let run_id = ctx.scope.run_id.to_string();
+        let code_location_id = self.code_location_id.clone();
         let client = self.client.clone();
+        let config = Arc::new(config);
 
         let results: Vec<(String, bool)> = py.detach(move || {
             rt().block_on(run_jobs_to_completion(
                 client,
-                &namespace,
+                namespace,
                 storage,
                 run_id,
+                code_location_id,
+                config,
                 max_concurrent,
-                jobs,
+                specs,
             ))
-            .unwrap_or_else(|e| {
-                tracing::error!(target: "rivers::k8s", error = %e, "k8s execution init failed");
-                instance_names_for_fallback
-                    .iter()
-                    .map(|n| (n.clone(), false))
-                    .collect()
-            })
         });
 
         // Step pods emit their own StepStart/StepSuccess/StepFailure events to

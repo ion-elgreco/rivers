@@ -39,6 +39,18 @@ impl FailureReason {
             FailureReason::Cancelled => "cancelled",
         }
     }
+
+    /// Inverse of [`Self::as_str`], for reading event metadata back.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "error" => FailureReason::Error,
+            "out_of_memory" => FailureReason::OutOfMemory,
+            "timeout" => FailureReason::Timeout,
+            "infrastructure" => FailureReason::Infrastructure,
+            "cancelled" => FailureReason::Cancelled,
+            _ => return None,
+        })
+    }
 }
 
 /// The wait schedule between attempts. Built via the [`Backoff::constant`],
