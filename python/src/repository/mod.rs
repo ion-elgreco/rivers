@@ -2620,7 +2620,10 @@ impl PyCodeRepository {
             if let ResolvedNode::Asset(a) = node {
                 let resolved = {
                     let asset = a.inner.borrow(py);
-                    asset.inner().retry().and_then(|r| r.as_inline().cloned())
+                    asset
+                        .inner()
+                        .retry_for_output(a.output_name.as_deref())
+                        .and_then(|r| r.as_inline().cloned())
                 };
                 a.retry = resolved;
             }

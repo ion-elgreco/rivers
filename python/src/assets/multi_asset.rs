@@ -60,6 +60,7 @@ impl PyMultiAsset {
                     partitions_def: a.partitions_def.as_ref().map(|p| p.clone_ref(py)),
                     partition_mapping: a.partition_mapping.clone(),
                     pool: a.pool.clone(),
+                    retry: a.retry.clone(),
                     // from_multi consumed and merged the original DepDef list;
                     // the reconstructed view does not preserve it.
                     deps: Vec::new(),

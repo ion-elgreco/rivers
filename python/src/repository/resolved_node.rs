@@ -173,7 +173,9 @@ impl ResolvedAsset {
         // Named refs aren't collapsed yet at this point (build_unresolved_graph
         // runs before resolve_retry_refs); resolve_resources_and_handlers
         // re-syncs node.retry afterwards.
-        let retry = asset.retry().and_then(|r| r.as_inline().cloned());
+        let retry = asset
+            .retry_for_output(output_name.as_deref())
+            .and_then(|r| r.as_inline().cloned());
         let metadata = asset.metadata().cloned();
         let backfill_strategy = asset.backfill_strategy().cloned();
 

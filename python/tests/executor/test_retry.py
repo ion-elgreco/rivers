@@ -339,6 +339,52 @@ def test_materialize_retry_kwarg(storage):
     assert calls["n"] == 2
 
 
+def test_multi_asset_output_retry(storage):
+    """A dict-returning multi-asset retries as one unit via AssetDef(retry=)."""
+    calls = {"n": 0}
+
+    @rs.Asset.from_multi(
+        output_defs=[
+            rs.AssetDef("mr_a", retry=rs.RetryPolicy(max_retries=2, retry_on=[ValueError])),
+            rs.AssetDef("mr_b"),
+        ],
+    )
+    def multi_flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("once")
+        return {"mr_a": 1, "mr_b": 2}
+
+    repo = rs.CodeRepository(
+        assets=[multi_flaky], default_executor=rs.Executor.in_process()
+    )
+    repo.resolve(storage=storage)
+    assert repo.materialize().success
+    assert calls["n"] == 2
+    types_a = [e.event_type for e in storage.get_events_for_asset("mr_a")]
+    types_b = [e.event_type for e in storage.get_events_for_asset("mr_b")]
+    assert types_a.count("StepRetry") == 1
+    assert types_b.count("StepRetry") == 1
+    assert "StepSuccess" in types_a and "StepSuccess" in types_b
+
+
+def test_multi_asset_conflicting_policies_error_at_resolve(storage):
+    @rs.Asset.from_multi(
+        output_defs=[
+            rs.AssetDef("cx_a", retry=rs.RetryPolicy(max_retries=1)),
+            rs.AssetDef("cx_b", retry=rs.RetryPolicy(max_retries=5)),
+        ],
+    )
+    def conflicted():
+        return {"cx_a": 1, "cx_b": 2}
+
+    repo = rs.CodeRepository(assets=[conflicted])
+    with pytest.raises(
+        rs.exceptions.ConfigurationError, match="different retry policies"
+    ):
+        repo.resolve(storage=storage)
+
+
 def test_downstream_runs_after_upstream_retry_succeeds(storage):
     calls = {"n": 0}
 

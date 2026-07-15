@@ -143,8 +143,23 @@ Every retried attempt leaves a `StepRetry` event on the run timeline carrying th
 
 The attempt count for a step is the number of its `StepRetry` events plus one; the final `StepSuccess`/`StepFailure` settles the outcome.
 
+## Multi-assets
+
+A multi-asset is one function call producing several outputs, so it can only retry **as a unit**. `AssetDef(retry=...)` attaches the policy per output, and every output that sets one must set the *same* one (checked at `resolve()`):
+
+```python
+@rs.Asset.from_multi(output_defs=[
+    rs.AssetDef("orders", retry=rs.RetryPolicy(max_retries=3, retry_on=[ConnectionError])),
+    rs.AssetDef("customers"),   # covered by the same step retry
+])
+def load_tables():
+    return {"orders": ..., "customers": ...}
+```
+
+Dict-returning multi-assets retry normally. **Generator multi-assets do not retry**: their body runs during output iteration, after earlier yields may already have materialized — re-running the whole generator would double-write those outputs.
+
 ## Limitations
 
-- Multi-asset outputs can't yet carry per-output policies (`AssetDef(retry=...)` is not implemented); a multi-asset step retries as a unit only via job/repo-level defaults.
+- Generator-style multi-assets don't retry (see above); dict-returning ones do.
 - Exception-type allow-lists don't match Kubernetes step failures yet (see above).
 - A run cancelled mid-backoff finishes the wait before the cancellation is honored at the next step boundary.

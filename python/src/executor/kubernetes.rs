@@ -600,11 +600,11 @@ impl ExecutorBackend for KubernetesBackend {
         let specs: Vec<StepJobSpec> = instances
             .iter()
             .map(|inst| {
-                let step_name = ctx.scope.plan.steps[inst.idx].name.clone();
+                let step = &ctx.scope.plan.steps[inst.idx];
                 StepJobSpec {
                     instance_name: inst.instance_name.clone(),
-                    policy: ctx.retry_policy(&step_name),
-                    step_name,
+                    policy: ctx.retry_policy_for(step),
+                    step_name: step.name.clone(),
                     mapping_key: inst.mapping_key.clone(),
                 }
             })

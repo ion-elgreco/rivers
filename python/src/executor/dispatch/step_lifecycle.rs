@@ -92,7 +92,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
     }
 
     // Pool slots stay claimed across retry attempts and backoff sleeps.
-    let policy = ctx.retry_policy(&step.name);
+    let policy = ctx.retry_policy_for(step);
     let mut attempt: u32 = 1;
     let outcome = loop {
         let outcome = worker.run_work(py, ctx);

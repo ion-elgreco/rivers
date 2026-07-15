@@ -206,7 +206,9 @@ def _dump_debug_info(run_name: str) -> str:
     return "\n".join(lines)
 
 
-def _query_run_events(run_id: str) -> list[dict]:
+def _query_run_events(
+    run_id: str, fields: str = "event_type, asset_key"
+) -> list[dict]:
     """Query SurrealDB via its HTTP /sql endpoint over a kr8s port-forward.
 
     kr8s exec doesn't support stdin on the v4 channel protocol that k3s
@@ -228,7 +230,7 @@ def _query_run_events(run_id: str) -> list[dict]:
     )
     user = base64.b64decode(secret.raw["data"]["username"]).decode()
     pwd = base64.b64decode(secret.raw["data"]["password"]).decode()
-    query = f"SELECT event_type, asset_key FROM events WHERE run_id = '{run_id}';"
+    query = f"SELECT {fields} FROM events WHERE run_id = '{run_id}';"
     with pod.portforward(remote_port=8000, local_port="auto") as local_port:
         # SurrealDB v3 root-user basic auth doesn't apply to DB-scoped queries;
         # we have to sign in to (ns=rivers, db=main) first and use the JWT.
