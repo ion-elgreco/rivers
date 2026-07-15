@@ -157,6 +157,7 @@ struct StepDispatch {
     /// multi-output steps this is `step.event_names()`; for mapped instances
     /// it's `vec![instance_name]`.
     start_event_names: Vec<String>,
+    retry: Option<rivers_core::execution::retry::RetryPolicy>,
 }
 
 /// Phase-4 worker for the async backend: hops onto a blocking thread, attaches
@@ -169,7 +170,7 @@ struct AsyncStepWorker {
 }
 
 impl AsyncWorker for AsyncStepWorker {
-    fn run_work(self) -> WorkOutcome {
+    fn run_work(&self) -> WorkOutcome {
         Python::try_attach(|py| {
             execute_with_capture(
                 py,
@@ -194,6 +195,7 @@ async fn dispatch_step(d: StepDispatch) -> WorkOutcome {
         events_tx,
         pool_step_name,
         start_event_names,
+        retry,
     } = d;
     let storage = shared.storage.clone();
     let run_id = shared.run_id.clone();
@@ -205,6 +207,7 @@ async fn dispatch_step(d: StepDispatch) -> WorkOutcome {
         start_event_names,
         events_tx,
         semaphore,
+        retry,
         AsyncStepWorker {
             shared,
             step,
@@ -257,6 +260,7 @@ impl ExecutorBackend for AsyncBackend {
                 }
                 let pool_step_name = inst.instance_name.clone();
                 let start_event_names = inst.event_names.clone();
+                let retry = ctx.retry_policy(&step.name);
                 (
                     inst.idx,
                     inst.instance_name,
@@ -271,6 +275,7 @@ impl ExecutorBackend for AsyncBackend {
                         events_tx: events_tx.clone(),
                         pool_step_name,
                         start_event_names,
+                        retry,
                     },
                 )
             })

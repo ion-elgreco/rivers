@@ -45,11 +45,10 @@ pub(crate) trait SyncWorker {
 
 /// Phase-4 work supplied by a backend that schedules onto a tokio task
 /// (async or parallel-pool). The worker runs inside `spawn_blocking` so it
-/// can't borrow from the orchestrator stack — it owns its data.
-pub(crate) trait AsyncWorker: Send + 'static {
-    fn run_work(self) -> WorkOutcome
-    where
-        Self: Sized;
+/// can't borrow from the orchestrator stack — it owns its data. Takes `&self`
+/// (shared via `Arc` across attempts) so the retry loop can re-run it.
+pub(crate) trait AsyncWorker: Send + Sync + 'static {
+    fn run_work(&self) -> WorkOutcome;
 }
 
 /// Run the synchronous lifecycle around `worker`. Pool-claim failures use
@@ -165,6 +164,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
     start_event_names: Vec<String>,
     events_tx: mpsc::UnboundedSender<EventRecord>,
     semaphore: Option<Arc<Semaphore>>,
+    retry_policy: Option<rivers_core::execution::retry::RetryPolicy>,
     worker: W,
 ) -> WorkOutcome {
     let _permit = if let Some(sem) = semaphore {
@@ -198,16 +198,86 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         ops::emit_step_start_via_tx(&events_tx, &code_location_id, &run_id, name, start_ts);
     }
 
-    let outcome = tokio::task::spawn_blocking(move || worker.run_work()).await;
+    // Pool slots stay claimed across retry attempts and backoff sleeps.
+    let worker = Arc::new(worker);
+    let mut attempt: u32 = 1;
+    let outcome = loop {
+        let w = Arc::clone(&worker);
+        // Classification needs the GIL; attach on the blocking thread, not here.
+        let joined = tokio::task::spawn_blocking(move || {
+            let outcome = w.run_work();
+            let classified = match &outcome {
+                WorkOutcome::Error { error, .. } => {
+                    Python::try_attach(|py| classify_pyerr(py, error))
+                }
+                _ => None,
+            };
+            (outcome, classified)
+        })
+        .await;
+        let (outcome, classified) = match joined {
+            Ok(pair) => pair,
+            Err(e) => break prep_error(format!("spawn_blocking join error: {e}")),
+        };
+        if !matches!(outcome, WorkOutcome::Error { .. }) {
+            break outcome;
+        }
+        let (Some(policy), Some((reason, exc_types))) = (&retry_policy, classified.as_ref()) else {
+            break outcome;
+        };
+        if !should_retry(policy, *reason, exc_types, attempt) {
+            break outcome;
+        }
+        // Flush the failed attempt's logs now; the outcome is discarded.
+        if let WorkOutcome::Error {
+            captured_logs: Some((stdout, stderr, logs)),
+            ..
+        } = &outcome
+        {
+            ops::emit_log_output_via_tx(
+                &events_tx,
+                &code_location_id,
+                &run_id,
+                &pool_step_name,
+                stdout,
+                stderr,
+                logs,
+                now_ts(),
+            );
+        }
+        let delay = compute_delay(policy, attempt, rng01());
+        for name in &start_event_names {
+            ops::emit_step_retry_via_tx(
+                &events_tx,
+                &code_location_id,
+                &run_id,
+                name,
+                attempt,
+                *reason,
+                delay,
+                now_ts(),
+            );
+        }
+        tracing::info!(
+            step = %pool_step_name,
+            attempt,
+            reason = reason.as_str(),
+            delay_ms = delay.as_millis() as u64,
+            "step failed, retrying"
+        );
+        tokio::time::sleep(delay).await;
+        attempt += 1;
+        let ts = now_ts();
+        for name in &start_event_names {
+            ops::emit_step_start_via_tx(&events_tx, &code_location_id, &run_id, name, ts);
+        }
+    };
 
     if let Some(g) = guard {
         g.release().await;
     }
 
-    match outcome {
-        Ok(o) => o,
-        Err(e) => prep_error(format!("spawn_blocking join error: {e}")),
-    }
+    outcome
 }
 
 fn prep_error(msg: String) -> WorkOutcome {
