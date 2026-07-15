@@ -3,7 +3,7 @@
 pub(crate) mod backend;
 mod classify;
 mod context;
-mod failure;
+pub(crate) mod failure;
 mod orchestrate;
 pub(crate) mod pool_claim;
 pub(crate) mod results;

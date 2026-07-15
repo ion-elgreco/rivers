@@ -79,12 +79,31 @@ fn mapped_step_job_name(run_id: &str, step_name: &str, mapping_key: &str) -> Str
     format!("rivers-step-{run_id}-{}", short_hash(&key))
 }
 
+/// Per-attempt knobs for a step Job: retry attempts get a distinct Job name
+/// (a finished K8s Job can't be re-run) and possibly escalated resources.
+#[derive(Default)]
+pub struct StepJobOverrides<'a> {
+    /// 1-indexed attempt; attempts > 1 append `-r<n>` to the Job name.
+    pub attempt: u32,
+    /// Replaces the config's worker cpu/memory per set axis; `gpu` adds
+    /// `nvidia.com/gpu` to requests and limits.
+    pub compute: Option<&'a rivers_core::execution::compute::Compute>,
+}
+
 /// Job name is `rivers-step-<run_id>-<8-char-hash(step_name)>` to stay
 /// within K8s' 63-char resource-name limit. Owned by the parent Run pod via
 /// OwnerReference so kube garbage-collects on Run delete.
 pub fn build_step_job(config: &K8sStepExecutorConfig, step_name: &str) -> Job {
-    let job_name = step_job_name(&config.run_id, step_name);
-    build_job_inner(config, &job_name, step_name, None)
+    build_step_job_with(config, step_name, &StepJobOverrides::default())
+}
+
+pub fn build_step_job_with(
+    config: &K8sStepExecutorConfig,
+    step_name: &str,
+    overrides: &StepJobOverrides,
+) -> Job {
+    let job_name = attempt_name(step_job_name(&config.run_id, step_name), overrides.attempt);
+    build_job_inner(config, &job_name, step_name, None, overrides)
 }
 
 /// One mapping shard of a fan-out step. Job name hashes
@@ -95,8 +114,28 @@ pub fn build_mapped_step_job(
     step_name: &str,
     mapping_key: &str,
 ) -> Job {
-    let job_name = mapped_step_job_name(&config.run_id, step_name, mapping_key);
-    build_job_inner(config, &job_name, step_name, Some(mapping_key))
+    build_mapped_step_job_with(config, step_name, mapping_key, &StepJobOverrides::default())
+}
+
+pub fn build_mapped_step_job_with(
+    config: &K8sStepExecutorConfig,
+    step_name: &str,
+    mapping_key: &str,
+    overrides: &StepJobOverrides,
+) -> Job {
+    let job_name = attempt_name(
+        mapped_step_job_name(&config.run_id, step_name, mapping_key),
+        overrides.attempt,
+    );
+    build_job_inner(config, &job_name, step_name, Some(mapping_key), overrides)
+}
+
+fn attempt_name(base: String, attempt: u32) -> String {
+    if attempt > 1 {
+        format!("{base}-r{attempt}")
+    } else {
+        base
+    }
 }
 
 fn build_job_inner(
@@ -104,6 +143,7 @@ fn build_job_inner(
     job_name: &str,
     step_name: &str,
     mapping_key: Option<&str>,
+    overrides: &StepJobOverrides,
 ) -> Job {
     let mut labels = BTreeMap::from([
         ("rivers.io/run-id".to_string(), config.run_id.clone()),
@@ -165,16 +205,27 @@ fn build_job_inner(
                         image_pull_policy: Some("IfNotPresent".to_string()),
                         command: Some(vec!["rivers".to_string()]),
                         args: Some(args),
-                        resources: Some(ResourceRequirements {
-                            requests: Some(BTreeMap::from([
-                                ("cpu".to_string(), Quantity(config.worker_cpu.clone())),
-                                ("memory".to_string(), Quantity(config.worker_memory.clone())),
-                            ])),
-                            limits: Some(BTreeMap::from([
-                                ("cpu".to_string(), Quantity(config.worker_cpu.clone())),
-                                ("memory".to_string(), Quantity(config.worker_memory.clone())),
-                            ])),
-                            ..Default::default()
+                        resources: Some({
+                            let cpu = overrides
+                                .compute
+                                .and_then(|c| c.cpu.clone())
+                                .unwrap_or_else(|| config.worker_cpu.clone());
+                            let memory = overrides
+                                .compute
+                                .and_then(|c| c.memory.clone())
+                                .unwrap_or_else(|| config.worker_memory.clone());
+                            let mut quantities = BTreeMap::from([
+                                ("cpu".to_string(), Quantity(cpu)),
+                                ("memory".to_string(), Quantity(memory)),
+                            ]);
+                            if let Some(gpu) = overrides.compute.and_then(|c| c.gpu.clone()) {
+                                quantities.insert("nvidia.com/gpu".to_string(), Quantity(gpu));
+                            }
+                            ResourceRequirements {
+                                requests: Some(quantities.clone()),
+                                limits: Some(quantities),
+                                ..Default::default()
+                            }
                         }),
                         env: Some({
                             let mut env = vec![
@@ -245,6 +296,85 @@ mod tests {
             extra_env: vec![],
             partition_key: None,
         }
+    }
+
+    #[test]
+    fn retry_attempt_gets_suffixed_name_and_escalated_resources() {
+        let config = test_config();
+        let base = build_step_job(&config, "big_join");
+        let base_name = base.metadata.name.as_deref().unwrap().to_string();
+
+        let compute = rivers_core::execution::compute::Compute {
+            cpu: None,
+            memory: Some("16Gi".to_string()),
+            gpu: None,
+        };
+        let retry = build_step_job_with(
+            &config,
+            "big_join",
+            &StepJobOverrides {
+                attempt: 3,
+                compute: Some(&compute),
+            },
+        );
+        assert_eq!(
+            retry.metadata.name.as_deref().unwrap(),
+            format!("{base_name}-r3")
+        );
+
+        let container = &retry
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0];
+        let resources = container.resources.as_ref().unwrap();
+        let requests = resources.requests.as_ref().unwrap();
+        let limits = resources.limits.as_ref().unwrap();
+        // memory overridden, cpu inherited from config
+        assert_eq!(requests["memory"].0, "16Gi");
+        assert_eq!(requests["cpu"].0, "1");
+        assert_eq!(limits["memory"].0, "16Gi");
+        assert!(!requests.contains_key("nvidia.com/gpu"));
+    }
+
+    #[test]
+    fn gpu_axis_adds_extended_resource() {
+        let compute = rivers_core::execution::compute::Compute {
+            cpu: None,
+            memory: None,
+            gpu: Some("1".to_string()),
+        };
+        let job = build_step_job_with(
+            &test_config(),
+            "gpu_step",
+            &StepJobOverrides {
+                attempt: 1,
+                compute: Some(&compute),
+            },
+        );
+        let container = &job
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0];
+        let requests = container
+            .resources
+            .as_ref()
+            .unwrap()
+            .requests
+            .as_ref()
+            .unwrap();
+        assert_eq!(requests["nvidia.com/gpu"].0, "1");
+        // unset axes fall back to config
+        assert_eq!(requests["memory"].0, "2Gi");
     }
 
     #[test]
