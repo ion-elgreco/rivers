@@ -335,9 +335,14 @@ class AssetDef:
         partition_mapping: dict[str | AssetDef, PartitionMapping] | None = ...,
         pool: str | list[str] | None = ...,
         pool_slots: int | dict[str, int] | None = ...,
+        retry: "RetryPolicy | str | None" = ...,
         deps: list["DepDef"] = ...,
     ) -> None:
-        """Build an asset definition shared between multi-asset outputs and deps."""
+        """Build an asset definition shared between multi-asset outputs and deps.
+
+        A multi-asset retries as one unit: every output that sets ``retry``
+        must set the same policy.
+        """
         ...
 
     @property

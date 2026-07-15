@@ -74,10 +74,7 @@ impl ExecutorBackend for ParallelBackend {
         // paths resolve futures once and can't re-submit an attempt.
         let (pool_instances, no_pool_instances): (Vec<StepInstance>, Vec<StepInstance>) =
             sync_instances.into_iter().partition(|i| {
-                !i.pools.is_empty()
-                    || ctx
-                        .retry_policy(&ctx.scope.plan.steps[i.idx].name)
-                        .is_some()
+                !i.pools.is_empty() || ctx.retry_policy_for(&ctx.scope.plan.steps[i.idx]).is_some()
             });
 
         let mut loky_futures: Vec<SubmittedStep> = Vec::new();
@@ -606,7 +603,7 @@ impl ParallelBackend {
                 pools: inst.pools.clone(),
                 event_names: inst.event_names.clone(),
                 instance_name: inst.instance_name.clone(),
-                retry: ctx.retry_policy(&ctx.scope.plan.steps[inst.idx].name),
+                retry: ctx.retry_policy_for(&ctx.scope.plan.steps[inst.idx]),
             });
         }
 

@@ -158,7 +158,18 @@ impl<'a> BatchContext<'a> {
         );
     }
 
-    /// Effective retry policy for a plan step (asset-level; `None` = fail fast).
+    /// Effective retry policy for a plan step (`None` = fail fast). Multi-asset
+    /// steps aren't node keys themselves — their outputs are; per-output
+    /// policies are validated uniform at resolve, so any output's works.
+    pub(crate) fn retry_policy_for(
+        &self,
+        step: &rivers_core::execution::plan::ExecutionStep,
+    ) -> Option<rivers_core::execution::retry::RetryPolicy> {
+        self.retry_policy(&step.name)
+            .or_else(|| step.outputs.iter().find_map(|n| self.retry_policy(n)))
+    }
+
+    /// Retry policy of one resolved node (asset-level).
     pub(crate) fn retry_policy(
         &self,
         step_name: &str,

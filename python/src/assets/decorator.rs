@@ -425,6 +425,10 @@ pub struct AssetDef {
     /// Pool membership: normalized (pool_key, slots_consumed) pairs.
     #[pyo3(get)]
     pub pool: Vec<(String, u32)>,
+    /// Retry policy for this output. A multi-asset retries as one unit, so
+    /// every output that sets a policy must set the same one (validated at
+    /// resolve).
+    pub retry: Option<rivers_core::execution::retry::RetryRef>,
     /// Per-output dependencies. Combined with the multi-asset's top-level
     /// `deps=` at build time: input deps merge into the function's input set
     /// (de-duplicated by name), lineage-only deps become edges to this output.
@@ -466,6 +470,7 @@ impl AssetDef {
         partition_mapping = None,
         pool = None,
         pool_slots = None,
+        retry = None,
         deps = vec![],
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -482,9 +487,11 @@ impl AssetDef {
         partition_mapping: Option<PartitionMappingDict>,
         pool: Option<&Bound<'py, PyAny>>,
         pool_slots: Option<&Bound<'py, PyAny>>,
+        retry: Option<Bound<'py, PyAny>>,
         deps: Vec<Py<DepDef>>,
     ) -> PyResult<Self> {
         let pool = normalize_pool(pool, pool_slots)?;
+        let retry = crate::retry::extract_retry_ref(retry)?;
         Ok(Self {
             name,
             tags,
@@ -496,6 +503,7 @@ impl AssetDef {
             partitions_def,
             partition_mapping,
             pool,
+            retry,
             deps,
         })
     }
@@ -723,9 +731,21 @@ impl Asset {
         }
     }
 
-    pub fn retry(&self) -> Option<&rivers_core::execution::retry::RetryRef> {
+    /// The retry policy governing the step that materializes `output` (for
+    /// multi-assets, the per-output `AssetDef` policy — uniform across outputs
+    /// by validation, since a multi-asset retries as one unit).
+    pub fn retry_for_output(
+        &self,
+        output: Option<&str>,
+    ) -> Option<&rivers_core::execution::retry::RetryRef> {
         match self {
             Asset::Single(a) => a.retry.as_ref(),
+            Asset::Multi(m) => output.and_then(|out| {
+                m.assets
+                    .iter()
+                    .find(|a| a.name.as_deref() == Some(out))
+                    .and_then(|a| a.retry.as_ref())
+            }),
             _ => None,
         }
     }
@@ -739,24 +759,64 @@ impl Asset {
 
     /// Resolve all ResourceRef io_handlers to Instance variants using the resources dict.
     /// `io_handler_keys` contains resource keys that are validated IOHandler instances.
-    /// Resolve a `retry="name"` reference against the repository `retries`
+    /// Resolve `retry="name"` references against the repository `retries`
     /// registry, replacing `Named` with the concrete `Inline` policy. Errors on
-    /// an unknown name.
+    /// an unknown name, and on multi-asset outputs declaring *different*
+    /// policies — one function call is one retry unit.
     pub fn resolve_retry_refs(
         &mut self,
         retries: &HashMap<String, rivers_core::execution::retry::RetryPolicy>,
     ) -> PyResult<()> {
-        use rivers_core::execution::retry::RetryRef;
-        if let Asset::Single(a) = self {
-            if let Some(RetryRef::Named(key)) = &a.retry {
-                let policy = retries.get(key).ok_or_else(|| {
+        use rivers_core::execution::retry::{RetryPolicy, RetryRef};
+
+        fn resolve_one(
+            slot: &mut Option<RetryRef>,
+            retries: &HashMap<String, RetryPolicy>,
+            owner: &str,
+        ) -> PyResult<()> {
+            if let Some(RetryRef::Named(key)) = slot {
+                let policy = retries.get(key.as_str()).ok_or_else(|| {
                     crate::errors::ConfigurationError::new_err(format!(
-                        "unknown retry policy '{key}' referenced by asset; registered: {:?}",
+                        "unknown retry policy '{key}' referenced by asset '{owner}'; \
+                         registered: {:?}",
                         retries.keys().collect::<Vec<_>>()
                     ))
                 })?;
-                a.retry = Some(RetryRef::Inline(policy.clone()));
+                *slot = Some(RetryRef::Inline(policy.clone()));
             }
+            Ok(())
+        }
+
+        match self {
+            Asset::Single(a) => {
+                let owner = a.name.clone().unwrap_or_default();
+                resolve_one(&mut a.retry, retries, &owner)?;
+            }
+            Asset::Multi(m) => {
+                for a in &mut m.assets {
+                    let owner = a.name.clone().unwrap_or_default();
+                    resolve_one(&mut a.retry, retries, &owner)?;
+                }
+                let mut first: Option<(&str, &RetryPolicy)> = None;
+                for a in &m.assets {
+                    let Some(policy) = a.retry.as_ref().and_then(|r| r.as_inline()) else {
+                        continue;
+                    };
+                    match first {
+                        None => first = Some((a.name.as_deref().unwrap_or(""), policy)),
+                        Some((first_name, first_policy)) if first_policy != policy => {
+                            return Err(crate::errors::ConfigurationError::new_err(format!(
+                                "multi-asset outputs '{first_name}' and '{}' declare different \
+                                 retry policies; a multi-asset retries as one unit, so every \
+                                 output that sets a policy must set the same one",
+                                a.name.as_deref().unwrap_or("")
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1136,7 +1196,7 @@ impl PyAsset {
                 hooks: None,
                 automation_condition: None,
                 pool: borrow_asset_def.pool.clone(),
-                retry: None,
+                retry: borrow_asset_def.retry.clone(),
             });
         }
 

@@ -23,11 +23,14 @@ import obstore.store
 from rivers import (
     Asset,
     CodeRepository,
+    ComputeEscalation,
     Executor,
     InMemoryIOHandler,
     Job,
     Output,
     PickleIOHandler,
+    RetryOn,
+    RetryPolicy,
     RunBackendConfig,
     RunQueueConfig,
     Task,
@@ -164,11 +167,69 @@ k8s_graph_job = Job(
 )
 
 
+# --- Retry jobs (K8s step executor; see tests/integration/kubernetes/test_k8s_retry.py) ---
+
+
+@Asset(io_handler=s3_io, retry=RetryPolicy(max_retries=2))
+def retry_always_fails():
+    raise RuntimeError("intentional failure, retried until the budget runs out")
+
+
+k8s_retry_exhausted_job = Job(
+    name="k8s_retry_exhausted_job",
+    assets=[retry_always_fails],
+)
+
+
+def _allocate_mib(mib: int) -> bytearray:
+    """Commit real pages (zero-page COW never charges the cgroup)."""
+    buf = bytearray(mib * 1024 * 1024)
+    for i in range(0, len(buf), 4096):
+        buf[i] = 1
+    return buf
+
+
+@Asset(
+    io_handler=s3_io,
+    retry=RetryPolicy(
+        max_retries=2,
+        retry_on=RetryOn.TRANSIENT,
+        escalate=ComputeEscalation(factor=2.0, max_memory="1Gi"),
+    ),
+)
+def oom_hungry():
+    # ~250MiB touched: over the 256Mi base limit, comfortably under the
+    # escalated 512Mi — OOMKilled on attempt 1, succeeds on attempt 2.
+    buf = _allocate_mib(250)
+    return Output(value={"allocated_mib": len(buf) // (1024 * 1024)})
+
+
+k8s_oom_escalation_job = Job(
+    name="k8s_oom_escalation_job",
+    assets=[oom_hungry],
+)
+
+
+@Asset(io_handler=s3_io)
+def oom_no_retry():
+    # No retry policy: the OOM-killed pod writes no event, so this run only
+    # terminates because the poll falls back to the Job status.
+    buf = _allocate_mib(250)
+    return Output(value={"allocated_mib": len(buf) // (1024 * 1024)})
+
+
+k8s_oom_no_retry_job = Job(
+    name="k8s_oom_no_retry_job",
+    assets=[oom_no_retry],
+)
+
+
 all_assets = [
     source_data, transform_data, final_report,
     s3_source, s3_transform, s3_report,
     always_fails, slow_asset,
     graph_pipeline,
+    retry_always_fails, oom_hungry, oom_no_retry,
 ]
 
 all_tasks = [graph_inner_load, graph_inner_transform]
@@ -176,7 +237,10 @@ all_tasks = [graph_inner_load, graph_inner_transform]
 repo = CodeRepository(
     assets=all_assets,
     tasks=all_tasks,
-    jobs=[k8s_inprocess_job, k8s_step_job, k8s_failing_job, k8s_slow_job, k8s_graph_job],
+    jobs=[
+        k8s_inprocess_job, k8s_step_job, k8s_failing_job, k8s_slow_job, k8s_graph_job,
+        k8s_retry_exhausted_job, k8s_oom_escalation_job, k8s_oom_no_retry_job,
+    ],
     default_executor=Executor.kubernetes(
         worker_cpu="250m",
         worker_memory="256Mi",
