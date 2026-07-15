@@ -192,6 +192,68 @@ def test_backoff_delay_is_applied(storage):
     assert calls["n"] == 2
 
 
+def test_async_asset_retry(storage):
+    calls = {"n": 0}
+
+    @rs.Asset(retry=rs.RetryPolicy(max_retries=2, retry_on=[ValueError]))
+    async def flaky_async() -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("transient")
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[flaky_async], default_executor=rs.Executor.in_process()
+    )
+    repo.resolve(storage=storage)
+    assert repo.materialize().success
+    assert calls["n"] == 2
+    types = [e.event_type for e in storage.get_events_for_asset("flaky_async")]
+    assert types.count("StepRetry") == 1
+    assert "StepFailure" not in types
+
+
+def test_parallel_executor_retry(tmp_path, storage):
+    """Retry a step whose exception was raised in a loky subprocess."""
+    import obstore.store
+
+    store = obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    handler = rs.PickleIOHandler(store=store)
+    marker = str(tmp_path / "attempted")
+
+    @rs.Asset(
+        io_handler=handler,
+        retry=rs.RetryPolicy(max_retries=2, retry_on=[ValueError]),
+    )
+    def flaky_subprocess() -> int:
+        import os
+
+        if not os.path.exists(marker):
+            with open(marker, "w") as f:
+                f.write("1")
+            raise ValueError("first attempt fails")
+        return 5
+
+    # A sibling step at the same level keeps the loky pool path engaged
+    # (a lone sync step would be run in-process by the parallel backend).
+    @rs.Asset(io_handler=handler)
+    def steady() -> int:
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[flaky_subprocess, steady],
+        default_executor=rs.Executor.parallel(max_workers=2),
+    )
+    repo.resolve(storage=storage)
+    assert repo.materialize().success
+    types = [
+        e.event_type for e in storage.get_events_for_asset("flaky_subprocess")
+    ]
+    assert types.count("StepRetry") == 1
+    assert "StepSuccess" in types
+    assert "StepFailure" not in types
+
+
 def test_downstream_runs_after_upstream_retry_succeeds(storage):
     calls = {"n": 0}
 

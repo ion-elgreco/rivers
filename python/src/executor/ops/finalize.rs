@@ -134,6 +134,73 @@ pub(crate) fn emit_step_retry(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_step_retry_via_tx(
+    tx: &tokio::sync::mpsc::UnboundedSender<EventRecord>,
+    code_location_id: &str,
+    run_id: &str,
+    step_name: &str,
+    attempt: u32,
+    reason: rivers_core::execution::retry::FailureReason,
+    delay: std::time::Duration,
+    ts: i64,
+) {
+    use rivers_core::execution::retry::meta;
+    let _ = tx.send(EventRecord {
+        code_location_id: code_location_id.to_string(),
+        event_type: EventType::StepRetry,
+        asset_key: Some(step_name.to_string()),
+        run_id: run_id.to_string(),
+        partition_key: None,
+        timestamp: ts,
+        metadata: vec![
+            (meta::ATTEMPT.to_string(), attempt.to_string()),
+            (meta::REASON.to_string(), reason.as_str().to_string()),
+            (
+                meta::NEXT_DELAY_MS.to_string(),
+                delay.as_millis().to_string(),
+            ),
+        ],
+        input_data_versions: vec![],
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_log_output_via_tx(
+    tx: &tokio::sync::mpsc::UnboundedSender<EventRecord>,
+    code_location_id: &str,
+    run_id: &str,
+    step_name: &str,
+    stdout: &str,
+    stderr: &str,
+    logs: &str,
+    ts: i64,
+) {
+    if stdout.is_empty() && stderr.is_empty() && logs.is_empty() {
+        return;
+    }
+    let mut metadata = Vec::new();
+    if !stdout.is_empty() {
+        metadata.push(("stdout".to_string(), stdout.to_string()));
+    }
+    if !stderr.is_empty() {
+        metadata.push(("stderr".to_string(), stderr.to_string()));
+    }
+    if !logs.is_empty() {
+        metadata.push(("logs".to_string(), logs.to_string()));
+    }
+    let _ = tx.send(EventRecord {
+        code_location_id: code_location_id.to_string(),
+        event_type: EventType::LogOutput,
+        asset_key: Some(step_name.to_string()),
+        run_id: run_id.to_string(),
+        partition_key: None,
+        timestamp: ts,
+        metadata,
+        input_data_versions: vec![],
+    });
+}
+
 pub(crate) fn emit_partition_failure(
     writer: &EventWriter,
     run_id: &str,

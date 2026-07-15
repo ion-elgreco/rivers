@@ -70,10 +70,15 @@ impl ExecutorBackend for ParallelBackend {
             return;
         }
 
+        // Retrying steps also take the lifecycle path — the batch/windowed fast
+        // paths resolve futures once and can't re-submit an attempt.
         let (pool_instances, no_pool_instances): (Vec<StepInstance>, Vec<StepInstance>) =
-            sync_instances
-                .into_iter()
-                .partition(|i| !i.pools.is_empty());
+            sync_instances.into_iter().partition(|i| {
+                !i.pools.is_empty()
+                    || ctx
+                        .retry_policy(&ctx.scope.plan.steps[i.idx].name)
+                        .is_some()
+            });
 
         let mut loky_futures: Vec<SubmittedStep> = Vec::new();
         let mut windowed_done = false;
@@ -588,6 +593,7 @@ impl ParallelBackend {
             pools: Vec<(String, u32)>,
             event_names: Vec<String>,
             instance_name: String,
+            retry: Option<rivers_core::execution::retry::RetryPolicy>,
         }
         let mut prepared: Vec<PreparedPoolStep> = Vec::new();
 
@@ -600,6 +606,7 @@ impl ParallelBackend {
                 pools: inst.pools.clone(),
                 event_names: inst.event_names.clone(),
                 instance_name: inst.instance_name.clone(),
+                retry: ctx.retry_policy(&ctx.scope.plan.steps[inst.idx].name),
             });
         }
 
@@ -624,6 +631,7 @@ impl ParallelBackend {
                         pools,
                         event_names,
                         instance_name,
+                        retry,
                     } = prep;
                     let idx = base.idx;
                     let pool_step_name = instance_name.clone();
@@ -647,6 +655,7 @@ impl ParallelBackend {
                             event_names,
                             events_tx,
                             None,
+                            retry,
                             worker,
                         )
                         .await;
@@ -691,7 +700,7 @@ struct LokyPoolWorker {
 }
 
 impl AsyncWorker for LokyPoolWorker {
-    fn run_work(self) -> WorkOutcome {
+    fn run_work(&self) -> WorkOutcome {
         Python::try_attach(|py| -> WorkOutcome {
             let cfg = || self.failure_config.as_ref().map(|c| c.clone_ref(py));
             let submit_tuple = match PyTuple::new(py, &self.submit_args) {
@@ -717,7 +726,7 @@ impl AsyncWorker for LokyPoolWorker {
             match future.call_method0(py, "result") {
                 Ok(worker_result) => WorkOutcome::WorkerSummary {
                     worker_result,
-                    input_versions: self.input_versions,
+                    input_versions: self.input_versions.clone(),
                     step_config: cfg(),
                 },
                 Err(error) => {
