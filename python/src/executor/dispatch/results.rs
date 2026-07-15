@@ -401,7 +401,7 @@ pub(crate) fn process_outcome(
     }
 }
 
-fn emit_captured_logs(ctx: &mut BatchContext, step_name: &str, logs: CapturedLogs) {
+pub(crate) fn emit_captured_logs(ctx: &mut BatchContext, step_name: &str, logs: CapturedLogs) {
     if let Some((stdout, stderr, rust_logs)) = logs {
         ctx.emit_log_output(step_name, &stdout, &stderr, &rust_logs, now_ts());
     }

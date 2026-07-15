@@ -106,6 +106,34 @@ pub(crate) fn emit_step_failure(
     );
 }
 
+pub(crate) fn emit_step_retry(
+    writer: &EventWriter,
+    run_id: &str,
+    step_name: &str,
+    attempt: u32,
+    reason: rivers_core::execution::retry::FailureReason,
+    delay: std::time::Duration,
+    ts: i64,
+) {
+    use rivers_core::execution::retry::meta;
+    emit_step_event(
+        writer,
+        run_id,
+        step_name,
+        EventType::StepRetry,
+        vec![
+            (meta::ATTEMPT.to_string(), attempt.to_string()),
+            (meta::REASON.to_string(), reason.as_str().to_string()),
+            (
+                meta::NEXT_DELAY_MS.to_string(),
+                delay.as_millis().to_string(),
+            ),
+        ],
+        ts,
+        None,
+    );
+}
+
 pub(crate) fn emit_partition_failure(
     writer: &EventWriter,
     run_id: &str,

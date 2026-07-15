@@ -140,6 +140,35 @@ impl<'a> BatchContext<'a> {
         );
     }
 
+    pub(crate) fn emit_step_retry(
+        &self,
+        step_name: &str,
+        attempt: u32,
+        reason: rivers_core::execution::retry::FailureReason,
+        delay: std::time::Duration,
+    ) {
+        ops::emit_step_retry(
+            self.sink.writer,
+            self.scope.run_id,
+            step_name,
+            attempt,
+            reason,
+            delay,
+            now_ts(),
+        );
+    }
+
+    /// Effective retry policy for a plan step (asset-level; `None` = fail fast).
+    pub(crate) fn retry_policy(
+        &self,
+        step_name: &str,
+    ) -> Option<rivers_core::execution::retry::RetryPolicy> {
+        self.repo
+            .node_map
+            .get(step_name)
+            .and_then(|n| n.retry().cloned())
+    }
+
     /// A failed partitioned step materialized none of its partitions, so record
     /// them all with one StepFailure carrying the whole key (a `Set` for a batched
     /// run); `get_failed_partitions` expands it. The None-keyed step-level failure
