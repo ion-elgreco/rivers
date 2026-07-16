@@ -2292,13 +2292,16 @@ impl StorageBackend for SurrealStorage {
 
     async fn get_run_progress(&self, run_id: &str) -> Result<RunProgress> {
         super::retry::with_retry(&self.retry_config, || async {
+            // Distinct steps, not raw events — a retried step re-emits
+            // StepStart/StepFailure per attempt and must count once.
             let mut result = self
                 .db
                 .query(
-                    "SELECT \
-                         math::sum(IF event_type = 'StepStart' THEN 1 ELSE 0 END) AS total, \
-                         math::sum(IF event_type = 'StepSuccess' OR (event_type = 'StepFailure' AND partition_key IS NONE) THEN 1 ELSE 0 END) AS completed \
-                     FROM events WHERE run_id = $run_id GROUP ALL; \
+                    "SELECT asset_key, event_type FROM events \
+                         WHERE run_id = $run_id \
+                         AND (event_type = 'StepStart' OR event_type = 'StepSuccess' \
+                              OR (event_type = 'StepFailure' AND partition_key IS NONE)) \
+                         GROUP BY asset_key, event_type; \
                      SELECT asset_key, timestamp FROM events \
                          WHERE run_id = $run_id \
                          AND (event_type = 'StepSuccess' OR (event_type = 'StepFailure' AND partition_key IS NONE)) \
@@ -2307,8 +2310,24 @@ impl StorageBackend for SurrealStorage {
                 .bind(("run_id", run_id.to_string()))
                 .await?;
 
-            let total: Option<u32> = result.take((0, "total"))?;
-            let completed: Option<u32> = result.take((0, "completed"))?;
+            #[derive(Debug, SurrealValue, serde::Deserialize)]
+            struct StepEventKind {
+                asset_key: Option<String>,
+                event_type: String,
+            }
+            let kinds: Vec<StepEventKind> = result.take(0)?;
+            let mut started: HashSet<&str> = HashSet::new();
+            let mut terminal: HashSet<&str> = HashSet::new();
+            for kind in &kinds {
+                let Some(key) = kind.asset_key.as_deref() else {
+                    continue;
+                };
+                if kind.event_type == "StepStart" {
+                    started.insert(key);
+                } else {
+                    terminal.insert(key);
+                }
+            }
 
             #[derive(Debug, SurrealValue, serde::Deserialize)]
             struct LastStep {
@@ -2319,8 +2338,8 @@ impl StorageBackend for SurrealStorage {
             let last = last_steps.into_iter().next();
 
             Ok(RunProgress {
-                completed_steps: completed.unwrap_or(0),
-                total_steps: total.unwrap_or(0),
+                completed_steps: terminal.len() as u32,
+                total_steps: started.len() as u32,
                 last_step_completed_at: last.as_ref().map(|s| s.timestamp),
                 last_completed_step: last.and_then(|s| s.asset_key),
             })
@@ -10954,6 +10973,42 @@ mod tests {
         assert_eq!(progress.total_steps, 1);
         assert_eq!(progress.completed_steps, 1);
         assert_eq!(progress.last_step_completed_at, Some(200));
+        assert_eq!(progress.last_completed_step.as_deref(), Some("a"));
+    }
+
+    #[tokio::test]
+    async fn test_get_run_progress_counts_retried_step_once() {
+        let storage = make_storage().await;
+        let run_id = "run-progress-retry";
+
+        // One step retried once: two StepStarts, a step-level failure, the
+        // StepRetry marker, then the succeeding attempt.
+        for (event_type, ts) in [
+            (EventType::StepStart, 100),
+            (EventType::StepFailure, 150),
+            (EventType::StepRetry, 160),
+            (EventType::StepStart, 200),
+            (EventType::StepSuccess, 250),
+        ] {
+            storage
+                .store_event(&EventRecord {
+                    code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+                    event_type,
+                    asset_key: Some("a".to_string()),
+                    run_id: run_id.to_string(),
+                    partition_key: None,
+                    timestamp: ts,
+                    metadata: vec![],
+                    input_data_versions: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        let progress = storage.get_run_progress(run_id).await.unwrap();
+        assert_eq!(progress.total_steps, 1);
+        assert_eq!(progress.completed_steps, 1);
+        assert_eq!(progress.last_step_completed_at, Some(250));
         assert_eq!(progress.last_completed_step.as_deref(), Some("a"));
     }
 
