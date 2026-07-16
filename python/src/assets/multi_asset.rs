@@ -32,6 +32,9 @@ pub struct MultiAsset {
     pub hooks: Option<Vec<Py<PyHook>>>,
     pub automation_condition: Option<PyAutomationCondition>,
     pub backfill_strategy: Option<PyBackfillStrategy>,
+    /// Compute for the step — one multi-asset is one step (one pod), so this
+    /// lives on the multi-asset, not per output.
+    pub compute: Option<rivers_core::execution::compute::Compute>,
 }
 
 /// Python-exposed marker subclass created via `Asset.from_multi(...)`.
@@ -61,7 +64,6 @@ impl PyMultiAsset {
                     partition_mapping: a.partition_mapping.clone(),
                     pool: a.pool.clone(),
                     retry: a.retry.clone(),
-                    compute: a.compute.clone(),
                     // from_multi consumed and merged the original DepDef list;
                     // the reconstructed view does not preserve it.
                     deps: Vec::new(),
