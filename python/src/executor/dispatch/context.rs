@@ -173,7 +173,7 @@ impl<'a> BatchContext<'a> {
     pub(crate) fn retry_policy_for(
         &self,
         step: &rivers_core::execution::plan::ExecutionStep,
-    ) -> Option<rivers_core::execution::retry::RetryPolicy> {
+    ) -> Option<&rivers_core::execution::retry::RetryPolicy> {
         self.retry_policy(&step.name)
             .or_else(|| step.outputs.iter().find_map(|n| self.retry_policy(n)))
     }
@@ -185,14 +185,11 @@ impl<'a> BatchContext<'a> {
     pub(crate) fn retry_policy(
         &self,
         step_name: &str,
-    ) -> Option<rivers_core::execution::retry::RetryPolicy> {
+    ) -> Option<&rivers_core::execution::retry::RetryPolicy> {
         if in_step_pod() {
             return None;
         }
-        self.repo
-            .node_map
-            .get(step_name)
-            .and_then(|n| n.retry().cloned())
+        self.repo.node_map.get(step_name).and_then(|n| n.retry())
     }
 
     /// Per-asset compute for a plan step; multi steps read their outputs'

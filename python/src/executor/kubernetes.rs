@@ -342,20 +342,12 @@ async fn poll_step_attempt(
                     // user error.
                     let last = failures.last();
                     let reason = last
-                        .and_then(|ev| {
-                            ev.metadata
-                                .iter()
-                                .find(|(k, _)| k == retry_meta::REASON)
-                                .and_then(|(_, v)| FailureReason::parse(v))
-                        })
+                        .and_then(|ev| retry_meta::value(&ev.metadata, retry_meta::REASON))
+                        .and_then(FailureReason::parse)
                         .unwrap_or(FailureReason::Error);
                     let exc_types = last
-                        .and_then(|ev| {
-                            ev.metadata
-                                .iter()
-                                .find(|(k, _)| k == retry_meta::EXC_TYPE)
-                                .map(|(_, v)| retry_meta::decode_exc_types(v))
-                        })
+                        .and_then(|ev| retry_meta::value(&ev.metadata, retry_meta::EXC_TYPE))
+                        .map(retry_meta::decode_exc_types)
                         .unwrap_or_default();
                     return StepPollOutcome::Failed { reason, exc_types };
                 }
@@ -516,9 +508,7 @@ async fn run_step_with_retries(
         };
         let baseline_failures = events
             .iter()
-            .filter(|e| {
-                matches!(e.event_type, EventType::StepFailure) && e.partition_key.is_none()
-            })
+            .filter(|e| matches!(e.event_type, EventType::StepFailure) && e.partition_key.is_none())
             .count()
             .min((attempt - 1) as usize);
         let overrides = StepJobOverrides {
@@ -712,7 +702,7 @@ impl ExecutorBackend for KubernetesBackend {
                 let step = &ctx.scope.plan.steps[inst.idx];
                 StepJobSpec {
                     instance_name: inst.instance_name.clone(),
-                    policy: ctx.retry_policy_for(step),
+                    policy: ctx.retry_policy_for(step).cloned(),
                     compute: ctx.compute_for(step),
                     step_name: step.name.clone(),
                     mapping_key: inst.mapping_key.clone(),

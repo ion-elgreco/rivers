@@ -263,7 +263,7 @@ impl ExecutorBackend for AsyncBackend {
                 }
                 let pool_step_name = inst.instance_name.clone();
                 let start_event_names = inst.event_names.clone();
-                let retry = ctx.retry_policy_for(&step);
+                let retry = ctx.retry_policy_for(&step).cloned();
                 (
                     inst.idx,
                     inst.instance_name,

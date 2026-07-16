@@ -246,9 +246,15 @@ pub(crate) fn emit_log_output_via_tx(
     logs: &str,
     ts: i64,
 ) {
-    if let Some(record) =
-        log_output_record(code_location_id, run_id, step_name, stdout, stderr, logs, ts)
-    {
+    if let Some(record) = log_output_record(
+        code_location_id,
+        run_id,
+        step_name,
+        stdout,
+        stderr,
+        logs,
+        ts,
+    ) {
         let _ = tx.send(record);
     }
 }
