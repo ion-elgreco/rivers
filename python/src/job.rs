@@ -211,18 +211,25 @@ impl PyJob {
             return;
         }
         tasks.sort_unstable();
+        tasks.dedup();
         let msg = format!(
             "job '{}': retry policies apply to asset steps only — task steps will not retry: {}",
             self.name,
             tasks.join(", ")
         );
-        if let Ok(msg) = std::ffi::CString::new(msg) {
-            let _ = PyErr::warn(
+        let warned = std::ffi::CString::new(msg.clone()).is_ok_and(|c| {
+            PyErr::warn(
                 py,
                 py.get_type::<pyo3::exceptions::PyUserWarning>().as_any(),
-                &msg,
+                &c,
                 2,
-            );
+            )
+            .is_ok()
+        });
+        if !warned {
+            // A strict warnings filter (-W error) promotes the warning into an
+            // Err we drop on purpose; keep the signal visible in the log.
+            tracing::warn!("{msg}");
         }
     }
 

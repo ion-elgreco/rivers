@@ -779,9 +779,9 @@ def test_job_retry_warns_for_task_steps(storage):
         repo.resolve(storage=storage)
 
 
-def test_task_retry_diagnostic_survives_strict_warnings(storage):
-    """The task-step diagnostic must not break resolve() under -W error —
-    it is structural (not config-fixable), so it is logged, not raised."""
+def test_task_retry_diagnostic_survives_strict_warnings(storage, capfd):
+    """The task-step diagnostic must not break resolve() under -W error — the
+    promoted warning is dropped and the signal falls back to the rust log."""
     import warnings
 
     @rs.Task
@@ -806,6 +806,33 @@ def test_task_retry_diagnostic_survives_strict_warnings(storage):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         repo.resolve(storage=storage)  # must not raise
+    # ...but the diagnostic must not vanish either: it lands in the log.
+    assert "task steps will not retry" in capfd.readouterr().err
+
+
+def test_task_retry_warning_deduplicates_names(storage):
+    @rs.Task
+    def dup_task() -> int:
+        return 1
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler())
+    def anchor3() -> int:
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[anchor3],
+        tasks=[dup_task],
+        jobs=[
+            rs.Job(
+                name="dupjob",
+                assets=[anchor3, dup_task, dup_task],
+                retry=rs.RetryPolicy(max_retries=1),
+            )
+        ],
+    )
+    with pytest.warns(UserWarning, match="task steps") as record:
+        repo.resolve(storage=storage)
+    assert str(record[0].message).count("dup_task") == 1
 
 
 def test_task_retry_warning_names_only_job_steps(storage):
