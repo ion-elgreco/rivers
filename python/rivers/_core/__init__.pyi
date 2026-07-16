@@ -273,11 +273,12 @@ class FailureReason:
     ERROR: "FailureReason"
     """Ordinary exception raised by user code."""
     OUT_OF_MEMORY: "FailureReason"
-    """Killed for exceeding a memory bound (OOMKilled / MemoryError)."""
+    """Pod terminated with reason ``OOMKilled``, or ``MemoryError`` in-process."""
     TIMEOUT: "FailureReason"
     """Exceeded a wall-clock deadline."""
     INFRASTRUCTURE: "FailureReason"
-    """Environmental: pod vanished, worker died — no user-code fault."""
+    """Environmental: pod vanished, bare kill signals (exit 137/143 without
+    ``OOMKilled`` — evictions, preemptions), worker-process death."""
     CANCELLED: "FailureReason"
     """Cancellation requested; never retried."""
 
