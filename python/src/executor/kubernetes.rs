@@ -307,9 +307,15 @@ async fn poll_step_attempt(
                 {
                     return StepPollOutcome::Success;
                 }
+                // Step-level failures only — per-partition failure marks
+                // (partition_key set) can land mid-attempt on a step that
+                // still succeeds.
                 let failures: Vec<_> = events
                     .iter()
-                    .filter(|ev| matches!(ev.event_type, EventType::StepFailure))
+                    .filter(|ev| {
+                        matches!(ev.event_type, EventType::StepFailure)
+                            && ev.partition_key.is_none()
+                    })
                     .collect();
                 if failures.len() > baseline_failures {
                     // The pod records a reason when it can; absent = ordinary
@@ -403,10 +409,11 @@ struct StepJobSpec {
 
 /// Run one step instance to completion, re-creating its Job per retry attempt
 /// (a finished K8s Job can't re-run, so attempt N gets a `-rN` name). On an
-/// escalating reason the next attempt's pod gets grown resources. Attempt
-/// numbering keys off the step's terminal-event count, so an orchestrator
-/// restart replays the ladder: prior attempts resolve instantly from their
-/// recorded events (409-adopting their Jobs) and the budget stays correct.
+/// escalating reason the next attempt's pod gets grown resources. An
+/// orchestrator restart resumes the ladder from the recorded `StepRetry`
+/// events: their reasons replay the escalation chain and set the next attempt
+/// number, so only the attempt actually in flight at the crash is re-polled
+/// (409-adopting its Job).
 async fn run_step_with_retries(
     client: kube_client::Client,
     namespace: String,
@@ -426,31 +433,43 @@ async fn run_step_with_retries(
         .as_ref()
         .map(|c| c.or_default(&executor_base))
         .unwrap_or(executor_base);
-    // StepRetry events already recorded for this step (an orchestrator restart
-    // replays earlier attempts; don't re-emit their retry events).
-    let prior_retries = storage
+    let initial_events = storage
         .get_events_for_step(&run_id, &spec.instance_name)
         .await
-        .map(|evs| {
-            evs.iter()
-                .filter(|e| matches!(e.event_type, EventType::StepRetry))
-                .count() as u32
-        })
-        .unwrap_or(0);
-    let mut attempt: u32 = 1;
+        .unwrap_or_default();
+    let recorded = retry_meta::recorded_ladder(
+        initial_events
+            .iter()
+            .filter(|e| matches!(e.event_type, EventType::StepRetry))
+            .map(|e| e.metadata.as_slice()),
+    );
+    for (_, reason) in &recorded {
+        if let Some(esc) = spec.policy.as_ref().and_then(|p| p.escalate.as_ref()) {
+            compute = rivers_k8s::compute::escalate_compute(&compute, esc, *reason);
+        }
+    }
+    let mut attempt: u32 = recorded.len() as u32 + 1;
+    let mut cached_events = Some(initial_events);
     loop {
         // Failure events recorded before this attempt started; only a failure
         // beyond this count belongs to this attempt (an OOM-killed attempt
-        // records none at all — the Job-status fallback covers it).
-        let baseline_failures = storage
-            .get_events_for_step(&run_id, &spec.instance_name)
-            .await
-            .map(|evs| {
-                evs.iter()
-                    .filter(|e| matches!(e.event_type, EventType::StepFailure))
-                    .count()
+        // records none at all — the Job-status fallback covers it). Capped at
+        // attempt-1 so a failure this attempt already recorded before an
+        // orchestrator restart resolves the re-poll instantly.
+        let events = match cached_events.take() {
+            Some(evs) => evs,
+            None => storage
+                .get_events_for_step(&run_id, &spec.instance_name)
+                .await
+                .unwrap_or_default(),
+        };
+        let baseline_failures = events
+            .iter()
+            .filter(|e| {
+                matches!(e.event_type, EventType::StepFailure) && e.partition_key.is_none()
             })
-            .unwrap_or(0);
+            .count()
+            .min((attempt - 1) as usize);
         let overrides = StepJobOverrides {
             attempt,
             compute: Some(&compute),
@@ -501,31 +520,29 @@ async fn run_step_with_retries(
             compute = rivers_k8s::compute::escalate_compute(&compute, esc, reason);
         }
         let delay = compute_delay(policy, attempt, rng01());
-        if attempt > prior_retries {
-            let mut metadata = vec![
-                (retry_meta::ATTEMPT.to_string(), attempt.to_string()),
-                (retry_meta::REASON.to_string(), reason.as_str().to_string()),
-                (
-                    retry_meta::NEXT_DELAY_MS.to_string(),
-                    delay.as_millis().to_string(),
-                ),
-            ];
-            if let Ok(compute_json) = serde_json::to_string(&compute) {
-                metadata.push((retry_meta::NEXT_COMPUTE.to_string(), compute_json));
-            }
-            let _ = storage
-                .store_event(&rivers_core::storage::EventRecord {
-                    code_location_id: code_location_id.clone(),
-                    event_type: EventType::StepRetry,
-                    asset_key: Some(spec.instance_name.clone()),
-                    run_id: run_id.clone(),
-                    partition_key: None,
-                    timestamp: rivers_core::util::now_ts(),
-                    metadata,
-                    input_data_versions: vec![],
-                })
-                .await;
+        let mut metadata = vec![
+            (retry_meta::ATTEMPT.to_string(), attempt.to_string()),
+            (retry_meta::REASON.to_string(), reason.as_str().to_string()),
+            (
+                retry_meta::NEXT_DELAY_MS.to_string(),
+                delay.as_millis().to_string(),
+            ),
+        ];
+        if let Ok(compute_json) = serde_json::to_string(&compute) {
+            metadata.push((retry_meta::NEXT_COMPUTE.to_string(), compute_json));
         }
+        let _ = storage
+            .store_event(&rivers_core::storage::EventRecord {
+                code_location_id: code_location_id.clone(),
+                event_type: EventType::StepRetry,
+                asset_key: Some(spec.instance_name.clone()),
+                run_id: run_id.clone(),
+                partition_key: None,
+                timestamp: rivers_core::util::now_ts(),
+                metadata,
+                input_data_versions: vec![],
+            })
+            .await;
         tracing::info!(
             target: "rivers::k8s",
             step = %spec.instance_name,

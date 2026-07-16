@@ -209,6 +209,31 @@ pub mod meta {
     pub fn decode_exc_types(value: &str) -> Vec<String> {
         serde_json::from_str(value).unwrap_or_default()
     }
+
+    /// Parse `(attempt, reason)` pairs from recorded `StepRetry` event
+    /// metadata, sorted by attempt. Entries without a parsable [`ATTEMPT`]
+    /// are dropped; a missing/unparsable [`REASON`] defaults to
+    /// [`super::FailureReason::Error`].
+    pub fn recorded_ladder<'a>(
+        step_retry_metas: impl Iterator<Item = &'a [(String, String)]>,
+    ) -> Vec<(u32, super::FailureReason)> {
+        let mut ladder: Vec<(u32, super::FailureReason)> = step_retry_metas
+            .filter_map(|meta| {
+                let attempt = meta
+                    .iter()
+                    .find(|(k, _)| k == ATTEMPT)
+                    .and_then(|(_, v)| v.parse::<u32>().ok())?;
+                let reason = meta
+                    .iter()
+                    .find(|(k, _)| k == REASON)
+                    .and_then(|(_, v)| super::FailureReason::parse(v))
+                    .unwrap_or(super::FailureReason::Error);
+                Some((attempt, reason))
+            })
+            .collect();
+        ladder.sort_by_key(|(attempt, _)| *attempt);
+        ladder
+    }
 }
 
 /// Does `policy.retry_on` admit a failure classified as `reason` whose raised
@@ -472,6 +497,29 @@ mod tests {
             max_cpu: None,
             on: vec![FailureReason::OutOfMemory],
         }
+    }
+
+    #[test]
+    fn recorded_ladder_sorts_and_defaults() {
+        let metas: Vec<Vec<(String, String)>> = vec![
+            // out of order, reason present
+            vec![
+                (meta::ATTEMPT.to_string(), "2".to_string()),
+                (meta::REASON.to_string(), "out_of_memory".to_string()),
+            ],
+            // missing reason -> Error
+            vec![(meta::ATTEMPT.to_string(), "1".to_string())],
+            // unparsable attempt -> dropped
+            vec![(meta::ATTEMPT.to_string(), "nope".to_string())],
+        ];
+        let ladder = meta::recorded_ladder(metas.iter().map(|m| m.as_slice()));
+        assert_eq!(
+            ladder,
+            vec![
+                (1, FailureReason::Error),
+                (2, FailureReason::OutOfMemory),
+            ]
+        );
     }
 
     #[test]
