@@ -17,14 +17,8 @@ pub(crate) fn classify_pyerr(py: Python, err: &PyErr) -> (FailureReason, Vec<Str
     let ty = err.get_type(py);
     let mut mro_names = Vec::new();
     for item in ty.mro().iter() {
-        let module = item
-            .getattr("__module__")
-            .and_then(|m| m.extract::<String>());
-        let qualname = item
-            .getattr("__qualname__")
-            .and_then(|q| q.extract::<String>());
-        if let (Ok(module), Ok(qualname)) = (module, qualname) {
-            mro_names.push(format!("{module}.{qualname}"));
+        if let Ok(name) = crate::utils::qualified_type_name(&item) {
+            mro_names.push(name);
         }
     }
 

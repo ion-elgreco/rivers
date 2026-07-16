@@ -1,10 +1,20 @@
 //! Utility helpers shared across the crate.
 use std::time::Duration;
 
-use pyo3::PyResult;
 use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 
 pub const CORE_MODULE: &str = "rivers._core";
+
+/// `module.qualname` of a Python type. The `retry_on` allow-list and MRO
+/// failure classification match on these strings, so both must format them
+/// through this helper. (Not `PyType::fully_qualified_name` — that omits the
+/// `builtins.` prefix.)
+pub(crate) fn qualified_type_name(ty: &Bound<'_, PyAny>) -> PyResult<String> {
+    let module: String = ty.getattr("__module__")?.extract()?;
+    let qualname: String = ty.getattr("__qualname__")?.extract()?;
+    Ok(format!("{module}.{qualname}"))
+}
 
 /// Parse a human-readable duration string (e.g. `"30s"`, `"5m"`, `"1h30m"`)
 /// into a `std::time::Duration`. Returns a PyO3 `ValueError` with a descriptive
