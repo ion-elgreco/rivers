@@ -405,6 +405,7 @@ impl Executor {
                             partition_key,
                             plan,
                             completed_steps: &completed_steps,
+                            resume,
                         },
                         state: dispatch::RunState {
                             data_versions: &mut data_versions,

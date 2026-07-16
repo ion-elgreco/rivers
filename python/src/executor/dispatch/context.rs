@@ -30,6 +30,9 @@ pub(crate) struct RunScope<'a> {
     pub plan: &'a ExecutionPlan,
     /// Steps already completed before this batch (resume case). Read-only.
     pub completed_steps: &'a HashSet<String>,
+    /// Resuming a prior run: retry ladders seed their attempt number from
+    /// recorded StepRetry events instead of restarting the budget.
+    pub resume: bool,
 }
 
 /// Mutable per-batch progress tracking.

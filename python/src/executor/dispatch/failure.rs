@@ -6,8 +6,8 @@ use std::time::Duration;
 use pyo3::exceptions::{PyKeyboardInterrupt, PyMemoryError, PyTimeoutError};
 use pyo3::prelude::*;
 use rivers_core::execution::retry::FailureReason;
-use rivers_core::storage::StorageBackend;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::{EventType, StorageBackend};
 
 use crate::runtime::io_rt;
 
@@ -105,6 +105,36 @@ pub(crate) fn run_cancelled_blocking(
     py.detach(move || {
         io_rt().block_on(async { storage.is_cancelled(&run_id).await.unwrap_or(false) })
     })
+}
+
+/// StepRetry events a prior (crashed) run already recorded for this step —
+/// a resumed ladder continues the budget from there instead of restarting it.
+pub(crate) async fn prior_step_retries(
+    storage: &SurrealStorage,
+    run_id: &str,
+    step_key: &str,
+) -> u32 {
+    storage
+        .get_events_for_step(run_id, step_key)
+        .await
+        .map(|evs| {
+            evs.iter()
+                .filter(|e| matches!(e.event_type, EventType::StepRetry))
+                .count() as u32
+        })
+        .unwrap_or(0)
+}
+
+pub(crate) fn prior_step_retries_blocking(
+    py: Python,
+    storage: &Arc<SurrealStorage>,
+    run_id: &str,
+    step_key: &str,
+) -> u32 {
+    let storage = Arc::clone(storage);
+    let run_id = run_id.to_string();
+    let step_key = step_key.to_string();
+    py.detach(move || io_rt().block_on(prior_step_retries(&storage, &run_id, &step_key)))
 }
 
 /// Uniform-ish sample in [0, 1) for backoff jitter, from thread ID + wall

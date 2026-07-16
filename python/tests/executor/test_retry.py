@@ -551,6 +551,51 @@ def test_mapped_max_concurrency_respected_with_retry(tmp_path, storage):
     assert peak == 1  # never more than one tracked instance in flight
 
 
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_resume_continues_retry_budget(storage, is_async):
+    """materialize(resume=True) seeds the ladder from recorded StepRetry
+    events instead of granting a fresh budget (parity with the K8s executor)."""
+    calls = {"n": 0}
+
+    def body() -> int:
+        calls["n"] += 1
+        raise ValueError("always")
+
+    if is_async:
+
+        @rs.Asset(retry=rs.RetryPolicy(max_retries=2, retry_on=[ValueError]))
+        async def doomed_resume() -> int:
+            return body()
+
+    else:
+
+        @rs.Asset(retry=rs.RetryPolicy(max_retries=2, retry_on=[ValueError]))
+        def doomed_resume() -> int:
+            return body()
+
+    repo = rs.CodeRepository(
+        assets=[doomed_resume], default_executor=rs.Executor.in_process()
+    )
+    repo.resolve(storage=storage)
+
+    run_id = "resume-budget-test"
+    result = repo.materialize(raise_on_error=False, run_id_override=run_id)
+    assert not result.success
+    assert calls["n"] == 3  # initial attempt + 2 retries
+
+    result = repo.materialize(
+        raise_on_error=False, run_id_override=run_id, resume=True
+    )
+    assert not result.success
+    assert calls["n"] == 4  # budget already spent: exactly one more attempt
+    retries = [
+        e
+        for e in storage.get_events_for_asset("doomed_resume")
+        if e.event_type == "StepRetry"
+    ]
+    assert len(retries) == 2  # no duplicate ladder on resume
+
+
 def test_worker_death_classified_infrastructure_and_retried(tmp_path, storage):
     """A loky worker killed mid-step surfaces as TerminatedWorkerError — an
     environmental failure, so retry_on=TRANSIENT retries it."""
