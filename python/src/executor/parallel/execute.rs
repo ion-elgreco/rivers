@@ -643,6 +643,7 @@ impl ParallelBackend {
                     let window = window.clone();
                     let worker = LokyPoolWorker {
                         max_workers: self.max_workers,
+                        executor: std::sync::Mutex::new(None),
                         submit_args: base.submit_args,
                         input_versions: base.input_versions,
                         failure_config: base.failure_config,
@@ -694,24 +695,52 @@ impl ParallelBackend {
 
 /// Phase-4 worker for the parallel pool path: submits the pre-built args to
 /// the reusable loky executor and blocks for the result, all under a
-/// `try_attach`d GIL inside `spawn_blocking`. The executor is re-acquired per
-/// attempt — `loky.get_reusable_executor` returns the live pool when healthy
-/// and respawns it after a worker death, so retries don't hit a broken pool.
+/// `try_attach`d GIL inside `spawn_blocking`. The executor handle is acquired
+/// once and cached; a failed attempt clears it so the retry re-acquires —
+/// `loky.get_reusable_executor` respawns a pool broken by a worker death.
 struct LokyPoolWorker {
     max_workers: usize,
+    executor: std::sync::Mutex<Option<Py<PyAny>>>,
     submit_args: Vec<Py<PyAny>>,
     input_versions: Vec<(String, String)>,
     failure_config: Option<Py<PyAny>>,
 }
 
+impl LokyPoolWorker {
+    fn acquire<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mut cached = self.executor.lock().unwrap();
+        if let Some(executor) = &*cached {
+            return Ok(executor.bind(py).clone());
+        }
+        let executor = py
+            .import("loky")?
+            .call_method1("get_reusable_executor", (self.max_workers,))?;
+        *cached = Some(executor.clone().unbind());
+        Ok(executor)
+    }
+
+    fn clear_executor(&self) {
+        *self.executor.lock().unwrap() = None;
+    }
+}
+
 impl AsyncWorker for LokyPoolWorker {
     fn run_work(&self) -> WorkOutcome {
+        let outcome = self.run_work_inner();
+        if matches!(outcome, WorkOutcome::Error { .. }) {
+            // The failed attempt may have broken the pool; the retry
+            // re-acquires a (respawned) executor.
+            self.clear_executor();
+        }
+        outcome
+    }
+}
+
+impl LokyPoolWorker {
+    fn run_work_inner(&self) -> WorkOutcome {
         Python::try_attach(|py| -> WorkOutcome {
             let cfg = || self.failure_config.as_ref().map(|c| c.clone_ref(py));
-            let executor = match py
-                .import("loky")
-                .and_then(|m| m.call_method1("get_reusable_executor", (self.max_workers,)))
-            {
+            let executor = match self.acquire(py) {
                 Ok(e) => e,
                 Err(error) => {
                     return WorkOutcome::Error {
