@@ -2517,6 +2517,7 @@ impl PyCodeRepository {
                 )?;
                 job.resolve_retry_ref(&self.raw_retries)?;
                 job.fill_retry_defaults(default_retry.as_ref());
+                job.warn_retry_skips_task_steps(py, default_retry.is_some());
                 validate_job_partition_compatibility(&name, &job.node_names, node_map)?;
             }
         }

@@ -189,6 +189,37 @@ impl PyJob {
         }
     }
 
+    /// Retry policies fill asset nodes only — surface the task/bash-task
+    /// steps a job-level or repo-default policy silently skips.
+    pub(crate) fn warn_retry_skips_task_steps(&self, py: Python, has_default: bool) {
+        if !has_default && self.retry.as_ref().and_then(|r| r.as_inline()).is_none() {
+            return;
+        }
+        let Some(map) = &self.node_map else { return };
+        let mut tasks: Vec<&str> = map
+            .iter()
+            .filter(|(_, n)| !matches!(n, ResolvedNode::Asset(_)))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        if tasks.is_empty() {
+            return;
+        }
+        tasks.sort_unstable();
+        let msg = format!(
+            "job '{}': retry policies apply to asset steps only — task steps will not retry: {}",
+            self.name,
+            tasks.join(", ")
+        );
+        if let Ok(msg) = std::ffi::CString::new(msg) {
+            let _ = PyErr::warn(
+                py,
+                py.get_type::<pyo3::exceptions::PyUserWarning>().as_any(),
+                &msg,
+                2,
+            );
+        }
+    }
+
     /// Validate the job's nodes against the repository graph and build the execution plan.
     ///
     /// `multi_asset_groups` and `composition_order` are graph-static inputs computed
