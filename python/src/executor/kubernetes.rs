@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ use crate::errors::ExecutionError;
 use crate::repository::resolved_node::ResolvedNode;
 use crate::runtime::rt;
 
-use super::dispatch::failure::{backoff_sleep_cancellable, rng01};
+use super::dispatch::failure::rng01;
 use super::dispatch::{BatchContext, ExecutorBackend, StepInstance};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -216,6 +217,23 @@ async fn create_or_adopt_k8s_job(
     Ok(())
 }
 
+/// Slice-sleep a backoff delay, cutting it short when the run-level
+/// cancellation flag (maintained by one watcher per run) flips.
+async fn sleep_unless_cancelled(cancelled: &AtomicBool, delay: Duration) -> bool {
+    const SLICE: Duration = Duration::from_secs(1);
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        tokio::time::sleep(remaining.min(SLICE)).await;
+    }
+}
+
 enum StepPollOutcome {
     Success,
     Failed {
@@ -291,12 +309,17 @@ async fn poll_step_attempt(
     poll_key: &str,
     job_name: &str,
     baseline_failures: usize,
+    cancelled: &AtomicBool,
 ) -> StepPollOutcome {
-    const EVENT_GRACE_CYCLES: u32 = 3;
+    // Job status is a fallback signal, checked every other cycle (4s) — two
+    // failed observations ≈ 8s grace for a terminal event to land first.
+    const EVENT_GRACE_CYCLES: u32 = 2;
     let jobs_api: kube_client::Api<Job> = kube_client::Api::namespaced(client.clone(), namespace);
     let mut job_failed_cycles: u32 = 0;
+    let mut cycle: u64 = 0;
     loop {
-        match storage.get_events_for_step(run_id, poll_key).await {
+        cycle += 1;
+        match storage.get_step_terminal_events(run_id, poll_key).await {
             Ok(events) => {
                 if events
                     .iter()
@@ -346,7 +369,7 @@ async fn poll_step_attempt(
                 );
             }
         }
-        if storage.is_cancelled(run_id).await.unwrap_or(false) {
+        if cancelled.load(Ordering::Relaxed) {
             tracing::info!(
                 target: "rivers::k8s",
                 step = %poll_key,
@@ -354,40 +377,42 @@ async fn poll_step_attempt(
             );
             return StepPollOutcome::Cancelled;
         }
-        match jobs_api.get_opt(job_name).await {
-            Ok(Some(job)) => {
-                let failed = job
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.failed)
-                    .unwrap_or_default()
-                    > 0;
-                if failed {
-                    job_failed_cycles += 1;
-                    if job_failed_cycles >= EVENT_GRACE_CYCLES {
-                        let reason = classify_failed_pod(client, namespace, job_name).await;
-                        tracing::warn!(
-                            target: "rivers::k8s",
-                            step = %poll_key,
-                            job = %job_name,
-                            reason = reason.as_str(),
-                            "step Job failed without a terminal event; classified from pod status"
-                        );
-                        return StepPollOutcome::Failed {
-                            reason,
-                            exc_types: vec![],
-                        };
+        if cycle % 2 == 0 {
+            match jobs_api.get_opt(job_name).await {
+                Ok(Some(job)) => {
+                    let failed = job
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.failed)
+                        .unwrap_or_default()
+                        > 0;
+                    if failed {
+                        job_failed_cycles += 1;
+                        if job_failed_cycles >= EVENT_GRACE_CYCLES {
+                            let reason = classify_failed_pod(client, namespace, job_name).await;
+                            tracing::warn!(
+                                target: "rivers::k8s",
+                                step = %poll_key,
+                                job = %job_name,
+                                reason = reason.as_str(),
+                                "step Job failed without a terminal event; classified from pod status"
+                            );
+                            return StepPollOutcome::Failed {
+                                reason,
+                                exc_types: vec![],
+                            };
+                        }
                     }
                 }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(
-                    target: "rivers::k8s",
-                    job = %job_name,
-                    error = %e,
-                    "failed to poll step Job status"
-                );
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: "rivers::k8s",
+                        job = %job_name,
+                        error = %e,
+                        "failed to poll step Job status"
+                    );
+                }
             }
         }
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -419,6 +444,7 @@ async fn run_step_with_retries(
     code_location_id: String,
     config: Arc<rivers_k8s::executor::K8sStepExecutorConfig>,
     semaphore: Option<Arc<Semaphore>>,
+    cancelled: Arc<AtomicBool>,
     spec: StepJobSpec,
 ) -> (String, bool) {
     let executor_base = Compute {
@@ -480,7 +506,7 @@ async fn run_step_with_retries(
         let events = match cached_events.take() {
             Some(evs) => evs,
             None => storage
-                .get_events_for_step(&run_id, &spec.instance_name)
+                .get_step_terminal_events(&run_id, &spec.instance_name)
                 .await
                 .unwrap_or_default(),
         };
@@ -524,6 +550,7 @@ async fn run_step_with_retries(
             &spec.instance_name,
             &job_name,
             baseline_failures,
+            &cancelled,
         )
         .await;
         drop(permit);
@@ -573,7 +600,7 @@ async fn run_step_with_retries(
             delay_ms = delay.as_millis() as u64,
             "step failed, retrying"
         );
-        if backoff_sleep_cancellable(&storage, &run_id, delay).await {
+        if sleep_unless_cancelled(&cancelled, delay).await {
             return (spec.instance_name, false);
         }
         attempt += 1;
@@ -595,6 +622,24 @@ async fn run_jobs_to_completion(
     let semaphore = max_concurrent.map(|n| Arc::new(Semaphore::new(n)));
     let mut join_set = JoinSet::new();
 
+    // One cancellation watcher per run — N step monitors read the flag
+    // instead of each polling the same storage key.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let watcher = tokio::spawn({
+        let storage = storage.clone();
+        let run_id = run_id.clone();
+        let cancelled = Arc::clone(&cancelled);
+        async move {
+            loop {
+                if storage.is_cancelled(&run_id).await.unwrap_or(false) {
+                    cancelled.store(true, Ordering::Relaxed);
+                    return;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        }
+    });
+
     for spec in specs {
         let client = client.clone();
         let namespace = namespace.clone();
@@ -603,6 +648,7 @@ async fn run_jobs_to_completion(
         let code_location_id = code_location_id.clone();
         let config = Arc::clone(&config);
         let semaphore = semaphore.clone();
+        let cancelled = Arc::clone(&cancelled);
 
         join_set.spawn(async move {
             run_step_with_retries(
@@ -613,6 +659,7 @@ async fn run_jobs_to_completion(
                 code_location_id,
                 config,
                 semaphore,
+                cancelled,
                 spec,
             )
             .await
@@ -632,6 +679,7 @@ async fn run_jobs_to_completion(
             }
         }
     }
+    watcher.abort();
     results
 }
 

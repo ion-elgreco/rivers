@@ -2237,6 +2237,14 @@ pub trait StorageBackend: PerCodeLocationStorage {
         step_key: &str,
     ) -> impl Future<Output = Result<Vec<StoredEvent>>> + Send;
 
+    /// Only a step's terminal events (`StepSuccess` / `StepFailure`), for
+    /// pollers that would otherwise re-fetch the whole growing event list.
+    fn get_step_terminal_events(
+        &self,
+        run_id: &str,
+        step_key: &str,
+    ) -> impl Future<Output = Result<Vec<StoredEvent>>> + Send;
+
     /// Get the set of step keys that completed successfully in a run.
     fn get_completed_step_keys(
         &self,

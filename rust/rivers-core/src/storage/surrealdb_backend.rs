@@ -2393,6 +2393,29 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
+    async fn get_step_terminal_events(
+        &self,
+        run_id: &str,
+        step_key: &str,
+    ) -> Result<Vec<StoredEvent>> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(
+                    "SELECT * FROM events \
+                         WHERE run_id = $run_id AND asset_key = $step_key \
+                         AND (event_type = 'StepSuccess' OR event_type = 'StepFailure') \
+                         ORDER BY timestamp ASC, sort_order ASC, id ASC",
+                )
+                .bind(("run_id", run_id.to_string()))
+                .bind(("step_key", step_key.to_string()))
+                .await?;
+            let events: Vec<DbStoredEvent> = result.take(0)?;
+            Ok(events.into_iter().map(|e| e.into_stored_event()).collect())
+        })
+        .await
+    }
+
     async fn get_completed_step_keys(&self, run_id: &str) -> Result<HashSet<String>> {
         super::retry::with_retry(&self.retry_config, || async {
             let mut result = self
@@ -10974,6 +10997,57 @@ mod tests {
         assert_eq!(progress.completed_steps, 1);
         assert_eq!(progress.last_step_completed_at, Some(200));
         assert_eq!(progress.last_completed_step.as_deref(), Some("a"));
+    }
+
+    #[tokio::test]
+    async fn test_get_step_terminal_events_filters_types() {
+        let storage = make_storage().await;
+        let run_id = "terminal-events-run";
+
+        for (event_type, pk, ts) in [
+            (EventType::StepStart, None, 100),
+            (EventType::StepRetry, None, 150),
+            (
+                EventType::StepFailure,
+                Some(PartitionKey::Single {
+                    keys: vec!["p1".to_string()],
+                }),
+                160,
+            ),
+            (EventType::StepFailure, None, 170),
+            (EventType::StepSuccess, None, 200),
+        ] {
+            storage
+                .store_event(&EventRecord {
+                    code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+                    event_type,
+                    asset_key: Some("a".to_string()),
+                    run_id: run_id.to_string(),
+                    partition_key: pk,
+                    timestamp: ts,
+                    metadata: vec![],
+                    input_data_versions: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        let events = storage
+            .get_step_terminal_events(run_id, "a")
+            .await
+            .unwrap();
+        let types: Vec<_> = events.iter().map(|e| e.event_type.clone()).collect();
+        assert_eq!(
+            types,
+            vec![
+                EventType::StepFailure,
+                EventType::StepFailure,
+                EventType::StepSuccess
+            ]
+        );
+        // partition-scoped failure keeps its key so callers can filter it
+        assert!(events[0].partition_key.is_some());
+        assert!(events[1].partition_key.is_none());
     }
 
     #[tokio::test]
