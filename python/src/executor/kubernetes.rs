@@ -247,7 +247,7 @@ enum StepPollOutcome {
 
 /// Terminal reason for a failed step pod. An OOM-killed pod dies before the
 /// `execute-step` CLI can write any event, so the pod's container status is
-/// the only signal (`OOMKilled` / exit 137).
+/// the only signal — see [`rivers_k8s::classify::classify_termination`].
 async fn classify_failed_pod(
     client: &kube_client::Client,
     namespace: &str,
