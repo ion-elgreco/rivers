@@ -248,6 +248,103 @@ def test_step_failure_reason_from_loky_subprocess(tmp_path, storage):
     assert dict(failures[0].metadata)["rivers/failure_reason"] == "timeout"
 
 
+def test_cancellation_interrupts_backoff(storage):
+    """A cancelled run stops waiting out the backoff and does not retry."""
+    import threading
+    import time
+
+    calls = {"n": 0}
+
+    @rs.Asset(retry=rs.RetryPolicy(max_retries=1, backoff=rs.Backoff.constant(20.0)))
+    def stuck() -> int:
+        calls["n"] += 1
+        raise ValueError("always")
+
+    repo = rs.CodeRepository(assets=[stuck], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+
+    def cancel_once_retry_scheduled():
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if any(
+                e.event_type == "StepRetry"
+                for e in storage.get_events_for_asset("stuck")
+            ):
+                for run in storage.get_runs(10):
+                    storage.request_cancellation(run.run_id)
+                return
+            time.sleep(0.1)
+
+    canceller = threading.Thread(target=cancel_once_retry_scheduled)
+    canceller.start()
+    start = time.monotonic()
+    result = repo.materialize(raise_on_error=False)
+    elapsed = time.monotonic() - start
+    canceller.join()
+
+    assert not result.success
+    assert calls["n"] == 1  # backoff interrupted — no second attempt
+    assert elapsed < 10  # nowhere near the 20s backoff
+
+
+@pytest.mark.parametrize(
+    "executor_factory,is_async",
+    [
+        pytest.param(rs.Executor.in_process, False, id="in_process_sync"),
+        pytest.param(rs.Executor.in_process, True, id="in_process_async"),
+        pytest.param(rs.Executor.parallel, False, id="parallel_sync"),
+    ],
+)
+def test_pool_slot_released_during_backoff(
+    tmp_path, storage, executor_factory, is_async
+):
+    """A backoff sleep releases the step's pool slots and re-claims them for
+    the next attempt — one StepSlotClaimed per attempt."""
+    marker = str(tmp_path / "attempted")
+
+    def flaky_body() -> int:
+        import os
+
+        if not os.path.exists(marker):
+            with open(marker, "w") as f:
+                f.write("1")
+            raise ValueError("first attempt fails")
+        return 1
+
+    policy = rs.RetryPolicy(
+        max_retries=2, retry_on=[ValueError], backoff=rs.Backoff.constant(0.2)
+    )
+    if is_async:
+
+        @rs.Asset(
+            pool="db", pool_slots=1, io_handler=rs.InMemoryIOHandler(), retry=policy
+        )
+        async def pooled_flaky() -> int:
+            return flaky_body()
+
+    else:
+
+        @rs.Asset(
+            pool="db", pool_slots=1, io_handler=rs.InMemoryIOHandler(), retry=policy
+        )
+        def pooled_flaky() -> int:
+            return flaky_body()
+
+    storage.set_pool_limit("db", 1)
+    repo = rs.CodeRepository(
+        assets=[pooled_flaky], default_executor=executor_factory()
+    )
+    repo.resolve(storage=storage)
+    result = repo.materialize()
+    assert result.success
+
+    events = storage.get_events_for_run(result.run_id)
+    claimed = [e for e in events if e.event_type == "StepSlotClaimed"]
+    released = [e for e in events if e.event_type == "StepSlotReleased"]
+    assert len(claimed) == 2  # initial attempt + re-claim after the backoff
+    assert len(released) == 2
+
+
 def test_backoff_delay_is_applied(storage):
     import time
 
