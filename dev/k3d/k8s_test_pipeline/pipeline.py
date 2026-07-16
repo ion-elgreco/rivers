@@ -133,6 +133,23 @@ k8s_slow_job = Job(
 )
 
 
+# --- Resume job (in-process; slow enough that an executor kill lands mid-run
+# — a too-fast run completes inside the kill window and stores its outcome,
+# which the operator honors instead of restarting) ---
+
+
+@Asset(io_handler=mem_io, metadata=INPROCESS_META)
+def resume_slow():
+    time.sleep(20)
+    return Output(value={"resumed": True})
+
+
+k8s_resume_job = Job(
+    name="k8s_resume_job",
+    assets=[resume_slow],
+)
+
+
 # --- Graph asset with internal tasks running in-process ---
 #
 # This proves the "outer pod / inner in-process" pattern end-to-end on K8s:
@@ -225,6 +242,28 @@ k8s_oom_no_retry_job = Job(
 )
 
 
+@Asset(io_handler=s3_io, retry=RetryPolicy(max_retries=1, retry_on=[ValueError]))
+def exc_match_listed():
+    raise ValueError("listed exception type — retried once, then budget spent")
+
+
+k8s_exc_listed_job = Job(
+    name="k8s_exc_listed_job",
+    assets=[exc_match_listed],
+)
+
+
+@Asset(io_handler=s3_io, retry=RetryPolicy(max_retries=1, retry_on=[ConnectionError]))
+def exc_match_unlisted():
+    raise ValueError("unlisted exception type — fails without retrying")
+
+
+k8s_exc_unlisted_job = Job(
+    name="k8s_exc_unlisted_job",
+    assets=[exc_match_unlisted],
+)
+
+
 # --- Per-asset compute (step pod sized by the asset, not the executor) ---
 
 
@@ -242,9 +281,10 @@ k8s_compute_job = Job(
 all_assets = [
     source_data, transform_data, final_report,
     s3_source, s3_transform, s3_report,
-    always_fails, slow_asset,
+    always_fails, slow_asset, resume_slow,
     graph_pipeline,
     retry_always_fails, oom_hungry, oom_no_retry,
+    exc_match_listed, exc_match_unlisted,
     sized_step,
 ]
 
@@ -254,8 +294,10 @@ repo = CodeRepository(
     assets=all_assets,
     tasks=all_tasks,
     jobs=[
-        k8s_inprocess_job, k8s_step_job, k8s_failing_job, k8s_slow_job, k8s_graph_job,
+        k8s_inprocess_job, k8s_step_job, k8s_failing_job, k8s_slow_job, k8s_resume_job,
+        k8s_graph_job,
         k8s_retry_exhausted_job, k8s_oom_escalation_job, k8s_oom_no_retry_job,
+        k8s_exc_listed_job, k8s_exc_unlisted_job,
         k8s_compute_job,
     ],
     default_executor=Executor.kubernetes(
