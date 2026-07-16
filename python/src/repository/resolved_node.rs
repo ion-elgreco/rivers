@@ -172,12 +172,6 @@ impl ResolvedAsset {
         let group = asset.group().cloned();
         let code_version = asset.code_version().cloned();
         let pool = asset.pool().clone();
-        // Named refs aren't collapsed yet at this point (build_unresolved_graph
-        // runs before resolve_retry_refs); resolve_resources_and_handlers
-        // re-syncs node.retry afterwards.
-        let retry = asset
-            .retry_for_output(output_name.as_deref())
-            .and_then(|r| r.as_inline().cloned());
         let compute = asset.compute_for_output(output_name.as_deref()).cloned();
         let metadata = asset.metadata().cloned();
         let backfill_strategy = asset.backfill_strategy().cloned();
@@ -270,7 +264,9 @@ impl ResolvedAsset {
             group,
             code_version,
             pool,
-            retry,
+            // Named refs aren't collapsed yet here; resolve_resources_and_handlers
+            // populates node.retry once resolve_retry_refs has run.
+            retry: None,
             compute,
             metadata,
             backfill_strategy,

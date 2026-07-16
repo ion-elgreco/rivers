@@ -2170,7 +2170,6 @@ impl PyCodeRepository {
     /// daemon) can stamp the run origin. The pymethod version delegates here
     /// with `LaunchedBy::Manual`.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn materialize_with_launcher(
         &self,
         selection: Option<Vec<String>>,
