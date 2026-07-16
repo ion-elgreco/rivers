@@ -618,6 +618,7 @@ impl ParallelBackend {
         let run_id = ctx.scope.run_id.to_string();
         let events_tx = ctx.event_sender();
         let window = max_concurrency.map(|n| Arc::new(Semaphore::new(n)));
+        let resume = ctx.scope.resume;
 
         type PoolResult = (usize, String, Vec<String>, WorkOutcome);
 
@@ -657,6 +658,7 @@ impl ParallelBackend {
                             events_tx,
                             window,
                             retry,
+                            resume,
                             worker,
                         )
                         .await;

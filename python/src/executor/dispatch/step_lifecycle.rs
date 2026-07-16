@@ -93,6 +93,17 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
 
     let policy = ctx.retry_policy_for(step);
     let mut attempt: u32 = 1;
+    if ctx.scope.resume
+        && policy.is_some()
+        && let Some(first) = event_names.first()
+    {
+        attempt += failure::prior_step_retries_blocking(
+            py,
+            ctx.sink.storage.backend(),
+            ctx.scope.run_id,
+            first,
+        );
+    }
     let outcome = loop {
         let outcome = worker.run_work(py, ctx);
         let WorkOutcome::Error {
@@ -212,6 +223,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
     events_tx: mpsc::UnboundedSender<EventRecord>,
     semaphore: Option<Arc<Semaphore>>,
     retry_policy: Option<rivers_core::execution::retry::RetryPolicy>,
+    resume: bool,
     worker: W,
 ) -> WorkOutcome {
     let mut permit = match &semaphore {
@@ -251,6 +263,12 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
 
     let worker = Arc::new(worker);
     let mut attempt: u32 = 1;
+    if resume
+        && retry_policy.is_some()
+        && let Some(first) = start_event_names.first()
+    {
+        attempt += failure::prior_step_retries(storage.backend(), &run_id, first).await;
+    }
     let outcome = loop {
         let w = Arc::clone(&worker);
         // Classification needs the GIL; attach on the blocking thread, not here.
