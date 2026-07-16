@@ -431,6 +431,74 @@ def test_parallel_executor_retry(tmp_path, storage):
     assert "StepFailure" not in types
 
 
+def test_mapped_max_concurrency_respected_with_retry(tmp_path, storage):
+    """Map instances honor ``max_concurrency`` windowing when the job carries
+    a retry policy. Pins the window across both parallel paths (task nodes
+    don't take asset/job retry policies today, so instances stay on the
+    windowed fast path; the pool/lifecycle path is semaphore-gated too)."""
+    import obstore.store
+
+    store = obstore.store.LocalStore(str(tmp_path / "data"), mkdir=True)
+    io = rs.PickleIOHandler(store=store)
+    active_dir = str(tmp_path / "active")
+    peak_file = str(tmp_path / "peak")
+    import os
+
+    os.mkdir(active_dir)
+
+    @rs.Task
+    def tracked(x: int) -> int:
+        import os
+        import time
+        import uuid
+
+        token = os.path.join(active_dir, uuid.uuid4().hex)
+        with open(token, "w") as f:
+            f.write("1")
+        try:
+            for _ in range(2):
+                with open(peak_file, "a") as f:
+                    f.write(f"{len(os.listdir(active_dir))}\n")
+                time.sleep(0.2)
+        finally:
+            os.remove(token)
+        return x * 2
+
+    @rs.Task
+    def sum_all(values: list) -> int:
+        return sum(values)
+
+    @rs.Asset(io_handler=io)
+    def numbers() -> list:
+        return [1, 2, 3]
+
+    @rs.Asset.from_graph(io_handler=io, node_io_handler=io)
+    def result():
+        nums = numbers()
+        mapped = nums.map(tracked, max_concurrency=1)
+        return sum_all(mapped.collect())
+
+    repo = rs.CodeRepository(
+        assets=[numbers, result],
+        tasks=[tracked, sum_all],
+        jobs=[
+            rs.Job(
+                name="pipeline",
+                assets=[numbers, result],
+                executor=rs.Executor.parallel(max_workers=4),
+                retry=rs.RetryPolicy(max_retries=1),
+            )
+        ],
+    )
+    repo.resolve(storage=storage)
+    repo.get_job("pipeline").execute()
+
+    assert repo.load_node("result") == 12
+    with open(peak_file) as f:
+        peak = max(int(line) for line in f.read().splitlines())
+    assert peak == 1  # never more than one tracked instance in flight
+
+
 def test_job_level_retry_default(storage):
     calls = {"n": 0}
 

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PySet, PyTuple};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::errors::ExecutionError;
@@ -182,7 +183,7 @@ impl ExecutorBackend for ParallelBackend {
         }
 
         if !pool_instances.is_empty() {
-            self.schedule_pool_steps_loky(py, ctx, pool_instances, failures);
+            self.schedule_pool_steps_loky(py, ctx, pool_instances, max_concurrency, failures);
         }
     }
 }
@@ -569,11 +570,14 @@ impl ParallelBackend {
     /// Pool-requiring steps: pre-build submit args (GIL), then JoinSet where each
     /// task runs through the shared async lifecycle, which handles pool claim,
     /// StepStart emission, the loky `spawn_blocking` hop, and pool release.
+    /// `max_concurrency` (mapped-group windowing) gates the lifecycle with a
+    /// semaphore so instances diverted here don't escape the window.
     fn schedule_pool_steps_loky(
         &self,
         py: Python,
         ctx: &mut BatchContext,
         pool_instances: Vec<StepInstance>,
+        max_concurrency: Option<usize>,
         failures: &mut Vec<(String, PyErr)>,
     ) {
         let executor = match self.get_loky_executor(py) {
@@ -615,6 +619,7 @@ impl ParallelBackend {
         let storage = ctx.sink.storage.clone();
         let run_id = ctx.scope.run_id.to_string();
         let events_tx = ctx.event_sender();
+        let window = max_concurrency.map(|n| Arc::new(Semaphore::new(n)));
 
         type PoolResult = (usize, String, Vec<String>, WorkOutcome);
 
@@ -636,6 +641,7 @@ impl ParallelBackend {
                     let run_id = run_id.clone();
                     let events_tx = events_tx.clone();
                     let event_names_for_outcome = event_names.clone();
+                    let window = window.clone();
                     let worker = LokyPoolWorker {
                         executor: Arc::clone(&executor_arc),
                         submit_args: base.submit_args,
@@ -651,7 +657,7 @@ impl ParallelBackend {
                             pool_step_name,
                             event_names,
                             events_tx,
-                            None,
+                            window,
                             retry,
                             worker,
                         )
