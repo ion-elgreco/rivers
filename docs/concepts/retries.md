@@ -116,7 +116,7 @@ On the Kubernetes executor every step runs in its own pod, so a retry can re-lau
 def skewed_join(): ...
 ```
 
-Starting from the executor's `worker_memory` (say 8Gi), an OOM-killed attempt relaunches at 16Gi, then 32Gi, then 64Gi — clamped at `max_memory`, which is required. A pod killed by the OOM killer never gets to write a failure event; the orchestrator detects the dead Job, reads `OOMKilled` / exit 137 off the pod status, and classifies the failure as `OUT_OF_MEMORY`. `escalate` implies its reasons are retriable, so you don't also have to list `OUT_OF_MEMORY` in `retry_on`.
+Starting from the executor's `worker_memory` (say 8Gi), an OOM-killed attempt relaunches at 16Gi, then 32Gi, then 64Gi — clamped at `max_memory`, which is required. A pod killed by the OOM killer never gets to write a failure event; the orchestrator detects the dead Job and classifies from pod status: an explicit `OOMKilled` termination reason is `OUT_OF_MEMORY`, while a bare kill signal (exit 137/143 without that reason — evictions, preemptions, node drains) is `INFRASTRUCTURE` and does not escalate. OOM detection therefore relies on the container runtime reporting `OOMKilled` (standard on containerd with cgroup v2); a runtime that surfaces an OOM as a bare exit 137 classifies it `INFRASTRUCTURE` instead. `escalate` implies its reasons are retriable, so you don't also have to list `OUT_OF_MEMORY` in `retry_on`.
 
 Each attempt creates a fresh Job (`-r2`, `-r3`, … name suffixes — a finished K8s Job can't re-run). `ComputeEscalation(cpu_factor=..., max_cpu=...)` optionally grows CPU alongside memory.
 
@@ -128,7 +128,7 @@ On the in-process and parallel executors `escalate` is inert — a local Python 
 - **parallel** — a failed subprocess step is re-submitted to the worker pool. The exception raised in the worker is re-raised in the orchestrator, so exception-type `retry_on` lists match as usual.
 - **kubernetes** — attempts re-create the step Job; classification comes from the step's own failure event when it wrote one, or from pod status when it didn't. The step pod stamps the failure reason and the exception's class hierarchy onto its `StepFailure` event, so exception-type allow-lists match across the pod boundary. A pod killed before it can write an event (e.g. OOM) is classified from pod status alone — only reason-based matching applies there.
 
-Concurrency slots (pools, the executor's step budget) are held per attempt: a non-zero backoff sleep releases them so waiting siblings (or other runs) can proceed, and re-claims them before the next attempt. Cancelling a run interrupts a backoff sleep within about a second.
+Concurrency slots (pools, the executor's step budget) are held per attempt: a non-zero backoff sleep releases them so waiting siblings (or other runs) can proceed, and re-claims them before the next attempt. Cancelling a run interrupts a backoff sleep within about a second on the in-process and parallel executors, and within a few seconds on Kubernetes (cancellation propagates through a per-run watcher).
 
 Retry policies apply to **asset** steps only. Task and bash-task steps (including a graph asset's internal tasks) run without retries — a job-level or repo-default policy skips them, and `resolve()` emits a `UserWarning` naming the affected steps.
 

@@ -60,9 +60,9 @@ Why a step failed. Classified per executor (exception type in-process; pod termi
 | Member | Meaning |
 |--------|---------|
 | `FailureReason.ERROR` | Ordinary exception raised by user code. |
-| `FailureReason.OUT_OF_MEMORY` | OOMKilled / exit 137 / `MemoryError`. |
+| `FailureReason.OUT_OF_MEMORY` | Pod terminated with reason `OOMKilled` / `MemoryError` in-process. |
 | `FailureReason.TIMEOUT` | Exceeded a wall-clock deadline / `TimeoutError`. |
-| `FailureReason.INFRASTRUCTURE` | Environmental: pod vanished, worker died — no user-code fault. |
+| `FailureReason.INFRASTRUCTURE` | Environmental: pod vanished, bare kill signals (exit 137/143 without `OOMKilled`), worker-process death — no user-code fault. |
 | `FailureReason.CANCELLED` | Cancellation requested; never retried. |
 
 ---
