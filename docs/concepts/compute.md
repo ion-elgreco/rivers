@@ -52,5 +52,13 @@ def sometimes_bigger(ctx): ...    # 8Gi → 16Gi → 32Gi → 64Gi
 ## Scope
 
 - Effective on the **Kubernetes** executor. The in-process and parallel executors have no per-step compute envelope; a `compute=` there logs a warning and is ignored.
-- Multi-assets: one step is one pod — the first output whose `AssetDef` sets `compute` provides the step's resources.
+- Multi-assets: one step is one pod, so `compute` is declared on `Asset.from_multi(compute=...)` itself, not per output:
+
+    ```python
+    @rs.Asset.from_multi(
+        output_defs=[rs.AssetDef("orders"), rs.AssetDef("customers")],
+        compute=rs.Compute(memory="8Gi"),
+    )
+    def load_tables(): ...
+    ```
 - Node placement (selectors, tolerations, affinity) and accelerator types are not part of `Compute`; it is resource quantities only.

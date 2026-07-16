@@ -193,7 +193,8 @@ impl<'a> BatchContext<'a> {
     }
 
     /// Per-asset compute for a plan step; multi steps read their outputs'
-    /// nodes (first output that sets one wins — one step is one pod).
+    /// nodes (each carries the multi-asset's single compute — declared on
+    /// the multi, one step is one pod).
     pub(crate) fn compute_for(
         &self,
         step: &rivers_core::execution::plan::ExecutionStep,

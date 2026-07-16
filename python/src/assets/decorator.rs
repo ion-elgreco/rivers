@@ -429,9 +429,6 @@ pub struct AssetDef {
     /// every output that sets a policy must set the same one (validated at
     /// resolve).
     pub retry: Option<rivers_core::execution::retry::RetryRef>,
-    /// Compute for the step materializing this output. One multi-asset step is
-    /// one pod: the first output that sets compute wins.
-    pub compute: Option<rivers_core::execution::compute::Compute>,
     /// Per-output dependencies. Combined with the multi-asset's top-level
     /// `deps=` at build time: input deps merge into the function's input set
     /// (de-duplicated by name), lineage-only deps become edges to this output.
@@ -474,7 +471,6 @@ impl AssetDef {
         pool = None,
         pool_slots = None,
         retry = None,
-        compute = None,
         deps = vec![],
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -492,7 +488,6 @@ impl AssetDef {
         pool: Option<&Bound<'py, PyAny>>,
         pool_slots: Option<&Bound<'py, PyAny>>,
         retry: Option<Bound<'py, PyAny>>,
-        compute: Option<crate::compute::PyCompute>,
         deps: Vec<Py<DepDef>>,
     ) -> PyResult<Self> {
         let pool = normalize_pool(pool, pool_slots)?;
@@ -509,7 +504,6 @@ impl AssetDef {
             partition_mapping,
             pool,
             retry,
-            compute: compute.map(|c| c.inner),
             deps,
         })
     }
@@ -756,18 +750,15 @@ impl Asset {
         }
     }
 
+    /// One multi-asset step is one pod, so compute is declared on the
+    /// multi-asset itself and shared by every output.
     pub fn compute_for_output(
         &self,
-        output: Option<&str>,
+        _output: Option<&str>,
     ) -> Option<&rivers_core::execution::compute::Compute> {
         match self {
             Asset::Single(a) => a.compute.as_ref(),
-            Asset::Multi(m) => output.and_then(|out| {
-                m.assets
-                    .iter()
-                    .find(|a| a.name.as_deref() == Some(out))
-                    .and_then(|a| a.compute.as_ref())
-            }),
+            Asset::Multi(m) => m.compute.as_ref(),
             _ => None,
         }
     }
@@ -1125,7 +1116,8 @@ impl PyAsset {
     ///
     /// Each `AssetDef` describes one output. Top-level arguments (tags, kinds,
     /// group, code_version, io_handler) are used as defaults when the individual
-    /// `AssetDef` does not specify them.
+    /// `AssetDef` does not specify them. `compute` is declared here, not per
+    /// output — the multi-asset runs as one step (one pod).
     ///
     /// Dependencies can be declared at the top level via `deps=` (applied to
     /// every output) or per-output via `AssetDef(deps=[...])`. Input deps from
@@ -1146,6 +1138,7 @@ impl PyAsset {
         deps = vec![],
         hooks = None,
         automation_condition = None,
+        compute = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn from_multi(
@@ -1162,6 +1155,7 @@ impl PyAsset {
         deps: Vec<Py<DepDef>>,
         hooks: Option<Vec<Py<PyHook>>>,
         automation_condition: Option<PyAutomationCondition>,
+        compute: Option<crate::compute::PyCompute>,
     ) -> PyResult<Py<PyAny>> {
         let py = cls.py();
         let handler = io_handler;
@@ -1222,7 +1216,7 @@ impl PyAsset {
                 automation_condition: None,
                 pool: borrow_asset_def.pool.clone(),
                 retry: borrow_asset_def.retry.clone(),
-                compute: borrow_asset_def.compute.clone(),
+                compute: None,
             });
         }
 
@@ -1290,6 +1284,7 @@ impl PyAsset {
             hooks,
             automation_condition,
             backfill_strategy: None,
+            compute: compute.map(|c| c.inner),
         });
         let base = PyAsset { inner: py_asset };
         let py_obj = Py::new(py, (PyMultiAsset {}, base))?;
