@@ -145,6 +145,64 @@ class TestK8sRetry:
             names = _step_worker_job_names("oom_hungry")
             assert any(n.endswith("-r2") for n in names), names
 
+    def test_exception_allowlist_listed_type_retries(self, grpc_stubs):
+        """The step pod stamps the exception MRO on its StepFailure event and
+        the orchestrator matches exception-type allow-lists against it."""
+        with GrpcChannel(grpc_stubs) as ch:
+            resp = ch.stub.ExecuteJob(
+                ch.pb2.ExecuteJobRequest(job_name="k8s_exc_listed_job")
+            )
+            assert resp.run_id
+
+            run_name = _wait_for_run_cr(timeout=30)
+            assert run_name, "No Run CR appeared after ExecuteJob call"
+
+            phase = _wait_for_phase(run_name, TERMINAL_PHASES, timeout=300)
+            if phase != "Failed":
+                pytest.fail(
+                    f"Run '{run_name}' ended with phase '{phase}' (expected Failed)\n"
+                    f"{_dump_debug_info(run_name)}"
+                )
+
+            events = _wait_for_events(
+                resp.run_id,
+                lambda evs: sum(e["event_type"] == "StepFailure" for e in evs) >= 2,
+            )
+            failures = [e for e in events if e["event_type"] == "StepFailure"]
+            retries = [e for e in events if e["event_type"] == "StepRetry"]
+            assert len(failures) == 2, f"expected 2 attempts, events: {events}"
+            assert len(retries) == 1
+            meta = _metadata_dict(failures[0])
+            assert meta["rivers/failure_reason"] == "error"
+            assert "builtins.ValueError" in meta["rivers/exc_type"]
+
+    def test_exception_allowlist_unlisted_type_fails_fast(self, grpc_stubs):
+        """An exception type absent from the allow-list is not retried, even
+        though the failure crossed the pod boundary as an event."""
+        with GrpcChannel(grpc_stubs) as ch:
+            resp = ch.stub.ExecuteJob(
+                ch.pb2.ExecuteJobRequest(job_name="k8s_exc_unlisted_job")
+            )
+            assert resp.run_id
+
+            run_name = _wait_for_run_cr(timeout=30)
+            assert run_name, "No Run CR appeared after ExecuteJob call"
+
+            phase = _wait_for_phase(run_name, TERMINAL_PHASES, timeout=300)
+            if phase != "Failed":
+                pytest.fail(
+                    f"Run '{run_name}' ended with phase '{phase}' (expected Failed)\n"
+                    f"{_dump_debug_info(run_name)}"
+                )
+
+            events = _wait_for_events(
+                resp.run_id,
+                lambda evs: any(e["event_type"] == "StepFailure" for e in evs),
+            )
+            failures = [e for e in events if e["event_type"] == "StepFailure"]
+            assert len(failures) == 1, f"expected a single attempt, events: {events}"
+            assert not any(e["event_type"] == "StepRetry" for e in events)
+
     def test_oom_without_policy_fails_fast(self, grpc_stubs):
         """Poll-hang regression: with no retry policy an OOM-killed pod leaves
         no event, and the run must still fail promptly via the Job-status
