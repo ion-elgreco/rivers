@@ -24,6 +24,7 @@ repo.get_job("pipeline").execute()
 | `assets` | `Sequence[SingleAsset \| MultiAsset \| GraphAsset \| Task \| BashTask]` | required | Nodes the job will materialize. |
 | `executor` | `Executor \| None` | `None` | Override the repository default executor for this job. |
 | `allow_incomplete_deps` | `bool` | `False` | Tolerate missing upstream deps (debug / partial graphs). Production jobs should leave this `False`. |
+| `retry` | `RetryPolicy \| str \| None` | `None` | Job-level retry default — a [`RetryPolicy`](retries.md) or a `retries` registry name. Assets with their own policy keep it. |
 
 **Methods:**
 

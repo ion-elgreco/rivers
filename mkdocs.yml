@@ -71,6 +71,7 @@ nav:
       - Task: api-reference/task.md
       - Job: api-reference/job.md
       - Executors: api-reference/executors.md
+      - Retries & Compute: api-reference/retries.md
       - Context: api-reference/context.md
       - Schedules: api-reference/schedules.md
       - Sensors: api-reference/sensors.md

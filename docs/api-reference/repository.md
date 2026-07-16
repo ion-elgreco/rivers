@@ -32,6 +32,8 @@ repo = rs.CodeRepository(
 | `run_queue` | `RunQueueConfig \| None` | `None` | Run-queue limits applied to daemon-submitted runs. See [Concurrency](concurrency.md). |
 | `run_backend` | `RunBackendConfig \| None` | `None` | Where runs are launched — local subprocess (default) or Kubernetes pods. |
 | `pool_limits` | `dict[str, int] \| None` | `None` | Initial concurrency-pool slot caps (`{pool_key: limit}`). |
+| `retries` | `dict[str, RetryPolicy] \| None` | `None` | Named retry policies referenced by `retry="name"` on assets, jobs, and `materialize()`. See [Retries & Compute](retries.md). |
+| `default_retry_policy` | `RetryPolicy \| str \| None` | `None` | Repo-wide retry default (lowest precedence: asset > job > this) — a policy or a `retries` registry name. |
 
 **Properties:**
 
@@ -85,6 +87,7 @@ def materialize(
     run_id_override: str | None = None,
     include_upstream: bool = False,
     resume: bool = False,
+    retry: RetryPolicy | str | None = None,
 ) -> RunResult
 ```
 
@@ -102,6 +105,7 @@ When a `RunQueueConfig` is configured, the run queue applies to daemon-submitted
 | `run_id_override` | `str \| None` | `None` | Use a pre-assigned run ID (used by K8s execution pods). |
 | `include_upstream` | `bool` | `False` | Also materialize transitive deps of `selection`. |
 | `resume` | `bool` | `False` | Skip already-completed steps from a crashed prior run with the same `run_id_override`. |
+| `retry` | `RetryPolicy \| str \| None` | `None` | Run-level retry default — a [`RetryPolicy`](retries.md) or a `retries` registry name. Assets with their own policy keep it. |
 
 **Returns:** [`RunResult`](#runresult).
 
