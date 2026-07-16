@@ -580,13 +580,12 @@ impl ParallelBackend {
         max_concurrency: Option<usize>,
         failures: &mut Vec<(String, PyErr)>,
     ) {
-        let executor = match self.get_loky_executor(py) {
-            Ok(e) => e,
-            Err(e) => {
-                ctx.fail_all_instances(&pool_instances, &e.to_string(), failures);
-                return;
-            }
-        };
+        // Preflight loky availability; workers re-acquire per attempt so a
+        // pool broken by a dead worker recovers on retry.
+        if let Err(e) = self.get_loky_executor(py) {
+            ctx.fail_all_instances(&pool_instances, &e.to_string(), failures);
+            return;
+        }
 
         // Requires GIL + ctx, so pre-build before entering JoinSet.
         struct PreparedPoolStep {
@@ -615,7 +614,6 @@ impl ParallelBackend {
             return;
         }
 
-        let executor_arc = Arc::new(executor.unbind());
         let storage = ctx.sink.storage.clone();
         let run_id = ctx.scope.run_id.to_string();
         let events_tx = ctx.event_sender();
@@ -643,7 +641,7 @@ impl ParallelBackend {
                     let event_names_for_outcome = event_names.clone();
                     let window = window.clone();
                     let worker = LokyPoolWorker {
-                        executor: Arc::clone(&executor_arc),
+                        max_workers: self.max_workers,
                         submit_args: base.submit_args,
                         input_versions: base.input_versions,
                         failure_config: base.failure_config,
@@ -692,11 +690,13 @@ impl ParallelBackend {
     }
 }
 
-/// Phase-4 worker for the parallel pool path: submits the pre-built args to a
-/// shared loky executor and blocks for the result, all under a `try_attach`d
-/// GIL inside `spawn_blocking`.
+/// Phase-4 worker for the parallel pool path: submits the pre-built args to
+/// the reusable loky executor and blocks for the result, all under a
+/// `try_attach`d GIL inside `spawn_blocking`. The executor is re-acquired per
+/// attempt — `loky.get_reusable_executor` returns the live pool when healthy
+/// and respawns it after a worker death, so retries don't hit a broken pool.
 struct LokyPoolWorker {
-    executor: Arc<Py<PyAny>>,
+    max_workers: usize,
     submit_args: Vec<Py<PyAny>>,
     input_versions: Vec<(String, String)>,
     failure_config: Option<Py<PyAny>>,
@@ -706,6 +706,19 @@ impl AsyncWorker for LokyPoolWorker {
     fn run_work(&self) -> WorkOutcome {
         Python::try_attach(|py| -> WorkOutcome {
             let cfg = || self.failure_config.as_ref().map(|c| c.clone_ref(py));
+            let executor = match py
+                .import("loky")
+                .and_then(|m| m.call_method1("get_reusable_executor", (self.max_workers,)))
+            {
+                Ok(e) => e,
+                Err(error) => {
+                    return WorkOutcome::Error {
+                        error,
+                        captured_logs: None,
+                        failure_config: cfg(),
+                    };
+                }
+            };
             let submit_tuple = match PyTuple::new(py, &self.submit_args) {
                 Ok(t) => t,
                 Err(error) => {
@@ -716,7 +729,7 @@ impl AsyncWorker for LokyPoolWorker {
                     };
                 }
             };
-            let future = match self.executor.call_method1(py, "submit", submit_tuple) {
+            let future = match executor.call_method1("submit", submit_tuple) {
                 Ok(f) => f,
                 Err(error) => {
                     return WorkOutcome::Error {
@@ -726,9 +739,9 @@ impl AsyncWorker for LokyPoolWorker {
                     };
                 }
             };
-            match future.call_method0(py, "result") {
+            match future.call_method0("result") {
                 Ok(worker_result) => WorkOutcome::WorkerSummary {
-                    worker_result,
+                    worker_result: worker_result.unbind(),
                     input_versions: self.input_versions.clone(),
                     step_config: cfg(),
                 },

@@ -28,6 +28,14 @@ pub(crate) fn classify_pyerr(py: Python, err: &PyErr) -> (FailureReason, Vec<Str
         }
     }
 
+    // Worker-process deaths (loky kill, broken pool) are environmental, not
+    // user errors — matched by MRO name so this crate needs no loky import.
+    const INFRA_EXC_TYPES: [&str; 3] = [
+        "loky.process_executor.TerminatedWorkerError",
+        "concurrent.futures.process.BrokenProcessPool",
+        "concurrent.futures._base.BrokenExecutor",
+    ];
+
     let reason = if err.is_instance_of::<PyMemoryError>(py) {
         FailureReason::OutOfMemory
     } else if err.is_instance_of::<PyTimeoutError>(py) {
@@ -38,6 +46,11 @@ pub(crate) fn classify_pyerr(py: Python, err: &PyErr) -> (FailureReason, Vec<Str
             .any(|n| n == "asyncio.exceptions.CancelledError")
     {
         FailureReason::Cancelled
+    } else if mro_names
+        .iter()
+        .any(|n| INFRA_EXC_TYPES.contains(&n.as_str()))
+    {
+        FailureReason::Infrastructure
     } else {
         FailureReason::Error
     };

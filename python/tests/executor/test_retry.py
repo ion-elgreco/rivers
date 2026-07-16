@@ -551,6 +551,48 @@ def test_mapped_max_concurrency_respected_with_retry(tmp_path, storage):
     assert peak == 1  # never more than one tracked instance in flight
 
 
+def test_worker_death_classified_infrastructure_and_retried(tmp_path, storage):
+    """A loky worker killed mid-step surfaces as TerminatedWorkerError — an
+    environmental failure, so retry_on=TRANSIENT retries it."""
+    import obstore.store
+
+    store = obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    handler = rs.PickleIOHandler(store=store)
+    marker = str(tmp_path / "attempted")
+    transient = rs.RetryPolicy(max_retries=2, retry_on=rs.RetryOn.TRANSIENT)
+
+    @rs.Asset(io_handler=handler, retry=transient)
+    def dies_once() -> int:
+        import os
+
+        if not os.path.exists(marker):
+            with open(marker, "w") as f:
+                f.write("1")
+            os._exit(42)  # hard-kill the worker process mid-step
+        return 5
+
+    # Sibling keeps the loky path engaged; carries the same policy in case
+    # the pool break collaterally kills its future.
+    @rs.Asset(io_handler=handler, retry=transient)
+    def steady() -> int:
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[dies_once, steady],
+        default_executor=rs.Executor.parallel(max_workers=2),
+    )
+    repo.resolve(storage=storage)
+    assert repo.materialize().success
+
+    retries = [
+        e
+        for e in storage.get_events_for_asset("dies_once")
+        if e.event_type == "StepRetry"
+    ]
+    assert len(retries) == 1
+    assert dict(retries[0].metadata)["rivers/failure_reason"] == "infrastructure"
+
+
 def test_job_level_retry_default(storage):
     calls = {"n": 0}
 
