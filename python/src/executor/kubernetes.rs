@@ -250,16 +250,13 @@ async fn classify_failed_pod(
                         .as_ref()
                         .and_then(|s| s.terminated.as_ref())
                         .or_else(|| cs.last_state.as_ref().and_then(|s| s.terminated.as_ref()));
-                    if let Some(t) = terminated {
-                        if t.reason.as_deref() == Some("OOMKilled") || t.exit_code == 137 {
-                            return FailureReason::OutOfMemory;
-                        }
-                        if t.reason.as_deref() == Some("DeadlineExceeded") {
-                            return FailureReason::Timeout;
-                        }
-                        if t.exit_code != 0 {
-                            return FailureReason::Error;
-                        }
+                    if let Some(t) = terminated
+                        && let Some(reason) = rivers_k8s::classify::classify_termination(
+                            t.reason.as_deref(),
+                            t.exit_code,
+                        )
+                    {
+                        return reason;
                     }
                 }
             }
