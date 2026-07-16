@@ -196,10 +196,16 @@ impl PyJob {
             return;
         }
         let Some(map) = &self.node_map else { return };
-        let mut tasks: Vec<&str> = map
+        // Walk the job's executed steps, not node_map — the map also holds
+        // out-of-job dependency nodes (allow_incomplete_deps) this job never runs.
+        let mut tasks: Vec<&str> = self
+            .node_names
             .iter()
-            .filter(|(_, n)| !matches!(n, ResolvedNode::Asset(_)))
-            .map(|(k, _)| k.as_str())
+            .filter(|name| {
+                map.get(name.as_str())
+                    .is_some_and(|n| !matches!(n, ResolvedNode::Asset(_)))
+            })
+            .map(|name| name.as_str())
             .collect();
         if tasks.is_empty() {
             return;

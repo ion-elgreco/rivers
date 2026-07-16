@@ -779,6 +779,70 @@ def test_job_retry_warns_for_task_steps(storage):
         repo.resolve(storage=storage)
 
 
+def test_task_retry_diagnostic_survives_strict_warnings(storage):
+    """The task-step diagnostic must not break resolve() under -W error —
+    it is structural (not config-fixable), so it is logged, not raised."""
+    import warnings
+
+    @rs.Task
+    def some_task() -> int:
+        return 1
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler())
+    def anchor2() -> int:
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[anchor2],
+        tasks=[some_task],
+        jobs=[
+            rs.Job(
+                name="strict",
+                assets=[anchor2, some_task],
+                retry=rs.RetryPolicy(max_retries=1),
+            )
+        ],
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        repo.resolve(storage=storage)  # must not raise
+
+
+def test_task_retry_warning_names_only_job_steps(storage):
+    """The warning enumerates the job's executed task steps — not out-of-job
+    dependency nodes that allow_incomplete_deps pulls into the node subset."""
+
+    @rs.Task(io_handler=rs.InMemoryIOHandler())
+    def upstream_task() -> int:
+        return 1
+
+    @rs.Task
+    def in_job_task() -> int:
+        return 2
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler())
+    def consumer(upstream_task: int) -> int:
+        return upstream_task
+
+    repo = rs.CodeRepository(
+        assets=[consumer],
+        tasks=[upstream_task, in_job_task],
+        jobs=[
+            rs.Job(
+                name="partial",
+                assets=[consumer, in_job_task],
+                retry=rs.RetryPolicy(max_retries=1),
+                allow_incomplete_deps=True,
+            )
+        ],
+    )
+    with pytest.warns(UserWarning, match="task steps") as record:
+        repo.resolve(storage=storage)
+    message = str(record[0].message)
+    assert "in_job_task" in message
+    assert "upstream_task" not in message  # dependency, not a step of this job
+
+
 def test_multi_asset_conflicting_policies_error_at_resolve(storage):
     @rs.Asset.from_multi(
         output_defs=[
