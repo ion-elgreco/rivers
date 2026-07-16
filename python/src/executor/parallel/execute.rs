@@ -606,7 +606,9 @@ impl ParallelBackend {
                 pools: inst.pools.clone(),
                 event_names: inst.event_names.clone(),
                 instance_name: inst.instance_name.clone(),
-                retry: ctx.retry_policy_for(&ctx.scope.plan.steps[inst.idx]),
+                retry: ctx
+                    .retry_policy_for(&ctx.scope.plan.steps[inst.idx])
+                    .cloned(),
             });
         }
 

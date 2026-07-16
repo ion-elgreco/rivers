@@ -91,7 +91,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
         ctx.emit_start(name, now_ts());
     }
 
-    let policy = ctx.retry_policy_for(step);
+    let policy = ctx.retry_policy_for(step).cloned();
     let mut attempt: u32 = 1;
     if ctx.scope.resume
         && policy.is_some()
@@ -269,13 +269,14 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
     {
         attempt += failure::prior_step_retries(storage.backend(), &run_id, first).await;
     }
+    let want_classify = retry_policy.is_some();
     let outcome = loop {
         let w = Arc::clone(&worker);
         // Classification needs the GIL; attach on the blocking thread, not here.
         let joined = tokio::task::spawn_blocking(move || {
             let outcome = w.run_work();
             let classified = match &outcome {
-                WorkOutcome::Error { error, .. } => {
+                WorkOutcome::Error { error, .. } if want_classify => {
                     Python::try_attach(|py| classify_pyerr(py, error))
                 }
                 _ => None,
