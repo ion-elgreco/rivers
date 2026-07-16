@@ -31,10 +31,6 @@ impl Compute {
         }
     }
 
-    /// True if every axis is unset.
-    pub fn is_empty(&self) -> bool {
-        self.cpu.is_none() && self.memory.is_none() && self.gpu.is_none()
-    }
 }
 
 #[cfg(test)]
@@ -56,18 +52,6 @@ mod tests {
         assert_eq!(resolved.cpu.as_deref(), Some("1")); // inherited
         assert_eq!(resolved.memory.as_deref(), Some("32Gi")); // overridden
         assert_eq!(resolved.gpu, None);
-    }
-
-    #[test]
-    fn empty_when_all_axes_unset() {
-        assert!(Compute::default().is_empty());
-        assert!(
-            !Compute {
-                memory: Some("1Gi".into()),
-                ..Default::default()
-            }
-            .is_empty()
-        );
     }
 
     #[test]
