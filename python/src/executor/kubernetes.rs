@@ -444,9 +444,21 @@ async fn run_step_with_retries(
             .filter(|e| matches!(e.event_type, EventType::StepRetry))
             .map(|e| e.metadata.as_slice()),
     );
-    for (_, reason) in &recorded {
-        if let Some(esc) = spec.policy.as_ref().and_then(|p| p.escalate.as_ref()) {
-            compute = rivers_k8s::compute::escalate_compute(&compute, esc, *reason);
+    // Resume the ladder's compute from what it last recorded; only re-derive
+    // from the (possibly since-changed) base when no record parses.
+    match retry_meta::recorded_next_compute(
+        initial_events
+            .iter()
+            .filter(|e| matches!(e.event_type, EventType::StepRetry))
+            .map(|e| e.metadata.as_slice()),
+    ) {
+        Some(recorded_compute) => compute = recorded_compute,
+        None => {
+            for (_, reason) in &recorded {
+                if let Some(esc) = spec.policy.as_ref().and_then(|p| p.escalate.as_ref()) {
+                    compute = rivers_k8s::compute::escalate_compute(&compute, esc, *reason);
+                }
+            }
         }
     }
     let mut attempt: u32 = recorded.len() as u32 + 1;

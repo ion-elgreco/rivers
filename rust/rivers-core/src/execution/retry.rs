@@ -210,6 +210,29 @@ pub mod meta {
         serde_json::from_str(value).unwrap_or_default()
     }
 
+    /// The [`NEXT_COMPUTE`] recorded on the highest-attempt `StepRetry`,
+    /// parsed back — a restarted orchestrator resumes escalation from exactly
+    /// what the ladder last requested instead of re-deriving it from the
+    /// (possibly since-changed) base.
+    pub fn recorded_next_compute<'a>(
+        step_retry_metas: impl Iterator<Item = &'a [(String, String)]>,
+    ) -> Option<crate::execution::compute::Compute> {
+        step_retry_metas
+            .filter_map(|meta| {
+                let attempt = meta
+                    .iter()
+                    .find(|(k, _)| k == ATTEMPT)
+                    .and_then(|(_, v)| v.parse::<u32>().ok())?;
+                let compute = meta
+                    .iter()
+                    .find(|(k, _)| k == NEXT_COMPUTE)
+                    .and_then(|(_, v)| serde_json::from_str(v).ok())?;
+                Some((attempt, compute))
+            })
+            .max_by_key(|(attempt, _)| *attempt)
+            .map(|(_, compute)| compute)
+    }
+
     /// Parse `(attempt, reason)` pairs from recorded `StepRetry` event
     /// metadata, sorted by attempt. Entries without a parsable [`ATTEMPT`]
     /// are dropped; a missing/unparsable [`REASON`] defaults to
@@ -520,6 +543,35 @@ mod tests {
                 (2, FailureReason::OutOfMemory),
             ]
         );
+    }
+
+    #[test]
+    fn recorded_next_compute_takes_highest_attempt() {
+        let metas: Vec<Vec<(String, String)>> = vec![
+            vec![
+                (meta::ATTEMPT.to_string(), "1".to_string()),
+                (
+                    meta::NEXT_COMPUTE.to_string(),
+                    r#"{"memory":"512Mi"}"#.to_string(),
+                ),
+            ],
+            vec![
+                (meta::ATTEMPT.to_string(), "2".to_string()),
+                (
+                    meta::NEXT_COMPUTE.to_string(),
+                    r#"{"memory":"1Gi"}"#.to_string(),
+                ),
+            ],
+            // malformed json is skipped
+            vec![
+                (meta::ATTEMPT.to_string(), "3".to_string()),
+                (meta::NEXT_COMPUTE.to_string(), "not json".to_string()),
+            ],
+        ];
+        let compute = meta::recorded_next_compute(metas.iter().map(|m| m.as_slice())).unwrap();
+        assert_eq!(compute.memory.as_deref(), Some("1Gi"));
+
+        assert!(meta::recorded_next_compute(std::iter::empty()).is_none());
     }
 
     #[test]
