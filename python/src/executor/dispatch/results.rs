@@ -429,10 +429,10 @@ pub(crate) fn handle_failure(
     failures: &mut Vec<(String, PyErr)>,
 ) {
     let err_msg = error.to_string();
-    let (reason, _) = super::failure::classify_pyerr(py, &error);
+    let classified = super::failure::classify_pyerr(py, &error);
     let ts = now_ts();
     for name in event_names {
-        ctx.emit_step_failure(name, &err_msg, Some(reason));
+        ctx.emit_step_failure(name, &err_msg, Some(&classified));
         ctx.emit_partition_failures(name, &err_msg, ts);
         ctx.state.mark_failed(name.clone());
     }

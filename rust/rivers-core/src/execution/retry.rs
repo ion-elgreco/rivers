@@ -190,7 +190,8 @@ pub mod meta {
     pub const ATTEMPT: &str = "rivers/attempt";
     /// [`super::FailureReason`] (snake_case) that classified the failure.
     pub const REASON: &str = "rivers/failure_reason";
-    /// Fully-qualified class of the raised exception, if any.
+    /// JSON array of the raised exception's fully-qualified MRO class names,
+    /// derived-first. Encode/decode via [`encode_exc_types`] / [`decode_exc_types`].
     pub const EXC_TYPE: &str = "rivers/exc_type";
     /// `"true"`/`"false"` — did the policy admit another attempt.
     pub const RETRIABLE: &str = "rivers/retriable";
@@ -198,6 +199,16 @@ pub mod meta {
     pub const NEXT_DELAY_MS: &str = "rivers/next_delay_ms";
     /// JSON-encoded next-attempt `Compute` when a `StepRetry` escalated resources.
     pub const NEXT_COMPUTE: &str = "rivers/next_compute";
+
+    /// Encode MRO class names for the [`EXC_TYPE`] metadata value.
+    pub fn encode_exc_types(exc_types: &[String]) -> String {
+        serde_json::to_string(exc_types).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// Inverse of [`encode_exc_types`]; empty on malformed input.
+    pub fn decode_exc_types(value: &str) -> Vec<String> {
+        serde_json::from_str(value).unwrap_or_default()
+    }
 }
 
 /// Does `policy.retry_on` admit a failure classified as `reason` whose raised
@@ -461,6 +472,18 @@ mod tests {
             max_cpu: None,
             on: vec![FailureReason::OutOfMemory],
         }
+    }
+
+    #[test]
+    fn exc_types_meta_round_trip() {
+        let names = vec![
+            "builtins.ConnectionResetError".to_string(),
+            "builtins.ConnectionError".to_string(),
+        ];
+        assert_eq!(meta::decode_exc_types(&meta::encode_exc_types(&names)), names);
+        assert_eq!(meta::encode_exc_types(&[]), "[]");
+        assert!(meta::decode_exc_types("").is_empty());
+        assert!(meta::decode_exc_types("not json").is_empty());
     }
 
     // ── serde ───────────────────────────────────────────────────────────────

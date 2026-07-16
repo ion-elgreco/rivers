@@ -88,23 +88,28 @@ pub(crate) fn emit_step_success(writer: &EventWriter, run_id: &str, step_name: &
     );
 }
 
-/// `reason` is `None` only for failures with no exception at hand (pre-spawn
-/// batch errors, mapped-step summaries); classified failures always stamp it
-/// so the K8s orchestrator can read it back for retry decisions.
+/// `classified` is `None` only for failures with no exception at hand
+/// (pre-spawn batch errors, mapped-step summaries); classified failures stamp
+/// reason + exception MRO so the K8s orchestrator can read them back for
+/// retry decisions across the pod boundary.
 pub(crate) fn emit_step_failure(
     writer: &EventWriter,
     run_id: &str,
     step_name: &str,
     error_msg: &str,
-    reason: Option<rivers_core::execution::retry::FailureReason>,
+    classified: Option<&(rivers_core::execution::retry::FailureReason, Vec<String>)>,
     ts: i64,
 ) {
+    use rivers_core::execution::retry::meta;
     let mut metadata = vec![("error".to_string(), error_msg.to_string())];
-    if let Some(reason) = reason {
-        metadata.push((
-            rivers_core::execution::retry::meta::REASON.to_string(),
-            reason.as_str().to_string(),
-        ));
+    if let Some((reason, exc_types)) = classified {
+        metadata.push((meta::REASON.to_string(), reason.as_str().to_string()));
+        if !exc_types.is_empty() {
+            metadata.push((
+                meta::EXC_TYPE.to_string(),
+                meta::encode_exc_types(exc_types),
+            ));
+        }
     }
     emit_step_event(
         writer,

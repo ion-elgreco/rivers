@@ -1,5 +1,7 @@
 """Declarative step retries (``@Asset(retry=...)``, repo ``retries`` registry)."""
 
+import json
+
 import pytest
 
 import rivers as rs
@@ -207,6 +209,9 @@ def test_step_failure_event_carries_failure_reason(
     assert len(failures) == 1
     meta = dict(failures[0].metadata)
     assert meta["rivers/failure_reason"] == expected_reason
+    exc_types = json.loads(meta["rivers/exc_type"])
+    assert f"builtins.{exc.__name__}" in exc_types
+    assert "builtins.BaseException" in exc_types  # full MRO, derived-first
 
 
 def test_step_failure_reason_from_loky_subprocess(tmp_path, storage):

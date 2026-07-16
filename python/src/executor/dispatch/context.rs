@@ -134,14 +134,14 @@ impl<'a> BatchContext<'a> {
         &self,
         step_name: &str,
         msg: &str,
-        reason: Option<rivers_core::execution::retry::FailureReason>,
+        classified: Option<&(rivers_core::execution::retry::FailureReason, Vec<String>)>,
     ) {
         ops::emit_step_failure(
             self.sink.writer,
             self.scope.run_id,
             step_name,
             msg,
-            reason,
+            classified,
             now_ts(),
         );
     }
@@ -339,14 +339,14 @@ impl<'a> BatchContext<'a> {
         failures: &mut Vec<(String, PyErr)>,
     ) {
         let err_msg = error.to_string();
-        let (reason, _) = Python::attach(|py| super::failure::classify_pyerr(py, &error));
+        let classified = Python::attach(|py| super::failure::classify_pyerr(py, &error));
         let ts = now_ts();
         ops::emit_step_failure(
             self.sink.writer,
             self.scope.run_id,
             step_name,
             &err_msg,
-            Some(reason),
+            Some(&classified),
             ts,
         );
         self.emit_partition_failures(step_name, &err_msg, ts);
