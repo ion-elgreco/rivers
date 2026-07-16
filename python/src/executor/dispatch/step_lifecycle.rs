@@ -26,11 +26,9 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::errors::ExecutionError;
 
-use rivers_core::execution::retry::{compute_delay, should_retry};
-
 use super::super::ops::{self, now_ts};
 use super::context::BatchContext;
-use super::failure::{self, classify_pyerr, rng01};
+use super::failure::{self, classify_pyerr};
 use super::pool_claim::PoolGuard;
 use super::results::{emit_captured_logs, process_outcome};
 use super::types::WorkOutcome;
@@ -105,42 +103,23 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
         );
     }
     let outcome = loop {
-        let outcome = worker.run_work(py, ctx);
-        let WorkOutcome::Error {
-            error,
-            captured_logs,
-            failure_config,
-        } = outcome
+        let mut outcome = worker.run_work(py, ctx);
+        let (WorkOutcome::Error { error, .. }, Some(policy)) = (&outcome, &policy) else {
+            break outcome;
+        };
+        let (reason, exc_types) = classify_pyerr(py, error);
+        let Some(delay) = failure::admit_retry(policy, step_name, reason, &exc_types, attempt)
         else {
             break outcome;
         };
-        let Some(policy) = &policy else {
-            break WorkOutcome::Error {
-                error,
-                captured_logs,
-                failure_config,
-            };
-        };
-        let (reason, exc_types) = classify_pyerr(py, &error);
-        if !should_retry(policy, reason, &exc_types, attempt) {
-            break WorkOutcome::Error {
-                error,
-                captured_logs,
-                failure_config,
-            };
+        // Flush the failed attempt's logs now (taken out so a cancelled
+        // backoff below can't re-emit them with the returned outcome).
+        if let WorkOutcome::Error { captured_logs, .. } = &mut outcome {
+            emit_captured_logs(ctx, step_name, captured_logs.take());
         }
-        emit_captured_logs(ctx, step_name, captured_logs);
-        let delay = compute_delay(policy, attempt, rng01());
         for name in event_names {
             ctx.emit_step_retry(name, attempt, reason, delay);
         }
-        tracing::info!(
-            step = step_name,
-            attempt,
-            reason = reason.as_str(),
-            delay_ms = delay.as_millis() as u64,
-            "step failed, retrying"
-        );
         if !delay.is_zero() {
             // A sleeping step must not hold pool slots (it would starve
             // siblings and other runs), and cancellation cuts the wait short.
@@ -153,11 +132,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
                 ctx.scope.run_id,
                 delay,
             ) {
-                break WorkOutcome::Error {
-                    error,
-                    captured_logs: None,
-                    failure_config,
-                };
+                break outcome;
             }
             if !pools.is_empty() {
                 match PoolGuard::acquire_blocking(
@@ -170,13 +145,12 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
                 ) {
                     Ok(g) => guard = Some(g),
                     Err(e) => {
-                        break WorkOutcome::Error {
-                            error: ExecutionError::new_err(format!(
+                        if let WorkOutcome::Error { error, .. } = &mut outcome {
+                            *error = ExecutionError::new_err(format!(
                                 "Failed to re-claim pool slots for retry: {e}"
-                            )),
-                            captured_logs: None,
-                            failure_config,
-                        };
+                            ));
+                        }
+                        break outcome;
                     }
                 }
             }
@@ -184,11 +158,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
         // Zero-backoff ladders have no sleep to interrupt — probe once per
         // attempt so a cancelled run stops instead of burning the budget.
         if failure::run_cancelled_blocking(py, ctx.sink.storage.backend(), ctx.scope.run_id) {
-            break WorkOutcome::Error {
-                error,
-                captured_logs: None,
-                failure_config,
-            };
+            break outcome;
         }
         attempt += 1;
         let ts = now_ts();
@@ -294,9 +264,11 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         let (Some(policy), Some((reason, exc_types))) = (&retry_policy, classified.as_ref()) else {
             break outcome;
         };
-        if !should_retry(policy, *reason, exc_types, attempt) {
+        let Some(delay) =
+            failure::admit_retry(policy, &pool_step_name, *reason, exc_types, attempt)
+        else {
             break outcome;
-        }
+        };
         // Flush the failed attempt's logs now (taken out so a cancelled
         // backoff below can't re-emit them with the returned outcome).
         if let WorkOutcome::Error { captured_logs, .. } = &mut outcome
@@ -313,7 +285,6 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
                 now_ts(),
             );
         }
-        let delay = compute_delay(policy, attempt, rng01());
         for name in &start_event_names {
             ops::emit_step_retry_via_tx(
                 &events_tx,
@@ -326,13 +297,6 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
                 now_ts(),
             );
         }
-        tracing::info!(
-            step = %pool_step_name,
-            attempt,
-            reason = reason.as_str(),
-            delay_ms = delay.as_millis() as u64,
-            "step failed, retrying"
-        );
         if !delay.is_zero() {
             // A sleeping step must not hold its concurrency permit or pool
             // slots, and cancellation cuts the wait short.
