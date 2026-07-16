@@ -1,8 +1,15 @@
 //! Failure classification for the step retry loop.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use pyo3::exceptions::{PyKeyboardInterrupt, PyMemoryError, PyTimeoutError};
 use pyo3::prelude::*;
 use rivers_core::execution::retry::FailureReason;
+use rivers_core::storage::StorageBackend;
+use rivers_core::storage::surrealdb_backend::SurrealStorage;
+
+use crate::runtime::io_rt;
 
 /// Classify a raised exception and collect its MRO as fully-qualified class
 /// names (`module.qualname`, derived-first) for the `retry_on` allow-list.
@@ -35,6 +42,42 @@ pub(crate) fn classify_pyerr(py: Python, err: &PyErr) -> (FailureReason, Vec<Str
         FailureReason::Error
     };
     (reason, mro_names)
+}
+
+/// Sleep out a backoff `delay` in 1s slices, polling run cancellation between
+/// slices. Returns true if the run was cancelled before the delay elapsed.
+pub(crate) async fn backoff_sleep_cancellable(
+    storage: &SurrealStorage,
+    run_id: &str,
+    delay: Duration,
+) -> bool {
+    const SLICE: Duration = Duration::from_secs(1);
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        tokio::time::sleep(remaining.min(SLICE)).await;
+        if remaining <= SLICE {
+            return false;
+        }
+        if storage.is_cancelled(run_id).await.unwrap_or(false) {
+            return true;
+        }
+    }
+}
+
+/// Blocking flavor for the sync lifecycle (GIL released for the wait).
+pub(crate) fn backoff_sleep_cancellable_blocking(
+    py: Python,
+    storage: &Arc<SurrealStorage>,
+    run_id: &str,
+    delay: Duration,
+) -> bool {
+    let storage = Arc::clone(storage);
+    let run_id = run_id.to_string();
+    py.detach(move || io_rt().block_on(backoff_sleep_cancellable(&storage, &run_id, delay)))
 }
 
 /// Uniform-ish sample in [0, 1) for backoff jitter, from thread ID + wall

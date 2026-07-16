@@ -19,7 +19,7 @@ use crate::errors::ExecutionError;
 use crate::repository::resolved_node::ResolvedNode;
 use crate::runtime::rt;
 
-use super::dispatch::failure::rng01;
+use super::dispatch::failure::{backoff_sleep_cancellable, rng01};
 use super::dispatch::{BatchContext, ExecutorBackend, StepInstance};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -421,6 +421,7 @@ async fn run_step_with_retries(
     run_id: String,
     code_location_id: String,
     config: Arc<rivers_k8s::executor::K8sStepExecutorConfig>,
+    semaphore: Option<Arc<Semaphore>>,
     spec: StepJobSpec,
 ) -> (String, bool) {
     let executor_base = Compute {
@@ -451,6 +452,17 @@ async fn run_step_with_retries(
     let mut attempt: u32 = recorded.len() as u32 + 1;
     let mut cached_events = Some(initial_events);
     loop {
+        // One concurrency permit per attempt — released for the backoff sleep
+        // so a waiting step can't starve its siblings.
+        let permit = match &semaphore {
+            Some(sem) => Some(
+                sem.clone()
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore not closed"),
+            ),
+            None => None,
+        };
         // Failure events recorded before this attempt started; only a failure
         // beyond this count belongs to this attempt (an OOM-killed attempt
         // records none at all — the Job-status fallback covers it). Capped at
@@ -505,6 +517,7 @@ async fn run_step_with_retries(
             baseline_failures,
         )
         .await;
+        drop(permit);
         let (reason, exc_types) = match outcome {
             StepPollOutcome::Success => return (spec.instance_name, true),
             StepPollOutcome::Cancelled => return (spec.instance_name, false),
@@ -551,13 +564,15 @@ async fn run_step_with_retries(
             delay_ms = delay.as_millis() as u64,
             "step failed, retrying"
         );
-        tokio::time::sleep(delay).await;
+        if backoff_sleep_cancellable(&storage, &run_id, delay).await {
+            return (spec.instance_name, false);
+        }
         attempt += 1;
     }
 }
 
-/// Run every step instance to completion, one monitor task each. The
-/// concurrency permit spans a step's whole retry ladder.
+/// Run every step instance to completion, one monitor task each. Each retry
+/// attempt holds one concurrency permit; backoff sleeps release it.
 async fn run_jobs_to_completion(
     client: kube_client::Client,
     namespace: String,
@@ -578,29 +593,20 @@ async fn run_jobs_to_completion(
         let run_id = run_id.clone();
         let code_location_id = code_location_id.clone();
         let config = Arc::clone(&config);
-        let permit = match semaphore {
-            Some(ref sem) => Some(
-                sem.clone()
-                    .acquire_owned()
-                    .await
-                    .expect("semaphore not closed"),
-            ),
-            None => None,
-        };
+        let semaphore = semaphore.clone();
 
         join_set.spawn(async move {
-            let result = run_step_with_retries(
+            run_step_with_retries(
                 client,
                 namespace,
                 storage,
                 run_id,
                 code_location_id,
                 config,
+                semaphore,
                 spec,
             )
-            .await;
-            drop(permit);
-            result
+            .await
         });
     }
 

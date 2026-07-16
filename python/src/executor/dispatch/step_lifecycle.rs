@@ -30,7 +30,7 @@ use rivers_core::execution::retry::{compute_delay, should_retry};
 
 use super::super::ops::{self, now_ts};
 use super::context::BatchContext;
-use super::failure::{classify_pyerr, rng01};
+use super::failure::{self, classify_pyerr, rng01};
 use super::pool_claim::PoolGuard;
 use super::results::{emit_captured_logs, process_outcome};
 use super::types::WorkOutcome;
@@ -64,7 +64,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
     worker: W,
     failures: &mut Vec<(String, PyErr)>,
 ) {
-    let guard = if pools.is_empty() {
+    let mut guard = if pools.is_empty() {
         None
     } else {
         match PoolGuard::acquire_blocking(
@@ -91,7 +91,6 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
         ctx.emit_start(name, now_ts());
     }
 
-    // Pool slots stay claimed across retry attempts and backoff sleeps.
     let policy = ctx.retry_policy_for(step);
     let mut attempt: u32 = 1;
     let outcome = loop {
@@ -131,7 +130,46 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
             delay_ms = delay.as_millis() as u64,
             "step failed, retrying"
         );
-        py.detach(|| std::thread::sleep(delay));
+        if !delay.is_zero() {
+            // A sleeping step must not hold pool slots (it would starve
+            // siblings and other runs), and cancellation cuts the wait short.
+            if let Some(g) = guard.take() {
+                g.release_blocking(py);
+            }
+            if failure::backoff_sleep_cancellable_blocking(
+                py,
+                ctx.sink.storage.backend(),
+                ctx.scope.run_id,
+                delay,
+            ) {
+                break WorkOutcome::Error {
+                    error,
+                    captured_logs: None,
+                    failure_config,
+                };
+            }
+            if !pools.is_empty() {
+                match PoolGuard::acquire_blocking(
+                    py,
+                    ctx.sink.storage,
+                    &pools,
+                    ctx.scope.run_id,
+                    step_name,
+                    ctx.event_sender(),
+                ) {
+                    Ok(g) => guard = Some(g),
+                    Err(e) => {
+                        break WorkOutcome::Error {
+                            error: ExecutionError::new_err(format!(
+                                "Failed to re-claim pool slots for retry: {e}"
+                            )),
+                            captured_logs: None,
+                            failure_config,
+                        };
+                    }
+                }
+            }
+        }
         attempt += 1;
         let ts = now_ts();
         for name in event_names {
@@ -167,13 +205,17 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
     retry_policy: Option<rivers_core::execution::retry::RetryPolicy>,
     worker: W,
 ) -> WorkOutcome {
-    let _permit = if let Some(sem) = semaphore {
-        Some(sem.acquire_owned().await.expect("semaphore not closed"))
-    } else {
-        None
+    let mut permit = match &semaphore {
+        Some(sem) => Some(
+            sem.clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore not closed"),
+        ),
+        None => None,
     };
 
-    let guard = if pools.is_empty() {
+    let mut guard = if pools.is_empty() {
         None
     } else {
         match PoolGuard::acquire(
@@ -198,7 +240,6 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         ops::emit_step_start_via_tx(&events_tx, &code_location_id, &run_id, name, start_ts);
     }
 
-    // Pool slots stay claimed across retry attempts and backoff sleeps.
     let worker = Arc::new(worker);
     let mut attempt: u32 = 1;
     let outcome = loop {
@@ -215,7 +256,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
             (outcome, classified)
         })
         .await;
-        let (outcome, classified) = match joined {
+        let (mut outcome, classified) = match joined {
             Ok(pair) => pair,
             Err(e) => break prep_error(format!("spawn_blocking join error: {e}")),
         };
@@ -228,20 +269,19 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         if !should_retry(policy, *reason, exc_types, attempt) {
             break outcome;
         }
-        // Flush the failed attempt's logs now; the outcome is discarded.
-        if let WorkOutcome::Error {
-            captured_logs: Some((stdout, stderr, logs)),
-            ..
-        } = &outcome
+        // Flush the failed attempt's logs now (taken out so a cancelled
+        // backoff below can't re-emit them with the returned outcome).
+        if let WorkOutcome::Error { captured_logs, .. } = &mut outcome
+            && let Some((stdout, stderr, logs)) = captured_logs.take()
         {
             ops::emit_log_output_via_tx(
                 &events_tx,
                 &code_location_id,
                 &run_id,
                 &pool_step_name,
-                stdout,
-                stderr,
-                logs,
+                &stdout,
+                &stderr,
+                &logs,
                 now_ts(),
             );
         }
@@ -265,7 +305,41 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
             delay_ms = delay.as_millis() as u64,
             "step failed, retrying"
         );
-        tokio::time::sleep(delay).await;
+        if !delay.is_zero() {
+            // A sleeping step must not hold its concurrency permit or pool
+            // slots, and cancellation cuts the wait short.
+            if let Some(g) = guard.take() {
+                g.release().await;
+            }
+            drop(permit.take());
+            if failure::backoff_sleep_cancellable(storage.backend(), &run_id, delay).await {
+                break outcome;
+            }
+            if let Some(sem) = &semaphore {
+                permit = Some(
+                    sem.clone()
+                        .acquire_owned()
+                        .await
+                        .expect("semaphore not closed"),
+                );
+            }
+            if !pools.is_empty() {
+                match PoolGuard::acquire(
+                    &storage,
+                    &pools,
+                    &run_id,
+                    &pool_step_name,
+                    events_tx.clone(),
+                )
+                .await
+                {
+                    Ok(g) => guard = Some(g),
+                    Err(e) => {
+                        break prep_error(format!("Failed to re-claim pool slots for retry: {e}"));
+                    }
+                }
+            }
+        }
         attempt += 1;
         let ts = now_ts();
         for name in &start_event_names {
@@ -273,6 +347,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         }
     };
 
+    drop(permit);
     if let Some(g) = guard {
         g.release().await;
     }
