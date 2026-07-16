@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use pyo3::exceptions::{PyKeyboardInterrupt, PyMemoryError, PyTimeoutError};
 use pyo3::prelude::*;
-use rivers_core::execution::retry::FailureReason;
+use rivers_core::execution::retry::{FailureReason, RetryPolicy, compute_delay, should_retry};
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{EventType, StorageBackend};
 
@@ -49,6 +49,29 @@ pub(crate) fn classify_pyerr(py: Python, err: &PyErr) -> (FailureReason, Vec<Str
         FailureReason::Error
     };
     (reason, mro_names)
+}
+
+/// Apply `policy` to a classified failed attempt: `Some(delay)` admits
+/// another attempt after `delay` (logged); `None` means give up.
+pub(crate) fn admit_retry(
+    policy: &RetryPolicy,
+    step_name: &str,
+    reason: FailureReason,
+    exc_types: &[String],
+    attempt: u32,
+) -> Option<Duration> {
+    if !should_retry(policy, reason, exc_types, attempt) {
+        return None;
+    }
+    let delay = compute_delay(policy, attempt, rng01());
+    tracing::info!(
+        step = step_name,
+        attempt,
+        reason = reason.as_str(),
+        delay_ms = delay.as_millis() as u64,
+        "step failed, retrying"
+    );
+    Some(delay)
 }
 
 /// Sleep out a backoff `delay` in 1s slices, polling run cancellation between
