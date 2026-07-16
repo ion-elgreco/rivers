@@ -21,7 +21,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionStep;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
-use rivers_core::storage::{EventRecord, ScopedStorageHandle};
+use rivers_core::storage::{EventRecord, ScopedStorageHandle, StorageBackend};
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::errors::ExecutionError;
@@ -169,6 +169,15 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
                     }
                 }
             }
+        }
+        // Zero-backoff ladders have no sleep to interrupt — probe once per
+        // attempt so a cancelled run stops instead of burning the budget.
+        if failure::run_cancelled_blocking(py, ctx.sink.storage.backend(), ctx.scope.run_id) {
+            break WorkOutcome::Error {
+                error,
+                captured_logs: None,
+                failure_config,
+            };
         }
         attempt += 1;
         let ts = now_ts();
@@ -339,6 +348,16 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
                     }
                 }
             }
+        }
+        // Zero-backoff ladders have no sleep to interrupt — probe once per
+        // attempt so a cancelled run stops instead of burning the budget.
+        if storage
+            .backend()
+            .is_cancelled(&run_id)
+            .await
+            .unwrap_or(false)
+        {
+            break outcome;
         }
         attempt += 1;
         let ts = now_ts();

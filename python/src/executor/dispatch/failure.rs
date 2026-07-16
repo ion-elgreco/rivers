@@ -80,6 +80,20 @@ pub(crate) fn backoff_sleep_cancellable_blocking(
     py.detach(move || io_rt().block_on(backoff_sleep_cancellable(&storage, &run_id, delay)))
 }
 
+/// One-shot cancellation probe for the retry loops — zero-backoff ladders have
+/// no sleep to interrupt, so each iteration checks explicitly.
+pub(crate) fn run_cancelled_blocking(
+    py: Python,
+    storage: &Arc<SurrealStorage>,
+    run_id: &str,
+) -> bool {
+    let storage = Arc::clone(storage);
+    let run_id = run_id.to_string();
+    py.detach(move || {
+        io_rt().block_on(async { storage.is_cancelled(&run_id).await.unwrap_or(false) })
+    })
+}
+
 /// Uniform-ish sample in [0, 1) for backoff jitter, from thread ID + wall
 /// clock — same dependency-free approach as `pool_claim::rand_jitter`.
 pub(crate) fn rng01() -> f64 {

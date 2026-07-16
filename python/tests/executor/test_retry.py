@@ -287,6 +287,58 @@ def test_cancellation_interrupts_backoff(storage):
     assert elapsed < 10  # nowhere near the 20s backoff
 
 
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_cancellation_stops_zero_backoff_retries(storage, is_async):
+    """With no backoff there is no sleep to interrupt — the ladder must still
+    observe cancellation between attempts instead of burning the budget."""
+    import threading
+    import time
+
+    calls = {"n": 0}
+
+    def body() -> int:
+        calls["n"] += 1
+        time.sleep(0.1)
+        raise ValueError("always")
+
+    if is_async:
+
+        @rs.Asset(retry=rs.RetryPolicy(max_retries=50))
+        async def stubborn() -> int:
+            return body()
+
+    else:
+
+        @rs.Asset(retry=rs.RetryPolicy(max_retries=50))
+        def stubborn() -> int:
+            return body()
+
+    repo = rs.CodeRepository(
+        assets=[stubborn], default_executor=rs.Executor.in_process()
+    )
+    repo.resolve(storage=storage)
+
+    def cancel_once_retrying():
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if any(
+                e.event_type == "StepRetry"
+                for e in storage.get_events_for_asset("stubborn")
+            ):
+                for run in storage.get_runs(10):
+                    storage.request_cancellation(run.run_id)
+                return
+            time.sleep(0.05)
+
+    canceller = threading.Thread(target=cancel_once_retrying)
+    canceller.start()
+    result = repo.materialize(raise_on_error=False)
+    canceller.join()
+
+    assert not result.success
+    assert calls["n"] < 25  # cancellation cut the 50-attempt budget short
+
+
 @pytest.mark.parametrize(
     "executor_factory,is_async",
     [
