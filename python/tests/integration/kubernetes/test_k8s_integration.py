@@ -489,14 +489,15 @@ class TestK8sGrpcFlow:
     def test_executor_resume_after_crash(self, grpc_stubs):
         """Operator restarts executor pod with --resume after crash, run still succeeds.
 
-        Uses the in-process job because killing the executor kills in-flight
-        steps (unlike step Jobs which are independent K8s resources).
-        Kills the executor immediately after it appears to guarantee it hasn't
-        finished yet.
+        Uses an in-process job (killing the executor kills in-flight steps,
+        unlike step Jobs which are independent K8s resources) whose step
+        sleeps long enough that the kill is guaranteed to land mid-run — a
+        run that completes inside the kill window stores its outcome, which
+        the operator honors instead of restarting.
         """
         with GrpcChannel(grpc_stubs) as ch:
             resp = ch.stub.ExecuteJob(
-                ch.pb2.ExecuteJobRequest(job_name="k8s_inprocess_job")
+                ch.pb2.ExecuteJobRequest(job_name="k8s_resume_job")
             )
             assert resp.run_id
 
