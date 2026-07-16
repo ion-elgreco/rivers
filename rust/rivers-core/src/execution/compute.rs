@@ -30,7 +30,6 @@ impl Compute {
             gpu: self.gpu.clone().or_else(|| default.gpu.clone()),
         }
     }
-
 }
 
 #[cfg(test)]
