@@ -569,28 +569,17 @@ async fn run_step_with_retries(
             compute = rivers_k8s::compute::escalate_compute(&compute, esc, reason);
         }
         let delay = compute_delay(policy, attempt, rng01());
-        let mut metadata = vec![
-            (retry_meta::ATTEMPT.to_string(), attempt.to_string()),
-            (retry_meta::REASON.to_string(), reason.as_str().to_string()),
-            (
-                retry_meta::NEXT_DELAY_MS.to_string(),
-                delay.as_millis().to_string(),
-            ),
-        ];
-        if let Ok(compute_json) = serde_json::to_string(&compute) {
-            metadata.push((retry_meta::NEXT_COMPUTE.to_string(), compute_json));
-        }
         let _ = storage
-            .store_event(&rivers_core::storage::EventRecord {
-                code_location_id: code_location_id.clone(),
-                event_type: EventType::StepRetry,
-                asset_key: Some(spec.instance_name.clone()),
-                run_id: run_id.clone(),
-                partition_key: None,
-                timestamp: rivers_core::util::now_ts(),
-                metadata,
-                input_data_versions: vec![],
-            })
+            .store_event(&super::ops::step_retry_record(
+                &code_location_id,
+                &run_id,
+                &spec.instance_name,
+                attempt,
+                reason,
+                delay,
+                Some(&compute),
+                rivers_core::util::now_ts(),
+            ))
             .await;
         tracing::info!(
             target: "rivers::k8s",
