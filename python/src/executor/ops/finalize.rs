@@ -122,6 +122,47 @@ pub(crate) fn emit_step_failure(
     );
 }
 
+/// The one StepRetry record shape, shared by every sink (EventWriter, event
+/// channel, raw store on the K8s orchestrator). The replay path reads these
+/// back, so the copies must not drift. `next_compute` is set only when the
+/// attempt escalated resources.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn step_retry_record(
+    code_location_id: &str,
+    run_id: &str,
+    step_name: &str,
+    attempt: u32,
+    reason: rivers_core::execution::retry::FailureReason,
+    delay: std::time::Duration,
+    next_compute: Option<&rivers_core::execution::compute::Compute>,
+    ts: i64,
+) -> EventRecord {
+    use rivers_core::execution::retry::meta;
+    let mut metadata = vec![
+        (meta::ATTEMPT.to_string(), attempt.to_string()),
+        (meta::REASON.to_string(), reason.as_str().to_string()),
+        (
+            meta::NEXT_DELAY_MS.to_string(),
+            delay.as_millis().to_string(),
+        ),
+    ];
+    if let Some(compute) = next_compute
+        && let Ok(json) = serde_json::to_string(compute)
+    {
+        metadata.push((meta::NEXT_COMPUTE.to_string(), json));
+    }
+    EventRecord {
+        code_location_id: code_location_id.to_string(),
+        event_type: EventType::StepRetry,
+        asset_key: Some(step_name.to_string()),
+        run_id: run_id.to_string(),
+        partition_key: None,
+        timestamp: ts,
+        metadata,
+        input_data_versions: vec![],
+    }
+}
+
 pub(crate) fn emit_step_retry(
     writer: &EventWriter,
     run_id: &str,
@@ -131,23 +172,9 @@ pub(crate) fn emit_step_retry(
     delay: std::time::Duration,
     ts: i64,
 ) {
-    use rivers_core::execution::retry::meta;
-    emit_step_event(
-        writer,
-        run_id,
-        step_name,
-        EventType::StepRetry,
-        vec![
-            (meta::ATTEMPT.to_string(), attempt.to_string()),
-            (meta::REASON.to_string(), reason.as_str().to_string()),
-            (
-                meta::NEXT_DELAY_MS.to_string(),
-                delay.as_millis().to_string(),
-            ),
-        ],
-        ts,
-        None,
-    );
+    writer.emit(step_retry_record(
+        "", run_id, step_name, attempt, reason, delay, None, ts,
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -161,24 +188,51 @@ pub(crate) fn emit_step_retry_via_tx(
     delay: std::time::Duration,
     ts: i64,
 ) {
-    use rivers_core::execution::retry::meta;
-    let _ = tx.send(EventRecord {
+    let _ = tx.send(step_retry_record(
+        code_location_id,
+        run_id,
+        step_name,
+        attempt,
+        reason,
+        delay,
+        None,
+        ts,
+    ));
+}
+
+/// The one LogOutput record shape; `None` when all streams are empty.
+fn log_output_record(
+    code_location_id: &str,
+    run_id: &str,
+    step_name: &str,
+    stdout: &str,
+    stderr: &str,
+    logs: &str,
+    ts: i64,
+) -> Option<EventRecord> {
+    if stdout.is_empty() && stderr.is_empty() && logs.is_empty() {
+        return None;
+    }
+    let mut metadata = Vec::new();
+    if !stdout.is_empty() {
+        metadata.push(("stdout".to_string(), stdout.to_string()));
+    }
+    if !stderr.is_empty() {
+        metadata.push(("stderr".to_string(), stderr.to_string()));
+    }
+    if !logs.is_empty() {
+        metadata.push(("logs".to_string(), logs.to_string()));
+    }
+    Some(EventRecord {
         code_location_id: code_location_id.to_string(),
-        event_type: EventType::StepRetry,
+        event_type: EventType::LogOutput,
         asset_key: Some(step_name.to_string()),
         run_id: run_id.to_string(),
         partition_key: None,
         timestamp: ts,
-        metadata: vec![
-            (meta::ATTEMPT.to_string(), attempt.to_string()),
-            (meta::REASON.to_string(), reason.as_str().to_string()),
-            (
-                meta::NEXT_DELAY_MS.to_string(),
-                delay.as_millis().to_string(),
-            ),
-        ],
+        metadata,
         input_data_versions: vec![],
-    });
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -192,29 +246,11 @@ pub(crate) fn emit_log_output_via_tx(
     logs: &str,
     ts: i64,
 ) {
-    if stdout.is_empty() && stderr.is_empty() && logs.is_empty() {
-        return;
+    if let Some(record) =
+        log_output_record(code_location_id, run_id, step_name, stdout, stderr, logs, ts)
+    {
+        let _ = tx.send(record);
     }
-    let mut metadata = Vec::new();
-    if !stdout.is_empty() {
-        metadata.push(("stdout".to_string(), stdout.to_string()));
-    }
-    if !stderr.is_empty() {
-        metadata.push(("stderr".to_string(), stderr.to_string()));
-    }
-    if !logs.is_empty() {
-        metadata.push(("logs".to_string(), logs.to_string()));
-    }
-    let _ = tx.send(EventRecord {
-        code_location_id: code_location_id.to_string(),
-        event_type: EventType::LogOutput,
-        asset_key: Some(step_name.to_string()),
-        run_id: run_id.to_string(),
-        partition_key: None,
-        timestamp: ts,
-        metadata,
-        input_data_versions: vec![],
-    });
 }
 
 pub(crate) fn emit_partition_failure(
@@ -245,29 +281,9 @@ pub(crate) fn emit_log_output(
     logs: &str,
     ts: i64,
 ) {
-    if stdout.is_empty() && stderr.is_empty() && logs.is_empty() {
-        return;
+    if let Some(record) = log_output_record("", run_id, step_name, stdout, stderr, logs, ts) {
+        writer.emit(record);
     }
-    let mut metadata = Vec::new();
-    if !stdout.is_empty() {
-        metadata.push(("stdout".to_string(), stdout.to_string()));
-    }
-    if !stderr.is_empty() {
-        metadata.push(("stderr".to_string(), stderr.to_string()));
-    }
-    if !logs.is_empty() {
-        metadata.push(("logs".to_string(), logs.to_string()));
-    }
-    writer.emit(EventRecord {
-        code_location_id: String::new(),
-        event_type: EventType::LogOutput,
-        asset_key: Some(step_name.to_string()),
-        run_id: run_id.to_string(),
-        partition_key: None,
-        timestamp: ts,
-        metadata,
-        input_data_versions: vec![],
-    });
 }
 
 /// `input_data_versions` carries `(dep_name, data_version)` pairs captured at
