@@ -130,6 +130,8 @@ On the in-process and parallel executors `escalate` is inert — a local Python 
 
 Concurrency slots (pools, the executor's step budget) are held per attempt: a non-zero backoff sleep releases them so waiting siblings (or other runs) can proceed, and re-claims them before the next attempt. Cancelling a run interrupts a backoff sleep within about a second.
 
+Retry policies apply to **asset** steps only. Task and bash-task steps (including a graph asset's internal tasks) run without retries — a job-level or repo-default policy skips them, and `resolve()` emits a `UserWarning` naming the affected steps.
+
 ## Observability
 
 Every retried attempt leaves a `StepRetry` event on the run timeline carrying the attempt number, the classified failure reason, the next delay, and (when escalating) the next resource request:

@@ -752,6 +752,33 @@ def test_multi_asset_output_retry(storage):
     assert "StepSuccess" in types_a and "StepSuccess" in types_b
 
 
+def test_job_retry_warns_for_task_steps(storage):
+    """Retry policies fill asset nodes only — a job-level policy over task
+    steps warns at resolve instead of silently skipping them."""
+
+    @rs.Task
+    def plain_task() -> int:
+        return 1
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler())
+    def anchor() -> int:
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[anchor],
+        tasks=[plain_task],
+        jobs=[
+            rs.Job(
+                name="mixed",
+                assets=[anchor, plain_task],
+                retry=rs.RetryPolicy(max_retries=1),
+            )
+        ],
+    )
+    with pytest.warns(UserWarning, match="task steps"):
+        repo.resolve(storage=storage)
+
+
 def test_multi_asset_conflicting_policies_error_at_resolve(storage):
     @rs.Asset.from_multi(
         output_defs=[
