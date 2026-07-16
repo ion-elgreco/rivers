@@ -190,9 +190,7 @@ fn normalize_retry_on(val: Option<Bound<'_, PyAny>>) -> PyResult<RetryOn> {
             reasons.push(reason.into());
         } else if let Ok(ty) = item.cast::<PyType>() {
             if ty.is_subclass_of::<PyBaseException>()? {
-                let module: String = ty.getattr("__module__")?.extract()?;
-                let qualname: String = ty.getattr("__qualname__")?.extract()?;
-                exceptions.push(format!("{module}.{qualname}"));
+                exceptions.push(crate::utils::qualified_type_name(ty.as_any())?);
             } else {
                 return Err(PyTypeError::new_err(format!(
                     "retry_on exception type must subclass BaseException: {}",
