@@ -130,12 +130,18 @@ impl<'a> BatchContext<'a> {
     }
 
     /// Emit only the event — no hooks, no recording.
-    pub(crate) fn emit_step_failure(&self, step_name: &str, msg: &str) {
+    pub(crate) fn emit_step_failure(
+        &self,
+        step_name: &str,
+        msg: &str,
+        reason: Option<rivers_core::execution::retry::FailureReason>,
+    ) {
         ops::emit_step_failure(
             self.sink.writer,
             self.scope.run_id,
             step_name,
             msg,
+            reason,
             now_ts(),
         );
     }
@@ -333,8 +339,16 @@ impl<'a> BatchContext<'a> {
         failures: &mut Vec<(String, PyErr)>,
     ) {
         let err_msg = error.to_string();
+        let (reason, _) = Python::attach(|py| super::failure::classify_pyerr(py, &error));
         let ts = now_ts();
-        ops::emit_step_failure(self.sink.writer, self.scope.run_id, step_name, &err_msg, ts);
+        ops::emit_step_failure(
+            self.sink.writer,
+            self.scope.run_id,
+            step_name,
+            &err_msg,
+            Some(reason),
+            ts,
+        );
         self.emit_partition_failures(step_name, &err_msg, ts);
         self.state.mark_failed(step_name.to_string());
         failures.push((step_name.to_string(), error));
@@ -356,6 +370,7 @@ impl<'a> BatchContext<'a> {
                 self.scope.run_id,
                 &inst.instance_name,
                 msg,
+                None,
                 ts,
             );
             let step = &self.scope.plan.steps[inst.idx];

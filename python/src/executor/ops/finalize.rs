@@ -88,19 +88,30 @@ pub(crate) fn emit_step_success(writer: &EventWriter, run_id: &str, step_name: &
     );
 }
 
+/// `reason` is `None` only for failures with no exception at hand (pre-spawn
+/// batch errors, mapped-step summaries); classified failures always stamp it
+/// so the K8s orchestrator can read it back for retry decisions.
 pub(crate) fn emit_step_failure(
     writer: &EventWriter,
     run_id: &str,
     step_name: &str,
     error_msg: &str,
+    reason: Option<rivers_core::execution::retry::FailureReason>,
     ts: i64,
 ) {
+    let mut metadata = vec![("error".to_string(), error_msg.to_string())];
+    if let Some(reason) = reason {
+        metadata.push((
+            rivers_core::execution::retry::meta::REASON.to_string(),
+            reason.as_str().to_string(),
+        ));
+    }
     emit_step_event(
         writer,
         run_id,
         step_name,
         EventType::StepFailure,
-        vec![("error".to_string(), error_msg.to_string())],
+        metadata,
         ts,
         None,
     );

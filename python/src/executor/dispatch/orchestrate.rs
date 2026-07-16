@@ -123,7 +123,7 @@ fn finalize_mapped_steps(ctx: &mut BatchContext, records: &[MappedStepRecord]) {
             }
         }
         if any_failed {
-            ctx.emit_step_failure(&step.name, "One or more map instances failed");
+            ctx.emit_step_failure(&step.name, "One or more map instances failed", None);
             ctx.state.mark_failed(step.name.clone());
         } else {
             ctx.emit_success(&step.name);

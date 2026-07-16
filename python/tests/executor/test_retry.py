@@ -168,6 +168,81 @@ def test_step_retry_event_metadata(storage):
     assert meta["rivers/next_delay_ms"] == "0"  # no backoff configured
 
 
+@pytest.mark.parametrize(
+    ("exc", "expected_reason"),
+    [
+        (TimeoutError, "timeout"),
+        (MemoryError, "out_of_memory"),
+        (ValueError, "error"),
+    ],
+)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_step_failure_event_carries_failure_reason(
+    storage, exc, expected_reason, is_async
+):
+    """StepFailure metadata classifies the failure — the K8s orchestrator
+    reads it back to drive retry_on across the pod boundary."""
+    if is_async:
+
+        @rs.Asset
+        async def doomed() -> int:
+            raise exc("boom")
+
+    else:
+
+        @rs.Asset
+        def doomed() -> int:
+            raise exc("boom")
+
+    repo = rs.CodeRepository(assets=[doomed], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+    result = repo.materialize(raise_on_error=False)
+
+    assert not result.success
+    failures = [
+        e
+        for e in storage.get_events_for_asset("doomed")
+        if e.event_type == "StepFailure"
+    ]
+    assert len(failures) == 1
+    meta = dict(failures[0].metadata)
+    assert meta["rivers/failure_reason"] == expected_reason
+
+
+def test_step_failure_reason_from_loky_subprocess(tmp_path, storage):
+    """Classification survives the loky IPC hop (exception is re-raised
+    from a pickled subprocess error)."""
+    import obstore.store
+
+    store = obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    handler = rs.PickleIOHandler(store=store)
+
+    @rs.Asset(io_handler=handler)
+    def times_out() -> int:
+        raise TimeoutError("too slow")
+
+    # Sibling keeps the loky path engaged (a lone sync step runs in-process).
+    @rs.Asset(io_handler=handler)
+    def steady() -> int:
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[times_out, steady],
+        default_executor=rs.Executor.parallel(max_workers=2),
+    )
+    repo.resolve(storage=storage)
+    result = repo.materialize(raise_on_error=False)
+
+    assert not result.success
+    failures = [
+        e
+        for e in storage.get_events_for_asset("times_out")
+        if e.event_type == "StepFailure"
+    ]
+    assert len(failures) == 1
+    assert dict(failures[0].metadata)["rivers/failure_reason"] == "timeout"
+
+
 def test_backoff_delay_is_applied(storage):
     import time
 

@@ -380,7 +380,12 @@ impl Executor {
                                     let step = &plan.steps[step_idx];
                                     for name in step.event_names() {
                                         ops::emit_step_failure(
-                                            &writer, run_id, name, &msg, now_ts(),
+                                            &writer,
+                                            run_id,
+                                            name,
+                                            &msg,
+                                            None,
+                                            now_ts(),
                                         );
                                         failures.push((
                                             name.clone(),
