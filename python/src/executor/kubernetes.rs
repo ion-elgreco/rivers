@@ -369,7 +369,11 @@ async fn poll_step_attempt(
                 );
             }
         }
-        if cancelled.load(Ordering::Relaxed) {
+        // Flag first (cheap, watcher-maintained); a direct storage read every
+        // 30th cycle (~60s) backstops the run's single watcher task.
+        if cancelled.load(Ordering::Relaxed)
+            || (cycle % 30 == 0 && storage.is_cancelled(run_id).await.unwrap_or(false))
+        {
             tracing::info!(
                 target: "rivers::k8s",
                 step = %poll_key,
