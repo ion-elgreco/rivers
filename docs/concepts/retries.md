@@ -126,7 +126,7 @@ On the in-process and parallel executors `escalate` is inert — a local Python 
 
 - **in_process** — attempts re-run inline; the backoff sleep releases the GIL.
 - **parallel** — a failed subprocess step is re-submitted to the worker pool. The exception raised in the worker is re-raised in the orchestrator, so exception-type `retry_on` lists match as usual.
-- **kubernetes** — attempts re-create the step Job; classification comes from the step's own failure event when it wrote one, or from pod status when it didn't. Exception-*type* allow-lists don't match across the pod boundary yet (reason-based matching and the presets work); a pod-side classifier is planned.
+- **kubernetes** — attempts re-create the step Job; classification comes from the step's own failure event when it wrote one, or from pod status when it didn't. The step pod stamps the failure reason and the exception's class hierarchy onto its `StepFailure` event, so exception-type allow-lists match across the pod boundary. A pod killed before it can write an event (e.g. OOM) is classified from pod status alone — only reason-based matching applies there.
 
 Concurrency slots (pools, the executor's step budget) stay held across a step's retry attempts and backoff sleeps — a retrying step is still "running" from the scheduler's point of view.
 

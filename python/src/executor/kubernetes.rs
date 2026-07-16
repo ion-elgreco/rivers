@@ -218,7 +218,12 @@ async fn create_or_adopt_k8s_job(
 
 enum StepPollOutcome {
     Success,
-    Failed { reason: FailureReason },
+    Failed {
+        reason: FailureReason,
+        /// MRO class names from the recorded StepFailure event; empty when
+        /// the pod died without writing one (e.g. OOM kill).
+        exc_types: Vec<String>,
+    },
     Cancelled,
 }
 
@@ -309,8 +314,8 @@ async fn poll_step_attempt(
                 if failures.len() > baseline_failures {
                     // The pod records a reason when it can; absent = ordinary
                     // user error.
-                    let reason = failures
-                        .last()
+                    let last = failures.last();
+                    let reason = last
                         .and_then(|ev| {
                             ev.metadata
                                 .iter()
@@ -318,7 +323,15 @@ async fn poll_step_attempt(
                                 .and_then(|(_, v)| FailureReason::parse(v))
                         })
                         .unwrap_or(FailureReason::Error);
-                    return StepPollOutcome::Failed { reason };
+                    let exc_types = last
+                        .and_then(|ev| {
+                            ev.metadata
+                                .iter()
+                                .find(|(k, _)| k == retry_meta::EXC_TYPE)
+                                .map(|(_, v)| retry_meta::decode_exc_types(v))
+                        })
+                        .unwrap_or_default();
+                    return StepPollOutcome::Failed { reason, exc_types };
                 }
             }
             Err(e) => {
@@ -357,7 +370,10 @@ async fn poll_step_attempt(
                             reason = reason.as_str(),
                             "step Job failed without a terminal event; classified from pod status"
                         );
-                        return StepPollOutcome::Failed { reason };
+                        return StepPollOutcome::Failed {
+                            reason,
+                            exc_types: vec![],
+                        };
                     }
                 }
             }
@@ -470,15 +486,15 @@ async fn run_step_with_retries(
             baseline_failures,
         )
         .await;
-        let reason = match outcome {
+        let (reason, exc_types) = match outcome {
             StepPollOutcome::Success => return (spec.instance_name, true),
             StepPollOutcome::Cancelled => return (spec.instance_name, false),
-            StepPollOutcome::Failed { reason } => reason,
+            StepPollOutcome::Failed { reason, exc_types } => (reason, exc_types),
         };
         let Some(policy) = &spec.policy else {
             return (spec.instance_name, false);
         };
-        if !should_retry(policy, reason, &[], attempt) {
+        if !should_retry(policy, reason, &exc_types, attempt) {
             return (spec.instance_name, false);
         }
         if let Some(esc) = &policy.escalate {
