@@ -121,21 +121,16 @@ impl Backoff {
 /// Which failures a policy is willing to retry. `Match` is the explicit
 /// allow-list: exception class names (matched against the raised exception's
 /// MRO, name-based so the policy is serializable) and/or failure reasons.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetryOn {
+    #[default]
     All,
     Transient,
     Match {
         exceptions: Vec<String>,
         reasons: Vec<FailureReason>,
     },
-}
-
-impl Default for RetryOn {
-    fn default() -> Self {
-        RetryOn::All
-    }
 }
 
 /// Grow a step's compute on retries triggered by resource exhaustion. Only
@@ -193,8 +188,6 @@ pub mod meta {
     /// JSON array of the raised exception's fully-qualified MRO class names,
     /// derived-first. Encode/decode via [`encode_exc_types`] / [`decode_exc_types`].
     pub const EXC_TYPE: &str = "rivers/exc_type";
-    /// `"true"`/`"false"` — did the policy admit another attempt.
-    pub const RETRIABLE: &str = "rivers/retriable";
     /// Delay in milliseconds before the next attempt (on a `StepRetry`).
     pub const NEXT_DELAY_MS: &str = "rivers/next_delay_ms";
     /// JSON-encoded next-attempt `Compute` when a `StepRetry` escalated resources.
@@ -210,6 +203,11 @@ pub mod meta {
         serde_json::from_str(value).unwrap_or_default()
     }
 
+    /// Value recorded under `key` in an event's metadata, if present.
+    pub fn value<'a>(meta: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        meta.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
     /// The [`NEXT_COMPUTE`] recorded on the highest-attempt `StepRetry`,
     /// parsed back — a restarted orchestrator resumes escalation from exactly
     /// what the ladder last requested instead of re-deriving it from the
@@ -219,14 +217,9 @@ pub mod meta {
     ) -> Option<crate::execution::compute::Compute> {
         step_retry_metas
             .filter_map(|meta| {
-                let attempt = meta
-                    .iter()
-                    .find(|(k, _)| k == ATTEMPT)
-                    .and_then(|(_, v)| v.parse::<u32>().ok())?;
-                let compute = meta
-                    .iter()
-                    .find(|(k, _)| k == NEXT_COMPUTE)
-                    .and_then(|(_, v)| serde_json::from_str(v).ok())?;
+                let attempt = value(meta, ATTEMPT).and_then(|v| v.parse::<u32>().ok())?;
+                let compute =
+                    value(meta, NEXT_COMPUTE).and_then(|v| serde_json::from_str(v).ok())?;
                 Some((attempt, compute))
             })
             .max_by_key(|(attempt, _)| *attempt)
@@ -242,14 +235,9 @@ pub mod meta {
     ) -> Vec<(u32, super::FailureReason)> {
         let mut ladder: Vec<(u32, super::FailureReason)> = step_retry_metas
             .filter_map(|meta| {
-                let attempt = meta
-                    .iter()
-                    .find(|(k, _)| k == ATTEMPT)
-                    .and_then(|(_, v)| v.parse::<u32>().ok())?;
-                let reason = meta
-                    .iter()
-                    .find(|(k, _)| k == REASON)
-                    .and_then(|(_, v)| super::FailureReason::parse(v))
+                let attempt = value(meta, ATTEMPT).and_then(|v| v.parse::<u32>().ok())?;
+                let reason = value(meta, REASON)
+                    .and_then(super::FailureReason::parse)
                     .unwrap_or(super::FailureReason::Error);
                 Some((attempt, reason))
             })
@@ -538,10 +526,7 @@ mod tests {
         let ladder = meta::recorded_ladder(metas.iter().map(|m| m.as_slice()));
         assert_eq!(
             ladder,
-            vec![
-                (1, FailureReason::Error),
-                (2, FailureReason::OutOfMemory),
-            ]
+            vec![(1, FailureReason::Error), (2, FailureReason::OutOfMemory),]
         );
     }
 
@@ -580,7 +565,10 @@ mod tests {
             "builtins.ConnectionResetError".to_string(),
             "builtins.ConnectionError".to_string(),
         ];
-        assert_eq!(meta::decode_exc_types(&meta::encode_exc_types(&names)), names);
+        assert_eq!(
+            meta::decode_exc_types(&meta::encode_exc_types(&names)),
+            names
+        );
         assert_eq!(meta::encode_exc_types(&[]), "[]");
         assert!(meta::decode_exc_types("").is_empty());
         assert!(meta::decode_exc_types("not json").is_empty());

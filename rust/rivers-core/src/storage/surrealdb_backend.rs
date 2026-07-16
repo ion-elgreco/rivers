@@ -2293,15 +2293,26 @@ impl StorageBackend for SurrealStorage {
     async fn get_run_progress(&self, run_id: &str) -> Result<RunProgress> {
         super::retry::with_retry(&self.retry_config, || async {
             // Distinct steps, not raw events — a retried step re-emits
-            // StepStart/StepFailure per attempt and must count once.
+            // StepStart/StepFailure per attempt and must count once. The dedup
+            // stays in-query so only scalars cross the DB hop (the operator
+            // polls this every reconcile pass).
             let mut result = self
                 .db
                 .query(
-                    "SELECT asset_key, event_type FROM events \
-                         WHERE run_id = $run_id \
-                         AND (event_type = 'StepStart' OR event_type = 'StepSuccess' \
-                              OR (event_type = 'StepFailure' AND partition_key IS NONE)) \
-                         GROUP BY asset_key, event_type; \
+                    "SELECT count() AS n FROM \
+                         (SELECT asset_key FROM events \
+                          WHERE run_id = $run_id AND event_type = 'StepStart' \
+                          AND asset_key IS NOT NONE \
+                          GROUP BY asset_key) \
+                         GROUP ALL; \
+                     SELECT count() AS n FROM \
+                         (SELECT asset_key FROM events \
+                          WHERE run_id = $run_id \
+                          AND (event_type = 'StepSuccess' \
+                               OR (event_type = 'StepFailure' AND partition_key IS NONE)) \
+                          AND asset_key IS NOT NONE \
+                          GROUP BY asset_key) \
+                         GROUP ALL; \
                      SELECT asset_key, timestamp FROM events \
                          WHERE run_id = $run_id \
                          AND (event_type = 'StepSuccess' OR (event_type = 'StepFailure' AND partition_key IS NONE)) \
@@ -2310,36 +2321,20 @@ impl StorageBackend for SurrealStorage {
                 .bind(("run_id", run_id.to_string()))
                 .await?;
 
-            #[derive(Debug, SurrealValue, serde::Deserialize)]
-            struct StepEventKind {
-                asset_key: Option<String>,
-                event_type: String,
-            }
-            let kinds: Vec<StepEventKind> = result.take(0)?;
-            let mut started: HashSet<&str> = HashSet::new();
-            let mut terminal: HashSet<&str> = HashSet::new();
-            for kind in &kinds {
-                let Some(key) = kind.asset_key.as_deref() else {
-                    continue;
-                };
-                if kind.event_type == "StepStart" {
-                    started.insert(key);
-                } else {
-                    terminal.insert(key);
-                }
-            }
+            let started: Option<u32> = result.take((0, "n"))?;
+            let terminal: Option<u32> = result.take((1, "n"))?;
 
             #[derive(Debug, SurrealValue, serde::Deserialize)]
             struct LastStep {
                 asset_key: Option<String>,
                 timestamp: i64,
             }
-            let last_steps: Vec<LastStep> = result.take(1)?;
+            let last_steps: Vec<LastStep> = result.take(2)?;
             let last = last_steps.into_iter().next();
 
             Ok(RunProgress {
-                completed_steps: terminal.len() as u32,
-                total_steps: started.len() as u32,
+                completed_steps: terminal.unwrap_or(0),
+                total_steps: started.unwrap_or(0),
                 last_step_completed_at: last.as_ref().map(|s| s.timestamp),
                 last_completed_step: last.and_then(|s| s.asset_key),
             })
@@ -6457,7 +6452,6 @@ mod tests {
                 metadata: vec![
                     (meta::ATTEMPT.to_string(), "1".to_string()),
                     (meta::REASON.to_string(), "out_of_memory".to_string()),
-                    (meta::RETRIABLE.to_string(), "true".to_string()),
                 ],
                 input_data_versions: vec![],
             },
@@ -11032,10 +11026,7 @@ mod tests {
                 .unwrap();
         }
 
-        let events = storage
-            .get_step_terminal_events(run_id, "a")
-            .await
-            .unwrap();
+        let events = storage.get_step_terminal_events(run_id, "a").await.unwrap();
         let types: Vec<_> = events.iter().map(|e| e.event_type.clone()).collect();
         assert_eq!(
             types,
