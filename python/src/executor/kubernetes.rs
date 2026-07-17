@@ -418,6 +418,9 @@ async fn poll_step_attempt(
 struct StepJobSpec {
     instance_name: String,
     step_name: String,
+    /// Every event/output name the step covers — multi-asset steps carry one
+    /// per output. The pod materializes all of them; retry events fan to each.
+    event_names: Vec<String>,
     mapping_key: Option<String>,
     policy: Option<RetryPolicy>,
     /// Per-asset compute; axes left unset fall back to the executor's
@@ -522,9 +525,12 @@ async fn run_step_with_retries(
                 key,
                 &overrides,
             ),
-            None => {
-                rivers_k8s::executor::build_step_job_with(&config, &spec.instance_name, &overrides)
-            }
+            None => rivers_k8s::executor::build_step_job_with(
+                &config,
+                &spec.instance_name,
+                &spec.event_names,
+                &overrides,
+            ),
         };
         let job_name = job.metadata.name.clone().unwrap_or_default();
         if let Err(e) = create_or_adopt_k8s_job(&client, &namespace, &job).await {
@@ -563,18 +569,20 @@ async fn run_step_with_retries(
             compute = rivers_k8s::compute::escalate_compute(&compute, esc, reason);
         }
         let delay = compute_delay(policy, attempt, rng01());
-        let _ = storage
-            .store_event(&super::ops::step_retry_record(
-                &code_location_id,
-                &run_id,
-                &spec.instance_name,
-                attempt,
-                reason,
-                delay,
-                Some(&compute),
-                rivers_core::util::now_ts(),
-            ))
-            .await;
+        for name in &spec.event_names {
+            let _ = storage
+                .store_event(&super::ops::step_retry_record(
+                    &code_location_id,
+                    &run_id,
+                    name,
+                    attempt,
+                    reason,
+                    delay,
+                    Some(&compute),
+                    rivers_core::util::now_ts(),
+                ))
+                .await;
+        }
         tracing::info!(
             target: "rivers::k8s",
             step = %spec.instance_name,
@@ -702,10 +710,11 @@ impl ExecutorBackend for KubernetesBackend {
                 let step = &ctx.scope.plan.steps[inst.idx];
                 StepJobSpec {
                     instance_name: inst.instance_name.clone(),
+                    step_name: step.name.clone(),
+                    event_names: inst.event_names.clone(),
+                    mapping_key: inst.mapping_key.clone(),
                     policy: ctx.retry_policy_for(step).cloned(),
                     compute: ctx.compute_for(step),
-                    step_name: step.name.clone(),
-                    mapping_key: inst.mapping_key.clone(),
                 }
             })
             .collect();

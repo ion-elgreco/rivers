@@ -81,7 +81,6 @@ fn mapped_step_job_name(run_id: &str, step_name: &str, mapping_key: &str) -> Str
 
 /// Per-attempt knobs for a step Job: retry attempts get a distinct Job name
 /// (a finished K8s Job can't be re-run) and possibly escalated resources.
-#[derive(Default)]
 pub struct StepJobOverrides<'a> {
     /// 1-indexed attempt; attempts > 1 append `-r<n>` to the Job name.
     pub attempt: u32,
@@ -90,20 +89,33 @@ pub struct StepJobOverrides<'a> {
     pub compute: Option<&'a rivers_core::execution::compute::Compute>,
 }
 
+impl Default for StepJobOverrides<'_> {
+    fn default() -> Self {
+        Self {
+            attempt: 1,
+            compute: None,
+        }
+    }
+}
+
 /// Job name is `rivers-step-<run_id>-<8-char-hash(step_name)>` to stay
 /// within K8s' 63-char resource-name limit. Owned by the parent Run pod via
 /// OwnerReference so kube garbage-collects on Run delete.
 pub fn build_step_job(config: &K8sStepExecutorConfig, step_name: &str) -> Job {
-    build_step_job_with(config, step_name, &StepJobOverrides::default())
+    let keys = [step_name.to_string()];
+    build_step_job_with(config, step_name, &keys, &StepJobOverrides::default())
 }
 
+/// `step_keys` become the pod's `--step-key` args — a multi-asset step passes
+/// every output so the pod materializes the whole unit, not one selection.
 pub fn build_step_job_with(
     config: &K8sStepExecutorConfig,
     step_name: &str,
+    step_keys: &[String],
     overrides: &StepJobOverrides,
 ) -> Job {
     let job_name = attempt_name(step_job_name(&config.run_id, step_name), overrides.attempt);
-    build_job_inner(config, &job_name, step_name, None, overrides)
+    build_job_inner(config, &job_name, step_name, step_keys, None, overrides)
 }
 
 /// One mapping shard of a fan-out step. Job name hashes
@@ -127,7 +139,15 @@ pub fn build_mapped_step_job_with(
         mapped_step_job_name(&config.run_id, step_name, mapping_key),
         overrides.attempt,
     );
-    build_job_inner(config, &job_name, step_name, Some(mapping_key), overrides)
+    let keys = [step_name.to_string()];
+    build_job_inner(
+        config,
+        &job_name,
+        step_name,
+        &keys,
+        Some(mapping_key),
+        overrides,
+    )
 }
 
 fn attempt_name(base: String, attempt: u32) -> String {
@@ -142,6 +162,7 @@ fn build_job_inner(
     config: &K8sStepExecutorConfig,
     job_name: &str,
     step_name: &str,
+    step_keys: &[String],
     mapping_key: Option<&str>,
     overrides: &StepJobOverrides,
 ) -> Job {
@@ -159,9 +180,10 @@ fn build_job_inner(
         config.module.clone(),
         "--run-id".to_string(),
         config.run_id.clone(),
-        "--step-key".to_string(),
-        step_name.to_string(),
     ];
+    for key in step_keys {
+        args.extend(["--step-key".to_string(), key.clone()]);
+    }
     if let Some(ref pk) = config.partition_key {
         args.extend(["--partition-key".to_string(), pk.clone()]);
     }
@@ -232,6 +254,11 @@ fn build_job_inner(
                                 EnvVar {
                                     name: "RIVERS_STEP_POD".to_string(),
                                     value: Some("1".to_string()),
+                                    ..Default::default()
+                                },
+                                EnvVar {
+                                    name: "RIVERS_STEP_ATTEMPT".to_string(),
+                                    value: Some(overrides.attempt.to_string()),
                                     ..Default::default()
                                 },
                                 EnvVar {
@@ -312,6 +339,7 @@ mod tests {
         let retry = build_step_job_with(
             &config,
             "big_join",
+            &["big_join".to_string()],
             &StepJobOverrides {
                 attempt: 3,
                 compute: Some(&compute),
@@ -320,6 +348,10 @@ mod tests {
         assert_eq!(
             retry.metadata.name.as_deref().unwrap(),
             format!("{base_name}-r3")
+        );
+        assert_eq!(
+            env_val(&get_env(&retry), "RIVERS_STEP_ATTEMPT"),
+            Some("3".to_string())
         );
 
         let container = &retry
@@ -342,6 +374,31 @@ mod tests {
     }
 
     #[test]
+    fn multi_output_step_passes_every_step_key() {
+        let keys = ["mr_x".to_string(), "mr_y".to_string()];
+        let job = build_step_job_with(&test_config(), "mr_x", &keys, &StepJobOverrides::default());
+        let args = job
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
+            .args
+            .as_ref()
+            .unwrap()
+            .clone();
+        let step_keys: Vec<_> = args
+            .windows(2)
+            .filter(|w| w[0] == "--step-key")
+            .map(|w| w[1].clone())
+            .collect();
+        assert_eq!(step_keys, ["mr_x", "mr_y"]);
+    }
+
+    #[test]
     fn gpu_axis_adds_extended_resource() {
         let compute = rivers_core::execution::compute::Compute {
             cpu: None,
@@ -351,6 +408,7 @@ mod tests {
         let job = build_step_job_with(
             &test_config(),
             "gpu_step",
+            &["gpu_step".to_string()],
             &StepJobOverrides {
                 attempt: 1,
                 compute: Some(&compute),
@@ -538,6 +596,7 @@ mod tests {
         let env = get_env(&job);
 
         assert_eq!(env_val(&env, "RIVERS_STEP_POD"), Some("1".to_string()));
+        assert_eq!(env_val(&env, "RIVERS_STEP_ATTEMPT"), Some("1".to_string()));
         assert_eq!(env_val(&env, "RIVERS_RUN_ID"), Some("abc-123".to_string()));
         assert_eq!(
             env_val(&env, "RIVERS_SURREAL_ENDPOINT"),
