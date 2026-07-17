@@ -4,7 +4,7 @@ import datetime
 import logging
 from typing import Any, Generic, TypeVar
 
-from rivers._core import IOHandler
+from rivers._core import IOHandler, RetryPolicy
 from rivers._core.assets import AssetDef
 from rivers._core.partitions import (
     PartitionContext,
@@ -51,6 +51,7 @@ class BashTask:
         tags: list[str] | None = None,
         partition_mapping: dict[str | AssetDef, PartitionMapping] | None = None,
         io_handler: IOHandler | str | None = None,
+        retry: "RetryPolicy | str | None" = None,
     ) -> None:
         """Construct a bash task.
 
@@ -62,6 +63,8 @@ class BashTask:
             tags: Run tags applied when this task executes.
             partition_mapping: Per-input partition mapping overrides.
             io_handler: Override the IO handler for this task's outputs.
+            retry: Retry policy for this task's step, or the name of a policy
+                registered in ``CodeRepository(retries={...})``.
         """
         ...
 
@@ -99,6 +102,7 @@ class Task:
         partitions_def: PartitionsDefinition | None = None,
         partition_mapping: dict[str | AssetDef, PartitionMapping] | None = None,
         io_handler: IOHandler | str | None = None,
+        retry: "RetryPolicy | str | None" = None,
     ) -> None:
         """Construct a task or build a decorator factory.
 
@@ -109,6 +113,8 @@ class Task:
             partitions_def: Partitions definition for this task's outputs.
             partition_mapping: Per-input partition mapping overrides.
             io_handler: Override the IO handler for this task's outputs.
+            retry: Retry policy for this task's step, or the name of a policy
+                registered in ``CodeRepository(retries={...})``.
         """
         ...
 

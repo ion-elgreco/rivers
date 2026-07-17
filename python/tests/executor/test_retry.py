@@ -752,137 +752,227 @@ def test_multi_asset_output_retry(storage):
     assert "StepSuccess" in types_a and "StepSuccess" in types_b
 
 
-def test_job_retry_warns_for_task_steps(storage):
-    """Retry policies fill asset nodes only — a job-level policy over task
-    steps warns at resolve instead of silently skipping them."""
+@pytest.mark.parametrize("executor_kind", ["in_process", "parallel"])
+def test_task_retry_succeeds(storage, tmp_path, executor_kind):
+    """A task with its own retry= policy retries like an asset step. The
+    marker file carries flakiness across loky subprocess attempts."""
+    import obstore.store
+
+    store = obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    handler = rs.PickleIOHandler(store=store)
+    marker = tmp_path / "task_attempted"
+
+    @rs.Task(
+        retry=rs.RetryPolicy(max_retries=2, retry_on=[ValueError]),
+        io_handler=handler,
+    )
+    def flaky_task() -> int:
+        if not marker.exists():
+            marker.write_text("x")
+            raise ValueError("transient")
+        return 7
+
+    # Sibling keeps the loky path engaged (a lone sync step runs in-process).
+    @rs.Asset(io_handler=handler)
+    def steady() -> int:
+        return 1
+
+    executor = (
+        rs.Executor.in_process()
+        if executor_kind == "in_process"
+        else rs.Executor.parallel(max_workers=2)
+    )
+    repo = rs.CodeRepository(
+        assets=[steady],
+        tasks=[flaky_task],
+        jobs=[rs.Job(name="tjob", assets=[steady, flaky_task], executor=executor)],
+    )
+    repo.resolve(storage=storage)
+    repo.get_job("tjob").execute()
+
+    types = [e.event_type for e in storage.get_events_for_asset("flaky_task")]
+    assert types.count("StepRetry") == 1
+    assert "StepSuccess" in types
+
+
+def test_async_task_retry(storage):
+    calls = {"n": 0}
+
+    @rs.Task(retry=rs.RetryPolicy(max_retries=2, retry_on=[ValueError]))
+    async def async_flaky() -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("transient")
+        return 3
+
+    repo = rs.CodeRepository(
+        assets=[],
+        tasks=[async_flaky],
+        jobs=[rs.Job(name="ajob", assets=[async_flaky])],
+        default_executor=rs.Executor.in_process(),
+    )
+    repo.resolve(storage=storage)
+    repo.get_job("ajob").execute()
+
+    assert calls["n"] == 2
+    types = [e.event_type for e in storage.get_events_for_asset("async_flaky")]
+    assert types.count("StepRetry") == 1
+    assert "StepSuccess" in types
+
+
+def test_bash_task_retry(storage, tmp_path):
+    marker = tmp_path / "bash_attempted"
+    flaky_bash = rs.BashTask(
+        name="flaky_bash",
+        command=f"test -f {marker} || {{ touch {marker}; exit 1; }}",
+        retry=rs.RetryPolicy(max_retries=2),
+    )
+
+    repo = rs.CodeRepository(
+        assets=[],
+        tasks=[flaky_bash],
+        jobs=[rs.Job(name="bjob", assets=[flaky_bash])],
+        default_executor=rs.Executor.in_process(),
+    )
+    repo.resolve(storage=storage)
+    repo.get_job("bjob").execute()
+
+    assert marker.exists()
+    types = [e.event_type for e in storage.get_events_for_asset("flaky_bash")]
+    assert types.count("StepRetry") == 1
+    assert "StepSuccess" in types
+
+
+def test_job_retry_fills_task_steps(storage):
+    """A job-level policy covers task steps that don't set their own."""
+    calls = {"n": 0}
 
     @rs.Task
     def plain_task() -> int:
-        return 1
-
-    @rs.Asset(io_handler=rs.InMemoryIOHandler())
-    def anchor() -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("transient")
         return 1
 
     repo = rs.CodeRepository(
-        assets=[anchor],
+        assets=[],
         tasks=[plain_task],
         jobs=[
             rs.Job(
                 name="mixed",
-                assets=[anchor, plain_task],
-                retry=rs.RetryPolicy(max_retries=1),
+                assets=[plain_task],
+                retry=rs.RetryPolicy(max_retries=2),
             )
         ],
+        default_executor=rs.Executor.in_process(),
     )
-    with pytest.warns(UserWarning, match="task steps"):
-        repo.resolve(storage=storage)
+    repo.resolve(storage=storage)
+    repo.get_job("mixed").execute()
+
+    assert calls["n"] == 2
+    types = [e.event_type for e in storage.get_events_for_asset("plain_task")]
+    assert types.count("StepRetry") == 1
+    assert "StepSuccess" in types
 
 
-def test_task_retry_diagnostic_survives_strict_warnings(storage, capfd):
-    """The task-step diagnostic must not break resolve() under -W error — the
-    promoted warning is dropped and the signal falls back to the rust log."""
-    import warnings
+def test_graph_asset_internal_task_retry(storage):
+    """A graph asset's internal task steps retry via the task's own policy."""
+    calls = {"n": 0}
+    io = rs.InMemoryIOHandler()
 
-    @rs.Task
-    def some_task() -> int:
-        return 1
+    @rs.Task(retry=rs.RetryPolicy(max_retries=2, retry_on=[ValueError]))
+    def flaky_inner() -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("transient")
+        return 5
 
-    @rs.Asset(io_handler=rs.InMemoryIOHandler())
-    def anchor2() -> int:
-        return 1
+    @rs.Asset.from_graph(io_handler=io, node_io_handler=io)
+    def wrapper():
+        return flaky_inner()
 
     repo = rs.CodeRepository(
-        assets=[anchor2],
-        tasks=[some_task],
-        jobs=[
-            rs.Job(
-                name="strict",
-                assets=[anchor2, some_task],
-                retry=rs.RetryPolicy(max_retries=1),
-            )
-        ],
+        assets=[wrapper],
+        tasks=[flaky_inner],
+        default_executor=rs.Executor.in_process(),
     )
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        repo.resolve(storage=storage)  # must not raise
-    # ...but the diagnostic must not vanish either: it lands in the log.
-    assert "task steps will not retry" in capfd.readouterr().err
+    repo.resolve(storage=storage)
+    assert repo.materialize().success
+
+    assert calls["n"] == 2
+    types = [
+        e.event_type for e in storage.get_events_for_asset("wrapper/flaky_inner")
+    ]
+    assert types.count("StepRetry") == 1
 
 
-def test_task_retry_warning_deduplicates_names(storage):
-    @rs.Task
-    def dup_task() -> int:
-        return 1
+def test_task_named_retry_policy(storage):
+    calls = {"n": 0}
 
-    @rs.Asset(io_handler=rs.InMemoryIOHandler())
-    def anchor3() -> int:
-        return 1
+    @rs.Task(retry="net")
+    def named_flaky() -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("transient")
+        return 3
 
     repo = rs.CodeRepository(
-        assets=[anchor3],
-        tasks=[dup_task],
-        jobs=[
-            rs.Job(
-                name="dupjob",
-                assets=[anchor3, dup_task, dup_task],
-                retry=rs.RetryPolicy(max_retries=1),
-            )
-        ],
+        assets=[],
+        tasks=[named_flaky],
+        jobs=[rs.Job(name="njob", assets=[named_flaky])],
+        retries={"net": rs.RetryPolicy(max_retries=2)},
+        default_executor=rs.Executor.in_process(),
     )
-    with pytest.warns(UserWarning, match="task steps") as record:
-        repo.resolve(storage=storage)
-    assert str(record[0].message).count("dup_task") == 1
+    repo.resolve(storage=storage)
+    repo.get_job("njob").execute()
+
+    assert calls["n"] == 2
 
 
-def test_task_retry_warning_names_only_job_steps(storage):
-    """The warning enumerates the job's executed task steps — not out-of-job
-    dependency nodes that allow_incomplete_deps pulls into the node subset."""
-
-    @rs.Task(io_handler=rs.InMemoryIOHandler())
-    def upstream_task() -> int:
-        return 1
+def test_graph_asset_retry_named_ref_resolves(storage):
+    """from_graph(retry='name') resolves against the registry at resolve();
+    an unknown name errors. (The policy drives the outer-pod ladder on the
+    K8s executor — covered by the K8s integration suite.)"""
+    io = rs.InMemoryIOHandler()
 
     @rs.Task
-    def in_job_task() -> int:
-        return 2
+    def inner() -> int:
+        return 1
 
-    @rs.Asset(io_handler=rs.InMemoryIOHandler())
-    def consumer(upstream_task: int) -> int:
-        return upstream_task
+    @rs.Asset.from_graph(io_handler=io, node_io_handler=io, retry="net")
+    def wrapped():
+        return inner()
 
     repo = rs.CodeRepository(
-        assets=[consumer],
-        tasks=[upstream_task, in_job_task],
-        jobs=[
-            rs.Job(
-                name="partial",
-                assets=[consumer, in_job_task],
-                retry=rs.RetryPolicy(max_retries=1),
-                allow_incomplete_deps=True,
-            )
-        ],
+        assets=[wrapped],
+        tasks=[inner],
+        retries={"net": rs.RetryPolicy(max_retries=2)},
     )
-    with pytest.warns(UserWarning, match="task steps") as record:
-        repo.resolve(storage=storage)
-    message = str(record[0].message)
-    assert "in_job_task" in message
-    assert "upstream_task" not in message  # dependency, not a step of this job
+    repo.resolve(storage=storage)
 
+    @rs.Asset.from_graph(io_handler=io, node_io_handler=io, retry="nope")
+    def broken():
+        return inner()
 
-def test_multi_asset_conflicting_policies_error_at_resolve(storage):
-    @rs.Asset.from_multi(
-        output_defs=[
-            rs.AssetDef("cx_a", retry=rs.RetryPolicy(max_retries=1)),
-            rs.AssetDef("cx_b", retry=rs.RetryPolicy(max_retries=5)),
-        ],
-    )
-    def conflicted():
-        return {"cx_a": 1, "cx_b": 2}
-
-    repo = rs.CodeRepository(assets=[conflicted])
+    repo2 = rs.CodeRepository(assets=[broken], tasks=[inner])
     with pytest.raises(
-        rs.exceptions.ConfigurationError, match="different retry policies"
+        rs.exceptions.ConfigurationError, match="unknown retry policy 'nope'"
+    ):
+        repo2.resolve(storage=storage)
+
+
+def test_task_unknown_named_retry_errors(storage):
+    @rs.Task(retry="nope")
+    def bad_task() -> int:
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[],
+        tasks=[bad_task],
+        jobs=[rs.Job(name="bad_job", assets=[bad_task])],
+    )
+    with pytest.raises(
+        rs.exceptions.ConfigurationError, match="unknown retry policy 'nope'"
     ):
         repo.resolve(storage=storage)
 

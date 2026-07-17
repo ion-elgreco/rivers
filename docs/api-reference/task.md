@@ -25,6 +25,7 @@ def another_task(data):
 | `partitions_def` | `PartitionsDefinition \| None` | `None` | Partition definition for partitioned tasks. |
 | `partition_mapping` | `dict[str, PartitionMapping] \| None` | `None` | Mapping from dependency name to partition mapping strategy. |
 | `io_handler` | `BaseIOHandler \| str \| None` | `None` | IO handler for persisting the task's output. |
+| `retry` | `RetryPolicy \| str \| None` | `None` | Retry policy for this task's step, or a `retries` registry name. See [Retries & Compute](retries.md). |
 
 **Properties:**
 
@@ -91,6 +92,7 @@ result = greet()  # "hello"
 | `tags` | `list[str] \| None` | `None` | Tags for categorization. |
 | `partition_mapping` | `dict[str, PartitionMapping] \| None` | `None` | Mapping from dependency name to partition mapping strategy. |
 | `io_handler` | `BaseIOHandler \| str \| None` | `None` | IO handler for persisting the task's output. |
+| `retry` | `RetryPolicy \| str \| None` | `None` | Retry policy for this task's step, or a `retries` registry name. See [Retries & Compute](retries.md). |
 
 **Properties:**
 

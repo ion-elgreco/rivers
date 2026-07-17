@@ -112,6 +112,8 @@ pub(crate) struct ResolvedTask {
     /// Metadata overrides for specific input deps (from parent graph asset's deps),
     /// keyed by upstream node name. Resolved through `param_remap` at access time.
     pub input_metadata_override: Option<HashMap<String, HashMap<String, String>>>,
+    /// Resolved retry policy (registry names collapsed to concrete at resolve()).
+    pub retry: Option<RetryPolicy>,
 }
 
 pub(crate) struct ResolvedBashTask {
@@ -124,6 +126,8 @@ pub(crate) struct ResolvedBashTask {
     pub partitions_def: Option<PartitionsDefinition>,
     /// Pre-merged partition_mapping: override OR bash task's own.
     pub partition_mapping: Option<HashMap<String, PartitionMapping>>,
+    /// Resolved retry policy (registry names collapsed to concrete at resolve()).
+    pub retry: Option<RetryPolicy>,
 }
 
 /// A node in the dependency graph — Asset, Task, or BashTask.
@@ -359,6 +363,8 @@ impl ResolvedTask {
             io_handler_override: None,
             input_io_handler_override,
             input_metadata_override,
+            // Set by resolve_resources_and_handlers once retry refs collapse.
+            retry: None,
         })
     }
 
@@ -379,6 +385,7 @@ impl ResolvedTask {
                     .collect()
             }),
             input_metadata_override: self.input_metadata_override.clone(),
+            retry: self.retry.clone(),
         }
     }
 }
@@ -407,6 +414,8 @@ impl ResolvedBashTask {
             tags,
             partitions_def,
             partition_mapping,
+            // Set by resolve_resources_and_handlers once retry refs collapse.
+            retry: None,
         }
     }
 
@@ -417,6 +426,7 @@ impl ResolvedBashTask {
             tags: self.tags.clone(),
             partitions_def: self.partitions_def.clone(),
             partition_mapping: self.partition_mapping.clone(),
+            retry: self.retry.clone(),
         }
     }
 }
@@ -728,7 +738,8 @@ impl ResolvedNode {
     pub fn retry(&self) -> Option<&RetryPolicy> {
         match self {
             ResolvedNode::Asset(node) => node.retry.as_ref(),
-            _ => None,
+            ResolvedNode::Task(node) => node.retry.as_ref(),
+            ResolvedNode::BashTask(node) => node.retry.as_ref(),
         }
     }
 
