@@ -61,4 +61,5 @@ def sometimes_bigger(ctx): ...    # 8Gi → 16Gi → 32Gi → 64Gi
     )
     def load_tables(): ...
     ```
+
 - Node placement (selectors, tolerations, affinity) and accelerator types are not part of `Compute`; it is resource quantities only.

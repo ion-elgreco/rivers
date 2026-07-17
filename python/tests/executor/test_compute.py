@@ -48,5 +48,3 @@ def test_compute_axes_and_repr():
     assert c.memory == "32Gi"
     assert c.gpu == "1"
     assert "memory='32Gi'" in repr(c)
-
-

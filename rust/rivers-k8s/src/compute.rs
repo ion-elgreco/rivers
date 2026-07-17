@@ -95,7 +95,7 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_input_returns_none() {
+    fn unparsable_input_returns_none() {
         assert_eq!(scale_quantity("weird", 2.0, None), None);
     }
 

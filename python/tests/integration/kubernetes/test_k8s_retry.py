@@ -121,7 +121,10 @@ class TestK8sRetry:
             retries = [e for e in events if e["event_type"] == "StepRetry"]
             assert len(failures) == 3, f"expected 3 attempts, events: {events}"
             assert len(retries) == 2
-            assert sorted(_metadata_dict(r)["rivers/attempt"] for r in retries) == ["1", "2"]
+            assert sorted(_metadata_dict(r)["rivers/attempt"] for r in retries) == [
+                "1",
+                "2",
+            ]
             assert not any(e["event_type"] == "StepSuccess" for e in events)
 
             # Attempts 2 and 3 ran as distinct -rN step Jobs.
