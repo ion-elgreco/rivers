@@ -35,6 +35,9 @@ pub struct MultiAsset {
     /// Compute for the step — one multi-asset is one step (one pod), so this
     /// lives on the multi-asset, not per output.
     pub compute: Option<rivers_core::execution::compute::Compute>,
+    /// Retry policy for the step — a multi-asset retries as one unit, so this
+    /// lives on the multi-asset, not per output.
+    pub retry: Option<rivers_core::execution::retry::RetryRef>,
 }
 
 /// Python-exposed marker subclass created via `Asset.from_multi(...)`.
@@ -63,7 +66,6 @@ impl PyMultiAsset {
                     partitions_def: a.partitions_def.as_ref().map(|p| p.clone_ref(py)),
                     partition_mapping: a.partition_mapping.clone(),
                     pool: a.pool.clone(),
-                    retry: a.retry.clone(),
                     // from_multi consumed and merged the original DepDef list;
                     // the reconstructed view does not preserve it.
                     deps: Vec::new(),

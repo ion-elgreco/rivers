@@ -147,18 +147,20 @@ The attempt count for a step is the number of its `StepRetry` events plus one; t
 
 ## Multi-assets
 
-A multi-asset is one function call producing several outputs, so it can only retry **as a unit**. `AssetDef(retry=...)` attaches the policy per output, and every output that sets one must set the *same* one (checked at `resolve()`):
+A multi-asset is one function call producing several outputs, so it can only retry **as a unit**. The policy is declared on `Asset.from_multi(retry=...)` itself — like `compute`, it belongs to the step, not to an output:
 
 ```python
-@rs.Asset.from_multi(output_defs=[
-    rs.AssetDef("orders", retry=rs.RetryPolicy(max_retries=3, retry_on=[ConnectionError])),
-    rs.AssetDef("customers"),   # covered by the same step retry
-])
+@rs.Asset.from_multi(
+    output_defs=[rs.AssetDef("orders"), rs.AssetDef("customers")],
+    retry=rs.RetryPolicy(max_retries=3, retry_on=[ConnectionError]),
+)
 def load_tables():
     return {"orders": ..., "customers": ...}
 ```
 
 Dict-returning multi-assets retry normally. **Generator multi-assets do not retry**: their body runs during output iteration, after earlier yields may already have materialized — re-running the whole generator would double-write those outputs.
+
+Graph assets take `Asset.from_graph(retry=...)` for the step carrying the graph asset's name. A graph's internal tasks are independent steps — give them their own `@rs.Task(retry=...)` policies; on the Kubernetes executor each internal task pod then retries on its own ladder.
 
 ## Limitations
 

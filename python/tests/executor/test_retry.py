@@ -724,14 +724,15 @@ def test_materialize_retry_kwarg(storage):
 
 
 def test_multi_asset_output_retry(storage):
-    """A dict-returning multi-asset retries as one unit via AssetDef(retry=)."""
+    """A dict-returning multi-asset retries as one unit via from_multi(retry=)."""
     calls = {"n": 0}
 
     @rs.Asset.from_multi(
         output_defs=[
-            rs.AssetDef("mr_a", retry=rs.RetryPolicy(max_retries=2, retry_on=[ValueError])),
+            rs.AssetDef("mr_a"),
             rs.AssetDef("mr_b"),
         ],
+        retry=rs.RetryPolicy(max_retries=2, retry_on=[ValueError]),
     )
     def multi_flaky():
         calls["n"] += 1

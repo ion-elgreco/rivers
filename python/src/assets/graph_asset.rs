@@ -39,6 +39,9 @@ pub struct GraphAsset {
     pub hooks: Option<Vec<Py<PyHook>>>,
     pub automation_condition: Option<PyAutomationCondition>,
     pub backfill_strategy: Option<PyBackfillStrategy>,
+    /// Retry policy for the graph asset's own step; internal tasks are
+    /// independent steps carrying their own policies.
+    pub retry: Option<rivers_core::execution::retry::RetryRef>,
     pub invocations: Vec<InvokedNode>,
     /// Namespaced task names in composition order (the order they were called in the graph body).
     pub invocation_order: Vec<String>,

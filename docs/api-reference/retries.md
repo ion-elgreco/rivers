@@ -21,7 +21,7 @@ rs.RetryPolicy(
 | `retry_on` | `RetryOn \| Sequence[type[BaseException] \| FailureReason] \| None` | `RetryOn.ALL` | A preset, or an allow-list mixing exception types (subclass-aware) and `FailureReason` members. |
 | `escalate` | `ComputeEscalation \| None` | `None` | Grow compute on resource-exhaustion retries. |
 
-Attach it per asset (`@rs.Asset(retry=...)`, `AssetDef(retry=...)`), per job (`Job(retry=...)`), per run (`materialize(retry=...)`), or repo-wide (`CodeRepository(default_retry_policy=...)`). Precedence is nearest-wins: asset > job > run/repo default. Every `retry=` site also accepts the name of a policy registered in `CodeRepository(retries={...})`.
+Attach it per asset (`@rs.Asset(retry=...)`, `Asset.from_multi(retry=...)`), per job (`Job(retry=...)`), per run (`materialize(retry=...)`), or repo-wide (`CodeRepository(default_retry_policy=...)`). Precedence is nearest-wins: asset > job > run/repo default. Every `retry=` site also accepts the name of a policy registered in `CodeRepository(retries={...})`.
 
 ---
 
