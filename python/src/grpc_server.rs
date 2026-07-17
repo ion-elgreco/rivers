@@ -167,6 +167,13 @@ impl CodeLocationService for CodeLocationImpl {
         request: Request<ExecuteJobRequest>,
     ) -> Result<Response<ExecuteJobResponse>, Status> {
         let req = request.into_inner();
+        let jobs = self.handle.job_names();
+        if !jobs.contains(&req.job_name) {
+            return Err(Status::not_found(format!(
+                "unknown job '{}'; registered jobs: {jobs:?}",
+                req.job_name
+            )));
+        }
         let run_request = crate::daemon::RunRequestData {
             run_key: None,
             tags: None,
