@@ -23,9 +23,8 @@
 //!
 //! `OutputItem`'s variants are constructible only from inside this module
 //! (private fields). Consumers can `match` and read but cannot fabricate a
-//! partially-merged `OutputItem`. Anyone re-introducing a `merge_metadata`
-//! call in a consumer would be skipping the contract — easy to spot in
-//! review.
+//! partially-merged `OutputItem`; a `merge_metadata` call outside this
+//! module is skipping the contract.
 
 use std::collections::HashSet;
 
