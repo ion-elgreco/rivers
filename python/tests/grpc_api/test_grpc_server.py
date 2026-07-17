@@ -192,11 +192,13 @@ def test_execute_job(full_grpc_channel):
 
 
 def test_execute_job_nonexistent(full_grpc_channel):
+    """An unknown job is rejected at the boundary — nothing is dispatched."""
     channel, pb2, pb2_grpc, _ = full_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)
     with pytest.raises(grpc.RpcError) as exc_info:
         stub.ExecuteJob(pb2.ExecuteJobRequest(job_name="no_such_job"))
-    assert exc_info.value.code() == grpc.StatusCode.INTERNAL
+    assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
+    assert "no_such_job" in exc_info.value.details()
 
 
 def test_get_schedules_with_schedule(full_grpc_channel):
@@ -348,6 +350,23 @@ def test_execute_job_with_run_queue_creates_queued_run(queued_grpc_channel):
     # Regression: queued runs from ExecuteJob must carry the requested job_name,
     # not the default. The jobs-list page's "last run" column joins on it.
     assert matching[0].job_name == "test_job"
+
+
+def test_execute_job_nonexistent_queued_creates_no_run(queued_grpc_channel):
+    """Regression: the queued path used to dispatch an unknown job as a
+    materialize-everything run; it must be rejected with no record written."""
+    channel, pb2, pb2_grpc, _, storage = queued_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    before = len(storage.get_runs(limit=100))
+    with pytest.raises(grpc.RpcError) as exc_info:
+        stub.ExecuteJob(pb2.ExecuteJobRequest(job_name="no_such_job"))
+    assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
+
+    import time
+
+    time.sleep(0.5)  # would-be async record creation window
+    assert len(storage.get_runs(limit=100)) == before
 
 
 def test_multiple_submits_all_queued(queued_grpc_channel):
