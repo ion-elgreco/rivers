@@ -349,6 +349,24 @@ k8s_graph_retry_job = Job(
 )
 
 
+# The asset carries NO policy of its own — only the job-level default can
+# drive the ladder, which proves job identity survives the Run CR hop.
+
+
+@Asset(io_handler=s3_io)
+def job_default_flaky():
+    if _k8s_attempt() == 1:
+        raise RuntimeError("flaky asset — retried by the job-level policy")
+    return Output(value={"ok": True})
+
+
+k8s_job_retry_job = Job(
+    name="k8s_job_retry_job",
+    assets=[job_default_flaky],
+    retry=RetryPolicy(max_retries=2),
+)
+
+
 # --- Per-asset compute (step pod sized by the asset, not the executor) ---
 
 
@@ -370,7 +388,7 @@ all_assets = [
     graph_pipeline,
     retry_always_fails, oom_hungry, oom_no_retry,
     exc_match_listed, exc_match_unlisted,
-    multi_retry, graph_retry_pipeline,
+    multi_retry, graph_retry_pipeline, job_default_flaky,
     sized_step,
 ]
 
@@ -385,6 +403,7 @@ repo = CodeRepository(
         k8s_retry_exhausted_job, k8s_oom_escalation_job, k8s_oom_no_retry_job,
         k8s_exc_listed_job, k8s_exc_unlisted_job,
         k8s_multi_retry_job, k8s_task_retry_job, k8s_bash_retry_job, k8s_graph_retry_job,
+        k8s_job_retry_job,
         k8s_compute_job,
     ],
     default_executor=Executor.kubernetes(

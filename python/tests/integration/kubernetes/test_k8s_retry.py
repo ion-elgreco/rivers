@@ -296,6 +296,22 @@ class TestK8sRetry:
         names = _step_worker_job_names("graph_retry_pipeline-graph_flaky_inner")
         assert any(n.endswith("-r2") for n in names), names
 
+    def test_job_level_retry_reaches_k8s_runs(self, grpc_stubs):
+        """Job(retry=) survives the Run CR hop: the run pod executes the job
+        itself (--job), so the job-level policy fills the asset's ladder even
+        though the asset declares no policy of its own."""
+        run_id = self._run_to_phase(grpc_stubs, "k8s_job_retry_job", "Succeeded")
+
+        events = _wait_for_events(
+            run_id,
+            lambda evs: any(e["event_type"] == "StepSuccess" for e in evs),
+        )
+        retries = [e for e in events if e["event_type"] == "StepRetry"]
+        assert len(retries) == 1, f"events: {events}"
+
+        names = _step_worker_job_names("job_default_flaky")
+        assert any(n.endswith("-r2") for n in names), names
+
     def test_oom_without_policy_fails_fast(self, grpc_stubs):
         """Poll-hang regression: with no retry policy an OOM-killed pod leaves
         no event, and the run must still fail promptly via the Job-status
