@@ -79,6 +79,7 @@ asset = Asset.from_multi(
 | `partitions_def` | `PartitionsDefinition \| None` | Top-level partition definition applied to all outputs. Takes precedence over per-output `AssetDef.partitions_def`. |
 | `deps` | `list[DepDef]` | Input and lineage-only dependencies. Created via `AssetDef.input()` and `AssetDef.dep()`. |
 | `compute` | `Compute \| None` | Compute for the whole step — a multi-asset runs as one step (one pod), so this is declared here, not per output. |
+| `retry` | `RetryPolicy \| str \| None` | Retry policy for the whole step — a multi-asset retries as one unit, so this is declared here, not per output. See [Retries & Compute](retries.md). |
 
 #### Top-level `partitions_def`
 
@@ -136,6 +137,7 @@ def my_pipeline():
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `node_io_handler` | `BaseIOHandler \| str \| None` | `None` | IO handler for internal tasks. Falls back to `io_handler`, then default. |
+| `retry` | `RetryPolicy \| str \| None` | `None` | Retry policy for the graph asset's own step. Internal tasks are independent steps — they carry their own `Task(retry=)` policies. See [Retries & Compute](retries.md). |
 
 `deps` is inherited from `Asset` — partition mappings, IO handler overrides, and metadata overrides are propagated to internal tasks.
 

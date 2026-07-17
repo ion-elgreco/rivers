@@ -425,10 +425,6 @@ pub struct AssetDef {
     /// Pool membership: normalized (pool_key, slots_consumed) pairs.
     #[pyo3(get)]
     pub pool: Vec<(String, u32)>,
-    /// Retry policy for this output. A multi-asset retries as one unit, so
-    /// every output that sets a policy must set the same one (validated at
-    /// resolve).
-    pub retry: Option<rivers_core::execution::retry::RetryRef>,
     /// Per-output dependencies. Combined with the multi-asset's top-level
     /// `deps=` at build time: input deps merge into the function's input set
     /// (de-duplicated by name), lineage-only deps become edges to this output.
@@ -470,7 +466,6 @@ impl AssetDef {
         partition_mapping = None,
         pool = None,
         pool_slots = None,
-        retry = None,
         deps = vec![],
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -487,11 +482,9 @@ impl AssetDef {
         partition_mapping: Option<PartitionMappingDict>,
         pool: Option<&Bound<'py, PyAny>>,
         pool_slots: Option<&Bound<'py, PyAny>>,
-        retry: Option<Bound<'py, PyAny>>,
         deps: Vec<Py<DepDef>>,
     ) -> PyResult<Self> {
         let pool = normalize_pool(pool, pool_slots)?;
-        let retry = crate::retry::extract_retry_ref(retry)?;
         Ok(Self {
             name,
             tags,
@@ -503,7 +496,6 @@ impl AssetDef {
             partitions_def,
             partition_mapping,
             pool,
-            retry,
             deps,
         })
     }
@@ -731,22 +723,19 @@ impl Asset {
         }
     }
 
-    /// The retry policy governing the step that materializes `output` (for
-    /// multi-assets, the per-output `AssetDef` policy — uniform across outputs
-    /// by validation, since a multi-asset retries as one unit).
+    /// The retry policy governing the step that materializes `output`. A
+    /// multi-asset retries as one unit, so the policy is declared on the
+    /// multi-asset itself and shared by every output. A graph asset's policy
+    /// rides on the node carrying the graph's name.
     pub fn retry_for_output(
         &self,
-        output: Option<&str>,
+        _output: Option<&str>,
     ) -> Option<&rivers_core::execution::retry::RetryRef> {
         match self {
             Asset::Single(a) => a.retry.as_ref(),
-            Asset::Multi(m) => output.and_then(|out| {
-                m.assets
-                    .iter()
-                    .find(|a| a.name.as_deref() == Some(out))
-                    .and_then(|a| a.retry.as_ref())
-            }),
-            _ => None,
+            Asset::Multi(m) => m.retry.as_ref(),
+            Asset::Graph(g) => g.retry.as_ref(),
+            Asset::External(_) => None,
         }
     }
 
@@ -773,9 +762,8 @@ impl Asset {
     /// Resolve all ResourceRef io_handlers to Instance variants using the resources dict.
     /// `io_handler_keys` contains resource keys that are validated IOHandler instances.
     /// Resolve `retry="name"` references against the repository `retries`
-    /// registry, replacing `Named` with the concrete `Inline` policy. Errors on
-    /// an unknown name, and on multi-asset outputs declaring *different*
-    /// policies — one function call is one retry unit.
+    /// registry, replacing `Named` with the concrete `Inline` policy. Errors
+    /// on an unknown name.
     pub fn resolve_retry_refs(
         &mut self,
         retries: &HashMap<String, rivers_core::execution::retry::RetryPolicy>,
@@ -806,30 +794,14 @@ impl Asset {
                 resolve_one(&mut a.retry, retries, &owner)?;
             }
             Asset::Multi(m) => {
-                for a in &mut m.assets {
-                    let owner = a.name.clone().unwrap_or_default();
-                    resolve_one(&mut a.retry, retries, &owner)?;
-                }
-                let mut first: Option<(&str, &RetryPolicy)> = None;
-                for a in &m.assets {
-                    let Some(policy) = a.retry.as_ref().and_then(|r| r.as_inline()) else {
-                        continue;
-                    };
-                    match first {
-                        None => first = Some((a.name.as_deref().unwrap_or(""), policy)),
-                        Some((first_name, first_policy)) if first_policy != policy => {
-                            return Err(crate::errors::ConfigurationError::new_err(format!(
-                                "multi-asset outputs '{first_name}' and '{}' declare different \
-                                 retry policies; a multi-asset retries as one unit, so every \
-                                 output that sets a policy must set the same one",
-                                a.name.as_deref().unwrap_or("")
-                            )));
-                        }
-                        _ => {}
-                    }
-                }
+                let owner = m.name.clone().unwrap_or_default();
+                resolve_one(&mut m.retry, retries, &owner)?;
             }
-            _ => {}
+            Asset::Graph(g) => {
+                let owner = g.name.clone().unwrap_or_default();
+                resolve_one(&mut g.retry, retries, &owner)?;
+            }
+            Asset::External(_) => {}
         }
         Ok(())
     }
@@ -1116,8 +1088,8 @@ impl PyAsset {
     ///
     /// Each `AssetDef` describes one output. Top-level arguments (tags, kinds,
     /// group, code_version, io_handler) are used as defaults when the individual
-    /// `AssetDef` does not specify them. `compute` is declared here, not per
-    /// output — the multi-asset runs as one step (one pod).
+    /// `AssetDef` does not specify them. `compute` and `retry` are declared
+    /// here, not per output — the multi-asset runs (and retries) as one step.
     ///
     /// Dependencies can be declared at the top level via `deps=` (applied to
     /// every output) or per-output via `AssetDef(deps=[...])`. Input deps from
@@ -1139,6 +1111,7 @@ impl PyAsset {
         hooks = None,
         automation_condition = None,
         compute = None,
+        retry = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn from_multi(
@@ -1156,6 +1129,7 @@ impl PyAsset {
         hooks: Option<Vec<Py<PyHook>>>,
         automation_condition: Option<PyAutomationCondition>,
         compute: Option<crate::compute::PyCompute>,
+        retry: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let py = cls.py();
         let handler = io_handler;
@@ -1215,7 +1189,7 @@ impl PyAsset {
                 hooks: None,
                 automation_condition: None,
                 pool: borrow_asset_def.pool.clone(),
-                retry: borrow_asset_def.retry.clone(),
+                retry: None,
                 compute: None,
             });
         }
@@ -1285,6 +1259,7 @@ impl PyAsset {
             automation_condition,
             backfill_strategy: None,
             compute: compute.map(|c| c.inner),
+            retry: crate::retry::extract_retry_ref(retry)?,
         });
         let base = PyAsset { inner: py_asset };
         let py_obj = Py::new(py, (PyMultiAsset {}, base))?;
@@ -1311,6 +1286,7 @@ impl PyAsset {
         deps = vec![],
         hooks = None,
         automation_condition = None,
+        retry = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn from_graph(
@@ -1328,6 +1304,7 @@ impl PyAsset {
         deps: Vec<Py<DepDef>>,
         hooks: Option<Vec<Py<PyHook>>>,
         automation_condition: Option<PyAutomationCondition>,
+        retry: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let py = cls.py();
         let handler = io_handler;
@@ -1355,6 +1332,7 @@ impl PyAsset {
             hooks,
             automation_condition,
             backfill_strategy: None,
+            retry: crate::retry::extract_retry_ref(retry)?,
             invocations: Vec::new(),
             invocation_order: Vec::new(),
             final_node: None,

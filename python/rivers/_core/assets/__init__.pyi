@@ -96,6 +96,7 @@ class Asset:
         hooks: list[Hook] | None = None,
         automation_condition: AutomationCondition | None = None,
         compute: Compute | None = None,
+        retry: "RetryPolicy | str | None" = None,
     ) -> "MultiAsset": ...
     @classmethod
     @overload
@@ -114,6 +115,7 @@ class Asset:
         hooks: list[Hook] | None = None,
         automation_condition: AutomationCondition | None = None,
         compute: Compute | None = None,
+        retry: "RetryPolicy | str | None" = None,
     ) -> Callable[[Callable[..., Any]], "MultiAsset"]: ...
 
     # from_graph: used as decorator (no wraps) or direct call (with wraps)
@@ -134,6 +136,7 @@ class Asset:
         deps: list["DepDef"] | None = None,
         hooks: list[Hook] | None = None,
         automation_condition: AutomationCondition | None = None,
+        retry: "RetryPolicy | str | None" = None,
     ) -> "GraphAsset": ...
     @classmethod
     @overload
@@ -152,6 +155,7 @@ class Asset:
         deps: list["DepDef"] | None = None,
         hooks: list[Hook] | None = None,
         automation_condition: AutomationCondition | None = None,
+        retry: "RetryPolicy | str | None" = None,
     ) -> Callable[[Callable[..., Any]], "GraphAsset"]: ...
 
     # external: used as decorator (no wraps) or direct call (with wraps)
@@ -339,14 +343,12 @@ class AssetDef:
         partition_mapping: dict[str | AssetDef, PartitionMapping] | None = ...,
         pool: str | list[str] | None = ...,
         pool_slots: int | dict[str, int] | None = ...,
-        retry: "RetryPolicy | str | None" = ...,
         deps: list["DepDef"] = ...,
     ) -> None:
         """Build an asset definition shared between multi-asset outputs and deps.
 
-        A multi-asset retries as one unit: every output that sets ``retry``
-        must set the same policy. Step compute is declared on
-        :meth:`Asset.from_multi` itself (one step is one pod), not per output.
+        Step ``compute`` and ``retry`` are declared on :meth:`Asset.from_multi`
+        itself (a multi-asset runs and retries as one step), not per output.
         """
         ...
 
