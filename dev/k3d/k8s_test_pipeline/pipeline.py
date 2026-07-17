@@ -22,6 +22,8 @@ import time
 import obstore.store
 from rivers import (
     Asset,
+    AssetDef,
+    BashTask,
     CodeRepository,
     Compute,
     ComputeEscalation,
@@ -264,6 +266,89 @@ k8s_exc_unlisted_job = Job(
 )
 
 
+# --- Retrying multi-asset / task / bash task / graph asset ---
+#
+# Every attempt runs as a fresh pod, so flakiness is keyed off the attempt
+# number the executor stamps on each step pod.
+
+
+def _k8s_attempt() -> int:
+    return int(os.environ.get("RIVERS_STEP_ATTEMPT", "1"))
+
+
+@Asset.from_multi(
+    output_defs=[
+        AssetDef("mr_x", io_handler=s3_io),
+        AssetDef("mr_y", io_handler=s3_io),
+    ],
+    retry=RetryPolicy(max_retries=2),
+)
+def multi_retry():
+    if _k8s_attempt() == 1:
+        raise RuntimeError("flaky multi-asset — succeeds on the retry")
+    return {"mr_x": 1, "mr_y": 2}
+
+
+k8s_multi_retry_job = Job(
+    name="k8s_multi_retry_job",
+    assets=[multi_retry],
+)
+
+
+@Task(io_handler=s3_io, retry=RetryPolicy(max_retries=2))
+def task_retry():
+    if _k8s_attempt() == 1:
+        raise RuntimeError("flaky task — succeeds on the retry")
+    return {"ok": True}
+
+
+k8s_task_retry_job = Job(
+    name="k8s_task_retry_job",
+    assets=[task_retry],
+)
+
+
+bash_retry = BashTask(
+    name="bash_retry",
+    command='test "${RIVERS_STEP_ATTEMPT:-1}" -gt 1',
+    io_handler=s3_io,
+    retry=RetryPolicy(max_retries=2),
+)
+
+k8s_bash_retry_job = Job(
+    name="k8s_bash_retry_job",
+    assets=[bash_retry],
+)
+
+
+# Without `rivers/node/executor` the graph's internal tasks each run as their
+# own step pod — the flaky one carries its own task-level policy, so its pod
+# ladder retries while the rest of the graph is untouched. from_graph(retry=)
+# covers the graph asset's own step.
+
+
+@Task(io_handler=s3_io, retry=RetryPolicy(max_retries=2))
+def graph_flaky_inner() -> dict:
+    if _k8s_attempt() == 1:
+        raise RuntimeError("flaky graph-internal task — its step pod retries")
+    return {"ok": True}
+
+
+@Asset.from_graph(
+    name="graph_retry_pipeline",
+    io_handler=s3_io,
+    retry=RetryPolicy(max_retries=1),
+)
+def graph_retry_pipeline():
+    return graph_flaky_inner()
+
+
+k8s_graph_retry_job = Job(
+    name="k8s_graph_retry_job",
+    assets=[graph_retry_pipeline],
+)
+
+
 # --- Per-asset compute (step pod sized by the asset, not the executor) ---
 
 
@@ -285,10 +370,11 @@ all_assets = [
     graph_pipeline,
     retry_always_fails, oom_hungry, oom_no_retry,
     exc_match_listed, exc_match_unlisted,
+    multi_retry, graph_retry_pipeline,
     sized_step,
 ]
 
-all_tasks = [graph_inner_load, graph_inner_transform]
+all_tasks = [graph_inner_load, graph_inner_transform, task_retry, bash_retry, graph_flaky_inner]
 
 repo = CodeRepository(
     assets=all_assets,
@@ -298,6 +384,7 @@ repo = CodeRepository(
         k8s_graph_job,
         k8s_retry_exhausted_job, k8s_oom_escalation_job, k8s_oom_no_retry_job,
         k8s_exc_listed_job, k8s_exc_unlisted_job,
+        k8s_multi_retry_job, k8s_task_retry_job, k8s_bash_retry_job, k8s_graph_retry_job,
         k8s_compute_job,
     ],
     default_executor=Executor.kubernetes(

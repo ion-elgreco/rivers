@@ -77,6 +77,23 @@ class TestK8sRetry:
     def teardown_method(self):
         _delete_runs_and_workers()
 
+    def _run_to_phase(self, grpc_stubs, job_name: str, want: str) -> str:
+        """ExecuteJob → wait for the Run CR to settle on `want`; returns run_id."""
+        with GrpcChannel(grpc_stubs) as ch:
+            resp = ch.stub.ExecuteJob(ch.pb2.ExecuteJobRequest(job_name=job_name))
+            assert resp.run_id
+
+            run_name = _wait_for_run_cr(timeout=30)
+            assert run_name, "No Run CR appeared after ExecuteJob call"
+
+            phase = _wait_for_phase(run_name, TERMINAL_PHASES, timeout=300)
+            if phase != want:
+                pytest.fail(
+                    f"Run '{run_name}' ended with phase '{phase}' (expected {want})\n"
+                    f"{_dump_debug_info(run_name)}"
+                )
+            return resp.run_id
+
     def test_retry_budget_exhausted_emits_attempt_ladder(self, grpc_stubs):
         """An always-failing step is attempted 1 + max_retries times, each
         attempt as its own step Job, before the run fails."""
@@ -202,6 +219,82 @@ class TestK8sRetry:
             failures = [e for e in events if e["event_type"] == "StepFailure"]
             assert len(failures) == 1, f"expected a single attempt, events: {events}"
             assert not any(e["event_type"] == "StepRetry" for e in events)
+
+    def test_multi_asset_retries_as_one_unit(self, grpc_stubs):
+        """A flaky multi-asset retries as one step pod: the StepRetry ladder
+        covers every output and the second attempt runs as a -r2 Job."""
+        run_id = self._run_to_phase(grpc_stubs, "k8s_multi_retry_job", "Succeeded")
+
+        events = _wait_for_events(
+            run_id,
+            lambda evs: sum(e["event_type"] == "StepSuccess" for e in evs) >= 2,
+        )
+        retried_keys = {
+            e["asset_key"] for e in events if e["event_type"] == "StepRetry"
+        }
+        assert retried_keys == {"mr_x", "mr_y"}, f"events: {events}"
+        succeeded_keys = {
+            e["asset_key"] for e in events if e["event_type"] == "StepSuccess"
+        }
+        assert {"mr_x", "mr_y"} <= succeeded_keys
+
+        # The multi step is planned under a representative output name.
+        names = _step_worker_job_names("mr_x")
+        assert any(n.endswith("-r2") for n in names), names
+
+    def test_task_step_retries(self, grpc_stubs):
+        """A @Task(retry=...) step drives per-attempt step Jobs like an asset."""
+        run_id = self._run_to_phase(grpc_stubs, "k8s_task_retry_job", "Succeeded")
+
+        events = _wait_for_events(
+            run_id,
+            lambda evs: any(e["event_type"] == "StepSuccess" for e in evs),
+        )
+        retries = [e for e in events if e["event_type"] == "StepRetry"]
+        assert len(retries) == 1, f"events: {events}"
+        assert _metadata_dict(retries[0])["rivers/attempt"] == "1"
+
+        names = _step_worker_job_names("task_retry")
+        assert any(n.endswith("-r2") for n in names), names
+
+    def test_bash_task_step_retries(self, grpc_stubs):
+        """A BashTask(retry=...) step retries: the command fails on attempt 1
+        (no -rN in the pod hostname) and succeeds in the -r2 Job."""
+        run_id = self._run_to_phase(grpc_stubs, "k8s_bash_retry_job", "Succeeded")
+
+        events = _wait_for_events(
+            run_id,
+            lambda evs: any(e["event_type"] == "StepSuccess" for e in evs),
+        )
+        retries = [e for e in events if e["event_type"] == "StepRetry"]
+        assert len(retries) == 1, f"events: {events}"
+
+        names = _step_worker_job_names("bash_retry")
+        assert any(n.endswith("-r2") for n in names), names
+
+    def test_graph_internal_task_step_retries(self, grpc_stubs):
+        """A graph asset's internal task runs as its own step pod and retries
+        via its task-level policy; the rest of the graph then completes."""
+        run_id = self._run_to_phase(grpc_stubs, "k8s_graph_retry_job", "Succeeded")
+
+        inner = "graph_retry_pipeline/graph_flaky_inner"
+        events = _wait_for_events(
+            run_id,
+            lambda evs: any(
+                e["event_type"] == "StepSuccess" and e["asset_key"] == inner
+                for e in evs
+            ),
+        )
+        retries = [
+            e
+            for e in events
+            if e["event_type"] == "StepRetry" and e["asset_key"] == inner
+        ]
+        assert len(retries) == 1, f"events: {events}"
+
+        # Step labels sanitize `/` to `-`.
+        names = _step_worker_job_names("graph_retry_pipeline-graph_flaky_inner")
+        assert any(n.endswith("-r2") for n in names), names
 
     def test_oom_without_policy_fails_fast(self, grpc_stubs):
         """Poll-hang regression: with no retry policy an OOM-killed pod leaves
