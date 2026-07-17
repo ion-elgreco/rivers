@@ -338,7 +338,11 @@ def execute(
 @app.command(name="execute-step")
 def execute_step(
     module: str = typer.Argument(help="Python module path containing CodeRepository"),
-    step_key: str = typer.Option(..., help="Asset key of the step to execute"),
+    step_key: list[str] = typer.Option(
+        ...,
+        help="Asset key(s) of the step to execute — repeated for a "
+        "multi-asset step so every output materializes",
+    ),
     run_id: str = typer.Option(..., help="Run ID this step belongs to"),
     repo_var: str = typer.Option(
         "repo", help="Variable name of CodeRepository in module"
@@ -382,19 +386,19 @@ def execute_step(
     if mapping_key:
         os.environ["RIVERS_MAPPING_KEY"] = mapping_key
 
+    name = ", ".join(step_key)
+    label = f"{name}[{mapping_key}]" if mapping_key else name
     try:
         _ = repo_obj.materialize(
-            selection=[step_key],
+            selection=list(step_key),
             partition_key=pk,
             run_id_override=run_id,
             raise_on_error=True,
         )
-        label = f"{step_key}[{mapping_key}]" if mapping_key else step_key
         typer.echo(f"Step {label} completed in run {run_id}")
     except SystemExit:
         raise
     except BaseException as exc:
-        label = f"{step_key}[{mapping_key}]" if mapping_key else step_key
         typer.echo(f"Step {label} failed: {exc}", err=True)
         raise typer.Exit(1)
 
