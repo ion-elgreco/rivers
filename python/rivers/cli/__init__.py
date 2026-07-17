@@ -264,6 +264,11 @@ def execute(
     target: str | None = typer.Option(
         None, help="Comma-separated asset names to execute (default: all)"
     ),
+    job: str | None = typer.Option(
+        None,
+        help="Job name to execute — runs the actual job so job-level config "
+        "(retry, executor) applies; takes precedence over --target",
+    ),
     partition_key: str | None = typer.Option(None, help="Partition key to materialize"),
     resume: bool = typer.Option(
         False, help="Resume a crashed run, skipping completed steps"
@@ -298,13 +303,21 @@ def execute(
     selection = [a.strip() for a in target.split(",")] if target else None
 
     try:
-        result = repo_obj.materialize(
-            selection=selection,
-            partition_key=pk,
-            run_id_override=run_id,
-            raise_on_error=False,
-            resume=resume,
-        )
+        if job:
+            result = repo_obj.get_job(job)._execute_run(
+                run_id,
+                partition_key=pk,
+                resume=resume,
+                raise_on_error=False,
+            )
+        else:
+            result = repo_obj.materialize(
+                selection=selection,
+                partition_key=pk,
+                run_id_override=run_id,
+                raise_on_error=False,
+                resume=resume,
+            )
         completed = len(result.materialized_assets) - len(result.failed_assets)
         total = len(result.materialized_assets)
 

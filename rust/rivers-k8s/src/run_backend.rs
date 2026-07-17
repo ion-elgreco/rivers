@@ -91,6 +91,7 @@ impl K8sRunBackendConfig {
                 image: self.image.clone(),
                 module: self.module.clone(),
                 target,
+                job_name: run_info.job_name.clone(),
                 surreal_endpoint: self.surreal_endpoint.clone(),
                 executor: Executor::Kubernetes,
                 parameters: None,
@@ -265,6 +266,7 @@ mod tests {
 
     fn test_run_info() -> CoordinatorRunInfo {
         CoordinatorRunInfo {
+            job_name: Some("nightly".to_string()),
             run_id: "abc-123".to_string(),
             code_location_id: "demo".to_string(),
             tags: vec![("team".to_string(), "data".to_string())],
@@ -291,6 +293,7 @@ mod tests {
         assert_eq!(
             run.spec,
             RunSpec {
+                job_name: Some("nightly".to_string()),
                 code_location_ref: CodeLocationRef {
                     name: "demo".to_string(),
                     identity: "demo".to_string(),

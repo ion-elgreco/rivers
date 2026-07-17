@@ -407,18 +407,24 @@ impl PyJob {
             raise_on_error,
         )
     }
-}
 
-impl PyJob {
-    /// Execute a previously created run. Updates run status in storage on completion.
-    /// gRPC `ExecuteJob` and daemon dispatch use this after the run record
-    /// has been written via `RepoHandle::create_started_run`.
+    /// Execute a previously created run. Updates run status in storage on
+    /// completion. Daemon dispatch and the K8s run pod (`rivers execute
+    /// --job`) use this after the run record has been written via
+    /// `RepoHandle::create_started_run`.
+    #[pyo3(name = "_execute_run", signature = (
+        run_id,
+        partition_key=None,
+        config=None,
+        resume=false,
+        raise_on_error=true,
+    ))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_run(
         &self,
         py: Python,
-        partition_key: Option<PyPartitionKey>,
         run_id: &str,
+        partition_key: Option<PyPartitionKey>,
         config: Option<HashMap<String, Py<PyAny>>>,
         resume: bool,
         raise_on_error: bool,
@@ -434,7 +440,9 @@ impl PyJob {
             raise_on_error,
         )
     }
+}
 
+impl PyJob {
     /// Single entry point used by `execute`, `execute_run`, and
     /// `materialize_with_launcher` (via a synthetic job).
     #[allow(clippy::too_many_arguments)]

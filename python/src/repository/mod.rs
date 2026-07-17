@@ -4154,7 +4154,7 @@ impl PyCodeRepository {
         Python::attach(|py| {
             job.bind(py)
                 .borrow()
-                .execute_run(py, Some(py_pk), &run_id, config, false, false)
+                .execute_run(py, &run_id, Some(py_pk), config, false, false)
         })
     }
 

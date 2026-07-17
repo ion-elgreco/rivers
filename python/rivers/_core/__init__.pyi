@@ -445,6 +445,22 @@ class Job:
         """
         ...
 
+    def _execute_run(
+        self,
+        run_id: str,
+        partition_key: PartitionKey | None = None,
+        config: dict[str, dict[str, Any]] | None = None,
+        resume: bool = False,
+        raise_on_error: bool = True,
+    ) -> "RunResult":
+        """Execute a previously created run record (internal).
+
+        Entry point for daemon dispatch and the Kubernetes run pod
+        (``rivers execute --job``) — the ``Started`` run record already
+        exists, so this attaches to it instead of creating a new one.
+        """
+        ...
+
 class MetadataValue:
     """A typed metadata value for asset outputs.
 

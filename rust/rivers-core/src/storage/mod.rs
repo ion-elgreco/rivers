@@ -747,6 +747,10 @@ pub struct CoordinatorRunInfo {
     pub tags: Vec<(String, String)>,
     #[serde(default)]
     pub node_names: Vec<String>,
+    /// Job this run executes, when it was dispatched as one — carried through
+    /// to the run backend so job-level config (retry, executor) survives.
+    #[serde(default)]
+    pub job_name: Option<String>,
     #[serde(default)]
     pub priority: i32,
     #[serde(default)]
