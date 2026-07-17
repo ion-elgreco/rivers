@@ -2666,9 +2666,9 @@ impl PerCodeLocationStorage for SurrealStorage {
                 "SELECT count() AS total FROM concurrency_slots \
                      WHERE lease_expires_at <= $now GROUP ALL; \
                  DELETE FROM concurrency_slots WHERE lease_expires_at <= $now; \
-                 SELECT run_id, code_location_id, tags, node_names, priority, partition_key, start_time \
+                 SELECT run_id, code_location_id, tags, node_names, job_name, priority, partition_key, start_time \
                      FROM runs WHERE status IN ['NotStarted', 'Started'] AND code_location_id = $cl; \
-                 SELECT run_id, code_location_id, tags, node_names, priority, partition_key, start_time \
+                 SELECT run_id, code_location_id, tags, node_names, job_name, priority, partition_key, start_time \
                      FROM runs WHERE status = 'Queued' AND code_location_id = $cl",
             )
             .bind(("now", now_ns))

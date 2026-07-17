@@ -86,6 +86,13 @@ spec:
                   `CodeLocation.status.resolvedImage`. Immutable after creation. Empty
                   string is acceptable on apply — webhook fills it.
                 type: string
+              jobName:
+                description: |-
+                  Job this run executes, when it was dispatched as one. The run pod then
+                  goes through the job path so job-level config (retry, executor)
+                  applies; absent for plain asset-selection runs.
+                nullable: true
+                type: string
               maxConcurrentSteps:
                 default: 10
                 format: uint32

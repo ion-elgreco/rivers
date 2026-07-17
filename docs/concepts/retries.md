@@ -167,4 +167,3 @@ Graph assets take `Asset.from_graph(retry=...)` for the step carrying the graph 
 - Generator-style multi-assets don't retry (see above); dict-returning ones do.
 - A Kubernetes pod killed before it can write its failure event (OOM kill, eviction) is classified from pod status alone — exception-type allow-lists can't match there, only failure reasons.
 - Cancelling a run mid-backoff takes effect within about a second on the local executors and within a few seconds on Kubernetes — not instantly.
-- `Job(retry=...)` does not reach runs launched through the Kubernetes run backend yet: the run pod executes the job as a node selection, which loses job identity. Asset/task-level policies and `CodeRepository(default_retry_policy=...)` apply everywhere.

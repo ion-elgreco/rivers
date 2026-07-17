@@ -58,6 +58,12 @@ pub struct RunSpec {
     /// Asset or job to materialize/execute.
     pub target: String,
 
+    /// Job this run executes, when it was dispatched as one. The run pod then
+    /// goes through the job path so job-level config (retry, executor)
+    /// applies; absent for plain asset-selection runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_name: Option<String>,
+
     #[serde(default = "default_surreal_endpoint")]
     pub surreal_endpoint: String,
 

@@ -151,6 +151,10 @@ fn build_execute_args(
 
     args.extend(["--target".to_string(), spec.target.clone()]);
 
+    if let Some(ref job) = spec.job_name {
+        args.extend(["--job".to_string(), job.clone()]);
+    }
+
     if let Some(ref pk) = spec.partition_key {
         args.extend(["--partition-key".to_string(), pk.clone()]);
     }
@@ -169,6 +173,7 @@ mod tests {
 
     fn test_run() -> Run {
         let spec = RunSpec {
+            job_name: None,
             code_location_ref: CodeLocationRef {
                 name: "demo".to_string(),
                 identity: "demo-id".to_string(),
