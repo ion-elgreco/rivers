@@ -40,7 +40,9 @@ class TestK8sCompute:
         """The step Job's container carries the asset's Compute, with unset
         axes untouched by the run-wide worker defaults."""
         with GrpcChannel(grpc_stubs) as ch:
-            resp = ch.stub.ExecuteJob(ch.pb2.ExecuteJobRequest(job_name="k8s_compute_job"))
+            resp = ch.stub.ExecuteJob(
+                ch.pb2.ExecuteJobRequest(job_name="k8s_compute_job")
+            )
             assert resp.run_id
 
             run_name = _wait_for_run_cr(timeout=30)

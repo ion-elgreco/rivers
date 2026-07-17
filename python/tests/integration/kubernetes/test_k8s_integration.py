@@ -206,9 +206,7 @@ def _dump_debug_info(run_name: str) -> str:
     return "\n".join(lines)
 
 
-def _query_run_events(
-    run_id: str, fields: str = "event_type, asset_key"
-) -> list[dict]:
+def _query_run_events(run_id: str, fields: str = "event_type, asset_key") -> list[dict]:
     """Query SurrealDB via its HTTP /sql endpoint over a kr8s port-forward.
 
     kr8s exec doesn't support stdin on the v4 channel protocol that k3s

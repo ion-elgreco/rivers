@@ -383,9 +383,7 @@ def test_pool_slot_released_during_backoff(
             return flaky_body()
 
     storage.set_pool_limit("db", 1)
-    repo = rs.CodeRepository(
-        assets=[pooled_flaky], default_executor=executor_factory()
-    )
+    repo = rs.CodeRepository(assets=[pooled_flaky], default_executor=executor_factory())
     repo.resolve(storage=storage)
     result = repo.materialize()
     assert result.success
@@ -475,9 +473,7 @@ def test_parallel_executor_retry(tmp_path, storage):
     )
     repo.resolve(storage=storage)
     assert repo.materialize().success
-    types = [
-        e.event_type for e in storage.get_events_for_asset("flaky_subprocess")
-    ]
+    types = [e.event_type for e in storage.get_events_for_asset("flaky_subprocess")]
     assert types.count("StepRetry") == 1
     assert "StepSuccess" in types
     assert "StepFailure" not in types
@@ -583,9 +579,7 @@ def test_resume_continues_retry_budget(storage, is_async):
     assert not result.success
     assert calls["n"] == 3  # initial attempt + 2 retries
 
-    result = repo.materialize(
-        raise_on_error=False, run_id_override=run_id, resume=True
-    )
+    result = repo.materialize(raise_on_error=False, run_id_override=run_id, resume=True)
     assert not result.success
     assert calls["n"] == 4  # budget already spent: exactly one more attempt
     retries = [
@@ -901,9 +895,7 @@ def test_graph_asset_internal_task_retry(storage):
     assert repo.materialize().success
 
     assert calls["n"] == 2
-    types = [
-        e.event_type for e in storage.get_events_for_asset("wrapper/flaky_inner")
-    ]
+    types = [e.event_type for e in storage.get_events_for_asset("wrapper/flaky_inner")]
     assert types.count("StepRetry") == 1
 
 
