@@ -168,7 +168,7 @@ impl PyJob {
         Ok(())
     }
 
-    /// Nearest-wins retry fill over this job's node subset: an asset keeps its
+    /// Nearest-wins retry fill over this job's node subset: a node keeps its
     /// own policy; otherwise the job's; otherwise `fallback` (the repo default).
     pub(crate) fn fill_retry_defaults(&mut self, fallback: Option<&RetryPolicy>) {
         let default = self
@@ -180,56 +180,15 @@ impl PyJob {
         let Some(policy) = default else { return };
         if let Some(map) = &mut self.node_map {
             for node in map.values_mut() {
-                if let ResolvedNode::Asset(a) = node
-                    && a.retry.is_none()
-                {
-                    a.retry = Some(policy.clone());
+                let slot = match node {
+                    ResolvedNode::Asset(a) => &mut a.retry,
+                    ResolvedNode::Task(t) => &mut t.retry,
+                    ResolvedNode::BashTask(b) => &mut b.retry,
+                };
+                if slot.is_none() {
+                    *slot = Some(policy.clone());
                 }
             }
-        }
-    }
-
-    /// Retry policies fill asset nodes only — surface the task/bash-task
-    /// steps a job-level or repo-default policy silently skips.
-    pub(crate) fn warn_retry_skips_task_steps(&self, py: Python, has_default: bool) {
-        if !has_default && self.retry.as_ref().and_then(|r| r.as_inline()).is_none() {
-            return;
-        }
-        let Some(map) = &self.node_map else { return };
-        // Walk the job's executed steps, not node_map — the map also holds
-        // out-of-job dependency nodes (allow_incomplete_deps) this job never runs.
-        let mut tasks: Vec<&str> = self
-            .node_names
-            .iter()
-            .filter(|name| {
-                map.get(name.as_str())
-                    .is_some_and(|n| !matches!(n, ResolvedNode::Asset(_)))
-            })
-            .map(|name| name.as_str())
-            .collect();
-        if tasks.is_empty() {
-            return;
-        }
-        tasks.sort_unstable();
-        tasks.dedup();
-        let msg = format!(
-            "job '{}': retry policies apply to asset steps only — task steps will not retry: {}",
-            self.name,
-            tasks.join(", ")
-        );
-        let warned = std::ffi::CString::new(msg.clone()).is_ok_and(|c| {
-            PyErr::warn(
-                py,
-                py.get_type::<pyo3::exceptions::PyUserWarning>().as_any(),
-                &c,
-                2,
-            )
-            .is_ok()
-        });
-        if !warned {
-            // A strict warnings filter (-W error) promotes the warning into an
-            // Err we drop on purpose; keep the signal visible in the log.
-            tracing::warn!("{msg}");
         }
     }
 
