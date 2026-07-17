@@ -228,6 +228,15 @@ spec:
               startedAt:
                 nullable: true
                 type: string
+              totalRestarts:
+                default: 0
+                description: |-
+                  Lifetime restart count — never reset, so every restart pod gets a
+                  fresh `-executor-<n>` name (`restartsWithoutProgress` resets on
+                  progress and would repeat names, 409-adopting an old completed pod).
+                format: uint32
+                minimum: 0.0
+                type: integer
               totalSteps:
                 format: uint32
                 minimum: 0.0

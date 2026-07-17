@@ -54,6 +54,7 @@ pub async fn handle_executor_failure(
     let progress_made = current_completed > last_known_completed;
 
     let mut new_status = status.clone();
+    new_status.total_restarts += 1;
 
     if progress_made {
         new_status.restarts_without_progress = 0;
@@ -101,13 +102,14 @@ pub async fn handle_executor_failure(
         return Ok(Action::await_change());
     }
 
-    let restart_num = new_status.restarts_without_progress;
-    let pod_name = format!("{name}-executor-{restart_num}");
+    // Named by the lifetime counter — the budget counter resets on progress
+    // and would reuse names, 409-adopting an old completed pod.
+    let pod_name = format!("{name}-executor-{}", new_status.total_restarts);
 
     tracing::info!(
         run = %name,
         pod = %pod_name,
-        restart = restart_num,
+        restart = new_status.restarts_without_progress,
         max = max_restarts,
         "restarting executor pod"
     );
@@ -126,13 +128,14 @@ pub async fn handle_executor_failure(
         Err(e) => return Err(e.into()),
     }
 
+    let budget_msg = format!(
+        "Restart {}/{max_restarts}",
+        new_status.restarts_without_progress
+    );
     new_status.executor_pod = Some(pod_name);
     push_condition(
         &mut new_status,
-        make_condition(
-            CONDITION_EXECUTOR_RESTARTED,
-            &format!("Restart {restart_num}/{max_restarts}"),
-        ),
+        make_condition(CONDITION_EXECUTOR_RESTARTED, &budget_msg),
     );
 
     patch_status(runs_api, name, &new_status).await?;
@@ -242,11 +245,40 @@ mod tests {
         let status = last_status_patch(&state);
         assert_eq!(status.phase, Some(RunPhase::Running));
         assert_eq!(status.restarts_without_progress, 0);
+        assert_eq!(status.total_restarts, 1);
         assert_eq!(status.completed_steps, Some(3));
         assert_eq!(status.total_steps, Some(5));
         assert!(status.last_progress_at.is_some());
-        assert_eq!(status.executor_pod.as_deref(), Some("test-run-executor-0"));
+        // Named by the lifetime counter — the budget reset must not reuse -0.
+        assert_eq!(status.executor_pod.as_deref(), Some("test-run-executor-1"));
         assert_eq!(status.completed_at, None);
+    }
+
+    #[tokio::test]
+    async fn restart_pod_names_stay_monotonic_across_progress_resets() {
+        let api_state = Arc::new(Mutex::new(MockApiState::default()));
+        let client = mock_client(api_state.clone());
+        let runs_api: Api<Run> = Api::namespaced(client.clone(), "default");
+        let pods_api: Api<Pod> = Api::namespaced(client.clone(), "default");
+
+        let storage = memory_storage().await;
+        let ctx = make_context(client, storage.clone());
+        seed_step_events(&storage, "run-1", 3, 5).await;
+
+        // Third lifetime restart, budget previously reset by progress.
+        let mut run = test_run_running("run-1", Some(1));
+        run.status.as_mut().unwrap().restarts_without_progress = 1;
+        run.status.as_mut().unwrap().total_restarts = 2;
+
+        handle_executor_failure(&runs_api, &pods_api, &ctx, &run, "test-run")
+            .await
+            .unwrap();
+
+        let state = api_state.lock().unwrap();
+        let status = last_status_patch(&state);
+        assert_eq!(status.restarts_without_progress, 0); // progress reset
+        assert_eq!(status.total_restarts, 3); // never resets
+        assert_eq!(status.executor_pod.as_deref(), Some("test-run-executor-3"));
     }
 
     #[tokio::test]
