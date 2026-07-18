@@ -199,9 +199,9 @@ def test_mp_config_injection():
 
 def test_mp_captures_stdout_in_log_event(tmp_path, storage):
     """Two sync siblings forced through loky should each ship their stdout
-    back as a LogOutput event, mirroring the in-process StepCapture path
-    (`test_materialize_captures_stdout_to_log_event` in test_materialize_parity).
-    Currently the worker doesn't run StepCapture, so no LogOutput is ever
+    back as a run_logs row, mirroring the in-process StepCapture path
+    (`test_materialize_captures_stdout_to_run_logs` in test_materialize_parity).
+    Currently the worker doesn't run StepCapture, so no log row is ever
     emitted from a loky child — `WorkOutcome::Error/WorkerSummary` always
     arrives with `captured_logs: None`."""
 
@@ -228,27 +228,20 @@ def test_mp_captures_stdout_in_log_event(tmp_path, storage):
         jobs=[rs.Job(name="j", assets=assets, executor=MP)],
     )
     repo.resolve(storage=storage)
-    repo.get_job("j").execute()
+    result = repo.get_job("j").execute()
 
-    log_left = [
-        e
-        for e in storage.get_events_for_asset("chatty_left")
-        if e.event_type == "LogOutput"
-    ]
-    log_right = [
-        e
-        for e in storage.get_events_for_asset("chatty_right")
-        if e.event_type == "LogOutput"
-    ]
-    assert log_left, "no LogOutput events for chatty_left under parallel executor"
-    assert log_right, "no LogOutput events for chatty_right under parallel executor"
-    assert "hello from left" in dict(log_left[0].metadata).get("stdout", "")
-    assert "hello from right" in dict(log_right[0].metadata).get("stdout", "")
+    logs = storage.get_run_logs(result.run_id)
+    log_left = [log for log in logs if log.step_key == "chatty_left"]
+    log_right = [log for log in logs if log.step_key == "chatty_right"]
+    assert log_left, "no run_logs row for chatty_left under parallel executor"
+    assert log_right, "no run_logs row for chatty_right under parallel executor"
+    assert "hello from left" in (log_left[0].stdout or "")
+    assert "hello from right" in (log_right[0].stdout or "")
 
 
 def test_mp_captures_stdout_when_worker_raises(tmp_path, storage):
     """Stdout printed by the worker before it raises should still arrive on
-    the parent as a LogOutput event. The worker stashes
+    the parent as a run_logs row. The worker stashes
     `_rivers_captured_logs` on the exception before re-raising; the
     orchestrator extracts it at the `WorkOutcome::Error` site."""
 
@@ -278,12 +271,18 @@ def test_mp_captures_stdout_when_worker_raises(tmp_path, storage):
     with pytest.raises(Exception, match="intentional failure"):
         repo.get_job("j").execute()
 
+    runs = storage.get_runs()
+    assert len(runs) == 1
+    boom_logs = [
+        log
+        for log in storage.get_run_logs(runs[0].run_id)
+        if log.step_key == "chatty_then_boom"
+    ]
     boom_events = storage.get_events_for_asset("chatty_then_boom")
-    log_events = [e for e in boom_events if e.event_type == "LogOutput"]
     failure_events = [e for e in boom_events if e.event_type == "StepFailure"]
-    assert log_events, "no LogOutput emitted for failed parallel asset"
+    assert boom_logs, "no run_logs row emitted for failed parallel asset"
     assert failure_events, "no StepFailure emitted for failed parallel asset"
-    assert "about to fail" in dict(log_events[0].metadata).get("stdout", "")
+    assert "about to fail" in (boom_logs[0].stdout or "")
 
 
 def test_mp_success_hook_receives_config(tmp_path):

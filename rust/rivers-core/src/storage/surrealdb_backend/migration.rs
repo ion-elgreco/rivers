@@ -102,7 +102,7 @@ impl AsyncMigrate for SurrealMigrate {
 
 /// Highest embedded migration version. Bump by adding a `Vn__*.surql` + an
 /// [`embedded_migrations`] entry; a test pins this to that max.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// One compat row per migration (the floors it set), folded by the open guard.
 const MIGRATION_META_TABLE: &str = "migration_meta";
@@ -112,6 +112,8 @@ fn embedded_migrations() -> Vec<Migration> {
     vec![
         Migration::unapplied("V1__base", include_str!("migrations/V1__base.surql"))
             .expect("V1__base migration name is well-formed"),
+        Migration::unapplied("V2__run_logs", include_str!("migrations/V2__run_logs.surql"))
+            .expect("V2__run_logs migration name is well-formed"),
     ]
 }
 
@@ -540,6 +542,88 @@ mod tests {
             count_rows(&db, REFINERY_HISTORY_TABLE).await,
             1,
             "idempotent: still one history row"
+        );
+    }
+
+    /// V2 moves V1-shape `LogOutput` events (metadata pairs) into `run_logs`
+    /// rows and deletes them from `events`; structured events stay put.
+    #[tokio::test]
+    async fn test_v2_moves_logoutput_events_to_run_logs() {
+        let db = any::connect("mem://").await.unwrap();
+        db.use_ns(DEFAULT_NAMESPACE)
+            .use_db(DEFAULT_DATABASE)
+            .await
+            .unwrap();
+
+        let v1_only: Vec<Migration> = embedded_migrations().into_iter().take(1).collect();
+        let mut backend = SurrealMigrate { db: db.clone() };
+        backend
+            .migrate(
+                &v1_only,
+                true,
+                false,
+                false,
+                Target::Latest,
+                REFINERY_HISTORY_TABLE,
+            )
+            .await
+            .expect("apply V1");
+
+        db.query(
+            "INSERT INTO events [
+                { code_location_id: 'default', event_type: 'LogOutput', asset_key: 'asset_a', \
+                  run_id: 'run-1', timestamp: 10, sort_order: 1, \
+                  metadata: [['stdout', 'hello out'], ['logs', 'rust line']], input_data_versions: [] },
+                { code_location_id: 'default', event_type: 'LogOutput', asset_key: 'asset_b', \
+                  run_id: 'run-1', timestamp: 11, sort_order: 1, \
+                  metadata: [['stderr', 'oh no']], input_data_versions: [] },
+                { code_location_id: 'default', event_type: 'StepSuccess', asset_key: 'asset_a', \
+                  run_id: 'run-1', timestamp: 12, sort_order: 4, metadata: [], input_data_versions: [] }
+            ] RETURN NONE",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        apply_migrations(&db).await.expect("apply V2");
+
+        #[derive(SurrealValue)]
+        struct LogRow {
+            step_key: String,
+            run_id: String,
+            timestamp: i64,
+            stdout: Option<String>,
+            stderr: Option<String>,
+            logs: Option<String>,
+        }
+        let rows: Vec<LogRow> =
+            db.query("SELECT * FROM run_logs ORDER BY timestamp ASC")
+                .await
+                .unwrap()
+                .take(0)
+                .unwrap();
+        assert_eq!(rows.len(), 2, "one run_logs row per LogOutput event");
+        assert_eq!(rows[0].step_key, "asset_a");
+        assert_eq!(rows[0].run_id, "run-1");
+        assert_eq!(rows[0].timestamp, 10);
+        assert_eq!(rows[0].stdout.as_deref(), Some("hello out"));
+        assert_eq!(rows[0].stderr, None);
+        assert_eq!(rows[0].logs.as_deref(), Some("rust line"));
+        assert_eq!(rows[1].step_key, "asset_b");
+        assert_eq!(rows[1].stdout, None);
+        assert_eq!(rows[1].stderr.as_deref(), Some("oh no"));
+
+        assert_eq!(
+            count_rows(&db, "events").await,
+            1,
+            "only the structured event remains"
+        );
+        let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
+        assert_eq!(
+            (stamps.version, stamps.min_reader, stamps.min_writer),
+            (2, 2, 2),
+            "v2 raises both floors"
         );
     }
 

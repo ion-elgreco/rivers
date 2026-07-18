@@ -473,7 +473,7 @@ pub(crate) fn process_worker_result(
     failures: &mut Vec<(String, PyErr)>,
 ) {
     // Emit captured stdout/stderr/rust_logs from the worker subprocess as a
-    // LogOutput event before output processing, mirroring the in-process path
+    // `run_logs` row before output processing, mirroring the in-process path
     // (`execute_step_with_capture` → `emit_captured_logs`).
     if let Ok(logs_obj) = worker_result.getattr(py, "captured_logs")
         && !logs_obj.is_none(py)

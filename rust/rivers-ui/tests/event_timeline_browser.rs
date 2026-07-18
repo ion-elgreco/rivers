@@ -99,7 +99,7 @@ fn step_failure_uses_error_badge() {
 
 #[wasm_bindgen_test]
 fn unknown_event_type_falls_back_to_muted() {
-    let events = vec![event("a", EventType::LogOutput, None, None, None)];
+    let events = vec![event("a", EventType::RunQueued, None, None, None)];
     let target = fresh_mount_target();
     let _handle = mount_to(target.clone(), move || {
         view! { <EventTimeline events=events.clone() /> }

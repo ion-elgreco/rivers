@@ -489,7 +489,7 @@ pub fn AssetDetailPage() -> impl IntoView {
 
         <div class="tab-content" style=move || if active_tab.get() == "events" { "" } else { "display:none" }>
             // Show only TERMINAL events (materializations / failures / observations) —
-            // intermediate events like StepStart, LogOutput, or slot-claim/renew are
+            // intermediate events like StepStart or slot-claim/renew are
             // noise at this zoom.
             <Transition>
                 {move || {

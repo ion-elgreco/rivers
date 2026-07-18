@@ -21,11 +21,12 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionStep;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
-use rivers_core::storage::{EventRecord, ScopedStorageHandle};
+use rivers_core::storage::ScopedStorageHandle;
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::errors::ExecutionError;
 
+use super::super::event_writer::WriterMsg;
 use super::super::ops::{self, now_ts};
 use super::context::BatchContext;
 use super::pool_claim::PoolGuard;
@@ -115,7 +116,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
     run_id: String,
     pool_step_name: String,
     start_event_names: Vec<String>,
-    events_tx: mpsc::UnboundedSender<EventRecord>,
+    events_tx: mpsc::UnboundedSender<WriterMsg>,
     semaphore: Option<Arc<Semaphore>>,
     worker: W,
 ) -> WorkOutcome {

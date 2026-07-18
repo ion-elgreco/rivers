@@ -26,7 +26,7 @@ import rivers as rs
 
 
 def test_async_backend_emits_log_events(storage):
-    """Async steps should emit LogOutput events (at minimum for Rust-side logs)."""
+    """Async steps should emit run_logs rows (at minimum for Rust-side logs)."""
 
     @rs.Asset
     async def logged_async() -> int:
@@ -512,7 +512,7 @@ def test_async_multi_asset_failure_marks_all_outputs():
 
 
 def test_sync_stdout_capture_content(monkeypatch, storage):
-    """InProcess sync step stdout is captured as LogOutput event content."""
+    """InProcess sync step stdout is captured as run_logs content."""
     import rivers._capture as cap
 
     monkeypatch.setattr(cap, "_installed", False)
@@ -529,18 +529,20 @@ def test_sync_stdout_capture_content(monkeypatch, storage):
         jobs=[rs.Job(name="j", assets=assets, executor=rs.Executor.in_process())],
     )
     repo.resolve(storage=storage)
-    repo.get_job("j").execute()
+    result = repo.get_job("j").execute()
     assert repo.load_node("cap_stdout_asset") == 42
 
-    events = storage.get_events_for_asset("cap_stdout_asset")
-    log_events = [e for e in events if e.event_type == "LogOutput"]
-    assert len(log_events) >= 1
-    log_meta = dict(log_events[0].metadata)
-    assert "hello from sync step" in log_meta.get("stdout", "")
+    logs = [
+        log
+        for log in storage.get_run_logs(result.run_id)
+        if log.step_key == "cap_stdout_asset"
+    ]
+    assert len(logs) >= 1
+    assert "hello from sync step" in (logs[0].stdout or "")
 
 
 def test_sync_stderr_capture_content(monkeypatch, storage):
-    """InProcess sync step stderr is captured as LogOutput event content."""
+    """InProcess sync step stderr is captured as run_logs content."""
     import sys
 
     import rivers._capture as cap
@@ -559,11 +561,13 @@ def test_sync_stderr_capture_content(monkeypatch, storage):
         jobs=[rs.Job(name="j", assets=assets, executor=rs.Executor.in_process())],
     )
     repo.resolve(storage=storage)
-    repo.get_job("j").execute()
+    result = repo.get_job("j").execute()
     assert repo.load_node("cap_stderr_asset") == 99
 
-    events = storage.get_events_for_asset("cap_stderr_asset")
-    log_events = [e for e in events if e.event_type == "LogOutput"]
-    assert len(log_events) >= 1
-    log_meta = dict(log_events[0].metadata)
-    assert "error output" in log_meta.get("stderr", "")
+    logs = [
+        log
+        for log in storage.get_run_logs(result.run_id)
+        if log.step_key == "cap_stderr_asset"
+    ]
+    assert len(logs) >= 1
+    assert "error output" in (logs[0].stderr or "")

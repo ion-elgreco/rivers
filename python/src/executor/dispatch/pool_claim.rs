@@ -17,6 +17,7 @@ use rivers_core::storage::{
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
+use crate::executor::event_writer::WriterMsg;
 use crate::executor::ops::now_ts;
 use crate::runtime::io_rt;
 
@@ -49,7 +50,7 @@ pub(crate) struct PoolGuard {
     run_id: String,
     step_key: String,
     renewal: AbortOnDrop,
-    events: mpsc::UnboundedSender<EventRecord>,
+    events: mpsc::UnboundedSender<WriterMsg>,
 }
 
 /// Aborts the wrapped tokio task on drop. `AbortHandle::drop` alone does not
@@ -76,7 +77,7 @@ impl PoolGuard {
         pools: &[(String, u32)],
         run_id: &str,
         step_key: &str,
-        events: mpsc::UnboundedSender<EventRecord>,
+        events: mpsc::UnboundedSender<WriterMsg>,
     ) -> anyhow::Result<Self> {
         claim_async_poll(storage, pools, run_id, step_key, &events).await?;
         let renewal = AbortOnDrop(spawn_lease_renewal(
@@ -101,7 +102,7 @@ impl PoolGuard {
         pools: &[(String, u32)],
         run_id: &str,
         step_key: &str,
-        events: mpsc::UnboundedSender<EventRecord>,
+        events: mpsc::UnboundedSender<WriterMsg>,
     ) -> anyhow::Result<Self> {
         let storage_c = storage.clone();
         let pools = pools.to_vec();
@@ -183,7 +184,7 @@ async fn claim_async_poll(
     pools: &[(String, u32)],
     run_id: &str,
     step_key: &str,
-    events: &mpsc::UnboundedSender<EventRecord>,
+    events: &mpsc::UnboundedSender<WriterMsg>,
 ) -> anyhow::Result<()> {
     let poll_interval = *CLAIM_POLL_INTERVAL;
     let max_jitter = *CLAIM_POLL_JITTER;
@@ -275,7 +276,7 @@ fn spawn_lease_renewal(
     storage: ScopedStorageHandle<SurrealStorage>,
     run_id: String,
     step_key: String,
-    events: mpsc::UnboundedSender<EventRecord>,
+    events: mpsc::UnboundedSender<WriterMsg>,
 ) -> AbortHandle {
     let interval = Duration::from_secs((DEFAULT_LEASE_DURATION_SECS / 3).max(1) as u64);
     io_rt()
@@ -317,21 +318,24 @@ fn spawn_lease_renewal(
 }
 
 fn emit_event(
-    tx: &mpsc::UnboundedSender<EventRecord>,
+    tx: &mpsc::UnboundedSender<WriterMsg>,
     code_location_id: &str,
     run_id: &str,
     step_key: &str,
     event_type: EventType,
     metadata: Vec<(String, String)>,
 ) {
-    let _ = tx.send(EventRecord {
-        code_location_id: code_location_id.to_string(),
-        event_type,
-        asset_key: Some(step_key.to_string()),
-        run_id: run_id.to_string(),
-        partition_key: None,
-        timestamp: now_ts(),
-        metadata,
-        input_data_versions: vec![],
-    });
+    let _ = tx.send(
+        EventRecord {
+            code_location_id: code_location_id.to_string(),
+            event_type,
+            asset_key: Some(step_key.to_string()),
+            run_id: run_id.to_string(),
+            partition_key: None,
+            timestamp: now_ts(),
+            metadata,
+            input_data_versions: vec![],
+        }
+        .into(),
+    );
 }

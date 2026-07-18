@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionPlan;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
-use rivers_core::storage::{EventRecord, ScopedStorageHandle};
+use rivers_core::storage::ScopedStorageHandle;
 use tokio::sync::mpsc;
 
 use crate::assets::io_handler_registry::IOHandlerRegistry;
@@ -20,7 +20,7 @@ use crate::repository::resolved_node::ResolvedNode;
 
 use super::super::GraphNodeMap;
 use super::super::async_exec::AsyncBridge;
-use super::super::event_writer::EventWriter;
+use super::super::event_writer::{EventWriter, WriterMsg};
 use super::super::ops::{self, now_ts};
 
 /// Immutable run-scope identity: who/what/when this batch is executing.
@@ -117,7 +117,7 @@ impl<'a> BatchContext<'a> {
             .unwrap_or_default()
     }
 
-    pub(crate) fn event_sender(&self) -> mpsc::UnboundedSender<EventRecord> {
+    pub(crate) fn event_sender(&self) -> mpsc::UnboundedSender<WriterMsg> {
         self.sink.writer.sender()
     }
 

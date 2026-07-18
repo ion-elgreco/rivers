@@ -208,7 +208,6 @@ pub enum EventType {
     StepStart,
     StepSuccess,
     StepFailure,
-    LogOutput,
     RunQueued,
     RunDequeued,
     StepSlotClaimed,
@@ -229,6 +228,19 @@ pub struct StoredEvent {
     pub timestamp: i64,
     pub metadata: Vec<(String, MetadataDisplay)>,
     pub data_version: Option<String>,
+}
+
+/// One step's captured output from the `run_logs` table — drives the
+/// run-detail log tabs. Mirrors `rivers_core::storage::StoredLog`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunLog {
+    pub id: String,
+    pub run_id: String,
+    pub step_key: String,
+    pub timestamp: i64,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub logs: Option<String>,
 }
 
 /// Asset DAG topology read from the per-CL storage blob. `edges` are
@@ -993,7 +1005,6 @@ mod conversions {
                 rivers_core::storage::EventType::StepStart => Self::StepStart,
                 rivers_core::storage::EventType::StepSuccess => Self::StepSuccess,
                 rivers_core::storage::EventType::StepFailure => Self::StepFailure,
-                rivers_core::storage::EventType::LogOutput => Self::LogOutput,
                 rivers_core::storage::EventType::RunQueued => Self::RunQueued,
                 rivers_core::storage::EventType::RunDequeued => Self::RunDequeued,
                 rivers_core::storage::EventType::StepSlotClaimed => Self::StepSlotClaimed,
@@ -1020,6 +1031,20 @@ mod conversions {
                     .map(|(k, v)| (k, MetadataDisplay::from_stored(&v)))
                     .collect(),
                 data_version,
+            }
+        }
+    }
+
+    impl From<rivers_core::storage::StoredLog> for RunLog {
+        fn from(l: rivers_core::storage::StoredLog) -> Self {
+            Self {
+                id: format!("{:?}", l.id),
+                run_id: l.run_id,
+                step_key: l.step_key,
+                timestamp: l.timestamp,
+                stdout: l.stdout,
+                stderr: l.stderr,
+                logs: l.logs,
             }
         }
     }

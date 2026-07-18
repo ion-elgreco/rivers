@@ -124,9 +124,9 @@ def test_materialize_raise_on_error_false_collects_failures():
     assert "always_fails" in failed_names
 
 
-def test_materialize_captures_stdout_to_log_event(storage):
+def test_materialize_captures_stdout_to_run_logs(storage):
     """materialize() must install stdout/stderr capture so step prints land in
-    LogOutput events, the same way Job.execute() does. Job.execute() calls
+    run_logs rows, the same way Job.execute() does. Job.execute() calls
     rivers._capture.install (job.rs:319); materialize_with_launcher does not."""
     import rivers._capture as cap
 
@@ -143,8 +143,8 @@ def test_materialize_captures_stdout_to_log_event(storage):
     result = repo.materialize(selection=["chatty"])
     assert result.success
 
-    events = storage.get_events_for_asset("chatty")
-    log_events = [e for e in events if e.event_type == "LogOutput"]
-    assert log_events, "materialize did not produce any LogOutput events"
-    log_meta = dict(log_events[0].metadata)
-    assert "hello from materialize" in log_meta.get("stdout", "")
+    logs = [
+        log for log in storage.get_run_logs(result.run_id) if log.step_key == "chatty"
+    ]
+    assert logs, "materialize did not produce any run_logs rows"
+    assert "hello from materialize" in (logs[0].stdout or "")

@@ -129,6 +129,84 @@ def test_failed_run_tracked():
     assert "StepFailure" in types
 
 
+def test_run_logs_captured_per_executor(executor_env):
+    """Step prints land in run_logs rows with the right step_key and stream,
+    for both executor types; events carry no log payload."""
+    import rivers._capture as cap
+
+    cap._installed = False
+    executor, io_factory = executor_env
+    storage = rs.Storage.memory()
+
+    @rs.Asset(name="noisy", io_handler=io_factory())
+    def noisy() -> int:
+        print("noisy stdout line")
+        import sys
+
+        print("noisy stderr line", file=sys.stderr)
+        return 1
+
+    repo = rs.CodeRepository(assets=[noisy], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize()
+    assert result.success
+
+    logs = [
+        log for log in storage.get_run_logs(result.run_id) if log.step_key == "noisy"
+    ]
+    assert logs, "no run_logs row for the step"
+    assert "noisy stdout line" in (logs[0].stdout or "")
+    assert "noisy stderr line" in (logs[0].stderr or "")
+    assert logs[0].run_id == result.run_id
+
+    # Logs are not events: the run's event stream stays payload-free.
+    events = storage.get_events_for_run(result.run_id)
+    assert all(e.event_type != "LogOutput" for e in events)
+    assert all("stdout" not in dict(e.metadata) for e in events)
+
+
+def test_run_logs_empty_for_quiet_run():
+    """A step that prints nothing produces no run_logs rows."""
+    storage = rs.Storage.memory()
+
+    @rs.Asset(name="quiet")
+    def quiet() -> int:
+        return 1
+
+    repo = rs.CodeRepository(assets=[quiet], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+    result = repo.materialize()
+    assert result.success
+    assert storage.get_run_logs(result.run_id) == []
+
+
+def test_async_get_run_logs():
+    """async_get_run_logs returns the same rows as the sync method."""
+    import asyncio
+
+    import rivers._capture as cap
+
+    cap._installed = False
+    storage = rs.Storage.memory()
+
+    @rs.Asset(name="talker")
+    def talker() -> int:
+        print("talker line")
+        return 1
+
+    repo = rs.CodeRepository(assets=[talker], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+    result = repo.materialize()
+    assert result.success
+
+    async def fetch():
+        return await storage.async_get_run_logs(result.run_id)
+
+    logs = asyncio.run(fetch())
+    assert [log.step_key for log in logs] == ["talker"]
+    assert "talker line" in (logs[0].stdout or "")
+
+
 def test_kv_roundtrip():
     """Basic kv_set/kv_get round-trip."""
     storage = rs.Storage.memory()

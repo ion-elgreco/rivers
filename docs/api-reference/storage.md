@@ -89,6 +89,7 @@ All query methods block the calling thread until the result is ready.
 |--------|-------------|
 | `get_events_for_asset(asset_key, limit=100)` | `list[StoredEvent]` |
 | `get_events_for_run(run_id)` | `list[StoredEvent]` |
+| `get_run_logs(run_id)` | `list[StoredLog]` |
 | `get_latest_materialization(asset_key, partition=None)` | `StoredEvent \| None` |
 | `get_asset_record(asset_key)` | `AssetRecord \| None` |
 | `get_asset_records()` | `list[AssetRecord]` |
@@ -138,6 +139,7 @@ asyncio.run(main())
 |--------------|-------------|
 | `async_get_events_for_asset(asset_key, limit=100)` | `list[StoredEvent]` |
 | `async_get_events_for_run(run_id)` | `list[StoredEvent]` |
+| `async_get_run_logs(run_id)` | `list[StoredLog]` |
 | `async_get_latest_materialization(asset_key, partition=None)` | `StoredEvent \| None` |
 | `async_get_asset_record(asset_key)` | `AssetRecord \| None` |
 | `async_get_asset_records()` | `list[AssetRecord]` |
@@ -170,6 +172,21 @@ asyncio.run(main())
 | `data_version` | `str \| None` |
 | `code_version` | `str \| None` |
 | `input_data_versions` | `list[tuple[str, str]]` |
+
+### `StoredLog`
+
+One step execution's captured output. Logs live in the dedicated `run_logs`
+table (not the events stream); streams the step didn't produce are `None`.
+
+| Field | Type |
+|-------|------|
+| `id` | `str` |
+| `run_id` | `str` |
+| `step_key` | `str` |
+| `timestamp` | `int` |
+| `stdout` | `str \| None` |
+| `stderr` | `str \| None` |
+| `logs` | `str \| None` |
 
 ### `AssetRecord`
 

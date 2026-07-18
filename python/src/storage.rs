@@ -14,7 +14,8 @@ use crate::errors::StorageError;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{
     AssetRecord, CodeLocationContext, LaunchedBy, RunRecord, RunStatus, ScopedStorage,
-    ScopedStorageHandle, StaleCauseCategory, StaleStatus, StorageBackend, StoredEvent, StoredTick,
+    ScopedStorageHandle, StaleCauseCategory, StaleStatus, StorageBackend, StoredEvent, StoredLog,
+    StoredTick,
 };
 
 use crate::partitions::PyPartitionKey;
@@ -56,6 +57,58 @@ impl From<StoredEvent> for PyStoredEvent {
             code_version: e.code_version,
             input_data_versions: e.input_data_versions,
         }
+    }
+}
+
+#[pyclass(
+    name = "StoredLog",
+    frozen,
+    get_all,
+    skip_from_py_object,
+    module = "rivers._core"
+)]
+#[derive(Clone)]
+pub struct PyStoredLog {
+    pub id: String,
+    pub run_id: String,
+    pub step_key: String,
+    pub timestamp: i64,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub logs: Option<String>,
+}
+
+impl From<StoredLog> for PyStoredLog {
+    fn from(l: StoredLog) -> Self {
+        Self {
+            id: format!("{}:{:?}", l.id.table.as_str(), l.id.key),
+            run_id: l.run_id,
+            step_key: l.step_key,
+            timestamp: l.timestamp,
+            stdout: l.stdout,
+            stderr: l.stderr,
+            logs: l.logs,
+        }
+    }
+}
+
+#[pymethods]
+impl PyStoredLog {
+    fn __repr__(&self) -> String {
+        let streams: Vec<&str> = [
+            self.stdout.as_ref().map(|_| "stdout"),
+            self.stderr.as_ref().map(|_| "stderr"),
+            self.logs.as_ref().map(|_| "logs"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        format!(
+            "StoredLog(run_id='{}', step_key='{}', streams=[{}])",
+            self.run_id,
+            self.step_key,
+            streams.join(", ")
+        )
     }
 }
 
@@ -872,6 +925,15 @@ impl PyStorage {
         })
     }
 
+    fn get_run_logs(&self, py: Python<'_>, run_id: &str) -> PyResult<Vec<PyStoredLog>> {
+        py.detach(|| {
+            io_rt()
+                .block_on(self.backend().get_run_logs(run_id))
+                .map(|v| v.into_iter().map(PyStoredLog::from).collect())
+                .map_err(to_py_err)
+        })
+    }
+
     #[pyo3(signature = (asset_key, partition=None))]
     fn get_latest_materialization(
         &self,
@@ -1357,6 +1419,23 @@ impl PyStorage {
         })
     }
 
+    fn async_get_run_logs<'py>(
+        &self,
+        py: Python<'py>,
+        run_id: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let handle = self.handle.clone();
+        let run_id = run_id.to_string();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            handle
+                .backend()
+                .get_run_logs(&run_id)
+                .await
+                .map(|v| v.into_iter().map(PyStoredLog::from).collect::<Vec<_>>())
+                .map_err(to_py_err)
+        })
+    }
+
     #[pyo3(signature = (asset_key, partition=None))]
     fn async_get_latest_materialization<'py>(
         &self,
@@ -1672,6 +1751,7 @@ pub fn register_storage_module(parent_module: &Bound<'_, PyModule>) -> PyResult<
     ], [
         PyStorageType,
         PyStoredEvent,
+        PyStoredLog,
         PyStoredTick,
         PyStaleCause,
         PyAssetRecord,
