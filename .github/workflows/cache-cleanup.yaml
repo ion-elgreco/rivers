@@ -1,0 +1,43 @@
+name: cache-cleanup
+
+# Caches saved during a PR run are scoped to refs/pull/N/merge — readable only
+# by that PR, but they count against the repo's 10 GB budget for up to 7 days
+# after close (sccache alone leaves O(1000) small entries per PR). Reclaim them
+# immediately so main's caches don't get LRU-evicted.
+on:
+  pull_request:
+    types: [closed]
+
+permissions: {}
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Fork PRs get a read-only token, so deletes would 403 — skip them and let
+    # the 7-day expiry handle their caches.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      actions: write
+    steps:
+      - name: Delete caches scoped to this PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF: refs/pull/${{ github.event.pull_request.number }}/merge
+        run: |
+          set -euo pipefail
+          # No bulk delete-by-ref API exists; drain in rounds of 100.
+          for _ in $(seq 1 60); do
+            ids=$(gh cache list --repo "$REPO" --ref "$REF" --limit 100 --json id --jq '.[].id')
+            if [ -z "$ids" ]; then
+              echo "done"
+              exit 0
+            fi
+            while read -r id; do
+              # tolerate races with expiry and concurrent reruns
+              gh cache delete "$id" --repo "$REPO" || true
+            done <<< "$ids"
+          done
+          echo "caches still remain after 60 rounds" >&2
+          exit 1
