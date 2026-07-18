@@ -55,6 +55,8 @@ jobs:
         uses: ./.github/actions/setup-env
         with:
           python-version: ${{ matrix.python-version }}
+          # lint compiles no Rust; keep it off the shared rust-cache key
+          rust-cache: "false"
 
       - name: setup venv
         run: just venv
@@ -179,6 +181,9 @@ jobs:
         with:
           # cargo-zigbuild + zig cross-linker for the linux-target operator/wheel build.
           cross_compile: "true"
+          # The zigbuild/maturin target dirs share only the registry with the
+          # arm64 test job — keep a dedicated primer tarball, don't race it.
+          cache-shared-key: "k8s"
 
       # k3d + helmfile + helm + kubectl at the exact versions mise.toml /
       # mise.lock pin for local dev — one source of truth instead of

@@ -17,6 +17,16 @@ inputs:
     required: false
     default: "true"
 
+  rust-cache:
+    description: "Enable the Rust compile caches (rust-cache + sccache). Jobs that run no cargo set this to 'false' so they can't save an empty tarball under the shared cache key."
+    required: false
+    default: "true"
+
+  cache-shared-key:
+    description: "rust-cache shared key. Jobs whose target contents don't overlap the default pool (e.g. cross-compile builds) set their own so they keep a dedicated primer tarball instead of racing the shared one."
+    required: false
+    default: "ci"
+
   cross_compile:
     description: "Install the cross-compile toolchain (cargo-zigbuild + zig as the cross linker). Release workflows that produce linux/amd64 + linux/arm64 artifacts from a single runner set this to 'true'."
     required: false
@@ -51,7 +61,7 @@ runs:
     # setup sscache for cache compilation — skipped when cache is disabled
     # so we don't pay the install cost in release builds that won't use it.
     - name: Setup sccache
-      if: inputs.cache == 'true'
+      if: inputs.cache == 'true' && inputs.rust-cache == 'true'
       uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
     - name: Setup Rust toolchain
@@ -62,7 +72,11 @@ runs:
         # wasm32-unknown-unknown` directly. wasm-pack used to install the
         # target on demand; cargo doesn't, so we pre-add it here.
         target: wasm32-unknown-unknown
-        cache: ${{ inputs.cache }}
+        cache: ${{ inputs.cache == 'true' && inputs.rust-cache == 'true' }}
+        # One cache per OS/arch shared by every job on the same key (drops the per-job key)
+        cache-shared-key: ${{ inputs.cache-shared-key }}
+        # PRs restore main's cache but never save their own copies
+        cache-save-if: ${{ github.ref == 'refs/heads/main' }}
         # Save partial compilation
         cache-on-failure: "true"
         rustflags: "-D warnings -C symbol-mangling-version=v0"
@@ -108,7 +122,9 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        pipx install ziglang
+        # Pinned — zig releases change bundled-clang behavior. Keep in sync
+        # with `ziglang_version` in the justfile.
+        pipx install 'ziglang==0.16.0'
         # ziglang ≥0.14 renamed its console script to `python-zig`;
         # cargo-zigbuild discovers the linker as `zig` on PATH.
         ln -sf "$(command -v python-zig)" "$HOME/.local/bin/zig"
