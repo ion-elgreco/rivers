@@ -11,6 +11,7 @@ End-to-end tests verifying:
 
 import pytest
 import rivers as rs
+from _polling import wait_for_all_runs_success as _wait_for_all_runs_success
 from _polling import wait_for_asset_materialized as _wait_for_asset_materialized
 from _polling import wait_for_runs as _wait_for_runs
 from rivers._core import AutomationDaemon
@@ -132,7 +133,7 @@ class TestRunQueueFullFlow:
             assert source_rec.last_data_version is not None
 
             # All runs should have completed successfully
-            runs = storage.get_runs(limit=100)
+            runs = _wait_for_all_runs_success(storage)
             for r in runs:
                 assert r.status == "Success", (
                     f"Run {r.run_id} has status {r.status}, expected Success"
@@ -188,7 +189,7 @@ class TestRunQueueFullFlow:
             assert rec_b is not None, "asset 'b' was never materialized"
 
             # All runs should have succeeded
-            runs = storage.get_runs(limit=100)
+            runs = _wait_for_all_runs_success(storage)
             for r in runs:
                 assert r.status == "Success", (
                     f"Run {r.run_id} has status {r.status}, expected Success"
@@ -244,7 +245,7 @@ class TestRunQueueFullFlow:
             assert rec_a is not None, "tagged_a was never materialized"
             assert rec_b is not None, "tagged_b was never materialized"
 
-            runs = storage.get_runs(limit=100)
+            runs = _wait_for_all_runs_success(storage)
             for r in runs:
                 assert r.status == "Success", (
                     f"Run {r.run_id} has status {r.status}, expected Success"
