@@ -80,10 +80,6 @@ jobs:
         run: just wasm
 
       - name: Cross-compile binaries
-        env:
-          # Silence the per-unit nullability wall from RocksDB's C++ build
-          # against zig's unannotated libc++ headers (see justfile zig_cxxflags).
-          CXXFLAGS: "-Wno-nullability-completeness"
         run: |
           cargo zigbuild -p rivers-operator --release --target "${TARGET}"
           cargo zigbuild -p rivers-ui --release --target "${TARGET}" --features ssr
