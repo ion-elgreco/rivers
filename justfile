@@ -132,25 +132,40 @@ gen-crds:
     cargo run -p rivers-k8s --bin rivers-gen-crd -- run > deploy/helm/rivers-crds/crds/runs.rivers.io.yaml
     @echo "Regenerated CodeLocation + Run CRDs from Rust types."
 
-# Cross-compile Rust binaries and Python wheel for Linux, then package as Docker images
+# Cross-compile Rust binaries + Python wheel for Linux, then build the Docker images
 k8s-build: _k8s-compile
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # RIVERS_K8S_SKIP_UI=1 / RIVERS_K8S_SKIP_DEMO=1 drop the UI + demo images
+    # (CI's k8s integration suite needs neither).
     mkdir -p deploy/staging
     cp target/{{ linux_target }}/debug/rivers-operator deploy/staging/
-    cp target/{{ linux_target }}/debug/rivers-ui deploy/staging/
     cp dist/*.whl deploy/staging/
     docker build -f deploy/docker/Dockerfile.operator -t rivers-operator:latest deploy/staging
-    docker build -f deploy/docker/Dockerfile.ui -t rivers-ui:latest deploy/staging
+    if [ "${RIVERS_K8S_SKIP_UI:-}" != "1" ]; then
+        cp target/{{ linux_target }}/debug/rivers-ui deploy/staging/
+        docker build -f deploy/docker/Dockerfile.ui -t rivers-ui:latest deploy/staging
+    fi
     cp python/pyproject.toml deploy/staging/pyproject.toml
     cp -r dev/k3d/k8s_test_pipeline deploy/staging/k8s_test_pipeline
     docker build -f dev/k3d/Dockerfile.code-location -t rivers-code-location:latest deploy/staging
-    cp -r examples/demo_project deploy/staging/demo_project
-    docker build -f dev/k3d/Dockerfile.demo -t rivers-demo:latest deploy/staging
+    if [ "${RIVERS_K8S_SKIP_DEMO:-}" != "1" ]; then
+        cp -r examples/demo_project deploy/staging/demo_project
+        docker build -f dev/k3d/Dockerfile.demo -t rivers-demo:latest deploy/staging
+    fi
     rm -rf deploy/staging
 
-# Cross-compile all artifacts for Linux (no Docker)
+# Cross-compile all artifacts for Linux (no Docker). RIVERS_K8S_SKIP_UI=1
+# skips the standalone rivers-ui server binary — the wheel still compiles the
+# rivers-ui lib and embeds its WASM, so `wasm` stays a prerequisite; only the
+# separate UI server (which the integration suite never deploys) is dropped.
 _k8s-compile: wasm _k8s-wheel
+    #!/usr/bin/env bash
+    set -euo pipefail
     cargo zigbuild -p rivers-operator --target {{ linux_target }}
-    cargo zigbuild -p rivers-ui --target {{ linux_target }} --features ssr
+    if [ "${RIVERS_K8S_SKIP_UI:-}" != "1" ]; then
+        cargo zigbuild -p rivers-ui --target {{ linux_target }} --features ssr
+    fi
 
 # Cross-compile just the Python wheel for Linux
 _k8s-wheel:
@@ -167,6 +182,40 @@ k8s-down:
 # Run K8s integration tests (cluster must be running)
 k8s-test:
     uv run --no-sync pytest python/tests/integration/kubernetes/ -v
+
+# Block until the deployed stack is ready (operator, storage, baseline CodeLocation)
+k8s-wait:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Gate operator + SurrealDB + MinIO, then the baseline CodeLocation reaching
+    # Ready (operator reconciled its pod, storage reachable). CI runs this before
+    # the suite so a broken deploy fails loudly instead of the tests silently
+    # skipping. RIVERS_K8S_SKIP_UI=1 drops the UI rollout wait.
+    ns=rivers
+    # Pin the context like the tests do, so this never waits on the wrong cluster.
+    kc=(kubectl --context "k3d-${RIVERS_K3D_CLUSTER:-rivers-test}" -n "$ns")
+    echo "==> Waiting for operator + storage + object store"
+    "${kc[@]}" rollout status deploy/rivers-operator --timeout=240s
+    "${kc[@]}" wait --for=condition=Ready pod -l app.kubernetes.io/name=surrealdb --timeout=240s
+    "${kc[@]}" wait --for=condition=Ready pod -l app.kubernetes.io/name=minio --timeout=180s
+    if [ "${RIVERS_K8S_SKIP_UI:-}" != "1" ]; then
+        "${kc[@]}" rollout status deploy/rivers-ui --timeout=180s
+    fi
+    cl="${RIVERS_K8S_TEST_CODE_LOCATION:-k8s-test-pipeline}"
+    echo "==> Waiting for CodeLocation ${cl} to reach Ready"
+    phase=""
+    for _ in $(seq 1 60); do
+        phase="$("${kc[@]}" get codelocation "$cl" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+        echo "    ${cl}: ${phase:-<pending>}"
+        [ "$phase" = "Ready" ] && break
+        sleep 5
+    done
+    if [ "$phase" != "Ready" ]; then
+        echo "==> CodeLocation ${cl} never reached Ready (phase=${phase:-<none>})" >&2
+        "${kc[@]}" get pods,codelocations || true
+        exit 1
+    fi
+    echo "==> Cluster ready."
 
 # Build a code-location Docker image (test or demo). Rebuilds only the Python wheel.
 k8s-code-location project="test": _k8s-wheel

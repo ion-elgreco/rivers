@@ -28,7 +28,7 @@ import pytest
 from kr8s import NotFoundError
 from kr8s.objects import APIObject, Deployment, Pod, Secret, Service
 
-from .conftest import KUBECTL_CONTEXT, kube_api
+from .conftest import KUBECTL_CONTEXT, cluster_gate, kube_api
 
 NAMESPACE = "rivers"
 # Operator-managed CodeLocation CR applied by `dev/k3d/setup.sh`; the
@@ -62,9 +62,9 @@ def _cluster_reachable() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _cluster_reachable(),
-    reason=f"k3d cluster '{KUBECTL_CONTEXT}' not reachable or namespace '{NAMESPACE}' missing",
+pytestmark = cluster_gate(
+    _cluster_reachable(),
+    f"k3d cluster '{KUBECTL_CONTEXT}' not reachable or namespace '{NAMESPACE}' missing",
 )
 
 
