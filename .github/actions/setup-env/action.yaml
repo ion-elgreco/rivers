@@ -122,7 +122,9 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        pipx install ziglang
+        # Pinned — zig releases change bundled-clang behavior. Keep in sync
+        # with `ziglang_version` in the justfile.
+        pipx install 'ziglang==0.16.0'
         # ziglang ≥0.14 renamed its console script to `python-zig`;
         # cargo-zigbuild discovers the linker as `zig` on PATH.
         ln -sf "$(command -v python-zig)" "$HOME/.local/bin/zig"

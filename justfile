@@ -11,6 +11,11 @@ profile := env_var_or_default("PROFILE", "dev")
 
 profile_dir := if profile == "dev" { "debug" } else { profile }
 
+# Pinned zig for the maturin/zigbuild builds — zig releases change bundled-clang
+# behavior. Keep in sync with the pipx install in .github/actions/setup-env.
+
+ziglang_version := "0.16.0"
+
 _default:
     just --list
 
@@ -35,15 +40,15 @@ wasm-dev:
 
 # Build and install rivers as editable (release WASM — use for UI work or shipping)
 develop: venv wasm
-    cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' maturin develop --profile {{ profile }}
+    cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --profile {{ profile }}
 
 # Faster develop for non-UI work — dev-profile WASM build (preserves panic symbols, larger blob; don't use for k8s/release)
 develop-fast: venv wasm-dev
-    cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' maturin develop --profile {{ profile }}
+    cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --profile {{ profile }}
 
 # Build and install rivers as editable (release mode, stripped WASM)
 develop-release: venv wasm
-    cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' maturin develop --release
+    cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --release
 
 # Run Python tests
 test:
@@ -126,6 +131,11 @@ docs-set-default push="--push":
 linux_target := "aarch64-unknown-linux-gnu"
 cluster_name := env_var_or_default("RIVERS_K3D_CLUSTER", "rivers-test")
 
+# zig's bundled libc++ headers lack nullability annotations; without this every
+# RocksDB C++ unit emits ~120 -Wnullability-completeness notes under zig cc.
+
+zig_cxxflags := "-Wno-nullability-completeness"
+
 # Regenerate CRD YAML from Rust types (source of truth) into the rivers-crds Helm chart
 gen-crds:
     cargo run -p rivers-k8s --bin rivers-gen-crd -- codelocation > deploy/helm/rivers-crds/crds/codelocations.rivers.io.yaml
@@ -162,6 +172,7 @@ k8s-build: _k8s-compile
 _k8s-compile: wasm _k8s-wheel
     #!/usr/bin/env bash
     set -euo pipefail
+    export CXXFLAGS="${CXXFLAGS:-} {{ zig_cxxflags }}"
     cargo zigbuild -p rivers-operator --target {{ linux_target }}
     if [ "${RIVERS_K8S_SKIP_UI:-}" != "1" ]; then
         cargo zigbuild -p rivers-ui --target {{ linux_target }} --features ssr
@@ -169,7 +180,7 @@ _k8s-compile: wasm _k8s-wheel
 
 # Cross-compile just the Python wheel for Linux
 _k8s-wheel:
-    cd python && CARGO_TARGET_DIR='{{ justfile_directory() }}/target/maturin' VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' maturin build --target {{ linux_target }} --zig --out ../dist
+    cd python && CXXFLAGS="${CXXFLAGS:-} {{ zig_cxxflags }}" CARGO_TARGET_DIR='{{ justfile_directory() }}/target/maturin' VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin build --target {{ linux_target }} --zig --out ../dist
 
 # Create k3d cluster, build images, deploy with Helm
 k8s-up: k8s-build
