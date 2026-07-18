@@ -289,8 +289,6 @@ pub(super) struct ConditionEvalLoopConfig {
     /// Shared with the schedule/sensor loop.
     pub run_dispatcher: Arc<crate::daemon::dispatchers::RunDispatcherKind>,
     pub backfill_dispatcher: Arc<crate::daemon::dispatchers::BackfillDispatcherKind>,
-    pub cancel: CancellationToken,
-    pub interval: std::time::Duration,
     pub tick_tx: tokio::sync::mpsc::UnboundedSender<TickWriteMsg>,
     pub max_ticks_retained: Option<usize>,
     pub eval_tx: tokio::sync::mpsc::UnboundedSender<ConditionEvalWriteMsg>,
@@ -299,16 +297,18 @@ pub(super) struct ConditionEvalLoopConfig {
     pub upstream_partition_keys: HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)>,
 }
 
-/// Background loop that periodically evaluates automation conditions on assets.
+/// Restore eval state and prime the cache. Awaited in `daemon_main_loop`
+/// before any dispatch-capable subdaemon spawns, so an in-process run can't
+/// land in the middle of the cache's initial load.
 #[tracing::instrument(skip_all, target = "rivers::daemon", name = "condition_loop", fields(asset_count = config.conditions.len()))]
-pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
+pub(in crate::daemon) async fn build_condition_engine(
+    config: ConditionEvalLoopConfig,
+) -> ConditionTickEngine {
     let ConditionEvalLoopConfig {
         conditions,
         storage,
         run_dispatcher,
         backfill_dispatcher,
-        cancel,
-        interval,
         tick_tx,
         max_ticks_retained,
         eval_tx,
@@ -375,13 +375,6 @@ pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
 
     let pass = ConditionPass::new(cache, eval_state, conditions, upstream_partition_keys);
 
-    tracing::info!(
-        target: "rivers::daemon",
-        count = pass.conditions.len(),
-        partitioned = pass.cache.partitioned_asset_count(),
-        "condition eval loop started"
-    );
-
     let mut engine = ConditionTickEngine {
         pass,
         code_location_id,
@@ -393,7 +386,38 @@ pub(super) async fn condition_eval_loop(config: ConditionEvalLoopConfig) {
         max_ticks_retained,
         max_evals_retained,
         last_state_persist: 0,
+        initial_changes: false,
     };
+
+    match engine
+        .pass
+        .refresh_cache(engine.storage.backend().as_ref(), now_ts())
+        .await
+    {
+        Ok(changed) => engine.initial_changes = changed,
+        Err(e) => tracing::warn!(
+            target: "rivers::daemon",
+            error = %e,
+            "initial condition cache load failed; the first tick retries"
+        ),
+    }
+
+    engine
+}
+
+/// Background loop that periodically evaluates automation conditions on assets.
+#[tracing::instrument(skip_all, target = "rivers::daemon", name = "condition_loop", fields(asset_count = engine.pass.conditions.len()))]
+pub(in crate::daemon) async fn condition_eval_loop(
+    mut engine: ConditionTickEngine,
+    cancel: CancellationToken,
+    interval: std::time::Duration,
+) {
+    tracing::info!(
+        target: "rivers::daemon",
+        count = engine.pass.conditions.len(),
+        partitioned = engine.pass.cache.partitioned_asset_count(),
+        "condition eval loop started"
+    );
 
     loop {
         tokio::select! {
