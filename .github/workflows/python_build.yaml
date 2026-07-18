@@ -180,27 +180,18 @@ jobs:
           # cargo-zigbuild + zig cross-linker for the linux-target operator/wheel build.
           cross_compile: "true"
 
-      # k3d + helmfile + helm at the exact versions mise.toml / mise.lock pin
-      # for local dev — one source of truth instead of hand-maintained download
-      # URLs (the action adds `--locked` automatically when mise.lock exists,
-      # and caches the installed tools). kubectl isn't mise-managed; it ships
-      # on GitHub runner images, with a pinned fallback below.
-      - name: Install k3d + helmfile + helm via mise
+      # k3d + helmfile + helm + kubectl at the exact versions mise.toml /
+      # mise.lock pin for local dev — one source of truth instead of
+      # hand-maintained download URLs (the action adds `--locked` when
+      # mise.lock exists and verifies its checksums, and caches the tools).
+      - name: Install cluster tooling via mise
         uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
         env:
           # Tool resolution hits the GitHub API — authenticate to dodge the
           # shared-runner-IP rate limit.
           GITHUB_TOKEN: ${{ github.token }}
         with:
-          install_args: k3d helmfile helm
-
-      - name: Ensure kubectl
-        run: |
-          if ! command -v kubectl >/dev/null 2>&1; then
-            curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/v1.31.4/bin/linux/arm64/kubectl"
-            sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
-          fi
-          k3d version && helmfile version && helm version --short && kubectl version --client
+          install_args: k3d helmfile helm kubectl
 
       # The external images (MinIO, SurrealDB) come from Docker Hub, whose
       # unauthenticated per-IP rate limits are a flake source on shared runner
