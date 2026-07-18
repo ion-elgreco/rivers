@@ -66,6 +66,10 @@ pub struct AssetConditionCache {
     /// guards overwrites so an earlier-finishing overlapping run can't clobber
     /// a later one's tags/asset-names.
     last_run_entry_ts: HashMap<(String, Option<PartitionKey>), i64>,
+    /// Test-only rendezvous between `initial_load`'s records read and its
+    /// run-status reads, so a test can commit a run completion there.
+    #[cfg(test)]
+    pub(crate) initial_load_gate: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl Default for AssetConditionCache {
@@ -109,6 +113,8 @@ impl AssetConditionCache {
             pending_grace_nanos: DEFAULT_PENDING_GRACE_NANOS,
             applied_run_ids: HashMap::new(),
             last_run_entry_ts: HashMap::new(),
+            #[cfg(test)]
+            initial_load_gate: None,
         }
     }
 
@@ -266,6 +272,24 @@ impl AssetConditionCache {
         let ctx = self.ctx.clone();
         let scoped = storage.for_code_location(&ctx);
 
+        // Run cursor FIRST: a run marked applied here was terminal before
+        // every read below (the executor flushes events before the terminal
+        // status write), so its effects are visible to them. A run completing
+        // mid-load stays unmarked and the first refresh re-applies it.
+        let recent = scoped.get_runs(1, None).await?;
+        if let Some(newest) = recent.first() {
+            self.last_seen_run_ts = newest.start_time.saturating_sub(1);
+            let ties = scoped
+                .get_runs_since(self.last_seen_run_ts, None, crate::storage::SortOrder::Asc)
+                .await?;
+            for run in &ties {
+                if run_status_is_terminal(&run.status) {
+                    self.applied_run_ids
+                        .insert(run.run_id.clone(), run.start_time);
+                }
+            }
+        }
+
         // Records loaded below already reflect past observations; replaying
         // the observation history would AssetClear live run tracking. The
         // cursor therefore trails the NEWEST stored observation by 1 (not
@@ -283,6 +307,12 @@ impl AssetConditionCache {
             .into_iter()
             .map(|r| (r.asset_key.clone(), r))
             .collect();
+
+        #[cfg(test)]
+        if let Some(gate) = &self.initial_load_gate {
+            gate.wait().await;
+            gate.wait().await;
+        }
 
         if let Some(topology) = scoped.get_graph_topology().await? {
             self.edges = topology.edges;
@@ -390,23 +420,6 @@ impl AssetConditionCache {
         }
 
         self.backfill = Self::load_active_backfills(storage, &self.ctx).await?;
-
-        let recent = scoped.get_runs(1, None).await?;
-        if let Some(newest) = recent.first() {
-            self.last_seen_run_ts = newest.start_time.saturating_sub(1);
-            // The newest runs' effects are already reflected in the records
-            // loaded above; seed them as applied so the first refresh doesn't
-            // replay them into the tick-scoped tag accumulators.
-            let ties = scoped
-                .get_runs_since(self.last_seen_run_ts, None, crate::storage::SortOrder::Asc)
-                .await?;
-            for run in &ties {
-                if run_status_is_terminal(&run.status) {
-                    self.applied_run_ids
-                        .insert(run.run_id.clone(), run.start_time);
-                }
-            }
-        }
 
         self.load_partition_status_inner(storage).await?;
 

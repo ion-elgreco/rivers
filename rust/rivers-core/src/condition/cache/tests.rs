@@ -145,6 +145,142 @@ fn override_covers_every_succeeded_run_not_the_first_found() {
     );
 }
 
+#[tokio::test]
+async fn initial_load_run_completing_mid_load_is_not_lost() {
+    // source → processed, both materialized by joint run r0. Schedule run r1
+    // (source only) is Started when initial_load begins and completes between
+    // the records read and the run-status reads. r1 must not be marked
+    // applied off that late terminal read: that skipped its effects forever,
+    // leaving last_run_asset_names[source] at r0's joint names, which kept
+    // LastRunIncludesTarget true and permanently suppressed eager() downstream.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+    let ctx = crate::storage::CodeLocationContext::new(cl.clone());
+
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[
+            rec_with_run("source", Some("r0"), 1000),
+            rec_with_run("processed", Some("r0"), 1000),
+        ])
+        .await
+        .unwrap();
+
+    use crate::assets::graph::{GraphTopology, NodeKind, TopologyNode};
+    let node = |name: &str| TopologyNode {
+        name: name.into(),
+        kind: NodeKind::Asset,
+        group: None,
+        parent_graph: None,
+    };
+    let topo = GraphTopology {
+        nodes: vec![node("source"), node("processed")],
+        edges: vec![("processed".to_string(), "source".to_string())],
+    };
+    storage
+        .kv_set(
+            &crate::graph_topology_key(&cl),
+            &serde_json::to_vec(&topo).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let run =
+        |run_id: &str, status: RunStatus, names: &[&str], start: i64, end: Option<i64>| RunRecord {
+            run_id: run_id.to_string(),
+            code_location_id: cl.clone(),
+            job_name: None,
+            status,
+            start_time: start,
+            end_time: end,
+            tags: Vec::new(),
+            node_names: names.iter().map(|s| s.to_string()).collect(),
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: crate::storage::LaunchedBy::Manual,
+        };
+    let mat_event = |asset: &str, run_id: &str, ts: i64| crate::storage::EventRecord {
+        code_location_id: cl.clone(),
+        event_type: crate::storage::EventType::Materialization {
+            data_version: Some(format!("dv_{asset}_{ts}")),
+        },
+        asset_key: Some(asset.to_string()),
+        run_id: run_id.to_string(),
+        partition_key: None,
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+
+    storage
+        .create_run(&run(
+            "r0",
+            RunStatus::Success,
+            &["source", "processed"],
+            1000,
+            Some(1000),
+        ))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[
+            mat_event("source", "r0", 1000),
+            mat_event("processed", "r0", 1000),
+        ])
+        .await
+        .unwrap();
+    storage
+        .create_run(&run("r1", RunStatus::Started, &["source"], 2000, None))
+        .await
+        .unwrap();
+
+    let gate = Arc::new(tokio::sync::Barrier::new(2));
+    let mut cache = AssetConditionCache::new(cl.clone());
+    cache.initial_load_gate = Some(Arc::clone(&gate));
+
+    let (load, ()) = tokio::join!(cache.refresh(&storage, 0), async {
+        gate.wait().await;
+        // r1 completes at the poison point: materialization first, then the
+        // terminal status — the executor's write order.
+        storage
+            .store_events(&[mat_event("source", "r1", 3000)])
+            .await
+            .unwrap();
+        storage
+            .update_run_status("r1", RunStatus::Success, Some(3000))
+            .await
+            .unwrap();
+        gate.wait().await;
+    });
+    load.unwrap();
+
+    assert!(
+        !cache.applied_run_ids.contains_key("r1"),
+        "a run completing mid-load must not be pre-marked applied"
+    );
+
+    let changed = cache.refresh(&storage, 0).await.unwrap();
+    assert!(changed, "first refresh must deliver r1's completion");
+    assert_eq!(
+        cache.records.get("source").unwrap().last_run_id.as_deref(),
+        Some("r1"),
+        "source's record must reflect the run that completed mid-load"
+    );
+    let names = cache
+        .last_run_asset_names
+        .get("source")
+        .and_then(|slots| slots.get(&None))
+        .expect("source must have last-run names once r1's effects apply");
+    assert_eq!(
+        names.as_ref(),
+        ["source".to_string()],
+        "last-run names must come from r1, not the stale joint run r0"
+    );
+}
+
 #[test]
 fn partition_keyed_success_clears_unpartitioned_asset_floor() {
     let mut cache = AssetConditionCache::new("default".to_string());
