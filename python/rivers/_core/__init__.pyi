@@ -267,6 +267,141 @@ class InvokedNodeOutput:
         """
         ...
 
+class FailureReason:
+    """Why a step failed; drives retry eligibility."""
+
+    ERROR: "FailureReason"
+    """Ordinary exception raised by user code."""
+    OUT_OF_MEMORY: "FailureReason"
+    """Pod terminated with reason ``OOMKilled``, or ``MemoryError`` in-process."""
+    TIMEOUT: "FailureReason"
+    """Exceeded a wall-clock deadline."""
+    INFRASTRUCTURE: "FailureReason"
+    """Environmental: pod vanished, bare kill signals (exit 137/143 without
+    ``OOMKilled`` — evictions, preemptions), worker-process death."""
+    CANCELLED: "FailureReason"
+    """Cancellation requested; never retried."""
+
+class RetryOn:
+    """Preset failure sets eligible for retry."""
+
+    ALL: "RetryOn"
+    """Any non-cancellation failure (default)."""
+    TRANSIENT: "RetryOn"
+    """Only ``OUT_OF_MEMORY`` / ``TIMEOUT`` / ``INFRASTRUCTURE`` — not
+    deterministic user errors."""
+
+class Backoff:
+    """A retry wait schedule. Build via the static factories; every shape takes
+    a relative ``jitter`` (0..1, fraction of the computed wait) and most take a
+    ``max_delay`` ceiling in seconds."""
+
+    @staticmethod
+    def constant(
+        delay: float, *, jitter: float = 0.0, max_delay: float | None = None
+    ) -> "Backoff":
+        """Wait ``delay`` seconds before every attempt."""
+        ...
+
+    @staticmethod
+    def linear(
+        step: float,
+        *,
+        initial: float = 0.0,
+        jitter: float = 0.0,
+        max_delay: float | None = None,
+    ) -> "Backoff":
+        """Wait ``initial + step * n`` seconds before attempt *n*+1."""
+        ...
+
+    @staticmethod
+    def exponential(
+        initial: float,
+        *,
+        factor: float = 2.0,
+        jitter: float = 0.0,
+        max_delay: float | None = None,
+    ) -> "Backoff":
+        """Wait ``initial * factor**(n-1)`` seconds, capped at ``max_delay``."""
+        ...
+
+    @staticmethod
+    def fixed(schedule: Sequence[float], *, jitter: float = 0.0) -> "Backoff":
+        """Walk an explicit per-attempt schedule (clamped to the last entry)."""
+        ...
+
+class ComputeEscalation:
+    """Grow a step's compute on OOM retries, up to a required ceiling. Effective
+    on executors that provision compute per step (Kubernetes)."""
+
+    def __init__(
+        self,
+        *,
+        max_memory: str,
+        factor: float = 2.0,
+        cpu_factor: float | None = None,
+        max_cpu: str | None = None,
+        on: Sequence[FailureReason] | None = None,
+    ) -> None:
+        """Configure escalation.
+
+        Args:
+            max_memory: Hard ceiling on the memory request (k8s quantity, e.g. ``"64Gi"``).
+            factor: Multiplier applied to the memory request per escalating retry.
+            cpu_factor: Optional multiplier for the CPU request.
+            max_cpu: Ceiling on CPU; used with ``cpu_factor``.
+            on: Failure reasons that escalate (default ``[FailureReason.OUT_OF_MEMORY]``).
+        """
+        ...
+
+    @property
+    def factor(self) -> float: ...
+    @property
+    def max_memory(self) -> str: ...
+
+class RetryPolicy:
+    """Declarative retry policy for a step (asset) or job."""
+
+    def __init__(
+        self,
+        max_retries: int = 1,
+        *,
+        backoff: Backoff | None = None,
+        retry_on: RetryOn | Sequence[type[BaseException] | FailureReason] | None = None,
+        escalate: ComputeEscalation | None = None,
+    ) -> None:
+        """Configure retries.
+
+        Args:
+            max_retries: Retry budget after the initial attempt.
+            backoff: Wait schedule between attempts (``None`` = retry immediately).
+            retry_on: A preset, or an allow-list mixing exception types
+                (subclass-aware) and :class:`FailureReason` members.
+            escalate: Grow compute on resource-exhaustion retries.
+        """
+        ...
+
+    @property
+    def max_retries(self) -> int: ...
+
+class Compute:
+    """Per-asset compute resources (Kubernetes quantity strings); ``None`` on an
+    axis inherits the executor default."""
+
+    def __init__(
+        self,
+        *,
+        cpu: str | None = None,
+        memory: str | None = None,
+        gpu: str | None = None,
+    ) -> None: ...
+    @property
+    def cpu(self) -> str | None: ...
+    @property
+    def memory(self) -> str | None: ...
+    @property
+    def gpu(self) -> str | None: ...
+
 class Job:
     """A named bundle of assets/tasks executed together as one run."""
 
@@ -276,6 +411,7 @@ class Job:
         assets: Sequence[Union[SingleAsset, MultiAsset, GraphAsset, Task, BashTask]],
         executor: "Executor | None" = None,
         allow_incomplete_deps: bool = False,
+        retry: "RetryPolicy | str | None" = None,
     ) -> None:
         """Construct a job.
 
@@ -285,6 +421,9 @@ class Job:
             executor: Override the repository default executor for this job.
             allow_incomplete_deps: Tolerate missing upstream deps (debug / partial
                 graphs); production jobs should leave this ``False``.
+            retry: Job-level retry default — a :class:`RetryPolicy` or the name of
+                a policy registered in ``CodeRepository(retries=...)``. Assets with
+                their own policy keep it.
         """
         ...
 
@@ -303,6 +442,22 @@ class Job:
                 ``rivers/priority`` is honored for run-queue priority.
             config: Per-asset config, keyed by asset name.
             raise_on_error: Raise on first failure instead of returning a failed result.
+        """
+        ...
+
+    def _execute_run(
+        self,
+        run_id: str,
+        partition_key: PartitionKey | None = None,
+        config: dict[str, dict[str, Any]] | None = None,
+        resume: bool = False,
+        raise_on_error: bool = True,
+    ) -> "RunResult":
+        """Execute a previously created run record (internal).
+
+        Entry point for daemon dispatch and the Kubernetes run pod
+        (``rivers execute --job``) — the ``Started`` run record already
+        exists, so this attaches to it instead of creating a new one.
         """
         ...
 
@@ -673,11 +828,17 @@ __all__ = [
     "AutomationDaemon",
     "Asset",
     "AssetExecutionContext",
+    "Backoff",
     "BashTask",
+    "Compute",
+    "ComputeEscalation",
+    "FailureReason",
     "InputContext",
     "InvokedNodeOutput",
     "Job",
     "Materialization",
+    "RetryOn",
+    "RetryPolicy",
     "MetadataValue",
     "DynamicOutput",
     "Observation",

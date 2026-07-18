@@ -56,6 +56,8 @@ nav:
       - Backfills: concepts/backfills.md
       - Scheduling & Automation: concepts/scheduling.md
       - Concurrency: concepts/concurrency.md
+      - Retries: concepts/retries.md
+      - Per-asset compute: concepts/compute.md
   - Installation:
       - Overview: installation/overview.md
       - Kubernetes: installation/kubernetes.md
@@ -69,6 +71,7 @@ nav:
       - Task: api-reference/task.md
       - Job: api-reference/job.md
       - Executors: api-reference/executors.md
+      - Retries & Compute: api-reference/retries.md
       - Context: api-reference/context.md
       - Schedules: api-reference/schedules.md
       - Sensors: api-reference/sensors.md

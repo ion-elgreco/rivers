@@ -41,6 +41,14 @@ Read by the `rivers-operator` binary at startup.
 | `RIVERS_WEBHOOK_CERT_DIR` | `/etc/webhook-cert` | Directory holding `tls.crt` / `tls.key` (the conventional `kubernetes.io/tls` Secret layout — works with cert-manager out of the box). |
 | `RIVERS_WEBHOOK_DISABLED` | unset (`"1"` to disable) | Disables the webhook entirely. Useful for local operator dev where you don't want to set up cert-manager. |
 
+## Kubernetes step pods
+
+Stamped by the executor onto every step pod (read them from asset/task code).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RIVERS_STEP_ATTEMPT` | `1` | 1-indexed attempt number of this step pod — increments on each [retry](retries.md). |
+
 ## Standalone UI binary
 
 Read by `rivers-ui` (the standalone UI server, distinct from the in-process UI started by `rivers dev`). Both flag and env-var forms are accepted.

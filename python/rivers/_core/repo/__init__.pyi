@@ -3,7 +3,14 @@
 from collections.abc import Sequence
 from typing import Any, TypeVar, Union, overload
 
-from rivers._core import BashTask, Job, RunBackendConfig, RunQueueConfig, Task
+from rivers._core import (
+    BashTask,
+    Job,
+    RetryPolicy,
+    RunBackendConfig,
+    RunQueueConfig,
+    Task,
+)
 from rivers._core.assets import ExternalAsset, GraphAsset, MultiAsset, SingleAsset
 from rivers._core.executor import Executor
 from rivers._core.partitions import BackfillStrategy, PartitionKey, PartitionKeyRange
@@ -131,6 +138,8 @@ class CodeRepository:
         sensors: Sequence[Sensor] | None = None,
         default_executor: Executor | None = None,
         resources: dict[str, Any] | None = None,
+        retries: dict[str, RetryPolicy] | None = None,
+        default_retry_policy: "RetryPolicy | str | None" = None,
         run_queue: "RunQueueConfig | None" = None,
         run_backend: "RunBackendConfig | None" = None,
         pool_limits: dict[str, int] | None = None,
@@ -145,6 +154,10 @@ class CodeRepository:
             sensors: Sensors attached to the repository.
             default_executor: Executor used when a job doesn't specify one.
             resources: ``{name: Resource}`` map injected into asset/task signatures.
+            retries: Named retry policies referenced by ``retry="name"`` on
+                assets and jobs.
+            default_retry_policy: Repo-wide retry default (lowest precedence:
+                asset > job > this) — a policy or a ``retries`` registry name.
             run_queue: Run queue limits and dequeue cadence.
             run_backend: Local vs Kubernetes run launch configuration.
             pool_limits: Initial concurrency-pool slot caps.
@@ -235,6 +248,7 @@ class CodeRepository:
         run_id_override: str | None = None,
         include_upstream: bool = False,
         resume: bool = False,
+        retry: "RetryPolicy | str | None" = None,
     ) -> RunResult:
         """Materialize assets synchronously.
 
@@ -247,6 +261,9 @@ class CodeRepository:
             run_id_override: Use a pre-assigned run ID (for K8s execution pods).
             include_upstream: Also materialize transitive deps (default: only ``selection``).
             resume: Skip already-completed steps from a crashed prior run with the same ID.
+            retry: Run-level retry default for this materialization — a
+                :class:`RetryPolicy` or a ``retries`` registry name. Assets with
+                their own policy keep it.
         """
         ...
 

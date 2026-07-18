@@ -21,6 +21,7 @@ pub struct Task {
     pub partition_mapping: Option<PartitionMappingDict>,
     /// IO handler for the task. Set to the shared `InMemoryIOHandler` by default during resolve.
     pub io_handler: Option<IOHandler>,
+    pub retry: Option<rivers_core::execution::retry::RetryRef>,
 }
 
 /// A composable task, exposed to Python as `Task`.
@@ -37,7 +38,7 @@ pub struct PyTask {
 #[pymethods]
 impl PyTask {
     #[new]
-    #[pyo3(signature = (wraps=None, name=None, tags=None, partitions_def=None, partition_mapping=None, io_handler=None))]
+    #[pyo3(signature = (wraps=None, name=None, tags=None, partitions_def=None, partition_mapping=None, io_handler=None, retry=None))]
     fn new(
         py: Python,
         wraps: Option<Py<PyAny>>,
@@ -46,6 +47,7 @@ impl PyTask {
         partitions_def: Option<Py<PartitionsDefinition>>,
         partition_mapping: Option<PartitionMappingDict>,
         io_handler: Option<IOHandler>,
+        retry: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let task_name = name_or_fn_name(py, name, &wraps);
 
@@ -59,6 +61,7 @@ impl PyTask {
                 partitions_def,
                 partition_mapping,
                 io_handler,
+                retry: crate::retry::extract_retry_ref(retry)?,
             },
         })
     }

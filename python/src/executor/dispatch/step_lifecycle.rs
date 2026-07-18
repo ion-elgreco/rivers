@@ -21,7 +21,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionStep;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
-use rivers_core::storage::ScopedStorageHandle;
+use rivers_core::storage::{ScopedStorageHandle, StorageBackend};
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::errors::ExecutionError;
@@ -29,26 +29,25 @@ use crate::errors::ExecutionError;
 use super::super::event_writer::WriterMsg;
 use super::super::ops::{self, now_ts};
 use super::context::BatchContext;
+use super::failure::{self, classify_pyerr};
 use super::pool_claim::PoolGuard;
-use super::results::process_outcome;
+use super::results::{emit_captured_logs, process_outcome};
 use super::types::WorkOutcome;
 
 /// Phase-4 work supplied by an in-process backend. Runs synchronously with
 /// the GIL held; the lifecycle hands `&BatchContext` so the worker can read
-/// resolved repo state during invocation.
+/// resolved repo state during invocation. Takes `&self` so the retry loop can
+/// re-run the same work for a later attempt.
 pub(crate) trait SyncWorker {
-    fn run_work(self, py: Python, ctx: &BatchContext) -> WorkOutcome
-    where
-        Self: Sized;
+    fn run_work(&self, py: Python, ctx: &BatchContext) -> WorkOutcome;
 }
 
 /// Phase-4 work supplied by a backend that schedules onto a tokio task
 /// (async or parallel-pool). The worker runs inside `spawn_blocking` so it
-/// can't borrow from the orchestrator stack — it owns its data.
-pub(crate) trait AsyncWorker: Send + 'static {
-    fn run_work(self) -> WorkOutcome
-    where
-        Self: Sized;
+/// can't borrow from the orchestrator stack — it owns its data. Takes `&self`
+/// (shared via `Arc` across attempts) so the retry loop can re-run it.
+pub(crate) trait AsyncWorker: Send + Sync + 'static {
+    fn run_work(&self) -> WorkOutcome;
 }
 
 /// Run the synchronous lifecycle around `worker`. Pool-claim failures use
@@ -64,7 +63,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
     worker: W,
     failures: &mut Vec<(String, PyErr)>,
 ) {
-    let guard = if pools.is_empty() {
+    let mut guard = if pools.is_empty() {
         None
     } else {
         match PoolGuard::acquire_blocking(
@@ -91,7 +90,83 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
         ctx.emit_start(name, now_ts());
     }
 
-    let outcome = worker.run_work(py, ctx);
+    let policy = ctx.retry_policy_for(step).cloned();
+    let mut attempt: u32 = 1;
+    if ctx.scope.resume
+        && policy.is_some()
+        && let Some(first) = event_names.first()
+    {
+        attempt += failure::prior_step_retries_blocking(
+            py,
+            ctx.sink.storage.backend(),
+            ctx.scope.run_id,
+            first,
+        );
+    }
+    let outcome = loop {
+        let mut outcome = worker.run_work(py, ctx);
+        let (WorkOutcome::Error { error, .. }, Some(policy)) = (&outcome, &policy) else {
+            break outcome;
+        };
+        let (reason, exc_types) = classify_pyerr(py, error);
+        let Some(delay) = failure::admit_retry(policy, step_name, reason, &exc_types, attempt)
+        else {
+            break outcome;
+        };
+        // Flush the failed attempt's logs now (taken out so a cancelled
+        // backoff below can't re-emit them with the returned outcome).
+        if let WorkOutcome::Error { captured_logs, .. } = &mut outcome {
+            emit_captured_logs(ctx, step_name, captured_logs.take());
+        }
+        for name in event_names {
+            ctx.emit_step_retry(name, attempt, reason, delay);
+        }
+        if !delay.is_zero() {
+            // A sleeping step must not hold pool slots (it would starve
+            // siblings and other runs), and cancellation cuts the wait short.
+            if let Some(g) = guard.take() {
+                g.release_blocking(py);
+            }
+            if failure::backoff_sleep_cancellable_blocking(
+                py,
+                ctx.sink.storage.backend(),
+                ctx.scope.run_id,
+                delay,
+            ) {
+                break outcome;
+            }
+            if !pools.is_empty() {
+                match PoolGuard::acquire_blocking(
+                    py,
+                    ctx.sink.storage,
+                    &pools,
+                    ctx.scope.run_id,
+                    step_name,
+                    ctx.event_sender(),
+                ) {
+                    Ok(g) => guard = Some(g),
+                    Err(e) => {
+                        if let WorkOutcome::Error { error, .. } = &mut outcome {
+                            *error = ExecutionError::new_err(format!(
+                                "Failed to re-claim pool slots for retry: {e}"
+                            ));
+                        }
+                        break outcome;
+                    }
+                }
+            }
+        }
+        // Zero-backoff ladders have no sleep to interrupt — probe once per
+        // attempt so a cancelled run stops instead of burning the budget.
+        if failure::run_cancelled_blocking(py, ctx.sink.storage.backend(), ctx.scope.run_id) {
+            break outcome;
+        }
+        attempt += 1;
+        let ts = now_ts();
+        for name in event_names {
+            ctx.emit_start(name, ts);
+        }
+    };
 
     if let Some(g) = guard {
         g.release_blocking(py);
@@ -118,15 +193,21 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
     start_event_names: Vec<String>,
     events_tx: mpsc::UnboundedSender<WriterMsg>,
     semaphore: Option<Arc<Semaphore>>,
+    retry_policy: Option<rivers_core::execution::retry::RetryPolicy>,
+    resume: bool,
     worker: W,
 ) -> WorkOutcome {
-    let _permit = if let Some(sem) = semaphore {
-        Some(sem.acquire_owned().await.expect("semaphore not closed"))
-    } else {
-        None
+    let mut permit = match &semaphore {
+        Some(sem) => Some(
+            sem.clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore not closed"),
+        ),
+        None => None,
     };
 
-    let guard = if pools.is_empty() {
+    let mut guard = if pools.is_empty() {
         None
     } else {
         match PoolGuard::acquire(
@@ -151,16 +232,130 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         ops::emit_step_start_via_tx(&events_tx, &code_location_id, &run_id, name, start_ts);
     }
 
-    let outcome = tokio::task::spawn_blocking(move || worker.run_work()).await;
+    let worker = Arc::new(worker);
+    let mut attempt: u32 = 1;
+    if resume
+        && retry_policy.is_some()
+        && let Some(first) = start_event_names.first()
+    {
+        attempt += failure::prior_step_retries(storage.backend(), &run_id, first).await;
+    }
+    let want_classify = retry_policy.is_some();
+    let outcome = loop {
+        let w = Arc::clone(&worker);
+        // Classification needs the GIL; attach on the blocking thread, not here.
+        let joined = tokio::task::spawn_blocking(move || {
+            let outcome = w.run_work();
+            let classified = match &outcome {
+                WorkOutcome::Error { error, .. } if want_classify => {
+                    Python::try_attach(|py| classify_pyerr(py, error))
+                }
+                _ => None,
+            };
+            (outcome, classified)
+        })
+        .await;
+        let (mut outcome, classified) = match joined {
+            Ok(pair) => pair,
+            Err(e) => break prep_error(format!("spawn_blocking join error: {e}")),
+        };
+        if !matches!(outcome, WorkOutcome::Error { .. }) {
+            break outcome;
+        }
+        let (Some(policy), Some((reason, exc_types))) = (&retry_policy, classified.as_ref()) else {
+            break outcome;
+        };
+        let Some(delay) =
+            failure::admit_retry(policy, &pool_step_name, *reason, exc_types, attempt)
+        else {
+            break outcome;
+        };
+        // Flush the failed attempt's logs now (taken out so a cancelled
+        // backoff below can't re-emit them with the returned outcome).
+        if let WorkOutcome::Error { captured_logs, .. } = &mut outcome
+            && let Some((stdout, stderr, logs)) = captured_logs.take()
+        {
+            ops::emit_log_output_via_tx(
+                &events_tx,
+                &code_location_id,
+                &run_id,
+                &pool_step_name,
+                &stdout,
+                &stderr,
+                &logs,
+                now_ts(),
+            );
+        }
+        for name in &start_event_names {
+            ops::emit_step_retry_via_tx(
+                &events_tx,
+                &code_location_id,
+                &run_id,
+                name,
+                attempt,
+                *reason,
+                delay,
+                now_ts(),
+            );
+        }
+        if !delay.is_zero() {
+            // A sleeping step must not hold its concurrency permit or pool
+            // slots, and cancellation cuts the wait short.
+            if let Some(g) = guard.take() {
+                g.release().await;
+            }
+            drop(permit.take());
+            if failure::backoff_sleep_cancellable(storage.backend(), &run_id, delay).await {
+                break outcome;
+            }
+            if let Some(sem) = &semaphore {
+                permit = Some(
+                    sem.clone()
+                        .acquire_owned()
+                        .await
+                        .expect("semaphore not closed"),
+                );
+            }
+            if !pools.is_empty() {
+                match PoolGuard::acquire(
+                    &storage,
+                    &pools,
+                    &run_id,
+                    &pool_step_name,
+                    events_tx.clone(),
+                )
+                .await
+                {
+                    Ok(g) => guard = Some(g),
+                    Err(e) => {
+                        break prep_error(format!("Failed to re-claim pool slots for retry: {e}"));
+                    }
+                }
+            }
+        }
+        // Zero-backoff ladders have no sleep to interrupt — probe once per
+        // attempt so a cancelled run stops instead of burning the budget.
+        if storage
+            .backend()
+            .is_cancelled(&run_id)
+            .await
+            .unwrap_or(false)
+        {
+            break outcome;
+        }
+        attempt += 1;
+        let ts = now_ts();
+        for name in &start_event_names {
+            ops::emit_step_start_via_tx(&events_tx, &code_location_id, &run_id, name, ts);
+        }
+    };
 
+    drop(permit);
     if let Some(g) = guard {
         g.release().await;
     }
 
-    match outcome {
-        Ok(o) => o,
-        Err(e) => prep_error(format!("spawn_blocking join error: {e}")),
-    }
+    outcome
 }
 
 fn prep_error(msg: String) -> WorkOutcome {

@@ -1002,6 +1002,7 @@ fn event_type_label(evt: &StoredEvent) -> &'static str {
         EventType::StepStart => "STEP_START",
         EventType::StepSuccess => "STEP_SUCCESS",
         EventType::StepFailure => "STEP_FAILURE",
+        EventType::StepRetry => "STEP_RETRY",
         EventType::Materialization => "MATERIALIZATION",
         EventType::Observation => "OBSERVATION",
         EventType::RunQueued => "RUN_QUEUED",
@@ -1018,6 +1019,7 @@ fn event_row_class(evt: &StoredEvent) -> &'static str {
         EventType::StepStart => "log-row--info",
         EventType::StepSuccess => "log-row--success",
         EventType::StepFailure => "log-row--error",
+        EventType::StepRetry => "log-row--warn",
         EventType::Materialization => "log-row--success",
         EventType::Observation => "log-row--info",
         EventType::RunQueued | EventType::RunDequeued => "log-row--info",
@@ -1044,6 +1046,19 @@ fn event_info(evt: &StoredEvent) -> String {
             .find(|(k, _)| k == "error")
             .map(|(_, v)| v.as_text())
             .unwrap_or_else(|| "Step failed".to_string()),
+        EventType::StepRetry => {
+            let mut s = "Retrying".to_string();
+            if let Some(a) = metadata_value(evt, "rivers/attempt") {
+                s.push_str(&format!(" after attempt {a}"));
+            }
+            if let Some(r) = metadata_value(evt, "rivers/failure_reason") {
+                s.push_str(&format!(" ({r})"));
+            }
+            if let Some(d) = metadata_value(evt, "rivers/next_delay_ms") {
+                s.push_str(&format!(" in {d}ms"));
+            }
+            s
+        }
         EventType::Materialization => {
             let mut parts = Vec::new();
             if let Some(p) = &evt.partition_key {

@@ -73,12 +73,13 @@ pub struct PyBashTask {
     pub partition_mapping: Option<PartitionMappingDict>,
     /// IO handler for the task. Set to the shared `InMemoryIOHandler` by default during resolve.
     pub io_handler: Option<IOHandler>,
+    pub retry: Option<rivers_core::execution::retry::RetryRef>,
 }
 
 #[pymethods]
 impl PyBashTask {
     #[new]
-    #[pyo3(signature = (name, command, env=None, cwd=None, tags=None, partition_mapping=None, io_handler=None))]
+    #[pyo3(signature = (name, command, env=None, cwd=None, tags=None, partition_mapping=None, io_handler=None, retry=None))]
     fn new(
         name: String,
         command: PyBashCommand,
@@ -87,6 +88,7 @@ impl PyBashTask {
         tags: Option<Vec<String>>,
         partition_mapping: Option<PartitionMappingDict>,
         io_handler: Option<IOHandler>,
+        retry: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         Ok(Self {
             name,
@@ -96,6 +98,7 @@ impl PyBashTask {
             tags,
             partition_mapping,
             io_handler,
+            retry: crate::retry::extract_retry_ref(retry)?,
         })
     }
 

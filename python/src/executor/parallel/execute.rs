@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PySet, PyTuple};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::errors::ExecutionError;
@@ -70,10 +71,12 @@ impl ExecutorBackend for ParallelBackend {
             return;
         }
 
+        // Retrying steps also take the lifecycle path — the batch/windowed fast
+        // paths resolve futures once and can't re-submit an attempt.
         let (pool_instances, no_pool_instances): (Vec<StepInstance>, Vec<StepInstance>) =
-            sync_instances
-                .into_iter()
-                .partition(|i| !i.pools.is_empty());
+            sync_instances.into_iter().partition(|i| {
+                !i.pools.is_empty() || ctx.retry_policy_for(&ctx.scope.plan.steps[i.idx]).is_some()
+            });
 
         let mut loky_futures: Vec<SubmittedStep> = Vec::new();
         let mut windowed_done = false;
@@ -180,7 +183,7 @@ impl ExecutorBackend for ParallelBackend {
         }
 
         if !pool_instances.is_empty() {
-            self.schedule_pool_steps_loky(py, ctx, pool_instances, failures);
+            self.schedule_pool_steps_loky(py, ctx, pool_instances, max_concurrency, failures);
         }
     }
 }
@@ -567,20 +570,22 @@ impl ParallelBackend {
     /// Pool-requiring steps: pre-build submit args (GIL), then JoinSet where each
     /// task runs through the shared async lifecycle, which handles pool claim,
     /// StepStart emission, the loky `spawn_blocking` hop, and pool release.
+    /// `max_concurrency` (mapped-group windowing) gates the lifecycle with a
+    /// semaphore so instances diverted here don't escape the window.
     fn schedule_pool_steps_loky(
         &self,
         py: Python,
         ctx: &mut BatchContext,
         pool_instances: Vec<StepInstance>,
+        max_concurrency: Option<usize>,
         failures: &mut Vec<(String, PyErr)>,
     ) {
-        let executor = match self.get_loky_executor(py) {
-            Ok(e) => e,
-            Err(e) => {
-                ctx.fail_all_instances(&pool_instances, &e.to_string(), failures);
-                return;
-            }
-        };
+        // Preflight loky availability; workers re-acquire per attempt so a
+        // pool broken by a dead worker recovers on retry.
+        if let Err(e) = self.get_loky_executor(py) {
+            ctx.fail_all_instances(&pool_instances, &e.to_string(), failures);
+            return;
+        }
 
         // Requires GIL + ctx, so pre-build before entering JoinSet.
         struct PreparedPoolStep {
@@ -588,6 +593,7 @@ impl ParallelBackend {
             pools: Vec<(String, u32)>,
             event_names: Vec<String>,
             instance_name: String,
+            retry: Option<rivers_core::execution::retry::RetryPolicy>,
         }
         let mut prepared: Vec<PreparedPoolStep> = Vec::new();
 
@@ -600,6 +606,9 @@ impl ParallelBackend {
                 pools: inst.pools.clone(),
                 event_names: inst.event_names.clone(),
                 instance_name: inst.instance_name.clone(),
+                retry: ctx
+                    .retry_policy_for(&ctx.scope.plan.steps[inst.idx])
+                    .cloned(),
             });
         }
 
@@ -607,10 +616,11 @@ impl ParallelBackend {
             return;
         }
 
-        let executor_arc = Arc::new(executor.unbind());
         let storage = ctx.sink.storage.clone();
         let run_id = ctx.scope.run_id.to_string();
         let events_tx = ctx.event_sender();
+        let window = max_concurrency.map(|n| Arc::new(Semaphore::new(n)));
+        let resume = ctx.scope.resume;
 
         type PoolResult = (usize, String, Vec<String>, WorkOutcome);
 
@@ -624,6 +634,7 @@ impl ParallelBackend {
                         pools,
                         event_names,
                         instance_name,
+                        retry,
                     } = prep;
                     let idx = base.idx;
                     let pool_step_name = instance_name.clone();
@@ -631,8 +642,9 @@ impl ParallelBackend {
                     let run_id = run_id.clone();
                     let events_tx = events_tx.clone();
                     let event_names_for_outcome = event_names.clone();
+                    let window = window.clone();
                     let worker = LokyPoolWorker {
-                        executor: Arc::clone(&executor_arc),
+                        max_workers: self.max_workers,
                         submit_args: base.submit_args,
                         input_versions: base.input_versions,
                         failure_config: base.failure_config,
@@ -646,7 +658,9 @@ impl ParallelBackend {
                             pool_step_name,
                             event_names,
                             events_tx,
-                            None,
+                            window,
+                            retry,
+                            resume,
                             worker,
                         )
                         .await;
@@ -680,20 +694,32 @@ impl ParallelBackend {
     }
 }
 
-/// Phase-4 worker for the parallel pool path: submits the pre-built args to a
-/// shared loky executor and blocks for the result, all under a `try_attach`d
-/// GIL inside `spawn_blocking`.
+/// Phase-4 worker for the parallel pool path: submits the pre-built args to
+/// the reusable loky executor and blocks for the result, all under a
+/// `try_attach`d GIL inside `spawn_blocking`. The executor is acquired per
+/// attempt — a healthy pool is returned as-is and a pool broken by a worker
+/// death is respawned, so retries self-heal.
 struct LokyPoolWorker {
-    executor: Arc<Py<PyAny>>,
+    max_workers: usize,
     submit_args: Vec<Py<PyAny>>,
     input_versions: Vec<(String, String)>,
     failure_config: Option<Py<PyAny>>,
 }
 
 impl AsyncWorker for LokyPoolWorker {
-    fn run_work(self) -> WorkOutcome {
+    fn run_work(&self) -> WorkOutcome {
         Python::try_attach(|py| -> WorkOutcome {
             let cfg = || self.failure_config.as_ref().map(|c| c.clone_ref(py));
+            let executor = match super::loky::acquire_reusable_executor(py, self.max_workers) {
+                Ok(e) => e,
+                Err(error) => {
+                    return WorkOutcome::Error {
+                        error,
+                        captured_logs: None,
+                        failure_config: cfg(),
+                    };
+                }
+            };
             let submit_tuple = match PyTuple::new(py, &self.submit_args) {
                 Ok(t) => t,
                 Err(error) => {
@@ -704,7 +730,7 @@ impl AsyncWorker for LokyPoolWorker {
                     };
                 }
             };
-            let future = match self.executor.call_method1(py, "submit", submit_tuple) {
+            let future = match executor.call_method1("submit", submit_tuple) {
                 Ok(f) => f,
                 Err(error) => {
                     return WorkOutcome::Error {
@@ -714,10 +740,10 @@ impl AsyncWorker for LokyPoolWorker {
                     };
                 }
             };
-            match future.call_method0(py, "result") {
+            match future.call_method0("result") {
                 Ok(worker_result) => WorkOutcome::WorkerSummary {
-                    worker_result,
-                    input_versions: self.input_versions,
+                    worker_result: worker_result.unbind(),
+                    input_versions: self.input_versions.clone(),
                     step_config: cfg(),
                 },
                 Err(error) => {

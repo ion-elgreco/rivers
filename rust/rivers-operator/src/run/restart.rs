@@ -29,12 +29,32 @@ pub async fn handle_executor_failure(
     let max_restarts = run.spec.max_restarts;
     let storage = ctx.storage.as_ref();
 
+    // A stored outcome means the executor COMPLETED the run before exiting —
+    // a deliberate failure/cancellation, not a crash. Honor it; restarting
+    // would replay the whole run.
+    if let Ok(Some(outcome)) = storage.get_run_outcome(run_id).await {
+        let mut new_status = status.clone();
+        new_status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        apply_outcome_to_status(&mut new_status, outcome);
+        patch_status(runs_api, name, &new_status).await?;
+        if let Some(ref phase) = new_status.phase {
+            sync_run_status_to_storage(storage, run_id, phase).await;
+        }
+        tracing::info!(
+            run = %name,
+            phase = ?new_status.phase,
+            "executor exited after completing the run; honoring stored outcome"
+        );
+        return Ok(Action::await_change());
+    }
+
     let progress = storage.get_run_progress(run_id).await.ok();
     let current_completed = progress.as_ref().map(|p| p.completed_steps).unwrap_or(0);
     let last_known_completed = status.completed_steps.unwrap_or(0);
     let progress_made = current_completed > last_known_completed;
 
     let mut new_status = status.clone();
+    new_status.total_restarts += 1;
 
     if progress_made {
         new_status.restarts_without_progress = 0;
@@ -82,13 +102,14 @@ pub async fn handle_executor_failure(
         return Ok(Action::await_change());
     }
 
-    let restart_num = new_status.restarts_without_progress;
-    let pod_name = format!("{name}-executor-{restart_num}");
+    // Named by the lifetime counter — the budget counter resets on progress
+    // and would reuse names, 409-adopting an old completed pod.
+    let pod_name = format!("{name}-executor-{}", new_status.total_restarts);
 
     tracing::info!(
         run = %name,
         pod = %pod_name,
-        restart = restart_num,
+        restart = new_status.restarts_without_progress,
         max = max_restarts,
         "restarting executor pod"
     );
@@ -107,13 +128,14 @@ pub async fn handle_executor_failure(
         Err(e) => return Err(e.into()),
     }
 
+    let budget_msg = format!(
+        "Restart {}/{max_restarts}",
+        new_status.restarts_without_progress
+    );
     new_status.executor_pod = Some(pod_name);
     push_condition(
         &mut new_status,
-        make_condition(
-            CONDITION_EXECUTOR_RESTARTED,
-            &format!("Restart {restart_num}/{max_restarts}"),
-        ),
+        make_condition(CONDITION_EXECUTOR_RESTARTED, &budget_msg),
     );
 
     patch_status(runs_api, name, &new_status).await?;
@@ -223,11 +245,40 @@ mod tests {
         let status = last_status_patch(&state);
         assert_eq!(status.phase, Some(RunPhase::Running));
         assert_eq!(status.restarts_without_progress, 0);
+        assert_eq!(status.total_restarts, 1);
         assert_eq!(status.completed_steps, Some(3));
         assert_eq!(status.total_steps, Some(5));
         assert!(status.last_progress_at.is_some());
-        assert_eq!(status.executor_pod.as_deref(), Some("test-run-executor-0"));
+        // Named by the lifetime counter — the budget reset must not reuse -0.
+        assert_eq!(status.executor_pod.as_deref(), Some("test-run-executor-1"));
         assert_eq!(status.completed_at, None);
+    }
+
+    #[tokio::test]
+    async fn restart_pod_names_stay_monotonic_across_progress_resets() {
+        let api_state = Arc::new(Mutex::new(MockApiState::default()));
+        let client = mock_client(api_state.clone());
+        let runs_api: Api<Run> = Api::namespaced(client.clone(), "default");
+        let pods_api: Api<Pod> = Api::namespaced(client.clone(), "default");
+
+        let storage = memory_storage().await;
+        let ctx = make_context(client, storage.clone());
+        seed_step_events(&storage, "run-1", 3, 5).await;
+
+        // Third lifetime restart, budget previously reset by progress.
+        let mut run = test_run_running("run-1", Some(1));
+        run.status.as_mut().unwrap().restarts_without_progress = 1;
+        run.status.as_mut().unwrap().total_restarts = 2;
+
+        handle_executor_failure(&runs_api, &pods_api, &ctx, &run, "test-run")
+            .await
+            .unwrap();
+
+        let state = api_state.lock().unwrap();
+        let status = last_status_patch(&state);
+        assert_eq!(status.restarts_without_progress, 0); // progress reset
+        assert_eq!(status.total_restarts, 3); // never resets
+        assert_eq!(status.executor_pod.as_deref(), Some("test-run-executor-3"));
     }
 
     #[tokio::test]
@@ -259,6 +310,50 @@ mod tests {
         assert_eq!(
             status.message.as_deref(),
             Some("Executor failed 3 time(s) without progress (max: 2)")
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_outcome_is_honored_without_restart() {
+        let api_state = Arc::new(Mutex::new(MockApiState::default()));
+        let client = mock_client(api_state.clone());
+        let runs_api: Api<Run> = Api::namespaced(client.clone(), "default");
+        let pods_api: Api<Pod> = Api::namespaced(client.clone(), "default");
+
+        let storage = memory_storage().await;
+        let ctx = make_context(client, storage.clone());
+        seed_run_record(&storage, "run-1").await;
+        storage
+            .set_run_outcome(
+                "run-1",
+                &RunOutcome::Failure {
+                    message: "all attempts exhausted".to_string(),
+                    completed_steps: 0,
+                    total_steps: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        let run = test_run_running("run-1", Some(0));
+        handle_executor_failure(&runs_api, &pods_api, &ctx, &run, "test-run")
+            .await
+            .unwrap();
+
+        let state = api_state.lock().unwrap();
+        let status = last_status_patch(&state);
+        // The deliberate failure is honored as-is: no restart accounting, no
+        // replacement executor pod.
+        assert_eq!(status.phase, Some(RunPhase::Failed));
+        assert_eq!(status.message.as_deref(), Some("all attempts exhausted"));
+        assert_eq!(status.restarts_without_progress, 0);
+        assert!(status.completed_at.is_some());
+        assert!(
+            !state
+                .requests
+                .iter()
+                .any(|r| r.method == "POST" && r.path.contains("/pods")),
+            "must not create a restart pod when the run completed"
         );
     }
 

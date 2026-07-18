@@ -55,6 +55,13 @@ fn default_max_workers() -> usize {
         .unwrap_or(1)
 }
 
+/// True inside a K8s step-worker pod (`RIVERS_STEP_POD=1`, stamped by the
+/// step Job builder).
+pub(crate) fn in_step_pod() -> bool {
+    static IN_STEP_POD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IN_STEP_POD.get_or_init(|| std::env::var("RIVERS_STEP_POD").is_ok_and(|v| v == "1"))
+}
+
 #[pyclass(name = "Executor", frozen, from_py_object, module = "rivers._core")]
 #[derive(Clone, Debug)]
 pub enum Executor {
@@ -229,6 +236,21 @@ impl Executor {
         io_handler_registry: &IOHandlerRegistry,
         resume: bool,
     ) -> Vec<(String, PyErr)> {
+        if !matches!(self, Executor::Kubernetes { .. }) {
+            let ignored: Vec<&str> = node_map
+                .iter()
+                .filter(|(_, n)| n.compute().is_some())
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if !ignored.is_empty() {
+                tracing::warn!(
+                    assets = ?ignored,
+                    "compute= is ignored by the in_process/parallel executors; \
+                     it applies on Kubernetes"
+                );
+            }
+        }
+
         let needs_bridge = plan
             .steps
             .iter()
@@ -358,7 +380,12 @@ impl Executor {
                                     let step = &plan.steps[step_idx];
                                     for name in step.event_names() {
                                         ops::emit_step_failure(
-                                            &writer, run_id, name, &msg, now_ts(),
+                                            &writer,
+                                            run_id,
+                                            name,
+                                            &msg,
+                                            None,
+                                            now_ts(),
                                         );
                                         failures.push((
                                             name.clone(),
@@ -378,6 +405,7 @@ impl Executor {
                             partition_key,
                             plan,
                             completed_steps: &completed_steps,
+                            resume,
                         },
                         state: dispatch::RunState {
                             data_versions: &mut data_versions,

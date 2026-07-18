@@ -401,7 +401,7 @@ pub(crate) fn process_outcome(
     }
 }
 
-fn emit_captured_logs(ctx: &mut BatchContext, step_name: &str, logs: CapturedLogs) {
+pub(crate) fn emit_captured_logs(ctx: &mut BatchContext, step_name: &str, logs: CapturedLogs) {
     if let Some((stdout, stderr, rust_logs)) = logs {
         ctx.emit_log_output(step_name, &stdout, &stderr, &rust_logs, now_ts());
     }
@@ -429,9 +429,10 @@ pub(crate) fn handle_failure(
     failures: &mut Vec<(String, PyErr)>,
 ) {
     let err_msg = error.to_string();
+    let classified = super::failure::classify_pyerr(py, &error);
     let ts = now_ts();
     for name in event_names {
-        ctx.emit_step_failure(name, &err_msg);
+        ctx.emit_step_failure(name, &err_msg, Some(&classified));
         ctx.emit_partition_failures(name, &err_msg, ts);
         ctx.state.mark_failed(name.clone());
     }

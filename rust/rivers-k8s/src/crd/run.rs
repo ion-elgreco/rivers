@@ -58,6 +58,12 @@ pub struct RunSpec {
     /// Asset or job to materialize/execute.
     pub target: String,
 
+    /// Job this run executes, when it was dispatched as one. The run pod then
+    /// goes through the job path so job-level config (retry, executor)
+    /// applies; absent for plain asset-selection runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_name: Option<String>,
+
     #[serde(default = "default_surreal_endpoint")]
     pub surreal_endpoint: String,
 
@@ -163,6 +169,11 @@ pub struct RunCrdStatus {
     pub executor_pod: Option<String>,
     #[serde(default)]
     pub restarts_without_progress: u32,
+    /// Lifetime restart count — never reset, so every restart pod gets a
+    /// fresh `-executor-<n>` name (`restartsWithoutProgress` resets on
+    /// progress and would repeat names, 409-adopting an old completed pod).
+    #[serde(default)]
+    pub total_restarts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_progress_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

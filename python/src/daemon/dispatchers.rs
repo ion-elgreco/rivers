@@ -36,7 +36,7 @@ pub(crate) fn launch_started_run(
             };
             if let Err(e) =
                 job.borrow(py)
-                    .execute_run(py, partition_key, &run_id, None, false, true)
+                    .execute_run(py, &run_id, partition_key, None, false, true)
             {
                 tracing::error!(
                     target: "rivers::executor",
@@ -200,6 +200,7 @@ impl DirectRunDispatcher {
                     Some(run_id.clone()),
                     false,
                     false,
+                    None,
                     launched_by,
                 ) {
                     tracing::error!(

@@ -2360,13 +2360,27 @@ impl StorageBackend for SurrealStorage {
 
     async fn get_run_progress(&self, run_id: &str) -> Result<RunProgress> {
         super::retry::with_retry(&self.retry_config, || async {
+            // Distinct steps, not raw events — a retried step re-emits
+            // StepStart/StepFailure per attempt and must count once. The dedup
+            // stays in-query so only scalars cross the DB hop (the operator
+            // polls this every reconcile pass).
             let mut result = self
                 .db
                 .query(
-                    "SELECT \
-                         math::sum(IF event_type = 'StepStart' THEN 1 ELSE 0 END) AS total, \
-                         math::sum(IF event_type = 'StepSuccess' OR (event_type = 'StepFailure' AND partition_key IS NONE) THEN 1 ELSE 0 END) AS completed \
-                     FROM events WHERE run_id = $run_id GROUP ALL; \
+                    "SELECT count() AS n FROM \
+                         (SELECT asset_key FROM events \
+                          WHERE run_id = $run_id AND event_type = 'StepStart' \
+                          AND asset_key IS NOT NONE \
+                          GROUP BY asset_key) \
+                         GROUP ALL; \
+                     SELECT count() AS n FROM \
+                         (SELECT asset_key FROM events \
+                          WHERE run_id = $run_id \
+                          AND (event_type = 'StepSuccess' \
+                               OR (event_type = 'StepFailure' AND partition_key IS NONE)) \
+                          AND asset_key IS NOT NONE \
+                          GROUP BY asset_key) \
+                         GROUP ALL; \
                      SELECT asset_key, timestamp FROM events \
                          WHERE run_id = $run_id \
                          AND (event_type = 'StepSuccess' OR (event_type = 'StepFailure' AND partition_key IS NONE)) \
@@ -2375,20 +2389,20 @@ impl StorageBackend for SurrealStorage {
                 .bind(("run_id", run_id.to_string()))
                 .await?;
 
-            let total: Option<u32> = result.take((0, "total"))?;
-            let completed: Option<u32> = result.take((0, "completed"))?;
+            let started: Option<u32> = result.take((0, "n"))?;
+            let terminal: Option<u32> = result.take((1, "n"))?;
 
             #[derive(Debug, SurrealValue, serde::Deserialize)]
             struct LastStep {
                 asset_key: Option<String>,
                 timestamp: i64,
             }
-            let last_steps: Vec<LastStep> = result.take(1)?;
+            let last_steps: Vec<LastStep> = result.take(2)?;
             let last = last_steps.into_iter().next();
 
             Ok(RunProgress {
-                completed_steps: completed.unwrap_or(0),
-                total_steps: total.unwrap_or(0),
+                completed_steps: terminal.unwrap_or(0),
+                total_steps: started.unwrap_or(0),
                 last_step_completed_at: last.as_ref().map(|s| s.timestamp),
                 last_completed_step: last.and_then(|s| s.asset_key),
             })
@@ -2431,6 +2445,29 @@ impl StorageBackend for SurrealStorage {
                 .query(
                     "SELECT * FROM events \
                          WHERE run_id = $run_id AND asset_key = $step_key \
+                         ORDER BY timestamp ASC, sort_order ASC, id ASC",
+                )
+                .bind(("run_id", run_id.to_string()))
+                .bind(("step_key", step_key.to_string()))
+                .await?;
+            let events: Vec<DbStoredEvent> = result.take(0)?;
+            Ok(events.into_iter().map(|e| e.into_stored_event()).collect())
+        })
+        .await
+    }
+
+    async fn get_step_terminal_events(
+        &self,
+        run_id: &str,
+        step_key: &str,
+    ) -> Result<Vec<StoredEvent>> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(
+                    "SELECT * FROM events \
+                         WHERE run_id = $run_id AND asset_key = $step_key \
+                         AND (event_type = 'StepSuccess' OR event_type = 'StepFailure') \
                          ORDER BY timestamp ASC, sort_order ASC, id ASC",
                 )
                 .bind(("run_id", run_id.to_string()))
@@ -2697,9 +2734,9 @@ impl PerCodeLocationStorage for SurrealStorage {
                 "SELECT count() AS total FROM concurrency_slots \
                      WHERE lease_expires_at <= $now GROUP ALL; \
                  DELETE FROM concurrency_slots WHERE lease_expires_at <= $now; \
-                 SELECT run_id, code_location_id, tags, node_names, priority, partition_key, start_time \
+                 SELECT run_id, code_location_id, tags, node_names, job_name, priority, partition_key, start_time \
                      FROM runs WHERE status IN ['NotStarted', 'Started'] AND code_location_id = $cl; \
-                 SELECT run_id, code_location_id, tags, node_names, priority, partition_key, start_time \
+                 SELECT run_id, code_location_id, tags, node_names, job_name, priority, partition_key, start_time \
                      FROM runs WHERE status = 'Queued' AND code_location_id = $cl",
             )
             .bind(("now", now_ns))
@@ -6524,6 +6561,65 @@ mod tests {
         for (a, b) in run_a.iter().zip(run_b.iter()) {
             assert_eq!(a, b);
         }
+    }
+
+    #[tokio::test]
+    async fn test_step_retry_event_round_trips_with_metadata() {
+        use crate::execution::retry::meta;
+        let storage = make_storage().await;
+        register(&storage, &["flaky"]).await;
+
+        let events = vec![
+            EventRecord {
+                code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("flaky".to_string()),
+                run_id: "retry_run".to_string(),
+                partition_key: None,
+                timestamp: 1000,
+                metadata: vec![
+                    (meta::ATTEMPT.to_string(), "1".to_string()),
+                    (meta::REASON.to_string(), "out_of_memory".to_string()),
+                ],
+                input_data_versions: vec![],
+            },
+            EventRecord {
+                code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepRetry,
+                asset_key: Some("flaky".to_string()),
+                run_id: "retry_run".to_string(),
+                partition_key: None,
+                timestamp: 1001,
+                metadata: vec![
+                    (meta::ATTEMPT.to_string(), "1".to_string()),
+                    (meta::REASON.to_string(), "out_of_memory".to_string()),
+                    (meta::NEXT_DELAY_MS.to_string(), "5000".to_string()),
+                    (
+                        meta::NEXT_COMPUTE.to_string(),
+                        r#"{"memory":"16Gi"}"#.to_string(),
+                    ),
+                ],
+                input_data_versions: vec![],
+            },
+        ];
+        storage.store_events(&events).await.unwrap();
+
+        let read = storage.get_events_for_run("retry_run").await.unwrap();
+        assert_eq!(read.len(), 2);
+        let retry = read
+            .iter()
+            .find(|e| e.event_type == EventType::StepRetry)
+            .expect("StepRetry event must survive the SurrealDB + RocksDB round-trip");
+        let get = |k: &str| {
+            retry
+                .metadata
+                .iter()
+                .find(|(mk, _)| mk == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get(meta::NEXT_DELAY_MS), Some("5000"));
+        assert_eq!(get(meta::NEXT_COMPUTE), Some(r#"{"memory":"16Gi"}"#));
+        assert_eq!(get(meta::REASON), Some("out_of_memory"));
     }
 
     #[tokio::test]
@@ -11022,6 +11118,90 @@ mod tests {
         assert_eq!(progress.total_steps, 1);
         assert_eq!(progress.completed_steps, 1);
         assert_eq!(progress.last_step_completed_at, Some(200));
+        assert_eq!(progress.last_completed_step.as_deref(), Some("a"));
+    }
+
+    #[tokio::test]
+    async fn test_get_step_terminal_events_filters_types() {
+        let storage = make_storage().await;
+        let run_id = "terminal-events-run";
+
+        for (event_type, pk, ts) in [
+            (EventType::StepStart, None, 100),
+            (EventType::StepRetry, None, 150),
+            (
+                EventType::StepFailure,
+                Some(PartitionKey::Single {
+                    keys: vec!["p1".to_string()],
+                }),
+                160,
+            ),
+            (EventType::StepFailure, None, 170),
+            (EventType::StepSuccess, None, 200),
+        ] {
+            storage
+                .store_event(&EventRecord {
+                    code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+                    event_type,
+                    asset_key: Some("a".to_string()),
+                    run_id: run_id.to_string(),
+                    partition_key: pk,
+                    timestamp: ts,
+                    metadata: vec![],
+                    input_data_versions: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        let events = storage.get_step_terminal_events(run_id, "a").await.unwrap();
+        let types: Vec<_> = events.iter().map(|e| e.event_type.clone()).collect();
+        assert_eq!(
+            types,
+            vec![
+                EventType::StepFailure,
+                EventType::StepFailure,
+                EventType::StepSuccess
+            ]
+        );
+        // partition-scoped failure keeps its key so callers can filter it
+        assert!(events[0].partition_key.is_some());
+        assert!(events[1].partition_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_run_progress_counts_retried_step_once() {
+        let storage = make_storage().await;
+        let run_id = "run-progress-retry";
+
+        // One step retried once: two StepStarts, a step-level failure, the
+        // StepRetry marker, then the succeeding attempt.
+        for (event_type, ts) in [
+            (EventType::StepStart, 100),
+            (EventType::StepFailure, 150),
+            (EventType::StepRetry, 160),
+            (EventType::StepStart, 200),
+            (EventType::StepSuccess, 250),
+        ] {
+            storage
+                .store_event(&EventRecord {
+                    code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+                    event_type,
+                    asset_key: Some("a".to_string()),
+                    run_id: run_id.to_string(),
+                    partition_key: None,
+                    timestamp: ts,
+                    metadata: vec![],
+                    input_data_versions: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        let progress = storage.get_run_progress(run_id).await.unwrap();
+        assert_eq!(progress.total_steps, 1);
+        assert_eq!(progress.completed_steps, 1);
+        assert_eq!(progress.last_step_completed_at, Some(250));
         assert_eq!(progress.last_completed_step.as_deref(), Some("a"));
     }
 

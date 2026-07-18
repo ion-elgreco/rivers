@@ -206,8 +206,22 @@ k8s-deploy project="test": (k8s-code-location project)
     fi
     docker tag "$SRC_IMAGE" "${REGISTRY_HOST}/${REPO}:latest"
     docker push "${REGISTRY_HOST}/${REPO}:latest"
+    DIGEST=$(docker inspect "${REGISTRY_HOST}/${REPO}:latest" | jq -r '.[0].RepoDigests[0]' | cut -d@ -f2)
     kubectl -n rivers rollout restart deployment/rivers-operator
     kubectl -n rivers rollout status deployment/rivers-operator --timeout=60s
+    # The operator re-resolves the pushed digest on reconcile; `rollout status`
+    # alone returns instantly against the still-converged old ReplicaSet, so
+    # wait for the new digest to land on the deployment first.
+    CUR=""
+    for _ in $(seq 1 60); do
+        CUR=$(kubectl -n rivers get deployment "${CR_NAME}" -o jsonpath='{.spec.template.spec.containers[0].image}' | cut -d@ -f2 || true)
+        [ "$CUR" = "$DIGEST" ] && break
+        sleep 2
+    done
+    if [ "$CUR" != "$DIGEST" ]; then
+        echo "deployment ${CR_NAME} never picked up pushed digest ${DIGEST} (still ${CUR})" >&2
+        exit 1
+    fi
     kubectl -n rivers rollout status deployment "${CR_NAME}" --timeout=120s
 
 # Full cycle: create cluster, deploy, test, tear down

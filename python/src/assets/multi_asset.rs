@@ -32,6 +32,12 @@ pub struct MultiAsset {
     pub hooks: Option<Vec<Py<PyHook>>>,
     pub automation_condition: Option<PyAutomationCondition>,
     pub backfill_strategy: Option<PyBackfillStrategy>,
+    /// Compute for the step — one multi-asset is one step (one pod), so this
+    /// lives on the multi-asset, not per output.
+    pub compute: Option<rivers_core::execution::compute::Compute>,
+    /// Retry policy for the step — a multi-asset retries as one unit, so this
+    /// lives on the multi-asset, not per output.
+    pub retry: Option<rivers_core::execution::retry::RetryRef>,
 }
 
 /// Python-exposed marker subclass created via `Asset.from_multi(...)`.

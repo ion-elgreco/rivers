@@ -2078,6 +2078,10 @@ pub struct PyCodeRepository {
     pub(crate) raw_sensors: HashMap<String, Py<PySensorDefinition>>,
     default_executor: Option<Executor>,
     raw_resources: HashMap<String, ResourceVariant>,
+    /// Named retry policies referenced by `retry="name"` on assets/jobs.
+    raw_retries: HashMap<String, rivers_core::execution::retry::RetryPolicy>,
+    /// Repo-wide retry default; the lowest-precedence rung (asset > job > this).
+    raw_default_retry: Option<rivers_core::execution::retry::RetryRef>,
     pub(crate) run_queue_config: Option<Py<crate::concurrency::PyRunQueueConfig>>,
     pub(crate) run_backend_config: Option<Py<crate::concurrency::PyRunBackendConfig>>,
     pool_limits: Option<HashMap<String, i32>>,
@@ -2092,8 +2096,27 @@ pub struct PyCodeRepository {
 }
 
 impl PyCodeRepository {
+    /// The repo-wide retry default with any registry name resolved; errors on
+    /// an unknown name.
+    fn resolved_default_retry(
+        &self,
+    ) -> PyResult<Option<rivers_core::execution::retry::RetryPolicy>> {
+        use rivers_core::execution::retry::RetryRef;
+        match &self.raw_default_retry {
+            None => Ok(None),
+            Some(RetryRef::Inline(p)) => Ok(Some(p.clone())),
+            Some(RetryRef::Named(key)) => match self.raw_retries.get(key) {
+                Some(p) => Ok(Some(p.clone())),
+                None => Err(crate::errors::ConfigurationError::new_err(format!(
+                    "unknown retry policy '{key}' in default_retry_policy; registered: {:?}",
+                    self.raw_retries.keys().collect::<Vec<_>>()
+                ))),
+            },
+        }
+    }
+
     fn effective_executor(&self) -> Executor {
-        if std::env::var("RIVERS_STEP_POD").is_ok_and(|v| v == "1") {
+        if crate::executor::in_step_pod() {
             return Executor::InProcess {};
         }
         self.default_executor.clone().unwrap_or(Executor::Parallel {
@@ -2157,6 +2180,7 @@ impl PyCodeRepository {
         run_id_override: Option<String>,
         include_upstream: bool,
         resume: bool,
+        retry: Option<rivers_core::execution::retry::RetryRef>,
         launched_by: LaunchedBy,
     ) -> PyResult<PyRunResult> {
         let guard = self.ensure_resolved()?;
@@ -2235,6 +2259,7 @@ impl PyCodeRepository {
             selected_names.into_iter().collect(),
             self.effective_executor(),
             true,
+            retry,
         );
         Python::attach(|py| {
             synthetic_job.configure_for_repo(
@@ -2252,6 +2277,8 @@ impl PyCodeRepository {
             &state.multi_asset_groups,
             &state.composition_order,
         )?;
+        synthetic_job.resolve_retry_ref(&self.raw_retries)?;
+        synthetic_job.fill_retry_defaults(self.resolved_default_retry()?.as_ref());
 
         // If `run_id_override` points at an existing record (queue-launched
         // run, or a Direct dispatcher that pre-wrote the record before
@@ -2466,6 +2493,7 @@ impl PyCodeRepository {
         composition_order: &HashMap<String, usize>,
     ) -> PyResult<()> {
         let default_executor = self.effective_executor();
+        let default_retry = self.resolved_default_retry()?;
 
         if let Some(ref job_list) = self.raw_jobs {
             let mut seen_names: HashSet<String> = HashSet::new();
@@ -2486,11 +2514,34 @@ impl PyCodeRepository {
                     multi_asset_groups,
                     composition_order,
                 )?;
+                job.resolve_retry_ref(&self.raw_retries)?;
+                job.fill_retry_defaults(default_retry.as_ref());
                 validate_job_partition_compatibility(&name, &job.node_names, node_map)?;
             }
         }
 
         Ok(())
+    }
+
+    /// Resolve a task-level `retry` ref against the repository `retries`
+    /// registry; errors on an unknown name.
+    fn resolve_task_retry_ref(
+        r: Option<rivers_core::execution::retry::RetryRef>,
+        retries: &HashMap<String, rivers_core::execution::retry::RetryPolicy>,
+        owner: &str,
+    ) -> PyResult<Option<rivers_core::execution::retry::RetryPolicy>> {
+        use rivers_core::execution::retry::RetryRef;
+        match r {
+            None => Ok(None),
+            Some(RetryRef::Inline(p)) => Ok(Some(p)),
+            Some(RetryRef::Named(key)) => match retries.get(&key) {
+                Some(p) => Ok(Some(p.clone())),
+                None => Err(ConfigurationError::new_err(format!(
+                    "unknown retry policy '{key}' referenced by task '{owner}'; registered: {:?}",
+                    retries.keys().collect::<Vec<_>>()
+                ))),
+            },
+        }
     }
 
     /// Resolve `IOHandler::ResourceRef` → `Instance` on every asset and refresh
@@ -2543,6 +2594,7 @@ impl PyCodeRepository {
                     &handlers,
                     &resource_keys_excluding_io_handlers,
                 )?;
+                asset.inner_mut().resolve_retry_refs(&self.raw_retries)?;
             }
             let asset = asset_py.borrow(py);
             if let Asset::Graph(graph_asset) = asset.inner() {
@@ -2578,6 +2630,32 @@ impl PyCodeRepository {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // ResolvedAssets were constructed inside build_unresolved_graph (before
+        // resolve_retry_refs ran), so re-pull the now-concrete policy per node.
+        // Task defs aren't covered by the asset pass; resolve their refs here.
+        for node in node_map.values_mut() {
+            match node {
+                ResolvedNode::Asset(a) => {
+                    let resolved = {
+                        let asset = a.inner.borrow(py);
+                        asset
+                            .inner()
+                            .retry_for_output(a.output_name.as_deref())
+                            .and_then(|r| r.as_inline().cloned())
+                    };
+                    a.retry = resolved;
+                }
+                ResolvedNode::Task(t) => {
+                    let r = t.inner.borrow(py).inner.retry.clone();
+                    t.retry = Self::resolve_task_retry_ref(r, &self.raw_retries, &t.name)?;
+                }
+                ResolvedNode::BashTask(b) => {
+                    let r = b.inner.borrow(py).retry.clone();
+                    b.retry = Self::resolve_task_retry_ref(r, &self.raw_retries, &b.name)?;
                 }
             }
         }
@@ -2919,8 +2997,9 @@ struct BuiltGraph {
 #[pymethods]
 impl PyCodeRepository {
     #[new]
-    #[pyo3(signature = (assets, tasks=None, jobs=None, schedules=None, sensors=None, default_executor=None, resources=None, run_queue=None, run_backend=None, pool_limits=None))]
-    fn new(
+    #[pyo3(signature = (assets, tasks=None, jobs=None, schedules=None, sensors=None, default_executor=None, resources=None, retries=None, default_retry_policy=None, run_queue=None, run_backend=None, pool_limits=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new<'py>(
         assets: Vec<Py<PyAsset>>,
         tasks: Option<Vec<Py<PyAny>>>,
         jobs: Option<Vec<Py<PyJob>>>,
@@ -2928,6 +3007,8 @@ impl PyCodeRepository {
         sensors: Option<Vec<Py<PySensorDefinition>>>,
         default_executor: Option<Executor>,
         resources: Option<HashMap<String, ResourceVariant>>,
+        retries: Option<HashMap<String, crate::retry::PyRetryPolicy>>,
+        default_retry_policy: Option<Bound<'py, PyAny>>,
         run_queue: Option<Py<crate::concurrency::PyRunQueueConfig>>,
         run_backend: Option<Py<crate::concurrency::PyRunBackendConfig>>,
         pool_limits: Option<HashMap<String, i32>>,
@@ -2954,6 +3035,12 @@ impl PyCodeRepository {
                 .collect(),
             default_executor,
             raw_resources: resources.unwrap_or_default(),
+            raw_retries: retries
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(k, v)| (k, v.inner))
+                .collect(),
+            raw_default_retry: crate::retry::extract_retry_ref(default_retry_policy)?,
             run_queue_config: run_queue,
             run_backend_config: run_backend,
             pool_limits,
@@ -3262,8 +3349,9 @@ impl PyCodeRepository {
         Ok(result_dict.into_any().unbind())
     }
 
-    #[pyo3(signature = (selection=None, partition_key=None, tags=None, raise_on_error=true, config=None, run_id_override=None, include_upstream=false, resume=false))]
+    #[pyo3(signature = (selection=None, partition_key=None, tags=None, raise_on_error=true, config=None, run_id_override=None, include_upstream=false, resume=false, retry=None))]
     #[tracing::instrument(skip_all, target = "rivers::repo", name = "materialize")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn materialize(
         &self,
         py: Python<'_>,
@@ -3275,7 +3363,9 @@ impl PyCodeRepository {
         run_id_override: Option<String>,
         include_upstream: bool,
         resume: bool,
+        retry: Option<Bound<'_, PyAny>>,
     ) -> PyResult<PyRunResult> {
+        let retry = crate::retry::extract_retry_ref(retry)?;
         py.detach(|| {
             self.materialize_with_launcher(
                 selection,
@@ -3286,6 +3376,7 @@ impl PyCodeRepository {
                 run_id_override,
                 include_upstream,
                 resume,
+                retry,
                 LaunchedBy::Manual,
             )
         })
@@ -4063,7 +4154,7 @@ impl PyCodeRepository {
         Python::attach(|py| {
             job.bind(py)
                 .borrow()
-                .execute_run(py, Some(py_pk), &run_id, config, false, false)
+                .execute_run(py, &run_id, Some(py_pk), config, false, false)
         })
     }
 
@@ -4168,6 +4259,7 @@ impl PyCodeRepository {
                     None,
                     false,
                     false,
+                    None,
                     LaunchedBy::Backfill {
                         backfill_id: backfill_id.to_string(),
                     },

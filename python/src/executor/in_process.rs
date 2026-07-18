@@ -141,7 +141,7 @@ pub(crate) struct InProcessStepWorker<'a> {
 }
 
 impl<'a> SyncWorker for InProcessStepWorker<'a> {
-    fn run_work(self, py: Python, ctx: &BatchContext) -> WorkOutcome {
+    fn run_work(&self, py: Python, ctx: &BatchContext) -> WorkOutcome {
         execute_step_with_capture(py, ctx, self.step, self.input_overrides)
     }
 }

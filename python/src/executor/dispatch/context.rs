@@ -18,10 +18,10 @@ use crate::metadata::MetadataValue;
 use crate::partitions::PyPartitionKey;
 use crate::repository::resolved_node::ResolvedNode;
 
-use super::super::GraphNodeMap;
 use super::super::async_exec::AsyncBridge;
 use super::super::event_writer::{EventWriter, WriterMsg};
 use super::super::ops::{self, now_ts};
+use super::super::{GraphNodeMap, in_step_pod};
 
 /// Immutable run-scope identity: who/what/when this batch is executing.
 pub(crate) struct RunScope<'a> {
@@ -30,6 +30,9 @@ pub(crate) struct RunScope<'a> {
     pub plan: &'a ExecutionPlan,
     /// Steps already completed before this batch (resume case). Read-only.
     pub completed_steps: &'a HashSet<String>,
+    /// Resuming a prior run: retry ladders seed their attempt number from
+    /// recorded StepRetry events instead of restarting the budget.
+    pub resume: bool,
 }
 
 /// Mutable per-batch progress tracking.
@@ -130,14 +133,79 @@ impl<'a> BatchContext<'a> {
     }
 
     /// Emit only the event — no hooks, no recording.
-    pub(crate) fn emit_step_failure(&self, step_name: &str, msg: &str) {
+    pub(crate) fn emit_step_failure(
+        &self,
+        step_name: &str,
+        msg: &str,
+        classified: Option<&(rivers_core::execution::retry::FailureReason, Vec<String>)>,
+    ) {
         ops::emit_step_failure(
             self.sink.writer,
             self.scope.run_id,
             step_name,
             msg,
+            classified,
             now_ts(),
         );
+    }
+
+    pub(crate) fn emit_step_retry(
+        &self,
+        step_name: &str,
+        attempt: u32,
+        reason: rivers_core::execution::retry::FailureReason,
+        delay: std::time::Duration,
+    ) {
+        ops::emit_step_retry(
+            self.sink.writer,
+            self.scope.run_id,
+            step_name,
+            attempt,
+            reason,
+            delay,
+            now_ts(),
+        );
+    }
+
+    /// Effective retry policy for a plan step (`None` = fail fast). Multi-asset
+    /// steps aren't node keys themselves — their outputs are; per-output
+    /// policies are validated uniform at resolve, so any output's works.
+    pub(crate) fn retry_policy_for(
+        &self,
+        step: &rivers_core::execution::plan::ExecutionStep,
+    ) -> Option<&rivers_core::execution::retry::RetryPolicy> {
+        self.retry_policy(&step.name)
+            .or_else(|| step.outputs.iter().find_map(|n| self.retry_policy(n)))
+    }
+
+    /// Retry policy of one resolved node (asset-level). Inside a K8s step pod
+    /// this is always `None`: the orchestrator owns the attempt ladder there,
+    /// and the pod re-applying the policy would nest retries (N pods × N
+    /// in-process attempts).
+    pub(crate) fn retry_policy(
+        &self,
+        step_name: &str,
+    ) -> Option<&rivers_core::execution::retry::RetryPolicy> {
+        if in_step_pod() {
+            return None;
+        }
+        self.repo.node_map.get(step_name).and_then(|n| n.retry())
+    }
+
+    /// Per-asset compute for a plan step; multi steps read their outputs'
+    /// nodes (each carries the multi-asset's single compute — declared on
+    /// the multi, one step is one pod).
+    pub(crate) fn compute_for(
+        &self,
+        step: &rivers_core::execution::plan::ExecutionStep,
+    ) -> Option<rivers_core::execution::compute::Compute> {
+        let lookup = |name: &str| {
+            self.repo
+                .node_map
+                .get(name)
+                .and_then(|n| n.compute().cloned())
+        };
+        lookup(&step.name).or_else(|| step.outputs.iter().find_map(|n| lookup(n)))
     }
 
     /// A failed partitioned step materialized none of its partitions, so record
@@ -272,8 +340,16 @@ impl<'a> BatchContext<'a> {
         failures: &mut Vec<(String, PyErr)>,
     ) {
         let err_msg = error.to_string();
+        let classified = Python::attach(|py| super::failure::classify_pyerr(py, &error));
         let ts = now_ts();
-        ops::emit_step_failure(self.sink.writer, self.scope.run_id, step_name, &err_msg, ts);
+        ops::emit_step_failure(
+            self.sink.writer,
+            self.scope.run_id,
+            step_name,
+            &err_msg,
+            Some(&classified),
+            ts,
+        );
         self.emit_partition_failures(step_name, &err_msg, ts);
         self.state.mark_failed(step_name.to_string());
         failures.push((step_name.to_string(), error));
@@ -295,6 +371,7 @@ impl<'a> BatchContext<'a> {
                 self.scope.run_id,
                 &inst.instance_name,
                 msg,
+                None,
                 ts,
             );
             let step = &self.scope.plan.steps[inst.idx];

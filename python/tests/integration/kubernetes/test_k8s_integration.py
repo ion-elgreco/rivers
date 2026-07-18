@@ -206,7 +206,7 @@ def _dump_debug_info(run_name: str) -> str:
     return "\n".join(lines)
 
 
-def _query_run_events(run_id: str) -> list[dict]:
+def _query_run_events(run_id: str, fields: str = "event_type, asset_key") -> list[dict]:
     """Query SurrealDB via its HTTP /sql endpoint over a kr8s port-forward.
 
     kr8s exec doesn't support stdin on the v4 channel protocol that k3s
@@ -228,7 +228,7 @@ def _query_run_events(run_id: str) -> list[dict]:
     )
     user = base64.b64decode(secret.raw["data"]["username"]).decode()
     pwd = base64.b64decode(secret.raw["data"]["password"]).decode()
-    query = f"SELECT event_type, asset_key FROM events WHERE run_id = '{run_id}';"
+    query = f"SELECT {fields} FROM events WHERE run_id = '{run_id}';"
     with pod.portforward(remote_port=8000, local_port="auto") as local_port:
         # SurrealDB v3 root-user basic auth doesn't apply to DB-scoped queries;
         # we have to sign in to (ns=rivers, db=main) first and use the JWT.
@@ -487,14 +487,15 @@ class TestK8sGrpcFlow:
     def test_executor_resume_after_crash(self, grpc_stubs):
         """Operator restarts executor pod with --resume after crash, run still succeeds.
 
-        Uses the in-process job because killing the executor kills in-flight
-        steps (unlike step Jobs which are independent K8s resources).
-        Kills the executor immediately after it appears to guarantee it hasn't
-        finished yet.
+        Uses an in-process job (killing the executor kills in-flight steps,
+        unlike step Jobs which are independent K8s resources) whose step
+        sleeps long enough that the kill is guaranteed to land mid-run — a
+        run that completes inside the kill window stores its outcome, which
+        the operator honors instead of restarting.
         """
         with GrpcChannel(grpc_stubs) as ch:
             resp = ch.stub.ExecuteJob(
-                ch.pb2.ExecuteJobRequest(job_name="k8s_inprocess_job")
+                ch.pb2.ExecuteJobRequest(job_name="k8s_resume_job")
             )
             assert resp.run_id
 

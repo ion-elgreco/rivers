@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use rivers_core::execution::retry::RetryPolicy;
 
 use crate::assets::decorator::{Asset, PyAsset};
 use crate::assets::io_handler::IOHandler;
@@ -45,6 +46,10 @@ pub(crate) struct ResolvedAsset {
     pub group: Option<String>,
     pub code_version: Option<String>,
     pub pool: Vec<(String, u32)>,
+    /// Resolved retry policy (registry names collapsed to concrete at resolve()).
+    pub retry: Option<RetryPolicy>,
+    /// Per-asset compute request; axes left unset inherit the executor default.
+    pub compute: Option<rivers_core::execution::compute::Compute>,
     pub metadata: Option<HashMap<String, String>>,
     pub backfill_strategy: Option<PyBackfillStrategy>,
     /// Flattened pure-Rust partition definition. The originating
@@ -107,6 +112,8 @@ pub(crate) struct ResolvedTask {
     /// Metadata overrides for specific input deps (from parent graph asset's deps),
     /// keyed by upstream node name. Resolved through `param_remap` at access time.
     pub input_metadata_override: Option<HashMap<String, HashMap<String, String>>>,
+    /// Resolved retry policy (registry names collapsed to concrete at resolve()).
+    pub retry: Option<RetryPolicy>,
 }
 
 pub(crate) struct ResolvedBashTask {
@@ -119,6 +126,8 @@ pub(crate) struct ResolvedBashTask {
     pub partitions_def: Option<PartitionsDefinition>,
     /// Pre-merged partition_mapping: override OR bash task's own.
     pub partition_mapping: Option<HashMap<String, PartitionMapping>>,
+    /// Resolved retry policy (registry names collapsed to concrete at resolve()).
+    pub retry: Option<RetryPolicy>,
 }
 
 /// A node in the dependency graph — Asset, Task, or BashTask.
@@ -167,6 +176,7 @@ impl ResolvedAsset {
         let group = asset.group().cloned();
         let code_version = asset.code_version().cloned();
         let pool = asset.pool().clone();
+        let compute = asset.compute_for_output(output_name.as_deref()).cloned();
         let metadata = asset.metadata().cloned();
         let backfill_strategy = asset.backfill_strategy().cloned();
 
@@ -258,6 +268,10 @@ impl ResolvedAsset {
             group,
             code_version,
             pool,
+            // Named refs aren't collapsed yet here; resolve_resources_and_handlers
+            // populates node.retry once resolve_retry_refs has run.
+            retry: None,
+            compute,
             metadata,
             backfill_strategy,
             partitions_def,
@@ -286,6 +300,8 @@ impl ResolvedAsset {
             group: self.group.clone(),
             code_version: self.code_version.clone(),
             pool: self.pool.clone(),
+            retry: self.retry.clone(),
+            compute: self.compute.clone(),
             metadata: self.metadata.clone(),
             backfill_strategy: self.backfill_strategy.clone(),
             partitions_def: self.partitions_def.clone(),
@@ -347,6 +363,8 @@ impl ResolvedTask {
             io_handler_override: None,
             input_io_handler_override,
             input_metadata_override,
+            // Set by resolve_resources_and_handlers once retry refs collapse.
+            retry: None,
         })
     }
 
@@ -367,6 +385,7 @@ impl ResolvedTask {
                     .collect()
             }),
             input_metadata_override: self.input_metadata_override.clone(),
+            retry: self.retry.clone(),
         }
     }
 }
@@ -395,6 +414,8 @@ impl ResolvedBashTask {
             tags,
             partitions_def,
             partition_mapping,
+            // Set by resolve_resources_and_handlers once retry refs collapse.
+            retry: None,
         }
     }
 
@@ -405,6 +426,7 @@ impl ResolvedBashTask {
             tags: self.tags.clone(),
             partitions_def: self.partitions_def.clone(),
             partition_mapping: self.partition_mapping.clone(),
+            retry: self.retry.clone(),
         }
     }
 }
@@ -710,6 +732,21 @@ impl ResolvedNode {
         match self {
             ResolvedNode::Asset(node) => node.pool.clone(),
             ResolvedNode::Task(_) | ResolvedNode::BashTask(_) => Vec::new(),
+        }
+    }
+
+    pub fn retry(&self) -> Option<&RetryPolicy> {
+        match self {
+            ResolvedNode::Asset(node) => node.retry.as_ref(),
+            ResolvedNode::Task(node) => node.retry.as_ref(),
+            ResolvedNode::BashTask(node) => node.retry.as_ref(),
+        }
+    }
+
+    pub fn compute(&self) -> Option<&rivers_core::execution::compute::Compute> {
+        match self {
+            ResolvedNode::Asset(node) => node.compute.as_ref(),
+            _ => None,
         }
     }
 

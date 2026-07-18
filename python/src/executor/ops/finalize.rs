@@ -91,22 +91,166 @@ pub(crate) fn emit_step_success(writer: &EventWriter, run_id: &str, step_name: &
     );
 }
 
+/// `classified` is `None` only for failures with no exception at hand
+/// (pre-spawn batch errors, mapped-step summaries); classified failures stamp
+/// reason + exception MRO so the K8s orchestrator can read them back for
+/// retry decisions across the pod boundary.
 pub(crate) fn emit_step_failure(
     writer: &EventWriter,
     run_id: &str,
     step_name: &str,
     error_msg: &str,
+    classified: Option<&(rivers_core::execution::retry::FailureReason, Vec<String>)>,
     ts: i64,
 ) {
+    use rivers_core::execution::retry::meta;
+    let mut metadata = vec![("error".to_string(), error_msg.to_string())];
+    if let Some((reason, exc_types)) = classified {
+        metadata.push((meta::REASON.to_string(), reason.as_str().to_string()));
+        if !exc_types.is_empty() {
+            metadata.push((
+                meta::EXC_TYPE.to_string(),
+                meta::encode_exc_types(exc_types),
+            ));
+        }
+    }
     emit_step_event(
         writer,
         run_id,
         step_name,
         EventType::StepFailure,
-        vec![("error".to_string(), error_msg.to_string())],
+        metadata,
         ts,
         None,
     );
+}
+
+/// The one StepRetry record shape, shared by every sink (EventWriter, event
+/// channel, raw store on the K8s orchestrator). The replay path reads these
+/// back, so the copies must not drift. `next_compute` is set only when the
+/// attempt escalated resources.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn step_retry_record(
+    code_location_id: &str,
+    run_id: &str,
+    step_name: &str,
+    attempt: u32,
+    reason: rivers_core::execution::retry::FailureReason,
+    delay: std::time::Duration,
+    next_compute: Option<&rivers_core::execution::compute::Compute>,
+    ts: i64,
+) -> EventRecord {
+    use rivers_core::execution::retry::meta;
+    let mut metadata = vec![
+        (meta::ATTEMPT.to_string(), attempt.to_string()),
+        (meta::REASON.to_string(), reason.as_str().to_string()),
+        (
+            meta::NEXT_DELAY_MS.to_string(),
+            delay.as_millis().to_string(),
+        ),
+    ];
+    if let Some(compute) = next_compute
+        && let Ok(json) = serde_json::to_string(compute)
+    {
+        metadata.push((meta::NEXT_COMPUTE.to_string(), json));
+    }
+    EventRecord {
+        code_location_id: code_location_id.to_string(),
+        event_type: EventType::StepRetry,
+        asset_key: Some(step_name.to_string()),
+        run_id: run_id.to_string(),
+        partition_key: None,
+        timestamp: ts,
+        metadata,
+        input_data_versions: vec![],
+    }
+}
+
+pub(crate) fn emit_step_retry(
+    writer: &EventWriter,
+    run_id: &str,
+    step_name: &str,
+    attempt: u32,
+    reason: rivers_core::execution::retry::FailureReason,
+    delay: std::time::Duration,
+    ts: i64,
+) {
+    writer.emit(step_retry_record(
+        "", run_id, step_name, attempt, reason, delay, None, ts,
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_step_retry_via_tx(
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::executor::event_writer::WriterMsg>,
+    code_location_id: &str,
+    run_id: &str,
+    step_name: &str,
+    attempt: u32,
+    reason: rivers_core::execution::retry::FailureReason,
+    delay: std::time::Duration,
+    ts: i64,
+) {
+    let _ = tx.send(
+        step_retry_record(
+            code_location_id,
+            run_id,
+            step_name,
+            attempt,
+            reason,
+            delay,
+            None,
+            ts,
+        )
+        .into(),
+    );
+}
+
+/// The one `run_logs` row shape; `None` when all streams are empty.
+fn log_output_record(
+    code_location_id: &str,
+    run_id: &str,
+    step_name: &str,
+    stdout: &str,
+    stderr: &str,
+    logs: &str,
+    ts: i64,
+) -> Option<LogRecord> {
+    let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    let record = LogRecord {
+        code_location_id: code_location_id.to_string(),
+        run_id: run_id.to_string(),
+        step_key: step_name.to_string(),
+        timestamp: ts,
+        stdout: non_empty(stdout),
+        stderr: non_empty(stderr),
+        logs: non_empty(logs),
+    };
+    (!record.is_empty()).then_some(record)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_log_output_via_tx(
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::executor::event_writer::WriterMsg>,
+    code_location_id: &str,
+    run_id: &str,
+    step_name: &str,
+    stdout: &str,
+    stderr: &str,
+    logs: &str,
+    ts: i64,
+) {
+    if let Some(record) = log_output_record(
+        code_location_id,
+        run_id,
+        step_name,
+        stdout,
+        stderr,
+        logs,
+        ts,
+    ) {
+        let _ = tx.send(record.into());
+    }
 }
 
 pub(crate) fn emit_partition_failure(
@@ -137,20 +281,9 @@ pub(crate) fn emit_log_output(
     logs: &str,
     ts: i64,
 ) {
-    let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_string());
-    let record = LogRecord {
-        code_location_id: String::new(),
-        run_id: run_id.to_string(),
-        step_key: step_name.to_string(),
-        timestamp: ts,
-        stdout: non_empty(stdout),
-        stderr: non_empty(stderr),
-        logs: non_empty(logs),
-    };
-    if record.is_empty() {
-        return;
+    if let Some(record) = log_output_record("", run_id, step_name, stdout, stderr, logs, ts) {
+        writer.emit_log(record);
     }
-    writer.emit_log(record);
 }
 
 /// `input_data_versions` carries `(dep_name, data_version)` pairs captured at
