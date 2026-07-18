@@ -55,6 +55,8 @@ jobs:
         uses: ./.github/actions/setup-env
         with:
           python-version: ${{ matrix.python-version }}
+          # lint compiles no Rust; keep it off the shared rust-cache key
+          rust-cache: "false"
 
       - name: setup venv
         run: just venv
