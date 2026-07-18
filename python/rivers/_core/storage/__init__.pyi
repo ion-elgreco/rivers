@@ -30,6 +30,20 @@ class StoredEvent:
     code_version: str | None
     input_data_versions: list[tuple[str, str]]
 
+class StoredLog:
+    """One step execution's captured output (``run_logs`` row).
+
+    Streams the step didn't produce are ``None``.
+    """
+
+    id: str
+    run_id: str
+    step_key: str
+    timestamp: int
+    stdout: str | None
+    stderr: str | None
+    logs: str | None
+
 class StaleCause:
     """One reason an asset is considered stale relative to its deps / code version."""
 
@@ -272,7 +286,15 @@ class Storage:
         ...
 
     def get_events_for_run(self, run_id: str) -> list[StoredEvent]:
-        """Return all events emitted during ``run_id`` (oldest first)."""
+        """Return all events emitted during ``run_id`` (oldest first).
+
+        Captured step output is not an event; fetch it with
+        :meth:`get_run_logs`.
+        """
+        ...
+
+    def get_run_logs(self, run_id: str) -> list[StoredLog]:
+        """Return the captured step output for ``run_id`` (oldest first)."""
         ...
 
     def get_latest_materialization(
@@ -454,6 +476,9 @@ class Storage:
     def async_get_events_for_run(
         self, run_id: str
     ) -> Coroutine[Any, Any, list[StoredEvent]]: ...
+    def async_get_run_logs(
+        self, run_id: str
+    ) -> Coroutine[Any, Any, list[StoredLog]]: ...
     def async_get_latest_materialization(
         self, asset_key: str, partition: str | None = None
     ) -> Coroutine[Any, Any, StoredEvent | None]: ...
@@ -505,5 +530,6 @@ __all__ = [
     "Storage",
     "StorageType",
     "StoredEvent",
+    "StoredLog",
     "StoredTick",
 ]

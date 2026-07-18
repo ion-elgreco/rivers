@@ -12,10 +12,10 @@ use super::DEFAULT_CODE_LOCATION_ID;
 use super::{
     AssetRecord, BackfillFilter, BackfillRecord, BackfillStatus, BackfillsPage, BackfillsSummary,
     BlockReason, ConcurrencyClaimStatus, ConditionEvalRecord, ConditionTickRecord,
-    CoordinatorRunInfo, EventRecord, EventType, PartitionKey, PerCodeLocationStorage,
+    CoordinatorRunInfo, EventRecord, EventType, LogRecord, PartitionKey, PerCodeLocationStorage,
     PoolBlockDetail, PoolInfo, PoolLimit, RunFilter, RunOutcome, RunProgress, RunRecord, RunStatus,
     RunsPage, RunsSummary, SlotHolder, StorageBackend, StoredConditionEval, StoredConditionTick,
-    StoredEvent, StoredTick, TickRecord,
+    StoredEvent, StoredLog, StoredTick, TickRecord,
 };
 #[cfg(test)]
 use crate::assets::graph::GraphTopology;
@@ -50,6 +50,59 @@ struct DbEventWrite {
     data_version: Option<String>,
     code_version: Option<String>,
     input_data_versions: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
+struct DbRunLogWrite {
+    code_location_id: String,
+    run_id: String,
+    step_key: String,
+    timestamp: i64,
+    stdout: Option<String>,
+    stderr: Option<String>,
+    logs: Option<String>,
+}
+
+impl From<&LogRecord> for DbRunLogWrite {
+    fn from(l: &LogRecord) -> Self {
+        Self {
+            code_location_id: l.code_location_id.clone(),
+            run_id: l.run_id.clone(),
+            step_key: l.step_key.clone(),
+            timestamp: l.timestamp,
+            stdout: l.stdout.clone(),
+            stderr: l.stderr.clone(),
+            logs: l.logs.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
+struct DbStoredRunLog {
+    id: RecordId,
+    #[serde(default = "crate::storage::default_code_location_id")]
+    code_location_id: String,
+    run_id: String,
+    step_key: String,
+    timestamp: i64,
+    stdout: Option<String>,
+    stderr: Option<String>,
+    logs: Option<String>,
+}
+
+impl DbStoredRunLog {
+    fn into_stored_log(self) -> StoredLog {
+        StoredLog {
+            id: self.id,
+            code_location_id: self.code_location_id,
+            run_id: self.run_id,
+            step_key: self.step_key,
+            timestamp: self.timestamp,
+            stdout: self.stdout,
+            stderr: self.stderr,
+            logs: self.logs,
+        }
+    }
 }
 
 /// One `asset_partitions` row, written in bulk via `upsert_asset_partitions`.
@@ -776,24 +829,7 @@ impl SurrealStorage {
         .await
     }
 
-    /// A run's `LogOutput` events (stdout/stderr/logs).
-    pub async fn get_run_log_events(&self, run_id: &str) -> Result<Vec<StoredEvent>> {
-        super::retry::with_retry(&self.retry_config, || async {
-            let mut result = self
-                .db
-                .query(
-                    "SELECT * FROM events WHERE run_id = $id AND event_type = 'LogOutput' \
-                     ORDER BY timestamp ASC, sort_order ASC, id ASC",
-                )
-                .bind(("id", run_id.to_string()))
-                .await?;
-            let events: Vec<DbStoredEvent> = result.take(0)?;
-            Ok(events.into_iter().map(|e| e.into_stored_event()).collect())
-        })
-        .await
-    }
-
-    /// A page of a run's structured (non-`LogOutput`) events, optionally scoped to one asset, plus the total.
+    /// A page of a run's events, optionally scoped to one asset, plus the total.
     pub async fn get_run_structured_events_page(
         &self,
         run_id: &str,
@@ -808,9 +844,9 @@ impl SurrealStorage {
                 ""
             };
             let sql = format!(
-                "SELECT * FROM events WHERE run_id = $id AND event_type != 'LogOutput'{asset_clause} \
+                "SELECT * FROM events WHERE run_id = $id{asset_clause} \
                  ORDER BY timestamp ASC, sort_order ASC, id ASC LIMIT $limit START $offset; \
-                 SELECT count() AS total FROM events WHERE run_id = $id AND event_type != 'LogOutput'{asset_clause} GROUP ALL;"
+                 SELECT count() AS total FROM events WHERE run_id = $id{asset_clause} GROUP ALL;"
             );
             let mut q = self
                 .db
@@ -1564,6 +1600,38 @@ impl StorageBackend for SurrealStorage {
         }
 
         Ok(event_ids)
+        })
+        .await
+    }
+
+    #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = logs.len()))]
+    async fn store_run_logs(&self, logs: &[LogRecord]) -> Result<()> {
+        if logs.is_empty() {
+            return Ok(());
+        }
+        let rows: Vec<DbRunLogWrite> = logs.iter().map(DbRunLogWrite::from).collect();
+        super::retry::with_retry(&self.retry_config, || async {
+            self.db
+                .query("INSERT INTO run_logs $rows RETURN NONE")
+                .bind(("rows", rows.clone()))
+                .await
+                .context("failed to store run logs")?
+                .check()
+                .context("failed to store run logs")?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_run_logs(&self, run_id: &str) -> Result<Vec<StoredLog>> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query("SELECT * FROM run_logs WHERE run_id = $id ORDER BY timestamp ASC, id ASC")
+                .bind(("id", run_id.to_string()))
+                .await?;
+            let rows: Vec<DbStoredRunLog> = result.take(0)?;
+            Ok(rows.into_iter().map(|l| l.into_stored_log()).collect())
         })
         .await
     }
@@ -3610,7 +3678,7 @@ mod tests {
             .map(|i| DbEventWrite {
                 code_location_id: "default".into(),
                 event_type: if i % 50 == 0 {
-                    "LogOutput"
+                    "StepStart"
                 } else {
                     "Materialization"
                 }
@@ -3635,7 +3703,7 @@ mod tests {
 
         let plan: Vec<serde_json::Value> =
             s.db.query(
-                "SELECT * FROM events WHERE run_id = 'r' AND event_type != 'LogOutput' \
+                "SELECT * FROM events WHERE run_id = 'r' \
                  ORDER BY timestamp ASC, sort_order ASC, id ASC LIMIT 50 START 0 EXPLAIN",
             )
             .await
@@ -3651,6 +3719,66 @@ mod tests {
             !plan.contains("SortTopKByKey") && !plan.contains("\"operator\":\"Sort\""),
             "page should not sort — the ordering index covers it: {plan}"
         );
+    }
+
+    /// `store_run_logs` / `get_run_logs` round-trip: per-run isolation,
+    /// timestamp ordering, and stream content survive intact.
+    #[tokio::test]
+    async fn run_logs_roundtrip() {
+        let storage = make_storage().await;
+        storage
+            .store_run_logs(&[
+                LogRecord {
+                    code_location_id: "default".into(),
+                    run_id: "run-1".into(),
+                    step_key: "b".into(),
+                    timestamp: 20,
+                    stdout: Some("b out".into()),
+                    stderr: None,
+                    logs: None,
+                },
+                LogRecord {
+                    code_location_id: "default".into(),
+                    run_id: "run-1".into(),
+                    step_key: "a".into(),
+                    timestamp: 10,
+                    stdout: Some("a out".into()),
+                    stderr: Some("a err".into()),
+                    logs: Some("a tracing".into()),
+                },
+                LogRecord {
+                    code_location_id: "default".into(),
+                    run_id: "run-2".into(),
+                    step_key: "c".into(),
+                    timestamp: 5,
+                    stdout: None,
+                    stderr: Some("c err".into()),
+                    logs: None,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let logs = storage.get_run_logs("run-1").await.unwrap();
+        assert_eq!(
+            logs.iter()
+                .map(|l| (l.step_key.as_str(), l.timestamp))
+                .collect::<Vec<_>>(),
+            vec![("a", 10), ("b", 20)],
+            "rows come back in timestamp order"
+        );
+        assert_eq!(logs[0].stdout.as_deref(), Some("a out"));
+        assert_eq!(logs[0].stderr.as_deref(), Some("a err"));
+        assert_eq!(logs[0].logs.as_deref(), Some("a tracing"));
+        assert_eq!(logs[1].stdout.as_deref(), Some("b out"));
+        assert_eq!(logs[1].stderr, None);
+
+        let logs2 = storage.get_run_logs("run-2").await.unwrap();
+        assert_eq!(logs2.len(), 1);
+        assert_eq!(logs2[0].stderr.as_deref(), Some("c err"));
+
+        assert!(storage.get_run_logs("missing").await.unwrap().is_empty());
+        storage.store_run_logs(&[]).await.unwrap();
     }
 
     /// The asset-events page must scan `idx_events_loc_asset_ts`, not sort every matching event.

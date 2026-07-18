@@ -1,15 +1,16 @@
 //! Async event writer — batches storage events from executor threads via a channel.
 //!
-//! `EventWriter` sends `EventRecord`s over an unbounded mpsc channel to a background
-//! Tokio task. The task accumulates events and flushes them to SurrealDB in batches
-//! (by count or timer), decoupling storage write latency from step execution
-//! throughput. The channel is unbounded so events arent lossed and we dont block the thread; if storage falls behind, depth grows and a warning is logged once it crosses the
+//! `EventWriter` sends `EventRecord`s / `LogRecord`s over an unbounded mpsc
+//! channel to a background Tokio task. The task accumulates them and flushes
+//! to SurrealDB in batches (by count or timer), decoupling storage write
+//! latency from step execution throughput. The channel is unbounded so events
+//! arent lossed and we dont block the thread; if storage falls behind, depth grows and a warning is logged once it crosses the
 //! high-water mark.
 use std::sync::Arc;
 use std::time::Duration;
 
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
-use rivers_core::storage::{EventRecord, ScopedStorageHandle, StorageBackend};
+use rivers_core::storage::{EventRecord, LogRecord, ScopedStorageHandle, StorageBackend};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -22,21 +23,39 @@ const FLUSH_INTERVAL_MS: u64 = 200;
 /// applied at half this value to avoid log spam around the boundary.
 const HIGH_WATER_MARK: usize = 4 * BATCH_SIZE;
 
+/// One message on the writer channel: a structured event or a step's log row.
+pub(crate) enum WriterMsg {
+    Event(EventRecord),
+    Log(LogRecord),
+}
+
+impl From<EventRecord> for WriterMsg {
+    fn from(e: EventRecord) -> Self {
+        Self::Event(e)
+    }
+}
+
+impl From<LogRecord> for WriterMsg {
+    fn from(l: LogRecord) -> Self {
+        Self::Log(l)
+    }
+}
+
 /// Background event writer that decouples storage writes from step execution.
 ///
-/// Events are sent to a background tokio task via an unbounded mpsc channel.
-/// The task accumulates events and flushes them in batches, either when the
-/// batch reaches `BATCH_SIZE` or on a `FLUSH_INTERVAL_MS` timer. The channel
-/// is unbounded to guarantee delivery — losing events is unacceptable, and a
-/// brief storage stall should not stall the executor. Sustained backlog above
-/// `HIGH_WATER_MARK` triggers a `warn!` so operators can see when storage is
-/// the bottleneck.
+/// Messages are sent to a background tokio task via an unbounded mpsc channel.
+/// The task accumulates events and log rows and flushes each in batches,
+/// either when a batch reaches `BATCH_SIZE` or on a `FLUSH_INTERVAL_MS` timer.
+/// The channel is unbounded to guarantee delivery — losing events is
+/// unacceptable, and a brief storage stall should not stall the executor.
+/// Sustained backlog above `HIGH_WATER_MARK` triggers a `warn!` so operators
+/// can see when storage is the bottleneck.
 pub(crate) struct EventWriter {
-    sender: mpsc::UnboundedSender<EventRecord>,
+    sender: mpsc::UnboundedSender<WriterMsg>,
     handle: JoinHandle<()>,
     /// Owning code-location identity; stamped onto every event passed through
-    /// `emit()`. Senders obtained via `sender()` bypass this and must stamp
-    /// the field themselves.
+    /// `emit()`/`emit_log()`. Senders obtained via `sender()` bypass this and
+    /// must stamp the field themselves.
     code_location_id: String,
 }
 
@@ -62,13 +81,20 @@ impl EventWriter {
     #[inline]
     pub(crate) fn emit(&self, mut event: EventRecord) {
         event.code_location_id = self.code_location_id.clone();
-        let _ = self.sender.send(event);
+        let _ = self.sender.send(WriterMsg::Event(event));
+    }
+
+    /// [`Self::emit`] for a step's captured log output.
+    #[inline]
+    pub(crate) fn emit_log(&self, mut log: LogRecord) {
+        log.code_location_id = self.code_location_id.clone();
+        let _ = self.sender.send(WriterMsg::Log(log));
     }
 
     /// Clone the underlying sender for passing to subsystems (e.g. PoolGuard).
-    /// Events sent through the returned sender bypass `emit`'s
+    /// Messages sent through the returned sender bypass `emit`'s
     /// `code_location_id` stamping and must set the field themselves.
-    pub(crate) fn sender(&self) -> mpsc::UnboundedSender<EventRecord> {
+    pub(crate) fn sender(&self) -> mpsc::UnboundedSender<WriterMsg> {
         self.sender.clone()
     }
 
@@ -90,8 +116,19 @@ async fn flush_batch(storage: &SurrealStorage, batch: &mut Vec<EventRecord>) {
     batch.clear();
 }
 
-async fn batch_writer_loop(mut rx: mpsc::UnboundedReceiver<EventRecord>, storage: &SurrealStorage) {
-    let mut batch = Vec::with_capacity(BATCH_SIZE);
+async fn flush_logs(storage: &SurrealStorage, batch: &mut Vec<LogRecord>) {
+    if batch.is_empty() {
+        return;
+    }
+    if let Err(e) = storage.store_run_logs(batch).await {
+        warn!("failed to flush log batch: {e:?}");
+    }
+    batch.clear();
+}
+
+async fn batch_writer_loop(mut rx: mpsc::UnboundedReceiver<WriterMsg>, storage: &SurrealStorage) {
+    let mut events = Vec::with_capacity(BATCH_SIZE);
+    let mut logs: Vec<LogRecord> = Vec::new();
     let mut interval = tokio::time::interval(Duration::from_millis(FLUSH_INTERVAL_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // First tick fires immediately; consume it so the loop ticks at the proper cadence.
@@ -102,20 +139,28 @@ async fn batch_writer_loop(mut rx: mpsc::UnboundedReceiver<EventRecord>, storage
         tokio::select! {
             msg = rx.recv() => {
                 match msg {
-                    Some(event) => {
-                        batch.push(event);
-                        if batch.len() >= BATCH_SIZE {
-                            flush_batch(storage, &mut batch).await;
+                    Some(WriterMsg::Event(event)) => {
+                        events.push(event);
+                        if events.len() >= BATCH_SIZE {
+                            flush_batch(storage, &mut events).await;
+                        }
+                    }
+                    Some(WriterMsg::Log(log)) => {
+                        logs.push(log);
+                        if logs.len() >= BATCH_SIZE {
+                            flush_logs(storage, &mut logs).await;
                         }
                     }
                     None => {
-                        flush_batch(storage, &mut batch).await;
+                        flush_batch(storage, &mut events).await;
+                        flush_logs(storage, &mut logs).await;
                         return;
                     }
                 }
             }
             _ = interval.tick() => {
-                flush_batch(storage, &mut batch).await;
+                flush_batch(storage, &mut events).await;
+                flush_logs(storage, &mut logs).await;
                 let depth = rx.len();
                 if depth >= HIGH_WATER_MARK && !above_high_water {
                     warn!(

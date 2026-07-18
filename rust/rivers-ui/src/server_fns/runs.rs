@@ -3,7 +3,7 @@
 use leptos::prelude::*;
 use leptos::server_fn::codec::Json;
 
-use crate::types::{EventsPage, RunFilter, RunRecord, RunsPage, RunsSummary, StoredEvent};
+use crate::types::{EventsPage, RunFilter, RunLog, RunRecord, RunsPage, RunsSummary, StoredEvent};
 
 /// Latest runs across all code locations. `status` accepts the wire-string
 /// form of [`RunStatus`] (`"Success"`, `"Failure"`, `"Started"`,
@@ -80,15 +80,16 @@ pub async fn get_run_step_events(run_id: String) -> Result<Vec<StoredEvent>, Ser
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
-/// A run's `LogOutput` events (stdout/stderr/logs) — typically small.
+/// A run's captured step logs (stdout/stderr/logs) — typically small.
 #[server]
-pub async fn get_run_log_events(run_id: String) -> Result<Vec<StoredEvent>, ServerFnError> {
+pub async fn get_run_logs(run_id: String) -> Result<Vec<RunLog>, ServerFnError> {
+    use rivers_core::storage::StorageBackend;
     let state = expect_context::<crate::state::AppState>();
     state
         .storage
-        .get_run_log_events(&run_id)
+        .get_run_logs(&run_id)
         .await
-        .map(|evts| evts.into_iter().map(Into::into).collect())
+        .map(|logs| logs.into_iter().map(Into::into).collect())
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionStep;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
-use rivers_core::storage::{EventRecord, ScopedStorageHandle};
+use rivers_core::storage::ScopedStorageHandle;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 
@@ -26,6 +26,7 @@ use super::super::dispatch::{
     AsyncWorker, BatchContext, ExecutorBackend, StepInstance, WorkOutcome, process_outcome,
     run_step_async_lifecycle,
 };
+use super::super::event_writer::WriterMsg;
 use super::super::ops::{self};
 
 fn python_not_attached_outcome() -> WorkOutcome {
@@ -148,7 +149,7 @@ struct StepDispatch {
     pools: Vec<(String, u32)>,
     semaphore: Option<Arc<Semaphore>>,
     locals: Option<pyo3_async_runtimes::TaskLocals>,
-    events_tx: mpsc::UnboundedSender<EventRecord>,
+    events_tx: mpsc::UnboundedSender<WriterMsg>,
     /// Step name reported on the `StepSlotWaiting` events emitted by the pool
     /// guard. Single-step name for `schedule_batch`; instance name for
     /// mapped fan-out.

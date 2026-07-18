@@ -16,10 +16,10 @@ use crate::now::use_now;
 use crate::server_fns::actions::{cancel_run, rerun_run};
 use crate::server_fns::locations::list_code_locations;
 use crate::server_fns::runs::{
-    get_run, get_run_asset_events_page, get_run_log_events, get_run_step_events,
+    get_run, get_run_asset_events_page, get_run_logs, get_run_step_events,
     get_run_structured_events_page,
 };
-use crate::types::{EventType, RunStatus, StoredEvent};
+use crate::types::{EventType, RunLog, RunStatus, StoredEvent};
 
 #[derive(Clone)]
 struct GanttStep {
@@ -136,12 +136,12 @@ pub fn RunDetailPage() -> impl IntoView {
         },
         |(id, _)| get_run_step_events(id),
     );
-    let log_events = Resource::new(
+    let run_logs = Resource::new(
         move || {
             params.track();
             (run_id(), refresh_tick.get())
         },
-        |(id, _)| get_run_log_events(id),
+        |(id, _)| get_run_logs(id),
     );
     let topology = Resource::new(
         move || loc.get(),
@@ -343,13 +343,13 @@ pub fn RunDetailPage() -> impl IntoView {
                 }}
             </Transition>
             // Created once (not in the resource Transition) so a live refresh can't
-            // re-mount it and reset the scroll buffer. `log_events` is reactive, so
+            // re-mount it and reset the scroll buffer. `run_logs` is reactive, so
             // stdout/stderr still update live.
             <RunLogPanel
                 run_id=run_id_memo
                 refresh_tick=refresh_tick
-                log_events=Signal::derive(move || {
-                    log_events.get().and_then(|r| r.ok()).unwrap_or_default()
+                run_logs=Signal::derive(move || {
+                    run_logs.get().and_then(|r| r.ok()).unwrap_or_default()
                 })
                 selected_step=selected_step
                 on_clear=set_selected_step
@@ -388,19 +388,17 @@ pub fn RunDetailPage() -> impl IntoView {
     }
 }
 
-/// Flatten a run's `LogOutput` events into `(asset, line)` pairs for a metadata
-/// key (`stdout`/`stderr`/`logs`).
-fn extract_log_lines(events: &[StoredEvent], key: &str) -> Vec<(String, String)> {
-    events
-        .iter()
-        .flat_map(|e| {
-            let asset = e.asset_key.clone().unwrap_or_default();
-            e.metadata
-                .iter()
-                .filter(|(k, _)| k == key)
-                .map(|(_, v)| v.as_text())
-                .filter(|v| !v.is_empty())
-                .map(move |v| (asset.clone(), v))
+/// Flatten a run's log rows into `(step, content)` pairs for one stream
+/// (`stdout`/`stderr`/`logs`).
+fn extract_log_lines(logs: &[RunLog], key: &str) -> Vec<(String, String)> {
+    logs.iter()
+        .filter_map(|l| {
+            let content = match key {
+                "stdout" => l.stdout.as_ref(),
+                "stderr" => l.stderr.as_ref(),
+                _ => l.logs.as_ref(),
+            }?;
+            (!content.is_empty()).then(|| (l.step_key.clone(), content.clone()))
         })
         .collect()
 }
@@ -1007,7 +1005,6 @@ fn event_type_label(evt: &StoredEvent) -> &'static str {
         EventType::StepRetry => "STEP_RETRY",
         EventType::Materialization => "MATERIALIZATION",
         EventType::Observation => "OBSERVATION",
-        EventType::LogOutput => "LOG_OUTPUT",
         EventType::RunQueued => "RUN_QUEUED",
         EventType::RunDequeued => "RUN_DEQUEUED",
         EventType::StepSlotClaimed => "SLOT_CLAIMED",
@@ -1025,7 +1022,6 @@ fn event_row_class(evt: &StoredEvent) -> &'static str {
         EventType::StepRetry => "log-row--warn",
         EventType::Materialization => "log-row--success",
         EventType::Observation => "log-row--info",
-        EventType::LogOutput => "log-row--muted",
         EventType::RunQueued | EventType::RunDequeued => "log-row--info",
         EventType::StepSlotClaimed | EventType::StepSlotReleased => "log-row--info",
         EventType::StepSlotWaiting => "log-row--warn",
@@ -1078,19 +1074,6 @@ fn event_info(evt: &StoredEvent) -> String {
             }
         }
         EventType::Observation => "Observed".to_string(),
-        EventType::LogOutput => {
-            let parts: Vec<&str> = evt
-                .metadata
-                .iter()
-                .filter(|(k, _)| k == "stdout" || k == "stderr" || k == "logs")
-                .map(|(k, _)| k.as_str())
-                .collect();
-            if parts.is_empty() {
-                "No output".to_string()
-            } else {
-                format!("Captured {}", parts.join(", "))
-            }
-        }
         EventType::RunQueued => "Run queued".to_string(),
         EventType::RunDequeued => "Run dequeued".to_string(),
         EventType::StepSlotClaimed => {
@@ -1331,7 +1314,7 @@ fn render_log_rows(data: Vec<(String, String)>, level_filter: &str) -> Vec<impl 
 fn RunLogPanel(
     run_id: Memo<String>,
     refresh_tick: ReadSignal<u32>,
-    log_events: Signal<Vec<StoredEvent>>,
+    run_logs: Signal<Vec<RunLog>>,
     selected_step: ReadSignal<Option<String>>,
     on_clear: WriteSignal<Option<String>>,
     log_tab: ReadSignal<String>,
@@ -1362,10 +1345,10 @@ fn RunLogPanel(
         set_ev_page.set(0);
     });
 
-    // stdout/stderr/logs derive from the small LogOutput stream, which refreshes live.
-    let all_stdout = Signal::derive(move || extract_log_lines(&log_events.get(), "stdout"));
-    let all_stderr = Signal::derive(move || extract_log_lines(&log_events.get(), "stderr"));
-    let all_logs = Signal::derive(move || extract_log_lines(&log_events.get(), "logs"));
+    // stdout/stderr/logs derive from the small run_logs stream, which refreshes live.
+    let all_stdout = Signal::derive(move || extract_log_lines(&run_logs.get(), "stdout"));
+    let all_stderr = Signal::derive(move || extract_log_lines(&run_logs.get(), "stderr"));
+    let all_logs = Signal::derive(move || extract_log_lines(&run_logs.get(), "logs"));
 
     let make_filtered = move |data: Signal<Vec<(String, String)>>| {
         Signal::derive(move || {

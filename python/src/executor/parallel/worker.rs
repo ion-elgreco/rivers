@@ -450,7 +450,7 @@ pub fn worker_execute_step(
     // Per-step capture: install the proxy writers (idempotent, child-process
     // local) and start a fresh StepCapture / Rust log capture pair around the
     // user code so prints + tracing logs land in the orchestrator's
-    // `LogOutput` event stream.
+    // `run_logs` stream.
     let _ = py
         .import("rivers._capture")
         .and_then(|m| m.call_method0("install"));

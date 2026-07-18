@@ -129,8 +129,6 @@ pub enum EventType {
     /// A failed attempt is about to be retried. Metadata carries the attempt
     /// number, classified reason, and next delay/resources.
     StepRetry,
-    /// Captured stdout/stderr output from a step execution.
-    LogOutput,
     // ── Concurrency observability events ──
     /// Run entered the queue (Queued status).
     RunQueued,
@@ -166,7 +164,6 @@ impl EventType {
             Self::StepSuccess => "StepSuccess",
             Self::StepFailure => "StepFailure",
             Self::StepRetry => "StepRetry",
-            Self::LogOutput => "LogOutput",
             Self::RunQueued => "RunQueued",
             Self::RunDequeued => "RunDequeued",
             Self::StepSlotClaimed => "StepSlotClaimed",
@@ -188,7 +185,6 @@ impl EventType {
             "StepSuccess" => Ok(Self::StepSuccess),
             "StepFailure" => Ok(Self::StepFailure),
             "StepRetry" => Ok(Self::StepRetry),
-            "LogOutput" => Ok(Self::LogOutput),
             "RunQueued" => Ok(Self::RunQueued),
             "RunDequeued" => Ok(Self::RunDequeued),
             "StepSlotClaimed" => Ok(Self::StepSlotClaimed),
@@ -211,7 +207,6 @@ impl EventType {
     pub fn sort_order(&self) -> i64 {
         match self {
             Self::StepStart => 0,
-            Self::LogOutput => 1,
             Self::Observation { .. } => 2,
             Self::Materialization { .. } => 3,
             Self::StepSuccess | Self::StepFailure | Self::StepRetry => 4,
@@ -1214,6 +1209,40 @@ pub enum RunOutcome {
     },
 }
 
+/// Captured output of one step execution — one row per step in `run_logs`.
+/// Streams the step didn't produce stay `None`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LogRecord {
+    #[serde(default = "default_code_location_id")]
+    pub code_location_id: String,
+    pub run_id: String,
+    pub step_key: String,
+    pub timestamp: i64,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub logs: Option<String>,
+}
+
+impl LogRecord {
+    pub fn is_empty(&self) -> bool {
+        self.stdout.is_none() && self.stderr.is_none() && self.logs.is_none()
+    }
+}
+
+/// Stored step log with its database-assigned ID.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StoredLog {
+    pub id: surrealdb::types::RecordId,
+    #[serde(default = "default_code_location_id")]
+    pub code_location_id: String,
+    pub run_id: String,
+    pub step_key: String,
+    pub timestamp: i64,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub logs: Option<String>,
+}
+
 /// Stored event with its database-assigned ID.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredEvent {
@@ -2069,6 +2098,11 @@ pub trait StorageBackend: PerCodeLocationStorage {
         &self,
         run_id: &str,
     ) -> impl Future<Output = Result<Vec<StoredEvent>>> + Send;
+
+    // Step logs (`run_logs` — one row per step execution)
+    fn store_run_logs(&self, logs: &[LogRecord]) -> impl Future<Output = Result<()>> + Send;
+    fn get_run_logs(&self, run_id: &str) -> impl Future<Output = Result<Vec<StoredLog>>> + Send;
+
     /// Scan the given runs' step events for `asset_key` in one pass.
     fn step_completion(
         &self,
@@ -2277,7 +2311,6 @@ mod event_type_tests {
             EventType::StepSuccess,
             EventType::StepFailure,
             EventType::StepRetry,
-            EventType::LogOutput,
             EventType::RunQueued,
             EventType::RunDequeued,
             EventType::StepSlotClaimed,
