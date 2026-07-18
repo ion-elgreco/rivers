@@ -34,7 +34,7 @@ mod types;
 
 pub use subprocess_eval::{eval_schedule_in_subprocess, eval_sensor_in_subprocess};
 
-use automation_condition::{ConditionEvalLoopConfig, condition_eval_loop};
+use automation_condition::{ConditionEvalLoopConfig, build_condition_engine, condition_eval_loop};
 use automation_entry::AutomationEntry;
 use batch_writer::{spawn_condition_eval_writer, spawn_tick_writer};
 pub(crate) use dispatchers::{BackfillDispatcherKind, RunDispatcherKind};
@@ -478,19 +478,25 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
         let (eval_tx, eval_writer_handle) =
             spawn_condition_eval_writer(handle.clone(), cancel.clone(), max_evals_retained);
         handles.push(eval_writer_handle);
-        handles.push(tokio::spawn(condition_eval_loop(ConditionEvalLoopConfig {
+        // Awaited here — before any dispatch-capable subdaemon spawns — so an
+        // in-process run can't land mid-initial-load.
+        let engine = build_condition_engine(ConditionEvalLoopConfig {
             conditions: asset_conditions,
             storage: handle.clone(),
             run_dispatcher: Arc::clone(&run_dispatcher),
             backfill_dispatcher: Arc::clone(&backfill_dispatcher),
-            cancel: cancel.clone(),
-            interval: condition_eval_interval,
             tick_tx: tick_tx.clone(),
             max_ticks_retained,
             eval_tx,
             max_evals_retained,
             upstream_partition_keys,
-        })));
+        })
+        .await;
+        handles.push(tokio::spawn(condition_eval_loop(
+            engine,
+            cancel.clone(),
+            condition_eval_interval,
+        )));
     }
 
     handles.push(spawn_backfill_pickup_loop(

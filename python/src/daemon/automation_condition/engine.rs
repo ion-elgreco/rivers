@@ -12,7 +12,7 @@ use crate::daemon::types::{ConditionEvalWriteMsg, TickWriteMsg};
 /// latches always persist immediately.
 const STATE_PERSIST_INTERVAL_NANOS: i64 = 60 * 1_000_000_000;
 
-pub(super) struct ConditionTickEngine {
+pub(in crate::daemon) struct ConditionTickEngine {
     pub(super) pass: ConditionPass,
 
     pub(super) code_location_id: String,
@@ -26,6 +26,10 @@ pub(super) struct ConditionTickEngine {
     pub(super) max_evals_retained: Option<usize>,
     /// When eval state last persisted (throttles passive-tick flushes).
     pub(super) last_state_persist: i64,
+    /// Carries the priming load's `changed` into the first tick — without it
+    /// a restart with persisted eval state skips every tick until some other
+    /// write lands, so latch-only conditions never re-evaluate.
+    pub(super) initial_changes: bool,
 }
 
 impl ConditionTickEngine {
@@ -36,7 +40,7 @@ impl ConditionTickEngine {
             .refresh_cache(self.storage.backend().as_ref(), now)
             .await
         {
-            Ok(changed) => changed,
+            Ok(changed) => changed || std::mem::take(&mut self.initial_changes),
             Err(e) => {
                 tracing::error!(target: "rivers::daemon", error = %e, "condition cache refresh failed");
                 return;

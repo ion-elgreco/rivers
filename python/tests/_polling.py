@@ -61,6 +61,22 @@ def wait_for_backfill_runs(storage, timeout: float = 15.0):
     return [r for r in runs if r.launched_by.kind == "backfill"]
 
 
+def wait_for_all_runs_success(storage, timeout: float = 15.0):
+    """Poll until at least one run exists and every run is Success, or timeout.
+
+    The executor commits materialization events before the run's terminal
+    status, so asset records can show materialized while the run still reads
+    Started — status sweeps must wait out that window.
+    """
+
+    def settled():
+        runs = storage.get_runs(limit=100)
+        return bool(runs) and all(r.status == "Success" for r in runs)
+
+    wait_until(settled, timeout=timeout)
+    return storage.get_runs(limit=100)
+
+
 def wait_for_run_terminal(storage, run_id, timeout: float = 15.0):
     """Poll until a specific run reaches a terminal state."""
     terminal = {"Success", "Failure", "Canceled"}
