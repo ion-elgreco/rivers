@@ -22,6 +22,11 @@ inputs:
     required: false
     default: "true"
 
+  cache-shared-key:
+    description: "rust-cache shared key. Jobs whose target contents don't overlap the default pool (e.g. cross-compile builds) set their own so they keep a dedicated primer tarball instead of racing the shared one."
+    required: false
+    default: "ci"
+
   cross_compile:
     description: "Install the cross-compile toolchain (cargo-zigbuild + zig as the cross linker). Release workflows that produce linux/amd64 + linux/arm64 artifacts from a single runner set this to 'true'."
     required: false
@@ -68,8 +73,8 @@ runs:
         # target on demand; cargo doesn't, so we pre-add it here.
         target: wasm32-unknown-unknown
         cache: ${{ inputs.cache == 'true' && inputs.rust-cache == 'true' }}
-        # One cache per OS/arch shared by every job (drops the per-job key)
-        cache-shared-key: "ci"
+        # One cache per OS/arch shared by every job on the same key (drops the per-job key)
+        cache-shared-key: ${{ inputs.cache-shared-key }}
         # PRs restore main's cache but never save their own copies
         cache-save-if: ${{ github.ref == 'refs/heads/main' }}
         # Save partial compilation
