@@ -26,7 +26,7 @@ import grpc
 import httpx
 import pytest
 from kr8s import NotFoundError
-from kr8s.objects import APIObject, Deployment, Pod, Secret, Service
+from kr8s.objects import APIObject, Deployment, Job, Pod, Secret, Service
 
 from .conftest import KUBECTL_CONTEXT, cluster_gate, kube_api
 
@@ -156,8 +156,6 @@ def _delete_runs_and_workers() -> None:
             pod.delete()
         except NotFoundError:
             pass
-    from kr8s.objects import Job
-
     for job in Job.list(
         namespace=NAMESPACE,
         label_selector="rivers.io/component=step-worker",
@@ -265,6 +263,18 @@ def _query_run_events(run_id: str) -> list[dict]:
     ):
         return data[0]["result"] or []
     return []
+
+
+def _wait_for_step_start(run_id: str, asset: str, timeout: int = 60) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any(
+            e["asset_key"] == asset and e["event_type"] == "StepStart"
+            for e in _query_run_events(run_id)
+        ):
+            return True
+        time.sleep(1)
+    return False
 
 
 def _wait_for_executor_pod(run_name: str, timeout: int = 60) -> str:
@@ -565,6 +575,27 @@ class TestK8sGrpcFlow:
                 f"Expected Cancelled but got '{phase}'\n{_dump_debug_info(run_name)}"
             )
 
+            # Step Jobs are removed by the operator's cleanup (background
+            # deletecollection), not by the executor — poll them to zero.
+            deadline = time.monotonic() + 45
+            leftover: list[Job] = []
+            while time.monotonic() < deadline:
+                leftover = list(
+                    Job.list(
+                        namespace=NAMESPACE,
+                        label_selector=(
+                            f"rivers.io/run-id={run_id},rivers.io/component=step-worker"
+                        ),
+                        api=kube_api(),
+                    )
+                )
+                if not leftover:
+                    break
+                time.sleep(2)
+            assert not leftover, (
+                f"Step Jobs not cleaned up after cancel: {[j.name for j in leftover]}"
+            )
+
     def test_failing_asset_marks_run_failed(self, grpc_stubs):
         """Asset that raises an exception drives the Run to Failed (executor outcome=Failure)."""
         with GrpcChannel(grpc_stubs) as ch:
@@ -647,7 +678,11 @@ class TestK8sGrpcFlow:
         Uses the in-process slow job whose single asset sleeps 120s — the
         executor only checks the cancel signal between assets, so it won't
         exit voluntarily during the grace period and the operator hits the
-        force-kill branch in cancel.rs.
+        force-kill branch in cancel.rs. The cancel is gated on slow_asset's
+        StepStart event: phase=Running precedes the first asset by several
+        seconds (storage open, module import), and a cancel landing in that
+        window is seen by the pre-asset check — the executor then exits
+        gracefully and the run ends as plain 'Run was cancelled'.
         """
         with GrpcChannel(grpc_stubs) as ch:
             resp = ch.stub.ExecuteJob(ch.pb2.ExecuteJobRequest(job_name="k8s_slow_job"))
@@ -667,6 +702,10 @@ class TestK8sGrpcFlow:
                 if status.get("executorPod") and status.get("phase") == "Running":
                     break
                 time.sleep(1)
+
+            assert _wait_for_step_start(run_id, "slow_asset"), (
+                "slow_asset never emitted StepStart"
+            )
 
             cancel_resp = ch.stub.CancelRun(ch.pb2.CancelRunRequest(run_id=run_id))
             assert cancel_resp.success
