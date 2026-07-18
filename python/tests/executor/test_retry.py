@@ -816,10 +816,13 @@ def test_async_task_retry(storage):
 
 
 def test_bash_task_retry(storage, tmp_path):
+    # Quoted POSIX form — sh (Git Bash on Windows runners) eats the
+    # backslashes of a raw Windows path, mangling where the marker lands.
     marker = tmp_path / "bash_attempted"
+    marker_sh = marker.as_posix()
     flaky_bash = rs.BashTask(
         name="flaky_bash",
-        command=f"test -f {marker} || {{ touch {marker}; exit 1; }}",
+        command=f"test -f '{marker_sh}' || {{ touch '{marker_sh}'; exit 1; }}",
         retry=rs.RetryPolicy(max_retries=2),
     )
 
