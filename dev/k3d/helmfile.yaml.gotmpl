@@ -10,7 +10,11 @@ kubeContext: k3d-{{ env "RIVERS_K3D_CLUSTER" | default "rivers-test" }}
 
 helmDefaults:
   wait: true
-  timeout: 15
+  # Tight fast-fail default for local dev iteration (the rivers chart's
+  # `wait-for-surreal` init container does the real readiness gating). CI sets
+  # RIVERS_HELMFILE_TIMEOUT to a real value so `sync` waits for the operator +
+  # storage to be ready and the deploy is deterministic.
+  timeout: {{ env "RIVERS_HELMFILE_TIMEOUT" | default "15" }}
   createNamespace: true
 
 # Pre-register repos so helmfile's automatic `helm dep build` can resolve
@@ -38,6 +42,9 @@ releases:
           image: rivers-operator:latest
           allowInsecureRegistry: true
         ui:
+          # CI (RIVERS_K8S_SKIP_UI=1) never builds/imports the UI image, so
+          # don't deploy it either — the integration suite doesn't touch it.
+          enabled: {{ if eq (env "RIVERS_K8S_SKIP_UI") "1" }}false{{ else }}true{{ end }}
           image: rivers-ui:latest
 
   # Dev-cluster scaffolding: MinIO + example CodeLocation CRs.
@@ -51,6 +58,8 @@ releases:
           - name: {{ env "RIVERS_K8S_TEST_CODE_LOCATION" | default "k8s-test-pipeline" }}
             image: k3d-rivers-registry:5000/rivers-code-location
             module: k8s_test_pipeline.pipeline
+{{- if ne (env "RIVERS_K8S_SKIP_DEMO") "1" }}
           - name: {{ env "RIVERS_K8S_DEMO_CODE_LOCATION" | default "demo" }}
             image: k3d-rivers-registry:5000/rivers-demo
             module: demo_project.pipeline
+{{- end }}

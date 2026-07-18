@@ -128,3 +128,122 @@ jobs:
 
       - name: Run tests
         run: just test
+
+  k8s-integration:
+    name: K8s integration (k3d)
+    # End-to-end coverage of the gRPC → daemon → operator → executor-pod →
+    # SurrealDB path — the only CI job that exercises the real Kubernetes stack.
+    # Runs on every PR: warm-cache runs finish in ~20-30 min, inside the rest
+    # of the matrix's envelope. The 60-min ceiling is a hang-catcher, not
+    # pacing — cold-cache runs (first ever, or a Cargo.lock bump) legitimately
+    # need ~45 min, and killing one would also lose the cache save that makes
+    # the next run fast. Push-to-main runs double as the cache primer PR runs
+    # restore from. Native arm64 runner so the arm64-pinned build/image flow
+    # needs no changes.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    # This job drives docker/k3d/helm from the repo root — override the
+    # workflow-wide `working-directory: python` default.
+    defaults:
+      run:
+        working-directory: .
+    env:
+      # Lean deploy: the suite never touches the UI or the demo code-location,
+      # so skip building/importing/deploying them (drops the UI server binary,
+      # its image, the demo image, and their rollouts).
+      RIVERS_K8S_SKIP_UI: "1"
+      RIVERS_K8S_SKIP_DEMO: "1"
+      # Let `helmfile sync` actually wait for operator + storage readiness so
+      # the deploy is deterministic (local dev uses a tight fast-fail timeout).
+      RIVERS_HELMFILE_TIMEOUT: "300"
+      # A missing/broken cluster must fail the job, never skip to green.
+      RIVERS_K8S_REQUIRE_CLUSTER: "1"
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # k3d + a full Rust target dir + several images are disk-hungry; drop
+      # large preinstalled toolchains we don't use to avoid a mid-run ENOSPC.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/powershell || true
+          df -h /
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup-env
+        with:
+          # cargo-zigbuild + zig cross-linker for the linux-target operator/wheel build.
+          cross_compile: "true"
+
+      # k3d + helmfile + helm + kubectl at the exact versions mise.toml /
+      # mise.lock pin for local dev — one source of truth instead of
+      # hand-maintained download URLs (the action adds `--locked` when
+      # mise.lock exists and verifies its checksums, and caches the tools).
+      - name: Install cluster tooling via mise
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
+        env:
+          # Tool resolution hits the GitHub API — authenticate to dodge the
+          # shared-runner-IP rate limit.
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          install_args: k3d helmfile helm kubectl
+
+      # The external images (MinIO, SurrealDB) come from Docker Hub, whose
+      # unauthenticated per-IP rate limits are a flake source on shared runner
+      # IPs at every-PR cadence. Cache them as a tarball: on a hit the job
+      # never contacts Docker Hub (setup.sh only pulls images missing
+      # locally). The static key doubles as a version pin — bump the -v1
+      # suffix to pick up newer upstream tags.
+      - name: Restore external image cache
+        id: image-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/rivers-ext-images.tar
+          key: rivers-ext-images-arm64-v1
+
+      - name: Load cached external images
+        if: steps.image-cache.outputs.cache-hit == 'true'
+        run: docker load -i /tmp/rivers-ext-images.tar
+
+      # Create the venv up front: `just k8s-up`'s wheel build points maturin at
+      # $VIRTUAL_ENV for interpreter discovery, and the test run needs it too.
+      - name: Create test venv
+        run: just venv
+
+      - name: Build images, create cluster, deploy
+        run: just k8s-up
+
+      # Written on cache miss only; actions/cache's post step uploads it at
+      # job end (on success — a red cold run re-pulls next time, that's fine).
+      - name: Package external images for cache
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        run: |
+          docker save -o /tmp/rivers-ext-images.tar \
+            minio/mc:latest minio/minio:latest surrealdb/surrealdb:v3
+
+      - name: Wait for the stack to be ready
+        run: just k8s-wait
+
+      # The kubernetes suite never imports rivers itself, but the shared root
+      # conftest does — install the wheel we just built for the image so the
+      # host venv can import it (no separate `just develop` build needed).
+      - name: Install rivers wheel into the test venv
+        run: uv pip install --python .venv/bin/python dist/*.whl
+
+      - name: Run k8s integration tests
+        run: just k8s-test
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          set +e
+          echo "=== pods ===";          kubectl -n rivers get pods -o wide
+          echo "=== codelocations ==="; kubectl -n rivers get codelocations -o wide
+          echo "=== runs ===";          kubectl -n rivers get runs -o wide
+          echo "=== operator logs ==="; kubectl -n rivers logs deploy/rivers-operator --tail=200
+          echo "=== recent events ==="; kubectl -n rivers get events --sort-by=.lastTimestamp | tail -60

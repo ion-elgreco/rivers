@@ -32,7 +32,7 @@ import pytest
 from kr8s import NotFoundError
 from kr8s.objects import APIObject, Deployment, Namespace, Secret, Service
 
-from .conftest import KUBECTL_CONTEXT, kube_api
+from .conftest import KUBECTL_CONTEXT, cluster_gate, kube_api
 
 NAMESPACE = "rivers"
 REGISTRY_SERVICE_NAME = "rivers-operator-registry"
@@ -90,9 +90,9 @@ def _cluster_ready() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _cluster_ready(),
-    reason=(
+pytestmark = cluster_gate(
+    _cluster_ready(),
+    (
         f"k3d cluster '{KUBECTL_CONTEXT}' / namespace '{NAMESPACE}' / "
         f"registry Service '{REGISTRY_SERVICE_NAME}' / baseline CodeLocation "
         f"'{BASELINE_CODE_LOCATION}' (Ready) not all present — "

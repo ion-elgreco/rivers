@@ -29,17 +29,28 @@ else
 fi
 
 echo "==> Pushing code-location images to local registry"
-for img in rivers-code-location rivers-demo; do
+# RIVERS_K8S_SKIP_DEMO=1 (CI) drops the demo code-location — the integration
+# suite only uses rivers-code-location.
+code_location_images=(rivers-code-location)
+[ "${RIVERS_K8S_SKIP_DEMO:-}" = "1" ] || code_location_images+=(rivers-demo)
+for img in "${code_location_images[@]}"; do
     docker tag "${img}:latest" "${REGISTRY_HOST}/${img}:latest"
     docker push "${REGISTRY_HOST}/${img}:latest"
 done
 
 echo "==> Importing operator + UI images directly into k3d (pulled by tag)"
-k3d image import rivers-operator:latest rivers-ui:latest -c "${CLUSTER_NAME}"
+# RIVERS_K8S_SKIP_UI=1 (CI) drops the UI image — it isn't built or deployed.
+import_images=(rivers-operator:latest)
+[ "${RIVERS_K8S_SKIP_UI:-}" = "1" ] || import_images+=(rivers-ui:latest)
+k3d image import "${import_images[@]}" -c "${CLUSTER_NAME}"
 
 echo "==> Importing external images"
 for img in minio/mc:latest minio/minio:latest surrealdb/surrealdb:v3; do
-    docker pull --platform linux/arm64 "$img"
+    # Skip the Docker Hub round-trip when a correct-arch copy is already
+    # local (CI restores these from cache; locally they persist across runs).
+    if [ "$(docker image inspect --format '{{.Architecture}}' "$img" 2>/dev/null)" != "arm64" ]; then
+        docker pull --platform linux/arm64 "$img"
+    fi
     k3d image import "$img" -c "${CLUSTER_NAME}"
 done
 
