@@ -27,7 +27,7 @@ def my_asset():
 | `code_version` | `str \| None` | `None` | Version string for change detection. |
 | `io_handler` | `BaseIOHandler \| None` | `None` | IO handler for persistence. |
 | `metadata` | `dict[str, str] \| None` | `None` | Static metadata passed to IO handlers. |
-| `partitions_def` | `PartitionsDefinition \| None` | `None` | Partition definition. |
+| `partitions_def` | `PartitionsDefinition \| str \| None` | `None` | Partition definition. |
 | `deps` | `list[DepDef] \| None` | `None` | Input and lineage-only dependencies. Created via `AssetDef.input()` and `AssetDef.dep()`. |
 | `hooks` | `list[Hook] \| None` | `None` | Success/failure hooks for this asset. |
 | `automation_condition` | `AutomationCondition \| None` | `None` | Declarative automation condition. |
@@ -47,7 +47,7 @@ def my_asset():
 | `group` | `str \| None` | Group name. |
 | `code_version` | `str \| None` | Code version string. |
 | `metadata` | `dict[str, str] \| None` | Static metadata. |
-| `partitions_def` | `PartitionsDefinition \| None` | Partition definition. |
+| `partitions_def` | `PartitionsDefinition \| str \| None` | Partition definition. |
 | `partition_mapping` | `dict[str, PartitionMapping] \| None` | Per-dep partition mappings (derived from `deps`). |
 | `hooks` | `list[Hook] \| None` | Attached hooks. |
 | `automation_condition` | `AutomationCondition \| None` | Automation condition. |
@@ -76,7 +76,7 @@ asset = Asset.from_multi(
 |-----------|------|-------------|
 | `wraps` | `Callable \| None` | The function to wrap. |
 | `output_defs` | `list[AssetDef]` | Output definitions for each output. |
-| `partitions_def` | `PartitionsDefinition \| None` | Top-level partition definition applied to all outputs. Takes precedence over per-output `AssetDef.partitions_def`. |
+| `partitions_def` | `PartitionsDefinition \| str \| None` | Top-level partition definition applied to all outputs. Takes precedence over per-output `AssetDef.partitions_def`. |
 | `deps` | `list[DepDef]` | Input and lineage-only dependencies. Created via `AssetDef.input()` and `AssetDef.dep()`. |
 | `compute` | `Compute \| None` | Compute for the whole step — a multi-asset runs as one step (one pod), so this is declared here, not per output. |
 | `retry` | `RetryPolicy \| str \| None` | Retry policy for the whole step — a multi-asset retries as one unit, so this is declared here, not per output. See [Retries & Compute](retries.md). |
@@ -174,7 +174,7 @@ def source_table(context: rs.AssetExecutionContext):
 | `kinds` | `str \| list[str] \| None` | `None` | Asset kind(s) (e.g. `"table"`). |
 | `group` | `str \| None` | `None` | Group name for organization. |
 | `metadata` | `dict[str, str] \| None` | `None` | Static metadata passed to IO handlers. |
-| `partitions_def` | `PartitionsDefinition \| None` | `None` | Partition definition. |
+| `partitions_def` | `PartitionsDefinition \| str \| None` | `None` | Partition definition. |
 | `automation_condition` | `AutomationCondition \| None` | `None` | Declarative automation condition. |
 
 The optional observation function receives an `AssetExecutionContext` and can call `context.add_output_metadata(...)` to record metadata about the external data source (e.g., row count, last modified timestamp). Trigger observations via `CodeRepository.observe()`.
@@ -233,7 +233,7 @@ rs.AssetDef(
 | `code_version` | `str \| None` | `None` |
 | `io_handler` | `BaseIOHandler \| str \| None` | `None` |
 | `metadata` | `dict[str, str] \| None` | `None` |
-| `partitions_def` | `PartitionsDefinition \| None` | `None` |
+| `partitions_def` | `PartitionsDefinition \| str \| None` | `None` |
 | `partition_mapping` | `dict[str \| AssetDef, PartitionMapping] \| None` | `None` |
 | `pool` | `str \| list[str] \| None` | `None` |
 | `pool_slots` | `int \| dict[str, int] \| None` | `None` |

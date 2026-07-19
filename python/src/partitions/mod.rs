@@ -8,7 +8,8 @@ pub mod mapping;
 
 pub use backfill_strategy::PyBackfillStrategy;
 pub use context::PartitionContext;
-pub use definition::PartitionsDefinition;
+pub(crate) use definition::resolve_partitions_def_ref;
+pub use definition::{PartitionsDefRef, PartitionsDefinition};
 pub use key::PyPartitionKey;
 pub use key_range::{DimensionSelection, PyPartitionKeyRange};
 pub use mapping::{PartitionKeySelector, PartitionMapping};

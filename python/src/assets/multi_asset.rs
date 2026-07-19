@@ -9,7 +9,7 @@ use super::single_asset::SingleAsset;
 use crate::automation::PyAutomationCondition;
 use crate::hooks::PyHook;
 use crate::partitions::backfill_strategy::PyBackfillStrategy;
-use crate::partitions::definition::PartitionsDefinition;
+use crate::partitions::definition::PartitionsDefRef;
 use crate::partitions::mapping::PartitionMappingDict;
 
 pub struct MultiAsset {
@@ -18,7 +18,7 @@ pub struct MultiAsset {
     pub is_async: bool,
     pub code_version: Option<String>,
     pub assets: Vec<SingleAsset>,
-    pub partitions_def: Option<Py<PartitionsDefinition>>,
+    pub partitions_def: Option<PartitionsDefRef>,
     /// Input dep names (from `AssetDef.input()` — must match fn params).
     pub input_dep_names: Vec<String>,
     /// Lineage-only dep names (non-input deps from `deps` parameter).

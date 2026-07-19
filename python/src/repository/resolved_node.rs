@@ -19,9 +19,9 @@ use crate::assets::decorator::{Asset, PyAsset};
 use crate::assets::io_handler::IOHandler;
 use crate::automation::PyAutomationCondition;
 use crate::hooks::PyHook;
-use crate::partitions::PartitionsDefinition;
 use crate::partitions::backfill_strategy::PyBackfillStrategy;
 use crate::partitions::mapping::PartitionMapping;
+use crate::partitions::{PartitionsDefinition, resolve_partitions_def_ref};
 use crate::task::{PyBashTask, PyTask};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,8 +142,15 @@ pub(crate) enum ResolvedNode {
 }
 
 impl ResolvedAsset {
-    /// `output_name` disambiguates multi-asset outputs.
-    pub fn new(py: Python, inner: Py<PyAsset>, output_name: Option<String>) -> PyResult<Self> {
+    /// `output_name` disambiguates multi-asset outputs. `partition_defs` is
+    /// the repository registry that `partitions_def="name"` refs resolve
+    /// against.
+    pub fn new(
+        py: Python,
+        inner: Py<PyAsset>,
+        output_name: Option<String>,
+        partition_defs: &HashMap<String, Py<PartitionsDefinition>>,
+    ) -> PyResult<Self> {
         let asset_ref = inner.borrow(py);
         let asset = asset_ref.inner();
 
@@ -182,15 +189,19 @@ impl ResolvedAsset {
 
         // For Multi outputs, prefer the per-output partitions_def, falling back
         // to the multi-level value. For other shapes, use the asset-level value.
-        let partitions_def = if let (Asset::Multi(multi), Some(out)) = (asset, &output_name) {
+        let partitions_def_ref = if let (Asset::Multi(multi), Some(out)) = (asset, &output_name) {
             multi
                 .assets
                 .iter()
                 .find(|sa| sa.name.as_deref() == Some(out.as_str()))
-                .and_then(|sa| sa.partitions_def.as_ref().map(|p| p.borrow(py).clone()))
-                .or_else(|| multi.partitions_def.as_ref().map(|p| p.borrow(py).clone()))
+                .and_then(|sa| sa.partitions_def.as_ref())
+                .or(multi.partitions_def.as_ref())
         } else {
-            asset.partitions_def().map(|p| p.borrow(py).clone())
+            asset.partitions_def()
+        };
+        let partitions_def = match partitions_def_ref {
+            Some(r) => Some(resolve_partitions_def_ref(r, partition_defs, &name)?.clone()),
+            None => None,
         };
 
         let partition_mapping = asset.partition_mapping().map(|m| m.0.clone());
@@ -327,10 +338,11 @@ impl ResolvedTask {
         inner: Py<PyTask>,
         param_remap: Option<HashMap<String, String>>,
         parent_graph_name: Option<String>,
-        partitions_def_override: Option<Py<PartitionsDefinition>>,
+        partitions_def_override: Option<PartitionsDefinition>,
         partition_mapping_override: Option<HashMap<String, PartitionMapping>>,
         input_io_handler_override: Option<HashMap<String, IOHandler>>,
         input_metadata_override: Option<HashMap<String, HashMap<String, String>>>,
+        partition_defs: &HashMap<String, Py<PartitionsDefinition>>,
     ) -> PyResult<Self> {
         let task_ref = inner.borrow(py);
         let task = &task_ref.inner;
@@ -342,9 +354,13 @@ impl ResolvedTask {
         let is_async = task.is_async;
         let tags = task.tags.clone();
 
-        let partitions_def = partitions_def_override
-            .map(|p| p.borrow(py).clone())
-            .or_else(|| task.partitions_def.as_ref().map(|p| p.borrow(py).clone()));
+        let partitions_def = match partitions_def_override {
+            Some(pd) => Some(pd),
+            None => match &task.partitions_def {
+                Some(r) => Some(resolve_partitions_def_ref(r, partition_defs, &name)?.clone()),
+                None => None,
+            },
+        };
 
         let partition_mapping = partition_mapping_override
             .or_else(|| task.partition_mapping.as_ref().map(|m| m.0.clone()));
@@ -394,7 +410,7 @@ impl ResolvedBashTask {
     pub fn new(
         py: Python,
         inner: Py<PyBashTask>,
-        partitions_def_override: Option<Py<PartitionsDefinition>>,
+        partitions_def: Option<PartitionsDefinition>,
         partition_mapping_override: Option<HashMap<String, PartitionMapping>>,
     ) -> Self {
         let bash_ref = inner.borrow(py);
@@ -403,10 +419,6 @@ impl ResolvedBashTask {
         let partition_mapping = partition_mapping_override
             .or_else(|| bash_ref.partition_mapping.as_ref().map(|m| m.0.clone()));
         drop(bash_ref);
-
-        let partitions_def = partitions_def_override
-            .as_ref()
-            .map(|p| p.borrow(py).clone());
 
         Self {
             inner,

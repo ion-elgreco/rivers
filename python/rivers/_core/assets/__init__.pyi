@@ -46,7 +46,7 @@ class Asset:
         code_version: str | None = ...,
         io_handler: IOHandler | str | None = ...,
         metadata: dict[str, str] | None = ...,
-        partitions_def: PartitionsDefinition | None = ...,
+        partitions_def: PartitionsDefinition | str | None = ...,
         deps: list["DepDef"] | None = ...,
         hooks: list[Hook] | None = ...,
         automation_condition: AutomationCondition | None = ...,
@@ -67,7 +67,7 @@ class Asset:
         code_version: str | None = None,
         io_handler: IOHandler | str | None = None,
         metadata: dict[str, str] | None = None,
-        partitions_def: PartitionsDefinition | None = None,
+        partitions_def: PartitionsDefinition | str | None = None,
         deps: list["DepDef"] | None = None,
         hooks: list[Hook] | None = None,
         automation_condition: AutomationCondition | None = None,
@@ -91,7 +91,7 @@ class Asset:
         group: str | None = None,
         code_version: str | None = None,
         io_handler: IOHandler | str | None = None,
-        partitions_def: PartitionsDefinition | None = None,
+        partitions_def: PartitionsDefinition | str | None = None,
         deps: list["DepDef"] = ...,
         hooks: list[Hook] | None = None,
         automation_condition: AutomationCondition | None = None,
@@ -110,7 +110,7 @@ class Asset:
         group: str | None = None,
         code_version: str | None = None,
         io_handler: IOHandler | str | None = None,
-        partitions_def: PartitionsDefinition | None = None,
+        partitions_def: PartitionsDefinition | str | None = None,
         deps: list["DepDef"] = ...,
         hooks: list[Hook] | None = None,
         automation_condition: AutomationCondition | None = None,
@@ -132,7 +132,7 @@ class Asset:
         io_handler: IOHandler | str | None = None,
         node_io_handler: IOHandler | str | None = None,
         metadata: dict[str, str] | None = None,
-        partitions_def: PartitionsDefinition | None = None,
+        partitions_def: PartitionsDefinition | str | None = None,
         deps: list["DepDef"] | None = None,
         hooks: list[Hook] | None = None,
         automation_condition: AutomationCondition | None = None,
@@ -151,7 +151,7 @@ class Asset:
         io_handler: IOHandler | str | None = None,
         node_io_handler: IOHandler | str | None = None,
         metadata: dict[str, str] | None = None,
-        partitions_def: PartitionsDefinition | None = None,
+        partitions_def: PartitionsDefinition | str | None = None,
         deps: list["DepDef"] | None = None,
         hooks: list[Hook] | None = None,
         automation_condition: AutomationCondition | None = None,
@@ -171,7 +171,7 @@ class Asset:
         kinds: str | list[str] | None = None,
         group: str | None = None,
         metadata: dict[str, str] | None = None,
-        partitions_def: PartitionsDefinition | None = None,
+        partitions_def: PartitionsDefinition | str | None = None,
         automation_condition: AutomationCondition | None = None,
     ) -> "ExternalAsset": ...
     @classmethod
@@ -186,7 +186,7 @@ class Asset:
         kinds: str | list[str] | None = None,
         group: str | None = None,
         metadata: dict[str, str] | None = None,
-        partitions_def: PartitionsDefinition | None = None,
+        partitions_def: PartitionsDefinition | str | None = None,
         automation_condition: AutomationCondition | None = None,
     ) -> "ExternalAsset": ...
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
@@ -233,8 +233,12 @@ class Asset:
         ...
 
     @property
-    def partitions_def(self) -> PartitionsDefinition | None:
-        """Partitions definition, or ``None`` for non-partitioned assets."""
+    def partitions_def(self) -> PartitionsDefinition | str | None:
+        """Partitions definition, or ``None`` for non-partitioned assets.
+
+        A ``str`` when the asset references a named definition from
+        ``CodeRepository(partition_defs={...})``.
+        """
         ...
 
     @property
@@ -326,7 +330,7 @@ class AssetDef:
     code_version: str | None
     io_handler: IOHandler | str | None
     metadata: dict[str, str] | None
-    partitions_def: PartitionsDefinition | None
+    partitions_def: PartitionsDefinition | str | None
     partition_mapping: dict[str | AssetDef, PartitionMapping] | None
     pool: list[tuple[str, int]]
 
@@ -339,7 +343,7 @@ class AssetDef:
         code_version: str | None = ...,
         io_handler: IOHandler | str | None = ...,
         metadata: dict[str, str] | None = ...,
-        partitions_def: PartitionsDefinition | None = ...,
+        partitions_def: PartitionsDefinition | str | None = ...,
         partition_mapping: dict[str | AssetDef, PartitionMapping] | None = ...,
         pool: str | list[str] | None = ...,
         pool_slots: int | dict[str, int] | None = ...,

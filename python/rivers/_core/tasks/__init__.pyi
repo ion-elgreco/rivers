@@ -99,7 +99,7 @@ class Task:
         wraps: Any | None = None,
         name: str | None = None,
         tags: list[str] | None = None,
-        partitions_def: PartitionsDefinition | None = None,
+        partitions_def: PartitionsDefinition | str | None = None,
         partition_mapping: dict[str | AssetDef, PartitionMapping] | None = None,
         io_handler: IOHandler | str | None = None,
         retry: "RetryPolicy | str | None" = None,
@@ -110,7 +110,9 @@ class Task:
             wraps: Function to wrap; ``None`` for the ``@Task(...)`` form.
             name: Override the task name.
             tags: Run tags.
-            partitions_def: Partitions definition for this task's outputs.
+            partitions_def: Partitions definition for this task's outputs, or
+                the name of a definition registered in
+                ``CodeRepository(partition_defs={...})``.
             partition_mapping: Per-input partition mapping overrides.
             io_handler: Override the IO handler for this task's outputs.
             retry: Retry policy for this task's step, or the name of a policy

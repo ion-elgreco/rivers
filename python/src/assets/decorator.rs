@@ -251,16 +251,50 @@ pub fn is_coroutine_function(py: Python, func: &Option<Py<PyAny>>) -> bool {
 }
 
 use crate::hooks::PyHook;
-use crate::partitions::PartitionsDefinition;
 use crate::partitions::backfill_strategy::PyBackfillStrategy;
 use crate::partitions::mapping::{PartitionMapping, PartitionMappingDict};
+use crate::partitions::{PartitionsDefRef, PartitionsDefinition};
 
-fn py_opt_eq<T: pyo3::PyTypeInfo>(py: Python, a: &Option<Py<T>>, b: &Option<Py<T>>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => a.bind(py).as_any().eq(b.bind(py).as_any()).unwrap_or(false),
-        _ => false,
+/// All partitioned multi-asset outputs must be the same variant, and Static
+/// defs must share at least one key.
+pub(crate) fn validate_multi_output_partition_defs(
+    partitioned_outputs: &[(&str, &PartitionsDefinition)],
+) -> PyResult<()> {
+    if partitioned_outputs.len() > 1 {
+        let first_name = partitioned_outputs[0].0;
+        let first_pd = partitioned_outputs[0].1;
+        for &(name, pd) in &partitioned_outputs[1..] {
+            if !first_pd.same_variant(pd) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Multi-asset output '{}' has {} partitions but '{}' has {} partitions. \
+                     All outputs must use the same partition type.",
+                    first_name,
+                    first_pd.variant_name(),
+                    name,
+                    pd.variant_name(),
+                )));
+            }
+        }
+        if let Some(first_keys) = first_pd.static_keys() {
+            let mut intersection: std::collections::HashSet<&str> =
+                first_keys.iter().map(|k| k.as_str()).collect();
+            for &(name, pd) in &partitioned_outputs[1..] {
+                if let Some(keys) = pd.static_keys() {
+                    let other: std::collections::HashSet<&str> =
+                        keys.iter().map(|k| k.as_str()).collect();
+                    intersection = intersection.intersection(&other).copied().collect();
+                    if intersection.is_empty() {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "Multi-asset outputs '{}' and '{}' have no overlapping \
+                             partition keys. At least one common key is required.",
+                            first_name, name,
+                        )));
+                    }
+                }
+            }
+        }
     }
+    Ok(())
 }
 
 fn io_handler_eq(py: Python, a: Option<&IOHandler>, b: Option<&IOHandler>) -> bool {
@@ -418,8 +452,7 @@ pub struct AssetDef {
     pub io_handler: Option<IOHandler>,
     #[pyo3(get, set)]
     pub metadata: Option<HashMap<String, String>>,
-    #[pyo3(get, set)]
-    pub partitions_def: Option<Py<PartitionsDefinition>>,
+    pub partitions_def: Option<PartitionsDefRef>,
     #[pyo3(get, set)]
     pub partition_mapping: Option<PartitionMappingDict>,
     /// Pool membership: normalized (pool_key, slots_consumed) pairs.
@@ -441,7 +474,7 @@ impl AssetDef {
             && self.code_version == other.code_version
             && self.metadata == other.metadata
             && self.pool == other.pool
-            && py_opt_eq(py, &self.partitions_def, &other.partitions_def)
+            && PartitionsDefRef::opt_eq(&self.partitions_def, &other.partitions_def)
             && io_handler_eq(py, self.io_handler.as_ref(), other.io_handler.as_ref())
     }
 
@@ -478,7 +511,7 @@ impl AssetDef {
         code_version: Option<String>,
         io_handler: Option<IOHandler>,
         metadata: Option<HashMap<String, String>>,
-        partitions_def: Option<Py<PartitionsDefinition>>,
+        partitions_def: Option<PartitionsDefRef>,
         partition_mapping: Option<PartitionMappingDict>,
         pool: Option<&Bound<'py, PyAny>>,
         pool_slots: Option<&Bound<'py, PyAny>>,
@@ -504,6 +537,17 @@ impl AssetDef {
     #[getter]
     fn deps(&self, py: Python) -> Vec<Py<DepDef>> {
         self.deps.iter().map(|d| d.clone_ref(py)).collect()
+    }
+
+    /// The definition object, or the `partition_defs` registry name string.
+    #[getter]
+    fn partitions_def(&self, py: Python) -> Option<Py<PyAny>> {
+        self.partitions_def.as_ref().map(|r| r.to_object(py))
+    }
+
+    #[setter]
+    fn set_partitions_def(&mut self, val: Option<PartitionsDefRef>) {
+        self.partitions_def = val;
     }
 
     /// Create an input dependency definition for use with `deps=[...]`.
@@ -657,7 +701,7 @@ impl Asset {
         }
     }
 
-    pub fn partitions_def(&self) -> Option<&Py<PartitionsDefinition>> {
+    pub fn partitions_def(&self) -> Option<&PartitionsDefRef> {
         match self {
             Asset::Single(a) => a.partitions_def.as_ref(),
             Asset::Multi(a) => a.partitions_def.as_ref(),
@@ -1030,7 +1074,7 @@ impl PyAsset {
         code_version: Option<String>,
         io_handler: Option<IOHandler>,
         metadata: Option<HashMap<String, String>>,
-        partitions_def: Option<Py<PartitionsDefinition>>,
+        partitions_def: Option<PartitionsDefRef>,
         deps: Vec<Py<DepDef>>,
         hooks: Option<Vec<Py<PyHook>>>,
         automation_condition: Option<PyAutomationCondition>,
@@ -1124,7 +1168,7 @@ impl PyAsset {
         group: Option<String>,
         code_version: Option<String>,
         io_handler: Option<IOHandler>,
-        partitions_def: Option<Py<PartitionsDefinition>>,
+        partitions_def: Option<PartitionsDefRef>,
         deps: Vec<Py<DepDef>>,
         hooks: Option<Vec<Py<PyHook>>>,
         automation_condition: Option<PyAutomationCondition>,
@@ -1195,51 +1239,21 @@ impl PyAsset {
         }
 
         // All partitioned outputs must be the same variant, and for Static defs
-        // there must be a non-empty intersection of keys.
+        // there must be a non-empty intersection of keys. Named refs can't be
+        // checked until the registry is known — build_unresolved_graph
+        // re-validates with resolved defs.
         if partitions_def.is_none() {
             let partitioned_outputs: Vec<_> = py_assets
                 .iter()
-                .filter_map(|a| {
-                    a.partitions_def
-                        .as_ref()
-                        .map(|pd| (a.name.as_deref().unwrap_or("?"), pd.get()))
+                .filter_map(|a| match a.partitions_def.as_ref() {
+                    Some(PartitionsDefRef::Inline(pd)) => Some((
+                        a.name.as_deref().expect("from_multi outputs are named"),
+                        pd.get(),
+                    )),
+                    _ => None,
                 })
                 .collect();
-
-            if partitioned_outputs.len() > 1 {
-                let first_name = partitioned_outputs[0].0;
-                let first_pd = partitioned_outputs[0].1;
-                for &(name, pd) in &partitioned_outputs[1..] {
-                    if !first_pd.same_variant(pd) {
-                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                            "Multi-asset output '{}' has {} partitions but '{}' has {} partitions. \
-                             All outputs must use the same partition type.",
-                            first_name,
-                            first_pd.variant_name(),
-                            name,
-                            pd.variant_name(),
-                        )));
-                    }
-                }
-                if let Some(first_keys) = first_pd.static_keys() {
-                    let mut intersection: std::collections::HashSet<&str> =
-                        first_keys.iter().map(|k| k.as_str()).collect();
-                    for &(name, pd) in &partitioned_outputs[1..] {
-                        if let Some(keys) = pd.static_keys() {
-                            let other: std::collections::HashSet<&str> =
-                                keys.iter().map(|k| k.as_str()).collect();
-                            intersection = intersection.intersection(&other).copied().collect();
-                            if intersection.is_empty() {
-                                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                                    "Multi-asset outputs '{}' and '{}' have no overlapping \
-                                     partition keys. At least one common key is required.",
-                                    first_name, name,
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
+            validate_multi_output_partition_defs(&partitioned_outputs)?;
         }
 
         let is_async = is_coroutine_function(py, &wraps);
@@ -1300,7 +1314,7 @@ impl PyAsset {
         io_handler: Option<IOHandler>,
         node_io_handler: Option<IOHandler>,
         metadata: Option<HashMap<String, String>>,
-        partitions_def: Option<Py<PartitionsDefinition>>,
+        partitions_def: Option<PartitionsDefRef>,
         deps: Vec<Py<DepDef>>,
         hooks: Option<Vec<Py<PyHook>>>,
         automation_condition: Option<PyAutomationCondition>,
@@ -1384,7 +1398,7 @@ impl PyAsset {
         kinds: Option<Kinds>,
         group: Option<String>,
         metadata: Option<HashMap<String, String>>,
-        partitions_def: Option<Py<PartitionsDefinition>>,
+        partitions_def: Option<PartitionsDefRef>,
         automation_condition: Option<PyAutomationCondition>,
     ) -> PyResult<Py<PyAny>> {
         let py = _cls.py();
@@ -1570,9 +1584,10 @@ impl PyAsset {
         self.inner.code_version().cloned()
     }
 
+    /// The definition object, or the `partition_defs` registry name string.
     #[getter]
-    fn partitions_def(&self) -> Option<&Py<PartitionsDefinition>> {
-        self.inner.partitions_def()
+    fn partitions_def(&self, py: Python) -> Option<Py<PyAny>> {
+        self.inner.partitions_def().map(|r| r.to_object(py))
     }
 
     #[getter]

@@ -22,7 +22,7 @@ def another_task(data):
 |-----------|------|---------|-------------|
 | `name` | `str \| None` | `None` | Task name. Defaults to function name. |
 | `tags` | `list[str] \| None` | `None` | Tags for categorization. |
-| `partitions_def` | `PartitionsDefinition \| None` | `None` | Partition definition for partitioned tasks. |
+| `partitions_def` | `PartitionsDefinition \| str \| None` | `None` | Partition definition for partitioned tasks, or the name of one registered in `CodeRepository(partition_defs={...})`. |
 | `partition_mapping` | `dict[str, PartitionMapping] \| None` | `None` | Mapping from dependency name to partition mapping strategy. |
 | `io_handler` | `BaseIOHandler \| str \| None` | `None` | IO handler for persisting the task's output. |
 | `retry` | `RetryPolicy \| str \| None` | `None` | Retry policy for this task's step, or a `retries` registry name. See [Retries & Compute](retries.md). |
