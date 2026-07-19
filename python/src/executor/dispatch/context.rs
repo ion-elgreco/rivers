@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionPlan;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::ScopedStorageHandle;
+use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use tokio::sync::mpsc;
 
 use crate::assets::io_handler_registry::IOHandlerRegistry;

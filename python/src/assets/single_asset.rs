@@ -19,7 +19,9 @@ pub struct SingleAsset {
     pub code_version: Option<String>,
     pub io_handler: Option<IOHandler>,
     pub metadata: Option<HashMap<String, String>>,
-    pub partitions_def: Option<Py<crate::partitions::PartitionsDefinition>>,
+    /// Partitions definition: inline or a name into the repository
+    /// `partition_defs` registry.
+    pub partitions_def: Option<crate::partitions::PartitionsDefRef>,
     pub partition_mapping: Option<PartitionMappingDict>,
     /// Input dep names (from `AssetDef.input()` — must match fn params).
     pub input_dep_names: Vec<String>,

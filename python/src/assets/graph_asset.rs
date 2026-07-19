@@ -8,7 +8,7 @@ use super::io_handler::IOHandler;
 use crate::automation::PyAutomationCondition;
 use crate::composition::InvokedNode;
 use crate::hooks::PyHook;
-use crate::partitions::PartitionsDefinition;
+use crate::partitions::PartitionsDefRef;
 use crate::partitions::backfill_strategy::PyBackfillStrategy;
 use crate::partitions::mapping::PartitionMappingDict;
 use pyo3::prelude::*;
@@ -25,7 +25,7 @@ pub struct GraphAsset {
     /// IO handler for internal tasks. Falls back to io_handler, then default.
     pub node_io_handler: Option<IOHandler>,
     pub metadata: Option<HashMap<String, String>>,
-    pub partitions_def: Option<Py<PartitionsDefinition>>,
+    pub partitions_def: Option<PartitionsDefRef>,
     /// Partition mappings for external asset dependencies (derived from deps).
     /// Maps asset name → mapping that transforms the graph's partition key
     /// to the upstream asset's partition space.

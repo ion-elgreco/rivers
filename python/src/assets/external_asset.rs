@@ -6,7 +6,7 @@ use pyo3::prelude::*;
 use super::decorator::{Kinds, PyAsset};
 use super::io_handler::IOHandler;
 use crate::automation::PyAutomationCondition;
-use crate::partitions::PartitionsDefinition;
+use crate::partitions::PartitionsDefRef;
 use crate::partitions::backfill_strategy::PyBackfillStrategy;
 
 pub struct ExternalAsset {
@@ -16,7 +16,7 @@ pub struct ExternalAsset {
     pub group: Option<String>,
     pub io_handler: IOHandler,
     pub metadata: Option<HashMap<String, String>>,
-    pub partitions_def: Option<Py<PartitionsDefinition>>,
+    pub partitions_def: Option<PartitionsDefRef>,
     pub observe_fn: Option<Py<PyAny>>,
     pub is_async_observe: bool,
     pub automation_condition: Option<PyAutomationCondition>,

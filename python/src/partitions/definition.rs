@@ -111,6 +111,77 @@ pub enum PartitionsDefinition {
     },
 }
 
+/// A `partitions_def=` argument: an inline [`PartitionsDefinition`] or a name
+/// into the repository `partition_defs` registry, resolved at
+/// `resolve()`/`validate()`. Mirrors the retry `Inline`/`Named` split.
+pub enum PartitionsDefRef {
+    Inline(Py<PartitionsDefinition>),
+    Named(String),
+}
+
+impl PartitionsDefRef {
+    pub fn clone_ref(&self, py: Python) -> Self {
+        match self {
+            Self::Inline(def) => Self::Inline(def.clone_ref(py)),
+            Self::Named(name) => Self::Named(name.clone()),
+        }
+    }
+
+    /// The Python view: the definition object, or the registry name string.
+    pub fn to_object(&self, py: Python) -> Py<PyAny> {
+        match self {
+            Self::Inline(def) => def.clone_ref(py).into_any(),
+            Self::Named(name) => pyo3::types::PyString::new(py, name).unbind().into_any(),
+        }
+    }
+
+    pub fn opt_eq(a: &Option<Self>, b: &Option<Self>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(Self::Inline(x)), Some(Self::Inline(y))) => x.get() == y.get(),
+            (Some(Self::Named(x)), Some(Self::Named(y))) => x == y,
+            _ => false,
+        }
+    }
+}
+
+impl FromPyObject<'_, '_> for PartitionsDefRef {
+    type Error = PyErr;
+
+    fn extract(ob: pyo3::Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
+        if let Ok(def) = ob.extract::<Py<PartitionsDefinition>>() {
+            return Ok(Self::Inline(def));
+        }
+        if let Ok(name) = ob.extract::<String>() {
+            return Ok(Self::Named(name));
+        }
+        Err(pyo3::exceptions::PyValueError::new_err(
+            "partitions_def must be a PartitionsDefinition or a str naming an entry in the \
+             repository partition_defs registry",
+        ))
+    }
+}
+
+/// Resolve a ref against the repository `partition_defs` registry; errors on
+/// an unknown name.
+pub(crate) fn resolve_partitions_def_ref<'a>(
+    r: &'a PartitionsDefRef,
+    partition_defs: &'a HashMap<String, Py<PartitionsDefinition>>,
+    owner: &str,
+) -> PyResult<&'a PartitionsDefinition> {
+    match r {
+        PartitionsDefRef::Inline(def) => Ok(def.get()),
+        PartitionsDefRef::Named(key) => partition_defs.get(key).map(|d| d.get()).ok_or_else(|| {
+            let mut registered: Vec<&String> = partition_defs.keys().collect();
+            registered.sort();
+            crate::errors::ConfigurationError::new_err(format!(
+                "unknown partitions definition '{key}' referenced by '{owner}'; \
+                     registered: {registered:?}"
+            ))
+        }),
+    }
+}
+
 impl PartitionsDefinition {
     /// Return the variant name as a string (e.g. "Static", "TimeWindow", "Multi", "Dynamic").
     pub fn variant_name(&self) -> &'static str {

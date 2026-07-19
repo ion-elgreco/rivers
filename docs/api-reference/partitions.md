@@ -54,6 +54,8 @@ Partition key values may not contain `|` or `,` — those characters are reserve
 
 Every definition is re-validated when the repository resolves: values built without the factory staticmethods (e.g. the raw `PartitionsDefinition.TimeWindow(...)` variant constructor) are held to the same rules before any partition keys are minted.
 
+Every `partitions_def=` parameter (`@Asset`, `Asset.from_multi` top-level and per-output `AssetDef`, `Asset.from_graph`, `Asset.external`, `Task`) accepts either a `PartitionsDefinition` or a `str` naming a definition registered in `CodeRepository(partition_defs={...})`. Unknown names fail at `resolve()`/`validate()` with the registered names listed. See [Named partition definitions](../concepts/partitions.md#named-partition-definitions).
+
 ### `PartitionsDefinition.static_()`
 
 ```python

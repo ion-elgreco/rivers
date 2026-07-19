@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionStep;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::ScopedStorageHandle;
+use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 

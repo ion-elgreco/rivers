@@ -13,7 +13,12 @@ from rivers._core import (
 )
 from rivers._core.assets import ExternalAsset, GraphAsset, MultiAsset, SingleAsset
 from rivers._core.executor import Executor
-from rivers._core.partitions import BackfillStrategy, PartitionKey, PartitionKeyRange
+from rivers._core.partitions import (
+    BackfillStrategy,
+    PartitionKey,
+    PartitionKeyRange,
+    PartitionsDefinition,
+)
 from rivers._core.schedule import Schedule, ScheduleTickResult
 from rivers._core.sensor import Sensor, SensorTickResult
 from rivers._core.storage import Storage
@@ -138,6 +143,7 @@ class CodeRepository:
         sensors: Sequence[Sensor] | None = None,
         default_executor: Executor | None = None,
         resources: dict[str, Any] | None = None,
+        partition_defs: dict[str, PartitionsDefinition] | None = None,
         retries: dict[str, RetryPolicy] | None = None,
         default_retry_policy: "RetryPolicy | str | None" = None,
         run_queue: "RunQueueConfig | None" = None,
@@ -154,6 +160,8 @@ class CodeRepository:
             sensors: Sensors attached to the repository.
             default_executor: Executor used when a job doesn't specify one.
             resources: ``{name: Resource}`` map injected into asset/task signatures.
+            partition_defs: Named partition definitions referenced by
+                ``partitions_def="name"`` on assets and tasks.
             retries: Named retry policies referenced by ``retry="name"`` on
                 assets and jobs.
             default_retry_policy: Repo-wide retry default (lowest precedence:

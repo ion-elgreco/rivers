@@ -29,6 +29,7 @@ repo = rs.CodeRepository(
 | `sensors` | `Sequence[Sensor] \| None` | `None` | Sensors to register. |
 | `default_executor` | `Executor \| None` | `None` | Default executor for jobs without one. Defaults to `Executor.parallel()` when not set. |
 | `resources` | `dict[str, Any] \| None` | `None` | Shared resources injected by parameter name into asset/task/schedule/sensor functions. |
+| `partition_defs` | `dict[str, PartitionsDefinition] \| None` | `None` | Named partition definitions referenced by `partitions_def="name"` on assets and tasks. See [Partitions](../concepts/partitions.md#named-partition-definitions). |
 | `run_queue` | `RunQueueConfig \| None` | `None` | Run-queue limits applied to daemon-submitted runs. See [Concurrency](concurrency.md). |
 | `run_backend` | `RunBackendConfig \| None` | `None` | Where runs are launched — local subprocess (default) or Kubernetes pods. |
 | `pool_limits` | `dict[str, int] \| None` | `None` | Initial concurrency-pool slot caps (`{pool_key: limit}`). |

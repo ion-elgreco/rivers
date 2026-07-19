@@ -102,6 +102,32 @@ submitting a key that isn't in storage (a typo, or one deleted via
 `delete_dynamic_partition`) is rejected at the boundary with a precise error
 instead of recording a materialization for a partition that doesn't exist.
 
+## Named partition definitions
+
+Register definitions once on the repository and reference them by name — the
+same pattern as named retry policies and IO handlers:
+
+```python
+repo = rs.CodeRepository(
+    assets=[daily_events, daily_summary],
+    partition_defs={
+        "daily": rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1)),
+        "regions": rs.PartitionsDefinition.static_(["us", "eu", "asia"]),
+    },
+)
+
+@rs.Asset(partitions_def="daily")
+def daily_events(): ...
+
+@rs.Asset(partitions_def="daily")
+def daily_summary(daily_events): ...
+```
+
+Every `partitions_def=` site accepts a name: `@Asset`, `Asset.from_multi`
+(top-level and per-output `AssetDef`), `Asset.from_graph`, `Asset.external`,
+and `Task`. An unknown name fails at `resolve()`/`validate()` with the
+registered names listed — never silently at execution time.
+
 ## Partition keys
 
 When executing a partitioned job, provide a key:

@@ -9,7 +9,7 @@ use crate::composition::{
     observe_invocation,
 };
 use crate::errors::TaskDefinitionError;
-use crate::partitions::PartitionsDefinition;
+use crate::partitions::PartitionsDefRef;
 use crate::partitions::mapping::PartitionMappingDict;
 
 pub struct Task {
@@ -17,7 +17,7 @@ pub struct Task {
     pub is_async: bool,
     pub name: Option<String>,
     pub tags: Option<Vec<String>>,
-    pub partitions_def: Option<Py<PartitionsDefinition>>,
+    pub partitions_def: Option<PartitionsDefRef>,
     pub partition_mapping: Option<PartitionMappingDict>,
     /// IO handler for the task. Set to the shared `InMemoryIOHandler` by default during resolve.
     pub io_handler: Option<IOHandler>,
@@ -44,7 +44,7 @@ impl PyTask {
         wraps: Option<Py<PyAny>>,
         name: Option<String>,
         tags: Option<Vec<String>>,
-        partitions_def: Option<Py<PartitionsDefinition>>,
+        partitions_def: Option<PartitionsDefRef>,
         partition_mapping: Option<PartitionMappingDict>,
         io_handler: Option<IOHandler>,
         retry: Option<Bound<'_, PyAny>>,

@@ -300,7 +300,7 @@ fn validate_job_partition_compatibility(
     Ok(())
 }
 
-use crate::assets::decorator::{Asset, PyAsset};
+use crate::assets::decorator::{Asset, PyAsset, validate_multi_output_partition_defs};
 use crate::assets::io_handler::IOHandler;
 use crate::automation::schedule::{self, PyScheduleDefinition, PyScheduleTickResult};
 use crate::automation::sensor::{self, PySensorDefinition, PySensorTickResult};
@@ -315,6 +315,7 @@ use crate::job::PyJob;
 use crate::partitions::mapping::PartitionMapping;
 use crate::partitions::{
     PartitionsDefinition, PyBackfillStrategy, PyPartitionKey, PyPartitionKeyRange,
+    resolve_partitions_def_ref,
 };
 use crate::result_types;
 use crate::storage::{PyStorage, PyStorageType};
@@ -738,6 +739,7 @@ pub(crate) fn build_unresolved_graph(
     assets: &[Py<PyAsset>],
     tasks: &[Py<PyAny>],
     resource_keys: &HashSet<&String>,
+    partition_defs: &HashMap<String, Py<PartitionsDefinition>>,
 ) -> PyResult<UnresolvedGraph> {
     let mut unresolved_graph: BTreeMap<String, Vec<NodeRef>> = BTreeMap::new();
     let mut node_map: HashMap<String, ResolvedNode> = HashMap::new();
@@ -764,6 +766,7 @@ pub(crate) fn build_unresolved_graph(
                         py,
                         decorator_py.clone_ref(py),
                         None,
+                        partition_defs,
                     )?)),
                 );
             }
@@ -796,8 +799,26 @@ pub(crate) fn build_unresolved_graph(
                             py,
                             decorator_py.clone_ref(py),
                             Some(output_name),
+                            partition_defs,
                         )?)),
                     );
+                }
+
+                // Re-run the per-output compatibility check with registry
+                // names resolved; decoration time could only see inline defs.
+                if multi_asset.partitions_def.is_none() {
+                    let mut partitioned_outputs = Vec::new();
+                    for inner in &multi_asset.assets {
+                        if let Some(r) = &inner.partitions_def {
+                            let owner =
+                                inner.name.as_deref().expect("from_multi outputs are named");
+                            partitioned_outputs.push((
+                                owner,
+                                resolve_partitions_def_ref(r, partition_defs, owner)?,
+                            ));
+                        }
+                    }
+                    validate_multi_output_partition_defs(&partitioned_outputs)?;
                 }
             }
             Asset::Graph(graph_asset) => {
@@ -823,6 +844,7 @@ pub(crate) fn build_unresolved_graph(
                         py,
                         decorator_py.clone_ref(py),
                         None,
+                        partition_defs,
                     )?)),
                 );
             }
@@ -835,6 +857,7 @@ pub(crate) fn build_unresolved_graph(
                         py,
                         decorator_py.clone_ref(py),
                         None,
+                        partition_defs,
                     )?)),
                 );
             }
@@ -855,7 +878,7 @@ pub(crate) fn build_unresolved_graph(
     let mut collect_steps: HashMap<String, Vec<NodeRef>> = HashMap::new();
     // Per-graph inheritance maps so internal tasks pick up the parent's
     // partition / io / metadata configuration.
-    let mut graph_partitions_def: HashMap<String, Py<PartitionsDefinition>> = HashMap::new();
+    let mut graph_partitions_def: HashMap<String, PartitionsDefinition> = HashMap::new();
     let mut graph_partition_mappings: HashMap<String, HashMap<String, PartitionMapping>> =
         HashMap::new();
     let mut graph_input_io_handlers: HashMap<String, HashMap<String, IOHandler>> = HashMap::new();
@@ -866,7 +889,10 @@ pub(crate) fn build_unresolved_graph(
         if let Asset::Graph(graph_asset) = inner_asset {
             let graph_name = graph_asset.name.clone().unwrap_or_default();
             if let Some(ref pd) = graph_asset.partitions_def {
-                graph_partitions_def.insert(graph_name.clone(), pd.clone_ref(py));
+                graph_partitions_def.insert(
+                    graph_name.clone(),
+                    resolve_partitions_def_ref(pd, partition_defs, &graph_name)?.clone(),
+                );
             }
             if let Some(ref pm) = graph_asset.partition_mappings {
                 graph_partition_mappings.insert(graph_name.clone(), pm.0.clone());
@@ -1003,9 +1029,7 @@ pub(crate) fn build_unresolved_graph(
                         // Inherit partitions_def and partition mappings from parent graph asset.
                         // Only propagate mapping entries for this task's actual deps.
                         let graph_name = ns_name.split('/').next().unwrap_or("");
-                        let pd_override = graph_partitions_def
-                            .get(graph_name)
-                            .map(|p| p.clone_ref(py));
+                        let pd_override = graph_partitions_def.get(graph_name).cloned();
                         let dep_names: HashSet<&str> = comp_deps
                             .iter()
                             .filter_map(|d| match d {
@@ -1052,6 +1076,7 @@ pub(crate) fn build_unresolved_graph(
                                 pm_override,
                                 ioh_override,
                                 meta_override,
+                                partition_defs,
                             )?),
                         );
                     }
@@ -1076,7 +1101,15 @@ pub(crate) fn build_unresolved_graph(
                 node_map.insert(
                     task_name,
                     ResolvedNode::Task(ResolvedTask::new(
-                        py, task_ref, None, None, None, None, None, None,
+                        py,
+                        task_ref,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        partition_defs,
                     )?),
                 );
             }
@@ -1098,9 +1131,7 @@ pub(crate) fn build_unresolved_graph(
                             .collect();
                         // Inherit partitions_def and partition mappings from parent graph asset.
                         let graph_name = ns_name.split('/').next().unwrap_or("");
-                        let pd_override = graph_partitions_def
-                            .get(graph_name)
-                            .map(|p| p.clone_ref(py));
+                        let pd_override = graph_partitions_def.get(graph_name).cloned();
                         let pm_override = graph_partition_mappings
                             .get(graph_name)
                             .map(|full_pm| {
@@ -2078,6 +2109,9 @@ pub struct PyCodeRepository {
     pub(crate) raw_sensors: HashMap<String, Py<PySensorDefinition>>,
     default_executor: Option<Executor>,
     raw_resources: HashMap<String, ResourceVariant>,
+    /// Named partition definitions referenced by `partitions_def="name"` on
+    /// assets/tasks.
+    raw_partition_defs: HashMap<String, Py<PartitionsDefinition>>,
     /// Named retry policies referenced by `retry="name"` on assets/jobs.
     raw_retries: HashMap<String, rivers_core::execution::retry::RetryPolicy>,
     /// Repo-wide retry default; the lowest-precedence rung (asset > job > this).
@@ -2379,7 +2413,13 @@ impl PyCodeRepository {
             composition_task_names,
             graph_task_names,
             step_kinds,
-        } = build_unresolved_graph(py, &self.raw_assets, &self.raw_tasks, resource_keys)?;
+        } = build_unresolved_graph(
+            py,
+            &self.raw_assets,
+            &self.raw_tasks,
+            resource_keys,
+            &self.raw_partition_defs,
+        )?;
 
         validate_partition_mappings(py, &node_map, &unresolved_graph)?;
 
@@ -2997,7 +3037,7 @@ struct BuiltGraph {
 #[pymethods]
 impl PyCodeRepository {
     #[new]
-    #[pyo3(signature = (assets, tasks=None, jobs=None, schedules=None, sensors=None, default_executor=None, resources=None, retries=None, default_retry_policy=None, run_queue=None, run_backend=None, pool_limits=None))]
+    #[pyo3(signature = (assets, tasks=None, jobs=None, schedules=None, sensors=None, default_executor=None, resources=None, partition_defs=None, retries=None, default_retry_policy=None, run_queue=None, run_backend=None, pool_limits=None))]
     #[allow(clippy::too_many_arguments)]
     fn new<'py>(
         assets: Vec<Py<PyAsset>>,
@@ -3007,6 +3047,7 @@ impl PyCodeRepository {
         sensors: Option<Vec<Py<PySensorDefinition>>>,
         default_executor: Option<Executor>,
         resources: Option<HashMap<String, ResourceVariant>>,
+        partition_defs: Option<HashMap<String, Py<PartitionsDefinition>>>,
         retries: Option<HashMap<String, crate::retry::PyRetryPolicy>>,
         default_retry_policy: Option<Bound<'py, PyAny>>,
         run_queue: Option<Py<crate::concurrency::PyRunQueueConfig>>,
@@ -3035,6 +3076,7 @@ impl PyCodeRepository {
                 .collect(),
             default_executor,
             raw_resources: resources.unwrap_or_default(),
+            raw_partition_defs: partition_defs.unwrap_or_default(),
             raw_retries: retries
                 .unwrap_or_default()
                 .into_iter()
