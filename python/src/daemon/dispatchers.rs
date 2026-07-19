@@ -445,6 +445,7 @@ impl LocalBackfillDispatcher {
                     false, // block=false
                     bf.dry_run,
                     bf.backfill_id.clone(),
+                    bf.launched_by.clone(),
                 ) {
                     Ok(result) => {
                         tracing::info!(

@@ -7,6 +7,7 @@ use crate::components::global_search::GlobalSearch;
 use crate::components::location_switcher::LocationSwitcher;
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::locations::list_code_locations;
+use crate::server_fns::user::get_current_user;
 
 fn nav_svg(path: &str) -> String {
     format!(
@@ -88,6 +89,45 @@ const ICON_DEPLOYMENT: &str = r#"<rect x="4" y="4" width="16" height="16" rx="2"
 
 const ICON_COLLAPSE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>"#;
 
+/// Signed-in user + sign-out link; renders nothing in auth mode `none`.
+/// Refetches on SPA navigation; a 401 hard-redirects into the login flow.
+#[component]
+fn CurrentUserChip(collapsed: Signal<bool>) -> impl IntoView {
+    let location = use_location();
+    let user = Resource::new(move || location.pathname.get(), |_| get_current_user());
+
+    Effect::new(move |_| {
+        if let Some(Err(e)) = user.get() {
+            if e.to_string().contains("401") {
+                let loc = window().location();
+                let rd = loc.pathname().unwrap_or_else(|_| "/".into());
+                let _ = loc.assign(&format!("/auth/login?rd={rd}"));
+            }
+        }
+    });
+
+    view! {
+        <Suspense fallback=|| ()>
+            {move || user.get().and_then(|res| res.ok().flatten()).map(|u| {
+                let title = u.email.clone().unwrap_or_else(|| u.subject.clone());
+                let display = u.display().to_string();
+                view! {
+                    <div class="user-chip" title=title>
+                        <span class="user-chip-name" class:nav-label--hidden=move || collapsed.get()>
+                            {display}
+                        </span>
+                        {u.logout_url.clone().map(|href| view! {
+                            <a class="user-chip-logout" class:nav-label--hidden=move || collapsed.get() href=href rel="external">
+                                "Sign out"
+                            </a>
+                        })}
+                    </div>
+                }
+            })}
+        </Suspense>
+    }
+}
+
 #[component]
 pub fn Shell(children: Children) -> impl IntoView {
     let collapsed = RwSignal::new(false);
@@ -145,6 +185,7 @@ pub fn Shell(children: Children) -> impl IntoView {
                 </div>
 
                 <div class="sidebar-footer">
+                    <CurrentUserChip collapsed=collapsed_signal/>
                     <button
                         class="sidebar-toggle"
                         on:click=move |_| collapsed.update(|c| *c = !*c)

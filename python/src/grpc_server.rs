@@ -105,6 +105,7 @@ impl CodeLocationService for CodeLocationImpl {
         request: Request<MaterializeRequest>,
     ) -> Result<Response<MaterializeResponse>, Status> {
         let req = request.into_inner();
+        let launched_by = manual_launch(req.user);
         let pk = req
             .partition_key
             .map(proto_partition_key_to_py)
@@ -143,7 +144,7 @@ impl CodeLocationService for CodeLocationImpl {
             asset_selection,
             partition_key: pk_core,
             tags,
-            launched_by: rivers_core::storage::LaunchedBy::Manual,
+            launched_by,
         };
         let run_id = mat_request.run_id.clone();
         let status = self.run_dispatcher.mode_label().to_string();
@@ -167,6 +168,7 @@ impl CodeLocationService for CodeLocationImpl {
         request: Request<ExecuteJobRequest>,
     ) -> Result<Response<ExecuteJobResponse>, Status> {
         let req = request.into_inner();
+        let launched_by = manual_launch(req.user);
         let jobs = self.handle.job_names();
         if !jobs.contains(&req.job_name) {
             return Err(Status::not_found(format!(
@@ -186,7 +188,7 @@ impl CodeLocationService for CodeLocationImpl {
 
         let mut outcome = self
             .run_dispatcher
-            .dispatch_jobs(&[run_request], rivers_core::storage::LaunchedBy::Manual)
+            .dispatch_jobs(&[run_request], launched_by)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -209,6 +211,7 @@ impl CodeLocationService for CodeLocationImpl {
         request: Request<RerunRunRequest>,
     ) -> Result<Response<RerunRunResponse>, Status> {
         let req = request.into_inner();
+        let launched_by = manual_launch(req.user);
         // Rebuilds the request from the stored run (partition + tags) for replay.
         let rerun = self
             .handle
@@ -221,7 +224,7 @@ impl CodeLocationService for CodeLocationImpl {
             crate::daemon::RunRerunRequest::Job(run_request) => {
                 let mut outcome = self
                     .run_dispatcher
-                    .dispatch_jobs(&[run_request], rivers_core::storage::LaunchedBy::Manual)
+                    .dispatch_jobs(&[run_request], launched_by)
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?;
                 if let Some(err) = outcome.errors.pop() {
@@ -232,7 +235,8 @@ impl CodeLocationService for CodeLocationImpl {
                     .pop()
                     .expect("dispatch_jobs returned no id for a single non-empty input")
             }
-            crate::daemon::RunRerunRequest::Materialization(mat_request) => {
+            crate::daemon::RunRerunRequest::Materialization(mut mat_request) => {
+                mat_request.launched_by = launched_by;
                 // Materialization run_ids are caller-minted — capture before the
                 // request moves into dispatch (it isn't returned).
                 let run_id = mat_request.run_id.clone();
@@ -581,6 +585,7 @@ impl CodeLocationService for CodeLocationImpl {
             tags,
             dry_run: req.dry_run,
             backfill_id: None,
+            launched_by: manual_launch(req.user),
         };
 
         let mut outcome = self
@@ -613,11 +618,12 @@ impl CodeLocationService for CodeLocationImpl {
     ) -> Result<Response<LaunchBackfillResponse>, Status> {
         let req = request.into_inner();
         // Builds a backfill over the missing partitions; same dispatch as `launch_backfill`.
-        let backfill_request = self
+        let mut backfill_request = self
             .handle
             .build_missing_backfill_request(&req.asset_key, req.max_concurrency)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        backfill_request.launched_by = manual_launch(req.user);
 
         let mut outcome = self
             .backfill_dispatcher
@@ -648,11 +654,12 @@ impl CodeLocationService for CodeLocationImpl {
         request: Request<RerunBackfillRequest>,
     ) -> Result<Response<RerunBackfillResponse>, Status> {
         let req = request.into_inner();
-        let backfill_request = self
+        let mut backfill_request = self
             .handle
             .build_rerun_request(&req.backfill_id, req.dry_run)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        backfill_request.launched_by = manual_launch(req.user);
 
         let mut outcome = self
             .backfill_dispatcher
@@ -736,6 +743,17 @@ impl CodeLocationService for CodeLocationImpl {
 }
 
 // --- Helpers ---
+
+/// Manual provenance from an optional proto `UserRef`.
+fn manual_launch(user: Option<rivers_api::rivers::UserRef>) -> rivers_core::storage::LaunchedBy {
+    rivers_core::storage::LaunchedBy::Manual {
+        user: user.map(|u| rivers_core::storage::UserRef {
+            subject: u.subject,
+            email: u.email,
+            name: u.name,
+        }),
+    }
+}
 
 fn empty_to_none<T>(v: Vec<T>) -> Option<Vec<T>> {
     if v.is_empty() { None } else { Some(v) }

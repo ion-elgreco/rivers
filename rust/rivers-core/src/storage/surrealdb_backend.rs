@@ -4630,7 +4630,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         storage.create_run(&run).await.unwrap();
         let mat_event = EventRecord {
@@ -4703,7 +4703,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         storage.create_run(&run).await.unwrap();
 
@@ -4757,7 +4757,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
 
         // First CREATE succeeds.
@@ -4803,7 +4803,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             };
             storage.create_run(&run).await.unwrap();
             all_runs.push(run);
@@ -4833,7 +4833,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         let run_fail = RunRecord {
             run_id: "fail".to_string(),
@@ -4847,7 +4847,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         storage.create_run(&run_ok).await.unwrap();
         storage.create_run(&run_fail).await.unwrap();
@@ -4876,7 +4876,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             };
             storage.create_run(&run).await.unwrap();
         }
@@ -4951,7 +4951,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             };
             storage.create_run(&run).await.unwrap();
         }
@@ -5037,7 +5037,7 @@ mod tests {
                     priority: 0,
                     partition_key: None,
                     block_reason: None,
-                    launched_by: LaunchedBy::Manual,
+                    launched_by: LaunchedBy::Manual { user: None },
                 })
                 .await
                 .unwrap();
@@ -5088,7 +5088,7 @@ mod tests {
                         priority: 0,
                         partition_key: None,
                         block_reason: None,
-                        launched_by: LaunchedBy::Manual,
+                        launched_by: LaunchedBy::Manual { user: None },
                     })
                     .await
                     .unwrap();
@@ -5146,7 +5146,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             };
             storage.create_run(&run).await.unwrap();
         }
@@ -5186,7 +5186,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             };
             storage_w.create_run(&run).await.unwrap();
         });
@@ -5243,7 +5243,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             };
             storage.create_run(&run).await.unwrap();
         })
@@ -5302,6 +5302,7 @@ mod tests {
                 create_time: 1,
                 end_time: None,
                 error: None,
+                launched_by: LaunchedBy::default(),
             };
             storage.create_backfill(&bf).await.unwrap();
         })
@@ -5411,7 +5412,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .collect();
 
@@ -5450,7 +5451,7 @@ mod tests {
                     keys: vec!["2025-01-01".to_string()],
                 }),
                 block_reason: Some("global run limit".to_string()),
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             },
             RunRecord {
                 run_id: "queued_2".to_string(),
@@ -5464,7 +5465,7 @@ mod tests {
                 priority: -10,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             },
         ];
 
@@ -6283,7 +6284,7 @@ mod tests {
                     priority: 0,
                     partition_key: None,
                     block_reason: None,
-                    launched_by: LaunchedBy::Manual,
+                    launched_by: LaunchedBy::Manual { user: None },
                 })
                 .await
                 .unwrap();
@@ -6337,7 +6338,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -6354,7 +6355,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -6371,7 +6372,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -6473,7 +6474,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -6490,7 +6491,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -7079,7 +7080,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         let run2 = RunRecord {
             run_id: "run_2".to_string(),
@@ -7093,7 +7094,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         let run3 = RunRecord {
             run_id: "run_3".to_string(),
@@ -7107,7 +7108,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         storage.create_run(&run1).await.unwrap();
         storage.create_run(&run2).await.unwrap();
@@ -7154,7 +7155,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         storage.create_run(&mk("zzz", 1000)).await.unwrap();
         storage.create_run(&mk("mmm", 2000)).await.unwrap();
@@ -7191,7 +7192,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         let run2 = RunRecord {
             run_id: "run_2".to_string(),
@@ -7205,7 +7206,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         let run3 = RunRecord {
             run_id: "run_3".to_string(),
@@ -7219,7 +7220,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         storage.create_run(&run1).await.unwrap();
         storage.create_run(&run2).await.unwrap();
@@ -7730,7 +7731,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         storage.create_run(&run).await.unwrap();
 
@@ -7798,7 +7799,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         storage.create_run(&run).await.unwrap();
 
@@ -7870,7 +7871,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         storage.create_run(&run).await.unwrap();
 
@@ -7922,7 +7923,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         storage.create_run(&run).await.unwrap();
 
@@ -7990,7 +7991,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         storage.create_run(&run).await.unwrap();
 
@@ -8061,7 +8062,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         storage.create_run(&run).await.unwrap();
 
@@ -8321,6 +8322,13 @@ mod tests {
             create_time: 1000,
             end_time: None,
             error: None,
+            launched_by: LaunchedBy::Manual {
+                user: Some(crate::storage::UserRef {
+                    subject: "sub-42".to_string(),
+                    email: Some("john.doe@example.com".to_string()),
+                    name: None,
+                }),
+            },
         };
         storage.create_backfill(&record).await.unwrap();
 
@@ -8330,6 +8338,18 @@ mod tests {
         assert_eq!(r.backfill_id, "bf-001");
         assert_eq!(r.status, BackfillStatus::Requested);
         assert_eq!(r.partition_keys.len(), 1);
+        assert_eq!(r.launched_by, record.launched_by, "provenance roundtrips");
+
+        // A pre-V3 row (no launched_by field) reads back as the default.
+        storage
+            .db
+            .query("CREATE backfills CONTENT { backfill_id: 'bf-old', code_location_id: 'default', status: 'Requested', strategy: { kind: 'MultiRun' }, failure_policy: 'Continue', asset_selection: [], partition_keys: [], run_ids: [], completed_partitions: [], failed_partitions: [], canceled_partitions: [], max_concurrency: 1, tags: [], create_time: 1, end_time: NONE, error: NONE }")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let old_row = storage.get_backfill("bf-old").await.unwrap();
+        assert!(old_row.is_some(), "pre-V3 row must still deserialize");
     }
 
     fn make_backfill(id: &str, status: BackfillStatus, create_time: i64) -> BackfillRecord {
@@ -8351,6 +8371,7 @@ mod tests {
             create_time,
             end_time: None,
             error: None,
+            launched_by: LaunchedBy::default(),
         }
     }
 
@@ -8449,7 +8470,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -8483,7 +8504,7 @@ mod tests {
                 priority: 10,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -8502,7 +8523,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -8521,7 +8542,7 @@ mod tests {
                 priority: 10,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -8558,7 +8579,7 @@ mod tests {
                     priority: 0,
                     partition_key: None,
                     block_reason: None,
-                    launched_by: LaunchedBy::Manual,
+                    launched_by: LaunchedBy::Manual { user: None },
                 })
                 .await
                 .unwrap();
@@ -8587,7 +8608,7 @@ mod tests {
                     keys: vec![format!("p{i}")],
                 }),
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .collect();
 
@@ -8636,7 +8657,7 @@ mod tests {
                     priority: 0,
                     partition_key: None,
                     block_reason: None,
-                    launched_by: LaunchedBy::Manual,
+                    launched_by: LaunchedBy::Manual { user: None },
                 })
                 .await
                 .unwrap();
@@ -8663,7 +8684,7 @@ mod tests {
                 priority: 5,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -8701,7 +8722,7 @@ mod tests {
                 priority: -10,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -8720,7 +8741,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -10484,7 +10505,7 @@ mod tests {
                         priority: 0,
                         partition_key: None,
                         block_reason: None,
-                        launched_by: LaunchedBy::Manual,
+                        launched_by: LaunchedBy::Manual { user: None },
                     })
                     .await
                     .unwrap();
@@ -10505,7 +10526,7 @@ mod tests {
                         priority: i as i32 % 10,
                         partition_key: None,
                         block_reason: None,
-                        launched_by: LaunchedBy::Manual,
+                        launched_by: LaunchedBy::Manual { user: None },
                     })
                     .await
                     .unwrap();
@@ -10574,7 +10595,7 @@ mod tests {
                 priority: 5,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -10672,7 +10693,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -10894,7 +10915,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -10959,7 +10980,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: Some("global limit".into()),
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -10988,7 +11009,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -11691,7 +11712,7 @@ mod tests {
                     priority: 0,
                     partition_key: None,
                     block_reason: None,
-                    launched_by: LaunchedBy::Manual,
+                    launched_by: LaunchedBy::Manual { user: None },
                 })
                 .await
                 .unwrap();
@@ -11710,7 +11731,7 @@ mod tests {
                 priority: 0,
                 partition_key: None,
                 block_reason: None,
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             })
             .await
             .unwrap();
@@ -11793,7 +11814,7 @@ mod tests {
                     priority: 0,
                     partition_key: None,
                     block_reason: None,
-                    launched_by: LaunchedBy::Manual,
+                    launched_by: LaunchedBy::Manual { user: None },
                 })
                 .await
                 .unwrap();
@@ -11836,7 +11857,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         // CL-A: 2 success, 1 failure
         for r in [
@@ -11891,7 +11912,7 @@ mod tests {
                     priority: 0,
                     partition_key: None,
                     block_reason: None,
-                    launched_by: LaunchedBy::Manual,
+                    launched_by: LaunchedBy::Manual { user: None },
                 })
                 .await
                 .unwrap();
@@ -11936,6 +11957,7 @@ mod tests {
             create_time,
             end_time: None,
             error: None,
+            launched_by: LaunchedBy::default(),
         }
     }
 

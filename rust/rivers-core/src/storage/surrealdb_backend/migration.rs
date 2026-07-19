@@ -102,7 +102,7 @@ impl AsyncMigrate for SurrealMigrate {
 
 /// Highest embedded migration version. Bump by adding a `Vn__*.surql` + an
 /// [`embedded_migrations`] entry; a test pins this to that max.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// One compat row per migration (the floors it set), folded by the open guard.
 const MIGRATION_META_TABLE: &str = "migration_meta";
@@ -114,6 +114,11 @@ fn embedded_migrations() -> Vec<Migration> {
             .expect("V1__base migration name is well-formed"),
         Migration::unapplied("V2__run_logs", include_str!("migrations/V2__run_logs.surql"))
             .expect("V2__run_logs migration name is well-formed"),
+        Migration::unapplied(
+            "V3__backfill_launched_by",
+            include_str!("migrations/V3__backfill_launched_by.surql"),
+        )
+        .expect("V3__backfill_launched_by migration name is well-formed"),
     ]
 }
 
@@ -622,8 +627,8 @@ mod tests {
         let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
         assert_eq!(
             (stamps.version, stamps.min_reader, stamps.min_writer),
-            (2, 2, 2),
-            "v2 raises both floors"
+            (3, 2, 2),
+            "v2 raised both floors; v3 is additive and leaves them at 2"
         );
     }
 

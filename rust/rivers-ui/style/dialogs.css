@@ -811,6 +811,31 @@ th.sortable:hover { color: var(--text); }
     flex-shrink: 0;
 }
 
+.user-chip {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.25rem 0.25rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 0.6rem;
+    overflow: hidden;
+}
+.user-chip-name {
+    color: var(--text);
+    font-size: 0.8rem;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.user-chip-logout {
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    text-decoration: none;
+    margin-left: auto;
+}
+.user-chip-logout:hover { color: var(--accent); }
+.sidebar--collapsed .user-chip { border-bottom: none; padding-bottom: 0.25rem; }
+
 .sidebar--collapsed .sidebar-footer {
     padding: 0.75rem 0.5rem;
     display: flex;

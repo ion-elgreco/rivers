@@ -632,7 +632,12 @@ pub fn launched_by_display(
     l: &LaunchedBy,
 ) -> (&'static str, &'static str, &'static str, Option<String>) {
     match l {
-        LaunchedBy::Manual => ("◉", "var(--text)", "manual", None),
+        LaunchedBy::Manual { user } => (
+            "◉",
+            "var(--text)",
+            "manual",
+            user.as_ref().map(|u| u.display().to_string()),
+        ),
         LaunchedBy::Schedule { name } => ("⏱", "var(--warning)", "schedule", Some(name.clone())),
         LaunchedBy::Sensor { name } => ("⚡", "var(--secondary)", "sensor", Some(name.clone())),
         LaunchedBy::Backfill { backfill_id } => (

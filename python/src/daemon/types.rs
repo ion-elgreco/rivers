@@ -98,6 +98,8 @@ pub(crate) struct BackfillRequestData {
     pub(crate) dry_run: bool,
     /// Pre-minted backfill id; `None` lets the repository generate one.
     pub(crate) backfill_id: Option<String>,
+    /// Provenance stamped on the `BackfillRecord`.
+    pub(crate) launched_by: rivers_core::storage::LaunchedBy,
 }
 
 pub(crate) enum TickOutcome {

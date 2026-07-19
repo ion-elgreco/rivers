@@ -398,7 +398,7 @@ impl PyJob {
             py,
             uuid::Uuid::new_v4().to_string(),
             RunInit::Create {
-                launched_by: LaunchedBy::Manual,
+                launched_by: LaunchedBy::Manual { user: None },
             },
             partition_key,
             tags.unwrap_or_default(),

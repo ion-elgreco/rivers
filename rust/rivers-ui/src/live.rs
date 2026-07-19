@@ -834,7 +834,7 @@ mod tests {
                         priority: 0,
                         partition_key: None,
                         block_reason: None,
-                        launched_by: LaunchedBy::Manual,
+                        launched_by: LaunchedBy::Manual { user: None },
                         code_location_id: rivers_core::storage::DEFAULT_CODE_LOCATION_ID
                             .to_string(),
                     };
@@ -934,6 +934,7 @@ mod tests {
                         create_time: 1,
                         end_time: None,
                         error: None,
+                        launched_by: rivers_core::storage::LaunchedBy::default(),
                     };
                     storage.create_backfill(&bf).await.expect("create_backfill");
                 },
@@ -1044,7 +1045,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
             code_location_id: rivers_core::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
         };
         storage.create_run(&run).await.expect("create_run");
@@ -1159,7 +1160,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
             code_location_id: rivers_core::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
         };
         storage.create_run(&run).await.unwrap();
@@ -1272,7 +1273,7 @@ mod tests {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
             code_location_id: rivers_core::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
         };
         storage.create_run(&run).await.unwrap();
@@ -1341,7 +1342,7 @@ mod tests {
             assets_after.contains("event: assets-changed"),
             "client_assets didn't receive its event:\n{assets_after}"
         );
-        let _ = LaunchedBy::Manual;
+        let _ = LaunchedBy::Manual { user: None };
 
         shutdown.cancel();
         let _ = tokio::time::timeout(Duration::from_millis(500), server).await;

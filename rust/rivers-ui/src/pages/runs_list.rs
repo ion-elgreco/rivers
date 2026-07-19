@@ -283,7 +283,7 @@ fn RunRow(record: RunRecord, code_location_label: String) -> impl IntoView {
         .map(|k| partition_scheme_for(k))
         .unwrap_or("·");
     let launched_cell = match (&launched_by, job_name.as_ref()) {
-        (crate::types::LaunchedBy::Manual, Some(j)) => {
+        (crate::types::LaunchedBy::Manual { .. }, Some(j)) => {
             view! { <LaunchedByCell launched_by=launched_by.clone() sub=j.clone()/> }.into_any()
         }
         _ => view! { <LaunchedByCell launched_by=launched_by/> }.into_any(),

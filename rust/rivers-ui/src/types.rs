@@ -10,6 +10,27 @@ pub(crate) fn partition_key_to_display(pk: rivers_core::storage::PartitionKey) -
     pk.to_display()
 }
 
+/// The signed-in user as exposed to the shell; `None` means auth mode
+/// `none`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentUser {
+    pub subject: String,
+    pub email: Option<String>,
+    pub name: Option<String>,
+    /// Where the sign-out control points; `None` hides it (forward mode
+    /// without a configured proxy logout URL).
+    pub logout_url: Option<String>,
+}
+
+impl CurrentUser {
+    pub fn display(&self) -> &str {
+        self.name
+            .as_deref()
+            .or(self.email.as_deref())
+            .unwrap_or(&self.subject)
+    }
+}
+
 /// Mirrors `rivers_core::storage::StaleStatus`. Computed on demand via
 /// `staleness::compute_staleness` over the records + topology — never persisted.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,12 +102,33 @@ pub enum RunStatus {
     Canceled,
 }
 
+/// Who performed a manual action — mirrors `rivers_core::storage::UserRef`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserRef {
+    pub subject: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl UserRef {
+    pub fn display(&self) -> &str {
+        self.name
+            .as_deref()
+            .or(self.email.as_deref())
+            .unwrap_or(&self.subject)
+    }
+}
+
 /// Origin of a run — mirrors `rivers_core::storage::LaunchedBy`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LaunchedBy {
-    #[default]
-    Manual,
+    Manual {
+        #[serde(default)]
+        user: Option<UserRef>,
+    },
     Schedule {
         name: String,
     },
@@ -97,6 +139,12 @@ pub enum LaunchedBy {
         backfill_id: String,
     },
     Condition,
+}
+
+impl Default for LaunchedBy {
+    fn default() -> Self {
+        Self::Manual { user: None }
+    }
 }
 
 /// A run's partition members, capped: a few keys + the total, so the run list
@@ -642,6 +690,8 @@ pub struct BackfillInfo {
     pub error: Option<String>,
     #[serde(default)]
     pub code_location_id: String,
+    #[serde(default)]
+    pub launched_by: LaunchedBy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -907,10 +957,22 @@ mod conversions {
         }
     }
 
+    impl From<rivers_core::storage::UserRef> for UserRef {
+        fn from(u: rivers_core::storage::UserRef) -> Self {
+            Self {
+                subject: u.subject,
+                email: u.email,
+                name: u.name,
+            }
+        }
+    }
+
     impl From<rivers_core::storage::LaunchedBy> for LaunchedBy {
         fn from(l: rivers_core::storage::LaunchedBy) -> Self {
             match l {
-                rivers_core::storage::LaunchedBy::Manual => Self::Manual,
+                rivers_core::storage::LaunchedBy::Manual { user } => Self::Manual {
+                    user: user.map(Into::into),
+                },
                 rivers_core::storage::LaunchedBy::Schedule { name } => Self::Schedule { name },
                 rivers_core::storage::LaunchedBy::Sensor { name } => Self::Sensor { name },
                 rivers_core::storage::LaunchedBy::Backfill { backfill_id } => {
@@ -1209,6 +1271,7 @@ mod conversions {
                 end_time: b.end_time,
                 error: b.error,
                 code_location_id: b.code_location_id,
+                launched_by: b.launched_by.into(),
             }
         }
     }
@@ -1314,7 +1377,7 @@ mod conversions {
                     ],
                 }),
                 block_reason: None,
-                launched_by: rivers_core::storage::LaunchedBy::Manual,
+                launched_by: rivers_core::storage::LaunchedBy::Manual { user: None },
             };
             let ui: RunRecord = core.into();
             let preview = ui

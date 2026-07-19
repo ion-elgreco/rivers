@@ -200,7 +200,7 @@ async fn initial_load_run_completing_mid_load_is_not_lost() {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: crate::storage::LaunchedBy::Manual,
+            launched_by: crate::storage::LaunchedBy::Manual { user: None },
         };
     let mat_event = |asset: &str, run_id: &str, ts: i64| crate::storage::EventRecord {
         code_location_id: cl.clone(),

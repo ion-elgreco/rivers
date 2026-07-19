@@ -32,6 +32,7 @@ pub(crate) fn extract_tick_outcome_from_parts(
     reqs: &[Py<PyRunRequest>],
     backfill_reqs: &[Py<PyBackfillRequest>],
     skip: Option<&Py<PySkipReason>>,
+    launched_by: &LaunchedBy,
 ) -> TickOutcome {
     if let Some(skip) = skip {
         TickOutcome::Skipped(skip.borrow(py).message.clone())
@@ -39,7 +40,7 @@ pub(crate) fn extract_tick_outcome_from_parts(
         TickOutcome::RunRequests(
             extract_run_request_data(py, reqs),
             Vec::new(),
-            extract_backfill_request_data(py, backfill_reqs),
+            extract_backfill_request_data(py, backfill_reqs, launched_by),
         )
     }
 }
@@ -67,7 +68,7 @@ pub(crate) fn extract_sensor_outcome_from_parts(
         SensorOutcome::RunRequests(
             run_reqs,
             mat_reqs,
-            extract_backfill_request_data(py, backfill_reqs),
+            extract_backfill_request_data(py, backfill_reqs, launched_by),
             new_cursor,
         )
     }
@@ -141,6 +142,7 @@ pub(crate) fn extract_run_request_data(
 pub(crate) fn extract_backfill_request_data(
     py: Python,
     reqs: &[Py<PyBackfillRequest>],
+    launched_by: &LaunchedBy,
 ) -> Vec<BackfillRequestData> {
     reqs.iter()
         .map(|br| {
@@ -155,6 +157,7 @@ pub(crate) fn extract_backfill_request_data(
                 tags: br.tags.clone(),
                 dry_run: false,
                 backfill_id: None,
+                launched_by: launched_by.clone(),
             }
         })
         .collect()

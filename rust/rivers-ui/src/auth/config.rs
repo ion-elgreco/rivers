@@ -1,0 +1,206 @@
+//! Auth configuration resolved from `RIVERS_AUTH_*` env vars.
+//!
+//! Secrets are env-only — never CLI flags — so they can't leak via `ps` or
+//! shell history.
+
+use anyhow::{Context, bail};
+use base64::Engine;
+use std::collections::HashMap;
+
+pub const DEFAULT_SESSION_TTL_SECS: i64 = 8 * 60 * 60;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AuthMode {
+    None,
+    Oidc(OidcConfig),
+    Forward(ForwardConfig),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OidcConfig {
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    /// External base URL (`https://rivers.example.com`); the redirect URI is
+    /// `<public_url>/auth/callback`. Never derived from the Host header.
+    pub public_url: String,
+    pub scopes: Vec<String>,
+    pub groups_claim: String,
+    pub rp_logout: bool,
+    /// 32+ bytes, decoded from base64. `None` → ephemeral per-process key
+    /// (sessions don't survive restarts or span replicas).
+    pub cookie_secret: Option<Vec<u8>>,
+    pub session_ttl_secs: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForwardConfig {
+    /// CIDRs whose socket peers may assert identity headers.
+    pub trusted_proxies: Vec<String>,
+    pub user_header: String,
+    pub email_header: String,
+    pub groups_header: String,
+    pub name_header: String,
+    pub logout_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Allowlists {
+    pub domains: Vec<String>,
+    pub groups: Vec<String>,
+    pub users: Vec<String>,
+}
+
+impl Allowlists {
+    pub fn is_empty(&self) -> bool {
+        self.domains.is_empty() && self.groups.is_empty() && self.users.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthConfig {
+    pub mode: AuthMode,
+    pub allow: Allowlists,
+}
+
+fn csv(v: Option<String>) -> Vec<String> {
+    v.map(|s| {
+        s.split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn flag(v: Option<String>) -> bool {
+    matches!(
+        v.as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("True") | Some("TRUE") | Some("yes")
+    )
+}
+
+impl AuthConfig {
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::from_lookup(&|k| std::env::var(k).ok())
+    }
+
+    pub fn from_map(map: &HashMap<String, String>) -> anyhow::Result<Self> {
+        Self::from_lookup(&|k| map.get(k).cloned())
+    }
+
+    fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        let allow = Allowlists {
+            domains: csv(get("RIVERS_AUTH_ALLOWED_DOMAINS"))
+                .into_iter()
+                .map(|d| d.to_ascii_lowercase())
+                .collect(),
+            groups: csv(get("RIVERS_AUTH_ALLOWED_GROUPS")),
+            users: csv(get("RIVERS_AUTH_ALLOWED_USERS")),
+        };
+
+        let mode = match get("RIVERS_AUTH_MODE").as_deref().map(str::trim) {
+            None | Some("") | Some("none") => AuthMode::None,
+            Some("oidc") => {
+                let require = |key: &str| {
+                    get(key)
+                        .filter(|v| !v.trim().is_empty())
+                        .with_context(|| format!("RIVERS_AUTH_MODE=oidc requires {key}"))
+                };
+                let public_url = require("RIVERS_AUTH_PUBLIC_URL")?
+                    .trim_end_matches('/')
+                    .to_string();
+                if !public_url.starts_with("http://") && !public_url.starts_with("https://") {
+                    bail!("RIVERS_AUTH_PUBLIC_URL must be an http(s) URL, got {public_url:?}");
+                }
+                let cookie_secret = get("RIVERS_AUTH_COOKIE_SECRET")
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|v| {
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(v.trim())
+                            .context("RIVERS_AUTH_COOKIE_SECRET is not valid base64")?;
+                        if bytes.len() < 32 {
+                            bail!(
+                                "RIVERS_AUTH_COOKIE_SECRET must decode to at least 32 bytes, got {}",
+                                bytes.len()
+                            );
+                        }
+                        Ok(bytes)
+                    })
+                    .transpose()?;
+                let session_ttl_secs = get("RIVERS_AUTH_SESSION_TTL")
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|v| {
+                        v.trim()
+                            .parse::<i64>()
+                            .context("RIVERS_AUTH_SESSION_TTL must be an integer (seconds)")
+                    })
+                    .transpose()?
+                    .unwrap_or(DEFAULT_SESSION_TTL_SECS);
+                if session_ttl_secs <= 0 {
+                    bail!("RIVERS_AUTH_SESSION_TTL must be positive");
+                }
+                let scopes = {
+                    let s = csv(get("RIVERS_AUTH_OIDC_SCOPES"));
+                    if s.is_empty() {
+                        // Also accept space-separated (the OIDC wire format).
+                        let raw = get("RIVERS_AUTH_OIDC_SCOPES").unwrap_or_default();
+                        let sp: Vec<String> = raw
+                            .split_whitespace()
+                            .map(|p| p.to_string())
+                            .collect();
+                        if sp.is_empty() {
+                            vec!["openid".into(), "profile".into(), "email".into()]
+                        } else {
+                            sp
+                        }
+                    } else {
+                        s
+                    }
+                };
+                AuthMode::Oidc(OidcConfig {
+                    issuer: require("RIVERS_AUTH_OIDC_ISSUER")?.trim_end_matches('/').to_string(),
+                    client_id: require("RIVERS_AUTH_OIDC_CLIENT_ID")?,
+                    client_secret: get("RIVERS_AUTH_OIDC_CLIENT_SECRET")
+                        .filter(|v| !v.trim().is_empty()),
+                    public_url,
+                    scopes,
+                    groups_claim: get("RIVERS_AUTH_OIDC_GROUPS_CLAIM")
+                        .filter(|v| !v.trim().is_empty())
+                        .unwrap_or_else(|| "groups".into()),
+                    rp_logout: flag(get("RIVERS_AUTH_OIDC_RP_LOGOUT")),
+                    cookie_secret,
+                    session_ttl_secs,
+                })
+            }
+            Some("forward") => {
+                let trusted_proxies = csv(get("RIVERS_AUTH_FORWARD_TRUSTED_PROXIES"));
+                if trusted_proxies.is_empty() {
+                    bail!(
+                        "RIVERS_AUTH_MODE=forward requires RIVERS_AUTH_FORWARD_TRUSTED_PROXIES \
+                         (comma-separated CIDRs; 0.0.0.0/0 must be typed deliberately)"
+                    );
+                }
+                let header = |key: &str, default: &str| {
+                    get(key)
+                        .filter(|v| !v.trim().is_empty())
+                        .unwrap_or_else(|| default.to_string())
+                };
+                AuthMode::Forward(ForwardConfig {
+                    trusted_proxies,
+                    user_header: header("RIVERS_AUTH_FORWARD_USER_HEADER", "Remote-User"),
+                    email_header: header("RIVERS_AUTH_FORWARD_EMAIL_HEADER", "Remote-Email"),
+                    groups_header: header("RIVERS_AUTH_FORWARD_GROUPS_HEADER", "Remote-Groups"),
+                    name_header: header("RIVERS_AUTH_FORWARD_NAME_HEADER", "Remote-Name"),
+                    logout_url: get("RIVERS_AUTH_FORWARD_LOGOUT_URL")
+                        .filter(|v| !v.trim().is_empty()),
+                })
+            }
+            Some(other) => bail!(
+                "RIVERS_AUTH_MODE must be none|oidc|forward, got {other:?}"
+            ),
+        };
+
+        Ok(Self { mode, allow })
+    }
+}

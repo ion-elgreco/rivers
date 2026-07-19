@@ -942,3 +942,98 @@ def test_launch_backfill_without_job_is_ad_hoc(rerun_grpc_channel):
     runs = [r for r in storage.get_runs(100) if r.partition_key is not None]
     assert runs, "expected partitioned runs"
     assert all(r.job_name is None for r in runs)
+
+
+# ── User attribution on manual launches ──
+
+
+def _user_ref(pb2, subject="sub-42", email="john.doe@example.com", name="John Doe"):
+    return pb2.UserRef(subject=subject, email=email, name=name)
+
+
+def test_materialize_stamps_user_on_run(rerun_grpc_channel):
+    channel, pb2, pb2_grpc, _, storage = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    resp = stub.Materialize(
+        pb2.MaterializeRequest(
+            selection=["part_asset"],
+            partition_key=_single_partition_key(pb2, "p1"),
+            user=_user_ref(pb2),
+        )
+    )
+    record = storage.get_run(resp.run_id)
+    assert record is not None
+    assert record.launched_by.kind == "manual"
+    user = record.launched_by.user
+    assert user is not None
+    assert user.subject == "sub-42"
+    assert user.email == "john.doe@example.com"
+    assert user.name == "John Doe"
+    assert user.display == "John Doe"
+
+
+def test_materialize_without_user_has_no_attribution(rerun_grpc_channel):
+    channel, pb2, pb2_grpc, _, storage = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    resp = stub.Materialize(
+        pb2.MaterializeRequest(
+            selection=["part_asset"],
+            partition_key=_single_partition_key(pb2, "p1"),
+        )
+    )
+    record = storage.get_run(resp.run_id)
+    assert record is not None
+    assert record.launched_by.kind == "manual"
+    assert record.launched_by.user is None
+    assert record.launched_by == rs.LaunchedBy.manual()
+
+
+def test_execute_job_stamps_user_on_run(rerun_grpc_channel):
+    channel, pb2, pb2_grpc, _, storage = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    resp = stub.ExecuteJob(
+        pb2.ExecuteJobRequest(
+            job_name="part_job",
+            partition_key=_single_partition_key(pb2, "p2"),
+            user=_user_ref(pb2, subject="job-user", email="job@example.com", name="Jo"),
+        )
+    )
+    assert resp.success is True
+    record = storage.get_run(resp.run_id)
+    assert record is not None
+    assert record.launched_by.kind == "manual"
+    user = record.launched_by.user
+    assert user is not None
+    assert user.subject == "job-user"
+    assert user.display == "Jo"
+
+
+def test_rerun_run_stamps_the_rerunning_user(rerun_grpc_channel):
+    """The rerun's attribution is the user who clicked rerun — not the
+    original launcher."""
+    channel, pb2, pb2_grpc, _, storage = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    original = stub.Materialize(
+        pb2.MaterializeRequest(
+            selection=["part_asset"],
+            partition_key=_single_partition_key(pb2, "p3"),
+            user=_user_ref(
+                pb2, subject="alice", email="alice@example.com", name="Alice"
+            ),
+        )
+    )
+    rerun = stub.RerunRun(
+        pb2.RerunRunRequest(
+            run_id=original.run_id,
+            user=_user_ref(pb2, subject="bob", email="bob@example.com", name="Bob"),
+        )
+    )
+    assert rerun.run_id != original.run_id
+    orig_record = storage.get_run(original.run_id)
+    rerun_record = storage.get_run(rerun.run_id)
+    assert orig_record.launched_by.user.subject == "alice"
+    assert rerun_record.launched_by.user.subject == "bob"

@@ -176,7 +176,7 @@ mod tests {
             priority,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         }
     }
 

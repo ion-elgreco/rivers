@@ -430,7 +430,8 @@ fn duration_cell_falls_back_to_human_for_tooltip_when_clock_empty() {
 fn launched_by_cell_manual_renders_with_label() {
     let target = fresh_mount_target();
     let _handle = mount_to(target.clone(), || {
-        view! { <LaunchedByCell launched_by=LaunchedBy::Manual /> }
+        let lb = LaunchedBy::Manual { user: None };
+        view! { <LaunchedByCell launched_by=lb /> }
     });
     let label = query_one(&target, ".grid-cell-mono");
     assert_eq!(label.text_content().unwrap().to_lowercase(), "manual");

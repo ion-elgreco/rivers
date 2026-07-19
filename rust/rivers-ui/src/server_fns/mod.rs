@@ -9,6 +9,7 @@ pub mod locations;
 pub mod overview;
 pub mod pools;
 pub mod runs;
+pub mod user;
 
 #[cfg(feature = "ssr")]
 pub(crate) async fn resolve_identity(

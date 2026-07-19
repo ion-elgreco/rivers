@@ -65,7 +65,7 @@ impl RunBackend for LocalRunBackend {
                 false,
                 false,
                 None,
-                LaunchedBy::Manual,
+                LaunchedBy::Manual { user: None },
             ) {
                 tracing::error!(
                     target: "rivers::coordinator",

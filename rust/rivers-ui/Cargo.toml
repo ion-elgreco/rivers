@@ -30,6 +30,12 @@ ssr = [
     "dep:futures-util",
     "dep:futures-core",
     "dep:base64",
+    "dep:axum-extra",
+    "dep:cookie",
+    "dep:openidconnect",
+    "dep:ipnet",
+    "dep:percent-encoding",
+    "dep:url",
 ]
 hydrate = [
     "leptos/hydrate",
@@ -78,6 +84,14 @@ tower-http = { workspace = true, features = ["compression-br", "compression-gzip
 futures-util = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
+axum-extra = { version = "0.10", features = ["cookie-private"], optional = true }
+# Same cookie version axum-extra re-exports; enables Key::derive_from (HKDF
+# expansion of 32-byte secrets) via feature unification.
+cookie = { version = "0.18", features = ["key-expansion"], optional = true }
+openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"], optional = true }
+ipnet = { version = "2", optional = true }
+percent-encoding = { version = "2", optional = true }
+url = { workspace = true, optional = true }
 
 # Hydrate-only dependencies
 wasm-bindgen = { version = "0.2", optional = true }
@@ -114,6 +128,8 @@ brotli = "8"
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tokio-stream = { workspace = true, features = ["net", "sync"] }
+# `ServiceExt::oneshot` for router-level auth tests.
+tower = { version = "0.5", features = ["util"] }
 
 # Wasm-only dev-deps for browser-based component tests. The extra
 # `web-sys` features here are needed by `tests/partition_picker_browser.rs`

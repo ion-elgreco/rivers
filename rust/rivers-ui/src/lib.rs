@@ -16,6 +16,8 @@
 
 pub mod app;
 #[cfg(feature = "ssr")]
+pub mod auth;
+#[cfg(feature = "ssr")]
 pub mod code_location_registry;
 pub mod components;
 #[cfg(feature = "ssr")]
@@ -167,13 +169,15 @@ mod server {
 
     /// Start the SSR axum server on `host:port` (with port-fallback up to 3099),
     /// wiring `/style.css`, the embedded WASM blob, the SSE live-broadcaster,
-    /// and the Leptos route table. Returns when `shutdown` fires.
+    /// the auth gate (when a mode is enabled), and the Leptos route table.
+    /// Returns when `shutdown` fires.
     pub async fn start_server(
         storage: Arc<SurrealStorage>,
         graph: Option<Arc<GraphTopology>>,
         host: String,
         port: u16,
         registry: crate::code_location_registry::Registry,
+        auth: Option<Arc<crate::auth::AuthRuntime>>,
         shutdown: CancellationToken,
     ) -> anyhow::Result<()> {
         let state = AppState {
@@ -243,8 +247,10 @@ mod server {
                 routes,
                 {
                     let state = state.clone();
+                    let auth_ctx = crate::auth::AuthCtx(auth.clone());
                     move || {
                         leptos::prelude::provide_context(state.clone());
+                        leptos::prelude::provide_context(auth_ctx.clone());
                     }
                 },
                 shell,
@@ -260,10 +266,19 @@ mod server {
                 DefaultPredicate::new().and(NotForContentType::const_new("application/wasm")),
             ));
 
+        if let Some(rt) = &auth {
+            tracing::info!(target: "rivers::auth", mode = rt.mode_str(), "authentication enabled");
+        }
+        let app = crate::auth::apply_auth(app, auth);
+
         tracing::info!(target: "rivers::ui", %actual_addr, "rivers UI started");
-        axum::serve(listener, app.into_make_service())
-            .with_graceful_shutdown(shutdown.cancelled_owned())
-            .await?;
+        axum::serve(
+            listener,
+            // Forward auth checks the socket peer; ConnectInfo exposes it.
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown.cancelled_owned())
+        .await?;
         tracing::info!(target: "rivers::ui", "UI server stopped");
         Ok(())
     }

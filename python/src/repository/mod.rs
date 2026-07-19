@@ -1904,6 +1904,7 @@ impl RepoHandle {
             failure_policy: Some(failure_policy),
             max_concurrency,
             tags: Some(tag_map),
+            launched_by: rivers_core::storage::LaunchedBy::default(),
             dry_run,
             backfill_id: None,
         })
@@ -1948,7 +1949,7 @@ impl RepoHandle {
                     asset_selection: record.node_names,
                     partition_key: record.partition_key,
                     tags,
-                    launched_by: rivers_core::storage::LaunchedBy::Manual,
+                    launched_by: rivers_core::storage::LaunchedBy::Manual { user: None },
                 },
             )),
         }
@@ -2037,6 +2038,7 @@ impl RepoHandle {
             tags: None,
             dry_run: false,
             backfill_id: None,
+            launched_by: rivers_core::storage::LaunchedBy::default(),
         })
     }
 
@@ -3419,7 +3421,7 @@ impl PyCodeRepository {
                 include_upstream,
                 resume,
                 retry,
-                LaunchedBy::Manual,
+                LaunchedBy::Manual { user: None },
             )
         })
     }
@@ -3512,8 +3514,15 @@ impl PyCodeRepository {
             // Post-drain shutdown token: UI stays alive during drain so /readyz is reachable.
             let shutdown = crate::shutdown::shutdown_token().child_token();
             let handle = rt().spawn(async move {
+                let auth = match rivers_ui::auth::AuthRuntime::from_env().await {
+                    Ok(auth) => auth,
+                    Err(e) => {
+                        tracing::error!(target: "rivers::auth", error = %e, "invalid RIVERS_AUTH_* configuration; UI not started");
+                        return;
+                    }
+                };
                 if let Err(e) =
-                    rivers_ui::start_server(storage_arc, graph, host, port, registry, shutdown)
+                    rivers_ui::start_server(storage_arc, graph, host, port, registry, auth, shutdown)
                         .await
                 {
                     tracing::error!(target: "rivers::ui", error = %e, "UI server error");
@@ -3566,6 +3575,7 @@ impl PyCodeRepository {
                 block,
                 dry_run,
                 None,
+                rivers_core::storage::LaunchedBy::default(),
             )
         })
     }
@@ -3742,6 +3752,7 @@ impl PyCodeRepository {
                 block,
                 dry_run,
                 None,
+                rivers_core::storage::LaunchedBy::default(),
             )
         })
     }
@@ -3789,7 +3800,7 @@ impl PyCodeRepository {
                 selection,
                 partition_key.as_ref(),
                 None,
-                LaunchedBy::Manual,
+                LaunchedBy::Manual { user: None },
                 None,
             ))
         })
@@ -3928,6 +3939,7 @@ impl PyCodeRepository {
         block: bool,
         dry_run: bool,
         preminted_id: Option<String>,
+        launched_by: rivers_core::storage::LaunchedBy,
     ) -> PyResult<PyBackfillResult> {
         let guard = self.ensure_resolved()?;
         let state = guard.as_ref().unwrap();
@@ -4105,6 +4117,7 @@ impl PyCodeRepository {
             create_time: now_ts(),
             end_time: None,
             error: None,
+            launched_by,
         };
 
         io_rt()
