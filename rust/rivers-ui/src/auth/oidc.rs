@@ -23,7 +23,8 @@ use super::config::OidcConfig;
 use super::identity::Identity;
 use super::pages::{error_page, forbidden_page};
 use super::session::{
-    PendingLogin, clear_jar, now_ts, pending_login_jar, read_pending_login, session_jar,
+    PendingLogin, clear_cookies, now_ts, pending_login_jar, read_pending_login,
+    session_response,
 };
 use super::{AuthRuntime, RuntimeKind};
 
@@ -209,7 +210,7 @@ pub async fn callback(
     };
     let fail = |detail: String| {
         (
-            clear_jar(&o.cookie_key, o.secure_cookies),
+            clear_cookies(o.secure_cookies),
             error_page(
                 axum::http::StatusCode::BAD_GATEWAY,
                 "Sign-in failed",
@@ -270,11 +271,8 @@ pub async fn callback(
     if !rt.allow.permits(&identity) {
         // Session cookie still set so the forbidden page's sign-out
         // link works; allowlists are re-checked per request.
-        return (
-            session_jar(&o.cookie_key, o.secure_cookies, &identity),
-            forbidden_page(&identity, Some("/auth/logout")),
-        )
-            .into_response();
+        let (jar, clear_state) = session_response(&o.cookie_key, o.secure_cookies, &identity);
+        return (jar, clear_state, forbidden_page(&identity, Some("/auth/logout"))).into_response();
     }
     tracing::info!(
         target: "rivers::auth",
@@ -282,11 +280,8 @@ pub async fn callback(
         email = identity.email.as_deref().unwrap_or(""),
         "user signed in"
     );
-    (
-        session_jar(&o.cookie_key, o.secure_cookies, &identity),
-        Redirect::to(&pending.rd),
-    )
-        .into_response()
+    let (jar, clear_state) = session_response(&o.cookie_key, o.secure_cookies, &identity);
+    (jar, clear_state, Redirect::to(&pending.rd)).into_response()
 }
 
 fn extract_groups(claims: &serde_json::Map<String, serde_json::Value>, claim: &str) -> Vec<String> {
@@ -323,7 +318,7 @@ pub async fn logout(State(rt): State<Arc<AuthRuntime>>) -> Response {
     let Some(o) = expect_oidc(&rt) else {
         return error_page(axum::http::StatusCode::NOT_FOUND, "Not found", "", None);
     };
-    let jar = clear_jar(&o.cookie_key, o.secure_cookies);
+    let clear = clear_cookies(o.secure_cookies);
     if o.cfg.rp_logout {
         if let Some(end) = &o.end_session_endpoint {
             if let Ok(mut url) = url::Url::parse(end) {
@@ -332,11 +327,11 @@ pub async fn logout(State(rt): State<Arc<AuthRuntime>>) -> Response {
                 url.query_pairs_mut()
                     .append_pair("client_id", &o.cfg.client_id)
                     .append_pair("post_logout_redirect_uri", &o.cfg.public_url);
-                return (jar, Redirect::to(url.as_str())).into_response();
+                return (clear, Redirect::to(url.as_str())).into_response();
             }
         }
     }
-    (jar, Redirect::to("/")).into_response()
+    (clear, Redirect::to("/")).into_response()
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ use tower::ServiceExt;
 
 use super::config::{Allowlists, AuthConfig, AuthMode, ForwardConfig, OidcConfig};
 use super::identity::Identity;
+use super::test_cookies::CookieStore;
 use super::oidc::RawClaims;
 use super::{AuthRuntime, apply_auth};
 
@@ -75,15 +76,7 @@ fn req(uri: &str, peer: Option<&str>, headers: &[(&str, &str)]) -> Request<Body>
     req
 }
 
-fn cookies_from(resp: &axum::response::Response) -> String {
-    resp.headers()
-        .get_all(header::SET_COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .map(|s| s.split(';').next().unwrap_or("").to_string())
-        .collect::<Vec<_>>()
-        .join("; ")
-}
+
 
 async fn body_string(resp: axum::response::Response) -> String {
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -313,9 +306,9 @@ async fn oidc_rt(idp: &MockIdp, allow: Allowlists) -> Arc<AuthRuntime> {
     .unwrap()
 }
 
-/// Drive `/auth/login` and return `(callback_uri, state_cookie)` with the
+/// Drive `/auth/login` and return `(callback_uri, cookie_store)` with the
 /// mock primed to embed the flow's nonce.
-async fn drive_login(app: &Router, idp: &MockIdp) -> (String, String) {
+async fn drive_login(app: &Router, idp: &MockIdp) -> (String, CookieStore) {
     let resp = app
         .clone()
         .oneshot(req("/auth/login?rd=/runs", None, &[]))
@@ -332,7 +325,9 @@ async fn drive_login(app: &Router, idp: &MockIdp) -> (String, String) {
     assert!(params.contains_key("code_challenge"));
     *idp.nonce.lock().unwrap() = Some(params["nonce"].clone());
     let callback = format!("/auth/callback?code=test-code&state={}", params["state"]);
-    (callback, cookies_from(&resp))
+    let mut store = CookieStore::default();
+    store.absorb(&resp);
+    (callback, store)
 }
 
 #[tokio::test]
@@ -358,35 +353,36 @@ async fn oidc_full_flow() {
     let resp = app.clone().oneshot(req("/api/whoami", None, &[])).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    let (callback, state_cookie) = drive_login(&app, &idp).await;
+    let (callback, mut store) = drive_login(&app, &idp).await;
     let resp = app
         .clone()
-        .oneshot(req(&callback, None, &[("cookie", &state_cookie)]))
+        .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER, "callback should succeed");
     assert_eq!(resp.headers()[header::LOCATION], "/runs");
-    let session_cookie = cookies_from(&resp);
+    store.absorb(&resp);
 
     let resp = app
         .clone()
-        .oneshot(req("/api/whoami", None, &[("cookie", &session_cookie)]))
+        .oneshot(req("/api/whoami", None, &[("cookie", &store.header_value())]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_string(resp).await, "sub-42");
 
-    // Logout clears the session; the cleared cookie no longer authenticates.
+    // Logout clears the session; a browser-faithful store must no longer
+    // authenticate (regression: removals were once silently unemitted).
     let resp = app
         .clone()
-        .oneshot(req("/auth/logout", None, &[("cookie", &session_cookie)]))
+        .oneshot(req("/auth/logout", None, &[("cookie", &store.header_value())]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    let cleared = cookies_from(&resp);
+    store.absorb(&resp);
     let resp = app
         .clone()
-        .oneshot(req("/api/whoami", None, &[("cookie", &cleared)]))
+        .oneshot(req("/api/whoami", None, &[("cookie", &store.header_value())]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -398,13 +394,13 @@ async fn oidc_callback_rejects_state_mismatch() {
     let rt = oidc_rt(&idp, Allowlists::default()).await;
     let app = app(Some(rt));
 
-    let (_, state_cookie) = drive_login(&app, &idp).await;
+    let (_, store) = drive_login(&app, &idp).await;
     let resp = app
         .clone()
         .oneshot(req(
             "/auth/callback?code=test-code&state=forged",
             None,
-            &[("cookie", &state_cookie)],
+            &[("cookie", &store.header_value())],
         ))
         .await
         .unwrap();
@@ -432,18 +428,18 @@ async fn oidc_allowlist_denies_at_callback_and_after() {
     let rt = oidc_rt(&idp, allow).await;
     let app = app(Some(rt));
 
-    let (callback, state_cookie) = drive_login(&app, &idp).await;
+    let (callback, mut store) = drive_login(&app, &idp).await;
     let resp = app
         .clone()
-        .oneshot(req(&callback, None, &[("cookie", &state_cookie)]))
+        .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     // The session cookie is set so sign-out works, but every request stays 403.
-    let session_cookie = cookies_from(&resp);
+    store.absorb(&resp);
     let resp = app
         .clone()
-        .oneshot(req("/", None, &[("cookie", &session_cookie)]))
+        .oneshot(req("/", None, &[("cookie", &store.header_value())]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -461,10 +457,10 @@ async fn oidc_groups_reach_allowlists() {
     let rt = oidc_rt(&idp, allow).await;
     let app = app(Some(rt));
 
-    let (callback, state_cookie) = drive_login(&app, &idp).await;
+    let (callback, store) = drive_login(&app, &idp).await;
     let resp = app
         .clone()
-        .oneshot(req(&callback, None, &[("cookie", &state_cookie)]))
+        .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);

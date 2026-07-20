@@ -4,6 +4,8 @@
 pub mod config;
 #[cfg(test)]
 mod flow_tests;
+#[cfg(test)]
+pub(crate) mod test_cookies;
 pub mod forward;
 pub mod identity;
 pub mod middleware;
