@@ -186,6 +186,7 @@ struct MockIdp {
     nonce: Mutex<Option<String>>,
     subject: String,
     email: String,
+    groups: Vec<String>,
 }
 
 type MockState = Arc<MockIdp>;
@@ -232,7 +233,7 @@ async fn token(State(idp): State<MockState>) -> Json<serde_json::Value> {
     let mut name = LocalizedClaim::new();
     name.insert(None, EndUserName::new("John Doe".into()));
     let mut groups = serde_json::Map::new();
-    groups.insert("groups".into(), serde_json::json!(["eng", "admins"]));
+    groups.insert("groups".into(), serde_json::json!(idp.groups));
     let claims = IdTokenClaims::<RawClaims, CoreGenderClaim>::new(
         IssuerUrl::new(idp.issuer.clone()).unwrap(),
         vec![Audience::new("rivers".into())],
@@ -267,6 +268,10 @@ async fn token(State(idp): State<MockState>) -> Json<serde_json::Value> {
 }
 
 async fn spawn_mock_idp(subject: &str, email: &str) -> MockState {
+    spawn_mock_idp_with_groups(subject, email, vec!["eng".into(), "admins".into()]).await
+}
+
+async fn spawn_mock_idp_with_groups(subject: &str, email: &str, groups: Vec<String>) -> MockState {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let issuer = format!("http://{}", listener.local_addr().unwrap());
     let state = Arc::new(MockIdp {
@@ -274,6 +279,7 @@ async fn spawn_mock_idp(subject: &str, email: &str) -> MockState {
         nonce: Mutex::new(None),
         subject: subject.to_string(),
         email: email.to_string(),
+        groups,
     });
     let router = Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
@@ -464,4 +470,52 @@ async fn oidc_groups_reach_allowlists() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+}
+
+/// A user in hundreds of IdP groups must still receive a session cookie under
+/// the ~4096-byte browser per-cookie limit; otherwise the browser silently
+/// drops the Set-Cookie and the user redirect-loops between the app and
+/// `/auth/login`. Only allowlist-relevant groups need to survive into the
+/// cookie, so the stored set stays bounded regardless of claim size.
+#[tokio::test]
+async fn oidc_large_groups_claim_yields_bounded_cookie() {
+    let big: Vec<String> = (0..500).map(|i| format!("group-{i:04}")).collect();
+    let idp = spawn_mock_idp_with_groups("sub-42", "john.doe@example.com", big).await;
+    // Admitted solely by one of the many groups.
+    let allow = Allowlists {
+        groups: vec!["group-0007".into()],
+        ..Default::default()
+    };
+    let rt = oidc_rt(&idp, allow).await;
+    let app = app(Some(rt));
+
+    let (callback, mut store) = drive_login(&app, &idp).await;
+    let resp = app
+        .clone()
+        .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "the matching group admits");
+
+    let session_cookie = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .find(|c| c.starts_with("rivers_session="))
+        .expect("session cookie set");
+    assert!(
+        session_cookie.len() < 4096,
+        "session cookie must stay under the 4KB browser limit, got {} bytes",
+        session_cookie.len()
+    );
+
+    // The reduced group set still admits on subsequent requests.
+    store.absorb(&resp);
+    let resp = app
+        .clone()
+        .oneshot(req("/", None, &[("cookie", &store.header_value())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

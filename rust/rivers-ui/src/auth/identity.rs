@@ -26,6 +26,18 @@ impl Identity {
 }
 
 impl Allowlists {
+    /// The subset of `groups` that can affect an allow decision — those
+    /// present in the configured group allowlist. `permits` only ever tests
+    /// group membership against this list, so reducing to it is
+    /// decision-preserving; it bounds what the OIDC session cookie carries so
+    /// an unbounded IdP groups claim can't overflow the 4 KB cookie limit.
+    pub fn relevant_groups(&self, groups: Vec<String>) -> Vec<String> {
+        groups
+            .into_iter()
+            .filter(|g| self.groups.iter().any(|allowed| allowed == g))
+            .collect()
+    }
+
     /// Empty lists admit any authenticated identity; otherwise a match in
     /// any list admits.
     pub fn permits(&self, id: &Identity) -> bool {
@@ -81,6 +93,31 @@ mod tests {
         assert!(allow.permits(&id(Some("John.Doe@Example.COM"), &[])));
         assert!(!allow.permits(&id(Some("john.doe@other.com"), &[])));
         assert!(!allow.permits(&id(None, &[])));
+    }
+
+    #[test]
+    fn relevant_groups_keeps_only_allowlisted_and_preserves_permits() {
+        let allow = Allowlists {
+            groups: vec!["data-eng".into()],
+            ..Default::default()
+        };
+        let many: Vec<String> = (0..200)
+            .map(|i| format!("g{i}"))
+            .chain(["data-eng".into()])
+            .collect();
+        let reduced = allow.relevant_groups(many.clone());
+        assert_eq!(reduced, vec!["data-eng".to_string()]);
+        // Reducing the stored groups doesn't change the admit decision.
+        assert_eq!(
+            allow.permits(&id(None, &many.iter().map(String::as_str).collect::<Vec<_>>())),
+            allow.permits(&id(None, &["data-eng"])),
+        );
+        // No configured group allowlist ⇒ groups are irrelevant ⇒ none kept.
+        let none = Allowlists {
+            users: vec!["sub-1".into()],
+            ..Default::default()
+        };
+        assert!(none.relevant_groups(many).is_empty());
     }
 
     #[test]

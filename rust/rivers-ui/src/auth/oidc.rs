@@ -257,7 +257,12 @@ pub async fn callback(
         Err(e) => return fail(format!("ID token validation failed: {e}")),
     };
 
-    let groups = extract_groups(&claims.additional_claims().0, &o.cfg.groups_claim);
+    // Persist only allowlist-relevant groups: a large IdP groups claim would
+    // otherwise blow the encrypted session cookie past the 4 KB browser limit
+    // and redirect-loop the login. `permits` only tests against these.
+    let groups = rt
+        .allow
+        .relevant_groups(extract_groups(&claims.additional_claims().0, &o.cfg.groups_claim));
     let identity = Identity {
         subject: claims.subject().to_string(),
         email: claims.email().map(|e| e.to_string()),
