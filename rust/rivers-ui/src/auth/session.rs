@@ -42,10 +42,15 @@ fn build(name: &'static str, value: String, secure: bool) -> Cookie<'static> {
 
 /// Explicit removal header. A from-scratch jar's `remove` emits nothing —
 /// cookie-rs only deltas removals for cookies it saw as request originals.
-fn removal_header(name: &str) -> (HeaderName, String) {
+///
+/// `secure` must match the set cookie: `__Host-`-prefixed names are only
+/// deleted by a Set-Cookie that also carries `Secure`, so a removal without
+/// it is silently ignored by the browser and the session outlives logout.
+fn removal_header(name: &str, secure: bool) -> (HeaderName, String) {
+    let secure_attr = if secure { "; Secure" } else { "" };
     (
         SET_COOKIE,
-        format!("{name}=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"),
+        format!("{name}=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT{secure_attr}"),
     )
 }
 
@@ -83,7 +88,7 @@ pub fn session_response(
     let value = serde_json::to_string(identity).expect("Identity serializes");
     (
         PrivateCookieJar::new(key.clone()).add(build(session_cookie_name(secure), value, secure)),
-        AppendHeaders([removal_header(state_cookie_name(secure))]),
+        AppendHeaders([removal_header(state_cookie_name(secure), secure)]),
     )
 }
 
@@ -96,8 +101,8 @@ pub fn pending_login_jar(key: &Key, secure: bool, pending: &PendingLogin) -> Pri
 /// Clears both cookies (logout / callback failure).
 pub fn clear_cookies(secure: bool) -> AppendHeaders<[(HeaderName, String); 2]> {
     AppendHeaders([
-        removal_header(session_cookie_name(secure)),
-        removal_header(state_cookie_name(secure)),
+        removal_header(session_cookie_name(secure), secure),
+        removal_header(state_cookie_name(secure), secure),
     ])
 }
 
@@ -119,6 +124,31 @@ mod tests {
 
     fn absorb(store: &mut CookieStore, resp: impl IntoResponse) {
         store.absorb(&resp.into_response());
+    }
+
+    fn set_cookies(resp: impl IntoResponse) -> Vec<String> {
+        resp.into_response()
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// `__Host-`-prefixed cookies (secure=true) can only be *deleted* by a
+    /// Set-Cookie that itself carries `Secure`; without it browsers reject
+    /// the removal and the session survives logout.
+    #[test]
+    fn secure_removal_cookies_carry_secure_attribute() {
+        let cookies = set_cookies(clear_cookies(true));
+        assert_eq!(cookies.len(), 2);
+        for c in &cookies {
+            assert!(c.contains("Secure"), "secure removal must include Secure: {c}");
+        }
+        // Non-secure (dev) removals must not claim Secure over http.
+        for c in set_cookies(clear_cookies(false)) {
+            assert!(!c.contains("Secure"), "non-secure removal must omit Secure: {c}");
+        }
     }
 
     #[test]
