@@ -29,22 +29,13 @@ import pytest
 from kr8s.objects import Deployment, Secret, Service
 
 from .conftest import KUBECTL_CONTEXT, cluster_gate, kube_api
+from .test_k8s_integration import NAMESPACE, _cluster_reachable
 
-NAMESPACE = "rivers"
 UI_DEPLOYMENT = "rivers-ui"
 UI_SERVICE = "rivers-ui"
 UI_PORT = 3000
 # Fixed so the IdP can pre-register http://127.0.0.1:18300/auth/callback.
 UI_LOCAL_PORT = 18300
-
-
-def _cluster_reachable() -> bool:
-    try:
-        api = kube_api()
-        list(api.get("namespaces", NAMESPACE))
-        return True
-    except Exception:
-        return False
 
 
 def _ui_deployed() -> bool:
