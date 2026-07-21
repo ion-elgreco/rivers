@@ -19,14 +19,13 @@ use openidconnect::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use super::config::OidcConfig;
+use super::config::{Allowlists, OidcConfig};
 use super::identity::Identity;
 use super::pages::{error_page, forbidden_page};
 use super::session::{
     PendingLogin, clear_cookies, clear_state_cookie, now_ts, pending_login_jar,
     read_pending_login, session_response,
 };
-use super::{AuthRuntime, RuntimeKind};
 
 /// Catch-all additional claims — the configurable groups claim is read
 /// from the map.
@@ -227,11 +226,13 @@ impl OidcRuntime {
     }
 }
 
-fn expect_oidc(rt: &AuthRuntime) -> Option<&OidcRuntime> {
-    match &rt.kind {
-        RuntimeKind::Oidc(o) => Some(o),
-        RuntimeKind::Forward(_) => None,
-    }
+/// Route state for the `/auth/*` handlers: the OIDC runtime plus the
+/// allowlists. Built only in OIDC mode (see `apply_auth`), so the handlers
+/// take it directly rather than re-checking the runtime kind.
+#[derive(Clone)]
+pub struct OidcState {
+    pub oidc: Arc<OidcRuntime>,
+    pub allow: Allowlists,
 }
 
 /// Reject anything that isn't a same-origin absolute path (open-redirect and
@@ -255,13 +256,8 @@ pub struct LoginQuery {
     pub rd: Option<String>,
 }
 
-pub async fn login(
-    State(rt): State<Arc<AuthRuntime>>,
-    Query(q): Query<LoginQuery>,
-) -> Response {
-    let Some(o) = expect_oidc(&rt) else {
-        return error_page(axum::http::StatusCode::NOT_FOUND, "Not found", "", None);
-    };
+pub async fn login(State(st): State<OidcState>, Query(q): Query<LoginQuery>) -> Response {
+    let o = &st.oidc;
     let client = o.client();
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let mut auth_req = client.authorize_url(
@@ -299,13 +295,11 @@ pub struct CallbackQuery {
 }
 
 pub async fn callback(
-    State(rt): State<Arc<AuthRuntime>>,
+    State(st): State<OidcState>,
     Query(q): Query<CallbackQuery>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let Some(o) = expect_oidc(&rt) else {
-        return error_page(axum::http::StatusCode::NOT_FOUND, "Not found", "", None);
-    };
+    let o = &st.oidc;
     // Clear only the in-flight state cookie — never the session. A failed or
     // forged callback must not be able to log out an already-signed-in user.
     let fail = |detail: String| {
@@ -368,7 +362,7 @@ pub async fn callback(
     // Persist only allowlist-relevant groups: a large IdP groups claim would
     // otherwise blow the encrypted session cookie past the 4 KB browser limit
     // and redirect-loop the login. `permits` only tests against these.
-    let groups = rt
+    let groups = st
         .allow
         .relevant_groups(extract_groups(&claims.additional_claims().0, &o.cfg.groups_claim));
     // Trust the email claim only when the IdP asserts it's verified: an
@@ -388,7 +382,7 @@ pub async fn callback(
         groups,
         expires_at: now_ts() + o.cfg.session_ttl_secs,
     };
-    if !rt.allow.permits(&identity) {
+    if !st.allow.permits(&identity) {
         // Session cookie still set so the forbidden page's sign-out link
         // works; allowlists are re-checked per request against the identity
         // snapshot taken here (IdP-side changes land at the next sign-in).
@@ -434,10 +428,8 @@ fn extract_groups(claims: &serde_json::Map<String, serde_json::Value>, claim: &s
     }
 }
 
-pub async fn logout(State(rt): State<Arc<AuthRuntime>>) -> Response {
-    let Some(o) = expect_oidc(&rt) else {
-        return error_page(axum::http::StatusCode::NOT_FOUND, "Not found", "", None);
-    };
+pub async fn logout(State(st): State<OidcState>) -> Response {
+    let o = &st.oidc;
     let clear = clear_cookies(o.cfg.secure_cookies());
     if o.cfg.rp_logout {
         if let Some(end) = &o.end_session_endpoint {

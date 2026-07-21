@@ -22,7 +22,7 @@ pub use identity::Identity;
 
 #[derive(Debug)]
 pub enum RuntimeKind {
-    Oidc(oidc::OidcRuntime),
+    Oidc(Arc<oidc::OidcRuntime>),
     Forward(forward::ForwardRuntime),
 }
 
@@ -38,7 +38,9 @@ impl AuthRuntime {
     pub async fn initialize(config: AuthConfig) -> anyhow::Result<Option<Arc<Self>>> {
         let kind = match config.mode {
             AuthMode::None => return Ok(None),
-            AuthMode::Oidc(cfg) => RuntimeKind::Oidc(oidc::OidcRuntime::initialize(cfg).await?),
+            AuthMode::Oidc(cfg) => {
+                RuntimeKind::Oidc(Arc::new(oidc::OidcRuntime::initialize(cfg).await?))
+            }
             AuthMode::Forward(cfg) => RuntimeKind::Forward(forward::ForwardRuntime::new(cfg)?),
         };
         Ok(Some(Arc::new(Self {
@@ -71,20 +73,24 @@ impl AuthRuntime {
 #[derive(Clone)]
 pub struct AuthCtx(pub Option<Arc<AuthRuntime>>);
 
-fn auth_routes(rt: Arc<AuthRuntime>) -> Router {
+fn auth_routes(state: oidc::OidcState) -> Router {
     Router::new()
         .route(crate::routes::LOGIN, get(oidc::login))
         .route(crate::routes::CALLBACK, get(oidc::callback))
         .route(crate::routes::LOGOUT, get(oidc::logout))
-        .with_state(rt)
+        .with_state(state)
 }
 
 /// Wrap a fully-built router with the auth gate; `None` returns it
-/// untouched.
+/// untouched. The `/auth/*` routes mount only in OIDC mode, with an
+/// `OidcState` so the handlers need no runtime mode check.
 pub fn apply_auth(router: Router, rt: Option<Arc<AuthRuntime>>) -> Router {
     let Some(rt) = rt else { return router };
-    let router = match rt.kind {
-        RuntimeKind::Oidc(_) => router.merge(auth_routes(rt.clone())),
+    let router = match &rt.kind {
+        RuntimeKind::Oidc(o) => router.merge(auth_routes(oidc::OidcState {
+            oidc: o.clone(),
+            allow: rt.allow.clone(),
+        })),
         RuntimeKind::Forward(_) => router,
     };
     router.layer(axum::middleware::from_fn_with_state(
