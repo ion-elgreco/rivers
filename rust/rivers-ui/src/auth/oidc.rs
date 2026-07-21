@@ -204,7 +204,11 @@ impl OidcRuntime {
         }
         let now = now_ts();
         if now - seen < KEY_REFRESH_COOLDOWN_SECS {
-            return false;
+            // A refresh landed recently (before we entered): re-fetching won't
+            // help, but the live client already holds the rotated keys, so signal
+            // a retry — the caller may have validated against a client snapshot
+            // taken before that refresh.
+            return true;
         }
         match discover_client(&self.cfg, &self.http).await {
             Ok((client, _)) => {

@@ -207,6 +207,12 @@ struct MockIdp {
     /// Number of `/token` exchanges served — lets a test observe that a second
     /// callback has passed code exchange.
     token_hits: std::sync::atomic::AtomicUsize,
+    /// One-shot: when armed, the FIRST `/token` call signals `token_entered` and
+    /// blocks on `token_release`, pinning one callback between its client
+    /// snapshot and its id-token validation while another refreshes the keys.
+    hold_token: std::sync::atomic::AtomicBool,
+    token_entered: tokio::sync::Notify,
+    token_release: tokio::sync::Notify,
 }
 
 type MockState = Arc<MockIdp>;
@@ -251,6 +257,12 @@ async fn jwks(State(idp): State<MockState>) -> Json<serde_json::Value> {
 }
 
 async fn token(State(idp): State<MockState>) -> Json<serde_json::Value> {
+    // One-shot pin: park the first callback here (after it snapshotted the
+    // verifying client) so a second callback can rotate the keys underneath it.
+    if idp.hold_token.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        idp.token_entered.notify_one();
+        idp.token_release.notified().await;
+    }
     use openidconnect::core::{
         CoreGenderClaim, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm, CoreTokenType,
     };
@@ -320,6 +332,9 @@ async fn spawn_mock_idp_with_groups(subject: &str, email: &str, groups: Vec<Stri
         discovery_entered: tokio::sync::Notify::new(),
         discovery_release: tokio::sync::Notify::new(),
         token_hits: std::sync::atomic::AtomicUsize::new(0),
+        hold_token: std::sync::atomic::AtomicBool::new(false),
+        token_entered: tokio::sync::Notify::new(),
+        token_release: tokio::sync::Notify::new(),
     });
     let router = Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
@@ -677,6 +692,61 @@ async fn oidc_concurrent_callbacks_during_rotation_all_recover() {
         sb.unwrap(),
         StatusCode::SEE_OTHER,
         "race-loser must recover too, not get a 502"
+    );
+}
+
+/// A callback that snapshots the pre-rotation client but validates just AFTER a
+/// concurrent login already refreshed the keys must still recover: its refresh
+/// hits the cooldown (a refresh just landed), so it must retry against the live,
+/// already-rotated client rather than 502. Complements
+/// `oidc_concurrent_callbacks_during_rotation_all_recover`, which covers the
+/// during-refresh ordering; this covers the just-after-refresh ordering.
+#[tokio::test]
+async fn oidc_callback_after_concurrent_refresh_still_recovers() {
+    use std::sync::atomic::Ordering;
+    let idp = spawn_mock_idp("sub-42", "john.doe@example.com").await;
+    let rt = oidc_rt(&idp, Allowlists::default()).await;
+    let app = app(Some(rt));
+
+    let (callback, store) = drive_login(&app, &idp).await;
+    let cookie = store.header_value();
+
+    // Rotate to a never-seen key; pin the loser's /token so it snapshots the
+    // pre-rotation client and only validates after the winner has refreshed.
+    *idp.key_id.lock().unwrap() = "test-rotated".into();
+    idp.hold_token.store(true, Ordering::Relaxed);
+
+    // Loser L: snapshots the stale client, then parks inside /token.
+    let l = {
+        let app = app.clone();
+        let callback = callback.clone();
+        let cookie = cookie.clone();
+        tokio::spawn(async move {
+            app.oneshot(req(&callback, None, &[("cookie", &cookie)]))
+                .await
+                .unwrap()
+                .status()
+        })
+    };
+    idp.token_entered.notified().await;
+
+    // Winner W: fails against the stale key, refreshes, swaps the shared client,
+    // and succeeds — advancing last_key_refresh so L's later refresh cooldowns.
+    let w = app
+        .clone()
+        .oneshot(req(&callback, None, &[("cookie", &cookie)]))
+        .await
+        .unwrap();
+    assert_eq!(w.status(), StatusCode::SEE_OTHER, "winner recovers via refresh");
+
+    // Release the loser: it validates the rotated token against its STALE
+    // snapshot, its refresh hits the cooldown, and it must retry against the
+    // live client instead of 502-ing.
+    idp.token_release.notify_one();
+    assert_eq!(
+        l.await.unwrap(),
+        StatusCode::SEE_OTHER,
+        "a login validating just after a concurrent refresh must recover, not 502"
     );
 }
 
