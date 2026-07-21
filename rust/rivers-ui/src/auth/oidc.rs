@@ -432,11 +432,7 @@ fn extract_groups(claims: &serde_json::Map<String, serde_json::Value>, claim: &s
             .iter()
             .filter_map(|v| v.as_str().map(String::from))
             .collect(),
-        Some(serde_json::Value::String(s)) => s
-            .split(',')
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-            .collect(),
+        Some(serde_json::Value::String(s)) => super::config::split_csv(s),
         _ => Vec::new(),
     }
 }

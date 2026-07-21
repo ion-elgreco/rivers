@@ -61,9 +61,7 @@ impl ForwardRuntime {
             .get_all(&self.cfg.groups_header)
             .iter()
             .filter_map(|v| v.to_str().ok())
-            .flat_map(|line| line.split(','))
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
+            .flat_map(|line| super::config::split_csv(line))
             .collect();
         Some(Identity {
             subject,

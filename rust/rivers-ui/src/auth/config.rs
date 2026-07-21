@@ -66,14 +66,17 @@ pub struct AuthConfig {
     pub allow: Allowlists,
 }
 
+/// Split a comma-separated string, trimming each item and dropping empties.
+/// The one kernel behind CSV env vars and comma-joined OIDC/proxy group claims.
+pub(super) fn split_csv(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
 fn csv(v: Option<String>) -> Vec<String> {
-    v.map(|s| {
-        s.split(',')
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-            .collect()
-    })
-    .unwrap_or_default()
+    v.map(|s| split_csv(&s)).unwrap_or_default()
 }
 
 fn flag(v: Option<String>) -> bool {
@@ -233,6 +236,15 @@ mod tests {
             AuthMode::Oidc(o) => o.scopes,
             other => panic!("expected oidc, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn split_csv_trims_and_drops_empties() {
+        assert_eq!(split_csv("a, b ,,c"), vec!["a", "b", "c"]);
+        assert_eq!(split_csv("solo"), vec!["solo"]);
+        assert!(split_csv("").is_empty());
+        assert!(split_csv("   ").is_empty());
+        assert!(split_csv(",, ,").is_empty());
     }
 
     #[test]
