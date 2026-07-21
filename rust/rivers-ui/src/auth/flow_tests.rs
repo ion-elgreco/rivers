@@ -400,6 +400,50 @@ async fn oidc_full_flow() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// A failed/forged callback must NOT clear the session cookie — otherwise any
+/// cross-site `GET /auth/callback?error=x` force-logs-out a signed-in user.
+#[tokio::test]
+async fn callback_failure_preserves_existing_session() {
+    let idp = spawn_mock_idp("sub-42", "john.doe@example.com").await;
+    let rt = oidc_rt(&idp, Allowlists::default()).await;
+    let app = app(Some(rt));
+
+    // Establish a real session.
+    let (callback, mut store) = drive_login(&app, &idp).await;
+    let resp = app
+        .clone()
+        .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    store.absorb(&resp);
+    assert!(store.contains("rivers_session"), "logged in");
+
+    // A forged callback (attacker-triggerable cross-site, no valid state).
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "/auth/callback?error=access_denied",
+            None,
+            &[("cookie", &store.header_value())],
+        ))
+        .await
+        .unwrap();
+    store.absorb(&resp);
+
+    // The session must survive; only a real /auth/logout ends it.
+    assert!(
+        store.contains("rivers_session"),
+        "callback failure must not delete the session cookie"
+    );
+    let resp = app
+        .clone()
+        .oneshot(req("/api/whoami", None, &[("cookie", &store.header_value())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "still authenticated");
+}
+
 /// The session-expiry redirect in `CurrentUserChip` needs a 401 the
 /// server-fn client can actually decode: an empty body decodes to a generic
 /// `Deserialization` error, indistinguishable from any other failure, so the

@@ -98,12 +98,19 @@ pub fn pending_login_jar(key: &Key, secure: bool, pending: &PendingLogin) -> Pri
     PrivateCookieJar::new(key.clone()).add(build(state_cookie_name(secure), value, secure))
 }
 
-/// Clears both cookies (logout / callback failure).
+/// Clears both cookies — logout only.
 pub fn clear_cookies(secure: bool) -> AppendHeaders<[(HeaderName, String); 2]> {
     AppendHeaders([
         removal_header(session_cookie_name(secure), secure),
         removal_header(state_cookie_name(secure), secure),
     ])
+}
+
+/// Clears only the in-flight OAuth-state cookie, leaving any existing session
+/// intact. Used on callback failure so a forged/failed login attempt can't
+/// force-logout a signed-in user.
+pub fn clear_state_cookie(secure: bool) -> AppendHeaders<[(HeaderName, String); 1]> {
+    AppendHeaders([removal_header(state_cookie_name(secure), secure)])
 }
 
 #[cfg(test)]

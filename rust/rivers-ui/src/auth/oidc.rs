@@ -23,8 +23,8 @@ use super::config::OidcConfig;
 use super::identity::Identity;
 use super::pages::{error_page, forbidden_page};
 use super::session::{
-    PendingLogin, clear_cookies, now_ts, pending_login_jar, read_pending_login,
-    session_response,
+    PendingLogin, clear_cookies, clear_state_cookie, now_ts, pending_login_jar,
+    read_pending_login, session_response,
 };
 use super::{AuthRuntime, RuntimeKind};
 
@@ -274,9 +274,11 @@ pub async fn callback(
     let Some(o) = expect_oidc(&rt) else {
         return error_page(axum::http::StatusCode::NOT_FOUND, "Not found", "", None);
     };
+    // Clear only the in-flight state cookie — never the session. A failed or
+    // forged callback must not be able to log out an already-signed-in user.
     let fail = |detail: String| {
         (
-            clear_cookies(o.secure_cookies),
+            clear_state_cookie(o.secure_cookies),
             error_page(
                 axum::http::StatusCode::BAD_GATEWAY,
                 "Sign-in failed",
