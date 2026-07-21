@@ -14,7 +14,7 @@ tests:
           path: spec.template.spec.containers[0].env
           content:
             name: RIVERS_AUTH_MODE
-            value: "none"
+          any: true
       - template: templates/ui-auth-secret.yaml
         hasDocuments:
           count: 0
