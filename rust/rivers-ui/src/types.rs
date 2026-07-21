@@ -12,14 +12,14 @@ pub(crate) fn partition_key_to_display(pk: rivers_core::storage::PartitionKey) -
 
 /// Human-readable label for an identity: `name`, else `email`, else
 /// `subject`. The single precedence rule every UI identity type shares.
-/// An empty string counts as absent, so a claim like `name:""` falls
-/// through instead of rendering blank.
+/// An empty or whitespace-only string counts as absent, so a claim like
+/// `name:""` or `name:" "` falls through instead of rendering blank.
 pub(crate) fn display_name<'a>(
     name: Option<&'a str>,
     email: Option<&'a str>,
     subject: &'a str,
 ) -> &'a str {
-    let non_empty = |s: &&'a str| !s.is_empty();
+    let non_empty = |s: &&'a str| !s.trim().is_empty();
     name.filter(non_empty)
         .or(email.filter(non_empty))
         .unwrap_or(subject)
@@ -1489,6 +1489,11 @@ mod display_tests {
         assert_eq!(display_name(Some(""), Some("e@x"), "sub"), "e@x");
         assert_eq!(display_name(Some(""), Some(""), "sub"), "sub");
         assert_eq!(display_name(None, Some(""), "sub"), "sub");
+
+        // Whitespace-only is absent too — complements the producer-side trim in
+        // oidc/forward so a spaces-only claim falls through, not renders blank.
+        assert_eq!(display_name(Some("   "), Some("e@x"), "sub"), "e@x");
+        assert_eq!(display_name(Some("  "), None, "sub"), "sub");
 
         let full = UserRef {
             subject: "sub".into(),
