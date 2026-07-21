@@ -66,13 +66,21 @@ pub type OidcClient = Client<
 >;
 
 pub struct OidcRuntime {
-    pub client: OidcClient,
+    /// Swapped out when the IdP rotates signing keys (see
+    /// [`OidcRuntime::refresh_keys_rate_limited`]); reads clone the `Arc`.
+    client: std::sync::RwLock<Arc<OidcClient>>,
+    /// Unix-seconds of the last key refresh; gates the refresh rate so a
+    /// burst of unverifiable tokens can't hammer the IdP. `0` = never.
+    last_key_refresh: std::sync::atomic::AtomicI64,
     pub http: reqwest::Client,
     pub cfg: OidcConfig,
     pub cookie_key: Key,
     pub secure_cookies: bool,
     pub end_session_endpoint: Option<String>,
 }
+
+/// Minimum spacing between on-miss JWKS refreshes.
+const KEY_REFRESH_COOLDOWN_SECS: i64 = 300;
 
 impl std::fmt::Debug for OidcRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -83,6 +91,32 @@ impl std::fmt::Debug for OidcRuntime {
     }
 }
 
+/// Run OIDC discovery and build the verifying client. Re-runnable so signing
+/// keys can be refreshed after the IdP rotates them.
+async fn discover_client(
+    cfg: &OidcConfig,
+    http: &reqwest::Client,
+) -> anyhow::Result<(OidcClient, Option<String>)> {
+    let issuer = IssuerUrl::new(cfg.issuer.clone()).context("invalid RIVERS_AUTH_OIDC_ISSUER")?;
+    let metadata = ProviderMetadataWithLogout::discover_async(issuer, http)
+        .await
+        .with_context(|| format!("OIDC discovery against {} failed", cfg.issuer))?;
+    let end_session_endpoint = metadata
+        .additional_metadata()
+        .end_session_endpoint
+        .clone()
+        .map(|u| u.to_string());
+    let redirect = RedirectUrl::new(format!("{}/auth/callback", cfg.public_url))
+        .context("invalid redirect URL derived from RIVERS_AUTH_PUBLIC_URL")?;
+    let client = OidcClient::from_provider_metadata(
+        metadata,
+        ClientId::new(cfg.client_id.clone()),
+        cfg.client_secret.clone().map(ClientSecret::new),
+    )
+    .set_redirect_uri(redirect);
+    Ok((client, end_session_endpoint))
+}
+
 impl OidcRuntime {
     pub async fn initialize(cfg: OidcConfig) -> anyhow::Result<Self> {
         let http = reqwest::ClientBuilder::new()
@@ -90,23 +124,7 @@ impl OidcRuntime {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("failed to build OIDC http client")?;
-        let issuer = IssuerUrl::new(cfg.issuer.clone()).context("invalid RIVERS_AUTH_OIDC_ISSUER")?;
-        let metadata = ProviderMetadataWithLogout::discover_async(issuer, &http)
-            .await
-            .with_context(|| format!("OIDC discovery against {} failed", cfg.issuer))?;
-        let end_session_endpoint = metadata
-            .additional_metadata()
-            .end_session_endpoint
-            .clone()
-            .map(|u| u.to_string());
-        let redirect = RedirectUrl::new(format!("{}/auth/callback", cfg.public_url))
-            .context("invalid redirect URL derived from RIVERS_AUTH_PUBLIC_URL")?;
-        let client = OidcClient::from_provider_metadata(
-            metadata,
-            ClientId::new(cfg.client_id.clone()),
-            cfg.client_secret.clone().map(ClientSecret::new),
-        )
-        .set_redirect_uri(redirect);
+        let (client, end_session_endpoint) = discover_client(&cfg, &http).await?;
         let secure_cookies = cfg.public_url.starts_with("https://");
         let cookie_key = match &cfg.cookie_secret {
             Some(bytes) => Key::derive_from(bytes),
@@ -120,13 +138,51 @@ impl OidcRuntime {
             }
         };
         Ok(Self {
-            client,
+            client: std::sync::RwLock::new(Arc::new(client)),
+            last_key_refresh: std::sync::atomic::AtomicI64::new(0),
             http,
             cfg,
             cookie_key,
             secure_cookies,
             end_session_endpoint,
         })
+    }
+
+    /// Current verifying client. Cheap `Arc` clone; the guard is never held
+    /// across an `.await`.
+    fn client(&self) -> Arc<OidcClient> {
+        self.client.read().unwrap().clone()
+    }
+
+    /// Re-run discovery to pick up rotated IdP signing keys, then swap the
+    /// verifying client. Rate-limited to at most once per
+    /// [`KEY_REFRESH_COOLDOWN_SECS`] so a flood of tokens with unknown `kid`s
+    /// can't turn into a flood of discovery requests. Returns whether a
+    /// refresh actually ran.
+    async fn refresh_keys_rate_limited(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let now = now_ts();
+        if now - self.last_key_refresh.load(Ordering::Relaxed) < KEY_REFRESH_COOLDOWN_SECS {
+            return false;
+        }
+        // Claim the window before the network round-trip so concurrent
+        // failures collapse into one refresh.
+        self.last_key_refresh.store(now, Ordering::Relaxed);
+        match discover_client(&self.cfg, &self.http).await {
+            Ok((client, _)) => {
+                *self.client.write().unwrap() = Arc::new(client);
+                tracing::info!(target: "rivers::auth", "refreshed OIDC signing keys");
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "rivers::auth",
+                    error = %format!("{e:#}"),
+                    "OIDC signing-key refresh failed"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -165,8 +221,9 @@ pub async fn login(
     let Some(o) = expect_oidc(&rt) else {
         return error_page(axum::http::StatusCode::NOT_FOUND, "Not found", "", None);
     };
+    let client = o.client();
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-    let mut auth_req = o.client.authorize_url(
+    let mut auth_req = client.authorize_url(
         CoreAuthenticationFlow::AuthorizationCode,
         CsrfToken::new_random,
         Nonce::new_random,
@@ -238,7 +295,8 @@ pub async fn callback(
         return fail("missing authorization code".to_string());
     };
 
-    let exchange = match o.client.exchange_code(AuthorizationCode::new(code)) {
+    let client = o.client();
+    let exchange = match client.exchange_code(AuthorizationCode::new(code)) {
         Ok(req) => req.set_pkce_verifier(PkceCodeVerifier::new(pending.pkce_verifier.clone())),
         Err(e) => return fail(format!("token endpoint not configured: {e}")),
     };
@@ -249,12 +307,22 @@ pub async fn callback(
     let Some(id_token) = token.id_token() else {
         return fail("token response contained no ID token".to_string());
     };
-    let claims = match id_token.claims(
-        &o.client.id_token_verifier(),
-        &Nonce::new(pending.nonce.clone()),
-    ) {
+    let nonce = Nonce::new(pending.nonce.clone());
+    let claims = match id_token.claims(&client.id_token_verifier(), &nonce) {
         Ok(claims) => claims,
-        Err(e) => return fail(format!("ID token validation failed: {e}")),
+        Err(first_err) => {
+            // The signing key may have rotated since startup; refresh the
+            // JWKS once (rate-limited) and retry before giving up.
+            if o.refresh_keys_rate_limited().await {
+                let client = o.client();
+                match id_token.claims(&client.id_token_verifier(), &nonce) {
+                    Ok(claims) => claims,
+                    Err(e) => return fail(format!("ID token validation failed: {e}")),
+                }
+            } else {
+                return fail(format!("ID token validation failed: {first_err}"));
+            }
+        }
     };
 
     // Persist only allowlist-relevant groups: a large IdP groups claim would

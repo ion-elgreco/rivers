@@ -187,6 +187,9 @@ struct MockIdp {
     subject: String,
     email: String,
     groups: Vec<String>,
+    /// Current signing-key id; both `/jwks` and `/token` read it, so flipping
+    /// it simulates an IdP key rotation.
+    key_id: Mutex<String>,
 }
 
 type MockState = Arc<MockIdp>;
@@ -205,18 +208,19 @@ async fn discovery(State(idp): State<MockState>) -> Json<serde_json::Value> {
     }))
 }
 
-fn signing_key() -> openidconnect::core::CoreRsaPrivateSigningKey {
+fn signing_key(kid: &str) -> openidconnect::core::CoreRsaPrivateSigningKey {
     openidconnect::core::CoreRsaPrivateSigningKey::from_pem(
         TEST_RSA_PEM,
-        Some(openidconnect::JsonWebKeyId::new("test".into())),
+        Some(openidconnect::JsonWebKeyId::new(kid.into())),
     )
     .unwrap()
 }
 
-async fn jwks() -> Json<serde_json::Value> {
+async fn jwks(State(idp): State<MockState>) -> Json<serde_json::Value> {
     use openidconnect::PrivateSigningKey;
     use openidconnect::core::CoreJsonWebKeySet;
-    let jwks = CoreJsonWebKeySet::new(vec![signing_key().as_verification_key()]);
+    let kid = idp.key_id.lock().unwrap().clone();
+    let jwks = CoreJsonWebKeySet::new(vec![signing_key(&kid).as_verification_key()]);
     Json(serde_json::to_value(&jwks).unwrap())
 }
 
@@ -246,6 +250,7 @@ async fn token(State(idp): State<MockState>) -> Json<serde_json::Value> {
     )
     .set_nonce(idp.nonce.lock().unwrap().clone().map(Nonce::new));
 
+    let kid = idp.key_id.lock().unwrap().clone();
     let id_token = IdToken::<
         RawClaims,
         CoreGenderClaim,
@@ -253,7 +258,7 @@ async fn token(State(idp): State<MockState>) -> Json<serde_json::Value> {
         CoreJwsSigningAlgorithm,
     >::new(
         claims,
-        &signing_key(),
+        &signing_key(&kid),
         CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
         None,
         None,
@@ -280,6 +285,7 @@ async fn spawn_mock_idp_with_groups(subject: &str, email: &str, groups: Vec<Stri
         subject: subject.to_string(),
         email: email.to_string(),
         groups,
+        key_id: Mutex::new("test".into()),
     });
     let router = Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
@@ -392,6 +398,43 @@ async fn oidc_full_flow() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// IdPs rotate signing keys routinely. The verifying client snapshots the
+/// JWKS at startup; without an on-miss refresh, every login fails once the
+/// key rotates and only a process restart recovers. A token signed by a
+/// newly-rotated key must still validate — the callback re-runs discovery and
+/// retries.
+#[tokio::test]
+async fn oidc_refreshes_signing_keys_after_rotation() {
+    let idp = spawn_mock_idp("sub-42", "john.doe@example.com").await;
+    let rt = oidc_rt(&idp, Allowlists::default()).await;
+    let app = app(Some(rt));
+
+    // Baseline: login with the startup key succeeds.
+    let (callback, store) = drive_login(&app, &idp).await;
+    let resp = app
+        .clone()
+        .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    // IdP rotates to a key the client has never seen.
+    *idp.key_id.lock().unwrap() = "test-rotated".into();
+
+    let (callback, store) = drive_login(&app, &idp).await;
+    let resp = app
+        .clone()
+        .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "login must recover after key rotation via JWKS refresh, got {}",
+        resp.status()
+    );
 }
 
 #[tokio::test]
