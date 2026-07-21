@@ -171,8 +171,7 @@ ui:
   auth:
     # none | oidc | forward
     mode: none
-    # External base URL (https://rivers.example.com). Required for oidc;
-    # redirect URI becomes <publicUrl>/auth/callback.
+    # External base URL. Required for oidc; redirect URI is <publicUrl>/auth/callback.
     publicUrl: ""
     # Session lifetime, seconds (oidc).
     sessionTtl: 28800
