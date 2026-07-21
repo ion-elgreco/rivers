@@ -375,14 +375,16 @@ pub async fn callback(
     let email = claims
         .email()
         .filter(|_| claims.email_verified() == Some(true))
-        .map(|e| e.to_string());
+        .map(|e| e.to_string())
+        .filter(|e| !e.is_empty());
     let identity = Identity {
         subject: claims.subject().to_string(),
         email,
         name: claims
             .name()
             .and_then(|n| n.get(None))
-            .map(|n| n.to_string()),
+            .map(|n| n.to_string())
+            .filter(|n| !n.is_empty()),
         groups,
         expires_at: now_ts() + o.cfg.session_ttl_secs,
     };

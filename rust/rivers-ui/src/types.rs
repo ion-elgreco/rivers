@@ -12,12 +12,17 @@ pub(crate) fn partition_key_to_display(pk: rivers_core::storage::PartitionKey) -
 
 /// Human-readable label for an identity: `name`, else `email`, else
 /// `subject`. The single precedence rule every UI identity type shares.
+/// An empty string counts as absent, so a claim like `name:""` falls
+/// through instead of rendering blank.
 pub(crate) fn display_name<'a>(
     name: Option<&'a str>,
     email: Option<&'a str>,
     subject: &'a str,
 ) -> &'a str {
-    name.or(email).unwrap_or(subject)
+    let non_empty = |s: &&'a str| !s.is_empty();
+    name.filter(non_empty)
+        .or(email.filter(non_empty))
+        .unwrap_or(subject)
 }
 
 /// The signed-in user as exposed to the shell; `None` means auth mode
@@ -1477,6 +1482,13 @@ mod display_tests {
         assert_eq!(display_name(Some("Jane"), Some("e@x"), "sub"), "Jane");
         assert_eq!(display_name(None, Some("e@x"), "sub"), "e@x");
         assert_eq!(display_name(None, None, "sub"), "sub");
+
+        // An empty string is not a present value: fall through to the next
+        // source so an IdP returning name:"" (or a verified email:"") renders
+        // the real identity, not a blank chip/forbidden-page/audit label.
+        assert_eq!(display_name(Some(""), Some("e@x"), "sub"), "e@x");
+        assert_eq!(display_name(Some(""), Some(""), "sub"), "sub");
+        assert_eq!(display_name(None, Some(""), "sub"), "sub");
 
         let full = UserRef {
             subject: "sub".into(),
