@@ -104,6 +104,12 @@ impl AuthConfig {
     }
 
     fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        // One source of truth for "present and not just whitespace"; the value
+        // is returned untrimmed (callers trim where they parse).
+        fn nonempty(get: &dyn Fn(&str) -> Option<String>, key: &str) -> Option<String> {
+            get(key).filter(|v| !v.trim().is_empty())
+        }
+
         let allow = Allowlists {
             domains: csv(get("RIVERS_AUTH_ALLOWED_DOMAINS"))
                 .into_iter()
@@ -117,8 +123,7 @@ impl AuthConfig {
             None | Some("") | Some("none") => AuthMode::None,
             Some("oidc") => {
                 let require = |key: &str| {
-                    get(key)
-                        .filter(|v| !v.trim().is_empty())
+                    nonempty(get, key)
                         .with_context(|| format!("RIVERS_AUTH_MODE=oidc requires {key}"))
                 };
                 let public_url = require("RIVERS_AUTH_PUBLIC_URL")?
@@ -127,8 +132,7 @@ impl AuthConfig {
                 if !public_url.starts_with("http://") && !public_url.starts_with("https://") {
                     bail!("RIVERS_AUTH_PUBLIC_URL must be an http(s) URL, got {public_url:?}");
                 }
-                let cookie_secret = get("RIVERS_AUTH_COOKIE_SECRET")
-                    .filter(|v| !v.trim().is_empty())
+                let cookie_secret = nonempty(get, "RIVERS_AUTH_COOKIE_SECRET")
                     .map(|v| {
                         let bytes = base64::engine::general_purpose::STANDARD
                             .decode(v.trim())
@@ -142,8 +146,7 @@ impl AuthConfig {
                         Ok(bytes)
                     })
                     .transpose()?;
-                let session_ttl_secs = get("RIVERS_AUTH_SESSION_TTL")
-                    .filter(|v| !v.trim().is_empty())
+                let session_ttl_secs = nonempty(get, "RIVERS_AUTH_SESSION_TTL")
                     .map(|v| {
                         v.trim()
                             .parse::<i64>()
@@ -178,12 +181,10 @@ impl AuthConfig {
                 AuthMode::Oidc(OidcConfig {
                     issuer: require("RIVERS_AUTH_OIDC_ISSUER")?.trim_end_matches('/').to_string(),
                     client_id: require("RIVERS_AUTH_OIDC_CLIENT_ID")?,
-                    client_secret: get("RIVERS_AUTH_OIDC_CLIENT_SECRET")
-                        .filter(|v| !v.trim().is_empty()),
+                    client_secret: nonempty(get, "RIVERS_AUTH_OIDC_CLIENT_SECRET"),
                     public_url,
                     scopes,
-                    groups_claim: get("RIVERS_AUTH_OIDC_GROUPS_CLAIM")
-                        .filter(|v| !v.trim().is_empty())
+                    groups_claim: nonempty(get, "RIVERS_AUTH_OIDC_GROUPS_CLAIM")
                         .unwrap_or_else(|| "groups".into()),
                     rp_logout: flag(get("RIVERS_AUTH_OIDC_RP_LOGOUT")),
                     cookie_secret,
@@ -199,9 +200,7 @@ impl AuthConfig {
                     );
                 }
                 let header = |key: &str, default: &str| {
-                    get(key)
-                        .filter(|v| !v.trim().is_empty())
-                        .unwrap_or_else(|| default.to_string())
+                    nonempty(get, key).unwrap_or_else(|| default.to_string())
                 };
                 AuthMode::Forward(ForwardConfig {
                     trusted_proxies,
@@ -209,8 +208,7 @@ impl AuthConfig {
                     email_header: header("RIVERS_AUTH_FORWARD_EMAIL_HEADER", "Remote-Email"),
                     groups_header: header("RIVERS_AUTH_FORWARD_GROUPS_HEADER", "Remote-Groups"),
                     name_header: header("RIVERS_AUTH_FORWARD_NAME_HEADER", "Remote-Name"),
-                    logout_url: get("RIVERS_AUTH_FORWARD_LOGOUT_URL")
-                        .filter(|v| !v.trim().is_empty()),
+                    logout_url: nonempty(get, "RIVERS_AUTH_FORWARD_LOGOUT_URL"),
                 })
             }
             Some(other) => bail!(
