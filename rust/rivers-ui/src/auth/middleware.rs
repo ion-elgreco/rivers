@@ -14,7 +14,11 @@ use super::session::read_session;
 use super::{AuthRuntime, RuntimeKind};
 
 fn is_public(path: &str) -> bool {
-    path == "/healthz" || path == "/readyz" || path.starts_with(crate::routes::AUTH_PREFIX)
+    path == "/healthz"
+        || path == "/readyz"
+        || path == crate::routes::LOGIN
+        || path == crate::routes::CALLBACK
+        || path == crate::routes::LOGOUT
 }
 
 #[cfg(test)]
@@ -33,6 +37,11 @@ mod tests {
         assert!(is_public("/readyz"));
         assert!(!is_public("/"));
         assert!(!is_public("/api/events"));
+        // Only the three real handlers are public — not the whole `/auth/`
+        // namespace. An unmatched `/auth/*` path must still hit the gate so a
+        // future catch-all SSR fallback can't leak through it.
+        assert!(!is_public("/auth/foobar"));
+        assert!(!is_public("/auth/"));
     }
 }
 

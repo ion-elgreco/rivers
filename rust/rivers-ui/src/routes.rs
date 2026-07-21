@@ -6,5 +6,3 @@
 pub const LOGIN: &str = "/auth/login";
 pub const CALLBACK: &str = "/auth/callback";
 pub const LOGOUT: &str = "/auth/logout";
-/// Prefix marking every auth route public in the request gate.
-pub const AUTH_PREFIX: &str = "/auth/";
