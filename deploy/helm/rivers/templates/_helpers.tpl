@@ -76,8 +76,8 @@ true
 
 {{/*
 Resolve a Secret value: inline override wins; otherwise re-read the
-existing Secret (`lookup`) so passwords don't rotate underneath running
-pods on upgrade; otherwise generate fresh `randAlphaNum 32`.
+existing Secret (`lookup`) so values don't rotate underneath running pods on
+upgrade; otherwise fall back to the caller-supplied `generate` value.
 
 The result is **memoized on `.Values`** by `cacheKey` — multiple includes
 within one render must agree (e.g. `rivers-surrealdb-auth` and
@@ -86,9 +86,11 @@ memoization each `randAlphaNum` call would diverge, leaving the auth
 Secret and the user-init Job's SurrealQL with different passwords on
 first install.
 
-Args (dict): `ctx` (root context), `secret`, `key`, `override`, `cacheKey`.
+Args (dict): `ctx` (root context), `secret`, `key`, `cacheKey`, `generate`
+(fallback value when neither an override nor an existing Secret is found),
+and optional `override`.
 */}}
-{{- define "rivers.surrealLookupOrGenerate" -}}
+{{- define "rivers.lookupOrGenerate" -}}
 {{- $cache := index .ctx.Values "__riversCachedPasswords" | default dict -}}
 {{- if not (hasKey $cache .cacheKey) -}}
 {{-   $val := "" -}}
@@ -99,7 +101,7 @@ Args (dict): `ctx` (root context), `secret`, `key`, `override`, `cacheKey`.
 {{-     if and $existing $existing.data (index $existing.data .key) -}}
 {{-       $val = (index $existing.data .key | b64dec) -}}
 {{-     else -}}
-{{-       $val = randAlphaNum 32 -}}
+{{-       $val = .generate -}}
 {{-     end -}}
 {{-   end -}}
 {{-   $_ := set $cache .cacheKey $val -}}
@@ -109,7 +111,7 @@ Args (dict): `ctx` (root context), `secret`, `key`, `override`, `cacheKey`.
 {{- end -}}
 
 {{- define "rivers.surrealBootstrapPassword" -}}
-{{- include "rivers.surrealLookupOrGenerate" (dict "ctx" . "cacheKey" "bootstrap" "secret" (include "rivers.surrealBootstrapSecretName" .) "key" "password" "override" .Values.surrealdb.auth.bootstrap.password) -}}
+{{- include "rivers.lookupOrGenerate" (dict "ctx" . "cacheKey" "bootstrap" "secret" (include "rivers.surrealBootstrapSecretName" .) "key" "password" "generate" (randAlphaNum 32) "override" .Values.surrealdb.auth.bootstrap.password) -}}
 {{- end -}}
 
 {{- define "rivers.surrealRiversUsername" -}}
@@ -117,7 +119,7 @@ Args (dict): `ctx` (root context), `secret`, `key`, `override`, `cacheKey`.
 {{- end -}}
 
 {{- define "rivers.surrealRiversPassword" -}}
-{{- include "rivers.surrealLookupOrGenerate" (dict "ctx" . "cacheKey" "rivers" "secret" (include "rivers.surrealAuthSecretName" .) "key" .Values.surrealdb.auth.secretKeys.password "override" .Values.surrealdb.auth.password) -}}
+{{- include "rivers.lookupOrGenerate" (dict "ctx" . "cacheKey" "rivers" "secret" (include "rivers.surrealAuthSecretName" .) "key" .Values.surrealdb.auth.secretKeys.password "generate" (randAlphaNum 32) "override" .Values.surrealdb.auth.password) -}}
 {{- end -}}
 
 {{/*
@@ -194,23 +196,12 @@ rivers-ui-auth
 
 {{/*
 Session-cookie key value: base64 of 48 random bytes (the binary expects
-base64 of >= 32). Preserved across upgrades via `lookup`, same pattern as
-the SurrealDB secrets.
+base64 of >= 32). Preserved across upgrades via the shared
+`rivers.lookupOrGenerate` (the same lookup/memoize path as the SurrealDB
+secrets), differing only in the generator.
 */}}
 {{- define "rivers.uiAuthCookieSecretValue" -}}
-{{- $cache := index .Values "__riversCachedPasswords" | default dict -}}
-{{- if not (hasKey $cache "uiCookie") -}}
-{{-   $val := "" -}}
-{{-   $existing := lookup "v1" "Secret" (include "rivers.namespace" .) (include "rivers.uiAuthCookieSecretName" .) -}}
-{{-   if and $existing $existing.data (index $existing.data .Values.ui.auth.cookieSecret.secretKey) -}}
-{{-     $val = (index $existing.data .Values.ui.auth.cookieSecret.secretKey | b64dec) -}}
-{{-   else -}}
-{{-     $val = (randAlphaNum 48 | b64enc) -}}
-{{-   end -}}
-{{-   $_ := set $cache "uiCookie" $val -}}
-{{-   $_ := set .Values "__riversCachedPasswords" $cache -}}
-{{- end -}}
-{{- index $cache "uiCookie" -}}
+{{- include "rivers.lookupOrGenerate" (dict "ctx" . "cacheKey" "uiCookie" "secret" (include "rivers.uiAuthCookieSecretName" .) "key" .Values.ui.auth.cookieSecret.secretKey "generate" (randAlphaNum 48 | b64enc)) -}}
 {{- end -}}
 
 {{/*
