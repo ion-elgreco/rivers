@@ -829,7 +829,9 @@ async fn oidc_callback_rejects_state_mismatch() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    // A forged/mismatched state is a client-side error → 4xx, not a 502
+    // (a 5xx would trip ingress interception and false backend-outage alerts).
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -840,7 +842,8 @@ async fn oidc_callback_without_state_cookie_fails() {
 
     let (callback, _) = drive_login(&app, &idp).await;
     let resp = app.clone().oneshot(req(&callback, None, &[])).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    // Missing pending-login cookie is a client/session error → 4xx, not 502.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

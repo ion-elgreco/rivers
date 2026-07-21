@@ -305,18 +305,16 @@ pub async fn callback(
     Query(q): Query<CallbackQuery>,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    use axum::http::StatusCode;
     let o = &st.oidc;
     // Clear only the in-flight state cookie — never the session. A failed or
     // forged callback must not be able to log out an already-signed-in user.
-    let fail = |detail: String| {
+    // Client/session-side failures are 4xx; only a real IdP round-trip failure
+    // is a 502 (a 5xx elsewhere trips ingress interception + false alerts).
+    let fail = |status: StatusCode, detail: String| {
         (
             clear_state_cookie(o.cfg.secure_cookies()),
-            error_page(
-                axum::http::StatusCode::BAD_GATEWAY,
-                "Sign-in failed",
-                &detail,
-                Some(crate::routes::LOGIN),
-            ),
+            error_page(status, "Sign-in failed", &detail, Some(crate::routes::LOGIN)),
         )
             .into_response()
     };
@@ -326,29 +324,43 @@ pub async fn callback(
             Some(d) => format!("{err}: {d}"),
             None => err.clone(),
         };
-        return fail(format!("the identity provider returned an error — {detail}"));
+        return fail(
+            StatusCode::BAD_REQUEST,
+            format!("the identity provider returned an error — {detail}"),
+        );
     }
     let Some(pending) = read_pending_login(&headers, &o.cookie_key, o.cfg.secure_cookies()) else {
-        return fail("login session missing or expired".to_string());
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "login session missing or expired".to_string(),
+        );
     };
     if q.state.as_deref() != Some(pending.state.as_str()) {
-        return fail("state parameter mismatch".to_string());
+        return fail(StatusCode::BAD_REQUEST, "state parameter mismatch".to_string());
     }
     let Some(code) = q.code else {
-        return fail("missing authorization code".to_string());
+        return fail(StatusCode::BAD_REQUEST, "missing authorization code".to_string());
     };
 
     let client = o.client();
     let exchange = match client.exchange_code(AuthorizationCode::new(code)) {
         Ok(req) => req.set_pkce_verifier(PkceCodeVerifier::new(pending.pkce_verifier.clone())),
-        Err(e) => return fail(format!("token endpoint not configured: {e}")),
+        Err(e) => {
+            return fail(
+                StatusCode::BAD_GATEWAY,
+                format!("token endpoint not configured: {e}"),
+            );
+        }
     };
     let token = match exchange.request_async(&o.http).await {
         Ok(token) => token,
-        Err(e) => return fail(format!("code exchange failed: {e}")),
+        Err(e) => return fail(StatusCode::BAD_GATEWAY, format!("code exchange failed: {e}")),
     };
     let Some(id_token) = token.id_token() else {
-        return fail("token response contained no ID token".to_string());
+        return fail(
+            StatusCode::BAD_GATEWAY,
+            "token response contained no ID token".to_string(),
+        );
     };
     let nonce = Nonce::new(pending.nonce.clone());
     let claims = match id_token.claims(&client.id_token_verifier(), &nonce) {
@@ -359,10 +371,17 @@ pub async fn callback(
             let client = o.client();
             match id_token.claims(&client.id_token_verifier(), &nonce) {
                 Ok(claims) => claims,
-                Err(e) => return fail(format!("ID token validation failed: {e}")),
+                Err(e) => {
+                    return fail(StatusCode::BAD_GATEWAY, format!("ID token validation failed: {e}"));
+                }
             }
         }
-        Err(first_err) => return fail(format!("ID token validation failed: {first_err}")),
+        Err(first_err) => {
+            return fail(
+                StatusCode::BAD_GATEWAY,
+                format!("ID token validation failed: {first_err}"),
+            );
+        }
     };
 
     // Persist only allowlist-relevant groups: a large IdP groups claim would
