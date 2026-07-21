@@ -220,10 +220,22 @@ mod server {
                 "/api/events",
                 get({
                     let sse_shutdown = shutdown.clone();
-                    move |query: Query<crate::live::EventsQuery>| {
+                    move |id: Option<axum::Extension<crate::auth::Identity>>,
+                          query: Query<crate::live::EventsQuery>| {
                         let tx = live_tx.clone();
                         let shutdown = sse_shutdown.clone();
-                        async move { events_sse(tx, shutdown, query).await }
+                        async move {
+                            // Cap the stream at the session's remaining life so
+                            // the client reconnects through the auth gate before
+                            // it expires. Absent in mode `none` (no identity).
+                            let max_age = id.map(|axum::Extension(i)| {
+                                crate::live::session_max_age(
+                                    i.expires_at,
+                                    crate::auth::session::now_ts(),
+                                )
+                            });
+                            events_sse(tx, shutdown, max_age, query).await
+                        }
                     }
                 }),
             )

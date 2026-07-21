@@ -368,24 +368,31 @@ fn event_stream(
     rx: broadcast::Receiver<&'static str>,
     wanted: Vec<(&'static str, &'static str)>,
     shutdown: CancellationToken,
+    deadline: Option<tokio::time::Instant>,
 ) -> impl futures_core::Stream<Item = &'static str> {
     use tokio::sync::broadcast::error::RecvError;
     // `pending` holds pre-computed event names ready to emit. On `Lagged` we
     // fill it with every wanted event name so each client listener fires
     // once; on a normal match we queue just the matched one.
     futures_util::stream::unfold(
-        (rx, wanted, Vec::<&'static str>::new(), shutdown),
-        |(mut rx, wanted, mut pending, shutdown)| async move {
+        (rx, wanted, Vec::<&'static str>::new(), shutdown, deadline),
+        |(mut rx, wanted, mut pending, shutdown, deadline)| async move {
             loop {
                 if shutdown.is_cancelled() {
                     return None;
                 }
                 if let Some(event_name) = pending.pop() {
-                    return Some((event_name, (rx, wanted, pending, shutdown)));
+                    return Some((event_name, (rx, wanted, pending, shutdown, deadline)));
                 }
                 let recv = tokio::select! {
                     result = rx.recv() => result,
                     _ = shutdown.cancelled() => return None,
+                    _ = async {
+                        match deadline {
+                            Some(d) => tokio::time::sleep_until(d).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => return None,
                 };
                 match recv {
                     Ok(channel) => {
@@ -416,15 +423,33 @@ fn event_stream(
 pub(crate) async fn events_sse(
     tx: broadcast::Sender<&'static str>,
     shutdown: CancellationToken,
+    max_age: Option<std::time::Duration>,
     query: Query<EventsQuery>,
 ) -> impl IntoResponse {
     use futures_util::StreamExt;
     let wanted = resolve_wanted(&query.channels);
     let rx = tx.subscribe();
-    let stream = event_stream(rx, wanted, shutdown).map(|event_name| {
+    // Bound the stream so the client reconnects (and re-runs the auth
+    // middleware) before its session would expire — an open stream is never
+    // otherwise re-validated.
+    let deadline = max_age.map(|d| tokio::time::Instant::now() + d);
+    let stream = event_stream(rx, wanted, shutdown, deadline).map(|event_name| {
         Ok::<_, std::convert::Infallible>(Event::default().event(event_name).data("1"))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Longest an SSE stream stays open before it must reconnect and
+/// re-authenticate, in seconds.
+const MAX_SSE_STREAM_SECS: i64 = 3600;
+
+/// How long an SSE stream opened at `now` may run: the lesser of the session's
+/// remaining lifetime (`expires_at`) and [`MAX_SSE_STREAM_SECS`] — the cap
+/// bounds forward-mode streams whose identity never expires. Zero once the
+/// session is already past `expires_at`, ending the stream immediately.
+pub(crate) fn session_max_age(expires_at: i64, now: i64) -> std::time::Duration {
+    let deadline = expires_at.min(now.saturating_add(MAX_SSE_STREAM_SECS));
+    std::time::Duration::from_secs(deadline.saturating_sub(now).max(0) as u64)
 }
 
 #[cfg(test)]
@@ -469,6 +494,25 @@ mod tests {
         assert!(resolve_wanted("").is_empty());
     }
 
+    #[test]
+    fn session_max_age_caps_and_floors() {
+        let now = 1_000_000;
+        // OIDC session with 10 min left, under the hard cap.
+        assert_eq!(session_max_age(now + 600, now), Duration::from_secs(600));
+        // Forward mode (expires_at = i64::MAX) collapses to the hard cap.
+        assert_eq!(
+            session_max_age(i64::MAX, now),
+            Duration::from_secs(MAX_SSE_STREAM_SECS as u64)
+        );
+        // A session longer than the cap is still capped.
+        assert_eq!(
+            session_max_age(now + 100_000, now),
+            Duration::from_secs(MAX_SSE_STREAM_SECS as u64)
+        );
+        // Already past expiry ⇒ zero, so the stream ends immediately.
+        assert_eq!(session_max_age(now - 5, now), Duration::from_secs(0));
+    }
+
     /// End-to-end through the real `event_stream`: broadcast ticks the
     /// client cares about arrive; ticks for other channels are filtered out;
     /// the event name is the pre-computed `{channel}-changed` string, not
@@ -478,7 +522,7 @@ mod tests {
         let (tx, _) = broadcast::channel::<&'static str>(16);
         let rx = tx.subscribe();
         let wanted = resolve_wanted("runs,lineage");
-        let mut stream = Box::pin(event_stream(rx, wanted, CancellationToken::new()));
+        let mut stream = Box::pin(event_stream(rx, wanted, CancellationToken::new(), None));
 
         // "assets" isn't in `wanted`; "runs" and "lineage" are.
         tx.send("assets").unwrap();
@@ -498,7 +542,7 @@ mod tests {
         let (tx, _) = broadcast::channel::<&'static str>(2);
         let rx = tx.subscribe();
         let wanted = resolve_wanted("runs,assets,lineage");
-        let mut stream = Box::pin(event_stream(rx, wanted, CancellationToken::new()));
+        let mut stream = Box::pin(event_stream(rx, wanted, CancellationToken::new(), None));
 
         // Overflow the 2-slot buffer before the stream polls — this forces
         // the next recv() to surface `Lagged`.
@@ -522,7 +566,7 @@ mod tests {
     async fn event_stream_empty_wanted_never_yields() {
         let (tx, _) = broadcast::channel::<&'static str>(16);
         let rx = tx.subscribe();
-        let mut stream = Box::pin(event_stream(rx, Vec::new(), CancellationToken::new()));
+        let mut stream = Box::pin(event_stream(rx, Vec::new(), CancellationToken::new(), None));
 
         tx.send("runs").unwrap();
         tx.send("assets").unwrap();
@@ -542,7 +586,7 @@ mod tests {
         let (tx, _) = broadcast::channel::<&'static str>(8);
         let rx = tx.subscribe();
         let wanted = resolve_wanted("runs");
-        let mut stream = Box::pin(event_stream(rx, wanted, CancellationToken::new()));
+        let mut stream = Box::pin(event_stream(rx, wanted, CancellationToken::new(), None));
 
         drop(tx);
 
@@ -565,7 +609,7 @@ mod tests {
         let rx = tx.subscribe();
         let wanted = resolve_wanted("runs");
         let shutdown = CancellationToken::new();
-        let mut stream = Box::pin(event_stream(rx, wanted, shutdown.clone()));
+        let mut stream = Box::pin(event_stream(rx, wanted, shutdown.clone(), None));
 
         // Sender is still alive; the only thing that should end the
         // stream is cancellation.
@@ -576,6 +620,31 @@ mod tests {
             got.expect("stream should terminate, not hang on shutdown"),
             None,
             "stream must yield None once shutdown is cancelled, even with a live sender"
+        );
+    }
+
+    /// An SSE stream must end once its max-age deadline elapses — even while
+    /// the broadcast sender is alive and no shutdown fired — so the client's
+    /// EventSource reconnects through the auth middleware. Without the deadline
+    /// an established stream is never re-authenticated after session expiry.
+    #[tokio::test]
+    async fn event_stream_ends_at_deadline() {
+        let (tx, _rx_keep) = broadcast::channel::<&'static str>(16);
+        let rx = tx.subscribe();
+        let wanted = resolve_wanted("runs");
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let mut stream = Box::pin(event_stream(
+            rx,
+            wanted,
+            CancellationToken::new(),
+            Some(deadline),
+        ));
+
+        let got = timeout(Duration::from_millis(500), stream.next()).await;
+        assert_eq!(
+            got.expect("stream should terminate at its deadline, not hang"),
+            None,
+            "stream must end once the max-age deadline elapses, even with a live sender"
         );
     }
 
@@ -607,7 +676,7 @@ mod tests {
                 move |query: axum::extract::Query<EventsQuery>| {
                     let tx = tx.clone();
                     let shutdown = sse_shutdown.clone();
-                    async move { events_sse(tx, shutdown, query).await }
+                    async move { events_sse(tx, shutdown, None, query).await }
                 }
             }),
         );
@@ -735,7 +804,7 @@ mod tests {
                 move |query: axum::extract::Query<EventsQuery>| {
                     let tx = tx.clone();
                     let shutdown = sse_shutdown.clone();
-                    async move { events_sse(tx, shutdown, query).await }
+                    async move { events_sse(tx, shutdown, None, query).await }
                 }
             }),
         );
@@ -1118,7 +1187,7 @@ mod tests {
                 move |query: axum::extract::Query<EventsQuery>| {
                     let tx = tx.clone();
                     let shutdown = sse_shutdown.clone();
-                    async move { events_sse(tx, shutdown, query).await }
+                    async move { events_sse(tx, shutdown, None, query).await }
                 }
             }),
         );
@@ -1229,7 +1298,7 @@ mod tests {
                 move |query: axum::extract::Query<EventsQuery>| {
                     let tx = tx.clone();
                     let shutdown = sse_shutdown.clone();
-                    async move { events_sse(tx, shutdown, query).await }
+                    async move { events_sse(tx, shutdown, None, query).await }
                 }
             }),
         );
