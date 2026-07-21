@@ -637,6 +637,26 @@ pub fn is_unauthorized(err: &ServerFnError) -> bool {
     matches!(err, ServerFnError::ServerError(msg) if msg == UNAUTHORIZED_MARKER)
 }
 
+/// Sub-line under a run row's launched-by label. For a manual run both the
+/// acting user *and* the job name are shown together (`job · user`), so an
+/// authenticated job launch reveals who triggered it — passing only the job
+/// name would hide the user. `None` lets `LaunchedByCell` fall back to its own
+/// default sub-line (schedule/sensor/backfill name).
+pub fn launched_by_sub_line(l: &LaunchedBy, job_name: Option<&str>) -> Option<String> {
+    match l {
+        LaunchedBy::Manual { user } => {
+            let user = user.as_ref().map(|u| u.display().to_string());
+            match (job_name, user) {
+                (Some(job), Some(user)) => Some(format!("{job} · {user}")),
+                (Some(job), None) => Some(job.to_string()),
+                (None, Some(user)) => Some(user),
+                (None, None) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Display metadata for a `LaunchedBy` origin: `(glyph, color, label, default_sub_line)`.
 /// Shared by `LaunchedByCell` and the run-detail header so the glyph/label set
 /// stays in one place.
@@ -665,6 +685,36 @@ pub fn launched_by_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launched_by_sub_line_manual_shows_job_and_user() {
+        use crate::types::{LaunchedBy, UserRef};
+        let user = Some(UserRef {
+            subject: "sub-1".into(),
+            email: None,
+            name: Some("Ada".into()),
+        });
+        // Authenticated job launch: both job and user, not just the job.
+        assert_eq!(
+            launched_by_sub_line(&LaunchedBy::Manual { user: user.clone() }, Some("nightly")),
+            Some("nightly · Ada".to_string())
+        );
+        // Auth disabled: job only.
+        assert_eq!(
+            launched_by_sub_line(&LaunchedBy::Manual { user: None }, Some("nightly")),
+            Some("nightly".to_string())
+        );
+        // Asset materialization by a user: user only.
+        assert_eq!(
+            launched_by_sub_line(&LaunchedBy::Manual { user }, None),
+            Some("Ada".to_string())
+        );
+        // Non-manual origins fall back to the cell's own sub-line.
+        assert_eq!(
+            launched_by_sub_line(&LaunchedBy::Schedule { name: "s".into() }, Some("j")),
+            None
+        );
+    }
 
     #[test]
     fn test_format_timestamp_some() {
