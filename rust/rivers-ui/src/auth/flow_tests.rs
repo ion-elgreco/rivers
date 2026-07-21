@@ -400,6 +400,37 @@ async fn oidc_full_flow() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// A hung IdP (TCP accepted, no HTTP response) must fail discovery instead
+/// of blocking forever: `initialize` runs before the UI binds its listener,
+/// so an unbounded request hangs the process with `/healthz` never served.
+#[tokio::test]
+async fn oidc_initialize_times_out_against_hung_idp() {
+    // Bound but never accepted — connections sit in the backlog with no
+    // response bytes, which only an HTTP-client timeout escapes.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+
+    let init = AuthRuntime::initialize(AuthConfig {
+        mode: AuthMode::Oidc(OidcConfig {
+            issuer,
+            client_id: "rivers".into(),
+            client_secret: None,
+            public_url: "http://ui.test".into(),
+            scopes: vec!["openid".into()],
+            groups_claim: "groups".into(),
+            rp_logout: false,
+            cookie_secret: None,
+            session_ttl_secs: 3600,
+        }),
+        allow: Allowlists::default(),
+    });
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), init)
+        .await
+        .expect("initialize must fail fast on a hung IdP, not block startup");
+    assert!(result.is_err(), "hung discovery must surface an error");
+    drop(listener);
+}
+
 /// IdPs rotate signing keys routinely. The verifying client snapshots the
 /// JWKS at startup; without an on-miss refresh, every login fails once the
 /// key rotates and only a process restart recovers. A token signed by a

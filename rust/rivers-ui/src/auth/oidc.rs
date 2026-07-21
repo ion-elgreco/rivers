@@ -82,6 +82,14 @@ pub struct OidcRuntime {
 /// Minimum spacing between on-miss JWKS refreshes.
 const KEY_REFRESH_COOLDOWN_SECS: i64 = 300;
 
+/// Bounds every IdP round-trip (discovery, JWKS, code exchange). Discovery
+/// runs before the UI binds its listener, so an unbounded request against a
+/// hung IdP would stall startup with `/healthz` never served.
+#[cfg(not(test))]
+const IDP_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+#[cfg(test)]
+const IDP_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl std::fmt::Debug for OidcRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OidcRuntime")
@@ -122,6 +130,7 @@ impl OidcRuntime {
         let http = reqwest::ClientBuilder::new()
             // Never follow IdP redirects (SSRF).
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(IDP_HTTP_TIMEOUT)
             .build()
             .context("failed to build OIDC http client")?;
         let (client, end_session_endpoint) = discover_client(&cfg, &http).await?;
