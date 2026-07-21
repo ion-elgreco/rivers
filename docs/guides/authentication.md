@@ -79,9 +79,19 @@ ui:
   auth:
     mode: forward
     forward:
-      trustedProxies: ["10.42.0.0/16"]   # your ingress/proxy pod CIDR
+      # The proxy pods' addresses ONLY — as narrow as you can make it.
+      trustedProxies: ["10.42.3.14/32"]
       logoutUrl: https://auth.example.com/logout
 ```
+
+!!! danger "Never trust the whole pod network"
+    On most clusters all pods share one CIDR (k3s defaults to
+    `10.42.0.0/16`) — listing it would let **every pod in the cluster**
+    forge identity headers and impersonate any user. Scope the list to the
+    proxy's actual addresses: its static egress IPs, a dedicated node pool's
+    range, or `/32`s kept current by your deploy tooling. If the proxy's IPs
+    aren't pinnable, add a NetworkPolicy that only admits UI traffic from
+    the proxy pods and treat `trustedProxies` as defense in depth.
 
 Header names default to the Authelia/Authentik convention and are all
 configurable:
@@ -135,7 +145,7 @@ ui:
   auth:
     mode: forward
     forward:
-      trustedProxies: ["10.42.0.0/16"]   # Envoy proxy pods
+      trustedProxies: ["10.42.7.5/32"]   # the Envoy proxy pods only — never the pod CIDR
       userHeader: x-user
       emailHeader: x-user-email
       nameHeader: x-user-name
@@ -158,9 +168,10 @@ the auth service's response headers onto the request:
 - ingress-nginx: `nginx.ingress.kubernetes.io/auth-url` +
   `auth-response-headers: Remote-User,Remote-Email,Remote-Groups,Remote-Name`.
 
-Then set `trustedProxies` to the controller's pod CIDR. If the UI Service
-is reachable without traversing the proxy, forward mode is an auth bypass —
-pair it with a NetworkPolicy.
+Then set `trustedProxies` to the controller pods' addresses (see the warning
+above — not the cluster pod CIDR). If the UI Service is reachable without
+traversing the proxy, forward mode is an auth bypass — pair it with a
+NetworkPolicy.
 
 ## Access control
 
