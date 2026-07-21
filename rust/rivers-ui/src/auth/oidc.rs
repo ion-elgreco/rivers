@@ -181,7 +181,9 @@ impl OidcRuntime {
     }
 
     /// Re-run discovery to pick up rotated IdP signing keys, then swap the
-    /// verifying client. Returns whether the keys were actually refreshed.
+    /// verifying client. Returns whether a retry against the live client is
+    /// worthwhile: `true` if this call refreshed the keys or a concurrent/recent
+    /// refresh already rotated them, `false` only if discovery was tried and failed.
     ///
     /// - Only one refresh runs at a time (`refresh_gate`), so concurrent
     ///   verification failures don't stampede the IdP.
