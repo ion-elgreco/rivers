@@ -136,7 +136,7 @@ fn CurrentUserChip(collapsed: Signal<bool>) -> impl IntoView {
         // navigations instead of blinking to the empty fallback each time.
         <Transition fallback=|| ()>
             {move || user.get().and_then(|res| res.ok().flatten()).map(|u| {
-                let title = u.email.clone().unwrap_or_else(|| u.subject.clone());
+                let title = u.user.email.clone().unwrap_or_else(|| u.user.subject.clone());
                 let display = u.display().to_string();
                 view! {
                     <div class="user-chip" title=title>

@@ -2,7 +2,7 @@
 
 use leptos::prelude::*;
 
-use crate::types::CurrentUser;
+use crate::types::{CurrentUser, UserRef};
 
 /// `None` when auth mode is `none`; otherwise the middleware has already
 /// inserted the identity extension.
@@ -19,9 +19,11 @@ pub async fn get_current_user() -> Result<Option<CurrentUser>, ServerFnError> {
         .ok()
         .map(|axum::Extension(id)| id);
     Ok(identity.map(|id| CurrentUser {
-        subject: id.subject,
-        email: id.email,
-        name: id.name,
+        user: UserRef {
+            subject: id.subject,
+            email: id.email,
+            name: id.name,
+        },
         logout_url: rt.logout_url(),
     }))
 }

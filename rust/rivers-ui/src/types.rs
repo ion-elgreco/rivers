@@ -10,13 +10,21 @@ pub(crate) fn partition_key_to_display(pk: rivers_core::storage::PartitionKey) -
     pk.to_display()
 }
 
+/// Human-readable label for an identity: `name`, else `email`, else
+/// `subject`. The single precedence rule every UI identity type shares.
+pub(crate) fn display_name<'a>(
+    name: Option<&'a str>,
+    email: Option<&'a str>,
+    subject: &'a str,
+) -> &'a str {
+    name.or(email).unwrap_or(subject)
+}
+
 /// The signed-in user as exposed to the shell; `None` means auth mode
 /// `none`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CurrentUser {
-    pub subject: String,
-    pub email: Option<String>,
-    pub name: Option<String>,
+    pub user: UserRef,
     /// Where the sign-out control points; `None` hides it (forward mode
     /// without a configured proxy logout URL).
     pub logout_url: Option<String>,
@@ -24,10 +32,7 @@ pub struct CurrentUser {
 
 impl CurrentUser {
     pub fn display(&self) -> &str {
-        self.name
-            .as_deref()
-            .or(self.email.as_deref())
-            .unwrap_or(&self.subject)
+        self.user.display()
     }
 }
 
@@ -114,10 +119,7 @@ pub struct UserRef {
 
 impl UserRef {
     pub fn display(&self) -> &str {
-        self.name
-            .as_deref()
-            .or(self.email.as_deref())
-            .unwrap_or(&self.subject)
+        display_name(self.name.as_deref(), self.email.as_deref(), &self.subject)
     }
 }
 
@@ -1461,6 +1463,40 @@ mod conversions {
             let core: rivers_core::storage::BackfillFilter = ui.into();
             assert!(core.status.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::{CurrentUser, UserRef, display_name};
+
+    /// All UI identity types share one precedence: name → email → subject.
+    /// Guards against the copies silently diverging.
+    #[test]
+    fn display_precedence_is_shared() {
+        assert_eq!(display_name(Some("Jane"), Some("e@x"), "sub"), "Jane");
+        assert_eq!(display_name(None, Some("e@x"), "sub"), "e@x");
+        assert_eq!(display_name(None, None, "sub"), "sub");
+
+        let full = UserRef {
+            subject: "sub".into(),
+            email: Some("e@x".into()),
+            name: Some("Jane".into()),
+        };
+        assert_eq!(full.display(), "Jane");
+        let cu = CurrentUser {
+            user: full.clone(),
+            logout_url: None,
+        };
+        // CurrentUser delegates to its nested UserRef.
+        assert_eq!(cu.display(), full.display());
+
+        let subject_only = UserRef {
+            subject: "sub".into(),
+            email: None,
+            name: None,
+        };
+        assert_eq!(subject_only.display(), "sub");
     }
 }
 

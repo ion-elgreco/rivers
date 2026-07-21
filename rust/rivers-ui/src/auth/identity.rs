@@ -18,10 +18,7 @@ pub struct Identity {
 
 impl Identity {
     pub fn display(&self) -> &str {
-        self.name
-            .as_deref()
-            .or(self.email.as_deref())
-            .unwrap_or(&self.subject)
+        crate::types::display_name(self.name.as_deref(), self.email.as_deref(), &self.subject)
     }
 }
 
