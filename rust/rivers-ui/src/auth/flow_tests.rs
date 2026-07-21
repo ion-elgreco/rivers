@@ -917,6 +917,31 @@ async fn oidc_verified_email_satisfies_domain_allowlist() {
     assert_eq!(resp.status(), StatusCode::SEE_OTHER, "verified email admits");
 }
 
+/// A verified email with surrounding whitespace still satisfies the domain
+/// allowlist: the OIDC claim trim normalizes it before the domain split.
+/// Without the trim the domain carries the trailing space and is denied.
+#[tokio::test]
+async fn oidc_padded_verified_email_is_trimmed_then_admitted() {
+    let idp = spawn_mock_idp("sub-42", "  john.doe@example.com  ").await;
+    let allow = Allowlists {
+        domains: vec!["example.com".into()],
+        ..Default::default()
+    };
+    let rt = oidc_rt(&idp, allow).await;
+    let app = app(Some(rt));
+
+    let (callback, store) = drive_login(&app, &idp).await;
+    let resp = app
+        .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "a padded verified email must be trimmed, then admitted"
+    );
+}
+
 #[tokio::test]
 async fn oidc_groups_reach_allowlists() {
     let idp = spawn_mock_idp("sub-42", "john.doe@example.com").await;
