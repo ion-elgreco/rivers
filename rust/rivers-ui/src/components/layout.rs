@@ -126,7 +126,7 @@ fn CurrentUserChip(collapsed: Signal<bool>) -> impl IntoView {
                 let path = loc.pathname().unwrap_or_else(|_| "/".into());
                 let query = loc.search().unwrap_or_default();
                 let rd = encode_rd(&format!("{path}{query}"));
-                let _ = loc.assign(&format!("/auth/login?rd={rd}"));
+                let _ = loc.assign(&format!("{}?rd={rd}", crate::routes::LOGIN));
             }
         }
     });

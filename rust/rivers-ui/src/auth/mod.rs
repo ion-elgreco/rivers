@@ -61,7 +61,7 @@ impl AuthRuntime {
     /// Where the UI's sign-out control should point, if anywhere.
     pub fn logout_url(&self) -> Option<String> {
         match &self.kind {
-            RuntimeKind::Oidc(_) => Some("/auth/logout".to_string()),
+            RuntimeKind::Oidc(_) => Some(crate::routes::LOGOUT.to_string()),
             RuntimeKind::Forward(f) => f.cfg.logout_url.clone(),
         }
     }
@@ -73,9 +73,9 @@ pub struct AuthCtx(pub Option<Arc<AuthRuntime>>);
 
 fn auth_routes(rt: Arc<AuthRuntime>) -> Router {
     Router::new()
-        .route("/auth/login", get(oidc::login))
-        .route("/auth/callback", get(oidc::callback))
-        .route("/auth/logout", get(oidc::logout))
+        .route(crate::routes::LOGIN, get(oidc::login))
+        .route(crate::routes::CALLBACK, get(oidc::callback))
+        .route(crate::routes::LOGOUT, get(oidc::logout))
         .with_state(rt)
 }
 

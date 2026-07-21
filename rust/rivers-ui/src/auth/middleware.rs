@@ -14,7 +14,26 @@ use super::session::read_session;
 use super::{AuthRuntime, RuntimeKind};
 
 fn is_public(path: &str) -> bool {
-    path == "/healthz" || path == "/readyz" || path.starts_with("/auth/")
+    path == "/healthz" || path == "/readyz" || path.starts_with(crate::routes::AUTH_PREFIX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_public;
+    use crate::routes;
+
+    /// The gate must treat every auth route as public — otherwise the login
+    /// flow itself would require a session. Ties the route consts to `is_public`.
+    #[test]
+    fn auth_routes_are_public() {
+        assert!(is_public(routes::LOGIN));
+        assert!(is_public(routes::CALLBACK));
+        assert!(is_public(routes::LOGOUT));
+        assert!(is_public("/healthz"));
+        assert!(is_public("/readyz"));
+        assert!(!is_public("/"));
+        assert!(!is_public("/api/events"));
+    }
 }
 
 fn wants_html(headers: &axum::http::HeaderMap) -> bool {
@@ -36,7 +55,7 @@ pub async fn require_auth(
         RuntimeKind::Oidc(o) => {
             if let Some(identity) = read_session(req.headers(), &o.cookie_key, o.cfg.secure_cookies()) {
                 if !rt.allow.permits(&identity) {
-                    return forbidden_page(&identity, Some("/auth/logout"));
+                    return forbidden_page(&identity, Some(crate::routes::LOGOUT));
                 }
                 req.extensions_mut().insert(identity);
                 return next.run(req).await;
@@ -52,7 +71,8 @@ pub async fn require_auth(
                     .map(|pq| pq.as_str())
                     .unwrap_or("/");
                 let login = format!(
-                    "/auth/login?rd={}",
+                    "{}?rd={}",
+                    crate::routes::LOGIN,
                     utf8_percent_encode(rd, NON_ALPHANUMERIC)
                 );
                 return Redirect::to(&login).into_response();

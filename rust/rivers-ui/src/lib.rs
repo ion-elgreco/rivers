@@ -28,6 +28,7 @@ pub mod live;
 pub mod loc;
 pub mod now;
 pub mod pages;
+pub mod routes;
 pub mod server_fns;
 pub mod state;
 pub mod synthetic;

@@ -133,7 +133,7 @@ async fn discover_client(
         .end_session_endpoint
         .clone()
         .map(|u| u.to_string());
-    let redirect = RedirectUrl::new(format!("{}/auth/callback", cfg.public_url))
+    let redirect = RedirectUrl::new(format!("{}{}", cfg.public_url, crate::routes::CALLBACK))
         .context("invalid redirect URL derived from RIVERS_AUTH_PUBLIC_URL")?;
     let client = OidcClient::from_provider_metadata(
         metadata,
@@ -315,7 +315,7 @@ pub async fn callback(
                 axum::http::StatusCode::BAD_GATEWAY,
                 "Sign-in failed",
                 &detail,
-                Some("/auth/login"),
+                Some(crate::routes::LOGIN),
             ),
         )
             .into_response()
@@ -393,7 +393,7 @@ pub async fn callback(
         // works; allowlists are re-checked per request against the identity
         // snapshot taken here (IdP-side changes land at the next sign-in).
         let (jar, clear_state) = session_response(&o.cookie_key, o.cfg.secure_cookies(), &identity);
-        return (jar, clear_state, forbidden_page(&identity, Some("/auth/logout"))).into_response();
+        return (jar, clear_state, forbidden_page(&identity, Some(crate::routes::LOGOUT))).into_response();
     }
     tracing::info!(
         target: "rivers::auth",
