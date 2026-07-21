@@ -193,12 +193,21 @@ impl OidcRuntime {
     ///   discovery failure doesn't block the next attempt.
     async fn refresh_signing_keys(&self) -> bool {
         use std::sync::atomic::Ordering;
-        // If a refresh is already in flight, let it do the work.
-        let Ok(_permit) = self.refresh_gate.try_acquire() else {
-            return false;
-        };
+        let seen = self.last_key_refresh.load(Ordering::Relaxed);
+        // Serialize refreshes so concurrent verification failures collapse into
+        // one discovery round-trip; a race-loser waits here rather than bailing.
+        let _permit = self
+            .refresh_gate
+            .acquire()
+            .await
+            .expect("refresh_gate is never closed");
+        // A refresh landed while we waited: the client already holds the rotated
+        // keys, so signal a retry without a second round-trip.
+        if self.last_key_refresh.load(Ordering::Relaxed) != seen {
+            return true;
+        }
         let now = now_ts();
-        if now - self.last_key_refresh.load(Ordering::Relaxed) < KEY_REFRESH_COOLDOWN_SECS {
+        if now - seen < KEY_REFRESH_COOLDOWN_SECS {
             return false;
         }
         match discover_client(&self.cfg, &self.http).await {

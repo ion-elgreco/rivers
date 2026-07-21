@@ -198,6 +198,15 @@ struct MockIdp {
     /// When true, the discovery endpoint 500s — simulates a transient IdP
     /// outage during a key-refresh attempt.
     discovery_fails: Mutex<bool>,
+    /// When armed, `/discovery` signals `discovery_entered` and then blocks on
+    /// `discovery_release`, pinning one key-refresh mid-flight so a second
+    /// concurrent callback races it.
+    hold_discovery: std::sync::atomic::AtomicBool,
+    discovery_entered: tokio::sync::Notify,
+    discovery_release: tokio::sync::Notify,
+    /// Number of `/token` exchanges served — lets a test observe that a second
+    /// callback has passed code exchange.
+    token_hits: std::sync::atomic::AtomicUsize,
 }
 
 type MockState = Arc<MockIdp>;
@@ -206,6 +215,10 @@ async fn discovery(State(idp): State<MockState>) -> axum::response::Response {
     use axum::response::IntoResponse;
     if *idp.discovery_fails.lock().unwrap() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if idp.hold_discovery.load(std::sync::atomic::Ordering::Relaxed) {
+        idp.discovery_entered.notify_one();
+        idp.discovery_release.notified().await;
     }
     let iss = &idp.issuer;
     Json(serde_json::json!({
@@ -283,6 +296,7 @@ async fn token(State(idp): State<MockState>) -> Json<serde_json::Value> {
     let mut resp =
         StandardTokenResponse::new(AccessToken::new("test-access".into()), CoreTokenType::Bearer, fields);
     resp.set_expires_in(Some(&std::time::Duration::from_secs(3600)));
+    idp.token_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Json(serde_json::to_value(&resp).unwrap())
 }
 
@@ -302,6 +316,10 @@ async fn spawn_mock_idp_with_groups(subject: &str, email: &str, groups: Vec<Stri
         groups,
         key_id: Mutex::new("test".into()),
         discovery_fails: Mutex::new(false),
+        hold_discovery: std::sync::atomic::AtomicBool::new(false),
+        discovery_entered: tokio::sync::Notify::new(),
+        discovery_release: tokio::sync::Notify::new(),
+        token_hits: std::sync::atomic::AtomicUsize::new(0),
     });
     let router = Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
@@ -602,6 +620,63 @@ async fn oidc_recovers_after_a_transient_refresh_failure() {
         StatusCode::SEE_OTHER,
         "must recover on the next login after a transient refresh failure, got {}",
         resp.status()
+    );
+}
+
+/// Concurrent callbacks during a key rotation must ALL recover. The first to
+/// win the refresh gate re-fetches the JWKS while the others wait on the gate,
+/// then retry against the refreshed keys — a race-loser must not be turned
+/// away with a 502 (the old `try_acquire` bailed instead of awaiting).
+#[tokio::test]
+async fn oidc_concurrent_callbacks_during_rotation_all_recover() {
+    use std::sync::atomic::Ordering;
+    let idp = spawn_mock_idp("sub-42", "john.doe@example.com").await;
+    let rt = oidc_rt(&idp, Allowlists::default()).await;
+    let app = app(Some(rt));
+
+    // One in-flight login; both concurrent callbacks replay its state cookie
+    // (the mock accepts the fixed code and bakes the flow's nonce).
+    let (callback, store) = drive_login(&app, &idp).await;
+    let cookie = store.header_value();
+
+    // Rotate to a never-seen key and pin the winner's refresh open.
+    *idp.key_id.lock().unwrap() = "test-rotated".into();
+    idp.hold_discovery.store(true, Ordering::Relaxed);
+
+    let spawn_cb = |cookie: String, callback: String, app: Router| {
+        tokio::spawn(async move {
+            app.oneshot(req(&callback, None, &[("cookie", &cookie)]))
+                .await
+                .unwrap()
+                .status()
+        })
+    };
+
+    // Winner: fails validation, wins the gate, blocks inside discovery.
+    let a = spawn_cb(cookie.clone(), callback.clone(), app.clone());
+    idp.discovery_entered.notified().await;
+
+    // Loser: same cookie; must WAIT on the gate, not bail with a 502.
+    let b = spawn_cb(cookie.clone(), callback.clone(), app.clone());
+    // Let the loser pass code exchange and reach its refresh attempt while the
+    // winner is still pinned (keys not yet swapped).
+    while idp.token_hits.load(Ordering::Relaxed) < 2 {
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+
+    // Release the winner; it swaps in the rotated key, the loser then retries.
+    idp.hold_discovery.store(false, Ordering::Relaxed);
+    idp.discovery_release.notify_one();
+
+    let (sa, sb) = tokio::join!(a, b);
+    assert_eq!(sa.unwrap(), StatusCode::SEE_OTHER, "winner recovers");
+    assert_eq!(
+        sb.unwrap(),
+        StatusCode::SEE_OTHER,
+        "race-loser must recover too, not get a 502"
     );
 }
 
