@@ -81,6 +81,18 @@ from a trusted proxy *without* identity headers gets a diagnostic `401` —
 that means the proxy authenticated nothing or drops its auth response
 headers.
 
+!!! danger "The proxy must strip inbound identity headers"
+    rivers trusts **every** `Remote-User`/`Remote-Email`/`Remote-Groups`/
+    `Remote-Name` line on a request from a trusted peer — it cannot tell a
+    proxy-set header from one the client sent. Your proxy must **replace**
+    (strip-then-set), not merely append, these headers. A proxy that only
+    adds its own values while forwarding the client's copies lets any
+    authenticated user send `Remote-Groups: admins` and pass the group
+    allowlist. Most forwardAuth integrations set (replace) the response
+    headers, but verify: ingress-nginx `auth-response-headers` and Traefik
+    `authResponseHeaders` overwrite; if you hand-configure header passing,
+    ensure inbound `Remote-*` are dropped at the edge.
+
 ```yaml
 ui:
   auth:
