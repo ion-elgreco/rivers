@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use pyo3::prelude::*;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
-use rivers_core::storage::{LaunchedBy, RunRecord, RunStatus};
+use rivers_core::storage::{RunRecord, RunStatus};
 
 use super::types::{BackfillRequestData, MaterializationRequestData, RunRequestData};
 use crate::gil_threads::GilThreads;
@@ -119,10 +119,9 @@ impl RunDispatcherKind {
         &self,
         job_reqs: &[RunRequestData],
         mat_reqs: &[MaterializationRequestData],
-        launched_by: LaunchedBy,
     ) -> anyhow::Result<DispatchOutcome> {
         let (jobs, mats) = tokio::join!(
-            self.dispatch_jobs(job_reqs, launched_by),
+            self.dispatch_jobs(job_reqs),
             self.dispatch_materialization(mat_reqs),
         );
         let mut merged = jobs?;
@@ -136,11 +135,10 @@ impl RunDispatcherKind {
     pub(crate) async fn dispatch_jobs(
         &self,
         requests: &[RunRequestData],
-        launched_by: LaunchedBy,
     ) -> anyhow::Result<DispatchOutcome> {
         match self {
-            Self::Direct(d) => d.dispatch_jobs(requests, launched_by).await,
-            Self::Queued(d) => d.dispatch_jobs(requests, launched_by).await,
+            Self::Direct(d) => d.dispatch_jobs(requests).await,
+            Self::Queued(d) => d.dispatch_jobs(requests).await,
         }
     }
 
@@ -223,7 +221,6 @@ impl DirectRunDispatcher {
     async fn dispatch_jobs(
         &self,
         requests: &[RunRequestData],
-        launched_by: LaunchedBy,
     ) -> anyhow::Result<DispatchOutcome> {
         if requests.is_empty() {
             return Ok(DispatchOutcome::default());
@@ -248,7 +245,7 @@ impl DirectRunDispatcher {
 
             match self
                 .handle
-                .create_started_run(&job_name, py_pk.as_ref(), launched_by.clone())
+                .create_started_run(&job_name, py_pk.as_ref(), r.launched_by.clone())
                 .await
             {
                 Ok(run_id) => {
@@ -318,7 +315,6 @@ impl QueuedRunDispatcher {
     async fn dispatch_jobs(
         &self,
         requests: &[RunRequestData],
-        launched_by: LaunchedBy,
     ) -> anyhow::Result<DispatchOutcome> {
         if requests.is_empty() {
             return Ok(DispatchOutcome::default());
@@ -346,7 +342,7 @@ impl QueuedRunDispatcher {
                     selection,
                     r.partition_key.as_ref(),
                     None,
-                    launched_by.clone(),
+                    r.launched_by.clone(),
                     Some(job_name.clone()),
                 )
                 .await

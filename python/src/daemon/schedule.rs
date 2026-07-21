@@ -97,6 +97,9 @@ pub(super) async fn evaluate_schedule_sync(
                 tags: tags.clone(),
                 partition_key: None,
                 job_name: Some(job_name.to_string()),
+                launched_by: rivers_core::storage::LaunchedBy::Schedule {
+                    name: name.to_string(),
+                },
             }],
             vec![], // no materialization requests for schedules
             vec![],

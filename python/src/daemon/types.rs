@@ -45,6 +45,10 @@ pub(crate) struct RunRequestData {
     /// the producer boundary so the dispatcher sees one type.
     pub(crate) partition_key: Option<crate::partitions::PyPartitionKey>,
     pub(crate) job_name: Option<String>,
+    /// Provenance stamped on the run, matching its sibling request DTOs. All
+    /// requests in one tick share the automation's origin; gRPC launches carry
+    /// the acting user.
+    pub(crate) launched_by: rivers_core::storage::LaunchedBy,
 }
 
 /// Materialization-shape run request — pre-resolved asset selection with

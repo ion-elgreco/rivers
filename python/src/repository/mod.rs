@@ -1943,6 +1943,9 @@ impl RepoHandle {
                     tags: Some(tags.into_iter().collect()),
                     partition_key: record.partition_key.as_ref().map(PyPartitionKey::from),
                     job_name: Some(job_name),
+                    // Placeholder — the caller (rerun_run) stamps the
+                    // rerunning user, like the materialization arm below.
+                    launched_by: rivers_core::storage::LaunchedBy::Manual { user: None },
                 },
             )),
             None => Ok(crate::daemon::RunRerunRequest::Materialization(

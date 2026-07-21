@@ -184,11 +184,12 @@ impl CodeLocationService for CodeLocationImpl {
                 .map(proto_partition_key_to_py)
                 .transpose()?,
             job_name: Some(req.job_name),
+            launched_by,
         };
 
         let mut outcome = self
             .run_dispatcher
-            .dispatch_jobs(&[run_request], launched_by)
+            .dispatch_jobs(&[run_request])
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -221,10 +222,13 @@ impl CodeLocationService for CodeLocationImpl {
 
         let status = self.run_dispatcher.mode_label().to_string();
         let run_id = match rerun {
-            crate::daemon::RunRerunRequest::Job(run_request) => {
+            crate::daemon::RunRerunRequest::Job(mut run_request) => {
+                // The rerun's provenance is the rerunning user, not the
+                // original launcher (mirrors the materialization arm below).
+                run_request.launched_by = launched_by;
                 let mut outcome = self
                     .run_dispatcher
-                    .dispatch_jobs(&[run_request], launched_by)
+                    .dispatch_jobs(&[run_request])
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?;
                 if let Some(err) = outcome.errors.pop() {
