@@ -124,6 +124,21 @@ mod tests {
         );
     }
 
+    /// A whitespace-only user header is absent, not a blank principal — the
+    /// `get` closure's trim+empty-drop is the forward-mode analog of the OIDC
+    /// claim trim. Regressing the `!is_empty()` filter would authenticate "".
+    #[test]
+    fn whitespace_only_user_header_is_absent() {
+        let rt = ForwardRuntime::new(cfg()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Remote-User", HeaderValue::from_static("   "));
+        assert!(rt.identity_from_headers(&headers).is_none());
+        // A padded but non-empty user is trimmed, not rejected.
+        let mut ok = HeaderMap::new();
+        ok.insert("Remote-User", HeaderValue::from_static("  jdoe  "));
+        assert_eq!(rt.identity_from_headers(&ok).unwrap().subject, "jdoe");
+    }
+
     #[test]
     fn identity_requires_user_header() {
         let rt = ForwardRuntime::new(cfg()).unwrap();
