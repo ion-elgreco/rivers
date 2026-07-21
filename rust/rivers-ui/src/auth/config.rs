@@ -140,22 +140,20 @@ impl AuthConfig {
                 if session_ttl_secs <= 0 {
                     bail!("RIVERS_AUTH_SESSION_TTL must be positive");
                 }
+                // Accept comma- and/or space-separated (the OAuth wire form),
+                // in one pass — the Helm default is space-separated.
                 let scopes = {
-                    let s = csv(get("RIVERS_AUTH_OIDC_SCOPES"));
-                    if s.is_empty() {
-                        // Also accept space-separated (the OIDC wire format).
-                        let raw = get("RIVERS_AUTH_OIDC_SCOPES").unwrap_or_default();
-                        let sp: Vec<String> = raw
-                            .split_whitespace()
-                            .map(|p| p.to_string())
-                            .collect();
-                        if sp.is_empty() {
-                            vec!["openid".into(), "profile".into(), "email".into()]
-                        } else {
-                            sp
-                        }
+                    let parsed: Vec<String> = get("RIVERS_AUTH_OIDC_SCOPES")
+                        .unwrap_or_default()
+                        .split(|c: char| c == ',' || c.is_whitespace())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect();
+                    if parsed.is_empty() {
+                        vec!["openid".into(), "profile".into(), "email".into()]
                     } else {
-                        s
+                        parsed
                     }
                 };
                 AuthMode::Oidc(OidcConfig {
@@ -202,5 +200,52 @@ impl AuthConfig {
         };
 
         Ok(Self { mode, allow })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oidc_map(scopes: Option<&str>) -> HashMap<String, String> {
+        let mut m = HashMap::from([
+            ("RIVERS_AUTH_MODE".to_string(), "oidc".to_string()),
+            ("RIVERS_AUTH_PUBLIC_URL".to_string(), "https://r.example.com".to_string()),
+            ("RIVERS_AUTH_OIDC_ISSUER".to_string(), "https://idp.example.com".to_string()),
+            ("RIVERS_AUTH_OIDC_CLIENT_ID".to_string(), "rivers".to_string()),
+        ]);
+        if let Some(s) = scopes {
+            m.insert("RIVERS_AUTH_OIDC_SCOPES".to_string(), s.to_string());
+        }
+        m
+    }
+
+    fn scopes_of(cfg: AuthConfig) -> Vec<String> {
+        match cfg.mode {
+            AuthMode::Oidc(o) => o.scopes,
+            other => panic!("expected oidc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scopes_parse_space_separated() {
+        // The Helm default is space-separated (the OAuth wire form). It must
+        // become three scopes, not one 3-word token.
+        let cfg = AuthConfig::from_map(&oidc_map(Some("openid profile email"))).unwrap();
+        assert_eq!(scopes_of(cfg), vec!["openid", "profile", "email"]);
+    }
+
+    #[test]
+    fn scopes_parse_comma_separated_and_mixed() {
+        let cfg = AuthConfig::from_map(&oidc_map(Some("openid, profile , email"))).unwrap();
+        assert_eq!(scopes_of(cfg), vec!["openid", "profile", "email"]);
+        let cfg = AuthConfig::from_map(&oidc_map(Some("openid profile,email offline_access"))).unwrap();
+        assert_eq!(scopes_of(cfg), vec!["openid", "profile", "email", "offline_access"]);
+    }
+
+    #[test]
+    fn scopes_default_when_unset() {
+        let cfg = AuthConfig::from_map(&oidc_map(None)).unwrap();
+        assert_eq!(scopes_of(cfg), vec!["openid", "profile", "email"]);
     }
 }
