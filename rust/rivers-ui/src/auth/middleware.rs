@@ -41,8 +41,10 @@ pub async fn require_auth(
                 req.extensions_mut().insert(identity);
                 return next.run(req).await;
             }
-            // Documents bounce to login; API/SSE get a bare 401 (a
-            // 302-to-IdP would confuse fetch/EventSource).
+            // Documents bounce to login; API/SSE get a 401 (a 302-to-IdP
+            // would confuse fetch/EventSource). The body is server_fn's
+            // `Variant|payload` wire format so a server-fn caller decodes a
+            // recognizable ServerError and can redirect into the login flow.
             if req.method() == Method::GET && wants_html(req.headers()) {
                 let rd = req
                     .uri()
@@ -55,7 +57,11 @@ pub async fn require_auth(
                 );
                 return Redirect::to(&login).into_response();
             }
-            StatusCode::UNAUTHORIZED.into_response()
+            (
+                StatusCode::UNAUTHORIZED,
+                format!("ServerError|{}", crate::helpers::UNAUTHORIZED_MARKER),
+            )
+                .into_response()
         }
         RuntimeKind::Forward(f) => {
             // Peer before headers — untrusted-peer headers are forgeable.

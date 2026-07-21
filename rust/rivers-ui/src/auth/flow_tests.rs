@@ -400,6 +400,34 @@ async fn oidc_full_flow() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// The session-expiry redirect in `CurrentUserChip` needs a 401 the
+/// server-fn client can actually decode: an empty body decodes to a generic
+/// `Deserialization` error, indistinguishable from any other failure, so the
+/// client-side login redirect can never fire. The middleware must emit the
+/// `Variant|payload` wire format with our marker.
+#[tokio::test]
+async fn api_401_body_is_server_fn_decodable() {
+    let idp = spawn_mock_idp("sub-42", "john.doe@example.com").await;
+    let rt = oidc_rt(&idp, Allowlists::default()).await;
+    let app = app(Some(rt));
+
+    let resp = app.oneshot(req("/api/whoami", None, &[])).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = body_string(resp).await;
+    assert_eq!(
+        body,
+        format!("ServerError|{}", crate::helpers::UNAUTHORIZED_MARKER),
+        "401 body must decode as ServerFnError::ServerError with the marker"
+    );
+    // What the WASM client does with it: decode → is_unauthorized.
+    let decoded: leptos::prelude::ServerFnError =
+        leptos::server_fn::error::FromServerFnError::de(leptos::server_fn::Bytes::from(body));
+    assert!(crate::helpers::is_unauthorized(&decoded));
+    assert!(!crate::helpers::is_unauthorized(
+        &leptos::prelude::ServerFnError::ServerError("disk full".into())
+    ));
+}
+
 /// A hung IdP (TCP accepted, no HTTP response) must fail discovery instead
 /// of blocking forever: `initialize` runs before the UI binds its listener,
 /// so an unbounded request hangs the process with `/healthz` never served.

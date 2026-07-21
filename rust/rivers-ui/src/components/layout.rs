@@ -98,7 +98,7 @@ fn CurrentUserChip(collapsed: Signal<bool>) -> impl IntoView {
 
     Effect::new(move |_| {
         if let Some(Err(e)) = user.get() {
-            if e.to_string().contains("401") {
+            if crate::helpers::is_unauthorized(&e) {
                 let loc = window().location();
                 let rd = loc.pathname().unwrap_or_else(|_| "/".into());
                 let _ = loc.assign(&format!("/auth/login?rd={rd}"));

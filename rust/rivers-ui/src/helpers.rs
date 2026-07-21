@@ -625,6 +625,18 @@ pub fn code_location_label(id: &str, entries: &[CodeLocationEntry]) -> String {
     }
 }
 
+/// Payload of the auth middleware's API 401, in server_fn's `Variant|payload`
+/// wire format so the client decodes it as `ServerFnError::ServerError` and
+/// [`is_unauthorized`] can key on it. An empty 401 body would decode as a
+/// generic `Deserialization` error, indistinguishable from real failures.
+pub const UNAUTHORIZED_MARKER: &str = "unauthorized: sign-in required";
+
+/// True when a server-fn call failed because the session is missing/expired
+/// — the client should bounce through `/auth/login`.
+pub fn is_unauthorized(err: &ServerFnError) -> bool {
+    matches!(err, ServerFnError::ServerError(msg) if msg == UNAUTHORIZED_MARKER)
+}
+
 /// Display metadata for a `LaunchedBy` origin: `(glyph, color, label, default_sub_line)`.
 /// Shared by `LaunchedByCell` and the run-detail header so the glyph/label set
 /// stays in one place.
