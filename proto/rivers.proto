@@ -383,6 +383,12 @@ message GetBackfillStatusResponse {
   uint32 canceled_partitions = 6;
   repeated string run_ids = 7;
   optional string error = 8;
+  // Provenance: kind is manual|schedule|sensor|backfill|condition; name is the
+  // schedule/sensor/backfill id where applicable; user is the acting user on a
+  // manual launch.
+  string launched_by_kind = 9;
+  optional string launched_by_name = 10;
+  optional UserRef launched_by_user = 11;
 }
 
 message CancelBackfillRequest {

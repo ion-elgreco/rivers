@@ -653,6 +653,28 @@ def test_get_backfill_status(backfill_grpc_channel):
     assert status.total_partitions == 2
 
 
+def test_get_backfill_status_carries_launched_by(backfill_grpc_channel):
+    """The gRPC status surface must expose provenance, like the storage path."""
+    channel, pb2, pb2_grpc, _, _ = backfill_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    launch = stub.LaunchBackfill(
+        pb2.LaunchBackfillRequest(
+            selection=["partitioned_asset"],
+            partition_keys=[_single_partition_key(pb2, "p1")],
+            failure_policy="continue",
+            max_concurrency=1,
+            user=_user_ref(pb2),
+        )
+    )
+    status = stub.GetBackfillStatus(
+        pb2.GetBackfillStatusRequest(backfill_id=launch.backfill_id)
+    )
+    assert status.launched_by_kind == "manual"
+    assert status.launched_by_user.subject == "sub-42"
+    assert status.launched_by_user.name == "John Doe"
+
+
 def test_get_backfill_status_not_found(backfill_grpc_channel):
     channel, pb2, pb2_grpc, _, _ = backfill_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)

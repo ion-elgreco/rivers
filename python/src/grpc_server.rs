@@ -700,16 +700,23 @@ impl CodeLocationService for CodeLocationImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         match status {
-            Some(s) => Ok(Response::new(GetBackfillStatusResponse {
-                backfill_id: s.backfill_id,
-                status: s.status,
-                total_partitions: s.total_partitions as u32,
-                completed_partitions: s.completed_partitions as u32,
-                failed_partitions: s.failed_partitions as u32,
-                canceled_partitions: s.canceled_partitions as u32,
-                run_ids: s.run_ids,
-                error: s.error,
-            })),
+            Some(s) => {
+                let (launched_by_kind, launched_by_name, launched_by_user) =
+                    launched_by_to_proto(s.launched_by.inner);
+                Ok(Response::new(GetBackfillStatusResponse {
+                    backfill_id: s.backfill_id,
+                    status: s.status,
+                    total_partitions: s.total_partitions as u32,
+                    completed_partitions: s.completed_partitions as u32,
+                    failed_partitions: s.failed_partitions as u32,
+                    canceled_partitions: s.canceled_partitions as u32,
+                    run_ids: s.run_ids,
+                    error: s.error,
+                    launched_by_kind,
+                    launched_by_name,
+                    launched_by_user,
+                }))
+            }
             None => Err(Status::not_found(format!(
                 "Backfill '{}' not found",
                 req.backfill_id
@@ -756,6 +763,28 @@ fn manual_launch(user: Option<rivers_api::rivers::UserRef>) -> rivers_core::stor
             email: u.email,
             name: u.name,
         }),
+    }
+}
+
+/// Flatten a `LaunchedBy` into the proto response's `(kind, name, user)` triple.
+fn launched_by_to_proto(
+    lb: rivers_core::storage::LaunchedBy,
+) -> (String, Option<String>, Option<rivers_api::rivers::UserRef>) {
+    use rivers_core::storage::LaunchedBy;
+    match lb {
+        LaunchedBy::Manual { user } => (
+            "manual".to_string(),
+            None,
+            user.map(|u| rivers_api::rivers::UserRef {
+                subject: u.subject,
+                email: u.email,
+                name: u.name,
+            }),
+        ),
+        LaunchedBy::Schedule { name } => ("schedule".to_string(), Some(name), None),
+        LaunchedBy::Sensor { name } => ("sensor".to_string(), Some(name), None),
+        LaunchedBy::Backfill { backfill_id } => ("backfill".to_string(), Some(backfill_id), None),
+        LaunchedBy::Condition => ("condition".to_string(), None, None),
     }
 }
 
