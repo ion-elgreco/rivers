@@ -8340,7 +8340,10 @@ mod tests {
         assert_eq!(r.partition_keys.len(), 1);
         assert_eq!(r.launched_by, record.launched_by, "provenance roundtrips");
 
-        // A pre-V3 row (no launched_by field) reads back as the default.
+        // A row created without launched_by (a v2 writer) gets the V3 DDL
+        // default and must deserialize back to the struct default. The
+        // genuinely-absent pre-V3 read path is covered by the migration-order
+        // test `test_v3_backfill_launched_by_defaults_for_legacy_rows`.
         storage
             .db
             .query("CREATE backfills CONTENT { backfill_id: 'bf-old', code_location_id: 'default', status: 'Requested', strategy: { kind: 'MultiRun' }, failure_policy: 'Continue', asset_selection: [], partition_keys: [], run_ids: [], completed_partitions: [], failed_partitions: [], canceled_partitions: [], max_concurrency: 1, tags: [], create_time: 1, end_time: NONE, error: NONE }")
@@ -8348,8 +8351,16 @@ mod tests {
             .unwrap()
             .check()
             .unwrap();
-        let old_row = storage.get_backfill("bf-old").await.unwrap();
-        assert!(old_row.is_some(), "pre-V3 row must still deserialize");
+        let old_row = storage
+            .get_backfill("bf-old")
+            .await
+            .unwrap()
+            .expect("row without an explicit launched_by must deserialize");
+        assert_eq!(
+            old_row.launched_by,
+            LaunchedBy::Manual { user: None },
+            "the DDL default round-trips to the struct default"
+        );
     }
 
     fn make_backfill(id: &str, status: BackfillStatus, create_time: i64) -> BackfillRecord {

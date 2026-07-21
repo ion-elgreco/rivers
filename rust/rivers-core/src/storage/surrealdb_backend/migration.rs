@@ -632,6 +632,54 @@ mod tests {
         );
     }
 
+    /// A backfill written under V2 (before `launched_by` was defined) has no
+    /// such key in storage. After migrating to V3 it must still read back —
+    /// falling to the struct default — not error.
+    #[tokio::test]
+    async fn test_v3_backfill_launched_by_defaults_for_legacy_rows() {
+        let db = any::connect("mem://").await.unwrap();
+        db.use_ns(DEFAULT_NAMESPACE)
+            .use_db(DEFAULT_DATABASE)
+            .await
+            .unwrap();
+
+        // Apply V1+V2 only — `launched_by` on backfills doesn't exist yet.
+        let pre_v3: Vec<Migration> = embedded_migrations().into_iter().take(2).collect();
+        let mut backend = SurrealMigrate { db: db.clone() };
+        backend
+            .migrate(&pre_v3, true, false, false, Target::Latest, REFINERY_HISTORY_TABLE)
+            .await
+            .expect("apply V1+V2");
+
+        // A legacy backfill row: no launched_by key.
+        db.query(
+            "INSERT INTO backfills { backfill_id: 'bf-legacy', code_location_id: 'default', \
+             status: 'Requested', strategy: { kind: 'MultiRun' }, failure_policy: 'Continue', \
+             asset_selection: [], partition_keys: [], run_ids: [], completed_partitions: [], \
+             failed_partitions: [], canceled_partitions: [], max_concurrency: 1, tags: [], \
+             create_time: 1, end_time: NONE, error: NONE } RETURN NONE",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        // Now migrate to V3 (adds the launched_by field) and read the old row.
+        apply_migrations(&db).await.expect("apply V3");
+        let rows: Vec<crate::storage::BackfillRecord> = db
+            .query("SELECT * FROM backfills WHERE backfill_id = 'bf-legacy'")
+            .await
+            .unwrap()
+            .take(0)
+            .expect("legacy backfill row must deserialize after V3");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].launched_by,
+            crate::storage::LaunchedBy::Manual { user: None },
+            "a legacy row's missing launched_by falls back to the struct default"
+        );
+    }
+
     /// Editing an already-applied migration is caught by refinery's checksum
     /// (the frozen-baseline guard — a different V1 body diverges).
     #[tokio::test]
