@@ -2,13 +2,14 @@
 
 use leptos::prelude::*;
 
-use crate::types::{CurrentUser, UserRef};
+use crate::types::CurrentUser;
 
 /// `None` when auth mode is `none`; otherwise the middleware has already
 /// inserted the identity extension.
 #[server]
 pub async fn get_current_user() -> Result<Option<CurrentUser>, ServerFnError> {
     use crate::auth::AuthCtx;
+    use crate::types::UserRef;
 
     let auth = expect_context::<AuthCtx>();
     let Some(rt) = auth.0 else {
