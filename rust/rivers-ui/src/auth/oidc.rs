@@ -67,11 +67,16 @@ pub type OidcClient = Client<
 
 pub struct OidcRuntime {
     /// Swapped out when the IdP rotates signing keys (see
-    /// [`OidcRuntime::refresh_keys_rate_limited`]); reads clone the `Arc`.
+    /// [`OidcRuntime::refresh_signing_keys`]); reads clone the `Arc`.
     client: std::sync::RwLock<Arc<OidcClient>>,
-    /// Unix-seconds of the last key refresh; gates the refresh rate so a
-    /// burst of unverifiable tokens can't hammer the IdP. `0` = never.
+    /// Unix-seconds of the last *successful* key refresh; rate-limits refreshes
+    /// so a healthy re-fetch isn't repeated for every token. `0` = never. A
+    /// failed refresh does NOT advance it, so a transient IdP outage can't latch
+    /// the cooldown and block recovery.
     last_key_refresh: std::sync::atomic::AtomicI64,
+    /// Single permit: at most one refresh in flight, so a burst of concurrent
+    /// verification failures collapses into one discovery round-trip.
+    refresh_gate: tokio::sync::Semaphore,
     pub http: reqwest::Client,
     pub cfg: OidcConfig,
     pub cookie_key: Key,
@@ -79,8 +84,23 @@ pub struct OidcRuntime {
     pub end_session_endpoint: Option<String>,
 }
 
-/// Minimum spacing between on-miss JWKS refreshes.
+/// Minimum spacing between successful JWKS refreshes.
 const KEY_REFRESH_COOLDOWN_SECS: i64 = 300;
+
+/// Whether an id-token validation failure could plausibly be fixed by
+/// refreshing the JWKS — i.e. the signing key couldn't be identified (the
+/// rotation signal). Claim-level failures (expiry, audience, issuer, nonce) and
+/// a bad signature under a *known* key can't be fixed by re-fetching keys, so
+/// they must not spend the refresh budget.
+pub(super) fn is_signing_key_failure(err: &openidconnect::ClaimsVerificationError) -> bool {
+    use openidconnect::{ClaimsVerificationError as CVE, SignatureVerificationError as SVE};
+    matches!(
+        err,
+        CVE::SignatureVerification(
+            SVE::NoMatchingKey | SVE::AmbiguousKeyId(_) | SVE::InvalidKey(_)
+        )
+    )
+}
 
 /// Bounds every IdP round-trip (discovery, JWKS, code exchange). Discovery
 /// runs before the UI binds its listener, so an unbounded request against a
@@ -149,6 +169,7 @@ impl OidcRuntime {
         Ok(Self {
             client: std::sync::RwLock::new(Arc::new(client)),
             last_key_refresh: std::sync::atomic::AtomicI64::new(0),
+            refresh_gate: tokio::sync::Semaphore::new(1),
             http,
             cfg,
             cookie_key,
@@ -164,22 +185,27 @@ impl OidcRuntime {
     }
 
     /// Re-run discovery to pick up rotated IdP signing keys, then swap the
-    /// verifying client. Rate-limited to at most once per
-    /// [`KEY_REFRESH_COOLDOWN_SECS`] so a flood of tokens with unknown `kid`s
-    /// can't turn into a flood of discovery requests. Returns whether a
-    /// refresh actually ran.
-    async fn refresh_keys_rate_limited(&self) -> bool {
+    /// verifying client. Returns whether the keys were actually refreshed.
+    ///
+    /// - Only one refresh runs at a time (`refresh_gate`), so concurrent
+    ///   verification failures don't stampede the IdP.
+    /// - The cooldown is keyed on the last *successful* refresh, so a transient
+    ///   discovery failure doesn't block the next attempt.
+    async fn refresh_signing_keys(&self) -> bool {
         use std::sync::atomic::Ordering;
+        // If a refresh is already in flight, let it do the work.
+        let Ok(_permit) = self.refresh_gate.try_acquire() else {
+            return false;
+        };
         let now = now_ts();
         if now - self.last_key_refresh.load(Ordering::Relaxed) < KEY_REFRESH_COOLDOWN_SECS {
             return false;
         }
-        // Claim the window before the network round-trip so concurrent
-        // failures collapse into one refresh.
-        self.last_key_refresh.store(now, Ordering::Relaxed);
         match discover_client(&self.cfg, &self.http).await {
             Ok((client, _)) => {
                 *self.client.write().unwrap() = Arc::new(client);
+                // Advance the cooldown only on success.
+                self.last_key_refresh.store(now, Ordering::Relaxed);
                 tracing::info!(target: "rivers::auth", "refreshed OIDC signing keys");
                 true
             }
@@ -321,19 +347,16 @@ pub async fn callback(
     let nonce = Nonce::new(pending.nonce.clone());
     let claims = match id_token.claims(&client.id_token_verifier(), &nonce) {
         Ok(claims) => claims,
-        Err(first_err) => {
-            // The signing key may have rotated since startup; refresh the
-            // JWKS once (rate-limited) and retry before giving up.
-            if o.refresh_keys_rate_limited().await {
-                let client = o.client();
-                match id_token.claims(&client.id_token_verifier(), &nonce) {
-                    Ok(claims) => claims,
-                    Err(e) => return fail(format!("ID token validation failed: {e}")),
-                }
-            } else {
-                return fail(format!("ID token validation failed: {first_err}"));
+        // Only an unidentifiable signing key is worth a JWKS refresh + retry;
+        // any other failure (expiry, nonce, audience) is returned as-is.
+        Err(first_err) if is_signing_key_failure(&first_err) && o.refresh_signing_keys().await => {
+            let client = o.client();
+            match id_token.claims(&client.id_token_verifier(), &nonce) {
+                Ok(claims) => claims,
+                Err(e) => return fail(format!("ID token validation failed: {e}")),
             }
         }
+        Err(first_err) => return fail(format!("ID token validation failed: {first_err}")),
     };
 
     // Persist only allowlist-relevant groups: a large IdP groups claim would

@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 use super::config::{Allowlists, AuthConfig, AuthMode, ForwardConfig, OidcConfig};
+use super::oidc::is_signing_key_failure;
 use super::identity::Identity;
 use super::test_cookies::CookieStore;
 use super::oidc::RawClaims;
@@ -190,11 +191,18 @@ struct MockIdp {
     /// Current signing-key id; both `/jwks` and `/token` read it, so flipping
     /// it simulates an IdP key rotation.
     key_id: Mutex<String>,
+    /// When true, the discovery endpoint 500s — simulates a transient IdP
+    /// outage during a key-refresh attempt.
+    discovery_fails: Mutex<bool>,
 }
 
 type MockState = Arc<MockIdp>;
 
-async fn discovery(State(idp): State<MockState>) -> Json<serde_json::Value> {
+async fn discovery(State(idp): State<MockState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if *idp.discovery_fails.lock().unwrap() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     let iss = &idp.issuer;
     Json(serde_json::json!({
         "issuer": iss,
@@ -206,6 +214,7 @@ async fn discovery(State(idp): State<MockState>) -> Json<serde_json::Value> {
         "id_token_signing_alg_values_supported": ["RS256"],
         "end_session_endpoint": format!("{iss}/logout"),
     }))
+    .into_response()
 }
 
 fn signing_key(kid: &str) -> openidconnect::core::CoreRsaPrivateSigningKey {
@@ -286,6 +295,7 @@ async fn spawn_mock_idp_with_groups(subject: &str, email: &str, groups: Vec<Stri
         email: email.to_string(),
         groups,
         key_id: Mutex::new("test".into()),
+        discovery_fails: Mutex::new(false),
     });
     let router = Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
@@ -537,6 +547,118 @@ async fn oidc_refreshes_signing_keys_after_rotation() {
         StatusCode::SEE_OTHER,
         "login must recover after key rotation via JWKS refresh, got {}",
         resp.status()
+    );
+}
+
+/// A refresh that fails (transient IdP outage) must NOT latch the cooldown:
+/// once the IdP recovers, the very next login must be able to refresh again.
+#[tokio::test]
+async fn oidc_recovers_after_a_transient_refresh_failure() {
+    let idp = spawn_mock_idp("sub-42", "john.doe@example.com").await;
+    let rt = oidc_rt(&idp, Allowlists::default()).await;
+    let app = app(Some(rt));
+
+    // Baseline login with the startup key.
+    let (callback, store) = drive_login(&app, &idp).await;
+    let resp = app
+        .clone()
+        .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    // Key rotates, but discovery is down: the on-miss refresh errors.
+    *idp.key_id.lock().unwrap() = "rotated".into();
+    *idp.discovery_fails.lock().unwrap() = true;
+    let (callback, store) = drive_login(&app, &idp).await;
+    let resp = app
+        .clone()
+        .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "refresh failed while discovery was down"
+    );
+
+    // IdP recovers. A failed refresh must not have consumed the cooldown, so
+    // this login refreshes successfully and gets in.
+    *idp.discovery_fails.lock().unwrap() = false;
+    let (callback, store) = drive_login(&app, &idp).await;
+    let resp = app
+        .clone()
+        .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "must recover on the next login after a transient refresh failure, got {}",
+        resp.status()
+    );
+}
+
+/// Only an unidentifiable signing key is worth a JWKS refresh; a claim-level
+/// failure (here: expiry) must not spend the refresh budget.
+#[test]
+fn only_unknown_key_failures_trigger_refresh() {
+    use openidconnect::core::{
+        CoreGenderClaim, CoreIdTokenVerifier, CoreJsonWebKeySet,
+        CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
+    };
+    use openidconnect::{
+        Audience, ClientId, IdToken, IdTokenClaims, IssuerUrl, Nonce, PrivateSigningKey,
+        StandardClaims, SubjectIdentifier,
+    };
+
+    fn nonce_ok(_: Option<&Nonce>) -> Result<(), String> {
+        Ok(())
+    }
+    let issuer = "http://idp.test";
+    let token = |kid: &str, exp_offset: i64| {
+        let claims = IdTokenClaims::<RawClaims, CoreGenderClaim>::new(
+            IssuerUrl::new(issuer.into()).unwrap(),
+            vec![Audience::new("rivers".into())],
+            chrono::Utc::now() + chrono::Duration::seconds(exp_offset),
+            chrono::Utc::now() - chrono::Duration::seconds(3600),
+            StandardClaims::new(SubjectIdentifier::new("sub".into())),
+            RawClaims(serde_json::Map::new()),
+        );
+        IdToken::<
+            RawClaims,
+            CoreGenderClaim,
+            CoreJweContentEncryptionAlgorithm,
+            CoreJwsSigningAlgorithm,
+        >::new(
+            claims,
+            &signing_key(kid),
+            CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+            None,
+            None,
+        )
+        .unwrap()
+    };
+    let verifier = |kid: &str| {
+        CoreIdTokenVerifier::new_public_client(
+            ClientId::new("rivers".into()),
+            IssuerUrl::new(issuer.into()).unwrap(),
+            CoreJsonWebKeySet::new(vec![signing_key(kid).as_verification_key()]),
+        )
+    };
+
+    // Signed with kid "A", verifier only knows kid "B" → NoMatchingKey.
+    let unknown_kid = token("A", 300).claims(&verifier("B"), nonce_ok).unwrap_err();
+    assert!(
+        is_signing_key_failure(&unknown_kid),
+        "unknown kid must trigger a refresh: {unknown_kid:?}"
+    );
+
+    // Signed with a known kid but expired → Expired, must NOT refresh.
+    let expired = token("A", -300).claims(&verifier("A"), nonce_ok).unwrap_err();
+    assert!(
+        !is_signing_key_failure(&expired),
+        "expiry must not trigger a refresh: {expired:?}"
     );
 }
 
