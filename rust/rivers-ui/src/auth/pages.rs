@@ -26,6 +26,8 @@ fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }
 
 pub fn error_page(
@@ -63,4 +65,22 @@ pub fn forbidden_page(identity: &Identity, logout_href: Option<&str>) -> Respons
              configured allowlists (<code>RIVERS_AUTH_ALLOWED_*</code>).</p>{logout}"
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `escape` must neutralize the quote characters too — these pages
+    /// interpolate values straight into `href="..."` attributes, so a stray
+    /// quote would break out of the attribute.
+    #[test]
+    fn escape_covers_attribute_breakout_chars() {
+        assert_eq!(
+            escape(r#"a"b'c<d>e&f"#),
+            "a&quot;b&#x27;c&lt;d&gt;e&amp;f"
+        );
+        let out = escape(r#"" onmouseover="alert(1)"#);
+        assert!(!out.contains('"'), "double-quote must not survive: {out}");
+    }
 }
