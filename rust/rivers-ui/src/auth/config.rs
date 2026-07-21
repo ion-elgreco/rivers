@@ -152,8 +152,9 @@ impl AuthConfig {
                 let scopes = {
                     let parsed: Vec<String> = get("RIVERS_AUTH_OIDC_SCOPES")
                         .unwrap_or_default()
+                        // Whitespace is itself a delimiter, so tokens never
+                        // carry surrounding whitespace — no trim needed.
                         .split(|c: char| c == ',' || c.is_whitespace())
-                        .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(String::from)
                         .collect();
