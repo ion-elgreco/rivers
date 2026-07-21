@@ -14,10 +14,20 @@ impl CookieStore {
             let sc = sc.to_str().unwrap();
             let (pair, attrs) = sc.split_once(';').unwrap_or((sc, ""));
             let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let name = name.trim();
+            // Enforce the browser `__Host-` prefix rules on BOTH set and
+            // removal: the Set-Cookie must be Secure, Path=/, and carry no
+            // Domain, else the user agent ignores it (this is what makes a
+            // `Secure`-less removal fail to delete the session).
+            if name.starts_with("__Host-")
+                && !(attrs.contains("Secure") && attrs.contains("Path=/") && !attrs.contains("Domain="))
+            {
+                continue;
+            }
             if attrs.contains("Max-Age=0") {
-                self.0.remove(name.trim());
+                self.0.remove(name);
             } else {
-                self.0.insert(name.trim().to_string(), value.to_string());
+                self.0.insert(name.to_string(), value.to_string());
             }
         }
     }

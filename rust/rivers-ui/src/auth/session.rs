@@ -167,6 +167,28 @@ mod tests {
         assert_eq!(read_session(&store.headers(), &key, false).unwrap(), id);
     }
 
+    /// Production runs secure=true (`__Host-` prefix + Secure). Exercise the
+    /// full set → read → logout path through a store that enforces the
+    /// browser `__Host-` rules — a `Secure`-less removal would be rejected and
+    /// leave the user signed in.
+    #[test]
+    fn secure_session_roundtrip_and_logout() {
+        let key = Key::generate();
+        let id = identity(now_ts() + 60);
+        let mut store = CookieStore::default();
+
+        absorb(&mut store, session_response(&key, true, &id));
+        assert!(store.contains(session_cookie_name(true))); // __Host-rivers_session
+        assert_eq!(read_session(&store.headers(), &key, true).unwrap(), id);
+
+        absorb(&mut store, clear_cookies(true));
+        assert!(
+            !store.contains(session_cookie_name(true)),
+            "secure logout must delete the __Host- session cookie"
+        );
+        assert!(read_session(&store.headers(), &key, true).is_none());
+    }
+
     #[test]
     fn expired_session_rejected() {
         let key = Key::generate();
