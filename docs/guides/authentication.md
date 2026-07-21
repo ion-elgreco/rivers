@@ -8,9 +8,10 @@ The rivers UI supports three authentication modes:
 | `oidc` | The UI runs the OpenID Connect authorization-code flow (with PKCE) against your identity provider directly. No proxy required. |
 | `forward` | A reverse proxy in front of rivers authenticates (Authelia, Authentik, oauth2-proxy, Envoy Gateway, …) and rivers trusts the identity headers it injects — but only from peers on an explicit trusted-proxy CIDR list. |
 
-In both enabled modes, every route except `/healthz`, `/readyz`, and `/auth/*`
-requires an identity: pages, server functions, the live-event stream, and
-debug endpoints. Manual launches (materialize, job runs, reruns, backfills)
+In both enabled modes, every route except `/healthz`, `/readyz`, and the
+sign-in endpoints (`/auth/login`, `/auth/callback`, `/auth/logout`) requires
+an identity: pages, server functions, the live-event stream, and debug
+endpoints. Manual launches (materialize, job runs, reruns, backfills)
 record *who* triggered them — the run's `launched_by` carries the user's
 stable subject plus email/name snapshots, shown in the runs list and detail
 pages.
@@ -274,5 +275,8 @@ Forward mode is testable with plain curl:
 RIVERS_AUTH_MODE=forward \
 RIVERS_AUTH_FORWARD_TRUSTED_PROXIES=127.0.0.1/32 \
 rivers dev my_module
-curl -H 'Remote-User: jdoe' http://127.0.0.1:3000/api/whoami
+# A request without the identity header is rejected by the gate:
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3000/                          # 401
+# Add the header a trusted proxy would inject, and the same request is admitted:
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Remote-User: jdoe' http://127.0.0.1:3000/   # not 401
 ```
