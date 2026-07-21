@@ -212,20 +212,17 @@ impl CodeLocationService for CodeLocationImpl {
         request: Request<RerunRunRequest>,
     ) -> Result<Response<RerunRunResponse>, Status> {
         let req = request.into_inner();
-        let launched_by = manual_launch(req.user);
-        // Rebuilds the request from the stored run (partition + tags) for replay.
+        // Rebuilds the request from the stored run (partition + tags) for replay,
+        // stamped with the rerunning user (not the original launcher).
         let rerun = self
             .handle
-            .build_run_rerun_request(&req.run_id)
+            .build_run_rerun_request(&req.run_id, manual_launch(req.user))
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         let status = self.run_dispatcher.mode_label().to_string();
         let run_id = match rerun {
-            crate::daemon::RunRerunRequest::Job(mut run_request) => {
-                // The rerun's provenance is the rerunning user, not the
-                // original launcher (mirrors the materialization arm below).
-                run_request.launched_by = launched_by;
+            crate::daemon::RunRerunRequest::Job(run_request) => {
                 let mut outcome = self
                     .run_dispatcher
                     .dispatch_jobs(&[run_request])
@@ -239,8 +236,7 @@ impl CodeLocationService for CodeLocationImpl {
                     .pop()
                     .expect("dispatch_jobs returned no id for a single non-empty input")
             }
-            crate::daemon::RunRerunRequest::Materialization(mut mat_request) => {
-                mat_request.launched_by = launched_by;
+            crate::daemon::RunRerunRequest::Materialization(mat_request) => {
                 // Materialization run_ids are caller-minted — capture before the
                 // request moves into dispatch (it isn't returned).
                 let run_id = mat_request.run_id.clone();
@@ -622,12 +618,15 @@ impl CodeLocationService for CodeLocationImpl {
     ) -> Result<Response<LaunchBackfillResponse>, Status> {
         let req = request.into_inner();
         // Builds a backfill over the missing partitions; same dispatch as `launch_backfill`.
-        let mut backfill_request = self
+        let backfill_request = self
             .handle
-            .build_missing_backfill_request(&req.asset_key, req.max_concurrency)
+            .build_missing_backfill_request(
+                &req.asset_key,
+                req.max_concurrency,
+                manual_launch(req.user),
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        backfill_request.launched_by = manual_launch(req.user);
 
         let mut outcome = self
             .backfill_dispatcher
@@ -658,12 +657,11 @@ impl CodeLocationService for CodeLocationImpl {
         request: Request<RerunBackfillRequest>,
     ) -> Result<Response<RerunBackfillResponse>, Status> {
         let req = request.into_inner();
-        let mut backfill_request = self
+        let backfill_request = self
             .handle
-            .build_rerun_request(&req.backfill_id, req.dry_run)
+            .build_rerun_request(&req.backfill_id, req.dry_run, manual_launch(req.user))
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        backfill_request.launched_by = manual_launch(req.user);
 
         let mut outcome = self
             .backfill_dispatcher

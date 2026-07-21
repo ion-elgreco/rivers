@@ -1105,3 +1105,49 @@ def test_backfill_status_launched_by_without_user(rerun_grpc_channel):
     status = repo.get_backfill(launch.backfill_id)
     assert status.launched_by == rs.LaunchedBy.manual()
     assert status.launched_by.user is None
+
+
+def test_rerun_backfill_stamps_the_rerunning_user(rerun_grpc_channel):
+    """A backfill rerun is attributed to the user who reran it, not the
+    original launcher."""
+    channel, pb2, pb2_grpc, repo, _ = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    original = stub.LaunchBackfill(
+        pb2.LaunchBackfillRequest(
+            selection=["part_asset"],
+            partition_keys=[_single_partition_key(pb2, "p1")],
+            failure_policy="continue",
+            max_concurrency=1,
+            dry_run=False,
+            user=_user_ref(pb2, subject="alice", email="alice@example.com", name="Alice"),
+        )
+    )
+    rerun = stub.RerunBackfill(
+        pb2.RerunBackfillRequest(
+            backfill_id=original.backfill_id,
+            dry_run=False,
+            user=_user_ref(pb2, subject="bob", email="bob@example.com", name="Bob"),
+        )
+    )
+    assert rerun.backfill_id != original.backfill_id
+    assert repo.get_backfill(original.backfill_id).launched_by.user.subject == "alice"
+    assert repo.get_backfill(rerun.backfill_id).launched_by.user.subject == "bob"
+
+
+def test_materialize_missing_stamps_user(rerun_grpc_channel):
+    """Materialize-missing stamps the acting user onto the backfill record."""
+    channel, pb2, pb2_grpc, repo, _ = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    resp = stub.MaterializeMissing(
+        pb2.MaterializeMissingRequest(
+            asset_key="part_asset",
+            max_concurrency=4,
+            user=_user_ref(pb2, subject="carol", email="carol@example.com", name="Carol"),
+        )
+    )
+    status = repo.get_backfill(resp.backfill_id)
+    assert status is not None
+    assert status.launched_by.kind == "manual"
+    assert status.launched_by.user.subject == "carol"

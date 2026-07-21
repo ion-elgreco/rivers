@@ -1862,6 +1862,7 @@ impl RepoHandle {
         &self,
         backfill_id: &str,
         dry_run: bool,
+        launched_by: rivers_core::storage::LaunchedBy,
     ) -> PyResult<crate::daemon::BackfillRequestData> {
         let storage = {
             let guard = self.state.read().unwrap();
@@ -1906,7 +1907,7 @@ impl RepoHandle {
             failure_policy: Some(failure_policy),
             max_concurrency,
             tags: Some(tag_map),
-            launched_by: rivers_core::storage::LaunchedBy::default(),
+            launched_by,
             dry_run,
             backfill_id: None,
         })
@@ -1918,6 +1919,7 @@ impl RepoHandle {
     pub(crate) async fn build_run_rerun_request(
         &self,
         run_id: &str,
+        launched_by: rivers_core::storage::LaunchedBy,
     ) -> PyResult<crate::daemon::RunRerunRequest> {
         let storage = {
             let guard = self.state.read().unwrap();
@@ -1943,9 +1945,7 @@ impl RepoHandle {
                     tags: Some(tags.into_iter().collect()),
                     partition_key: record.partition_key.as_ref().map(PyPartitionKey::from),
                     job_name: Some(job_name),
-                    // Placeholder — the caller (rerun_run) stamps the
-                    // rerunning user, like the materialization arm below.
-                    launched_by: rivers_core::storage::LaunchedBy::Manual { user: None },
+                    launched_by,
                 },
             )),
             None => Ok(crate::daemon::RunRerunRequest::Materialization(
@@ -1954,7 +1954,7 @@ impl RepoHandle {
                     asset_selection: record.node_names,
                     partition_key: record.partition_key,
                     tags,
-                    launched_by: rivers_core::storage::LaunchedBy::Manual { user: None },
+                    launched_by,
                 },
             )),
         }
@@ -1967,6 +1967,7 @@ impl RepoHandle {
         &self,
         asset_key: &str,
         max_concurrency: u32,
+        launched_by: rivers_core::storage::LaunchedBy,
     ) -> PyResult<crate::daemon::BackfillRequestData> {
         // Dynamic keys live in storage, not the def — capture the namespace and
         // fetch after dropping the guard; other kinds enumerate from the def here.
@@ -2043,7 +2044,7 @@ impl RepoHandle {
             tags: None,
             dry_run: false,
             backfill_id: None,
-            launched_by: rivers_core::storage::LaunchedBy::default(),
+            launched_by,
         })
     }
 
