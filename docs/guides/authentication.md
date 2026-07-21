@@ -64,6 +64,13 @@ must be base64 of at least 32 bytes. Rotating it signs every user out at
 once. When the session expires the next page load transparently re-runs the
 redirect — invisible while the IdP session is alive.
 
+Outside the chart (docker-compose, bare processes), set
+`RIVERS_AUTH_COOKIE_SECRET` explicitly — e.g. `openssl rand -base64 48`.
+Without it each process generates an ephemeral key at startup (logged as a
+warning): sessions die on every restart, and behind a load balancer each
+replica mints cookies the others can't decrypt, so logins bounce back to
+the IdP indefinitely.
+
 ## Forward auth
 
 The proxy owns login; rivers consumes the identity headers it injects.
