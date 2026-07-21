@@ -8,10 +8,7 @@ use crate::types::SubmitPartitionKey;
 /// Session identity as a proto `UserRef`; `None` in auth mode `none`.
 #[cfg(feature = "ssr")]
 async fn current_user_ref() -> Option<rivers_api::rivers::UserRef> {
-    let identity = leptos_axum::extract::<axum::Extension<crate::auth::Identity>>()
-        .await
-        .ok()
-        .map(|axum::Extension(id)| id)?;
+    let identity = super::current_identity().await?;
     Some(rivers_api::rivers::UserRef {
         subject: identity.subject,
         email: identity.email,

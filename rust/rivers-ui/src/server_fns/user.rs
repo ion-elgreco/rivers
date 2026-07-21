@@ -8,16 +8,13 @@ use crate::types::{CurrentUser, UserRef};
 /// inserted the identity extension.
 #[server]
 pub async fn get_current_user() -> Result<Option<CurrentUser>, ServerFnError> {
-    use crate::auth::{AuthCtx, Identity};
+    use crate::auth::AuthCtx;
 
     let auth = expect_context::<AuthCtx>();
     let Some(rt) = auth.0 else {
         return Ok(None);
     };
-    let identity = leptos_axum::extract::<axum::Extension<Identity>>()
-        .await
-        .ok()
-        .map(|axum::Extension(id)| id);
+    let identity = super::current_identity().await;
     Ok(identity.map(|id| CurrentUser {
         user: UserRef {
             subject: id.subject,
