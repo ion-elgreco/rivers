@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-polars  = ["polars>=1.33.1"]
+polars  = ["polars>=1.42.1"]
 pyarrow = ["pyarrow>=18.0.0"]
 datafusion = ["datafusion>=53"]
 pandas  = ["pandas>=2.0.0", "pyarrow>=18.0.0"]
