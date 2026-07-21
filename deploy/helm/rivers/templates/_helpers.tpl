@@ -262,7 +262,7 @@ only; nothing is emitted in mode "none".
   valueFrom:
     secretKeyRef:
       name: {{ $auth.cookieSecret.existingSecret | default (include "rivers.uiAuthCookieSecretName" .) }}
-      key: {{ $auth.cookieSecret.secretKey }}
+      key: {{ $auth.cookieSecret.secretKey | quote }}
 - name: RIVERS_AUTH_OIDC_ISSUER
   value: {{ $auth.oidc.issuer | quote }}
 - name: RIVERS_AUTH_OIDC_CLIENT_ID
