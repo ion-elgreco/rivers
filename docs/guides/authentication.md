@@ -205,6 +205,12 @@ ui:
     allowedUsers: ["ops@example.com"]    # email or subject
 ```
 
+Email-based rules (`allowedDomains`, and `allowedUsers` matched by email) only
+trust the OIDC `email` claim when the IdP marks it verified
+(`email_verified: true`) — an unverified address is ignored for access control
+and identity. For IdPs that don't assert `email_verified`, gate on
+`allowedGroups` or on `allowedUsers` by subject instead.
+
 Denied users get a `403` page naming the identity and the gate. Finer roles
 (viewer/launcher/admin, per-code-location grants) are a planned follow-up
 on top of the groups already captured in the session.

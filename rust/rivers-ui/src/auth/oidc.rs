@@ -365,9 +365,16 @@ pub async fn callback(
     let groups = rt
         .allow
         .relevant_groups(extract_groups(&claims.additional_claims().0, &o.cfg.groups_claim));
+    // Trust the email claim only when the IdP asserts it's verified: an
+    // unverified address is attacker-settable and must never satisfy
+    // allowedDomains/allowedUsers (nor stand in as the identity).
+    let email = claims
+        .email()
+        .filter(|_| claims.email_verified() == Some(true))
+        .map(|e| e.to_string());
     let identity = Identity {
         subject: claims.subject().to_string(),
-        email: claims.email().map(|e| e.to_string()),
+        email,
         name: claims
             .name()
             .and_then(|n| n.get(None))

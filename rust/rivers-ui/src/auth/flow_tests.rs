@@ -187,6 +187,10 @@ struct MockIdp {
     nonce: Mutex<Option<String>>,
     subject: String,
     email: String,
+    /// `email_verified` claim baked into the ID token; `Some(true)` is the
+    /// normal org-IdP case. Flip to `Some(false)`/`None` to model an IdP that
+    /// lets a user self-assert an unverified address.
+    email_verified: Mutex<Option<bool>>,
     groups: Vec<String>,
     /// Current signing-key id; both `/jwks` and `/token` read it, so flipping
     /// it simulates an IdP key rotation.
@@ -254,6 +258,7 @@ async fn token(State(idp): State<MockState>) -> Json<serde_json::Value> {
         chrono::Utc::now(),
         StandardClaims::new(SubjectIdentifier::new(idp.subject.clone()))
             .set_email(Some(EndUserEmail::new(idp.email.clone())))
+            .set_email_verified(*idp.email_verified.lock().unwrap())
             .set_name(Some(name)),
         RawClaims(groups),
     )
@@ -293,6 +298,7 @@ async fn spawn_mock_idp_with_groups(subject: &str, email: &str, groups: Vec<Stri
         nonce: Mutex::new(None),
         subject: subject.to_string(),
         email: email.to_string(),
+        email_verified: Mutex::new(Some(true)),
         groups,
         key_id: Mutex::new("test".into()),
         discovery_fails: Mutex::new(false),
@@ -717,6 +723,53 @@ async fn oidc_allowlist_denies_at_callback_and_after() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// An unverified `email` claim must NOT satisfy the domain allowlist. An IdP
+/// that lets users self-assert an address (email_verified=false) would
+/// otherwise let an attacker forge membership in an allowed domain.
+#[tokio::test]
+async fn oidc_unverified_email_is_not_trusted_for_allowlist() {
+    let idp = spawn_mock_idp("sub-42", "attacker@example.com").await;
+    *idp.email_verified.lock().unwrap() = Some(false);
+    let allow = Allowlists {
+        domains: vec!["example.com".into()],
+        ..Default::default()
+    };
+    let rt = oidc_rt(&idp, allow).await;
+    let app = app(Some(rt));
+
+    let (callback, store) = drive_login(&app, &idp).await;
+    let resp = app
+        .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "unverified email must not satisfy the domain allowlist"
+    );
+}
+
+/// The normal path: a verified email claim satisfies the domain allowlist.
+/// Guards against over-gating that would deny legitimate verified users.
+#[tokio::test]
+async fn oidc_verified_email_satisfies_domain_allowlist() {
+    // email_verified defaults to Some(true) in the mock IdP.
+    let idp = spawn_mock_idp("sub-42", "john.doe@example.com").await;
+    let allow = Allowlists {
+        domains: vec!["example.com".into()],
+        ..Default::default()
+    };
+    let rt = oidc_rt(&idp, allow).await;
+    let app = app(Some(rt));
+
+    let (callback, store) = drive_login(&app, &idp).await;
+    let resp = app
+        .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "verified email admits");
 }
 
 #[tokio::test]
