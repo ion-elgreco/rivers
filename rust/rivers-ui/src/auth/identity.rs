@@ -57,7 +57,9 @@ impl Allowlists {
             return true;
         }
         self.users.iter().any(|u| {
-            u == &id.subject || email.as_deref() == Some(u.to_ascii_lowercase().as_str())
+            // Subject is an exact match; email is case-insensitive without
+            // allocating a lowercased copy of each configured user per request.
+            u == &id.subject || email.as_deref().is_some_and(|e| u.eq_ignore_ascii_case(e))
         })
     }
 }
@@ -140,5 +142,22 @@ mod tests {
         };
         assert!(allow.permits(&id(Some("JOHN.DOE@example.com"), &[])));
         assert!(!allow.permits(&id(Some("bob@example.com"), &[])));
+    }
+
+    /// Email matching is case-insensitive on both sides — a mixed-case
+    /// configured user still admits a differently-cased email — while the
+    /// subject compare stays exact.
+    #[test]
+    fn user_email_match_is_case_insensitive_both_sides() {
+        let allow = Allowlists {
+            users: vec!["Ops@Example.COM".into()],
+            ..Default::default()
+        };
+        assert!(allow.permits(&id(Some("ops@example.com"), &[])));
+        assert!(allow.permits(&id(Some("OPS@EXAMPLE.COM"), &[])));
+        assert!(!allow.permits(&id(Some("other@example.com"), &[])));
+        // A case-variant of the configured value is NOT a subject match
+        // (subjects are exact), so an unrelated email is still denied.
+        assert!(!allow.permits(&id(None, &[])));
     }
 }
