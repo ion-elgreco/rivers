@@ -21,7 +21,7 @@ from rivers._core.partitions import (
 )
 from rivers._core.schedule import Schedule, ScheduleTickResult
 from rivers._core.sensor import Sensor, SensorTickResult
-from rivers._core.storage import Storage
+from rivers._core.storage import LaunchedBy, Storage
 
 T = TypeVar("T")
 
@@ -104,6 +104,8 @@ class BackfillStatus:
     """Error message if the backfill itself failed (vs. individual partitions)."""
     tags: list[tuple[str, str]]
     """Tags attached to every run launched by the backfill."""
+    launched_by: LaunchedBy
+    """Origin of this backfill (manual with optional acting user, sensor, …)."""
 
 class CodeRepository:
     """Top-level container — declares the assets, tasks, jobs, and automations

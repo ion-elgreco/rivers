@@ -318,7 +318,7 @@ use crate::partitions::{
     resolve_partitions_def_ref,
 };
 use crate::result_types;
-use crate::storage::{PyStorage, PyStorageType};
+use crate::storage::{PyLaunchedBy, PyStorage, PyStorageType};
 use crate::task::{PyBashTask, PyTask};
 
 use self::resolved_node::{ResolvedAsset, ResolvedBashTask, ResolvedNode, ResolvedTask};
@@ -479,6 +479,7 @@ pub struct PyBackfillStatusResult {
     pub run_ids: Vec<String>,
     pub error: Option<String>,
     pub tags: Vec<(String, String)>,
+    pub launched_by: PyLaunchedBy,
 }
 
 #[pymethods]
@@ -1850,6 +1851,7 @@ impl RepoHandle {
             run_ids: r.run_ids,
             error: r.error,
             tags: r.tags,
+            launched_by: r.launched_by.into(),
         }))
     }
 

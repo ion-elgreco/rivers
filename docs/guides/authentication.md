@@ -217,6 +217,9 @@ record = storage.get_run(run_id)
 assert record.launched_by.kind == "manual"
 if record.launched_by.user is not None:
     print(record.launched_by.user.subject, record.launched_by.user.display)
+
+status = repo.get_backfill(backfill_id)
+print(status.launched_by.kind, status.launched_by.user)
 ```
 
 Runs from schedules, sensors, conditions, and the Python API

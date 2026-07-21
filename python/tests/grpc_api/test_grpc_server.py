@@ -1037,3 +1037,49 @@ def test_rerun_run_stamps_the_rerunning_user(rerun_grpc_channel):
     rerun_record = storage.get_run(rerun.run_id)
     assert orig_record.launched_by.user.subject == "alice"
     assert rerun_record.launched_by.user.subject == "bob"
+
+
+def test_backfill_status_exposes_launched_by(rerun_grpc_channel):
+    """Backfill provenance must be readable back through the Python API,
+    not just stored and rendered in the web UI."""
+    channel, pb2, pb2_grpc, repo, _ = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    launch = stub.LaunchBackfill(
+        pb2.LaunchBackfillRequest(
+            selection=["part_asset"],
+            partition_keys=[
+                _single_partition_key(pb2, "p1"),
+                _single_partition_key(pb2, "p2"),
+            ],
+            failure_policy="continue",
+            max_concurrency=1,
+            dry_run=False,
+            user=_user_ref(pb2),
+        )
+    )
+    status = repo.get_backfill(launch.backfill_id)
+    assert status is not None
+    assert status.launched_by.kind == "manual"
+    user = status.launched_by.user
+    assert user is not None
+    assert user.subject == "sub-42"
+    assert user.display == "John Doe"
+
+
+def test_backfill_status_launched_by_without_user(rerun_grpc_channel):
+    channel, pb2, pb2_grpc, repo, _ = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    launch = stub.LaunchBackfill(
+        pb2.LaunchBackfillRequest(
+            selection=["part_asset"],
+            partition_keys=[_single_partition_key(pb2, "p3")],
+            failure_policy="continue",
+            max_concurrency=1,
+            dry_run=False,
+        )
+    )
+    status = repo.get_backfill(launch.backfill_id)
+    assert status.launched_by == rs.LaunchedBy.manual()
+    assert status.launched_by.user is None
