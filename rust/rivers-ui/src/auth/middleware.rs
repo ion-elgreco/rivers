@@ -34,7 +34,7 @@ pub async fn require_auth(
     }
     match &rt.kind {
         RuntimeKind::Oidc(o) => {
-            if let Some(identity) = read_session(req.headers(), &o.cookie_key, o.secure_cookies) {
+            if let Some(identity) = read_session(req.headers(), &o.cookie_key, o.cfg.secure_cookies()) {
                 if !rt.allow.permits(&identity) {
                     return forbidden_page(&identity, Some("/auth/logout"));
                 }

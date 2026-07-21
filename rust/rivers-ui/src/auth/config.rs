@@ -36,6 +36,14 @@ pub struct OidcConfig {
     pub session_ttl_secs: i64,
 }
 
+impl OidcConfig {
+    /// Cookies carry the `Secure` attribute (and `__Host-` prefix) exactly when
+    /// the public URL is https — a pure function of `public_url`.
+    pub fn secure_cookies(&self) -> bool {
+        self.public_url.starts_with("https://")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForwardConfig {
     /// CIDRs whose socket peers may assert identity headers.
@@ -236,6 +244,23 @@ mod tests {
             AuthMode::Oidc(o) => o.scopes,
             other => panic!("expected oidc, got {other:?}"),
         }
+    }
+
+    fn oidc_cfg(map: &HashMap<String, String>) -> OidcConfig {
+        match AuthConfig::from_map(map).unwrap().mode {
+            AuthMode::Oidc(o) => o,
+            other => panic!("expected oidc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secure_cookies_follows_public_url_scheme() {
+        let mut https = oidc_map(None);
+        https.insert("RIVERS_AUTH_PUBLIC_URL".into(), "https://r.example.com".into());
+        assert!(oidc_cfg(&https).secure_cookies());
+        let mut http = oidc_map(None);
+        http.insert("RIVERS_AUTH_PUBLIC_URL".into(), "http://localhost:3000".into());
+        assert!(!oidc_cfg(&http).secure_cookies());
     }
 
     #[test]

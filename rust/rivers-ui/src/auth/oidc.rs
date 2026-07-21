@@ -80,7 +80,6 @@ pub struct OidcRuntime {
     pub http: reqwest::Client,
     pub cfg: OidcConfig,
     pub cookie_key: Key,
-    pub secure_cookies: bool,
     pub end_session_endpoint: Option<String>,
 }
 
@@ -154,7 +153,6 @@ impl OidcRuntime {
             .build()
             .context("failed to build OIDC http client")?;
         let (client, end_session_endpoint) = discover_client(&cfg, &http).await?;
-        let secure_cookies = cfg.public_url.starts_with("https://");
         let cookie_key = match &cfg.cookie_secret {
             Some(bytes) => Key::derive_from(bytes),
             None => {
@@ -173,7 +171,6 @@ impl OidcRuntime {
             http,
             cfg,
             cookie_key,
-            secure_cookies,
             end_session_endpoint,
         })
     }
@@ -287,7 +284,7 @@ pub async fn login(
         iat: now_ts(),
     };
     (
-        pending_login_jar(&o.cookie_key, o.secure_cookies, &pending),
+        pending_login_jar(&o.cookie_key, o.cfg.secure_cookies(), &pending),
         Redirect::to(auth_url.as_str()),
     )
         .into_response()
@@ -313,7 +310,7 @@ pub async fn callback(
     // forged callback must not be able to log out an already-signed-in user.
     let fail = |detail: String| {
         (
-            clear_state_cookie(o.secure_cookies),
+            clear_state_cookie(o.cfg.secure_cookies()),
             error_page(
                 axum::http::StatusCode::BAD_GATEWAY,
                 "Sign-in failed",
@@ -331,7 +328,7 @@ pub async fn callback(
         };
         return fail(format!("the identity provider returned an error — {detail}"));
     }
-    let Some(pending) = read_pending_login(&headers, &o.cookie_key, o.secure_cookies) else {
+    let Some(pending) = read_pending_login(&headers, &o.cookie_key, o.cfg.secure_cookies()) else {
         return fail("login session missing or expired".to_string());
     };
     if q.state.as_deref() != Some(pending.state.as_str()) {
@@ -395,7 +392,7 @@ pub async fn callback(
         // Session cookie still set so the forbidden page's sign-out link
         // works; allowlists are re-checked per request against the identity
         // snapshot taken here (IdP-side changes land at the next sign-in).
-        let (jar, clear_state) = session_response(&o.cookie_key, o.secure_cookies, &identity);
+        let (jar, clear_state) = session_response(&o.cookie_key, o.cfg.secure_cookies(), &identity);
         return (jar, clear_state, forbidden_page(&identity, Some("/auth/logout"))).into_response();
     }
     tracing::info!(
@@ -404,7 +401,7 @@ pub async fn callback(
         email = identity.email.as_deref().unwrap_or(""),
         "user signed in"
     );
-    let (jar, clear_state) = session_response(&o.cookie_key, o.secure_cookies, &identity);
+    let (jar, clear_state) = session_response(&o.cookie_key, o.cfg.secure_cookies(), &identity);
     (jar, clear_state, Redirect::to(&pending.rd)).into_response()
 }
 
@@ -441,7 +438,7 @@ pub async fn logout(State(rt): State<Arc<AuthRuntime>>) -> Response {
     let Some(o) = expect_oidc(&rt) else {
         return error_page(axum::http::StatusCode::NOT_FOUND, "Not found", "", None);
     };
-    let clear = clear_cookies(o.secure_cookies);
+    let clear = clear_cookies(o.cfg.secure_cookies());
     if o.cfg.rp_logout {
         if let Some(end) = &o.end_session_endpoint {
             if let Ok(mut url) = url::Url::parse(end) {
