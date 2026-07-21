@@ -56,14 +56,15 @@ impl ForwardRuntime {
                 .map(String::from)
         };
         let subject = get(&self.cfg.user_header)?;
-        let groups = get(&self.cfg.groups_header)
-            .map(|g| {
-                g.split(',')
-                    .map(|p| p.trim().to_string())
-                    .filter(|p| !p.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Every header line counts — proxies may emit one line per group.
+        let groups = headers
+            .get_all(&self.cfg.groups_header)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|line| line.split(','))
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
         Some(Identity {
             subject,
             email: get(&self.cfg.email_header),
@@ -107,6 +108,22 @@ mod tests {
         let mut c = cfg();
         c.trusted_proxies = vec!["not-a-cidr".into()];
         assert!(ForwardRuntime::new(c).is_err());
+    }
+
+    /// Proxies may emit one header line per group (Envoy, oauth2-proxy
+    /// configurations); all lines must contribute, not just the first.
+    #[test]
+    fn repeated_groups_header_lines_all_count() {
+        let rt = ForwardRuntime::new(cfg()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Remote-User", HeaderValue::from_static("jdoe"));
+        headers.append("Remote-Groups", HeaderValue::from_static("data-eng"));
+        headers.append("Remote-Groups", HeaderValue::from_static("admins, ops"));
+        let id = rt.identity_from_headers(&headers).unwrap();
+        assert_eq!(
+            id.groups,
+            vec!["data-eng".to_string(), "admins".into(), "ops".into()]
+        );
     }
 
     #[test]
