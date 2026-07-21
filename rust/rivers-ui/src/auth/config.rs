@@ -316,4 +316,33 @@ mod tests {
         ok.insert("RIVERS_AUTH_SESSION_TTL".into(), "3600".to_string());
         assert!(AuthConfig::from_map(&ok).is_ok());
     }
+
+    #[test]
+    fn session_ttl_rejects_zero_and_negative() {
+        // TTL <= 0 → expires_at = now_ts() + 0 (or negative) → read_session
+        // rejects every session → an endless login-redirect loop.
+        for bad in ["0", "-1"] {
+            let mut m = oidc_map(None);
+            m.insert("RIVERS_AUTH_SESSION_TTL".into(), bad.to_string());
+            assert!(AuthConfig::from_map(&m).is_err(), "TTL {bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn cookie_secret_rejects_under_32_bytes() {
+        // A secret under 32 bytes would panic Key::derive_from at startup, so
+        // config must reject it; exactly 32 bytes is accepted.
+        let mut short = oidc_map(None);
+        short.insert(
+            "RIVERS_AUTH_COOKIE_SECRET".into(),
+            base64::engine::general_purpose::STANDARD.encode([0u8; 16]),
+        );
+        assert!(AuthConfig::from_map(&short).is_err(), "a <32-byte secret must be rejected");
+        let mut ok = oidc_map(None);
+        ok.insert(
+            "RIVERS_AUTH_COOKIE_SECRET".into(),
+            base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+        );
+        assert!(AuthConfig::from_map(&ok).is_ok(), "a 32-byte secret is accepted");
+    }
 }
