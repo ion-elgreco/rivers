@@ -89,6 +89,27 @@ const ICON_DEPLOYMENT: &str = r#"<rect x="4" y="4" width="16" height="16" rx="2"
 
 const ICON_COLLAPSE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>"#;
 
+/// Browser `encodeURIComponent` — encodes the query delimiters so a path with
+/// a query survives as a single `rd` value. Only reachable on the client.
+#[cfg(target_arch = "wasm32")]
+mod js {
+    use wasm_bindgen::prelude::wasm_bindgen;
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_name = encodeURIComponent)]
+        pub fn encode_uri_component(s: &str) -> String;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn encode_rd(s: &str) -> String {
+    js::encode_uri_component(s)
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn encode_rd(s: &str) -> String {
+    s.to_string()
+}
+
 /// Signed-in user + sign-out link; renders nothing in auth mode `none`.
 /// Refetches on SPA navigation; a 401 hard-redirects into the login flow.
 #[component]
@@ -100,14 +121,20 @@ fn CurrentUserChip(collapsed: Signal<bool>) -> impl IntoView {
         if let Some(Err(e)) = user.get() {
             if crate::helpers::is_unauthorized(&e) {
                 let loc = window().location();
-                let rd = loc.pathname().unwrap_or_else(|_| "/".into());
+                // Preserve the full path + query so filters/pagination survive
+                // the round-trip through login (encoded to stay one rd value).
+                let path = loc.pathname().unwrap_or_else(|_| "/".into());
+                let query = loc.search().unwrap_or_default();
+                let rd = encode_rd(&format!("{path}{query}"));
                 let _ = loc.assign(&format!("/auth/login?rd={rd}"));
             }
         }
     });
 
     view! {
-        <Suspense fallback=|| ()>
+        // `Transition`, not `Suspense`: keep the chip visible across SPA
+        // navigations instead of blinking to the empty fallback each time.
+        <Transition fallback=|| ()>
             {move || user.get().and_then(|res| res.ok().flatten()).map(|u| {
                 let title = u.email.clone().unwrap_or_else(|| u.subject.clone());
                 let display = u.display().to_string();
@@ -124,7 +151,7 @@ fn CurrentUserChip(collapsed: Signal<bool>) -> impl IntoView {
                     </div>
                 }
             })}
-        </Suspense>
+        </Transition>
     }
 }
 
