@@ -210,12 +210,22 @@ Denied users get a `403` page naming the identity and the gate. Finer roles
 on top of the groups already captured in the session.
 
 Allowlists are enforced on every request, but the identity they check —
-subject, email, groups — is snapshotted into the session cookie at sign-in.
-IdP-side changes (removing a user from a group, disabling the account) only
-take hold at the next sign-in, so at most `sessionTtl` (default 8h) later.
-Tightening the *allowlist* locks a session out immediately; to evict
-everyone at once, rotate the cookie secret. Pick a `sessionTtl` that matches
-how fast revocation must propagate.
+subject, email, and groups — is snapshotted into the session cookie at
+sign-in. To keep the cookie small, only the groups that match the allowlist
+*at sign-in time* are stored. Consequences:
+
+- **Removing** a user from the allowlist (or from a group) — and any
+  IdP-side change like disabling the account — takes hold at the next
+  sign-in, so at most `sessionTtl` (default 8h) later. To evict everyone
+  immediately, rotate the cookie secret (signs all sessions out at once).
+- **Tightening** `allowedGroups`/`allowedDomains`/`allowedUsers` locks
+  existing sessions out on their next request.
+- **Adding a group** to `allowedGroups` only admits existing sessions after
+  they sign in again (that group wasn't stored in their cookie). Expanding
+  `allowedDomains`/`allowedUsers` *is* immediate — email and subject are
+  stored in full.
+
+Pick a `sessionTtl` that matches how fast access changes must propagate.
 
 ## Who launched what
 
