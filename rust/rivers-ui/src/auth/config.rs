@@ -8,6 +8,9 @@ use base64::Engine;
 use std::collections::HashMap;
 
 pub const DEFAULT_SESSION_TTL_SECS: i64 = 8 * 60 * 60;
+/// Cap on `RIVERS_AUTH_SESSION_TTL` (10 years) — well beyond any real session
+/// yet far from i64::MAX, so `now_ts() + ttl` can't overflow.
+const MAX_SESSION_TTL_SECS: i64 = 10 * 365 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AuthMode {
@@ -137,8 +140,12 @@ impl AuthConfig {
                     })
                     .transpose()?
                     .unwrap_or(DEFAULT_SESSION_TTL_SECS);
-                if session_ttl_secs <= 0 {
-                    bail!("RIVERS_AUTH_SESSION_TTL must be positive");
+                // Upper bound keeps now_ts() + session_ttl_secs from overflowing
+                // i64 (which would wrap negative and instantly expire sessions).
+                if session_ttl_secs <= 0 || session_ttl_secs > MAX_SESSION_TTL_SECS {
+                    bail!(
+                        "RIVERS_AUTH_SESSION_TTL must be between 1 and {MAX_SESSION_TTL_SECS} seconds"
+                    );
                 }
                 // Accept comma- and/or space-separated (the OAuth wire form),
                 // in one pass — the Helm default is space-separated.
@@ -247,5 +254,18 @@ mod tests {
     fn scopes_default_when_unset() {
         let cfg = AuthConfig::from_map(&oidc_map(None)).unwrap();
         assert_eq!(scopes_of(cfg), vec!["openid", "profile", "email"]);
+    }
+
+    #[test]
+    fn session_ttl_rejects_overflowing_values() {
+        // now_ts() + session_ttl_secs must not overflow i64 (would wrap negative
+        // and instantly expire every session).
+        let mut m = oidc_map(None);
+        m.insert("RIVERS_AUTH_SESSION_TTL".into(), i64::MAX.to_string());
+        assert!(AuthConfig::from_map(&m).is_err(), "absurd TTL must be rejected");
+        // A sane TTL still parses.
+        let mut ok = oidc_map(None);
+        ok.insert("RIVERS_AUTH_SESSION_TTL".into(), "3600".to_string());
+        assert!(AuthConfig::from_map(&ok).is_ok());
     }
 }
