@@ -367,19 +367,22 @@ pub async fn callback(
 }
 
 fn extract_groups(claims: &serde_json::Map<String, serde_json::Value>, claim: &str) -> Vec<String> {
-    // Dotted claim names traverse nested objects (Keycloak realm roles live
-    // at `realm_access.roles`).
-    let mut value = None;
-    let mut cursor = claims;
-    let mut parts = claim.split('.').peekable();
-    while let Some(part) = parts.next() {
-        match cursor.get(part) {
-            Some(serde_json::Value::Object(next)) if parts.peek().is_some() => cursor = next,
-            Some(v) if parts.peek().is_none() => {
-                value = Some(v);
-                break;
+    // Literal name first — Auth0-style namespaced claims contain dots
+    // (`https://myapp.example.com/groups`). Only then treat dots as nested
+    // traversal (Keycloak realm roles live at `realm_access.roles`).
+    let mut value = claims.get(claim);
+    if value.is_none() {
+        let mut cursor = claims;
+        let mut parts = claim.split('.').peekable();
+        while let Some(part) = parts.next() {
+            match cursor.get(part) {
+                Some(serde_json::Value::Object(next)) if parts.peek().is_some() => cursor = next,
+                Some(v) if parts.peek().is_none() => {
+                    value = Some(v);
+                    break;
+                }
+                _ => break,
             }
-            _ => break,
         }
     }
     match value {
@@ -438,12 +441,19 @@ mod tests {
                 "groups": ["eng", "admins"],
                 "flat": "a, b ,",
                 "realm_access": {"roles": ["r1", "r2"]},
+                // Auth0-style namespaced claim: the name itself contains dots.
+                "https://myapp.example.com/groups": ["ns1", "ns2"],
             }),
         )
         .unwrap();
         assert_eq!(extract_groups(&claims, "groups"), vec!["eng", "admins"]);
         assert_eq!(extract_groups(&claims, "flat"), vec!["a", "b"]);
         assert_eq!(extract_groups(&claims, "realm_access.roles"), vec!["r1", "r2"]);
+        assert_eq!(
+            extract_groups(&claims, "https://myapp.example.com/groups"),
+            vec!["ns1", "ns2"],
+            "literal claim names must win over dotted traversal"
+        );
         assert!(extract_groups(&claims, "missing").is_empty());
     }
 }
