@@ -43,7 +43,11 @@ impl Allowlists {
         }
         let email = id.email.as_deref().map(str::to_ascii_lowercase);
         if let Some(email) = &email {
-            if let Some(domain) = email.rsplit_once('@').map(|(_, d)| d) {
+            if let Some(domain) = email
+                .rsplit_once('@')
+                .filter(|(local, _)| !local.is_empty())
+                .map(|(_, d)| d)
+            {
                 if self.domains.iter().any(|d| d == domain) {
                     return true;
                 }
@@ -92,6 +96,17 @@ mod tests {
         assert!(allow.permits(&id(Some("John.Doe@Example.COM"), &[])));
         assert!(!allow.permits(&id(Some("john.doe@other.com"), &[])));
         assert!(!allow.permits(&id(None, &[])));
+    }
+
+    /// An empty local part (`@example.com`) is not a real account in the
+    /// domain and must not satisfy a domain allowlist.
+    #[test]
+    fn domain_match_requires_a_non_empty_local_part() {
+        let allow = Allowlists {
+            domains: vec!["example.com".into()],
+            ..Default::default()
+        };
+        assert!(!allow.permits(&id(Some("@example.com"), &[])));
     }
 
     #[test]
