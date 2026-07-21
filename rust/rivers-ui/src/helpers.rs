@@ -643,17 +643,17 @@ pub fn is_unauthorized(err: &ServerFnError) -> bool {
 /// name would hide the user. `None` lets `LaunchedByCell` fall back to its own
 /// default sub-line (schedule/sensor/backfill name).
 pub fn launched_by_sub_line(l: &LaunchedBy, job_name: Option<&str>) -> Option<String> {
-    match l {
-        LaunchedBy::Manual { user } => {
-            let user = user.as_ref().map(|u| u.display().to_string());
-            match (job_name, user) {
-                (Some(job), Some(user)) => Some(format!("{job} · {user}")),
-                (Some(job), None) => Some(job.to_string()),
-                (None, Some(user)) => Some(user),
-                (None, None) => None,
-            }
-        }
-        _ => None,
+    // Non-manual origins fall back to the cell's own default sub-line; for
+    // manual runs, reuse `launched_by_display`'s user payload (single source of
+    // the user-display rule) and layer the job name on top.
+    if !matches!(l, LaunchedBy::Manual { .. }) {
+        return None;
+    }
+    let (_, _, _, user) = launched_by_display(l);
+    match (job_name, user) {
+        (Some(job), Some(user)) => Some(format!("{job} · {user}")),
+        (Some(job), None) => Some(job.to_string()),
+        (None, sub) => sub,
     }
 }
 
