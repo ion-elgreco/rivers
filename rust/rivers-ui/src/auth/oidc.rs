@@ -351,8 +351,9 @@ pub async fn callback(
         expires_at: now_ts() + o.cfg.session_ttl_secs,
     };
     if !rt.allow.permits(&identity) {
-        // Session cookie still set so the forbidden page's sign-out
-        // link works; allowlists are re-checked per request.
+        // Session cookie still set so the forbidden page's sign-out link
+        // works; allowlists are re-checked per request against the identity
+        // snapshot taken here (IdP-side changes land at the next sign-in).
         let (jar, clear_state) = session_response(&o.cookie_key, o.secure_cookies, &identity);
         return (jar, clear_state, forbidden_page(&identity, Some("/auth/logout"))).into_response();
     }

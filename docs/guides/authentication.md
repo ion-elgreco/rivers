@@ -197,6 +197,14 @@ Denied users get a `403` page naming the identity and the gate. Finer roles
 (viewer/launcher/admin, per-code-location grants) are a planned follow-up
 on top of the groups already captured in the session.
 
+Allowlists are enforced on every request, but the identity they check —
+subject, email, groups — is snapshotted into the session cookie at sign-in.
+IdP-side changes (removing a user from a group, disabling the account) only
+take hold at the next sign-in, so at most `sessionTtl` (default 8h) later.
+Tightening the *allowlist* locks a session out immediately; to evict
+everyone at once, rotate the cookie secret. Pick a `sessionTtl` that matches
+how fast revocation must propagate.
+
 ## Who launched what
 
 With auth enabled, manual actions carry the acting user end-to-end: the UI
