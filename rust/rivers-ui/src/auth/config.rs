@@ -179,7 +179,9 @@ impl AuthConfig {
                     }
                 };
                 AuthMode::Oidc(OidcConfig {
-                    issuer: require("RIVERS_AUTH_OIDC_ISSUER")?.trim_end_matches('/').to_string(),
+                    // Exact-match identifier (unlike public_url): keep any
+                    // trailing slash or discovery's issuer compare rejects Auth0.
+                    issuer: require("RIVERS_AUTH_OIDC_ISSUER")?.trim().to_string(),
                     client_id: require("RIVERS_AUTH_OIDC_CLIENT_ID")?,
                     client_secret: nonempty(get, "RIVERS_AUTH_OIDC_CLIENT_SECRET"),
                     public_url,
@@ -259,6 +261,16 @@ mod tests {
         let mut http = oidc_map(None);
         http.insert("RIVERS_AUTH_PUBLIC_URL".into(), "http://localhost:3000".into());
         assert!(!oidc_cfg(&http).secure_cookies());
+    }
+
+    #[test]
+    fn oidc_issuer_preserves_a_trailing_slash() {
+        // The OIDC issuer is an exact-match identifier; Auth0's canonical
+        // issuer ends in '/', and discovery compares issuer strings verbatim.
+        // Stripping the slash would abort startup for such IdPs.
+        let mut m = oidc_map(None);
+        m.insert("RIVERS_AUTH_OIDC_ISSUER".into(), "https://tenant.auth0.com/".into());
+        assert_eq!(oidc_cfg(&m).issuer, "https://tenant.auth0.com/");
     }
 
     #[test]
