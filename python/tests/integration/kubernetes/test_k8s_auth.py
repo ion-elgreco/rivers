@@ -38,32 +38,6 @@ UI_PORT = 3000
 UI_LOCAL_PORT = 18300
 
 
-def _ui_deployed() -> bool:
-    try:
-        Deployment.get(UI_DEPLOYMENT, namespace=NAMESPACE, api=kube_api())
-        return True
-    except Exception:
-        return False
-
-
-_reachable = _cluster_reachable()
-pytestmark = [
-    cluster_gate(
-        _reachable,
-        f"k3d cluster '{KUBECTL_CONTEXT}' not reachable or namespace '{NAMESPACE}' missing",
-    ),
-    # UI-less deploys (RIVERS_K8S_SKIP_UI=1) are legitimate even in CI —
-    # skip rather than fail.
-    pytest.mark.skipif(
-        _reachable and not _ui_deployed(),
-        reason="rivers-ui deployment not present (UI-less deploy)",
-    ),
-    # Each test rolls the UI deployment (and one installs a Helm chart) —
-    # far beyond the repo-wide 60s per-test budget.
-    pytest.mark.timeout(900),
-]
-
-
 def _retry_api(fn, attempts: int = 5, delay: float = 3.0):
     """The k3d API server can 504 briefly under image-pull / install load."""
     last: Exception | None = None
@@ -74,6 +48,41 @@ def _retry_api(fn, attempts: int = 5, delay: float = 3.0):
             last = e
             time.sleep(delay)
     raise last
+
+
+def _ui_deployed() -> bool:
+    """Whether the rivers-ui Deployment exists. Retries so a transient API 504
+    (image-pull / install load) can't masquerade as a missing deploy and gate
+    the suite to a false skip/fail."""
+    try:
+        _retry_api(
+            lambda: Deployment.get(UI_DEPLOYMENT, namespace=NAMESPACE, api=kube_api())
+        )
+        return True
+    except Exception:
+        return False
+
+
+_reachable = _cluster_reachable()
+# A deliberately UI-less deploy (RIVERS_K8S_SKIP_UI=1) legitimately skips even
+# in CI. Otherwise the UI is expected: a missing deploy is a real failure, so
+# gate its presence through cluster_gate (fail-loud under REQUIRE_CLUSTER)
+# rather than a plain skipif that would slip a broken deploy through as green.
+_skip_ui = os.environ.get("RIVERS_K8S_SKIP_UI") == "1"
+pytestmark = [
+    cluster_gate(
+        _reachable,
+        f"k3d cluster '{KUBECTL_CONTEXT}' not reachable or namespace '{NAMESPACE}' missing",
+    ),
+    pytest.mark.skipif(_skip_ui, reason="RIVERS_K8S_SKIP_UI=1 (UI-less deploy)"),
+    cluster_gate(
+        _skip_ui or not _reachable or _ui_deployed(),
+        f"rivers-ui Deployment '{UI_DEPLOYMENT}' expected but not present (broken deploy?)",
+    ),
+    # Each test rolls the UI deployment (and one installs a Helm chart) —
+    # far beyond the repo-wide 60s per-test budget.
+    pytest.mark.timeout(900),
+]
 
 
 def _ui_pods() -> list:
