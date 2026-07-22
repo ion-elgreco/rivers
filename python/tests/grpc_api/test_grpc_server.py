@@ -436,9 +436,11 @@ def test_rerun_rejects_run_from_another_code_location(grpc_stubs, storage, monke
     port = foo._start_grpc_server("127.0.0.1", 0)
     channel = grpc.insecure_channel(f"127.0.0.1:{port}")
     grpc.channel_ready_future(channel).result(timeout=5)
-    run_id = pb2_grpc.CodeLocationServiceStub(channel).ExecuteJob(
-        pb2.ExecuteJobRequest(job_name="test_job")
-    ).run_id
+    run_id = (
+        pb2_grpc.CodeLocationServiceStub(channel)
+        .ExecuteJob(pb2.ExecuteJobRequest(job_name="test_job"))
+        .run_id
+    )
     channel.close()
     foo._stop_grpc_server()
 
