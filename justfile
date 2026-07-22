@@ -180,6 +180,18 @@ _k8s-wheel:
 k8s-up: k8s-build
     dev/k3d/setup.sh
 
+# Port-forward the UI + FerrisKey (api + login SPA) for a browser OIDC login (RIVERS_K8S_AUTH=1 deploy)
+k8s-auth-forward:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ctx="k3d-${RIVERS_K3D_CLUSTER:-rivers-test}"
+    echo "Forwarding UI :3000  ferriskey-api :3333  ferriskey login :8080  (Ctrl-C to stop)"
+    trap 'kill 0' EXIT
+    kubectl --context "$ctx" -n rivers port-forward svc/rivers-ui 3000:3000 &
+    kubectl --context "$ctx" -n rivers port-forward svc/ferriskey-api 3333:3333 &
+    kubectl --context "$ctx" -n rivers port-forward svc/ferriskey-webapp 8080:80 &
+    wait
+
 # Tear down k3d cluster
 k8s-down:
     k3d cluster delete {{ cluster_name }}

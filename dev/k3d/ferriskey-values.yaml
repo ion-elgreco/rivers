@@ -1,0 +1,24 @@
+# FerrisKey values for the standing k3d auth toggle (RIVERS_K8S_AUTH=1).
+# One external host `ferriskey.localtest.me`: the browser resolves it to
+# 127.0.0.1 (public localtest.me wildcard) and reaches it through the
+# port-forwards; pods resolve the same name to the api Service via the
+# coredns-custom rewrite. api on :3333, login SPA on :8080. Dev only.
+postgresql:
+  persistence:
+    enabled: false
+
+api:
+  server:
+    # The login SPA (:8080) calls the api cross-origin, so its origin (and the
+    # UI's, for safety) must be allowed.
+    allowedOrigins:
+      - http://ferriskey.localtest.me:8080
+      - http://localhost:3000
+  webapp:
+    # Where the api sends the browser to render the login page.
+    url: http://ferriskey.localtest.me:8080
+
+webapp:
+  api:
+    # Where the login SPA (in the browser) calls the api.
+    url: http://ferriskey.localtest.me:3333/api
