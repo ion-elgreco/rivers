@@ -52,8 +52,9 @@ impl OidcConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForwardConfig {
-    /// CIDRs whose socket peers may assert identity headers.
-    pub trusted_proxies: Vec<String>,
+    /// CIDRs whose socket peers may assert identity headers (a bare IP is a
+    /// single-host `/32`/`/128`).
+    pub trusted_proxies: Vec<ipnet::IpNet>,
     pub user_header: String,
     pub email_header: String,
     pub groups_header: String,
@@ -98,6 +99,15 @@ fn flag(v: Option<String>) -> bool {
         v.as_deref().map(str::trim),
         Some("1") | Some("true") | Some("True") | Some("TRUE") | Some("yes")
     )
+}
+
+/// A CIDR, or a bare IP taken as a single-host `/32` (v4) / `/128` (v6).
+fn parse_cidr(s: &str) -> anyhow::Result<ipnet::IpNet> {
+    s.parse::<ipnet::IpNet>().or_else(|_| {
+        s.parse::<std::net::IpAddr>()
+            .map(ipnet::IpNet::from)
+            .map_err(|_| anyhow::anyhow!("invalid trusted proxy CIDR {s:?}"))
+    })
 }
 
 impl AuthConfig {
@@ -207,13 +217,17 @@ impl AuthConfig {
                 })
             }
             Some("forward") => {
-                let trusted_proxies = csv(get("RIVERS_AUTH_FORWARD_TRUSTED_PROXIES"));
-                if trusted_proxies.is_empty() {
+                let raw = csv(get("RIVERS_AUTH_FORWARD_TRUSTED_PROXIES"));
+                if raw.is_empty() {
                     bail!(
                         "RIVERS_AUTH_MODE=forward requires RIVERS_AUTH_FORWARD_TRUSTED_PROXIES \
                          (comma-separated CIDRs; 0.0.0.0/0 must be typed deliberately)"
                     );
                 }
+                let trusted_proxies = raw
+                    .iter()
+                    .map(|s| parse_cidr(s))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
                 let header = |key: &str, default: &str| {
                     nonempty(get, key).unwrap_or_else(|| default.to_string())
                 };
@@ -289,6 +303,28 @@ mod tests {
         let mut sub = oidc_map(None);
         sub.insert("RIVERS_AUTH_PUBLIC_URL".into(), "https://host/rivers".into());
         assert_eq!(oidc_cfg(&sub).base_url(), "https://host/rivers");
+    }
+
+    #[test]
+    fn trusted_proxies_reject_bad_cidr_and_accept_bare_ip() {
+        let forward = |proxies: &str| {
+            AuthConfig::from_map(&HashMap::from([
+                ("RIVERS_AUTH_MODE".to_string(), "forward".to_string()),
+                (
+                    "RIVERS_AUTH_FORWARD_TRUSTED_PROXIES".to_string(),
+                    proxies.to_string(),
+                ),
+            ]))
+        };
+        assert!(forward("not-a-cidr").is_err(), "a bad CIDR is rejected at load");
+        // A bare IP is accepted as a single-host net.
+        let AuthMode::Forward(cfg) = forward("10.42.7.5, 10.0.0.0/8").unwrap().mode else {
+            panic!("expected forward");
+        };
+        assert_eq!(cfg.trusted_proxies.len(), 2);
+        assert!(
+            cfg.trusted_proxies[0].contains(&"10.42.7.5".parse::<std::net::IpAddr>().unwrap())
+        );
     }
 
     #[test]

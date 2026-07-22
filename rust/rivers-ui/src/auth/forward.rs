@@ -2,7 +2,6 @@
 //! from socket peers on the trusted CIDR list.
 
 use axum::http::HeaderMap;
-use ipnet::IpNet;
 use std::net::IpAddr;
 
 use super::config::ForwardConfig;
@@ -10,25 +9,12 @@ use super::identity::Identity;
 
 #[derive(Debug, Clone)]
 pub struct ForwardRuntime {
-    trusted: Vec<IpNet>,
     pub cfg: ForwardConfig,
 }
 
 impl ForwardRuntime {
-    pub fn new(cfg: ForwardConfig) -> anyhow::Result<Self> {
-        let trusted = cfg
-            .trusted_proxies
-            .iter()
-            .map(|s| {
-                s.parse::<IpNet>().or_else(|_| {
-                    // Accept bare IPs as /32 (v4) or /128 (v6).
-                    s.parse::<IpAddr>().map(IpNet::from).map_err(|_| {
-                        anyhow::anyhow!("invalid trusted proxy CIDR {s:?}")
-                    })
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Self { trusted, cfg })
+    pub fn new(cfg: ForwardConfig) -> Self {
+        Self { cfg }
     }
 
     /// Decided on the direct socket peer — never X-Forwarded-For.
@@ -41,7 +27,8 @@ impl ForwardRuntime {
             },
             v4 => [v4, v4],
         };
-        self.trusted
+        self.cfg
+            .trusted_proxies
             .iter()
             .any(|net| candidates.iter().any(|ip| net.contains(ip)))
     }
@@ -81,7 +68,10 @@ mod tests {
 
     fn cfg() -> ForwardConfig {
         ForwardConfig {
-            trusted_proxies: vec!["10.42.0.0/16".into(), "127.0.0.1".into()],
+            trusted_proxies: vec![
+                "10.42.0.0/16".parse().unwrap(),
+                "127.0.0.1/32".parse().unwrap(),
+            ],
             user_header: "Remote-User".into(),
             email_header: "Remote-Email".into(),
             groups_header: "Remote-Groups".into(),
@@ -91,8 +81,8 @@ mod tests {
     }
 
     #[test]
-    fn cidr_and_bare_ip_trust() {
-        let rt = ForwardRuntime::new(cfg()).unwrap();
+    fn peer_trusted_matches_cidrs() {
+        let rt = ForwardRuntime::new(cfg());
         assert!(rt.peer_trusted("10.42.3.7".parse().unwrap()));
         assert!(rt.peer_trusted("127.0.0.1".parse().unwrap()));
         assert!(!rt.peer_trusted("10.43.0.1".parse().unwrap()));
@@ -101,18 +91,11 @@ mod tests {
         assert!(rt.peer_trusted("::ffff:10.42.3.7".parse().unwrap()));
     }
 
-    #[test]
-    fn invalid_cidr_is_an_error() {
-        let mut c = cfg();
-        c.trusted_proxies = vec!["not-a-cidr".into()];
-        assert!(ForwardRuntime::new(c).is_err());
-    }
-
     /// Proxies may emit one header line per group (Envoy, oauth2-proxy
     /// configurations); all lines must contribute, not just the first.
     #[test]
     fn repeated_groups_header_lines_all_count() {
-        let rt = ForwardRuntime::new(cfg()).unwrap();
+        let rt = ForwardRuntime::new(cfg());
         let mut headers = HeaderMap::new();
         headers.insert("Remote-User", HeaderValue::from_static("jdoe"));
         headers.append("Remote-Groups", HeaderValue::from_static("data-eng"));
@@ -129,7 +112,7 @@ mod tests {
     /// claim trim. Regressing the `!is_empty()` filter would authenticate "".
     #[test]
     fn whitespace_only_user_header_is_absent() {
-        let rt = ForwardRuntime::new(cfg()).unwrap();
+        let rt = ForwardRuntime::new(cfg());
         let mut headers = HeaderMap::new();
         headers.insert("Remote-User", HeaderValue::from_static("   "));
         assert!(rt.identity_from_headers(&headers).is_none());
@@ -141,7 +124,7 @@ mod tests {
 
     #[test]
     fn identity_requires_user_header() {
-        let rt = ForwardRuntime::new(cfg()).unwrap();
+        let rt = ForwardRuntime::new(cfg());
         let mut headers = HeaderMap::new();
         headers.insert("Remote-Email", HeaderValue::from_static("a@b.com"));
         assert!(rt.identity_from_headers(&headers).is_none());

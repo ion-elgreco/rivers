@@ -41,7 +41,7 @@ impl AuthRuntime {
             AuthMode::Oidc(cfg) => {
                 RuntimeKind::Oidc(Arc::new(oidc::OidcRuntime::initialize(cfg).await?))
             }
-            AuthMode::Forward(cfg) => RuntimeKind::Forward(forward::ForwardRuntime::new(cfg)?),
+            AuthMode::Forward(cfg) => RuntimeKind::Forward(forward::ForwardRuntime::new(cfg)),
         };
         Ok(Some(Arc::new(Self {
             allow: config.allow,

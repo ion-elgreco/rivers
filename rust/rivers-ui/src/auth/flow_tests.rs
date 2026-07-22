@@ -91,7 +91,7 @@ async fn body_string(resp: axum::response::Response) -> String {
 async fn forward_rt(allow: Allowlists) -> Arc<AuthRuntime> {
     AuthRuntime::initialize(AuthConfig {
         mode: AuthMode::Forward(ForwardConfig {
-            trusted_proxies: vec!["10.42.0.0/16".into()],
+            trusted_proxies: vec!["10.42.0.0/16".parse().unwrap()],
             user_header: "Remote-User".into(),
             email_header: "Remote-Email".into(),
             groups_header: "Remote-Groups".into(),
