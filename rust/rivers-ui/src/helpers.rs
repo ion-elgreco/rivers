@@ -343,6 +343,31 @@ pub fn short_id(id: &str, max_len: usize) -> String {
     }
 }
 
+/// Up-to-two uppercase initials for the avatar ("John Doe" → "JD",
+/// "admin" → "A", all-symbol names → "?").
+pub fn initials(display: &str) -> String {
+    let mut firsts = display
+        .split_whitespace()
+        .filter_map(|w| w.chars().find(|c| c.is_alphanumeric()));
+    match (firsts.next(), firsts.last()) {
+        (Some(f), Some(l)) => f.to_uppercase().chain(l.to_uppercase()).collect(),
+        (Some(f), None) => f.to_uppercase().collect(),
+        _ => "?".to_string(),
+    }
+}
+
+/// Stable per-user avatar hue. FNV-1a by hand: `DefaultHasher` is not
+/// stable across builds, and the server-rendered color must match what
+/// the client recomputes at hydration.
+pub fn avatar_hue(seed: &str) -> u16 {
+    let mut h: u32 = 0x811c9dc5;
+    for b in seed.bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    (h % 360) as u16
+}
+
 /// What the partition picker should render for a job's selection.
 ///
 /// Single source of truth for the dialog: callers route on the variant
@@ -731,6 +756,27 @@ pub fn launched_by_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initials_take_first_and_last_word() {
+        assert_eq!(initials("John Doe"), "JD");
+        assert_eq!(initials("John Ronald Reuel Tolkien"), "JT");
+        assert_eq!(initials("admin"), "A");
+        assert_eq!(initials("john.doe@example.com"), "J");
+        // Symbol-led words fall through to their first alphanumeric.
+        assert_eq!(initials("(ion) k"), "IK");
+        assert_eq!(initials("---"), "?");
+        assert_eq!(initials(""), "?");
+    }
+
+    #[test]
+    fn avatar_hue_is_stable_and_bounded() {
+        // Pinned value: SSR and hydration must agree across builds/targets.
+        assert_eq!(avatar_hue("john.doe"), avatar_hue("john.doe"));
+        assert_eq!(avatar_hue("john.doe"), 34);
+        assert!(avatar_hue("") < 360);
+        assert_ne!(avatar_hue("alice"), avatar_hue("bob"));
+    }
 
     #[test]
     fn launched_by_sub_line_manual_shows_job_and_user() {
