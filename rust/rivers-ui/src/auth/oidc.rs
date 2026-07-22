@@ -132,7 +132,7 @@ async fn discover_client(
         .end_session_endpoint
         .clone()
         .map(|u| u.to_string());
-    let redirect = RedirectUrl::new(format!("{}{}", cfg.public_url, crate::routes::CALLBACK))
+    let redirect = RedirectUrl::new(format!("{}{}", cfg.base_url(), crate::routes::CALLBACK))
         .context("invalid redirect URL derived from RIVERS_AUTH_PUBLIC_URL")?;
     let client = OidcClient::from_provider_metadata(
         metadata,
@@ -483,7 +483,7 @@ pub async fn logout(State(st): State<OidcState>, headers: axum::http::HeaderMap)
                 // the spec's alternative.
                 url.query_pairs_mut()
                     .append_pair("client_id", &o.cfg.client_id)
-                    .append_pair("post_logout_redirect_uri", &o.cfg.public_url);
+                    .append_pair("post_logout_redirect_uri", o.cfg.base_url());
                 return (clear, Redirect::to(url.as_str())).into_response();
             }
         }

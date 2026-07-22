@@ -25,8 +25,8 @@ pub struct OidcConfig {
     pub client_id: String,
     pub client_secret: Option<String>,
     /// External base URL (`https://rivers.example.com`); the redirect URI is
-    /// `<public_url>/auth/callback`. Never derived from the Host header.
-    pub public_url: String,
+    /// `<base_url()>/auth/callback`. Never derived from the Host header.
+    pub public_url: url::Url,
     pub scopes: Vec<String>,
     pub groups_claim: String,
     pub rp_logout: bool,
@@ -40,7 +40,13 @@ impl OidcConfig {
     /// Cookies carry the `Secure` attribute (and `__Host-` prefix) exactly when
     /// the public URL is https — a pure function of `public_url`.
     pub fn secure_cookies(&self) -> bool {
-        self.public_url.starts_with("https://")
+        self.public_url.scheme() == "https"
+    }
+
+    /// External base without a trailing slash, for appending absolute routes
+    /// (a `url::Url` always serializes its origin with a trailing `/`).
+    pub fn base_url(&self) -> &str {
+        self.public_url.as_str().trim_end_matches('/')
     }
 }
 
@@ -126,12 +132,19 @@ impl AuthConfig {
                     nonempty(get, key)
                         .with_context(|| format!("RIVERS_AUTH_MODE=oidc requires {key}"))
                 };
-                let public_url = require("RIVERS_AUTH_PUBLIC_URL")?
-                    .trim_end_matches('/')
-                    .to_string();
-                if !public_url.starts_with("http://") && !public_url.starts_with("https://") {
-                    bail!("RIVERS_AUTH_PUBLIC_URL must be an http(s) URL, got {public_url:?}");
-                }
+                let public_url = {
+                    let raw = require("RIVERS_AUTH_PUBLIC_URL")?;
+                    let url = url::Url::parse(raw.trim()).with_context(|| {
+                        format!("RIVERS_AUTH_PUBLIC_URL must be a valid URL, got {raw:?}")
+                    })?;
+                    if !matches!(url.scheme(), "http" | "https") {
+                        bail!("RIVERS_AUTH_PUBLIC_URL must be an http(s) URL, got {url}");
+                    }
+                    if url.host_str().map(str::is_empty).unwrap_or(true) {
+                        bail!("RIVERS_AUTH_PUBLIC_URL must include a host, got {raw:?}");
+                    }
+                    url
+                };
                 let cookie_secret = nonempty(get, "RIVERS_AUTH_COOKIE_SECRET")
                     .map(|v| {
                         let bytes = base64::engine::general_purpose::STANDARD
@@ -261,6 +274,21 @@ mod tests {
         let mut http = oidc_map(None);
         http.insert("RIVERS_AUTH_PUBLIC_URL".into(), "http://localhost:3000".into());
         assert!(!oidc_cfg(&http).secure_cookies());
+    }
+
+    #[test]
+    fn public_url_must_be_a_valid_absolute_http_url() {
+        // Rejected at load, not deferred to a broken redirect URI at first login:
+        // garbage, missing scheme, empty host, and non-http schemes.
+        for bad in ["not a url", "https://", "ftp://host", "rivers.example.com"] {
+            let mut m = oidc_map(None);
+            m.insert("RIVERS_AUTH_PUBLIC_URL".into(), bad.to_string());
+            assert!(AuthConfig::from_map(&m).is_err(), "{bad:?} must be rejected");
+        }
+        // A subpath deployment parses and is preserved with no trailing slash.
+        let mut sub = oidc_map(None);
+        sub.insert("RIVERS_AUTH_PUBLIC_URL".into(), "https://host/rivers".into());
+        assert_eq!(oidc_cfg(&sub).base_url(), "https://host/rivers");
     }
 
     #[test]
