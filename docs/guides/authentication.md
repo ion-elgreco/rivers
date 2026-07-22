@@ -109,14 +109,58 @@ ui:
       logoutUrl: https://auth.example.com/logout
 ```
 
-!!! danger "Never trust the whole pod network"
-    On most clusters all pods share one CIDR (k3s defaults to
-    `10.42.0.0/16`) — listing it would let **every pod in the cluster**
-    forge identity headers and impersonate any user. Scope the list to the
-    proxy's actual addresses: its static egress IPs, a dedicated node pool's
-    range, or `/32`s kept current by your deploy tooling. If the proxy's IPs
-    aren't pinnable, add a NetworkPolicy that only admits UI traffic from
-    the proxy pods and treat `trustedProxies` as defense in depth.
+`trustedProxies` matches the **source IP of the connection** rivers receives, so
+it must name the proxy's real peer addresses. There are two sound ways to set it.
+
+**Pin the proxy's IPs** (shown above) — its static egress IPs, a dedicated node
+pool's range, or `/32`s kept current by your tooling. Simple, but proxy pods
+reschedule onto other nodes and get new pod IPs, so pinned `/32`s go stale.
+
+**Trust broadly, gate with a NetworkPolicy (recommended).** Make network
+reachability the boundary instead of the IP list: a NetworkPolicy that admits UI
+traffic only from the proxy pods — matched by **label**, which survives
+rescheduling — and then open `trustedProxies` wide. The IP check is now coarse on
+purpose, because nothing but the proxy can even open a connection:
+
+```yaml
+# values.yaml — trust any peer; the NetworkPolicy below is the real gate
+ui:
+  auth:
+    forward:
+      trustedProxies: ["0.0.0.0/0", "::/0"]   # ::/0 only needed on dual-stack
+```
+
+…paired with a NetworkPolicy applied alongside the release (`kubectl apply` /
+your GitOps), pinning UI ingress to the proxy pods by label:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rivers-ui-proxy-only
+  namespace: rivers
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: rivers-ui }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: envoy-gateway-system }
+          podSelector:
+            matchLabels: { app.kubernetes.io/name: envoy }   # your proxy's labels
+      ports: [{ port: 3000 }]
+```
+
+This is the standard forward-auth posture — the app is unreachable except through
+the proxy — and it needs a policy-enforcing CNI (k3s ships one; plain flannel does
+not, so the policy would silently no-op there).
+
+!!! danger "A broad range with no NetworkPolicy is an impersonation hole"
+    `0.0.0.0/0` — or the pod CIDR (k3s defaults to `10.42.0.0/16`) — with no
+    network control lets **any pod in the cluster** forge `Remote-*` headers and
+    impersonate any user. Broad `trustedProxies` is only safe paired with the
+    NetworkPolicy above (or equivalent isolation).
 
 Header names default to the Authelia/Authentik convention and are all
 configurable:
