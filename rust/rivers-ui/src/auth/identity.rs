@@ -123,7 +123,10 @@ mod tests {
         assert_eq!(reduced, vec!["data-eng".to_string()]);
         // Reducing the stored groups doesn't change the admit decision.
         assert_eq!(
-            allow.permits(&id(None, &many.iter().map(String::as_str).collect::<Vec<_>>())),
+            allow.permits(&id(
+                None,
+                &many.iter().map(String::as_str).collect::<Vec<_>>()
+            )),
             allow.permits(&id(None, &["data-eng"])),
         );
         // No configured group allowlist ⇒ groups are irrelevant ⇒ none kept.

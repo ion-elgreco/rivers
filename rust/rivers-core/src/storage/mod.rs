@@ -2455,7 +2455,9 @@ mod launched_by_tests {
     #[test]
     fn manual_without_user_roundtrips_as_pre_user_shape() {
         let v = LaunchedBy::Manual { user: None }.into_value();
-        let Value::Object(map) = &v else { panic!("expected object") };
+        let Value::Object(map) = &v else {
+            panic!("expected object")
+        };
         assert!(!map.contains_key("user"), "None user must be omitted");
         assert_eq!(
             LaunchedBy::from_value(v).unwrap(),

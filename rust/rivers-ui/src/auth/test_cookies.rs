@@ -20,7 +20,9 @@ impl CookieStore {
             // Domain, else the user agent ignores it (this is what makes a
             // `Secure`-less removal fail to delete the session).
             if name.starts_with("__Host-")
-                && !(attrs.contains("Secure") && attrs.contains("Path=/") && !attrs.contains("Domain="))
+                && !(attrs.contains("Secure")
+                    && attrs.contains("Path=/")
+                    && !attrs.contains("Domain="))
             {
                 continue;
             }

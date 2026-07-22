@@ -1120,7 +1120,9 @@ def test_rerun_backfill_stamps_the_rerunning_user(rerun_grpc_channel):
             failure_policy="continue",
             max_concurrency=1,
             dry_run=False,
-            user=_user_ref(pb2, subject="alice", email="alice@example.com", name="Alice"),
+            user=_user_ref(
+                pb2, subject="alice", email="alice@example.com", name="Alice"
+            ),
         )
     )
     rerun = stub.RerunBackfill(
@@ -1144,7 +1146,9 @@ def test_materialize_missing_stamps_user(rerun_grpc_channel):
         pb2.MaterializeMissingRequest(
             asset_key="part_asset",
             max_concurrency=4,
-            user=_user_ref(pb2, subject="carol", email="carol@example.com", name="Carol"),
+            user=_user_ref(
+                pb2, subject="carol", email="carol@example.com", name="Carol"
+            ),
         )
     )
     status = repo.get_backfill(resp.backfill_id)

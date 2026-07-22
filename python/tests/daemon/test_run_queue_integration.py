@@ -410,7 +410,9 @@ class TestScheduleSensorQueueRegression:
 
             # Provenance must survive the queued dispatch path: the run carries
             # the firing automation's origin, not a generic manual stamp.
-            expected_name = "fast_schedule" if source_kind == "schedule" else "fast_sensor"
+            expected_name = (
+                "fast_schedule" if source_kind == "schedule" else "fast_sensor"
+            )
             run = runs[0]
             assert run.launched_by.kind == source_kind
             assert run.launched_by.name == expected_name

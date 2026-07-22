@@ -112,8 +112,11 @@ fn embedded_migrations() -> Vec<Migration> {
     vec![
         Migration::unapplied("V1__base", include_str!("migrations/V1__base.surql"))
             .expect("V1__base migration name is well-formed"),
-        Migration::unapplied("V2__run_logs", include_str!("migrations/V2__run_logs.surql"))
-            .expect("V2__run_logs migration name is well-formed"),
+        Migration::unapplied(
+            "V2__run_logs",
+            include_str!("migrations/V2__run_logs.surql"),
+        )
+        .expect("V2__run_logs migration name is well-formed"),
         Migration::unapplied(
             "V3__backfill_launched_by",
             include_str!("migrations/V3__backfill_launched_by.surql"),
@@ -602,12 +605,12 @@ mod tests {
             stderr: Option<String>,
             logs: Option<String>,
         }
-        let rows: Vec<LogRow> =
-            db.query("SELECT * FROM run_logs ORDER BY timestamp ASC")
-                .await
-                .unwrap()
-                .take(0)
-                .unwrap();
+        let rows: Vec<LogRow> = db
+            .query("SELECT * FROM run_logs ORDER BY timestamp ASC")
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
         assert_eq!(rows.len(), 2, "one run_logs row per LogOutput event");
         assert_eq!(rows[0].step_key, "asset_a");
         assert_eq!(rows[0].run_id, "run-1");
@@ -647,7 +650,14 @@ mod tests {
         let pre_v3: Vec<Migration> = embedded_migrations().into_iter().take(2).collect();
         let mut backend = SurrealMigrate { db: db.clone() };
         backend
-            .migrate(&pre_v3, true, false, false, Target::Latest, REFINERY_HISTORY_TABLE)
+            .migrate(
+                &pre_v3,
+                true,
+                false,
+                false,
+                Target::Latest,
+                REFINERY_HISTORY_TABLE,
+            )
             .await
             .expect("apply V1+V2");
 

@@ -180,8 +180,15 @@ async fn connect_db(dir: &Path, experimental: bool) -> Surreal<Any> {
     } else {
         any::connect(url).await.expect("connect")
     };
-    db.use_ns("rivers").use_db("rivers").await.expect("use ns/db");
-    db.query(SCHEMA).await.expect("apply schema").check().expect("schema ok");
+    db.use_ns("rivers")
+        .use_db("rivers")
+        .await
+        .expect("use ns/db");
+    db.query(SCHEMA)
+        .await
+        .expect("apply schema")
+        .check()
+        .expect("schema ok");
     db
 }
 
@@ -193,7 +200,9 @@ fn log_event_row(run: usize, idx: usize, payload: Option<String>) -> EventRow {
         run_id: run_id(run),
         timestamp: idx as i64,
         sort_order: 1,
-        metadata: payload.map(|p| vec![("stdout".to_string(), p)]).unwrap_or_default(),
+        metadata: payload
+            .map(|p| vec![("stdout".to_string(), p)])
+            .unwrap_or_default(),
         data_version: None,
         code_version: None,
         input_data_versions: vec![],
@@ -418,7 +427,11 @@ async fn bench_logs_table(
     } else {
         RUN_LOGS_SCHEMA_STR
     };
-    db.query(schema).await.expect("run_logs schema").check().expect("run_logs ok");
+    db.query(schema)
+        .await
+        .expect("run_logs schema")
+        .check()
+        .expect("run_logs ok");
 
     let rows_bytes: Vec<LogRowBytes> = if as_bytes {
         (0..n_events)
@@ -779,9 +792,17 @@ fn expected_total(base: usize, n_steps: usize) -> usize {
 
 async fn bench_stream_rows(dir: &Path, n_steps: usize, base: usize, ts_index: bool) -> Metrics {
     let db = connect_db(dir, false).await;
-    db.query(STREAM_TABLE_SCHEMA).await.expect("schema").check().expect("schema ok");
+    db.query(STREAM_TABLE_SCHEMA)
+        .await
+        .expect("schema")
+        .check()
+        .expect("schema ok");
     if ts_index {
-        db.query(STREAM_TABLE_TS_IDX).await.expect("idx").check().expect("idx ok");
+        db.query(STREAM_TABLE_TS_IDX)
+            .await
+            .expect("idx")
+            .check()
+            .expect("idx ok");
     }
 
     let mut rows: Vec<StreamRow> = Vec::with_capacity(n_steps * 3);
@@ -855,7 +876,11 @@ struct NoStreamRowOut {
 
 async fn bench_three_tables(dir: &Path, n_steps: usize, base: usize) -> Metrics {
     let db = connect_db(dir, false).await;
-    db.query(three_tables_schema()).await.expect("schema").check().expect("schema ok");
+    db.query(three_tables_schema())
+        .await
+        .expect("schema")
+        .check()
+        .expect("schema ok");
 
     let mut per_table: [Vec<NoStreamRow>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for i in 0..n_steps {
@@ -914,7 +939,11 @@ async fn bench_three_tables(dir: &Path, n_steps: usize, base: usize) -> Metrics 
 
 async fn bench_wide_rows(dir: &Path, n_steps: usize, base: usize) -> Metrics {
     let db = connect_db(dir, false).await;
-    db.query(WIDE_TABLE_SCHEMA).await.expect("schema").check().expect("schema ok");
+    db.query(WIDE_TABLE_SCHEMA)
+        .await
+        .expect("schema")
+        .check()
+        .expect("schema ok");
 
     let rows: Vec<WideRow> = (0..n_steps)
         .map(|i| {

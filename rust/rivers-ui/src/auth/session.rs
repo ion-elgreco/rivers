@@ -11,11 +11,19 @@ use super::identity::Identity;
 /// `__Host-` requires Secure + Path=/ + no Domain, which pins the cookie to
 /// exactly this origin; plain names are the http://localhost dev fallback.
 pub fn session_cookie_name(secure: bool) -> &'static str {
-    if secure { "__Host-rivers_session" } else { "rivers_session" }
+    if secure {
+        "__Host-rivers_session"
+    } else {
+        "rivers_session"
+    }
 }
 
 pub fn state_cookie_name(secure: bool) -> &'static str {
-    if secure { "__Host-rivers_oauth_state" } else { "rivers_oauth_state" }
+    if secure {
+        "__Host-rivers_oauth_state"
+    } else {
+        "rivers_oauth_state"
+    }
 }
 
 /// In-flight login state, minted at `/auth/login` and consumed once at
@@ -150,11 +158,17 @@ mod tests {
         let cookies = set_cookies(clear_cookies(true));
         assert_eq!(cookies.len(), 2);
         for c in &cookies {
-            assert!(c.contains("Secure"), "secure removal must include Secure: {c}");
+            assert!(
+                c.contains("Secure"),
+                "secure removal must include Secure: {c}"
+            );
         }
         // Non-secure (dev) removals must not claim Secure over http.
         for c in set_cookies(clear_cookies(false)) {
-            assert!(!c.contains("Secure"), "non-secure removal must omit Secure: {c}");
+            assert!(
+                !c.contains("Secure"),
+                "non-secure removal must omit Secure: {c}"
+            );
         }
     }
 
@@ -193,7 +207,10 @@ mod tests {
     fn expired_session_rejected() {
         let key = Key::generate();
         let mut store = CookieStore::default();
-        absorb(&mut store, session_response(&key, false, &identity(now_ts() - 1)));
+        absorb(
+            &mut store,
+            session_response(&key, false, &identity(now_ts() - 1)),
+        );
         assert!(read_session(&store.headers(), &key, false).is_none());
     }
 
@@ -201,7 +218,10 @@ mod tests {
     fn wrong_key_rejected() {
         let key = Key::generate();
         let mut store = CookieStore::default();
-        absorb(&mut store, session_response(&key, false, &identity(now_ts() + 60)));
+        absorb(
+            &mut store,
+            session_response(&key, false, &identity(now_ts() + 60)),
+        );
         assert!(read_session(&store.headers(), &Key::generate(), false).is_none());
     }
 
@@ -234,7 +254,10 @@ mod tests {
     fn clear_cookies_deletes_a_held_session() {
         let key = Key::generate();
         let mut store = CookieStore::default();
-        absorb(&mut store, session_response(&key, false, &identity(now_ts() + 60)));
+        absorb(
+            &mut store,
+            session_response(&key, false, &identity(now_ts() + 60)),
+        );
         assert!(read_session(&store.headers(), &key, false).is_some());
 
         absorb(&mut store, clear_cookies(false));
@@ -256,7 +279,10 @@ mod tests {
         absorb(&mut store, pending_login_jar(&key, false, &pending));
         assert!(store.contains(state_cookie_name(false)));
 
-        absorb(&mut store, session_response(&key, false, &identity(now_ts() + 60)));
+        absorb(
+            &mut store,
+            session_response(&key, false, &identity(now_ts() + 60)),
+        );
         assert!(!store.contains(state_cookie_name(false)));
         assert!(read_session(&store.headers(), &key, false).is_some());
     }

@@ -5,15 +5,15 @@ use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::cookie::Key;
 use openidconnect::core::{
-    CoreAuthDisplay, CoreAuthPrompt, CoreAuthenticationFlow, CoreErrorResponseType, CoreGenderClaim,
-    CoreJsonWebKey, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
+    CoreAuthDisplay, CoreAuthPrompt, CoreAuthenticationFlow, CoreErrorResponseType,
+    CoreGenderClaim, CoreJsonWebKey, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
     CoreRevocableToken, CoreTokenIntrospectionResponse, CoreTokenType,
 };
 use openidconnect::{
     AdditionalClaims, AuthorizationCode, Client, ClientId, ClientSecret, CsrfToken,
-    EmptyExtraTokenFields, EndpointMaybeSet, EndpointNotSet, EndpointSet, IdTokenFields,
-    IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier, ProviderMetadataWithLogout,
-    RedirectUrl, RequestTokenError, RevocationErrorResponseType, Scope, StandardErrorResponse,
+    EmptyExtraTokenFields, EndpointMaybeSet, EndpointNotSet, EndpointSet, IdTokenFields, IssuerUrl,
+    Nonce, PkceCodeChallenge, PkceCodeVerifier, ProviderMetadataWithLogout, RedirectUrl,
+    RequestTokenError, RevocationErrorResponseType, Scope, StandardErrorResponse,
     StandardTokenResponse, TokenResponse, reqwest,
 };
 use serde::{Deserialize, Serialize};
@@ -23,8 +23,8 @@ use super::config::{Allowlists, OidcConfig};
 use super::identity::Identity;
 use super::pages::{error_page, forbidden_page};
 use super::session::{
-    PendingLogin, clear_cookies, clear_state_cookie, now_ts, pending_login_jar,
-    read_pending_login, read_session, session_response,
+    PendingLogin, clear_cookies, clear_state_cookie, now_ts, pending_login_jar, read_pending_login,
+    read_session, session_response,
 };
 
 /// Catch-all additional claims — the configurable groups claim is read
@@ -317,7 +317,12 @@ pub async fn callback(
     let fail = |status: StatusCode, detail: String| {
         (
             clear_state_cookie(o.cfg.secure_cookies()),
-            error_page(status, "Sign-in failed", &detail, Some(crate::routes::LOGIN)),
+            error_page(
+                status,
+                "Sign-in failed",
+                &detail,
+                Some(crate::routes::LOGIN),
+            ),
         )
             .into_response()
     };
@@ -339,10 +344,16 @@ pub async fn callback(
         );
     };
     if q.state.as_deref() != Some(pending.state.as_str()) {
-        return fail(StatusCode::BAD_REQUEST, "state parameter mismatch".to_string());
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "state parameter mismatch".to_string(),
+        );
     }
     let Some(code) = q.code else {
-        return fail(StatusCode::BAD_REQUEST, "missing authorization code".to_string());
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "missing authorization code".to_string(),
+        );
     };
 
     let client = o.client();
@@ -383,7 +394,10 @@ pub async fn callback(
             match id_token.claims(&client.id_token_verifier(), &nonce) {
                 Ok(claims) => claims,
                 Err(e) => {
-                    return fail(StatusCode::BAD_GATEWAY, format!("ID token validation failed: {e}"));
+                    return fail(
+                        StatusCode::BAD_GATEWAY,
+                        format!("ID token validation failed: {e}"),
+                    );
                 }
             }
         }
@@ -398,9 +412,10 @@ pub async fn callback(
     // Persist only allowlist-relevant groups: a large IdP groups claim would
     // otherwise blow the encrypted session cookie past the 4 KB browser limit
     // and redirect-loop the login. `permits` only tests against these.
-    let groups = st
-        .allow
-        .relevant_groups(extract_groups(&claims.additional_claims().0, &o.cfg.groups_claim));
+    let groups = st.allow.relevant_groups(extract_groups(
+        &claims.additional_claims().0,
+        &o.cfg.groups_claim,
+    ));
     // Trust the email claim only when the IdP asserts it's verified: an
     // unverified address is attacker-settable and must never satisfy
     // allowedDomains/allowedUsers (nor stand in as the identity).
@@ -427,7 +442,12 @@ pub async fn callback(
         // works; allowlists are re-checked per request against the identity
         // snapshot taken here (IdP-side changes land at the next sign-in).
         let (jar, clear_state) = session_response(&o.cookie_key, o.cfg.secure_cookies(), &identity);
-        return (jar, clear_state, forbidden_page(&identity, Some(crate::routes::LOGOUT))).into_response();
+        return (
+            jar,
+            clear_state,
+            forbidden_page(&identity, Some(crate::routes::LOGOUT)),
+        )
+            .into_response();
     }
     tracing::info!(
         target: "rivers::auth",
@@ -508,19 +528,21 @@ mod tests {
 
     #[test]
     fn groups_from_array_string_and_nested() {
-        let claims: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
-            serde_json::json!({
+        let claims: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
                 "groups": ["eng", "admins"],
                 "flat": "a, b ,",
                 "realm_access": {"roles": ["r1", "r2"]},
                 // Auth0-style namespaced claim: the name itself contains dots.
                 "https://myapp.example.com/groups": ["ns1", "ns2"],
-            }),
-        )
-        .unwrap();
+            }))
+            .unwrap();
         assert_eq!(extract_groups(&claims, "groups"), vec!["eng", "admins"]);
         assert_eq!(extract_groups(&claims, "flat"), vec!["a", "b"]);
-        assert_eq!(extract_groups(&claims, "realm_access.roles"), vec!["r1", "r2"]);
+        assert_eq!(
+            extract_groups(&claims, "realm_access.roles"),
+            vec!["r1", "r2"]
+        );
         assert_eq!(
             extract_groups(&claims, "https://myapp.example.com/groups"),
             vec!["ns1", "ns2"],

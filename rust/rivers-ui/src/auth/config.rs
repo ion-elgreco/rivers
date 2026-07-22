@@ -240,9 +240,7 @@ impl AuthConfig {
                     logout_url: nonempty(get, "RIVERS_AUTH_FORWARD_LOGOUT_URL"),
                 })
             }
-            Some(other) => bail!(
-                "RIVERS_AUTH_MODE must be none|oidc|forward, got {other:?}"
-            ),
+            Some(other) => bail!("RIVERS_AUTH_MODE must be none|oidc|forward, got {other:?}"),
         };
 
         Ok(Self { mode, allow })
@@ -256,9 +254,18 @@ mod tests {
     fn oidc_map(scopes: Option<&str>) -> HashMap<String, String> {
         let mut m = HashMap::from([
             ("RIVERS_AUTH_MODE".to_string(), "oidc".to_string()),
-            ("RIVERS_AUTH_PUBLIC_URL".to_string(), "https://r.example.com".to_string()),
-            ("RIVERS_AUTH_OIDC_ISSUER".to_string(), "https://idp.example.com".to_string()),
-            ("RIVERS_AUTH_OIDC_CLIENT_ID".to_string(), "rivers".to_string()),
+            (
+                "RIVERS_AUTH_PUBLIC_URL".to_string(),
+                "https://r.example.com".to_string(),
+            ),
+            (
+                "RIVERS_AUTH_OIDC_ISSUER".to_string(),
+                "https://idp.example.com".to_string(),
+            ),
+            (
+                "RIVERS_AUTH_OIDC_CLIENT_ID".to_string(),
+                "rivers".to_string(),
+            ),
         ]);
         if let Some(s) = scopes {
             m.insert("RIVERS_AUTH_OIDC_SCOPES".to_string(), s.to_string());
@@ -283,10 +290,16 @@ mod tests {
     #[test]
     fn secure_cookies_follows_public_url_scheme() {
         let mut https = oidc_map(None);
-        https.insert("RIVERS_AUTH_PUBLIC_URL".into(), "https://r.example.com".into());
+        https.insert(
+            "RIVERS_AUTH_PUBLIC_URL".into(),
+            "https://r.example.com".into(),
+        );
         assert!(oidc_cfg(&https).secure_cookies());
         let mut http = oidc_map(None);
-        http.insert("RIVERS_AUTH_PUBLIC_URL".into(), "http://localhost:3000".into());
+        http.insert(
+            "RIVERS_AUTH_PUBLIC_URL".into(),
+            "http://localhost:3000".into(),
+        );
         assert!(!oidc_cfg(&http).secure_cookies());
     }
 
@@ -297,11 +310,17 @@ mod tests {
         for bad in ["not a url", "https://", "ftp://host", "rivers.example.com"] {
             let mut m = oidc_map(None);
             m.insert("RIVERS_AUTH_PUBLIC_URL".into(), bad.to_string());
-            assert!(AuthConfig::from_map(&m).is_err(), "{bad:?} must be rejected");
+            assert!(
+                AuthConfig::from_map(&m).is_err(),
+                "{bad:?} must be rejected"
+            );
         }
         // A subpath deployment parses and is preserved with no trailing slash.
         let mut sub = oidc_map(None);
-        sub.insert("RIVERS_AUTH_PUBLIC_URL".into(), "https://host/rivers".into());
+        sub.insert(
+            "RIVERS_AUTH_PUBLIC_URL".into(),
+            "https://host/rivers".into(),
+        );
         assert_eq!(oidc_cfg(&sub).base_url(), "https://host/rivers");
     }
 
@@ -316,15 +335,16 @@ mod tests {
                 ),
             ]))
         };
-        assert!(forward("not-a-cidr").is_err(), "a bad CIDR is rejected at load");
+        assert!(
+            forward("not-a-cidr").is_err(),
+            "a bad CIDR is rejected at load"
+        );
         // A bare IP is accepted as a single-host net.
         let AuthMode::Forward(cfg) = forward("10.42.7.5, 10.0.0.0/8").unwrap().mode else {
             panic!("expected forward");
         };
         assert_eq!(cfg.trusted_proxies.len(), 2);
-        assert!(
-            cfg.trusted_proxies[0].contains(&"10.42.7.5".parse::<std::net::IpAddr>().unwrap())
-        );
+        assert!(cfg.trusted_proxies[0].contains(&"10.42.7.5".parse::<std::net::IpAddr>().unwrap()));
     }
 
     #[test]
@@ -333,7 +353,10 @@ mod tests {
         // issuer ends in '/', and discovery compares issuer strings verbatim.
         // Stripping the slash would abort startup for such IdPs.
         let mut m = oidc_map(None);
-        m.insert("RIVERS_AUTH_OIDC_ISSUER".into(), "https://tenant.auth0.com/".into());
+        m.insert(
+            "RIVERS_AUTH_OIDC_ISSUER".into(),
+            "https://tenant.auth0.com/".into(),
+        );
         assert_eq!(oidc_cfg(&m).issuer, "https://tenant.auth0.com/");
     }
 
@@ -358,8 +381,12 @@ mod tests {
     fn scopes_parse_comma_separated_and_mixed() {
         let cfg = AuthConfig::from_map(&oidc_map(Some("openid, profile , email"))).unwrap();
         assert_eq!(scopes_of(cfg), vec!["openid", "profile", "email"]);
-        let cfg = AuthConfig::from_map(&oidc_map(Some("openid profile,email offline_access"))).unwrap();
-        assert_eq!(scopes_of(cfg), vec!["openid", "profile", "email", "offline_access"]);
+        let cfg =
+            AuthConfig::from_map(&oidc_map(Some("openid profile,email offline_access"))).unwrap();
+        assert_eq!(
+            scopes_of(cfg),
+            vec!["openid", "profile", "email", "offline_access"]
+        );
     }
 
     #[test]
@@ -374,7 +401,10 @@ mod tests {
         // and instantly expire every session).
         let mut m = oidc_map(None);
         m.insert("RIVERS_AUTH_SESSION_TTL".into(), i64::MAX.to_string());
-        assert!(AuthConfig::from_map(&m).is_err(), "absurd TTL must be rejected");
+        assert!(
+            AuthConfig::from_map(&m).is_err(),
+            "absurd TTL must be rejected"
+        );
         // A sane TTL still parses.
         let mut ok = oidc_map(None);
         ok.insert("RIVERS_AUTH_SESSION_TTL".into(), "3600".to_string());
@@ -388,7 +418,10 @@ mod tests {
         for bad in ["0", "-1"] {
             let mut m = oidc_map(None);
             m.insert("RIVERS_AUTH_SESSION_TTL".into(), bad.to_string());
-            assert!(AuthConfig::from_map(&m).is_err(), "TTL {bad} must be rejected");
+            assert!(
+                AuthConfig::from_map(&m).is_err(),
+                "TTL {bad} must be rejected"
+            );
         }
     }
 
@@ -401,12 +434,18 @@ mod tests {
             "RIVERS_AUTH_COOKIE_SECRET".into(),
             base64::engine::general_purpose::STANDARD.encode([0u8; 16]),
         );
-        assert!(AuthConfig::from_map(&short).is_err(), "a <32-byte secret must be rejected");
+        assert!(
+            AuthConfig::from_map(&short).is_err(),
+            "a <32-byte secret must be rejected"
+        );
         let mut ok = oidc_map(None);
         ok.insert(
             "RIVERS_AUTH_COOKIE_SECRET".into(),
             base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
         );
-        assert!(AuthConfig::from_map(&ok).is_ok(), "a 32-byte secret is accepted");
+        assert!(
+            AuthConfig::from_map(&ok).is_ok(),
+            "a 32-byte secret is accepted"
+        );
     }
 }

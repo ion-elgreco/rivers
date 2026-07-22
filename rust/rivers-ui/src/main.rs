@@ -167,7 +167,9 @@ async fn main() {
         token.cancel();
     });
 
-    rivers_ui::start_server(storage, graph, args.host, args.port, registry, auth, shutdown)
-        .await
-        .expect("Server error");
+    rivers_ui::start_server(
+        storage, graph, args.host, args.port, registry, auth, shutdown,
+    )
+    .await
+    .expect("Server error");
 }

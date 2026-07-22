@@ -218,10 +218,7 @@ impl DirectRunDispatcher {
     }
 
     /// Create one `Started` `RunRecord` per request, then launch each on a detached OS thread.
-    async fn dispatch_jobs(
-        &self,
-        requests: &[RunRequestData],
-    ) -> anyhow::Result<DispatchOutcome> {
+    async fn dispatch_jobs(&self, requests: &[RunRequestData]) -> anyhow::Result<DispatchOutcome> {
         if requests.is_empty() {
             return Ok(DispatchOutcome::default());
         }
@@ -312,10 +309,7 @@ impl QueuedRunDispatcher {
     }
 
     /// Submit each request via `repo.submit_run`, producing `Queued` `RunRecord`s.
-    async fn dispatch_jobs(
-        &self,
-        requests: &[RunRequestData],
-    ) -> anyhow::Result<DispatchOutcome> {
+    async fn dispatch_jobs(&self, requests: &[RunRequestData]) -> anyhow::Result<DispatchOutcome> {
         if requests.is_empty() {
             return Ok(DispatchOutcome::default());
         }

@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 use super::config::{Allowlists, AuthConfig, AuthMode, ForwardConfig, OidcConfig};
-use super::oidc::is_signing_key_failure;
 use super::identity::Identity;
-use super::test_cookies::CookieStore;
 use super::oidc::RawClaims;
+use super::oidc::is_signing_key_failure;
+use super::test_cookies::CookieStore;
 use super::{AuthRuntime, apply_auth};
 
 // Throwaway 2048-bit key for the mock IdP. Test fixture only.
@@ -76,8 +76,6 @@ fn req(uri: &str, peer: Option<&str>, headers: &[(&str, &str)]) -> Request<Body>
     }
     req
 }
-
-
 
 async fn body_string(resp: axum::response::Response) -> String {
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -139,7 +137,10 @@ async fn forward_trusted_peer_with_headers_passes_identity() {
         .oneshot(req(
             "/api/whoami",
             Some("10.42.7.7"),
-            &[("Remote-User", "jdoe"), ("Remote-Email", "john.doe@example.com")],
+            &[
+                ("Remote-User", "jdoe"),
+                ("Remote-Email", "john.doe@example.com"),
+            ],
         ))
         .await
         .unwrap();
@@ -224,7 +225,10 @@ async fn discovery(State(idp): State<MockState>) -> axum::response::Response {
     if *idp.discovery_fails.lock().unwrap() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    if idp.hold_discovery.load(std::sync::atomic::Ordering::Relaxed) {
+    if idp
+        .hold_discovery
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         idp.discovery_entered.notify_one();
         idp.discovery_release.notified().await;
     }
@@ -272,7 +276,10 @@ async fn token(State(idp): State<MockState>) -> axum::response::Response {
     }
     // One-shot pin: park the first callback here (after it snapshotted the
     // verifying client) so a second callback can rotate the keys underneath it.
-    if idp.hold_token.swap(false, std::sync::atomic::Ordering::Relaxed) {
+    if idp
+        .hold_token
+        .swap(false, std::sync::atomic::Ordering::Relaxed)
+    {
         idp.token_entered.notify_one();
         idp.token_release.notified().await;
     }
@@ -318,10 +325,14 @@ async fn token(State(idp): State<MockState>) -> axum::response::Response {
     .unwrap();
 
     let fields = IdTokenFields::new(Some(id_token), EmptyExtraTokenFields {});
-    let mut resp =
-        StandardTokenResponse::new(AccessToken::new("test-access".into()), CoreTokenType::Bearer, fields);
+    let mut resp = StandardTokenResponse::new(
+        AccessToken::new("test-access".into()),
+        CoreTokenType::Bearer,
+        fields,
+    );
     resp.set_expires_in(Some(&std::time::Duration::from_secs(3600)));
-    idp.token_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    idp.token_hits
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Json(serde_json::to_value(&resp).unwrap()).into_response()
 }
 
@@ -390,8 +401,7 @@ async fn drive_login(app: &Router, idp: &MockIdp) -> (String, CookieStore) {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    let authorize =
-        url::Url::parse(resp.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let authorize = url::Url::parse(resp.headers()[header::LOCATION].to_str().unwrap()).unwrap();
     assert!(authorize.as_str().starts_with(&idp.issuer));
     let params: HashMap<String, String> = authorize.query_pairs().into_owned().collect();
     assert_eq!(params["response_type"], "code");
@@ -425,7 +435,11 @@ async fn oidc_full_flow() {
             .starts_with("/auth/login?rd=")
     );
     // …while API requests get a bare 401.
-    let resp = app.clone().oneshot(req("/api/whoami", None, &[])).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(req("/api/whoami", None, &[]))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     let (callback, mut store) = drive_login(&app, &idp).await;
@@ -434,13 +448,21 @@ async fn oidc_full_flow() {
         .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "callback should succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "callback should succeed"
+    );
     assert_eq!(resp.headers()[header::LOCATION], "/runs");
     store.absorb(&resp);
 
     let resp = app
         .clone()
-        .oneshot(req("/api/whoami", None, &[("cookie", &store.header_value())]))
+        .oneshot(req(
+            "/api/whoami",
+            None,
+            &[("cookie", &store.header_value())],
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -450,14 +472,22 @@ async fn oidc_full_flow() {
     // authenticate (regression: removals were once silently unemitted).
     let resp = app
         .clone()
-        .oneshot(req("/auth/logout", None, &[("cookie", &store.header_value())]))
+        .oneshot(req(
+            "/auth/logout",
+            None,
+            &[("cookie", &store.header_value())],
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     store.absorb(&resp);
     let resp = app
         .clone()
-        .oneshot(req("/api/whoami", None, &[("cookie", &store.header_value())]))
+        .oneshot(req(
+            "/api/whoami",
+            None,
+            &[("cookie", &store.header_value())],
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -501,7 +531,11 @@ async fn callback_failure_preserves_existing_session() {
     );
     let resp = app
         .clone()
-        .oneshot(req("/api/whoami", None, &[("cookie", &store.header_value())]))
+        .oneshot(req(
+            "/api/whoami",
+            None,
+            &[("cookie", &store.header_value())],
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "still authenticated");
@@ -751,7 +785,11 @@ async fn oidc_callback_after_concurrent_refresh_still_recovers() {
         .oneshot(req(&callback, None, &[("cookie", &cookie)]))
         .await
         .unwrap();
-    assert_eq!(w.status(), StatusCode::SEE_OTHER, "winner recovers via refresh");
+    assert_eq!(
+        w.status(),
+        StatusCode::SEE_OTHER,
+        "winner recovers via refresh"
+    );
 
     // Release the loser: it validates the rotated token against its STALE
     // snapshot, its refresh hits the cooldown, and it must retry against the
@@ -769,8 +807,8 @@ async fn oidc_callback_after_concurrent_refresh_still_recovers() {
 #[test]
 fn only_unknown_key_failures_trigger_refresh() {
     use openidconnect::core::{
-        CoreGenderClaim, CoreIdTokenVerifier, CoreJsonWebKeySet,
-        CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
+        CoreGenderClaim, CoreIdTokenVerifier, CoreJsonWebKeySet, CoreJweContentEncryptionAlgorithm,
+        CoreJwsSigningAlgorithm,
     };
     use openidconnect::{
         Audience, ClientId, IdToken, IdTokenClaims, IssuerUrl, Nonce, PrivateSigningKey,
@@ -813,14 +851,18 @@ fn only_unknown_key_failures_trigger_refresh() {
     };
 
     // Signed with kid "A", verifier only knows kid "B" → NoMatchingKey.
-    let unknown_kid = token("A", 300).claims(&verifier("B"), nonce_ok).unwrap_err();
+    let unknown_kid = token("A", 300)
+        .claims(&verifier("B"), nonce_ok)
+        .unwrap_err();
     assert!(
         is_signing_key_failure(&unknown_kid),
         "unknown kid must trigger a refresh: {unknown_kid:?}"
     );
 
     // Signed with a known kid but expired → Expired, must NOT refresh.
-    let expired = token("A", -300).claims(&verifier("A"), nonce_ok).unwrap_err();
+    let expired = token("A", -300)
+        .claims(&verifier("A"), nonce_ok)
+        .unwrap_err();
     assert!(
         !is_signing_key_failure(&expired),
         "expiry must not trigger a refresh: {expired:?}"
@@ -855,7 +897,11 @@ async fn oidc_callback_without_state_cookie_fails() {
     let app = app(Some(rt));
 
     let (callback, _) = drive_login(&app, &idp).await;
-    let resp = app.clone().oneshot(req(&callback, None, &[])).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(req(&callback, None, &[]))
+        .await
+        .unwrap();
     // Missing pending-login cookie is a client/session error → 4xx, not 502.
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
@@ -892,7 +938,11 @@ async fn oidc_logout_without_session_emits_no_cookie() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     assert!(
-        resp.headers().get_all(header::SET_COOKIE).iter().next().is_none(),
+        resp.headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .next()
+            .is_none(),
         "a cookie-less logout must not emit a Set-Cookie removal"
     );
 }
@@ -968,7 +1018,11 @@ async fn oidc_verified_email_satisfies_domain_allowlist() {
         .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "verified email admits");
+    assert_eq!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "verified email admits"
+    );
 }
 
 /// A verified email with surrounding whitespace still satisfies the domain
@@ -1040,7 +1094,11 @@ async fn oidc_large_groups_claim_yields_bounded_cookie() {
         .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "the matching group admits");
+    assert_eq!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "the matching group admits"
+    );
 
     let session_cookie = resp
         .headers()

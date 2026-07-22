@@ -41,7 +41,9 @@ pub fn error_page(
         body.push_str(&format!("<p>{}</p>", escape(detail)));
     }
     if let Some(href) = retry_href {
-        body.push_str(&format!(r#"<p><a href="{href}">Try signing in again</a></p>"#));
+        body.push_str(&format!(
+            r#"<p><a href="{href}">Try signing in again</a></p>"#
+        ));
     }
     page(status, title, body)
 }
@@ -76,10 +78,7 @@ mod tests {
     /// quote would break out of the attribute.
     #[test]
     fn escape_covers_attribute_breakout_chars() {
-        assert_eq!(
-            escape(r#"a"b'c<d>e&f"#),
-            "a&quot;b&#x27;c&lt;d&gt;e&amp;f"
-        );
+        assert_eq!(escape(r#"a"b'c<d>e&f"#), "a&quot;b&#x27;c&lt;d&gt;e&amp;f");
         let out = escape(r#"" onmouseover="alert(1)"#);
         assert!(!out.contains('"'), "double-quote must not survive: {out}");
     }
@@ -90,7 +89,9 @@ mod tests {
     #[tokio::test]
     async fn pages_set_the_mobile_viewport() {
         let resp = error_page(StatusCode::FORBIDDEN, "Denied", "why", None);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let html = String::from_utf8_lossy(&bytes);
         assert!(
             html.contains(r#"name="viewport""#),

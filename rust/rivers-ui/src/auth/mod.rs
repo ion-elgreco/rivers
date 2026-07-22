@@ -4,14 +4,14 @@
 pub mod config;
 #[cfg(test)]
 mod flow_tests;
-#[cfg(test)]
-pub(crate) mod test_cookies;
 pub mod forward;
 pub mod identity;
 pub mod middleware;
 pub mod oidc;
 pub mod pages;
 pub mod session;
+#[cfg(test)]
+pub(crate) mod test_cookies;
 
 use axum::Router;
 use axum::routing::get;
