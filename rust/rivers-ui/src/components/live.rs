@@ -194,6 +194,10 @@ pub fn use_live_kick(
         let err_cb = Closure::<dyn Fn()>::new(move || {
             // EventSource::CLOSED == 2; CONNECTING == 0; OPEN == 1.
             let new_status = if es_for_err.ready_state() == EventSource::CLOSED {
+                // A terminal close may mean the session lapsed (the max-age-capped
+                // stream ended and the reconnect hit the auth gate); re-check and
+                // bounce to login if so. A non-auth close leaves the probe OK.
+                crate::helpers::spawn_login_redirect_if_unauthorized();
                 LiveStatus::Stale
             } else {
                 LiveStatus::Reconnecting
