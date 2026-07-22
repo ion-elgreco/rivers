@@ -33,6 +33,7 @@ ssr = [
     "dep:axum-extra",
     "dep:cookie",
     "dep:openidconnect",
+    "dep:reqwest",
     "dep:ipnet",
     "dep:percent-encoding",
     "dep:url",
@@ -89,6 +90,9 @@ axum-extra = { version = "0.10", features = ["cookie-private"], optional = true 
 # expansion of 32-byte secrets) via feature unification.
 cookie = { version = "0.18", features = ["key-expansion"], optional = true }
 openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"], optional = true }
+# Native roots on the same reqwest openidconnect pulls with rustls-tls (webpki);
+# the OIDC client trusts both. default-features=false keeps native-tls off.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
 ipnet = { version = "2", optional = true }
 percent-encoding = { version = "2", optional = true }
 url = { workspace = true, optional = true }

@@ -13,7 +13,7 @@ use openidconnect::{
     AdditionalClaims, AuthorizationCode, Client, ClientId, ClientSecret, CsrfToken,
     EmptyExtraTokenFields, EndpointMaybeSet, EndpointNotSet, EndpointSet, IdTokenFields,
     IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier, ProviderMetadataWithLogout,
-    RedirectUrl, RevocationErrorResponseType, Scope, StandardErrorResponse,
+    RedirectUrl, RequestTokenError, RevocationErrorResponseType, Scope, StandardErrorResponse,
     StandardTokenResponse, TokenResponse, reqwest,
 };
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ use super::identity::Identity;
 use super::pages::{error_page, forbidden_page};
 use super::session::{
     PendingLogin, clear_cookies, clear_state_cookie, now_ts, pending_login_jar,
-    read_pending_login, session_response,
+    read_pending_login, read_session, session_response,
 };
 
 /// Catch-all additional claims — the configurable groups claim is read
@@ -149,6 +149,9 @@ impl OidcRuntime {
             // Never follow IdP redirects (SSRF).
             .redirect(reqwest::redirect::Policy::none())
             .timeout(IDP_HTTP_TIMEOUT)
+            // Trust system roots (internal/corporate CA) + webpki roots (public IdPs).
+            .tls_built_in_webpki_certs(true)
+            .tls_built_in_native_certs(true)
             .build()
             .context("failed to build OIDC http client")?;
         let (client, end_session_endpoint) = discover_client(&cfg, &http).await?;
@@ -354,7 +357,15 @@ pub async fn callback(
     };
     let token = match exchange.request_async(&o.http).await {
         Ok(token) => token,
-        Err(e) => return fail(StatusCode::BAD_GATEWAY, format!("code exchange failed: {e}")),
+        Err(e) => {
+            // invalid_grant etc. from the token endpoint is a client error → 4xx;
+            // only a transport/parse failure is a real IdP round-trip → 502.
+            let status = match &e {
+                RequestTokenError::ServerResponse(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            return fail(status, format!("code exchange failed: {e}"));
+        }
     };
     let Some(id_token) = token.id_token() else {
         return fail(
@@ -457,8 +468,13 @@ fn extract_groups(claims: &serde_json::Map<String, serde_json::Value>, claim: &s
     }
 }
 
-pub async fn logout(State(st): State<OidcState>) -> Response {
+pub async fn logout(State(st): State<OidcState>, headers: axum::http::HeaderMap) -> Response {
     let o = &st.oidc;
+    // No session ⇒ no-op: an unconditional cookie removal would let a cookie-less
+    // cross-site GET force-logout a signed-in user (logout CSRF).
+    if read_session(&headers, &o.cookie_key, o.cfg.secure_cookies()).is_none() {
+        return Redirect::to("/").into_response();
+    }
     let clear = clear_cookies(o.cfg.secure_cookies());
     if o.cfg.rp_logout {
         if let Some(end) = &o.end_session_endpoint {

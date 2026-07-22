@@ -213,6 +213,8 @@ struct MockIdp {
     hold_token: std::sync::atomic::AtomicBool,
     token_entered: tokio::sync::Notify,
     token_release: tokio::sync::Notify,
+    /// When set, `/token` returns an RFC 6749 `invalid_grant` error body.
+    token_errors: std::sync::atomic::AtomicBool,
 }
 
 type MockState = Arc<MockIdp>;
@@ -256,7 +258,18 @@ async fn jwks(State(idp): State<MockState>) -> Json<serde_json::Value> {
     Json(serde_json::to_value(&jwks).unwrap())
 }
 
-async fn token(State(idp): State<MockState>) -> Json<serde_json::Value> {
+async fn token(State(idp): State<MockState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if idp.token_errors.load(std::sync::atomic::Ordering::Relaxed) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "authorization code is invalid or has expired",
+            })),
+        )
+            .into_response();
+    }
     // One-shot pin: park the first callback here (after it snapshotted the
     // verifying client) so a second callback can rotate the keys underneath it.
     if idp.hold_token.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -309,7 +322,7 @@ async fn token(State(idp): State<MockState>) -> Json<serde_json::Value> {
         StandardTokenResponse::new(AccessToken::new("test-access".into()), CoreTokenType::Bearer, fields);
     resp.set_expires_in(Some(&std::time::Duration::from_secs(3600)));
     idp.token_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Json(serde_json::to_value(&resp).unwrap())
+    Json(serde_json::to_value(&resp).unwrap()).into_response()
 }
 
 async fn spawn_mock_idp(subject: &str, email: &str) -> MockState {
@@ -335,6 +348,7 @@ async fn spawn_mock_idp_with_groups(subject: &str, email: &str, groups: Vec<Stri
         hold_token: std::sync::atomic::AtomicBool::new(false),
         token_entered: tokio::sync::Notify::new(),
         token_release: tokio::sync::Notify::new(),
+        token_errors: std::sync::atomic::AtomicBool::new(false),
     });
     let router = Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
@@ -844,6 +858,43 @@ async fn oidc_callback_without_state_cookie_fails() {
     let resp = app.clone().oneshot(req(&callback, None, &[])).await.unwrap();
     // Missing pending-login cookie is a client/session error → 4xx, not 502.
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A token-endpoint OAuth error (invalid_grant on a reused/expired code) is a
+/// client/flow error → 4xx, not a 502 that would trip ingress alerts.
+#[tokio::test]
+async fn oidc_token_endpoint_error_is_client_error_not_502() {
+    use std::sync::atomic::Ordering;
+    let idp = spawn_mock_idp("sub-42", "john.doe@example.com").await;
+    let rt = oidc_rt(&idp, Allowlists::default()).await;
+    let app = app(Some(rt));
+
+    let (callback, store) = drive_login(&app, &idp).await;
+    idp.token_errors.store(true, Ordering::Relaxed);
+    let resp = app
+        .oneshot(req(&callback, None, &[("cookie", &store.header_value())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Logout without a session cookie must be a no-op: emitting a cookie removal
+/// would let a cookie-less cross-site GET force-logout a signed-in user.
+#[tokio::test]
+async fn oidc_logout_without_session_emits_no_cookie() {
+    let idp = spawn_mock_idp("sub-42", "john.doe@example.com").await;
+    let rt = oidc_rt(&idp, Allowlists::default()).await;
+    let app = app(Some(rt));
+
+    let resp = app
+        .oneshot(req(crate::routes::LOGOUT, None, &[]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(
+        resp.headers().get_all(header::SET_COOKIE).iter().next().is_none(),
+        "a cookie-less logout must not emit a Set-Cookie removal"
+    );
 }
 
 #[tokio::test]

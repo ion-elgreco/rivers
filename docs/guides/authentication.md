@@ -57,6 +57,11 @@ ID, Google, Dex, Authentik, Zitadel. Knobs:
 | `ui.auth.oidc.rpLogout` | `RIVERS_AUTH_OIDC_RP_LOGOUT` | `false` — when `true`, sign-out also ends the IdP session |
 | `ui.auth.sessionTtl` | `RIVERS_AUTH_SESSION_TTL` | `28800` (8h) |
 
+The issuer's TLS certificate is validated against both the container's system
+trust store and bundled public CA roots, so an IdP served with an internal or
+corporate CA works once that CA is in the image's trust store (the standard
+`ca-certificates` path); public IdPs need no setup.
+
 Sessions are stateless encrypted cookies (AES-256-GCM) — no session table,
 no sticky sessions, and no OAuth tokens are ever stored. The cookie key is
 chart-managed (`rivers-ui-auth` Secret, generated once and preserved across
