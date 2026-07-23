@@ -387,8 +387,10 @@ def test_multiple_submits_all_queued(queued_grpc_channel):
     assert len(queued) == 3
 
 
-def test_cancel_run_sets_cancellation_flag(queued_grpc_channel):
-    """CancelRun gRPC sets cancellation flag in storage for local backend."""
+def test_cancel_run_cancels_queued_run(queued_grpc_channel):
+    """CancelRun on a still-queued run flips it to Canceled and removes it from
+    the queue — regression: only the cancellation flag was set (consumed solely
+    by the executor), so a queued run stayed Queued forever."""
     channel, pb2, pb2_grpc, _, storage = queued_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)
 
@@ -399,6 +401,64 @@ def test_cancel_run_sets_cancellation_flag(queued_grpc_channel):
     assert cancel_resp.success
 
     assert storage.is_cancelled(resp.run_id)
+    run = storage.get_run(resp.run_id)
+    assert run is not None
+    assert run.status == "Canceled"
+    assert resp.run_id not in [r.run_id for r in storage.get_queued_runs()]
+
+
+def test_rerun_rejects_run_from_another_code_location(grpc_stubs, storage, monkeypatch):
+    """RerunRun must refuse a run owned by a different code location —
+    regression: location bar rebuilt foo's run against its own definitions and
+    dispatched a mangled copy stamped with bar's identity."""
+    handler = DictIOHandler()
+
+    def make_repo(cl_id):
+        @rs.Asset(io_handler=handler)
+        def alpha():
+            return 1
+
+        job = rs.Job(name="test_job", assets=[alpha])
+        monkeypatch.setenv("RIVERS_CODE_LOCATION_ID", cl_id)
+        repo = rs.CodeRepository(
+            assets=[alpha],
+            jobs=[job],
+            default_executor=rs.Executor.in_process(),
+            run_queue=rs.RunQueueConfig(max_concurrent_runs=2, dequeue_interval="50ms"),
+        )
+        repo.resolve(storage=storage)
+        return repo
+
+    pb2, pb2_grpc = grpc_stubs
+
+    # One gRPC server at a time: create a queued run under cl-foo, stop.
+    foo = make_repo("cl-foo")
+    port = foo._start_grpc_server("127.0.0.1", 0)
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+    run_id = (
+        pb2_grpc.CodeLocationServiceStub(channel)
+        .ExecuteJob(pb2.ExecuteJobRequest(job_name="test_job"))
+        .run_id
+    )
+    channel.close()
+    foo._stop_grpc_server()
+
+    bar = make_repo("cl-bar")
+    port = bar._start_grpc_server("127.0.0.1", 0)
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+    try:
+        with pytest.raises(grpc.RpcError) as exc_info:
+            pb2_grpc.CodeLocationServiceStub(channel).RerunRun(
+                pb2.RerunRunRequest(run_id=run_id)
+            )
+        assert "code location" in exc_info.value.details()
+        # The original run is untouched.
+        assert storage.get_run(run_id).status == "Queued"
+    finally:
+        channel.close()
+        bar._stop_grpc_server()
 
 
 @pytest.fixture

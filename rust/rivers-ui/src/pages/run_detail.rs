@@ -166,18 +166,17 @@ pub fn RunDetailPage() -> impl IntoView {
     let (view_mode, set_view_mode) = signal("gantt".to_string());
 
     // Re-execute reuses the run's exact config server-side (partition, tags, job
-    // vs. materialization), so a partitioned run replays on its partition.
+    // vs. materialization), so a partitioned run replays on its partition. Both
+    // actions route by the run's owning location, not the page's.
     let reexecute = Action::new(move |run_id: &String| {
         let run_id = run_id.clone();
-        let (ns, name) = loc.get();
-        async move { rerun_run(ns, name, run_id).await }
+        async move { rerun_run(run_id).await }
     });
     let reexecute_pending = reexecute.pending();
 
     let cancel = Action::new(move |id: &String| {
         let id = id.clone();
-        let (ns, name) = loc.get();
-        async move { cancel_run(ns, name, id).await }
+        async move { cancel_run(id).await }
     });
     let cancel_pending = cancel.pending();
 

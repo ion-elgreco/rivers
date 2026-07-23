@@ -16,6 +16,57 @@ async fn current_user_ref() -> Option<rivers_api::rivers::UserRef> {
     })
 }
 
+/// Connect to the code location that owns `run_id` (from its stored
+/// `code_location_id`), regardless of which location the UI is currently
+/// showing — a run-scoped action routed to the page's location would replay
+/// foreign runs against the wrong definitions.
+#[cfg(feature = "ssr")]
+async fn connect_to_run_owner(
+    run_id: &str,
+) -> Result<
+    rivers_api::rivers::code_location_service_client::CodeLocationServiceClient<
+        tonic::transport::Channel,
+    >,
+    ServerFnError,
+> {
+    use rivers_core::storage::StorageBackend;
+    let state = expect_context::<crate::state::AppState>();
+    let record = state
+        .storage
+        .get_run(run_id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .ok_or_else(|| ServerFnError::new(format!("run '{run_id}' not found")))?;
+    let cl = record.code_location_id;
+    let entries = state
+        .registry
+        .list()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let entry = entries
+        .iter()
+        .find(|e| e.identity == cl)
+        // Single-location registries (dev mode) can't cross locations.
+        .or_else(|| match entries.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            ServerFnError::new(format!(
+                "code location '{cl}' owning run '{run_id}' is not registered"
+            ))
+        })?;
+    if !entry.is_ready() {
+        return Err(ServerFnError::new(format!(
+            "code location {}/{} is not Ready (phase={})",
+            entry.namespace, entry.name, entry.phase
+        )));
+    }
+    crate::code_location_registry::connect_code_location(&entry.grpc_endpoint)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
 /// Convert a UI-side `SubmitPartitionKey` into the proto wire type
 /// `ProtoPartitionKey`. SSR-only because `rivers_api` isn't compiled on
 /// WASM.
@@ -97,20 +148,13 @@ pub async fn trigger_materialize(
 }
 
 /// Re-execute a run by id, server-side: replays it on its original partition,
-/// reusing tags + job/materialization shape. Returns the new `run_id`.
+/// reusing tags + job/materialization shape, routed to the run's owning code
+/// location. Returns the new `run_id`.
 #[server]
-pub async fn rerun_run(
-    loc_ns: String,
-    loc_name: String,
-    run_id: String,
-) -> Result<MaterializeResult, ServerFnError> {
+pub async fn rerun_run(run_id: String) -> Result<MaterializeResult, ServerFnError> {
     use rivers_api::rivers::RerunRunRequest;
 
-    let state = expect_context::<crate::state::AppState>();
-    let (_, mut client) = state
-        .connect_to(&loc_ns, &loc_name)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut client = connect_to_run_owner(&run_id).await?;
 
     let resp = client
         .rerun_run(RerunRunRequest {
@@ -301,18 +345,10 @@ pub async fn execute_job(
 /// signals the run backend (Local in-process / K8s pod kill). Returns
 /// `true` once the request was accepted.
 #[server]
-pub async fn cancel_run(
-    loc_ns: String,
-    loc_name: String,
-    run_id: String,
-) -> Result<bool, ServerFnError> {
+pub async fn cancel_run(run_id: String) -> Result<bool, ServerFnError> {
     use rivers_api::rivers::CancelRunRequest;
 
-    let state = expect_context::<crate::state::AppState>();
-    let (_, mut client) = state
-        .connect_to(&loc_ns, &loc_name)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut client = connect_to_run_owner(&run_id).await?;
 
     let resp = client
         .cancel_run(CancelRunRequest { run_id })

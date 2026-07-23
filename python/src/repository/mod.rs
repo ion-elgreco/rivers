@@ -1921,18 +1921,26 @@ impl RepoHandle {
         run_id: &str,
         launched_by: rivers_core::storage::LaunchedBy,
     ) -> PyResult<crate::daemon::RunRerunRequest> {
-        let storage = {
+        let (storage, own_cl) = {
             let guard = self.state.read().unwrap();
             let state = guard.as_ref().ok_or_else(|| {
                 ExecutionError::new_err("Repository not resolved — call resolve() first")
             })?;
-            state.storage.clone()
+            (state.storage.clone(), state.code_location_id.clone())
         };
         let record = storage
             .get_run(run_id)
             .await
             .map_err(|e| ExecutionError::new_err(format!("Failed to load run: {e}")))?
             .ok_or_else(|| ExecutionError::new_err(format!("run '{run_id}' not found")))?;
+        // Storage is shared across locations: replaying a foreign run against
+        // this repo's definitions would dispatch a mangled copy under our id.
+        if record.code_location_id != own_cl {
+            return Err(ExecutionError::new_err(format!(
+                "run '{run_id}' belongs to code location '{}' — retry it from that location",
+                record.code_location_id
+            )));
+        }
 
         let mut tags = record.tags;
         tags.retain(|(k, _)| k != tag_keys::RERUN_OF);
@@ -2088,10 +2096,23 @@ impl RepoHandle {
             (state.storage.clone(), state.run_backend.clone())
         };
 
+        // Flag first so a run dispatched concurrently still sees the cancel at
+        // executor startup.
         storage
             .request_cancellation(run_id)
             .await
             .map_err(|e| ExecutionError::new_err(format!("failed to request cancellation: {e}")))?;
+
+        // A still-queued run has no backend to signal — flip it to Canceled so
+        // it leaves the queue instead of lingering flagged-but-Queued.
+        if storage
+            .cancel_queued_run(run_id)
+            .await
+            .map_err(|e| ExecutionError::new_err(format!("failed to cancel queued run: {e}")))?
+        {
+            tracing::info!(target: "rivers::repo", run_id = %run_id, "queued run canceled");
+            return Ok(true);
+        }
 
         match run_backend.terminate_run(run_id).await {
             Ok(true) => {

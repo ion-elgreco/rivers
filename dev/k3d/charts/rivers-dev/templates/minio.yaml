@@ -28,6 +28,9 @@ spec:
           ports:
             - containerPort: 9000
               name: s3
+          volumeMounts:
+            - name: data
+              mountPath: /data
           readinessProbe:
             httpGet:
               path: /minio/health/ready
@@ -41,6 +44,46 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+        # Converges the bucket on every pod start (a fresh PVC starts empty);
+        # a helm hook can't do this — the tolerated 15s --wait timeout in the
+        # dev helmfile marks the upgrade failed and skips post-upgrade hooks.
+        - name: ensure-bucket
+          image: {{ .Values.minio.mcImage }}
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              until mc alias set myminio http://127.0.0.1:9000 {{ .Values.minio.rootUser }} {{ .Values.minio.rootPassword }}; do
+                sleep 2
+              done
+              mc mb --ignore-existing myminio/{{ .Values.minio.bucket }}
+              sleep infinity
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-data
+---
+# A restart used to wipe the volume-less /data (and the bucket with it),
+# failing every run until a manual re-create.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: minio
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
 ---
 apiVersion: v1
 kind: Service
@@ -57,26 +100,3 @@ spec:
       name: s3
   selector:
     app.kubernetes.io/name: minio
----
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: minio-create-bucket
-  namespace: {{ .Values.namespace }}
-spec:
-  backoffLimit: 10
-  template:
-    spec:
-      restartPolicy: OnFailure
-      containers:
-        - name: mc
-          image: {{ .Values.minio.mcImage }}
-          imagePullPolicy: IfNotPresent
-          command: ["sh", "-c"]
-          args:
-            - |
-              until mc alias set myminio http://minio.{{ .Values.namespace }}.svc:9000 {{ .Values.minio.rootUser }} {{ .Values.minio.rootPassword }}; do
-                echo "waiting for minio..."
-                sleep 2
-              done
-              mc mb --ignore-existing myminio/{{ .Values.minio.bucket }}
