@@ -97,6 +97,9 @@ pub(super) async fn evaluate_schedule_sync(
                 tags: tags.clone(),
                 partition_key: None,
                 job_name: Some(job_name.to_string()),
+                launched_by: rivers_core::storage::LaunchedBy::Schedule {
+                    name: name.to_string(),
+                },
             }],
             vec![], // no materialization requests for schedules
             vec![],
@@ -105,6 +108,7 @@ pub(super) async fn evaluate_schedule_sync(
 
     let precomputed = precomputed.clone();
     let name = name.to_string();
+    let sched_name = name.clone();
     let exec_time = execution_time.to_string();
     let job_name = job_name.to_string();
     let tags = tags.clone();
@@ -135,6 +139,7 @@ pub(super) async fn evaluate_schedule_sync(
                 &parsed.run_requests,
                 &parsed.backfill_requests,
                 parsed.skip_reason.as_ref(),
+                &rivers_core::storage::LaunchedBy::Schedule { name: sched_name },
             ))
         })
         .unwrap_or(Err("Python not attached".into()))
@@ -157,6 +162,7 @@ pub(super) async fn evaluate_schedule_async(
     let eval_fn = eval_fn.clone();
     let precomputed = precomputed.clone();
     let name = name.to_string();
+    let sched_name = name.clone();
     let exec_time = execution_time.to_string();
     let job_name = job_name.to_string();
 
@@ -201,6 +207,7 @@ pub(super) async fn evaluate_schedule_async(
                 &parsed.run_requests,
                 &parsed.backfill_requests,
                 parsed.skip_reason.as_ref(),
+                &rivers_core::storage::LaunchedBy::Schedule { name: sched_name },
             ))
         })
         .unwrap_or(Err("Python not attached".into()))

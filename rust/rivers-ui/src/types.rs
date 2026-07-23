@@ -10,6 +10,37 @@ pub(crate) fn partition_key_to_display(pk: rivers_core::storage::PartitionKey) -
     pk.to_display()
 }
 
+/// Human-readable label for an identity: `name`, else `email`, else
+/// `subject`. The single precedence rule every UI identity type shares.
+/// An empty or whitespace-only string counts as absent, so a claim like
+/// `name:""` or `name:" "` falls through instead of rendering blank.
+pub(crate) fn display_name<'a>(
+    name: Option<&'a str>,
+    email: Option<&'a str>,
+    subject: &'a str,
+) -> &'a str {
+    let non_empty = |s: &&'a str| !s.trim().is_empty();
+    name.filter(non_empty)
+        .or(email.filter(non_empty))
+        .unwrap_or(subject)
+}
+
+/// The signed-in user as exposed to the shell; `None` means auth mode
+/// `none`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentUser {
+    pub user: UserRef,
+    /// Where the sign-out control points; `None` hides it (forward mode
+    /// without a configured proxy logout URL).
+    pub logout_url: Option<String>,
+}
+
+impl CurrentUser {
+    pub fn display(&self) -> &str {
+        self.user.display()
+    }
+}
+
 /// Mirrors `rivers_core::storage::StaleStatus`. Computed on demand via
 /// `staleness::compute_staleness` over the records + topology — never persisted.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,12 +112,30 @@ pub enum RunStatus {
     Canceled,
 }
 
+/// Who performed a manual action — mirrors `rivers_core::storage::UserRef`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserRef {
+    pub subject: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl UserRef {
+    pub fn display(&self) -> &str {
+        display_name(self.name.as_deref(), self.email.as_deref(), &self.subject)
+    }
+}
+
 /// Origin of a run — mirrors `rivers_core::storage::LaunchedBy`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LaunchedBy {
-    #[default]
-    Manual,
+    Manual {
+        #[serde(default)]
+        user: Option<UserRef>,
+    },
     Schedule {
         name: String,
     },
@@ -97,6 +146,12 @@ pub enum LaunchedBy {
         backfill_id: String,
     },
     Condition,
+}
+
+impl Default for LaunchedBy {
+    fn default() -> Self {
+        Self::Manual { user: None }
+    }
 }
 
 /// A run's partition members, capped: a few keys + the total, so the run list
@@ -642,6 +697,8 @@ pub struct BackfillInfo {
     pub error: Option<String>,
     #[serde(default)]
     pub code_location_id: String,
+    #[serde(default)]
+    pub launched_by: LaunchedBy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -907,10 +964,22 @@ mod conversions {
         }
     }
 
+    impl From<rivers_core::storage::UserRef> for UserRef {
+        fn from(u: rivers_core::storage::UserRef) -> Self {
+            Self {
+                subject: u.subject,
+                email: u.email,
+                name: u.name,
+            }
+        }
+    }
+
     impl From<rivers_core::storage::LaunchedBy> for LaunchedBy {
         fn from(l: rivers_core::storage::LaunchedBy) -> Self {
             match l {
-                rivers_core::storage::LaunchedBy::Manual => Self::Manual,
+                rivers_core::storage::LaunchedBy::Manual { user } => Self::Manual {
+                    user: user.map(Into::into),
+                },
                 rivers_core::storage::LaunchedBy::Schedule { name } => Self::Schedule { name },
                 rivers_core::storage::LaunchedBy::Sensor { name } => Self::Sensor { name },
                 rivers_core::storage::LaunchedBy::Backfill { backfill_id } => {
@@ -1209,6 +1278,7 @@ mod conversions {
                 end_time: b.end_time,
                 error: b.error,
                 code_location_id: b.code_location_id,
+                launched_by: b.launched_by.into(),
             }
         }
     }
@@ -1314,7 +1384,7 @@ mod conversions {
                     ],
                 }),
                 block_reason: None,
-                launched_by: rivers_core::storage::LaunchedBy::Manual,
+                launched_by: rivers_core::storage::LaunchedBy::Manual { user: None },
             };
             let ui: RunRecord = core.into();
             let preview = ui
@@ -1398,6 +1468,52 @@ mod conversions {
             let core: rivers_core::storage::BackfillFilter = ui.into();
             assert!(core.status.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::{CurrentUser, UserRef, display_name};
+
+    /// All UI identity types share one precedence: name → email → subject.
+    /// Guards against the copies silently diverging.
+    #[test]
+    fn display_precedence_is_shared() {
+        assert_eq!(display_name(Some("Jane"), Some("e@x"), "sub"), "Jane");
+        assert_eq!(display_name(None, Some("e@x"), "sub"), "e@x");
+        assert_eq!(display_name(None, None, "sub"), "sub");
+
+        // An empty string is not a present value: fall through to the next
+        // source so an IdP returning name:"" (or a verified email:"") renders
+        // the real identity, not a blank chip/forbidden-page/audit label.
+        assert_eq!(display_name(Some(""), Some("e@x"), "sub"), "e@x");
+        assert_eq!(display_name(Some(""), Some(""), "sub"), "sub");
+        assert_eq!(display_name(None, Some(""), "sub"), "sub");
+
+        // Whitespace-only is absent too — complements the producer-side trim in
+        // oidc/forward so a spaces-only claim falls through, not renders blank.
+        assert_eq!(display_name(Some("   "), Some("e@x"), "sub"), "e@x");
+        assert_eq!(display_name(Some("  "), None, "sub"), "sub");
+
+        let full = UserRef {
+            subject: "sub".into(),
+            email: Some("e@x".into()),
+            name: Some("Jane".into()),
+        };
+        assert_eq!(full.display(), "Jane");
+        let cu = CurrentUser {
+            user: full.clone(),
+            logout_url: None,
+        };
+        // CurrentUser delegates to its nested UserRef.
+        assert_eq!(cu.display(), full.display());
+
+        let subject_only = UserRef {
+            subject: "sub".into(),
+            email: None,
+            name: None,
+        };
+        assert_eq!(subject_only.display(), "sub");
     }
 }
 

@@ -105,6 +105,7 @@ impl CodeLocationService for CodeLocationImpl {
         request: Request<MaterializeRequest>,
     ) -> Result<Response<MaterializeResponse>, Status> {
         let req = request.into_inner();
+        let launched_by = manual_launch(req.user);
         let pk = req
             .partition_key
             .map(proto_partition_key_to_py)
@@ -143,7 +144,7 @@ impl CodeLocationService for CodeLocationImpl {
             asset_selection,
             partition_key: pk_core,
             tags,
-            launched_by: rivers_core::storage::LaunchedBy::Manual,
+            launched_by,
         };
         let run_id = mat_request.run_id.clone();
         let status = self.run_dispatcher.mode_label().to_string();
@@ -167,6 +168,7 @@ impl CodeLocationService for CodeLocationImpl {
         request: Request<ExecuteJobRequest>,
     ) -> Result<Response<ExecuteJobResponse>, Status> {
         let req = request.into_inner();
+        let launched_by = manual_launch(req.user);
         let jobs = self.handle.job_names();
         if !jobs.contains(&req.job_name) {
             return Err(Status::not_found(format!(
@@ -182,11 +184,12 @@ impl CodeLocationService for CodeLocationImpl {
                 .map(proto_partition_key_to_py)
                 .transpose()?,
             job_name: Some(req.job_name),
+            launched_by,
         };
 
         let mut outcome = self
             .run_dispatcher
-            .dispatch_jobs(&[run_request], rivers_core::storage::LaunchedBy::Manual)
+            .dispatch_jobs(&[run_request])
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -209,10 +212,11 @@ impl CodeLocationService for CodeLocationImpl {
         request: Request<RerunRunRequest>,
     ) -> Result<Response<RerunRunResponse>, Status> {
         let req = request.into_inner();
-        // Rebuilds the request from the stored run (partition + tags) for replay.
+        // Rebuilds the request from the stored run (partition + tags) for replay,
+        // stamped with the rerunning user (not the original launcher).
         let rerun = self
             .handle
-            .build_run_rerun_request(&req.run_id)
+            .build_run_rerun_request(&req.run_id, manual_launch(req.user))
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -221,7 +225,7 @@ impl CodeLocationService for CodeLocationImpl {
             crate::daemon::RunRerunRequest::Job(run_request) => {
                 let mut outcome = self
                     .run_dispatcher
-                    .dispatch_jobs(&[run_request], rivers_core::storage::LaunchedBy::Manual)
+                    .dispatch_jobs(&[run_request])
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?;
                 if let Some(err) = outcome.errors.pop() {
@@ -581,6 +585,7 @@ impl CodeLocationService for CodeLocationImpl {
             tags,
             dry_run: req.dry_run,
             backfill_id: None,
+            launched_by: manual_launch(req.user),
         };
 
         let mut outcome = self
@@ -615,7 +620,11 @@ impl CodeLocationService for CodeLocationImpl {
         // Builds a backfill over the missing partitions; same dispatch as `launch_backfill`.
         let backfill_request = self
             .handle
-            .build_missing_backfill_request(&req.asset_key, req.max_concurrency)
+            .build_missing_backfill_request(
+                &req.asset_key,
+                req.max_concurrency,
+                manual_launch(req.user),
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -650,7 +659,7 @@ impl CodeLocationService for CodeLocationImpl {
         let req = request.into_inner();
         let backfill_request = self
             .handle
-            .build_rerun_request(&req.backfill_id, req.dry_run)
+            .build_rerun_request(&req.backfill_id, req.dry_run, manual_launch(req.user))
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -689,16 +698,23 @@ impl CodeLocationService for CodeLocationImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         match status {
-            Some(s) => Ok(Response::new(GetBackfillStatusResponse {
-                backfill_id: s.backfill_id,
-                status: s.status,
-                total_partitions: s.total_partitions as u32,
-                completed_partitions: s.completed_partitions as u32,
-                failed_partitions: s.failed_partitions as u32,
-                canceled_partitions: s.canceled_partitions as u32,
-                run_ids: s.run_ids,
-                error: s.error,
-            })),
+            Some(s) => {
+                let (launched_by_kind, launched_by_name, launched_by_user) =
+                    launched_by_to_proto(s.launched_by.inner);
+                Ok(Response::new(GetBackfillStatusResponse {
+                    backfill_id: s.backfill_id,
+                    status: s.status,
+                    total_partitions: s.total_partitions as u32,
+                    completed_partitions: s.completed_partitions as u32,
+                    failed_partitions: s.failed_partitions as u32,
+                    canceled_partitions: s.canceled_partitions as u32,
+                    run_ids: s.run_ids,
+                    error: s.error,
+                    launched_by_kind,
+                    launched_by_name,
+                    launched_by_user,
+                }))
+            }
             None => Err(Status::not_found(format!(
                 "Backfill '{}' not found",
                 req.backfill_id
@@ -736,6 +752,39 @@ impl CodeLocationService for CodeLocationImpl {
 }
 
 // --- Helpers ---
+
+/// Manual provenance from an optional proto `UserRef`.
+fn manual_launch(user: Option<rivers_api::rivers::UserRef>) -> rivers_core::storage::LaunchedBy {
+    rivers_core::storage::LaunchedBy::Manual {
+        user: user.map(|u| rivers_core::storage::UserRef {
+            subject: u.subject,
+            email: u.email,
+            name: u.name,
+        }),
+    }
+}
+
+/// Flatten a `LaunchedBy` into the proto response's `(kind, name, user)` triple.
+fn launched_by_to_proto(
+    lb: rivers_core::storage::LaunchedBy,
+) -> (String, Option<String>, Option<rivers_api::rivers::UserRef>) {
+    use rivers_core::storage::LaunchedBy;
+    match lb {
+        LaunchedBy::Manual { user } => (
+            "manual".to_string(),
+            None,
+            user.map(|u| rivers_api::rivers::UserRef {
+                subject: u.subject,
+                email: u.email,
+                name: u.name,
+            }),
+        ),
+        LaunchedBy::Schedule { name } => ("schedule".to_string(), Some(name), None),
+        LaunchedBy::Sensor { name } => ("sensor".to_string(), Some(name), None),
+        LaunchedBy::Backfill { backfill_id } => ("backfill".to_string(), Some(backfill_id), None),
+        LaunchedBy::Condition => ("condition".to_string(), None, None),
+    }
+}
 
 fn empty_to_none<T>(v: Vec<T>) -> Option<Vec<T>> {
     if v.is_empty() { None } else { Some(v) }

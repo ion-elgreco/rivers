@@ -199,8 +199,10 @@ pub fn GraphPage() -> impl IntoView {
     let dialog_asset_keys =
         Signal::derive(move || mat_target.get().map(|k| vec![k]).unwrap_or_default());
     let start_materialize: Callback<String> = Callback::new(move |key: String| {
-        let picker =
-            partition_picker_for_assets(&[key.clone()], &asset_info_by_key.get_untracked());
+        let picker = partition_picker_for_assets(
+            std::slice::from_ref(&key),
+            &asset_info_by_key.get_untracked(),
+        );
         if matches!(picker, JobPartitionPicker::None) {
             materialize_action.dispatch(key);
         } else {

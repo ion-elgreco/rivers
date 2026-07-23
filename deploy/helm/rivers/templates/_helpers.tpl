@@ -76,8 +76,8 @@ true
 
 {{/*
 Resolve a Secret value: inline override wins; otherwise re-read the
-existing Secret (`lookup`) so passwords don't rotate underneath running
-pods on upgrade; otherwise generate fresh `randAlphaNum 32`.
+existing Secret (`lookup`) so values don't rotate underneath running pods on
+upgrade; otherwise fall back to the caller-supplied `generate` value.
 
 The result is **memoized on `.Values`** by `cacheKey` — multiple includes
 within one render must agree (e.g. `rivers-surrealdb-auth` and
@@ -86,9 +86,11 @@ memoization each `randAlphaNum` call would diverge, leaving the auth
 Secret and the user-init Job's SurrealQL with different passwords on
 first install.
 
-Args (dict): `ctx` (root context), `secret`, `key`, `override`, `cacheKey`.
+Args (dict): `ctx` (root context), `secret`, `key`, `cacheKey`, `generate`
+(fallback value when neither an override nor an existing Secret is found),
+and optional `override`.
 */}}
-{{- define "rivers.surrealLookupOrGenerate" -}}
+{{- define "rivers.lookupOrGenerate" -}}
 {{- $cache := index .ctx.Values "__riversCachedPasswords" | default dict -}}
 {{- if not (hasKey $cache .cacheKey) -}}
 {{-   $val := "" -}}
@@ -99,7 +101,7 @@ Args (dict): `ctx` (root context), `secret`, `key`, `override`, `cacheKey`.
 {{-     if and $existing $existing.data (index $existing.data .key) -}}
 {{-       $val = (index $existing.data .key | b64dec) -}}
 {{-     else -}}
-{{-       $val = randAlphaNum 32 -}}
+{{-       $val = .generate -}}
 {{-     end -}}
 {{-   end -}}
 {{-   $_ := set $cache .cacheKey $val -}}
@@ -109,7 +111,7 @@ Args (dict): `ctx` (root context), `secret`, `key`, `override`, `cacheKey`.
 {{- end -}}
 
 {{- define "rivers.surrealBootstrapPassword" -}}
-{{- include "rivers.surrealLookupOrGenerate" (dict "ctx" . "cacheKey" "bootstrap" "secret" (include "rivers.surrealBootstrapSecretName" .) "key" "password" "override" .Values.surrealdb.auth.bootstrap.password) -}}
+{{- include "rivers.lookupOrGenerate" (dict "ctx" . "cacheKey" "bootstrap" "secret" (include "rivers.surrealBootstrapSecretName" .) "key" "password" "generate" (randAlphaNum 32) "override" .Values.surrealdb.auth.bootstrap.password) -}}
 {{- end -}}
 
 {{- define "rivers.surrealRiversUsername" -}}
@@ -117,7 +119,7 @@ Args (dict): `ctx` (root context), `secret`, `key`, `override`, `cacheKey`.
 {{- end -}}
 
 {{- define "rivers.surrealRiversPassword" -}}
-{{- include "rivers.surrealLookupOrGenerate" (dict "ctx" . "cacheKey" "rivers" "secret" (include "rivers.surrealAuthSecretName" .) "key" .Values.surrealdb.auth.secretKeys.password "override" .Values.surrealdb.auth.password) -}}
+{{- include "rivers.lookupOrGenerate" (dict "ctx" . "cacheKey" "rivers" "secret" (include "rivers.surrealAuthSecretName" .) "key" .Values.surrealdb.auth.secretKeys.password "generate" (randAlphaNum 32) "override" .Values.surrealdb.auth.password) -}}
 {{- end -}}
 
 {{/*
@@ -185,5 +187,116 @@ downstream are only added when auth is requested.
   value: {{ .Values.surrealdb.auth.secretKeys.username | quote }}
 - name: RIVERS_SURREAL_AUTH_PASSWORD_KEY
   value: {{ .Values.surrealdb.auth.secretKeys.password | quote }}
+{{- end }}
+{{- end -}}
+
+{{- define "rivers.uiAuthCookieSecretName" -}}
+rivers-ui-auth
+{{- end -}}
+
+{{/*
+Session-cookie key value: base64 of 48 random bytes (the binary expects
+base64 of >= 32). Preserved across upgrades via the shared
+`rivers.lookupOrGenerate` (the same lookup/memoize path as the SurrealDB
+secrets), differing only in the generator.
+*/}}
+{{- define "rivers.uiAuthCookieSecretValue" -}}
+{{- include "rivers.lookupOrGenerate" (dict "ctx" . "cacheKey" "uiCookie" "secret" (include "rivers.uiAuthCookieSecretName" .) "key" .Values.ui.auth.cookieSecret.secretKey "generate" (randAlphaNum 48 | b64enc)) -}}
+{{- end -}}
+
+{{/*
+Fail the install loudly on unusable ui.auth combinations.
+*/}}
+{{- define "rivers.validateUiAuth" -}}
+{{- $auth := .Values.ui.auth -}}
+{{- if not (has $auth.mode (list "none" "oidc" "forward")) -}}
+{{ fail (printf "ui.auth.mode must be none|oidc|forward, got %q" $auth.mode) }}
+{{- end -}}
+{{- if eq $auth.mode "oidc" -}}
+{{- if not $auth.oidc.issuer -}}
+{{ fail "ui.auth.mode=oidc requires ui.auth.oidc.issuer" }}
+{{- end -}}
+{{- if not $auth.oidc.clientId -}}
+{{ fail "ui.auth.mode=oidc requires ui.auth.oidc.clientId" }}
+{{- end -}}
+{{- if not $auth.publicUrl -}}
+{{ fail "ui.auth.mode=oidc requires ui.auth.publicUrl" }}
+{{- end -}}
+{{- if and (not $auth.oidc.existingSecret) (not $auth.oidc.publicClient) -}}
+{{ fail "ui.auth.mode=oidc requires ui.auth.oidc.existingSecret (or publicClient: true for PKCE-only IdP registrations)" }}
+{{- end -}}
+{{- end -}}
+{{- if and (eq $auth.mode "forward") (not $auth.forward.trustedProxies) -}}
+{{ fail "ui.auth.mode=forward requires ui.auth.forward.trustedProxies (0.0.0.0/0 must be typed deliberately)" }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+RIVERS_AUTH_* env for the UI container. Secrets flow via secretKeyRef
+only; nothing is emitted in mode "none".
+*/}}
+{{- define "rivers.uiAuthEnv" -}}
+{{- $auth := .Values.ui.auth -}}
+{{- if ne $auth.mode "none" }}
+- name: RIVERS_AUTH_MODE
+  value: {{ $auth.mode | quote }}
+{{- with $auth.allowedDomains }}
+- name: RIVERS_AUTH_ALLOWED_DOMAINS
+  value: {{ join "," . | quote }}
+{{- end }}
+{{- with $auth.allowedGroups }}
+- name: RIVERS_AUTH_ALLOWED_GROUPS
+  value: {{ join "," . | quote }}
+{{- end }}
+{{- with $auth.allowedUsers }}
+- name: RIVERS_AUTH_ALLOWED_USERS
+  value: {{ join "," . | quote }}
+{{- end }}
+{{- end }}
+{{- if eq $auth.mode "oidc" }}
+- name: RIVERS_AUTH_PUBLIC_URL
+  value: {{ $auth.publicUrl | quote }}
+- name: RIVERS_AUTH_SESSION_TTL
+  value: {{ $auth.sessionTtl | quote }}
+- name: RIVERS_AUTH_COOKIE_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ $auth.cookieSecret.existingSecret | default (include "rivers.uiAuthCookieSecretName" .) }}
+      key: {{ $auth.cookieSecret.secretKey | quote }}
+- name: RIVERS_AUTH_OIDC_ISSUER
+  value: {{ $auth.oidc.issuer | quote }}
+- name: RIVERS_AUTH_OIDC_CLIENT_ID
+  value: {{ $auth.oidc.clientId | quote }}
+{{- if not $auth.oidc.publicClient }}
+- name: RIVERS_AUTH_OIDC_CLIENT_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ $auth.oidc.existingSecret }}
+      key: {{ $auth.oidc.clientSecretKey }}
+{{- end }}
+- name: RIVERS_AUTH_OIDC_SCOPES
+  value: {{ $auth.oidc.scopes | quote }}
+- name: RIVERS_AUTH_OIDC_GROUPS_CLAIM
+  value: {{ $auth.oidc.groupsClaim | quote }}
+{{- if $auth.oidc.rpLogout }}
+- name: RIVERS_AUTH_OIDC_RP_LOGOUT
+  value: "true"
+{{- end }}
+{{- end }}
+{{- if eq $auth.mode "forward" }}
+- name: RIVERS_AUTH_FORWARD_TRUSTED_PROXIES
+  value: {{ join "," $auth.forward.trustedProxies | quote }}
+- name: RIVERS_AUTH_FORWARD_USER_HEADER
+  value: {{ $auth.forward.userHeader | quote }}
+- name: RIVERS_AUTH_FORWARD_EMAIL_HEADER
+  value: {{ $auth.forward.emailHeader | quote }}
+- name: RIVERS_AUTH_FORWARD_GROUPS_HEADER
+  value: {{ $auth.forward.groupsHeader | quote }}
+- name: RIVERS_AUTH_FORWARD_NAME_HEADER
+  value: {{ $auth.forward.nameHeader | quote }}
+{{- with $auth.forward.logoutUrl }}
+- name: RIVERS_AUTH_FORWARD_LOGOUT_URL
+  value: {{ . | quote }}
+{{- end }}
 {{- end }}
 {{- end -}}

@@ -5,6 +5,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::SubmitPartitionKey;
 
+/// Session identity as a proto `UserRef`; `None` in auth mode `none`.
+#[cfg(feature = "ssr")]
+async fn current_user_ref() -> Option<rivers_api::rivers::UserRef> {
+    let identity = super::current_identity().await?;
+    Some(rivers_api::rivers::UserRef {
+        subject: identity.subject,
+        email: identity.email,
+        name: identity.name,
+    })
+}
+
 /// Connect to the code location that owns `run_id` (from its stored
 /// `code_location_id`), regardless of which location the UI is currently
 /// showing — a run-scoped action routed to the page's location would replay
@@ -124,6 +135,7 @@ pub async fn trigger_materialize(
                 .into_iter()
                 .map(|(k, v)| Tag { key: k, value: v })
                 .collect(),
+            user: current_user_ref().await,
         })
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -145,7 +157,10 @@ pub async fn rerun_run(run_id: String) -> Result<MaterializeResult, ServerFnErro
     let mut client = connect_to_run_owner(&run_id).await?;
 
     let resp = client
-        .rerun_run(RerunRunRequest { run_id })
+        .rerun_run(RerunRunRequest {
+            run_id,
+            user: current_user_ref().await,
+        })
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
 
@@ -198,6 +213,7 @@ pub async fn rerun_backfill(
         .rerun_backfill(RerunBackfillRequest {
             backfill_id,
             dry_run: false,
+            user: current_user_ref().await,
         })
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -232,6 +248,7 @@ pub async fn materialize_missing_partitions(
             asset_key,
             // Matches `repo.backfill`'s default fan-out.
             max_concurrency: 4,
+            user: current_user_ref().await,
         })
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -280,6 +297,7 @@ pub async fn launch_backfill(
                 .collect(),
             dry_run: false,
             job_name,
+            user: current_user_ref().await,
         })
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -310,6 +328,7 @@ pub async fn execute_job(
         .execute_job(ExecuteJobRequest {
             job_name,
             partition_key: partition_key.map(submit_to_proto),
+            user: current_user_ref().await,
         })
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;

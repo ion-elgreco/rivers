@@ -9,6 +9,17 @@ pub mod locations;
 pub mod overview;
 pub mod pools;
 pub mod runs;
+pub mod user;
+
+/// The request's authenticated session identity, or `None` in auth mode
+/// `none` (the middleware inserts the extension only when auth is enabled).
+#[cfg(feature = "ssr")]
+pub(crate) async fn current_identity() -> Option<crate::auth::Identity> {
+    leptos_axum::extract::<axum::Extension<crate::auth::Identity>>()
+        .await
+        .ok()
+        .map(|axum::Extension(id)| id)
+}
 
 #[cfg(feature = "ssr")]
 pub(crate) async fn resolve_identity(

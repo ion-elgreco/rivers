@@ -1,0 +1,139 @@
+//! Forward-auth (trusted-header SSO): parse proxy identity headers, but only
+//! from socket peers on the trusted CIDR list.
+
+use axum::http::HeaderMap;
+use std::net::IpAddr;
+
+use super::config::ForwardConfig;
+use super::identity::Identity;
+
+#[derive(Debug, Clone)]
+pub struct ForwardRuntime {
+    pub cfg: ForwardConfig,
+}
+
+impl ForwardRuntime {
+    pub fn new(cfg: ForwardConfig) -> Self {
+        Self { cfg }
+    }
+
+    /// Decided on the direct socket peer — never X-Forwarded-For.
+    pub fn peer_trusted(&self, peer: IpAddr) -> bool {
+        // An IPv4 peer on a dual-stack listener surfaces as ::ffff:a.b.c.d.
+        let candidates: [IpAddr; 2] = match peer {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => [peer, IpAddr::V4(v4)],
+                None => [peer, peer],
+            },
+            v4 => [v4, v4],
+        };
+        self.cfg
+            .trusted_proxies
+            .iter()
+            .any(|net| candidates.iter().any(|ip| net.contains(ip)))
+    }
+
+    pub fn identity_from_headers(&self, headers: &HeaderMap) -> Option<Identity> {
+        let get = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(String::from)
+        };
+        let subject = get(&self.cfg.user_header)?;
+        // Every header line counts — proxies may emit one line per group.
+        let groups = headers
+            .get_all(&self.cfg.groups_header)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|line| super::config::split_csv(line))
+            .collect();
+        Some(Identity {
+            subject,
+            email: get(&self.cfg.email_header),
+            name: get(&self.cfg.name_header),
+            groups,
+            // The proxy re-asserts identity on every request; nothing to expire.
+            expires_at: i64::MAX,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn cfg() -> ForwardConfig {
+        ForwardConfig {
+            trusted_proxies: vec![
+                "10.42.0.0/16".parse().unwrap(),
+                "127.0.0.1/32".parse().unwrap(),
+            ],
+            user_header: "Remote-User".into(),
+            email_header: "Remote-Email".into(),
+            groups_header: "Remote-Groups".into(),
+            name_header: "Remote-Name".into(),
+            logout_url: None,
+        }
+    }
+
+    #[test]
+    fn peer_trusted_matches_cidrs() {
+        let rt = ForwardRuntime::new(cfg());
+        assert!(rt.peer_trusted("10.42.3.7".parse().unwrap()));
+        assert!(rt.peer_trusted("127.0.0.1".parse().unwrap()));
+        assert!(!rt.peer_trusted("10.43.0.1".parse().unwrap()));
+        assert!(!rt.peer_trusted("192.168.1.1".parse().unwrap()));
+        // v4-mapped v6 peer matches its v4 CIDR.
+        assert!(rt.peer_trusted("::ffff:10.42.3.7".parse().unwrap()));
+    }
+
+    /// Proxies may emit one header line per group (Envoy, oauth2-proxy
+    /// configurations); all lines must contribute, not just the first.
+    #[test]
+    fn repeated_groups_header_lines_all_count() {
+        let rt = ForwardRuntime::new(cfg());
+        let mut headers = HeaderMap::new();
+        headers.insert("Remote-User", HeaderValue::from_static("jdoe"));
+        headers.append("Remote-Groups", HeaderValue::from_static("data-eng"));
+        headers.append("Remote-Groups", HeaderValue::from_static("admins, ops"));
+        let id = rt.identity_from_headers(&headers).unwrap();
+        assert_eq!(
+            id.groups,
+            vec!["data-eng".to_string(), "admins".into(), "ops".into()]
+        );
+    }
+
+    /// A whitespace-only user header is absent, not a blank principal — the
+    /// `get` closure's trim+empty-drop is the forward-mode analog of the OIDC
+    /// claim trim. Regressing the `!is_empty()` filter would authenticate "".
+    #[test]
+    fn whitespace_only_user_header_is_absent() {
+        let rt = ForwardRuntime::new(cfg());
+        let mut headers = HeaderMap::new();
+        headers.insert("Remote-User", HeaderValue::from_static("   "));
+        assert!(rt.identity_from_headers(&headers).is_none());
+        // A padded but non-empty user is trimmed, not rejected.
+        let mut ok = HeaderMap::new();
+        ok.insert("Remote-User", HeaderValue::from_static("  jdoe  "));
+        assert_eq!(rt.identity_from_headers(&ok).unwrap().subject, "jdoe");
+    }
+
+    #[test]
+    fn identity_requires_user_header() {
+        let rt = ForwardRuntime::new(cfg());
+        let mut headers = HeaderMap::new();
+        headers.insert("Remote-Email", HeaderValue::from_static("a@b.com"));
+        assert!(rt.identity_from_headers(&headers).is_none());
+
+        headers.insert("Remote-User", HeaderValue::from_static("jdoe"));
+        headers.insert("Remote-Groups", HeaderValue::from_static("eng, admins ,"));
+        let id = rt.identity_from_headers(&headers).unwrap();
+        assert_eq!(id.subject, "jdoe");
+        assert_eq!(id.email.as_deref(), Some("a@b.com"));
+        assert_eq!(id.groups, vec!["eng".to_string(), "admins".to_string()]);
+    }
+}

@@ -245,7 +245,7 @@ pub async fn seed_run_record(storage: &SurrealStorage, run_id: &str) {
             priority: 0,
             partition_key: None,
             block_reason: None,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         })
         .await
         .unwrap();

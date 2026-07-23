@@ -94,6 +94,25 @@ class StoredTick:
     error: str | None
     cursor: str | None
 
+class UserRef:
+    """Who performed a manual action. Read-only snapshot."""
+
+    @property
+    def subject(self) -> str:
+        """Stable identifier: OIDC ``sub`` / forward-auth user header."""
+
+    @property
+    def email(self) -> str | None:
+        """Email snapshot taken at launch time."""
+
+    @property
+    def name(self) -> str | None:
+        """Display-name snapshot taken at launch time."""
+
+    @property
+    def display(self) -> str:
+        """Human-readable label: name, else email, else subject."""
+
 class LaunchedBy:
     """Origin of a run. Construct via the classmethod factories; discriminate on `.kind`."""
 
@@ -132,6 +151,11 @@ class LaunchedBy:
     @property
     def backfill_id(self) -> str | None:
         """Backfill id; None for other variants."""
+
+    @property
+    def user(self) -> UserRef | None:
+        """Acting user for manual runs launched through an authenticated UI
+        session; None otherwise (CLI / Python / unauthenticated UI)."""
 
     def __eq__(self, other: object) -> bool: ...
     def __hash__(self) -> int: ...

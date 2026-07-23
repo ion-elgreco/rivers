@@ -713,6 +713,28 @@ def test_get_backfill_status(backfill_grpc_channel):
     assert status.total_partitions == 2
 
 
+def test_get_backfill_status_carries_launched_by(backfill_grpc_channel):
+    """The gRPC status surface must expose provenance, like the storage path."""
+    channel, pb2, pb2_grpc, _, _ = backfill_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    launch = stub.LaunchBackfill(
+        pb2.LaunchBackfillRequest(
+            selection=["partitioned_asset"],
+            partition_keys=[_single_partition_key(pb2, "p1")],
+            failure_policy="continue",
+            max_concurrency=1,
+            user=_user_ref(pb2),
+        )
+    )
+    status = stub.GetBackfillStatus(
+        pb2.GetBackfillStatusRequest(backfill_id=launch.backfill_id)
+    )
+    assert status.launched_by_kind == "manual"
+    assert status.launched_by_user.subject == "sub-42"
+    assert status.launched_by_user.name == "John Doe"
+
+
 def test_get_backfill_status_not_found(backfill_grpc_channel):
     channel, pb2, pb2_grpc, _, _ = backfill_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)
@@ -1002,3 +1024,194 @@ def test_launch_backfill_without_job_is_ad_hoc(rerun_grpc_channel):
     runs = [r for r in storage.get_runs(100) if r.partition_key is not None]
     assert runs, "expected partitioned runs"
     assert all(r.job_name is None for r in runs)
+
+
+# ── User attribution on manual launches ──
+
+
+def _user_ref(pb2, subject="sub-42", email="john.doe@example.com", name="John Doe"):
+    return pb2.UserRef(subject=subject, email=email, name=name)
+
+
+def test_materialize_stamps_user_on_run(rerun_grpc_channel):
+    channel, pb2, pb2_grpc, _, storage = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    resp = stub.Materialize(
+        pb2.MaterializeRequest(
+            selection=["part_asset"],
+            partition_key=_single_partition_key(pb2, "p1"),
+            user=_user_ref(pb2),
+        )
+    )
+    record = storage.get_run(resp.run_id)
+    assert record is not None
+    assert record.launched_by.kind == "manual"
+    user = record.launched_by.user
+    assert user is not None
+    assert user.subject == "sub-42"
+    assert user.email == "john.doe@example.com"
+    assert user.name == "John Doe"
+    assert user.display == "John Doe"
+
+
+def test_materialize_without_user_has_no_attribution(rerun_grpc_channel):
+    channel, pb2, pb2_grpc, _, storage = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    resp = stub.Materialize(
+        pb2.MaterializeRequest(
+            selection=["part_asset"],
+            partition_key=_single_partition_key(pb2, "p1"),
+        )
+    )
+    record = storage.get_run(resp.run_id)
+    assert record is not None
+    assert record.launched_by.kind == "manual"
+    assert record.launched_by.user is None
+    assert record.launched_by == rs.LaunchedBy.manual()
+
+
+def test_execute_job_stamps_user_on_run(rerun_grpc_channel):
+    channel, pb2, pb2_grpc, _, storage = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    resp = stub.ExecuteJob(
+        pb2.ExecuteJobRequest(
+            job_name="part_job",
+            partition_key=_single_partition_key(pb2, "p2"),
+            user=_user_ref(pb2, subject="job-user", email="job@example.com", name="Jo"),
+        )
+    )
+    assert resp.success is True
+    record = storage.get_run(resp.run_id)
+    assert record is not None
+    assert record.launched_by.kind == "manual"
+    user = record.launched_by.user
+    assert user is not None
+    assert user.subject == "job-user"
+    assert user.display == "Jo"
+
+
+def test_rerun_run_stamps_the_rerunning_user(rerun_grpc_channel):
+    """The rerun's attribution is the user who clicked rerun — not the
+    original launcher."""
+    channel, pb2, pb2_grpc, _, storage = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    original = stub.Materialize(
+        pb2.MaterializeRequest(
+            selection=["part_asset"],
+            partition_key=_single_partition_key(pb2, "p3"),
+            user=_user_ref(
+                pb2, subject="alice", email="alice@example.com", name="Alice"
+            ),
+        )
+    )
+    rerun = stub.RerunRun(
+        pb2.RerunRunRequest(
+            run_id=original.run_id,
+            user=_user_ref(pb2, subject="bob", email="bob@example.com", name="Bob"),
+        )
+    )
+    assert rerun.run_id != original.run_id
+    orig_record = storage.get_run(original.run_id)
+    rerun_record = storage.get_run(rerun.run_id)
+    assert orig_record.launched_by.user.subject == "alice"
+    assert rerun_record.launched_by.user.subject == "bob"
+
+
+def test_backfill_status_exposes_launched_by(rerun_grpc_channel):
+    """Backfill provenance must be readable back through the Python API,
+    not just stored and rendered in the web UI."""
+    channel, pb2, pb2_grpc, repo, _ = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    launch = stub.LaunchBackfill(
+        pb2.LaunchBackfillRequest(
+            selection=["part_asset"],
+            partition_keys=[
+                _single_partition_key(pb2, "p1"),
+                _single_partition_key(pb2, "p2"),
+            ],
+            failure_policy="continue",
+            max_concurrency=1,
+            dry_run=False,
+            user=_user_ref(pb2),
+        )
+    )
+    status = repo.get_backfill(launch.backfill_id)
+    assert status is not None
+    assert status.launched_by.kind == "manual"
+    user = status.launched_by.user
+    assert user is not None
+    assert user.subject == "sub-42"
+    assert user.display == "John Doe"
+
+
+def test_backfill_status_launched_by_without_user(rerun_grpc_channel):
+    channel, pb2, pb2_grpc, repo, _ = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    launch = stub.LaunchBackfill(
+        pb2.LaunchBackfillRequest(
+            selection=["part_asset"],
+            partition_keys=[_single_partition_key(pb2, "p3")],
+            failure_policy="continue",
+            max_concurrency=1,
+            dry_run=False,
+        )
+    )
+    status = repo.get_backfill(launch.backfill_id)
+    assert status.launched_by == rs.LaunchedBy.manual()
+    assert status.launched_by.user is None
+
+
+def test_rerun_backfill_stamps_the_rerunning_user(rerun_grpc_channel):
+    """A backfill rerun is attributed to the user who reran it, not the
+    original launcher."""
+    channel, pb2, pb2_grpc, repo, _ = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    original = stub.LaunchBackfill(
+        pb2.LaunchBackfillRequest(
+            selection=["part_asset"],
+            partition_keys=[_single_partition_key(pb2, "p1")],
+            failure_policy="continue",
+            max_concurrency=1,
+            dry_run=False,
+            user=_user_ref(
+                pb2, subject="alice", email="alice@example.com", name="Alice"
+            ),
+        )
+    )
+    rerun = stub.RerunBackfill(
+        pb2.RerunBackfillRequest(
+            backfill_id=original.backfill_id,
+            dry_run=False,
+            user=_user_ref(pb2, subject="bob", email="bob@example.com", name="Bob"),
+        )
+    )
+    assert rerun.backfill_id != original.backfill_id
+    assert repo.get_backfill(original.backfill_id).launched_by.user.subject == "alice"
+    assert repo.get_backfill(rerun.backfill_id).launched_by.user.subject == "bob"
+
+
+def test_materialize_missing_stamps_user(rerun_grpc_channel):
+    """Materialize-missing stamps the acting user onto the backfill record."""
+    channel, pb2, pb2_grpc, repo, _ = rerun_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    resp = stub.MaterializeMissing(
+        pb2.MaterializeMissingRequest(
+            asset_key="part_asset",
+            max_concurrency=4,
+            user=_user_ref(
+                pb2, subject="carol", email="carol@example.com", name="Carol"
+            ),
+        )
+    )
+    status = repo.get_backfill(resp.backfill_id)
+    assert status is not None
+    assert status.launched_by.kind == "manual"
+    assert status.launched_by.user.subject == "carol"

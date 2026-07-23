@@ -145,6 +145,12 @@ async fn main() {
         }
     };
 
+    // Bad RIVERS_AUTH_* config or an unreachable issuer aborts startup
+    // rather than silently skipping auth.
+    let auth = rivers_ui::auth::AuthRuntime::from_env()
+        .await
+        .expect("invalid RIVERS_AUTH_* configuration");
+
     let shutdown = CancellationToken::new();
     let token = shutdown.clone();
     tokio::spawn(async move {
@@ -161,7 +167,9 @@ async fn main() {
         token.cancel();
     });
 
-    rivers_ui::start_server(storage, graph, args.host, args.port, registry, shutdown)
-        .await
-        .expect("Server error");
+    rivers_ui::start_server(
+        storage, graph, args.host, args.port, registry, auth, shutdown,
+    )
+    .await
+    .expect("Server error");
 }

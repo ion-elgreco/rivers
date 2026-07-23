@@ -102,7 +102,7 @@ impl AsyncMigrate for SurrealMigrate {
 
 /// Highest embedded migration version. Bump by adding a `Vn__*.surql` + an
 /// [`embedded_migrations`] entry; a test pins this to that max.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// One compat row per migration (the floors it set), folded by the open guard.
 const MIGRATION_META_TABLE: &str = "migration_meta";
@@ -117,6 +117,11 @@ fn embedded_migrations() -> Vec<Migration> {
             include_str!("migrations/V2__run_logs.surql"),
         )
         .expect("V2__run_logs migration name is well-formed"),
+        Migration::unapplied(
+            "V3__backfill_launched_by",
+            include_str!("migrations/V3__backfill_launched_by.surql"),
+        )
+        .expect("V3__backfill_launched_by migration name is well-formed"),
     ]
 }
 
@@ -625,8 +630,63 @@ mod tests {
         let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
         assert_eq!(
             (stamps.version, stamps.min_reader, stamps.min_writer),
-            (2, 2, 2),
-            "v2 raises both floors"
+            (3, 2, 2),
+            "v2 raised both floors; v3 is additive and leaves them at 2"
+        );
+    }
+
+    /// A backfill written under V2 (before `launched_by` was defined) has no
+    /// such key in storage. After migrating to V3 it must still read back —
+    /// falling to the struct default — not error.
+    #[tokio::test]
+    async fn test_v3_backfill_launched_by_defaults_for_legacy_rows() {
+        let db = any::connect("mem://").await.unwrap();
+        db.use_ns(DEFAULT_NAMESPACE)
+            .use_db(DEFAULT_DATABASE)
+            .await
+            .unwrap();
+
+        // Apply V1+V2 only — `launched_by` on backfills doesn't exist yet.
+        let pre_v3: Vec<Migration> = embedded_migrations().into_iter().take(2).collect();
+        let mut backend = SurrealMigrate { db: db.clone() };
+        backend
+            .migrate(
+                &pre_v3,
+                true,
+                false,
+                false,
+                Target::Latest,
+                REFINERY_HISTORY_TABLE,
+            )
+            .await
+            .expect("apply V1+V2");
+
+        // A legacy backfill row: no launched_by key.
+        db.query(
+            "INSERT INTO backfills { backfill_id: 'bf-legacy', code_location_id: 'default', \
+             status: 'Requested', strategy: { kind: 'MultiRun' }, failure_policy: 'Continue', \
+             asset_selection: [], partition_keys: [], run_ids: [], completed_partitions: [], \
+             failed_partitions: [], canceled_partitions: [], max_concurrency: 1, tags: [], \
+             create_time: 1, end_time: NONE, error: NONE } RETURN NONE",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        // Now migrate to V3 (adds the launched_by field) and read the old row.
+        apply_migrations(&db).await.expect("apply V3");
+        let rows: Vec<crate::storage::BackfillRecord> = db
+            .query("SELECT * FROM backfills WHERE backfill_id = 'bf-legacy'")
+            .await
+            .unwrap()
+            .take(0)
+            .expect("legacy backfill row must deserialize after V3");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].launched_by,
+            crate::storage::LaunchedBy::Manual { user: None },
+            "a legacy row's missing launched_by falls back to the struct default"
         );
     }
 
