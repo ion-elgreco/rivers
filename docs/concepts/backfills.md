@@ -242,3 +242,7 @@ result = repo.rerun_backfill(result.backfill_id, block=True)
 ### Web UI
 
 The rivers web UI provides a dedicated **Backfills** page at `/backfills` that shows all backfills with their status, progress, and associated runs.
+
+## Launch recovery
+
+A daemon-executed backfill commits `Requested → InProgress` before submitting its runs. If run submission fails, the backfill is marked `CompletedFailed` with the error recorded on the record. If the daemon dies in between instead (no runs were ever submitted), the backfill monitor notices the zero-run `InProgress` record after a grace period (180s) and flips it back to `Requested`, so the pickup loop re-executes it from scratch. Run submission is atomic — either all of a backfill's runs and their `run_ids` link land, or none do — which is what makes the automatic re-execution safe.

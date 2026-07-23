@@ -1279,6 +1279,92 @@ impl SurrealStorage {
         swallow_phantom_commit(result, "enqueue_runs", &format!("batch[{}]", records.len()))
     }
 
+    /// [`Self::enqueue_runs`] plus linking the run ids onto the owning
+    /// backfill, all in one transaction — `run_ids` can never disagree with
+    /// the runs table.
+    pub async fn enqueue_backfill_runs(
+        &self,
+        records: &[RunRecord],
+        backfill_id: &str,
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let events: Vec<DbEventWrite> = records
+            .iter()
+            .map(|r| DbEventWrite::from(&run_queued_event(r)))
+            .collect();
+        let run_ids: Vec<String> = records.iter().map(|r| r.run_id.clone()).collect();
+        let result = super::retry::with_retry(&self.retry_config, || async {
+            self.db
+                .query(
+                    "BEGIN TRANSACTION;\n\
+                     INSERT INTO runs $runs;\n\
+                     INSERT INTO events $events;\n\
+                     UPDATE backfills SET run_ids = array::union(run_ids, $run_ids) \
+                         WHERE backfill_id = $backfill_id;\n\
+                     COMMIT TRANSACTION;",
+                )
+                .bind(("runs", records.to_vec()))
+                .bind(("events", events.clone()))
+                .bind(("run_ids", run_ids.clone()))
+                .bind(("backfill_id", backfill_id.to_string()))
+                .await
+                .context("failed to enqueue backfill runs batch")?;
+            Ok(())
+        })
+        .await;
+        swallow_phantom_commit(
+            result,
+            "enqueue_backfill_runs",
+            &format!("batch[{}]", records.len()),
+        )
+    }
+
+    /// Flip a zero-run `InProgress` backfill back to `Requested` so the
+    /// pickup loop re-executes it (guarded — a backfill that gained runs or
+    /// moved on is left alone). Returns whether the flip applied.
+    pub async fn resume_stalled_backfill(&self, backfill_id: &str) -> Result<bool> {
+        super::retry::with_retry(&self.retry_config, || async {
+            #[derive(Debug, SurrealValue, serde::Deserialize)]
+            struct IdRow {
+                #[allow(dead_code)]
+                backfill_id: String,
+            }
+            let mut result = self
+                .db
+                .query(
+                    "UPDATE backfills SET status = 'Requested' \
+                         WHERE backfill_id = $id AND status = 'InProgress' \
+                         AND array::len(run_ids) = 0 \
+                         RETURN backfill_id",
+                )
+                .bind(("id", backfill_id.to_string()))
+                .await?;
+            let flipped: Vec<IdRow> = result.take(0)?;
+            Ok(!flipped.is_empty())
+        })
+        .await
+    }
+
+    /// Mark a backfill `CompletedFailed` with the submission error recorded.
+    pub async fn fail_backfill(&self, backfill_id: &str, error: &str) -> Result<()> {
+        super::retry::with_retry(&self.retry_config, || async {
+            self.db
+                .query(
+                    "UPDATE backfills SET status = 'CompletedFailed', \
+                         end_time = $end_time, error = $error \
+                         WHERE backfill_id = $id",
+                )
+                .bind(("id", backfill_id.to_string()))
+                .bind(("end_time", now_nanos()))
+                .bind(("error", error.to_string()))
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn get_code_version(
         &self,
         code_location_id: &str,
@@ -11336,6 +11422,86 @@ mod tests {
             events[0].metadata,
             vec![("error".to_string(), "launch failed: boom".to_string())]
         );
+    }
+
+    // ── backfill launch recovery ──
+
+    #[tokio::test]
+    async fn test_enqueue_backfill_runs_links_atomically() {
+        let storage = make_storage().await;
+        storage
+            .create_backfill(&make_backfill("bf1", BackfillStatus::InProgress, 100))
+            .await
+            .unwrap();
+
+        let records = vec![
+            minimal_run("bf1-r1", RunStatus::Queued),
+            minimal_run("bf1-r2", RunStatus::Queued),
+        ];
+        storage
+            .enqueue_backfill_runs(&records, "bf1")
+            .await
+            .unwrap();
+
+        let bf = storage.get_backfill("bf1").await.unwrap().unwrap();
+        let mut linked = bf.run_ids.clone();
+        linked.sort();
+        assert_eq!(linked, vec!["bf1-r1".to_string(), "bf1-r2".to_string()]);
+
+        for run_id in ["bf1-r1", "bf1-r2"] {
+            let run = storage.get_run(run_id).await.unwrap().unwrap();
+            assert_eq!(run.status, RunStatus::Queued);
+            let (events, total) = storage
+                .get_run_structured_events_page(run_id, None, 0, 10)
+                .await
+                .unwrap();
+            assert_eq!(total, 1);
+            assert_eq!(events[0].event_type, EventType::RunQueued);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resume_stalled_backfill_flips_only_zero_run_in_progress() {
+        let storage = make_storage().await;
+
+        // Zero-run InProgress → flips back to Requested.
+        storage
+            .create_backfill(&make_backfill("stuck", BackfillStatus::InProgress, 100))
+            .await
+            .unwrap();
+        assert!(storage.resume_stalled_backfill("stuck").await.unwrap());
+        let bf = storage.get_backfill("stuck").await.unwrap().unwrap();
+        assert_eq!(bf.status, BackfillStatus::Requested);
+
+        // InProgress with runs → left alone.
+        let mut with_runs = make_backfill("linked", BackfillStatus::InProgress, 100);
+        with_runs.run_ids = vec!["r1".to_string()];
+        storage.create_backfill(&with_runs).await.unwrap();
+        assert!(!storage.resume_stalled_backfill("linked").await.unwrap());
+        let bf = storage.get_backfill("linked").await.unwrap().unwrap();
+        assert_eq!(bf.status, BackfillStatus::InProgress);
+
+        // Already Requested → no-op.
+        assert!(!storage.resume_stalled_backfill("stuck").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_fail_backfill_records_error() {
+        let storage = make_storage().await;
+        storage
+            .create_backfill(&make_backfill("doomed", BackfillStatus::InProgress, 100))
+            .await
+            .unwrap();
+
+        storage
+            .fail_backfill("doomed", "submit exploded")
+            .await
+            .unwrap();
+
+        let bf = storage.get_backfill("doomed").await.unwrap().unwrap();
+        assert_eq!(bf.status, BackfillStatus::CompletedFailed);
+        assert!(bf.end_time.is_some());
+        assert_eq!(bf.error.as_deref(), Some("submit exploded"));
     }
 
     // ── Run progress, outcome, cancellation, step events ──

@@ -326,8 +326,13 @@ async fn fail_unlaunched_run(
     }
 }
 
+/// How long a zero-run `InProgress` backfill may sit before the monitor flips
+/// it back to `Requested` for re-execution.
+const BACKFILL_RESUME_GRACE_NS: i64 = 180 * 1_000_000_000;
+
 /// Backfill monitor — polls for InProgress backfills owned by this CL every
-/// 5s and finalizes them when all their runs reach a terminal state.
+/// 5s and finalizes them when all their runs reach a terminal state; flips
+/// zero-run stragglers back to Requested so the pickup loop re-executes them.
 pub(crate) fn spawn_backfill_monitor(
     handle: ScopedStorageHandle<SurrealStorage>,
     cancel: CancellationToken,
@@ -359,6 +364,33 @@ pub(crate) fn spawn_backfill_monitor(
 
             let mut completions = tokio::task::JoinSet::new();
             for bf in backfills {
+                // Zero runs = the executor died between the InProgress flip
+                // and run submission; the pickup loop only re-picks Requested,
+                // so nothing else will ever touch it. Flip it back (guarded)
+                // once past the grace period so pickup re-executes it.
+                if bf.run_ids.is_empty() {
+                    if now_ts() - bf.create_time > BACKFILL_RESUME_GRACE_NS {
+                        match handle
+                            .backend()
+                            .resume_stalled_backfill(&bf.backfill_id)
+                            .await
+                        {
+                            Ok(true) => tracing::warn!(
+                                target: "rivers::backfill_monitor",
+                                backfill_id = %bf.backfill_id,
+                                "backfill stuck in progress with no runs; re-queued for pickup"
+                            ),
+                            Ok(false) => {}
+                            Err(e) => tracing::warn!(
+                                target: "rivers::backfill_monitor",
+                                backfill_id = %bf.backfill_id,
+                                error = %e,
+                                "failed to re-queue stalled backfill"
+                            ),
+                        }
+                    }
+                    continue;
+                }
                 let backend = Arc::clone(handle.backend());
                 completions.spawn(async move {
                     let result = backend.try_complete_backfill(&bf.backfill_id, &[]).await;

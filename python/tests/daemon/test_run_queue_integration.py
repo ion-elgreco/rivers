@@ -493,3 +493,75 @@ class TestOrphanedNotStartedRuns:
         assert record is not None
         assert record.status == "Canceled"
         assert record.end_time is not None
+
+
+# ---------------------------------------------------------------------------
+# Test: Zero-run InProgress backfill is resumed by the monitor
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillResume:
+    """A backfill flipped to InProgress by a daemon that died before
+    submitting its runs has no owner: pickup only re-picks Requested and the
+    monitor skips zero-run records. The monitor's resume sweep flips it back
+    to Requested so pickup re-executes it end to end."""
+
+    def test_zero_run_in_progress_backfill_resumes(self, storage):
+        import time
+
+        @rs.Asset(
+            name="bf_target",
+            io_handler=rs.InMemoryIOHandler(),
+            partitions_def=rs.PartitionsDefinition.static_(["x", "y"]),
+        )
+        def bf_target() -> str:
+            return "data"
+
+        repo = rs.CodeRepository(
+            assets=[bf_target],
+            default_executor=rs.Executor.in_process(),
+            run_queue=rs.RunQueueConfig(
+                max_concurrent_runs=10,
+                dequeue_interval="100ms",
+            ),
+        )
+        repo.resolve(storage=storage)
+
+        # Orphan: InProgress with no runs, created far in the past so it is
+        # past the resume grace period immediately.
+        storage._create_backfill(
+            "stuck-bf", ["bf_target"], ["x", "y"], "InProgress", 1_000
+        )
+
+        daemon = AutomationDaemon(
+            repo=repo,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            # Monitor tick (5s cadence) flips it to Requested, pickup re-executes
+            # through the queue, monitor finalizes on a later tick.
+            deadline = time.monotonic() + 45
+            status = None
+            while time.monotonic() < deadline:
+                status = repo.get_backfill("stuck-bf")
+                if status is not None and status.status not in (
+                    "InProgress",
+                    "Requested",
+                ):
+                    break
+                time.sleep(0.5)
+
+            assert status is not None, "backfill disappeared"
+            assert status.status == "CompletedSuccess", (
+                f"expected the backfill to resume and complete, got {status.status}"
+            )
+            assert status.completed_partitions == 2
+
+            runs = storage.get_runs(limit=50)
+            bf_runs = [r for r in runs if r.launched_by.kind == "backfill"]
+            assert len(bf_runs) >= 1, "no runs were submitted for the resumed backfill"
+            assert all(r.status == "Success" for r in bf_runs)
+        finally:
+            daemon.stop()
