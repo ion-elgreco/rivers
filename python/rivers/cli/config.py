@@ -94,7 +94,7 @@ class RiversConfig(BaseSettings):
             name: {k: v for k, v in fields.items() if v is not None}
             for name, fields in groups.items()
         }
-        return cls(**{name: fields for name, fields in provided.items() if fields})
+        return cls(**{name: fields for name, fields in provided.items() if fields})  # type: ignore
 
     @classmethod
     def settings_customise_sources(
