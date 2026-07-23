@@ -2442,7 +2442,6 @@ mod partition_key_tests {
 #[cfg(test)]
 mod launched_by_tests {
     use super::*;
-    use surrealdb::types::SurrealValue as _;
 
     fn user() -> UserRef {
         UserRef {
