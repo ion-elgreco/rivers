@@ -42,16 +42,14 @@ impl Allowlists {
             return true;
         }
         let email = id.email.as_deref().map(str::to_ascii_lowercase);
-        if let Some(email) = &email {
-            if let Some(domain) = email
+        if let Some(email) = &email
+            && let Some(domain) = email
                 .rsplit_once('@')
                 .filter(|(local, _)| !local.is_empty())
                 .map(|(_, d)| d)
-            {
-                if self.domains.iter().any(|d| d == domain) {
-                    return true;
-                }
-            }
+            && self.domains.iter().any(|d| d == domain)
+        {
+            return true;
         }
         if self
             .groups

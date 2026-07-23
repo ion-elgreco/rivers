@@ -99,10 +99,10 @@ fn CurrentUserChip(collapsed: Signal<bool>) -> impl IntoView {
     let open = RwSignal::new(false);
 
     Effect::new(move |_| {
-        if let Some(Err(e)) = user.get() {
-            if crate::helpers::is_unauthorized(&e) {
-                crate::helpers::redirect_to_login();
-            }
+        if let Some(Err(e)) = user.get()
+            && crate::helpers::is_unauthorized(&e)
+        {
+            crate::helpers::redirect_to_login();
         }
     });
 

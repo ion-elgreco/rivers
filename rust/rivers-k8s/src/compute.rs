@@ -38,15 +38,15 @@ pub fn escalate_compute(
         return current.clone();
     }
     let mut next = current.clone();
-    if let Some(mem) = &current.memory {
-        if let Some(scaled) = scale_quantity(mem, esc.factor, Some(&esc.max_memory)) {
-            next.memory = Some(scaled);
-        }
+    if let Some(mem) = &current.memory
+        && let Some(scaled) = scale_quantity(mem, esc.factor, Some(&esc.max_memory))
+    {
+        next.memory = Some(scaled);
     }
-    if let (Some(cpu), Some(cpu_factor)) = (&current.cpu, esc.cpu_factor) {
-        if let Some(scaled) = scale_quantity(cpu, cpu_factor, esc.max_cpu.as_deref()) {
-            next.cpu = Some(scaled);
-        }
+    if let (Some(cpu), Some(cpu_factor)) = (&current.cpu, esc.cpu_factor)
+        && let Some(scaled) = scale_quantity(cpu, cpu_factor, esc.max_cpu.as_deref())
+    {
+        next.cpu = Some(scaled);
     }
     next
 }

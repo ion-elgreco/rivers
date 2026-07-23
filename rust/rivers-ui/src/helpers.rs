@@ -349,7 +349,7 @@ pub fn initials(display: &str) -> String {
     let mut firsts = display
         .split_whitespace()
         .filter_map(|w| w.chars().find(|c| c.is_alphanumeric()));
-    match (firsts.next(), firsts.last()) {
+    match (firsts.next(), firsts.next_back()) {
         (Some(f), Some(l)) => f.to_uppercase().chain(l.to_uppercase()).collect(),
         (Some(f), None) => f.to_uppercase().collect(),
         _ => "?".to_string(),

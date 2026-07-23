@@ -496,17 +496,16 @@ pub async fn logout(State(st): State<OidcState>, headers: axum::http::HeaderMap)
         return Redirect::to("/").into_response();
     }
     let clear = clear_cookies(o.cfg.secure_cookies());
-    if o.cfg.rp_logout {
-        if let Some(end) = &o.end_session_endpoint {
-            if let Ok(mut url) = url::Url::parse(end) {
-                // No tokens stored, so no id_token_hint; client_id is
-                // the spec's alternative.
-                url.query_pairs_mut()
-                    .append_pair("client_id", &o.cfg.client_id)
-                    .append_pair("post_logout_redirect_uri", o.cfg.base_url());
-                return (clear, Redirect::to(url.as_str())).into_response();
-            }
-        }
+    if o.cfg.rp_logout
+        && let Some(end) = &o.end_session_endpoint
+        && let Ok(mut url) = url::Url::parse(end)
+    {
+        // No tokens stored, so no id_token_hint; client_id is
+        // the spec's alternative.
+        url.query_pairs_mut()
+            .append_pair("client_id", &o.cfg.client_id)
+            .append_pair("post_logout_redirect_uri", o.cfg.base_url());
+        return (clear, Redirect::to(url.as_str())).into_response();
     }
     (clear, Redirect::to("/")).into_response()
 }
