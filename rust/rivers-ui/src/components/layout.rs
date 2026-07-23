@@ -7,6 +7,7 @@ use crate::components::global_search::GlobalSearch;
 use crate::components::location_switcher::LocationSwitcher;
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::locations::list_code_locations;
+use crate::server_fns::user::get_current_user;
 
 fn nav_svg(path: &str) -> String {
     format!(
@@ -88,6 +89,74 @@ const ICON_DEPLOYMENT: &str = r#"<rect x="4" y="4" width="16" height="16" rx="2"
 
 const ICON_COLLAPSE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>"#;
 
+/// Signed-in user: avatar + name opening an account menu (identity header +
+/// sign-out); renders nothing in auth mode `none`.
+/// Refetches on SPA navigation; a 401 hard-redirects into the login flow.
+#[component]
+fn CurrentUserChip(collapsed: Signal<bool>) -> impl IntoView {
+    let location = use_location();
+    let user = Resource::new(move || location.pathname.get(), |_| get_current_user());
+    let open = RwSignal::new(false);
+
+    Effect::new(move |_| {
+        if let Some(Err(e)) = user.get()
+            && crate::helpers::is_unauthorized(&e)
+        {
+            crate::helpers::redirect_to_login();
+        }
+    });
+
+    view! {
+        // `Transition`, not `Suspense`: keep the chip visible across SPA
+        // navigations instead of blinking to the empty fallback each time.
+        <Transition fallback=|| ()>
+            {move || user.get().and_then(|res| res.ok().flatten()).map(|u| {
+                let name = u.display().to_string();
+                let email = u.user.email.clone();
+                let logout = u.logout_url.clone();
+                let init = crate::helpers::initials(&name);
+                let avatar_style = format!(
+                    "background: hsl({} 45% 34%)",
+                    crate::helpers::avatar_hue(&u.user.subject)
+                );
+                let menu_name = name.clone();
+                view! {
+                    <div class="user-menu-anchor">
+                        <button
+                            class="user-chip"
+                            class:user-chip--open=move || open.get()
+                            on:click=move |_| open.update(|o| *o = !*o)
+                            aria-haspopup="menu"
+                            aria-expanded=move || open.get().to_string()
+                        >
+                            <span class="user-avatar" style=avatar_style>{init}</span>
+                            <span class="user-chip-name" class:nav-label--hidden=move || collapsed.get()>
+                                {name}
+                            </span>
+                        </button>
+                        <Show when=move || open.get()>
+                            <div class="user-menu-backdrop" on:click=move |_| open.set(false)></div>
+                            <div class="user-menu" role="menu">
+                                <div class="user-menu-header">
+                                    <div class="user-menu-name">{menu_name.clone()}</div>
+                                    {email.clone().map(|e| view! {
+                                        <div class="user-menu-email">{e}</div>
+                                    })}
+                                </div>
+                                {logout.clone().map(|href| view! {
+                                    <a class="user-menu-item" href=href rel="external" role="menuitem">
+                                        "Sign out"
+                                    </a>
+                                })}
+                            </div>
+                        </Show>
+                    </div>
+                }
+            })}
+        </Transition>
+    }
+}
+
 #[component]
 pub fn Shell(children: Children) -> impl IntoView {
     let collapsed = RwSignal::new(false);
@@ -145,6 +214,7 @@ pub fn Shell(children: Children) -> impl IntoView {
                 </div>
 
                 <div class="sidebar-footer">
+                    <CurrentUserChip collapsed=collapsed_signal/>
                     <button
                         class="sidebar-toggle"
                         on:click=move |_| collapsed.update(|c| *c = !*c)

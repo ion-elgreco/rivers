@@ -1,4 +1,5 @@
 {{- if .Values.ui.enabled }}
+{{- include "rivers.validateUiAuth" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -57,6 +58,7 @@ spec:
                   name: rivers-registry-token
                   key: token
             {{- include "rivers.surrealEnv" . | nindent 12 }}
+            {{- include "rivers.uiAuthEnv" . | nindent 12 }}
           ports:
             - containerPort: {{ .Values.ui.port }}
               name: http

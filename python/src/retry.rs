@@ -240,12 +240,12 @@ impl PyComputeEscalation {
                 "ComputeEscalation factor must be > 0, got {factor}"
             )));
         }
-        if let Some(cf) = cpu_factor {
-            if cf <= 0.0 {
-                return Err(ConfigurationError::new_err(format!(
-                    "ComputeEscalation cpu_factor must be > 0, got {cf}"
-                )));
-            }
+        if let Some(cf) = cpu_factor
+            && cf <= 0.0
+        {
+            return Err(ConfigurationError::new_err(format!(
+                "ComputeEscalation cpu_factor must be > 0, got {cf}"
+            )));
         }
         let on = on
             .map(|v| {

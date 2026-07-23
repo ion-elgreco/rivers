@@ -46,10 +46,19 @@ message GetInfoResponse {
 
 // --- Materialization & job execution ---
 
+// Who performed a manual action. `subject` is the stable identity
+// (OIDC sub / forward-auth user header); email/name are display snapshots.
+message UserRef {
+  string subject = 1;
+  optional string email = 2;
+  optional string name = 3;
+}
+
 message MaterializeRequest {
   repeated string selection = 1;
   optional ProtoPartitionKey partition_key = 2;
   repeated Tag tags = 3;
+  optional UserRef user = 4;
 }
 
 message MaterializeResponse {
@@ -66,6 +75,7 @@ message Tag {
 message ExecuteJobRequest {
   string job_name = 1;
   optional ProtoPartitionKey partition_key = 2;
+  optional UserRef user = 3;
 }
 
 message ExecuteJobResponse {
@@ -77,6 +87,7 @@ message ExecuteJobResponse {
 // replays it on its original partition, reusing its tags — caller supplies the id.
 message RerunRunRequest {
   string run_id = 1;
+  optional UserRef user = 2;
 }
 
 message RerunRunResponse {
@@ -326,6 +337,7 @@ message LaunchBackfillRequest {
   // When set, the backfill targets a named Job — each partition runs with the
   // job's own plan + executor. Mutually exclusive with `selection`.
   optional string job_name = 9;
+  optional UserRef user = 10;
 }
 
 message LaunchBackfillResponse {
@@ -341,11 +353,13 @@ message LaunchBackfillResponse {
 message MaterializeMissingRequest {
   string asset_key = 1;
   uint32 max_concurrency = 2;
+  optional UserRef user = 3;
 }
 
 message RerunBackfillRequest {
   string backfill_id = 1;
   bool dry_run = 2;
+  optional UserRef user = 3;
 }
 
 message RerunBackfillResponse {
@@ -369,6 +383,12 @@ message GetBackfillStatusResponse {
   uint32 canceled_partitions = 6;
   repeated string run_ids = 7;
   optional string error = 8;
+  // Provenance: kind is manual|schedule|sensor|backfill|condition; name is the
+  // schedule/sensor/backfill id where applicable; user is the acting user on a
+  // manual launch.
+  string launched_by_kind = 9;
+  optional string launched_by_name = 10;
+  optional UserRef launched_by_user = 11;
 }
 
 message CancelBackfillRequest {

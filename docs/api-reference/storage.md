@@ -250,6 +250,24 @@ rs.LaunchedBy.condition()
 | `kind` | `str` | One of `"manual"`, `"schedule"`, `"sensor"`, `"backfill"`, `"condition"`. |
 | `name` | `str \| None` | Schedule or sensor name (else `None`). |
 | `backfill_id` | `str \| None` | Backfill id (else `None`). |
+| `user` | `UserRef \| None` | Acting user on a manual launch from the authenticated UI (else `None`). |
+
+The `user` is populated by the authenticated web UI, which stamps the session
+identity onto the launch and carries it end-to-end onto the run's (and
+backfill's) `launched_by` — `rs.LaunchedBy.manual()` from Python has no user.
+See the [authentication guide](../guides/authentication.md#who-launched-what).
+
+### `UserRef`
+
+Identity of the user who triggered a manual launch — the stable subject plus
+display snapshots.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `subject` | `str` | Stable, unique id (OIDC `sub` / forward-auth user header). |
+| `email` | `str \| None` | Email snapshot at launch time. |
+| `name` | `str \| None` | Display-name snapshot at launch time. |
+| `display` | `str` | Human-readable label: `name`, else `email`, else `subject`. |
 
 ### `StoredTick`
 

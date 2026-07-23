@@ -318,7 +318,7 @@ use crate::partitions::{
     resolve_partitions_def_ref,
 };
 use crate::result_types;
-use crate::storage::{PyStorage, PyStorageType};
+use crate::storage::{PyLaunchedBy, PyStorage, PyStorageType};
 use crate::task::{PyBashTask, PyTask};
 
 use self::resolved_node::{ResolvedAsset, ResolvedBashTask, ResolvedNode, ResolvedTask};
@@ -479,6 +479,7 @@ pub struct PyBackfillStatusResult {
     pub run_ids: Vec<String>,
     pub error: Option<String>,
     pub tags: Vec<(String, String)>,
+    pub launched_by: PyLaunchedBy,
 }
 
 #[pymethods]
@@ -1850,6 +1851,7 @@ impl RepoHandle {
             run_ids: r.run_ids,
             error: r.error,
             tags: r.tags,
+            launched_by: r.launched_by.into(),
         }))
     }
 
@@ -1860,6 +1862,7 @@ impl RepoHandle {
         &self,
         backfill_id: &str,
         dry_run: bool,
+        launched_by: rivers_core::storage::LaunchedBy,
     ) -> PyResult<crate::daemon::BackfillRequestData> {
         let storage = {
             let guard = self.state.read().unwrap();
@@ -1904,6 +1907,7 @@ impl RepoHandle {
             failure_policy: Some(failure_policy),
             max_concurrency,
             tags: Some(tag_map),
+            launched_by,
             dry_run,
             backfill_id: None,
         })
@@ -1915,6 +1919,7 @@ impl RepoHandle {
     pub(crate) async fn build_run_rerun_request(
         &self,
         run_id: &str,
+        launched_by: rivers_core::storage::LaunchedBy,
     ) -> PyResult<crate::daemon::RunRerunRequest> {
         let storage = {
             let guard = self.state.read().unwrap();
@@ -1940,6 +1945,7 @@ impl RepoHandle {
                     tags: Some(tags.into_iter().collect()),
                     partition_key: record.partition_key.as_ref().map(PyPartitionKey::from),
                     job_name: Some(job_name),
+                    launched_by,
                 },
             )),
             None => Ok(crate::daemon::RunRerunRequest::Materialization(
@@ -1948,7 +1954,7 @@ impl RepoHandle {
                     asset_selection: record.node_names,
                     partition_key: record.partition_key,
                     tags,
-                    launched_by: rivers_core::storage::LaunchedBy::Manual,
+                    launched_by,
                 },
             )),
         }
@@ -1961,6 +1967,7 @@ impl RepoHandle {
         &self,
         asset_key: &str,
         max_concurrency: u32,
+        launched_by: rivers_core::storage::LaunchedBy,
     ) -> PyResult<crate::daemon::BackfillRequestData> {
         // Dynamic keys live in storage, not the def — capture the namespace and
         // fetch after dropping the guard; other kinds enumerate from the def here.
@@ -2037,6 +2044,7 @@ impl RepoHandle {
             tags: None,
             dry_run: false,
             backfill_id: None,
+            launched_by,
         })
     }
 
@@ -3419,7 +3427,7 @@ impl PyCodeRepository {
                 include_upstream,
                 resume,
                 retry,
-                LaunchedBy::Manual,
+                LaunchedBy::Manual { user: None },
             )
         })
     }
@@ -3512,8 +3520,15 @@ impl PyCodeRepository {
             // Post-drain shutdown token: UI stays alive during drain so /readyz is reachable.
             let shutdown = crate::shutdown::shutdown_token().child_token();
             let handle = rt().spawn(async move {
+                let auth = match rivers_ui::auth::AuthRuntime::from_env().await {
+                    Ok(auth) => auth,
+                    Err(e) => {
+                        tracing::error!(target: "rivers::auth", error = %e, "invalid RIVERS_AUTH_* configuration; UI not started");
+                        return;
+                    }
+                };
                 if let Err(e) =
-                    rivers_ui::start_server(storage_arc, graph, host, port, registry, shutdown)
+                    rivers_ui::start_server(storage_arc, graph, host, port, registry, auth, shutdown)
                         .await
                 {
                     tracing::error!(target: "rivers::ui", error = %e, "UI server error");
@@ -3566,6 +3581,7 @@ impl PyCodeRepository {
                 block,
                 dry_run,
                 None,
+                rivers_core::storage::LaunchedBy::default(),
             )
         })
     }
@@ -3742,6 +3758,7 @@ impl PyCodeRepository {
                 block,
                 dry_run,
                 None,
+                rivers_core::storage::LaunchedBy::default(),
             )
         })
     }
@@ -3789,7 +3806,7 @@ impl PyCodeRepository {
                 selection,
                 partition_key.as_ref(),
                 None,
-                LaunchedBy::Manual,
+                LaunchedBy::Manual { user: None },
                 None,
             ))
         })
@@ -3928,6 +3945,7 @@ impl PyCodeRepository {
         block: bool,
         dry_run: bool,
         preminted_id: Option<String>,
+        launched_by: rivers_core::storage::LaunchedBy,
     ) -> PyResult<PyBackfillResult> {
         let guard = self.ensure_resolved()?;
         let state = guard.as_ref().unwrap();
@@ -4105,6 +4123,7 @@ impl PyCodeRepository {
             create_time: now_ts(),
             end_time: None,
             error: None,
+            launched_by,
         };
 
         io_rt()

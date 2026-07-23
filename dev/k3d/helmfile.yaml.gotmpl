@@ -63,3 +63,18 @@ releases:
             image: k3d-rivers-registry:5000/rivers-demo
             module: demo_project.pipeline
 {{- end }}
+{{- if eq (env "RIVERS_K8S_AUTH") "1" }}
+
+  # Opt-in standing OIDC provider for a browsable login. setup.sh bootstraps the
+  # `rivers` client + demo user, adds the split-horizon DNS, and flips rivers-ui
+  # to oidc. `wait: false` — the chart's DB-migration post-install hook deadlocks
+  # helm --wait. The auth integration test installs its own separate ferriskey
+  # release, so don't run `just k8s-test` while this toggle is up.
+  - name: ferriskey
+    namespace: rivers
+    chart: oci://ghcr.io/ferriskey/charts/ferriskey
+    version: 0.7.1
+    wait: false
+    values:
+      - ferriskey-values.yaml
+{{- end }}

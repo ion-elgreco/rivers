@@ -34,6 +34,7 @@ Returned by `CodeRepository.get_backfill()`.
 | `run_ids` | `list[str]` | IDs of runs created by the backfill |
 | `error` | `str \| None` | Error message if the backfill failed |
 | `tags` | `list[tuple[str, str]]` | Tags attached to every run launched by the backfill |
+| `launched_by` | `LaunchedBy` | Origin of the backfill; manual launches from the authenticated UI carry the acting `user` |
 
 ---
 

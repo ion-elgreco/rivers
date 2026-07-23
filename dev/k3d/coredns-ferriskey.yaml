@@ -1,0 +1,13 @@
+# Split-horizon DNS for the auth toggle: pods resolve the external issuer host
+# to the in-cluster FerrisKey api Service, while the browser resolves the same
+# name to 127.0.0.1 via the public localtest.me wildcard. k3s auto-imports a
+# ConfigMap named `coredns-custom`; keys ending in `.override` are spliced into
+# the default `.:53` server block.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  ferriskey.override: |
+    rewrite name ferriskey.localtest.me ferriskey-api.rivers.svc.cluster.local

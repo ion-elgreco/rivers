@@ -293,6 +293,30 @@ removes the footgun by always requiring auth for the bundled path.
 of them when using embedded storage. Set them in your shell when pointing
 `rivers dev` at an authenticated remote SurrealDB.
 
+## UI authentication
+
+The UI ships unauthenticated (`ui.auth.mode: none`). Before exposing it via
+Ingress or HTTPRoute, enable one of the two auth modes:
+
+```yaml
+ui:
+  auth:
+    mode: oidc                        # or "forward" behind an auth proxy
+    publicUrl: https://rivers.example.com
+    oidc:
+      issuer: https://keycloak.example.com/realms/main
+      clientId: rivers
+      existingSecret: rivers-oidc-client   # key: client-secret
+```
+
+`oidc` speaks OpenID Connect (code flow + PKCE) directly to your IdP;
+`forward` trusts identity headers injected by an authenticating reverse
+proxy (Authelia, oauth2-proxy, Envoy Gateway, …) from an explicit
+`trustedProxies` CIDR list. Invalid combinations fail `helm install`
+loudly. See the [authentication guide](../guides/authentication.md) for the
+full option set, proxy header mappings, allowlists, and the launched-by
+audit trail.
+
 ## Open ports
 
 | Port    | Component         | Purpose                                       |

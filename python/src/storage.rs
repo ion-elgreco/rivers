@@ -185,11 +185,55 @@ impl From<AssetRecord> for PyAssetRecord {
     }
 }
 
+/// Who performed a manual action — Python mirror of
+/// `rivers_core::storage::UserRef`.
+#[pyclass(name = "UserRef", frozen, skip_from_py_object, module = "rivers._core")]
+#[derive(Clone, Debug)]
+pub struct PyUserRef {
+    pub(crate) inner: rivers_core::storage::UserRef,
+}
+
+#[pymethods]
+impl PyUserRef {
+    /// Stable identifier: OIDC `sub` / forward-auth user header.
+    #[getter]
+    fn subject(&self) -> &str {
+        &self.inner.subject
+    }
+
+    /// Email snapshot taken at launch time.
+    #[getter]
+    fn email(&self) -> Option<&str> {
+        self.inner.email.as_deref()
+    }
+
+    /// Display-name snapshot taken at launch time.
+    #[getter]
+    fn name(&self) -> Option<&str> {
+        self.inner.name.as_deref()
+    }
+
+    /// Human-readable label: name, else email, else subject.
+    #[getter]
+    fn display(&self) -> &str {
+        self.inner.display()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("UserRef(subject={:?})", self.inner.subject)
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
 /// Origin of a run — Python mirror of `rivers_core::storage::LaunchedBy`.
 ///
 /// Variants are discriminated by `.kind`; carried payloads are exposed as
-/// `.name` (schedule / sensor) and `.backfill_id` (backfill), both `None` for
-/// variants that don't carry one. Use the classmethod constructors
+/// `.name` (schedule / sensor), `.backfill_id` (backfill), and `.user`
+/// (manual runs launched through an authenticated UI session), each `None`
+/// for variants that don't carry them. Use the classmethod constructors
 /// (`LaunchedBy.manual()`, `LaunchedBy.schedule("daily")`, …) to build values.
 #[pyclass(
     name = "LaunchedBy",
@@ -207,7 +251,7 @@ impl PyLaunchedBy {
     #[classmethod]
     fn manual(_cls: &Bound<'_, pyo3::types::PyType>) -> Self {
         Self {
-            inner: LaunchedBy::Manual,
+            inner: LaunchedBy::Manual { user: None },
         }
     }
 
@@ -242,7 +286,7 @@ impl PyLaunchedBy {
     #[getter]
     fn kind(&self) -> &'static str {
         match self.inner {
-            LaunchedBy::Manual => "manual",
+            LaunchedBy::Manual { .. } => "manual",
             LaunchedBy::Schedule { .. } => "schedule",
             LaunchedBy::Sensor { .. } => "sensor",
             LaunchedBy::Backfill { .. } => "backfill",
@@ -266,9 +310,22 @@ impl PyLaunchedBy {
         }
     }
 
+    #[getter]
+    fn user(&self) -> Option<PyUserRef> {
+        match &self.inner {
+            LaunchedBy::Manual { user: Some(user) } => Some(PyUserRef {
+                inner: user.clone(),
+            }),
+            _ => None,
+        }
+    }
+
     fn __repr__(&self) -> String {
         match &self.inner {
-            LaunchedBy::Manual => "LaunchedBy.manual()".to_string(),
+            LaunchedBy::Manual { user: None } => "LaunchedBy.manual()".to_string(),
+            LaunchedBy::Manual { user: Some(u) } => {
+                format!("LaunchedBy.manual()  # user={}", u.subject)
+            }
             LaunchedBy::Schedule { name } => format!("LaunchedBy.schedule({name:?})"),
             LaunchedBy::Sensor { name } => format!("LaunchedBy.sensor({name:?})"),
             LaunchedBy::Backfill { backfill_id } => {
@@ -287,7 +344,7 @@ impl PyLaunchedBy {
         use std::hash::{Hash, Hasher};
         let mut h = DefaultHasher::new();
         match &self.inner {
-            LaunchedBy::Manual => 0u8.hash(&mut h),
+            LaunchedBy::Manual { .. } => 0u8.hash(&mut h),
             LaunchedBy::Schedule { name } => {
                 1u8.hash(&mut h);
                 name.hash(&mut h);
@@ -1374,7 +1431,7 @@ impl PyStorage {
             priority,
             partition_key: None,
             block_reason,
-            launched_by: LaunchedBy::Manual,
+            launched_by: LaunchedBy::Manual { user: None },
         };
         py.detach(|| {
             io_rt()
@@ -1755,6 +1812,7 @@ pub fn register_storage_module(parent_module: &Bound<'_, PyModule>) -> PyResult<
         PyStoredTick,
         PyStaleCause,
         PyAssetRecord,
+        PyUserRef,
         PyLaunchedBy,
         PyRunRecord,
         PyPoolLimit,

@@ -65,6 +65,7 @@ nav:
       - Graph Assets: guides/graph-assets.md
       - Partitioned Assets: guides/partitioned-assets.md
       - Delta Lake: guides/delta-lake.md
+      - Authentication: guides/authentication.md
   - API Reference:
       - CodeRepository: api-reference/repository.md
       - Assets: api-reference/assets.md

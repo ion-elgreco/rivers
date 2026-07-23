@@ -1,0 +1,186 @@
+suite: ui authentication
+templates:
+  - templates/ui-deployment.yaml
+  - templates/ui-auth-secret.yaml
+release:
+  name: rivers
+  namespace: rivers
+tests:
+  - it: default mode none — no RIVERS_AUTH_* env, no cookie Secret
+    asserts:
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_AUTH_MODE
+          any: true
+      - template: templates/ui-auth-secret.yaml
+        hasDocuments:
+          count: 0
+
+  - it: oidc mode stamps env + chart-managed cookie Secret
+    set:
+      ui.auth.mode: oidc
+      ui.auth.publicUrl: https://rivers.example.com
+      ui.auth.oidc.issuer: https://keycloak.example.com/realms/main
+      ui.auth.oidc.clientId: rivers
+      ui.auth.oidc.existingSecret: my-oidc-client
+    asserts:
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_AUTH_MODE
+            value: "oidc"
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_AUTH_OIDC_ISSUER
+            value: "https://keycloak.example.com/realms/main"
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_AUTH_OIDC_CLIENT_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: my-oidc-client
+                key: client-secret
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_AUTH_COOKIE_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: rivers-ui-auth
+                key: cookie-secret
+      - template: templates/ui-auth-secret.yaml
+        hasDocuments:
+          count: 1
+
+  - it: oidc public client — no client-secret env
+    set:
+      ui.auth.mode: oidc
+      ui.auth.publicUrl: https://rivers.example.com
+      ui.auth.oidc.issuer: https://idp.example.com
+      ui.auth.oidc.clientId: rivers
+      ui.auth.oidc.publicClient: true
+    asserts:
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_AUTH_OIDC_CLIENT_SECRET
+        any: true
+
+  - it: user-supplied cookie Secret suppresses the chart-managed one
+    set:
+      ui.auth.mode: oidc
+      ui.auth.publicUrl: https://rivers.example.com
+      ui.auth.oidc.issuer: https://idp.example.com
+      ui.auth.oidc.clientId: rivers
+      ui.auth.oidc.existingSecret: my-oidc-client
+      ui.auth.cookieSecret.existingSecret: my-cookie-secret
+    asserts:
+      - template: templates/ui-auth-secret.yaml
+        hasDocuments:
+          count: 0
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_AUTH_COOKIE_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: my-cookie-secret
+                key: cookie-secret
+
+  - it: oidc without issuer fails the install
+    set:
+      ui.auth.mode: oidc
+      ui.auth.publicUrl: https://rivers.example.com
+      ui.auth.oidc.clientId: rivers
+      ui.auth.oidc.existingSecret: my-oidc-client
+    asserts:
+      - template: templates/ui-deployment.yaml
+        failedTemplate:
+          errorPattern: "requires ui.auth.oidc.issuer"
+
+  - it: oidc confidential client without existingSecret fails the install
+    set:
+      ui.auth.mode: oidc
+      ui.auth.publicUrl: https://rivers.example.com
+      ui.auth.oidc.issuer: https://idp.example.com
+      ui.auth.oidc.clientId: rivers
+    asserts:
+      - template: templates/ui-deployment.yaml
+        failedTemplate:
+          errorPattern: "requires ui.auth.oidc.existingSecret"
+
+  - it: forward without trustedProxies fails the install
+    set:
+      ui.auth.mode: forward
+    asserts:
+      - template: templates/ui-deployment.yaml
+        failedTemplate:
+          errorPattern: "requires ui.auth.forward.trustedProxies"
+
+  - it: forward mode stamps trust + header env and no cookie Secret
+    set:
+      ui.auth.mode: forward
+      ui.auth.forward.trustedProxies:
+        - 10.42.0.0/16
+        - 10.43.7.7
+      ui.auth.forward.userHeader: X-Auth-Request-User
+      ui.auth.forward.logoutUrl: https://auth.example.com/logout
+      ui.auth.allowedGroups:
+        - data-eng
+    asserts:
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_AUTH_FORWARD_TRUSTED_PROXIES
+            value: "10.42.0.0/16,10.43.7.7"
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_AUTH_FORWARD_USER_HEADER
+            value: "X-Auth-Request-User"
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_AUTH_FORWARD_LOGOUT_URL
+            value: "https://auth.example.com/logout"
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_AUTH_ALLOWED_GROUPS
+            value: "data-eng"
+      - template: templates/ui-auth-secret.yaml
+        hasDocuments:
+          count: 0
+
+  - it: unknown mode fails the install
+    set:
+      ui.auth.mode: basic
+    asserts:
+      - template: templates/ui-deployment.yaml
+        failedTemplate:
+          errorPattern: "ui.auth.mode must be none"

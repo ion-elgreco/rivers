@@ -167,6 +167,45 @@ ui:
   imagePullPolicy: IfNotPresent
   port: 3000
   serviceType: ClusterIP
+  # UI authentication.
+  auth:
+    # none | oidc | forward
+    mode: none
+    # External base URL. Required for oidc; redirect URI is <publicUrl>/auth/callback.
+    publicUrl: ""
+    # Session lifetime, seconds (oidc).
+    sessionTtl: 28800
+    # Session-cookie key. Auto-generated + preserved across upgrades unless
+    # existingSecret is set. Value must be base64 of >= 32 bytes.
+    cookieSecret:
+      existingSecret: ""
+      secretKey: cookie-secret
+    oidc:
+      issuer: ""
+      clientId: ""
+      # Secret holding the client secret under clientSecretKey. Required
+      # unless publicClient (PKCE-only).
+      existingSecret: ""
+      clientSecretKey: client-secret
+      publicClient: false
+      scopes: "openid profile email"
+      groupsClaim: groups
+      # Also end the IdP session on logout.
+      rpLogout: false
+    forward:
+      # CIDRs allowed to assert identity headers. Required for forward;
+      # 0.0.0.0/0 must be typed deliberately.
+      trustedProxies: []
+      userHeader: Remote-User
+      emailHeader: Remote-Email
+      groupsHeader: Remote-Groups
+      nameHeader: Remote-Name
+      # Proxy logout URL for the UI's sign-out link.
+      logoutUrl: ""
+    # Empty lists admit any authenticated user.
+    allowedDomains: []
+    allowedGroups: []
+    allowedUsers: []
   resources:
     requests:
       cpu: 100m

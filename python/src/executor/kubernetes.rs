@@ -364,7 +364,7 @@ async fn poll_step_attempt(
         // Flag first (cheap, watcher-maintained); a direct storage read every
         // 30th cycle (~60s) backstops the run's single watcher task.
         if cancelled.load(Ordering::Relaxed)
-            || (cycle % 30 == 0 && storage.is_cancelled(run_id).await.unwrap_or(false))
+            || (cycle.is_multiple_of(30) && storage.is_cancelled(run_id).await.unwrap_or(false))
         {
             tracing::info!(
                 target: "rivers::k8s",
@@ -373,7 +373,7 @@ async fn poll_step_attempt(
             );
             return StepPollOutcome::Cancelled;
         }
-        if cycle % 2 == 0 {
+        if cycle.is_multiple_of(2) {
             match jobs_api.get_opt(job_name).await {
                 Ok(Some(job)) => {
                     let failed = job

@@ -32,14 +32,15 @@ pub(crate) fn extract_tick_outcome_from_parts(
     reqs: &[Py<PyRunRequest>],
     backfill_reqs: &[Py<PyBackfillRequest>],
     skip: Option<&Py<PySkipReason>>,
+    launched_by: &LaunchedBy,
 ) -> TickOutcome {
     if let Some(skip) = skip {
         TickOutcome::Skipped(skip.borrow(py).message.clone())
     } else {
         TickOutcome::RunRequests(
-            extract_run_request_data(py, reqs),
+            extract_run_request_data(py, reqs, launched_by),
             Vec::new(),
-            extract_backfill_request_data(py, backfill_reqs),
+            extract_backfill_request_data(py, backfill_reqs, launched_by),
         )
     }
 }
@@ -67,7 +68,7 @@ pub(crate) fn extract_sensor_outcome_from_parts(
         SensorOutcome::RunRequests(
             run_reqs,
             mat_reqs,
-            extract_backfill_request_data(py, backfill_reqs),
+            extract_backfill_request_data(py, backfill_reqs, launched_by),
             new_cursor,
         )
     }
@@ -95,6 +96,7 @@ fn split_run_requests(
                     .clone()
                     .map(|k| crate::partitions::PyPartitionKey::Single { key: vec![k] }),
                 job_name: rr.job_name.clone(),
+                launched_by: launched_by.clone(),
             });
         } else if let Some(sel) = default_asset_selection {
             mat_reqs.push(MaterializationRequestData {
@@ -121,6 +123,7 @@ fn split_run_requests(
 pub(crate) fn extract_run_request_data(
     py: Python,
     reqs: &[Py<PyRunRequest>],
+    launched_by: &LaunchedBy,
 ) -> Vec<RunRequestData> {
     reqs.iter()
         .map(|rr| {
@@ -133,6 +136,7 @@ pub(crate) fn extract_run_request_data(
                     .clone()
                     .map(|k| crate::partitions::PyPartitionKey::Single { key: vec![k] }),
                 job_name: rr.job_name.clone(),
+                launched_by: launched_by.clone(),
             }
         })
         .collect()
@@ -141,6 +145,7 @@ pub(crate) fn extract_run_request_data(
 pub(crate) fn extract_backfill_request_data(
     py: Python,
     reqs: &[Py<PyBackfillRequest>],
+    launched_by: &LaunchedBy,
 ) -> Vec<BackfillRequestData> {
     reqs.iter()
         .map(|br| {
@@ -155,6 +160,7 @@ pub(crate) fn extract_backfill_request_data(
                 tags: br.tags.clone(),
                 dry_run: false,
                 backfill_id: None,
+                launched_by: launched_by.clone(),
             }
         })
         .collect()

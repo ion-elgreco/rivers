@@ -343,6 +343,31 @@ pub fn short_id(id: &str, max_len: usize) -> String {
     }
 }
 
+/// Up-to-two uppercase initials for the avatar ("John Doe" → "JD",
+/// "admin" → "A", all-symbol names → "?").
+pub fn initials(display: &str) -> String {
+    let mut firsts = display
+        .split_whitespace()
+        .filter_map(|w| w.chars().find(|c| c.is_alphanumeric()));
+    match (firsts.next(), firsts.next_back()) {
+        (Some(f), Some(l)) => f.to_uppercase().chain(l.to_uppercase()).collect(),
+        (Some(f), None) => f.to_uppercase().collect(),
+        _ => "?".to_string(),
+    }
+}
+
+/// Stable per-user avatar hue. FNV-1a by hand: `DefaultHasher` is not
+/// stable across builds, and the server-rendered color must match what
+/// the client recomputes at hydration.
+pub fn avatar_hue(seed: &str) -> u16 {
+    let mut h: u32 = 0x811c9dc5;
+    for b in seed.bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    (h % 360) as u16
+}
+
 /// What the partition picker should render for a job's selection.
 ///
 /// Single source of truth for the dialog: callers route on the variant
@@ -625,6 +650,84 @@ pub fn code_location_label(id: &str, entries: &[CodeLocationEntry]) -> String {
     }
 }
 
+/// Payload of the auth middleware's API 401, in server_fn's `Variant|payload`
+/// wire format so the client decodes it as `ServerFnError::ServerError` and
+/// [`is_unauthorized`] can key on it. An empty 401 body would decode as a
+/// generic `Deserialization` error, indistinguishable from real failures.
+pub const UNAUTHORIZED_MARKER: &str = "unauthorized: sign-in required";
+
+/// True when a server-fn call failed because the session is missing/expired
+/// — the client should bounce through `/auth/login`.
+pub fn is_unauthorized(err: &ServerFnError) -> bool {
+    matches!(err, ServerFnError::ServerError(msg) if msg == UNAUTHORIZED_MARKER)
+}
+
+/// Hard-redirect into the login flow, preserving path+query as `rd`. No-op
+/// under SSR; idempotent so overlapping triggers don't stack navigations.
+#[cfg(target_arch = "wasm32")]
+pub fn redirect_to_login() {
+    use std::cell::Cell;
+    thread_local! { static REDIRECTING: Cell<bool> = const { Cell::new(false) }; }
+    if REDIRECTING.with(|r| r.replace(true)) {
+        return;
+    }
+    let loc = window().location();
+    let path = loc.pathname().unwrap_or_else(|_| "/".into());
+    let query = loc.search().unwrap_or_default();
+    let rd = js::encode_uri_component(&format!("{path}{query}"));
+    let _ = loc.assign(&format!("{}?rd={rd}", crate::routes::LOGIN));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn redirect_to_login() {}
+
+#[cfg(target_arch = "wasm32")]
+mod js {
+    use wasm_bindgen::prelude::wasm_bindgen;
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_name = encodeURIComponent)]
+        pub fn encode_uri_component(s: &str) -> String;
+    }
+}
+
+/// Re-check auth after a signal the session may have lapsed (e.g. the live
+/// stream closed) and redirect to login only if actually unauthorized — a live
+/// session or a transient error is left alone. No-op under SSR.
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_login_redirect_if_unauthorized() {
+    leptos::task::spawn_local(async {
+        if let Err(e) = crate::server_fns::user::get_current_user().await {
+            if is_unauthorized(&e) {
+                redirect_to_login();
+            }
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn spawn_login_redirect_if_unauthorized() {}
+
+/// Sub-line under a run row's launched-by label. For a manual run both the
+/// acting user *and* the job name are shown together (`job · user`), so an
+/// authenticated job launch reveals who triggered it — passing only the job
+/// name would hide the user. `None` lets `LaunchedByCell` fall back to its own
+/// default sub-line (schedule/sensor/backfill name).
+pub fn launched_by_sub_line(l: &LaunchedBy, job_name: Option<&str>) -> Option<String> {
+    // Non-manual origins fall back to the cell's own default sub-line; for
+    // manual runs, reuse `launched_by_display`'s user payload (single source of
+    // the user-display rule) and layer the job name on top.
+    if !matches!(l, LaunchedBy::Manual { .. }) {
+        return None;
+    }
+    let (_, _, _, user) = launched_by_display(l);
+    match (job_name, user) {
+        (Some(job), Some(user)) => Some(format!("{job} · {user}")),
+        (Some(job), None) => Some(job.to_string()),
+        (None, sub) => sub,
+    }
+}
+
 /// Display metadata for a `LaunchedBy` origin: `(glyph, color, label, default_sub_line)`.
 /// Shared by `LaunchedByCell` and the run-detail header so the glyph/label set
 /// stays in one place.
@@ -632,7 +735,12 @@ pub fn launched_by_display(
     l: &LaunchedBy,
 ) -> (&'static str, &'static str, &'static str, Option<String>) {
     match l {
-        LaunchedBy::Manual => ("◉", "var(--text)", "manual", None),
+        LaunchedBy::Manual { user } => (
+            "◉",
+            "var(--text)",
+            "manual",
+            user.as_ref().map(|u| u.display().to_string()),
+        ),
         LaunchedBy::Schedule { name } => ("⏱", "var(--warning)", "schedule", Some(name.clone())),
         LaunchedBy::Sensor { name } => ("⚡", "var(--secondary)", "sensor", Some(name.clone())),
         LaunchedBy::Backfill { backfill_id } => (
@@ -648,6 +756,57 @@ pub fn launched_by_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initials_take_first_and_last_word() {
+        assert_eq!(initials("John Doe"), "JD");
+        assert_eq!(initials("John Ronald Reuel Tolkien"), "JT");
+        assert_eq!(initials("admin"), "A");
+        assert_eq!(initials("john.doe@example.com"), "J");
+        // Symbol-led words fall through to their first alphanumeric.
+        assert_eq!(initials("(ion) k"), "IK");
+        assert_eq!(initials("---"), "?");
+        assert_eq!(initials(""), "?");
+    }
+
+    #[test]
+    fn avatar_hue_is_stable_and_bounded() {
+        // Pinned value: SSR and hydration must agree across builds/targets.
+        assert_eq!(avatar_hue("john.doe"), avatar_hue("john.doe"));
+        assert_eq!(avatar_hue("john.doe"), 34);
+        assert!(avatar_hue("") < 360);
+        assert_ne!(avatar_hue("alice"), avatar_hue("bob"));
+    }
+
+    #[test]
+    fn launched_by_sub_line_manual_shows_job_and_user() {
+        use crate::types::{LaunchedBy, UserRef};
+        let user = Some(UserRef {
+            subject: "sub-1".into(),
+            email: None,
+            name: Some("Ada".into()),
+        });
+        // Authenticated job launch: both job and user, not just the job.
+        assert_eq!(
+            launched_by_sub_line(&LaunchedBy::Manual { user: user.clone() }, Some("nightly")),
+            Some("nightly · Ada".to_string())
+        );
+        // Auth disabled: job only.
+        assert_eq!(
+            launched_by_sub_line(&LaunchedBy::Manual { user: None }, Some("nightly")),
+            Some("nightly".to_string())
+        );
+        // Asset materialization by a user: user only.
+        assert_eq!(
+            launched_by_sub_line(&LaunchedBy::Manual { user }, None),
+            Some("Ada".to_string())
+        );
+        // Non-manual origins fall back to the cell's own sub-line.
+        assert_eq!(
+            launched_by_sub_line(&LaunchedBy::Schedule { name: "s".into() }, Some("j")),
+            None
+        );
+    }
 
     #[test]
     fn test_format_timestamp_some() {

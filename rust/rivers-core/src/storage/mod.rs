@@ -606,14 +606,39 @@ impl SurrealValue for RunStatus {
     }
 }
 
+/// Who performed a manual action. `subject` is the stable identifier
+/// (OIDC `sub` / forward-auth user header); email/name are launch-time
+/// display snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue, serde::Serialize, serde::Deserialize)]
+pub struct UserRef {
+    pub subject: String,
+    #[serde(default)]
+    #[surreal(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    #[surreal(default)]
+    pub name: Option<String>,
+}
+
+impl UserRef {
+    pub fn display(&self) -> &str {
+        self.name
+            .as_deref()
+            .or(self.email.as_deref())
+            .unwrap_or(&self.subject)
+    }
+}
+
 /// Origin of a run — what caused it to be created.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[derive(Default)]
 pub enum LaunchedBy {
-    /// User-triggered via CLI / API / UI.
-    #[default]
-    Manual,
+    /// User-triggered via CLI / API / UI; `user` is set only for
+    /// authenticated UI sessions.
+    Manual {
+        #[serde(default)]
+        user: Option<UserRef>,
+    },
     /// Spawned by a schedule tick.
     Schedule { name: String },
     /// Spawned by a sensor tick.
@@ -624,6 +649,12 @@ pub enum LaunchedBy {
     Condition,
 }
 
+impl Default for LaunchedBy {
+    fn default() -> Self {
+        Self::Manual { user: None }
+    }
+}
+
 impl SurrealValue for LaunchedBy {
     fn kind_of() -> Kind {
         <std::collections::HashMap<String, Value>>::kind_of()
@@ -632,8 +663,12 @@ impl SurrealValue for LaunchedBy {
     fn into_value(self) -> Value {
         let mut map = std::collections::BTreeMap::new();
         match self {
-            Self::Manual => {
+            Self::Manual { user } => {
                 map.insert("kind".to_string(), "manual".to_string().into_value());
+                // Omitted when None — matches the pre-user row shape.
+                if let Some(user) = user {
+                    map.insert("user".to_string(), user.into_value());
+                }
             }
             Self::Schedule { name } => {
                 map.insert("kind".to_string(), "schedule".to_string().into_value());
@@ -661,7 +696,14 @@ impl SurrealValue for LaunchedBy {
             .and_then(|v| String::from_value(v.clone()).ok())
             .unwrap_or_default();
         match kind.as_str() {
-            "" | "manual" => Ok(Self::Manual),
+            "" | "manual" => {
+                let user = map
+                    .get("user")
+                    .filter(|v| !matches!(v, Value::None | Value::Null))
+                    .map(|v| UserRef::from_value(v.clone()))
+                    .transpose()?;
+                Ok(Self::Manual { user })
+            }
             "schedule" => {
                 let name = map
                     .get("name")
@@ -977,6 +1019,10 @@ pub struct BackfillRecord {
     pub create_time: i64,
     pub end_time: Option<i64>,
     pub error: Option<String>,
+    /// Defaults cover rows written before V3.
+    #[serde(default)]
+    #[surreal(default)]
+    pub launched_by: LaunchedBy,
 }
 
 // ── Concurrency pool records ──
@@ -2390,5 +2436,68 @@ mod partition_key_tests {
             ],
         };
         assert_eq!(pk.to_display(), "a, d=x");
+    }
+}
+
+#[cfg(test)]
+mod launched_by_tests {
+    use super::*;
+
+    fn user() -> UserRef {
+        UserRef {
+            subject: "sub-1".into(),
+            email: Some("john.doe@example.com".into()),
+            name: Some("John Doe".into()),
+        }
+    }
+
+    #[test]
+    fn manual_without_user_roundtrips_as_pre_user_shape() {
+        let v = LaunchedBy::Manual { user: None }.into_value();
+        let Value::Object(map) = &v else {
+            panic!("expected object")
+        };
+        assert!(!map.contains_key("user"), "None user must be omitted");
+        assert_eq!(
+            LaunchedBy::from_value(v).unwrap(),
+            LaunchedBy::Manual { user: None }
+        );
+    }
+
+    #[test]
+    fn manual_with_user_roundtrips() {
+        let launched = LaunchedBy::Manual { user: Some(user()) };
+        let back = LaunchedBy::from_value(launched.clone().into_value()).unwrap();
+        assert_eq!(back, launched);
+    }
+
+    #[test]
+    fn pre_user_row_shape_deserializes() {
+        // Exactly what pre-user rows carry: {"kind": "manual"}.
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("kind".to_string(), "manual".to_string().into_value());
+        let v = Value::Object(map.into());
+        assert_eq!(
+            LaunchedBy::from_value(v).unwrap(),
+            LaunchedBy::Manual { user: None }
+        );
+    }
+
+    #[test]
+    fn user_ref_display_precedence() {
+        let mut u = user();
+        assert_eq!(u.display(), "John Doe");
+        u.name = None;
+        assert_eq!(u.display(), "john.doe@example.com");
+        u.email = None;
+        assert_eq!(u.display(), "sub-1");
+    }
+
+    #[test]
+    fn serde_json_pre_user_manual_deserializes() {
+        // UI DTOs and event payloads travel through serde; the pre-user JSON
+        // shape must keep parsing.
+        let l: LaunchedBy = serde_json::from_str(r#"{"kind":"manual"}"#).unwrap();
+        assert_eq!(l, LaunchedBy::Manual { user: None });
     }
 }

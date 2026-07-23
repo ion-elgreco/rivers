@@ -33,7 +33,6 @@ pub(crate) async fn process_tick_result(
     let entry = &mut automations[index];
     let auto_name = entry.name().to_string();
     let auto_type = entry.automation_type_str();
-    let launched_by = entry.launched_by();
     let timestamp = now_ts();
 
     match result {
@@ -48,7 +47,7 @@ pub(crate) async fn process_tick_result(
             let final_cursor = outcome.cursor_or(prev_cursor);
 
             let tick_outcome = run_dispatcher
-                .dispatch_tick(run_requests, materialization_requests, launched_by.clone())
+                .dispatch_tick(run_requests, materialization_requests)
                 .await;
             let (run_ids, mut dispatch_errors) = log_dispatch_outcome(
                 tick_outcome,
