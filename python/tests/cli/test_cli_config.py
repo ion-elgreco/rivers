@@ -330,3 +330,72 @@ class TestSourcePriority:
         cfg = RiversConfig()
         assert cfg.server.port == 1111
         assert cfg.server.grpc_port == 9090
+
+
+class TestFromCli:
+    """``RiversConfig.from_cli`` — the flat CLI args → nested config adapter.
+
+    This is the seam ``rivers dev`` uses; every flat flag must land on its
+    nested group, and unset flags (``None``) must leave lower-precedence
+    sources (env/TOML) in charge.
+    """
+
+    def test_all_flags_map_to_nested_groups(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        cfg = RiversConfig.from_cli(
+            module="a.b.c",
+            repo_var="my_repo",
+            host="0.0.0.0",
+            port=4000,
+            grpc_port=4001,
+            storage_path="/tmp/store",
+            surreal_endpoint="ws://db:8000",
+            no_daemon=True,
+            synthetic="1k",
+        )
+        assert cfg.module.path == "a.b.c"
+        assert cfg.module.repo_var == "my_repo"
+        assert cfg.server.host == "0.0.0.0"
+        assert cfg.server.port == 4000
+        assert cfg.server.grpc_port == 4001
+        assert cfg.storage.path == "/tmp/store"
+        assert cfg.storage.endpoint == "ws://db:8000"
+        assert cfg.daemon.no_daemon is True
+        assert cfg.synthetic.size == "1k"
+
+    def test_omitted_flags_fall_back_to_defaults(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        cfg = RiversConfig.from_cli(module="a.b.c")
+        assert cfg.module.path == "a.b.c"
+        assert cfg.module.repo_var == "repo"
+        assert cfg.server.host == "127.0.0.1"
+        assert cfg.server.port == 3000
+        assert cfg.storage.path == ".rivers/storage/"
+        assert cfg.daemon.no_daemon is False
+        assert cfg.synthetic.size is None
+
+    def test_no_flags_matches_plain_construction(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert RiversConfig.from_cli() == RiversConfig()
+
+    def test_flag_overrides_toml_but_sibling_keys_survive(self, tmp_path, monkeypatch):
+        """A flag replaces only its own key: siblings in the same TOML group
+        and untouched groups deep-merge through."""
+        monkeypatch.chdir(tmp_path)
+        _make_rivers_toml(
+            tmp_path,
+            module={"path": "toml.mod", "repo_var": "toml_repo"},
+            server={"port": 5555},
+        )
+        cfg = RiversConfig.from_cli(module="cli.mod")
+        assert cfg.module.path == "cli.mod"
+        assert cfg.module.repo_var == "toml_repo"
+        assert cfg.server.port == 5555
+
+    def test_unset_bool_flag_leaves_toml_value(self, tmp_path, monkeypatch):
+        """``no_daemon=None`` (flag not passed) must not clobber a TOML
+        ``no_daemon = true``; an explicit ``False`` must."""
+        monkeypatch.chdir(tmp_path)
+        _make_rivers_toml(tmp_path, daemon={"no_daemon": True})
+        assert RiversConfig.from_cli().daemon.no_daemon is True
+        assert RiversConfig.from_cli(no_daemon=False).daemon.no_daemon is False
