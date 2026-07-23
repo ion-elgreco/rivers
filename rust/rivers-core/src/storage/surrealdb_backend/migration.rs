@@ -636,8 +636,10 @@ mod tests {
     }
 
     /// A backfill written under V2 (before `launched_by` was defined) has no
-    /// such key in storage. After migrating to V3 it must still read back —
-    /// falling to the struct default — not error.
+    /// such key in storage. After migrating to V3 it must read back (struct
+    /// default) AND stay writable: DEFAULT only fills the field at create
+    /// time, so V3 also backfills the stored NONE — without that, any UPDATE
+    /// on a legacy row trips field coercion.
     #[tokio::test]
     async fn test_v3_backfill_launched_by_defaults_for_legacy_rows() {
         let db = any::connect("mem://").await.unwrap();
@@ -688,6 +690,12 @@ mod tests {
             crate::storage::LaunchedBy::Manual { user: None },
             "a legacy row's missing launched_by falls back to the struct default"
         );
+
+        db.query("UPDATE backfills SET status = 'Canceled' WHERE backfill_id = 'bf-legacy'")
+            .await
+            .unwrap()
+            .check()
+            .expect("legacy backfill row must be writable after V3");
     }
 
     /// Editing an already-applied migration is caught by refinery's checksum
