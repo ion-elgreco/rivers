@@ -273,6 +273,8 @@ code {
     transform: rotate(45deg);
 }
 .asset-row-check:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+.asset-row-check:disabled { opacity: 0.25; cursor: default; }
+.asset-row-check:disabled:hover { border-color: var(--outline-variant); }
 
 /* === Rivers-style bulk selection bar: flat text buttons, mono, muted ===
  * Matches rivers-screens.jsx AssetsScreen bulk bar:

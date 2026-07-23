@@ -196,7 +196,7 @@ pub fn RunDetailPage() -> impl IntoView {
                         let rerun_run_id = record.run_id.clone();
                         let status_kind = run_status_kind(&record.status);
                         let sid = short_id(&record.run_id, 8);
-                        let is_active_status = matches!(record.status, RunStatus::Started | RunStatus::NotStarted | RunStatus::Queued);
+                        let is_active_status = crate::helpers::run_is_active(&record.status);
                         let (_, _, trigger_label, trigger_sub) = launched_by_display(&record.launched_by);
                         // Reactive elapsed: ticks once per second while end_time
                         // is None (run still in flight), freezes when end_time

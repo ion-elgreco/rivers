@@ -23,15 +23,17 @@ use crate::components::ui_kit::{
     RiversSearch, StatusChip, Topbar, partition_scheme_for,
 };
 use crate::helpers::{
-    code_location_label, format_duration, format_timestamp, run_status_class, run_status_kind,
+    code_location_label, format_duration, format_timestamp, run_is_active, run_status_class,
+    run_status_kind,
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::now::RelTime;
+use crate::server_fns::actions::{CancelRunsResult, cancel_runs};
 use crate::server_fns::locations::list_code_locations;
 use crate::server_fns::runs::{get_runs_page, get_runs_summary};
 use crate::types::{CodeLocationEntry, RunFilter, RunRecord, RunStatus, RunsSummary};
 
-const GRID: &str = "grid-template-columns: 80px 1.2fr 0.7fr 1.4fr 0.6fr 0.9fr 0.8fr 1fr";
+const GRID: &str = "grid-template-columns: 32px 80px 1.2fr 0.7fr 1.4fr 0.6fr 0.9fr 0.8fr 1fr";
 
 fn status_from_tab(tab: &str) -> Option<RunStatus> {
     match tab {
@@ -81,6 +83,43 @@ pub fn RunsListPage() -> impl IntoView {
     });
 
     let locations = Resource::new(|| (), |_| list_code_locations());
+
+    // Multiselect for bulk cancel. Ids only — rows come back from the page
+    // Resource. Pruned on every page fetch so the selection never outlives
+    // the visible page or a run that finished mid-selection.
+    let (selected, set_selected) = signal(Vec::<String>::new());
+    Effect::new(move |_| {
+        if let Some(Ok(p)) = runs_page.get() {
+            let live: std::collections::HashSet<&str> = p
+                .rows
+                .iter()
+                .filter(|r| run_is_active(&r.status))
+                .map(|r| r.run_id.as_str())
+                .collect();
+            let cur = selected.get_untracked();
+            let keep: Vec<String> = cur
+                .iter()
+                .filter(|id| live.contains(id.as_str()))
+                .cloned()
+                .collect();
+            if keep.len() != cur.len() {
+                set_selected.set(keep);
+            }
+        }
+    });
+
+    let cancel_action = Action::new(move |ids: &Vec<String>| {
+        let ids = ids.clone();
+        async move { cancel_runs(ids).await }
+    });
+    // On completion keep only the failed ids selected (retryable); the
+    // refresh tick pulls the new statuses in.
+    Effect::new(move |_| {
+        if let Some(Ok(res)) = cancel_action.value().get() {
+            set_selected.set(res.failed.iter().map(|(id, _)| id.clone()).collect());
+            set_refresh_tick.update(|t| *t += 1);
+        }
+    });
 
     // Summary is intentionally on a separate Resource with a narrower key:
     // only `refresh_tick` triggers a refetch, not filter/page/page_size.
@@ -223,18 +262,103 @@ pub fn RunsListPage() -> impl IntoView {
             }
             render={move |rows: Vec<RunRecord>| {
                 let locs = locations.get().and_then(|r| r.ok()).unwrap_or_default();
-                view! { <RunsTable rows=rows locations=locs/> }.into_any()
+                view! {
+                    <RunsTable
+                        rows=rows
+                        locations=locs
+                        selected=selected
+                        set_selected=set_selected
+                        cancel_action=cancel_action
+                    />
+                }.into_any()
             }}
         />
     }
 }
 
 #[component]
-fn RunsTable(rows: Vec<RunRecord>, locations: Vec<CodeLocationEntry>) -> impl IntoView {
+fn RunsTable(
+    rows: Vec<RunRecord>,
+    locations: Vec<CodeLocationEntry>,
+    selected: ReadSignal<Vec<String>>,
+    set_selected: WriteSignal<Vec<String>>,
+    cancel_action: Action<Vec<String>, Result<CancelRunsResult, ServerFnError>>,
+) -> impl IntoView {
     let locations = std::sync::Arc::new(locations);
+    let cancel_pending = cancel_action.pending();
+    let cancellable: Vec<String> = rows
+        .iter()
+        .filter(|r| run_is_active(&r.status))
+        .map(|r| r.run_id.clone())
+        .collect();
+    let n_cancellable = cancellable.len();
+    let cancellable = StoredValue::new(cancellable);
+
     view! {
+        {(n_cancellable > 0).then(|| view! {
+            <div class="bulk-actions">
+                <button
+                    class="bulk-link-btn"
+                    on:click=move |_| set_selected.set(cancellable.get_value())
+                >
+                    {format!("Select all cancellable ({n_cancellable})")}
+                </button>
+                <span class="bulk-sep">"·"</span>
+                <button class="bulk-link-btn" on:click=move |_| set_selected.set(Vec::new())>
+                    "Clear"
+                </button>
+                <Show when=move || !selected.get().is_empty()>
+                    <button
+                        class="btn btn-danger"
+                        on:click=move |_| { cancel_action.dispatch(selected.get()); }
+                        disabled=move || cancel_pending.get()
+                    >
+                        <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+                            <rect x="3" y="2" width="2.5" height="8"/>
+                            <rect x="6.5" y="2" width="2.5" height="8"/>
+                        </svg>
+                        {move || {
+                            if cancel_pending.get() {
+                                "Canceling...".to_string()
+                            } else {
+                                let n = selected.get().len();
+                                format!("Cancel {n} run{}", if n == 1 { "" } else { "s" })
+                            }
+                        }}
+                    </button>
+                </Show>
+                {move || cancel_action.value().get().map(|r| match r {
+                    Ok(res) if res.failed.is_empty() => {
+                        let n = res.requested;
+                        view! {
+                            <span class="text-muted">
+                                {format!("cancel requested for {n} run{}", if n == 1 { "" } else { "s" })}
+                            </span>
+                        }.into_any()
+                    }
+                    Ok(res) => {
+                        let detail = res
+                            .failed
+                            .iter()
+                            .map(|(id, e)| format!("{id}: {e}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        view! {
+                            <span class="text-error" title=detail>
+                                {format!("{} requested · {} failed", res.requested, res.failed.len())}
+                            </span>
+                        }.into_any()
+                    }
+                    Err(e) => view! {
+                        <span class="text-error">{format!("cancel failed: {e}")}</span>
+                    }.into_any(),
+                })}
+                <span class="bulk-count">{move || format!("{} selected", selected.get().len())}</span>
+            </div>
+        })}
         <div class="grid-table">
             <div class="grid-table-head" style=GRID>
+                <span></span>
                 <span>"RUN"</span>
                 <span>"LAUNCHED BY"</span>
                 <span>"STATUS"</span>
@@ -249,7 +373,7 @@ fn RunsTable(rows: Vec<RunRecord>, locations: Vec<CodeLocationEntry>) -> impl In
                 key=|r: &RunRecord| r.run_id.clone()
                 children=move |r: RunRecord| {
                     let label = code_location_label(&r.code_location_id, &locations);
-                    view! { <RunRow record=r code_location_label=label/> }
+                    view! { <RunRow record=r code_location_label=label selected=selected set_selected=set_selected/> }
                 }
             />
         </div>
@@ -257,8 +381,16 @@ fn RunsTable(rows: Vec<RunRecord>, locations: Vec<CodeLocationEntry>) -> impl In
 }
 
 #[component]
-fn RunRow(record: RunRecord, code_location_label: String) -> impl IntoView {
+fn RunRow(
+    record: RunRecord,
+    code_location_label: String,
+    selected: ReadSignal<Vec<String>>,
+    set_selected: WriteSignal<Vec<String>>,
+) -> impl IntoView {
     let run_id = record.run_id.clone();
+    let can_cancel = run_is_active(&record.status);
+    let id_for_check = run_id.clone();
+    let id_for_toggle = run_id.clone();
     let (ns, name) = use_current_location().get();
     let href = loc_path(&ns, &name, &format!("runs/{}", run_id));
     let short_id = if run_id.len() > 8 {
@@ -293,6 +425,23 @@ fn RunRow(record: RunRecord, code_location_label: String) -> impl IntoView {
     view! {
         <A href=href attr:class="grid-row" attr:style=GRID attr:title=created_abs>
             <span class=rail_cls></span>
+            <span on:click=move |ev: leptos::ev::MouseEvent| ev.stop_propagation()>
+                <input
+                    class="asset-row-check"
+                    type="checkbox"
+                    disabled=!can_cancel
+                    title=(!can_cancel).then_some("only queued or in-progress runs can be canceled")
+                    prop:checked=move || selected.get().contains(&id_for_check)
+                    on:click=move |ev| ev.stop_propagation()
+                    on:change=move |_| set_selected.update(|s| {
+                        if s.contains(&id_for_toggle) {
+                            s.retain(|x| x != &id_for_toggle);
+                        } else {
+                            s.push(id_for_toggle.clone());
+                        }
+                    })
+                />
+            </span>
             <span class="grid-cell-mono">{short_id}</span>
             {launched_cell}
             <StatusChip kind=st_kind small=true/>
