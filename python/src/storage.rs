@@ -1440,6 +1440,59 @@ impl PyStorage {
         })
     }
 
+    /// Create a backfill record (test helper). Not part of the public API.
+    #[pyo3(name = "_create_backfill", signature = (backfill_id, asset_selection, partition_keys, status, create_time))]
+    fn create_backfill(
+        &self,
+        py: Python<'_>,
+        backfill_id: &str,
+        asset_selection: Vec<String>,
+        partition_keys: Vec<String>,
+        status: &str,
+        create_time: i64,
+    ) -> PyResult<()> {
+        use rivers_core::storage::{
+            BackfillFailurePolicy, BackfillRecord, BackfillStatus, BackfillStrategy, PartitionKey,
+        };
+        let status = match status {
+            "Requested" => BackfillStatus::Requested,
+            "InProgress" => BackfillStatus::InProgress,
+            other => {
+                return Err(StorageError::new_err(format!(
+                    "Unknown backfill status: {other}"
+                )));
+            }
+        };
+        let record = BackfillRecord {
+            backfill_id: backfill_id.to_string(),
+            code_location_id: self.cl().to_string(),
+            status,
+            strategy: BackfillStrategy::SingleRun,
+            failure_policy: BackfillFailurePolicy::Continue,
+            asset_selection,
+            job_name: None,
+            partition_keys: partition_keys
+                .into_iter()
+                .map(|k| PartitionKey::Single { keys: vec![k] })
+                .collect(),
+            run_ids: vec![],
+            completed_partitions: vec![],
+            failed_partitions: vec![],
+            canceled_partitions: vec![],
+            max_concurrency: 4,
+            tags: vec![],
+            create_time,
+            end_time: None,
+            error: None,
+            launched_by: LaunchedBy::Manual { user: None },
+        };
+        py.detach(|| {
+            io_rt()
+                .block_on(self.backend().create_backfill(&record))
+                .map_err(to_py_err)
+        })
+    }
+
     #[pyo3(signature = (asset_key, limit=100))]
     fn async_get_events_for_asset<'py>(
         &self,

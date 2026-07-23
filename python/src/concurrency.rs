@@ -14,33 +14,41 @@ pub struct PyRunQueueConfig {
     pub tag_concurrency_limits: Vec<Py<PyTagConcurrencyLimit>>,
     #[pyo3(get)]
     pub dequeue_interval: String,
+    #[pyo3(get)]
+    pub start_timeout: String,
     parsed_interval: Duration,
+    parsed_start_timeout: Duration,
 }
 
 #[pymethods]
 impl PyRunQueueConfig {
     #[new]
-    #[pyo3(signature = (max_concurrent_runs=10, tag_concurrency_limits=vec![], dequeue_interval="250ms"))]
+    #[pyo3(signature = (max_concurrent_runs=10, tag_concurrency_limits=vec![], dequeue_interval="250ms", start_timeout="180s"))]
     fn new(
         max_concurrent_runs: i32,
         tag_concurrency_limits: Vec<Py<PyTagConcurrencyLimit>>,
         dequeue_interval: &str,
+        start_timeout: &str,
     ) -> PyResult<Self> {
         let parsed_interval = crate::utils::parse_duration("dequeue_interval", dequeue_interval)?;
+        let parsed_start_timeout = crate::utils::parse_duration("start_timeout", start_timeout)?;
         Ok(Self {
             max_concurrent_runs,
             tag_concurrency_limits,
             dequeue_interval: dequeue_interval.to_string(),
+            start_timeout: start_timeout.to_string(),
             parsed_interval,
+            parsed_start_timeout,
         })
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "RunQueueConfig(max_concurrent_runs={}, tag_concurrency_limits=[...{}], dequeue_interval='{}')",
+            "RunQueueConfig(max_concurrent_runs={}, tag_concurrency_limits=[...{}], dequeue_interval='{}', start_timeout='{}')",
             self.max_concurrent_runs,
             self.tag_concurrency_limits.len(),
             self.dequeue_interval,
+            self.start_timeout,
         )
     }
 }
@@ -55,6 +63,7 @@ impl PyRunQueueConfig {
                 .map(|l| TagConcurrencyLimit::from(&*l.borrow(py)))
                 .collect(),
             dequeue_interval: self.parsed_interval,
+            start_timeout: self.parsed_start_timeout,
         }
     }
 }

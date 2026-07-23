@@ -31,6 +31,8 @@ rivers dev my_pipeline \
 
 Resolves the repository, then starts the gRPC backend, the web UI, and (unless `--no-daemon`) the automation daemon. Tears down storage on exit.
 
+Every flag (and the module argument) can also come from configuration, with CLI flags taking precedence: `RIVERS_<GROUP>_<KEY>` environment variables (e.g. `RIVERS_SERVER_PORT`, `RIVERS_MODULE_PATH`), then the `[module]`/`[server]`/`[storage]`/`[daemon]` tables in `rivers.toml`, then `[tool.rivers.*]` in `pyproject.toml` — both files found by walking up from the current directory.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--host` | `127.0.0.1` | UI/gRPC bind host. |

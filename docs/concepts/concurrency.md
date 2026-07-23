@@ -33,6 +33,10 @@ The queue coordinator wakes every `dequeue_interval`, looks at how many runs are
 
 `materialize()` ignores the queue — call it explicitly only when you mean "run this right now, no gating."
 
+### Launch failures and the start timeout
+
+Dequeuing admits a run (it stops counting as queued and starts counting toward `max_concurrent_runs`) before the executor for it exists. If launching that executor fails, the run is marked failed immediately, with the error attached to the run as a `RunLaunchFailed` event. If the launch is interrupted (say the daemon restarts at exactly the wrong moment), the coordinator's sweep catches it later: a dequeued run with no live executor after `start_timeout` (default 180s) is marked failed the same way. Without this, such a run would hold a concurrency slot forever while being invisible in the queue.
+
 ## Tag concurrency limits
 
 Tags carved on runs (via `RunRequest(tags={...})`, `repo.materialize(tags=...)`, or schedule/sensor decorators) become the unit for finer-grained limits. `TagConcurrencyLimit` lets you cap concurrency per tag key, per specific value, or per *distinct* value:

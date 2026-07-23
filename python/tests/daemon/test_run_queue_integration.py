@@ -13,6 +13,7 @@ import pytest
 import rivers as rs
 from _polling import wait_for_all_runs_success as _wait_for_all_runs_success
 from _polling import wait_for_asset_materialized as _wait_for_asset_materialized
+from _polling import wait_for_run_terminal as _wait_for_run_terminal
 from _polling import wait_for_runs as _wait_for_runs
 from rivers._core import AutomationDaemon
 
@@ -424,5 +425,143 @@ class TestScheduleSensorQueueRegression:
             assert len(completed) >= 1, (
                 f"No successful runs, statuses: {[r.status for r in storage.get_runs(limit=100)]}"
             )
+        finally:
+            daemon.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test: Orphaned NotStarted runs — start-timeout sweep and cancellation
+# ---------------------------------------------------------------------------
+
+
+class TestOrphanedNotStartedRuns:
+    """A dequeued run whose executor never appeared (daemon died between
+    dequeue and launch, or the launch failed) sits in NotStarted forever:
+    the coordinator only re-selects Queued runs. The sweep fails it; the
+    cancel path can also clear it directly."""
+
+    def test_stalled_not_started_run_swept_to_failure(self, storage):
+        @rs.Asset(name="idle", io_handler=rs.InMemoryIOHandler())
+        def idle() -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[idle],
+            default_executor=rs.Executor.in_process(),
+            run_queue=rs.RunQueueConfig(
+                dequeue_interval="100ms",
+                start_timeout="1s",
+            ),
+        )
+        repo.resolve(storage=storage)
+
+        # Fabricate the orphan: start_time is ancient and there is no
+        # RunDequeued event, so the enqueue-time fallback puts it far past
+        # the 1s start timeout.
+        storage._create_run("stuck-run", "j", "NotStarted", 1_000)
+
+        daemon = AutomationDaemon(
+            repo=repo,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            # The sweep runs on the health-check cadence (5s), so the first
+            # pass lands ~5s after daemon start.
+            record = _wait_for_run_terminal(storage, "stuck-run", timeout=15)
+            assert record is not None, "stuck run disappeared from storage"
+            assert record.status == "Failure", (
+                f"expected the sweep to fail the orphan, got {record.status}"
+            )
+            assert record.end_time is not None
+
+            events = storage.get_events_for_run("stuck-run")
+            launch_failed = [e for e in events if e.event_type == "RunLaunchFailed"]
+            assert len(launch_failed) == 1
+            error = dict(launch_failed[0].metadata).get("error", "")
+            assert "no executor appeared" in error
+        finally:
+            daemon.stop()
+
+    def test_cancel_covers_not_started(self, storage):
+        storage._create_run("orphan", "j", "NotStarted", 1_000)
+
+        assert storage.cancel_queued_run("orphan")
+
+        record = storage.get_run("orphan")
+        assert record is not None
+        assert record.status == "Canceled"
+        assert record.end_time is not None
+
+
+# ---------------------------------------------------------------------------
+# Test: Zero-run InProgress backfill is resumed by the monitor
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillResume:
+    """A backfill flipped to InProgress by a daemon that died before
+    submitting its runs has no owner: pickup only re-picks Requested and the
+    monitor skips zero-run records. The monitor's resume sweep flips it back
+    to Requested so pickup re-executes it end to end."""
+
+    def test_zero_run_in_progress_backfill_resumes(self, storage):
+        import time
+
+        @rs.Asset(
+            name="bf_target",
+            io_handler=rs.InMemoryIOHandler(),
+            partitions_def=rs.PartitionsDefinition.static_(["x", "y"]),
+        )
+        def bf_target() -> str:
+            return "data"
+
+        repo = rs.CodeRepository(
+            assets=[bf_target],
+            default_executor=rs.Executor.in_process(),
+            run_queue=rs.RunQueueConfig(
+                max_concurrent_runs=10,
+                dequeue_interval="100ms",
+            ),
+        )
+        repo.resolve(storage=storage)
+
+        # Orphan: InProgress with no runs, created far in the past so it is
+        # past the resume grace period immediately.
+        storage._create_backfill(
+            "stuck-bf", ["bf_target"], ["x", "y"], "InProgress", 1_000
+        )
+
+        daemon = AutomationDaemon(
+            repo=repo,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            # Monitor tick (5s cadence) flips it to Requested, pickup re-executes
+            # through the queue, monitor finalizes on a later tick.
+            deadline = time.monotonic() + 45
+            status = None
+            while time.monotonic() < deadline:
+                status = repo.get_backfill("stuck-bf")
+                if status is not None and status.status not in (
+                    "InProgress",
+                    "Requested",
+                ):
+                    break
+                time.sleep(0.5)
+
+            assert status is not None, "backfill disappeared"
+            assert status.status == "CompletedSuccess", (
+                f"expected the backfill to resume and complete, got {status.status}"
+            )
+            assert status.completed_partitions == 2
+
+            runs = storage.get_runs(limit=50)
+            bf_runs = [r for r in runs if r.launched_by.kind == "backfill"]
+            assert len(bf_runs) >= 1, "no runs were submitted for the resumed backfill"
+            assert all(r.status == "Success" for r in bf_runs)
         finally:
             daemon.stop()

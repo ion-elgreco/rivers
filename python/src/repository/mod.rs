@@ -1587,10 +1587,18 @@ impl RepoHandle {
             verify_dynamic_partition_keys(&storage, &first.code_location_id, &dyn_checks).await?;
         }
 
-        storage
-            .enqueue_runs(&records)
-            .await
-            .map_err(|e| ExecutionError::new_err(format!("Failed to enqueue runs: {e}")))?;
+        // Backfill runs carry the run_ids link on the backfill record in the
+        // same transaction, so the link can never lie about what exists.
+        match &launched_by {
+            LaunchedBy::Backfill { backfill_id } => storage
+                .enqueue_backfill_runs(&records, backfill_id)
+                .await
+                .map_err(|e| ExecutionError::new_err(format!("Failed to enqueue runs: {e}")))?,
+            _ => storage
+                .enqueue_runs(&records)
+                .await
+                .map_err(|e| ExecutionError::new_err(format!("Failed to enqueue runs: {e}")))?,
+        }
 
         let run_ids: Vec<String> = records.into_iter().map(|r| r.run_id).collect();
         tracing::info!(
@@ -4432,48 +4440,67 @@ impl PyCodeRepository {
             ))
             .map_err(|e| ExecutionError::new_err(format!("{e}")))?;
 
-        let core_keys: Vec<PartitionKey> = record.partition_keys.clone();
-        let run_groups =
-            rivers_core::execution::backfill::group_into_runs(&record.strategy, &core_keys);
+        let submit = || -> PyResult<Vec<String>> {
+            let core_keys: Vec<PartitionKey> = record.partition_keys.clone();
+            let run_groups =
+                rivers_core::execution::backfill::group_into_runs(&record.strategy, &core_keys);
 
-        let mut run_tags: Vec<(String, String)> = record.tags.clone();
-        if !run_tags.iter().any(|(k, _)| k == tag_keys::PRIORITY) {
-            run_tags.push((
-                tag_keys::PRIORITY.to_string(),
-                DEFAULT_BACKFILL_PRIORITY.to_string(),
-            ));
+            let mut run_tags: Vec<(String, String)> = record.tags.clone();
+            if !run_tags.iter().any(|(k, _)| k == tag_keys::PRIORITY) {
+                run_tags.push((
+                    tag_keys::PRIORITY.to_string(),
+                    DEFAULT_BACKFILL_PRIORITY.to_string(),
+                ));
+            }
+
+            let runs: Vec<RunSubmission> = run_groups
+                .iter()
+                .map(|group| RunSubmission {
+                    selection: Some(record.asset_selection.clone()),
+                    partition_key: Some(PyPartitionKey::from(
+                        &rivers_core::execution::backfill::bundle_keys(group),
+                    )),
+                    tags: Some(run_tags.clone()),
+                    job_name: record.job_name.clone(),
+                })
+                .collect();
+
+            // The run_ids link is written by enqueue_backfill_runs in the
+            // same transaction as the runs themselves.
+            io_rt().block_on(self.submit_runs(
+                runs,
+                LaunchedBy::Backfill {
+                    backfill_id: backfill_id.to_string(),
+                },
+            ))
+        };
+
+        match submit() {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Post-InProgress failure would otherwise strand the backfill
+                // with no runs (storage-layer retries already absorbed
+                // transients). If this write also fails, the monitor's
+                // zero-run sweep re-queues the backfill instead.
+                tracing::error!(
+                    target: "rivers::repo",
+                    backfill_id = %backfill_id,
+                    error = %e,
+                    "backfill run submission failed; marking backfill failed"
+                );
+                if let Err(mark_err) =
+                    io_rt().block_on(state.storage.fail_backfill(backfill_id, &format!("{e}")))
+                {
+                    tracing::error!(
+                        target: "rivers::repo",
+                        backfill_id = %backfill_id,
+                        error = %mark_err,
+                        "failed to mark backfill failed"
+                    );
+                }
+                Err(e)
+            }
         }
-
-        let runs: Vec<RunSubmission> = run_groups
-            .iter()
-            .map(|group| RunSubmission {
-                selection: Some(record.asset_selection.clone()),
-                partition_key: Some(PyPartitionKey::from(
-                    &rivers_core::execution::backfill::bundle_keys(group),
-                )),
-                tags: Some(run_tags.clone()),
-                job_name: record.job_name.clone(),
-            })
-            .collect();
-
-        let run_ids = io_rt().block_on(self.submit_runs(
-            runs,
-            LaunchedBy::Backfill {
-                backfill_id: backfill_id.to_string(),
-            },
-        ))?;
-
-        // Link run_ids to the backfill so try_complete_backfill can finalize
-        // when all runs are terminal.
-        let _ = io_rt().block_on(state.storage.update_backfill_progress(
-            backfill_id,
-            &run_ids,
-            &[],
-            &[],
-            &[],
-        ));
-
-        Ok(())
     }
 }
 
