@@ -13,6 +13,7 @@ import pytest
 import rivers as rs
 from _polling import wait_for_all_runs_success as _wait_for_all_runs_success
 from _polling import wait_for_asset_materialized as _wait_for_asset_materialized
+from _polling import wait_for_run_terminal as _wait_for_run_terminal
 from _polling import wait_for_runs as _wait_for_runs
 from rivers._core import AutomationDaemon
 
@@ -426,3 +427,69 @@ class TestScheduleSensorQueueRegression:
             )
         finally:
             daemon.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test: Orphaned NotStarted runs — start-timeout sweep and cancellation
+# ---------------------------------------------------------------------------
+
+
+class TestOrphanedNotStartedRuns:
+    """A dequeued run whose executor never appeared (daemon died between
+    dequeue and launch, or the launch failed) sits in NotStarted forever:
+    the coordinator only re-selects Queued runs. The sweep fails it; the
+    cancel path can also clear it directly."""
+
+    def test_stalled_not_started_run_swept_to_failure(self, storage):
+        @rs.Asset(name="idle", io_handler=rs.InMemoryIOHandler())
+        def idle() -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[idle],
+            default_executor=rs.Executor.in_process(),
+            run_queue=rs.RunQueueConfig(
+                dequeue_interval="100ms",
+                start_timeout="1s",
+            ),
+        )
+        repo.resolve(storage=storage)
+
+        # Fabricate the orphan: start_time is ancient and there is no
+        # RunDequeued event, so the enqueue-time fallback puts it far past
+        # the 1s start timeout.
+        storage._create_run("stuck-run", "j", "NotStarted", 1_000)
+
+        daemon = AutomationDaemon(
+            repo=repo,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            # The sweep runs on the health-check cadence (5s), so the first
+            # pass lands ~5s after daemon start.
+            record = _wait_for_run_terminal(storage, "stuck-run", timeout=15)
+            assert record is not None, "stuck run disappeared from storage"
+            assert record.status == "Failure", (
+                f"expected the sweep to fail the orphan, got {record.status}"
+            )
+            assert record.end_time is not None
+
+            events = storage.get_events_for_run("stuck-run")
+            launch_failed = [e for e in events if e.event_type == "RunLaunchFailed"]
+            assert len(launch_failed) == 1
+            error = dict(launch_failed[0].metadata).get("error", "")
+            assert "no executor appeared" in error
+        finally:
+            daemon.stop()
+
+    def test_cancel_covers_not_started(self, storage):
+        storage._create_run("orphan", "j", "NotStarted", 1_000)
+
+        assert storage.cancel_queued_run("orphan")
+
+        record = storage.get_run("orphan")
+        assert record is not None
+        assert record.status == "Canceled"
+        assert record.end_time is not None

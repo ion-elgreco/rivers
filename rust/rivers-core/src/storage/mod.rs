@@ -134,6 +134,9 @@ pub enum EventType {
     RunQueued,
     /// Coordinator dequeued a run (Queued → NotStarted).
     RunDequeued,
+    /// A dequeued run never launched (backend launch error or no executor
+    /// appeared within the start timeout). Metadata carries the error.
+    RunLaunchFailed,
     /// Step successfully claimed pool slots.
     StepSlotClaimed,
     /// Step waiting for pool slots (claim returned Pending).
@@ -166,6 +169,7 @@ impl EventType {
             Self::StepRetry => "StepRetry",
             Self::RunQueued => "RunQueued",
             Self::RunDequeued => "RunDequeued",
+            Self::RunLaunchFailed => "RunLaunchFailed",
             Self::StepSlotClaimed => "StepSlotClaimed",
             Self::StepSlotWaiting => "StepSlotWaiting",
             Self::StepSlotRenewed => "StepSlotRenewed",
@@ -187,6 +191,7 @@ impl EventType {
             "StepRetry" => Ok(Self::StepRetry),
             "RunQueued" => Ok(Self::RunQueued),
             "RunDequeued" => Ok(Self::RunDequeued),
+            "RunLaunchFailed" => Ok(Self::RunLaunchFailed),
             "StepSlotClaimed" => Ok(Self::StepSlotClaimed),
             "StepSlotWaiting" => Ok(Self::StepSlotWaiting),
             "StepSlotRenewed" => Ok(Self::StepSlotRenewed),
@@ -210,7 +215,7 @@ impl EventType {
             Self::Observation { .. } => 2,
             Self::Materialization { .. } => 3,
             Self::StepSuccess | Self::StepFailure | Self::StepRetry => 4,
-            Self::RunQueued | Self::RunDequeued => 5,
+            Self::RunQueued | Self::RunDequeued | Self::RunLaunchFailed => 5,
             Self::StepSlotClaimed
             | Self::StepSlotWaiting
             | Self::StepSlotRenewed
@@ -1409,6 +1414,14 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         code_location_id: &str,
     ) -> impl Future<Output = Result<(u32, Vec<CoordinatorRunInfo>, Vec<CoordinatorRunInfo>)>> + Send;
 
+    /// Run ids stuck in `NotStarted` whose dequeue happened before `cutoff_ns`
+    /// (falling back to the run's enqueue time when no RunDequeued event exists).
+    fn get_stalled_not_started_runs(
+        &self,
+        code_location_id: &str,
+        cutoff_ns: i64,
+    ) -> impl Future<Output = Result<Vec<String>>> + Send;
+
     fn add_dynamic_partitions(
         &self,
         code_location_id: &str,
@@ -1999,6 +2012,15 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
         PerCodeLocationStorage::get_queued_runs(self.backend, self.code_location_id).await
     }
 
+    pub async fn get_stalled_not_started_runs(&self, cutoff_ns: i64) -> Result<Vec<String>> {
+        PerCodeLocationStorage::get_stalled_not_started_runs(
+            self.backend,
+            self.code_location_id,
+            cutoff_ns,
+        )
+        .await
+    }
+
     pub async fn get_runs_since(
         &self,
         since_timestamp: i64,
@@ -2165,6 +2187,10 @@ pub trait StorageBackend: PerCodeLocationStorage {
         status: RunStatus,
         end_time: Option<i64>,
     ) -> impl Future<Output = Result<()>> + Send;
+    /// Transition an existing run to `Started` unless it was canceled.
+    /// Returns `false` (without touching the record) when the run is
+    /// `Canceled` — the executor must skip the run instead of resurrecting it.
+    fn try_start_run(&self, run_id: &str) -> impl Future<Output = Result<bool>> + Send;
     /// Set or clear the block reason on a queued run.
     fn update_run_block_reason(
         &self,
@@ -2287,7 +2313,8 @@ pub trait StorageBackend: PerCodeLocationStorage {
     /// Delete all concurrency slot rows whose lease has expired.
     fn free_expired_leases(&self) -> impl Future<Output = Result<u32>> + Send;
 
-    /// Cancel a queued run (transition from Queued to Canceled).
+    /// Cancel a run that hasn't started yet (transition from Queued or
+    /// NotStarted to Canceled).
     fn cancel_queued_run(&self, run_id: &str) -> impl Future<Output = Result<bool>> + Send;
 
     // ── K8s run coordination ──

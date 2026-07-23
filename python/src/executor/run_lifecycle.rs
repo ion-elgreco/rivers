@@ -31,7 +31,8 @@ pub(crate) enum RunInit {
     /// Insert a fresh `RunRecord` with status `Started`.
     Create { launched_by: LaunchedBy },
     /// The record already exists (created by `Job::create_run` or by the queue
-    /// dequeuer); transition its status to `Started`.
+    /// dequeuer); transition its status to `Started` — unless it was canceled
+    /// while waiting, in which case the run is skipped.
     Existing,
 }
 
@@ -62,7 +63,7 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
 
     let node_names = args.plan.all_asset_names();
 
-    py.detach(|| -> PyResult<()> {
+    let started = py.detach(|| -> PyResult<bool> {
         match args.init {
             RunInit::Create { launched_by } => {
                 let priority = priority_from_tags(&args.tags);
@@ -85,21 +86,29 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
                     .map_err(|e| {
                         ExecutionError::new_err(format!("Failed to create run record: {e}"))
                     })?;
+                Ok(true)
             }
-            RunInit::Existing => {
-                io_rt()
-                    .block_on(args.storage.backend().update_run_status(
-                        &args.run_id,
-                        RunStatus::Started,
-                        None,
-                    ))
-                    .map_err(|e| {
-                        ExecutionError::new_err(format!("Failed to transition run to Started: {e}"))
-                    })?;
-            }
+            RunInit::Existing => io_rt()
+                .block_on(args.storage.backend().try_start_run(&args.run_id))
+                .map_err(|e| {
+                    ExecutionError::new_err(format!("Failed to transition run to Started: {e}"))
+                }),
         }
-        Ok(())
     })?;
+
+    if !started {
+        tracing::info!(
+            target: "rivers::executor",
+            run_id = %args.run_id,
+            "run was canceled before start; skipping execution"
+        );
+        return Ok(build_run_result(
+            args.run_id,
+            RunStatus::Canceled,
+            node_names,
+            vec![],
+        ));
+    }
 
     let failures = args.executor.execute_plan(
         py,

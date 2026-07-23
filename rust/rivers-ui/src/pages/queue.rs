@@ -10,9 +10,14 @@ use crate::components::ui_kit::{
 use crate::loc::{loc_path, use_current_location};
 use crate::now::use_now;
 use crate::server_fns::pools::get_queued_runs;
-use crate::types::RunRecord;
+use crate::types::{RunRecord, RunStatus};
 
 fn lane_key(record: &RunRecord) -> (&'static str, &'static str, &'static str) {
+    // Dequeued, waiting for its executor to appear — no longer blocked on a
+    // resource, so it gets its own lane regardless of any stale block_reason.
+    if record.status == RunStatus::NotStarted {
+        return ("launching", "Launching", "var(--accent)");
+    }
     match record.block_reason.as_deref().unwrap_or("") {
         r if r.starts_with("pool:") || r.contains("gpu") || r.contains("pool") => {
             ("pool", "Pool saturation", "var(--error)")

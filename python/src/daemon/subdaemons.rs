@@ -6,7 +6,9 @@ use chrono::Utc;
 use pyo3::prelude::*;
 use rivers_core::run_backend::RunHealthStatus;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
-use rivers_core::storage::{RunStatus, ScopedStorageHandle, StorageBackend};
+use rivers_core::storage::{
+    EventRecord, EventType, RunStatus, ScopedStorageHandle, StorageBackend,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::RunBackendKind;
@@ -102,7 +104,9 @@ pub(crate) fn spawn_run_queue_coordinator(
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let dequeue_interval = rq_config.dequeue_interval;
+    let start_timeout = rq_config.start_timeout;
     let storage = Arc::clone(handle.backend());
+    let sweep_handle = handle.clone();
     let coordinator = rivers_core::concurrency::RunQueueCoordinator::new(rq_config, handle);
     let is_k8s = matches!(*run_backend, RunBackendKind::Kubernetes(_));
 
@@ -126,58 +130,12 @@ pub(crate) fn spawn_run_queue_coordinator(
                 _ = tokio::time::sleep(interval) => {}
             }
 
-            if last_health_check.elapsed() >= health_interval && !active_runs.is_empty() {
-                let mut checks = tokio::task::JoinSet::new();
-                for run_id in active_runs.iter().cloned() {
-                    let backend = Arc::clone(&run_backend);
-                    checks.spawn(async move {
-                        let health = backend.check_run_health(&run_id).await;
-                        (run_id, health)
-                    });
+            if last_health_check.elapsed() >= health_interval {
+                if !active_runs.is_empty() {
+                    health_check_active_runs(&storage, &run_backend, &mut active_runs).await;
                 }
-                while let Some(joined) = checks.join_next().await {
-                    let Ok((run_id, health)) = joined else {
-                        continue;
-                    };
-                    match health {
-                        Ok(RunHealthStatus::Exited) => {
-                            tracing::info!(
-                                target: "rivers::coordinator",
-                                run_id = %run_id,
-                                "run exited (detected via health check)"
-                            );
-                            active_runs.remove(&run_id);
-                        }
-                        Ok(RunHealthStatus::Missing) => {
-                            if let Ok(Some(_)) = storage.get_run_outcome(&run_id).await {
-                                tracing::info!(
-                                    target: "rivers::coordinator",
-                                    run_id = %run_id,
-                                    "run CR missing but outcome already recorded — skipping"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    target: "rivers::coordinator",
-                                    run_id = %run_id,
-                                    "run missing — marking as canceled"
-                                );
-                                let _ = storage
-                                    .update_run_status(&run_id, RunStatus::Canceled, Some(now_ts()))
-                                    .await;
-                            }
-                            active_runs.remove(&run_id);
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "rivers::coordinator",
-                                run_id = %run_id,
-                                error = %e,
-                                "health check failed"
-                            );
-                        }
-                    }
-                }
+                sweep_stalled_not_started(&sweep_handle, &run_backend, &active_runs, start_timeout)
+                    .await;
                 last_health_check = tokio::time::Instant::now();
             }
 
@@ -191,6 +149,13 @@ pub(crate) fn spawn_run_queue_coordinator(
                                 error = %e,
                                 "failed to launch dequeued run"
                             );
+                            fail_unlaunched_run(
+                                &storage,
+                                &run.code_location_id,
+                                &run.run_id,
+                                &format!("launch failed: {e}"),
+                            )
+                            .await;
                         } else {
                             active_runs.insert(run.run_id.clone());
                         }
@@ -206,6 +171,159 @@ pub(crate) fn spawn_run_queue_coordinator(
             }
         }
     })
+}
+
+async fn health_check_active_runs(
+    storage: &SurrealStorage,
+    run_backend: &Arc<RunBackendKind>,
+    active_runs: &mut HashSet<String>,
+) {
+    let mut checks = tokio::task::JoinSet::new();
+    for run_id in active_runs.iter().cloned() {
+        let backend = Arc::clone(run_backend);
+        checks.spawn(async move {
+            let health = backend.check_run_health(&run_id).await;
+            (run_id, health)
+        });
+    }
+    while let Some(joined) = checks.join_next().await {
+        let Ok((run_id, health)) = joined else {
+            continue;
+        };
+        match health {
+            Ok(RunHealthStatus::Exited) => {
+                tracing::info!(
+                    target: "rivers::coordinator",
+                    run_id = %run_id,
+                    "run exited (detected via health check)"
+                );
+                active_runs.remove(&run_id);
+            }
+            Ok(RunHealthStatus::Missing) => {
+                if let Ok(Some(_)) = storage.get_run_outcome(&run_id).await {
+                    tracing::info!(
+                        target: "rivers::coordinator",
+                        run_id = %run_id,
+                        "run CR missing but outcome already recorded — skipping"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "rivers::coordinator",
+                        run_id = %run_id,
+                        "run missing — marking as canceled"
+                    );
+                    let _ = storage
+                        .update_run_status(&run_id, RunStatus::Canceled, Some(now_ts()))
+                        .await;
+                }
+                active_runs.remove(&run_id);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    target: "rivers::coordinator",
+                    run_id = %run_id,
+                    error = %e,
+                    "health check failed"
+                );
+            }
+        }
+    }
+}
+
+/// Fail dequeued runs whose executor never appeared. A crash between dequeue
+/// and launch (or a failed launch by a prior daemon) leaves a `NotStarted` run
+/// the tick query can never re-select — it silently holds a concurrency slot
+/// until failed here.
+async fn sweep_stalled_not_started(
+    handle: &ScopedStorageHandle<SurrealStorage>,
+    run_backend: &Arc<RunBackendKind>,
+    active_runs: &HashSet<String>,
+    start_timeout: Duration,
+) {
+    let cutoff = now_ts() - start_timeout.as_nanos() as i64;
+    let stalled = match handle.scoped().get_stalled_not_started_runs(cutoff).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                target: "rivers::coordinator",
+                error = %e,
+                "stalled-run sweep query failed"
+            );
+            return;
+        }
+    };
+    for run_id in stalled {
+        if active_runs.contains(&run_id) {
+            continue; // launched by this daemon — the health check owns it
+        }
+        match run_backend.check_run_health(&run_id).await {
+            Ok(RunHealthStatus::Missing) => {
+                if let Ok(Some(_)) = handle.backend().get_run_outcome(&run_id).await {
+                    continue;
+                }
+                tracing::error!(
+                    target: "rivers::coordinator",
+                    run_id = %run_id,
+                    timeout_secs = start_timeout.as_secs(),
+                    "dequeued run never started within the start timeout; marking failed"
+                );
+                fail_unlaunched_run(
+                    handle.backend(),
+                    handle.code_location_id(),
+                    &run_id,
+                    &format!(
+                        "no executor appeared within {}s of dequeue",
+                        start_timeout.as_secs()
+                    ),
+                )
+                .await;
+            }
+            // Live or exited executor (health check / operator owns those), or
+            // a transient backend error — leave for a later pass.
+            _ => {}
+        }
+    }
+}
+
+async fn fail_unlaunched_run(
+    storage: &SurrealStorage,
+    code_location_id: &str,
+    run_id: &str,
+    error: &str,
+) {
+    if let Err(e) = storage
+        .update_run_status(run_id, RunStatus::Failure, Some(now_ts()))
+        .await
+    {
+        tracing::error!(
+            target: "rivers::coordinator",
+            run_id = %run_id,
+            error = %e,
+            "failed to fail-out an unlaunched run; it will read as in-flight until the next sweep"
+        );
+        return;
+    }
+    if let Err(e) = storage
+        .store_event(&EventRecord {
+            code_location_id: code_location_id.to_string(),
+            event_type: EventType::RunLaunchFailed,
+            asset_key: None,
+            run_id: run_id.to_string(),
+            partition_key: None,
+            timestamp: now_ts(),
+            metadata: vec![("error".to_string(), error.to_string())],
+            input_data_versions: vec![],
+        })
+        .await
+    {
+        tracing::warn!(
+            target: "rivers::coordinator",
+            run_id = %run_id,
+            error = %e,
+            "failed to persist RunLaunchFailed event"
+        );
+    }
 }
 
 /// Backfill monitor — polls for InProgress backfills owned by this CL every

@@ -42,6 +42,7 @@ queue = rs.RunQueueConfig(
 | `max_concurrent_runs` | `int` | `10` | Maximum number of runs in-flight at once. |
 | `tag_concurrency_limits` | `list[TagConcurrencyLimit]` | `[]` | Per-tag concurrency caps applied on top of `max_concurrent_runs`. |
 | `dequeue_interval` | `str` | `"250ms"` | Polling interval for the queue worker (humantime). |
+| `start_timeout` | `str` | `"180s"` | How long a dequeued run may wait for its executor to appear before it is marked failed (humantime). |
 
 ---
 

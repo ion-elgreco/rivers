@@ -1006,6 +1006,7 @@ fn event_type_label(evt: &StoredEvent) -> &'static str {
         EventType::Observation => "OBSERVATION",
         EventType::RunQueued => "RUN_QUEUED",
         EventType::RunDequeued => "RUN_DEQUEUED",
+        EventType::RunLaunchFailed => "RUN_LAUNCH_FAILED",
         EventType::StepSlotClaimed => "SLOT_CLAIMED",
         EventType::StepSlotWaiting => "SLOT_WAITING",
         EventType::StepSlotRenewed => "SLOT_RENEWED",
@@ -1022,6 +1023,7 @@ fn event_row_class(evt: &StoredEvent) -> &'static str {
         EventType::Materialization => "log-row--success",
         EventType::Observation => "log-row--info",
         EventType::RunQueued | EventType::RunDequeued => "log-row--info",
+        EventType::RunLaunchFailed => "log-row--error",
         EventType::StepSlotClaimed | EventType::StepSlotReleased => "log-row--info",
         EventType::StepSlotWaiting => "log-row--warn",
         EventType::StepSlotRenewed => "log-row--muted",
@@ -1075,6 +1077,9 @@ fn event_info(evt: &StoredEvent) -> String {
         EventType::Observation => "Observed".to_string(),
         EventType::RunQueued => "Run queued".to_string(),
         EventType::RunDequeued => "Run dequeued".to_string(),
+        EventType::RunLaunchFailed => metadata_value(evt, "error")
+            .map(|e| format!("Run launch failed: {e}"))
+            .unwrap_or_else(|| "Run launch failed".to_string()),
         EventType::StepSlotClaimed => {
             let pools = metadata_value(evt, "pools");
             format!(
