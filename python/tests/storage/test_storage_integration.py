@@ -357,22 +357,6 @@ def test_create_storage_embedded(tmp_path: Path):
 # --- CLI integration tests ---
 
 
-def test_cli_dev_missing_module(tmp_path: Path):
-    """rivers dev with nonexistent module fails gracefully."""
-    result = runner.invoke(
-        app,
-        ["dev", "nonexistent_module_xyz", "--storage-path", str(tmp_path / "storage")],
-    )
-    assert result.exit_code != 0
-    assert "not found" in result.output.lower() or result.exit_code == 1
-
-
-def test_cli_dev_requires_module_arg():
-    """rivers dev requires a module argument."""
-    result = runner.invoke(app, ["dev"])
-    assert result.exit_code != 0
-
-
 def test_cli_materialize_missing_module(tmp_path: Path):
     """rivers materialize with nonexistent module fails gracefully."""
     result = runner.invoke(

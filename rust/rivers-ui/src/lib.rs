@@ -168,10 +168,10 @@ mod server {
         anyhow::bail!("No available port in range {start}-{max}")
     }
 
-    /// Start the SSR axum server on `host:port` (with port-fallback up to 3099),
-    /// wiring `/style.css`, the embedded WASM blob, the SSE live-broadcaster,
-    /// the auth gate (when a mode is enabled), and the Leptos route table.
-    /// Returns when `shutdown` fires.
+    /// Start the SSR axum server on `host:port` (with port-fallback up to
+    /// `port + 99`), wiring `/style.css`, the embedded WASM blob, the SSE
+    /// live-broadcaster, the auth gate (when a mode is enabled), and the
+    /// Leptos route table. Returns when `shutdown` fires.
     pub async fn start_server(
         storage: Arc<SurrealStorage>,
         graph: Option<Arc<GraphTopology>>,
@@ -187,7 +187,7 @@ mod server {
             registry,
         };
 
-        let listener = find_available_port(&host, port, 3099).await?;
+        let listener = find_available_port(&host, port, port.saturating_add(99)).await?;
         let actual_addr = listener.local_addr()?;
 
         let leptos_options = LeptosOptions::builder()

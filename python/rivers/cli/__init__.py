@@ -88,8 +88,8 @@ def dev(
     surreal_endpoint: str | None = typer.Option(
         None, help="Remote SurrealDB endpoint (overrides --storage-path)"
     ),
-    no_daemon: bool = typer.Option(
-        False, help="Disable schedule/sensor automation daemon"
+    no_daemon: bool | None = typer.Option(
+        None, help="Disable schedule/sensor automation daemon"
     ),
     synthetic: str | None = typer.Option(
         None, help="Override graph with synthetic DAG (e.g. 100, 1k, 10k, 50k)"
@@ -100,22 +100,16 @@ def dev(
     Resolves the repository (registering assets and graph topology in storage),
     then starts the gRPC backend and web UI servers in-process.
     """
-    cfg = RiversConfig(
-        **{
-            k: v
-            for k, v in {
-                "module": module,
-                "repo_var": repo_var,
-                "host": host,
-                "port": port,
-                "grpc_port": grpc_port,
-                "storage_path": storage_path,
-                "surreal_endpoint": surreal_endpoint,
-                "no_daemon": no_daemon,
-                "synthetic": synthetic,
-            }.items()
-            if v is not None
-        }
+    cfg = RiversConfig.from_cli(
+        module=module,
+        repo_var=repo_var,
+        host=host,
+        port=port,
+        grpc_port=grpc_port,
+        storage_path=storage_path,
+        surreal_endpoint=surreal_endpoint,
+        no_daemon=no_daemon,
+        synthetic=synthetic,
     )
 
     os.environ["RIVERS_DEPLOYMENT"] = "dev"
@@ -126,28 +120,34 @@ def dev(
 
     if cfg.module.path is None:
         typer.echo(
-            "Error: no module configured. Set 'module' in [rivers] config or pass --module",
+            "Error: no module configured. Set 'module' in [rivers] config "
+            "or pass a module argument",
             err=True,
         )
         raise typer.Exit(1)
 
     # Import user module and resolve repository before opening storage —
     # otherwise a bad module name strands a RocksDB-locked dir on disk.
+    # Absolute cwd, not "." — the "." finder caches listings across chdirs.
+    sys.path.insert(0, os.getcwd())
     try:
         mod = importlib.import_module(cfg.module.path)
     except ModuleNotFoundError:
-        typer.echo(f"Error: module '{module}' not found", err=True)
+        typer.echo(f"Error: module '{cfg.module.path}' not found", err=True)
         raise typer.Exit(1)
 
     repo_obj = getattr(mod, cfg.module.repo_var, None)
     if repo_obj is None:
-        typer.echo(f"Error: '{repo_var}' not found in module '{module}'", err=True)
+        typer.echo(
+            f"Error: '{cfg.module.repo_var}' not found in module '{cfg.module.path}'",
+            err=True,
+        )
         raise typer.Exit(1)
 
     from rivers import CodeRepository
 
     if not isinstance(repo_obj, CodeRepository):
-        typer.echo(f"Error: '{repo_var}' is not a CodeRepository", err=True)
+        typer.echo(f"Error: '{cfg.module.repo_var}' is not a CodeRepository", err=True)
         raise typer.Exit(1)
 
     storage_endpoint = cfg.storage.endpoint
@@ -166,13 +166,18 @@ def dev(
 
     repo_obj.resolve(storage=storage)
 
+    _serve_dev(cfg, repo_obj, storage)
+
+
+def _serve_dev(cfg: RiversConfig, repo_obj, storage) -> None:
+    """Start the gRPC backend, web UI, and automation daemon, then block."""
     # Start gRPC backend server (returns actual port, may differ if requested was in use)
     actual_grpc_port = repo_obj._start_grpc_server(
         cfg.server.host, cfg.server.grpc_port
     )
 
     # Start UI server in-process (shares same storage, no lock conflict)
-    grpc_url = f"http://{host}:{actual_grpc_port}"
+    grpc_url = f"http://{cfg.server.host}:{actual_grpc_port}"
     repo_obj._start_ui_server(
         cfg.server.host,
         cfg.server.port,

@@ -61,6 +61,42 @@ class RiversConfig(BaseSettings):
     )
 
     @classmethod
+    def from_cli(
+        cls,
+        module: str | None = None,
+        repo_var: str | None = None,
+        host: str | None = None,
+        port: int | None = None,
+        grpc_port: int | None = None,
+        storage_path: str | None = None,
+        surreal_endpoint: str | None = None,
+        no_daemon: bool | None = None,
+        synthetic: str | None = None,
+    ) -> "RiversConfig":
+        """Build a config from flat CLI arguments.
+
+        Maps each provided flag onto its nested group as a partial dict so
+        pydantic-settings deep-merges it over the env/TOML sources. ``None``
+        means "flag not passed" and leaves the lower-precedence sources in
+        charge of that key.
+
+        Returns:
+            RiversConfig: the merged configuration.
+        """
+        groups: dict[str, dict] = {
+            "module": {"path": module, "repo_var": repo_var},
+            "server": {"host": host, "port": port, "grpc_port": grpc_port},
+            "storage": {"path": storage_path, "endpoint": surreal_endpoint},
+            "daemon": {"no_daemon": no_daemon},
+            "synthetic": {"size": synthetic},
+        }
+        provided = {
+            name: {k: v for k, v in fields.items() if v is not None}
+            for name, fields in groups.items()
+        }
+        return cls(**{name: fields for name, fields in provided.items() if fields})
+
+    @classmethod
     def settings_customise_sources(
         cls,
         settings_cls: type[BaseSettings],
