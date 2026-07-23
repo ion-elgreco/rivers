@@ -707,7 +707,12 @@ impl SurrealStorage {
             if code_location_id.is_some() {
                 wheres.push("code_location_id = $cl");
             }
-            if filter.status.is_some() {
+            // "Queued" is the whole queue system: waiting (Queued) plus
+            // dequeued-but-launching (NotStarted) — same bucket the runs
+            // summary counts.
+            if filter.status == Some(RunStatus::Queued) {
+                wheres.push("status IN ['Queued', 'NotStarted']");
+            } else if filter.status.is_some() {
                 wheres.push("status = $status");
             }
             if filter.job_name.is_some() {
@@ -1756,6 +1761,27 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
+    async fn try_start_run(&self, run_id: &str) -> Result<bool> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(
+                    "UPDATE runs SET status = 'Started' \
+                         WHERE run_id = $run_id AND status != 'Canceled'; \
+                     SELECT status FROM runs WHERE run_id = $run_id LIMIT 1",
+                )
+                .bind(("run_id", run_id.to_string()))
+                .await?;
+            let status: Option<String> = result.take((1, "status"))?;
+            match status.as_deref() {
+                Some("Started") => Ok(true),
+                Some(_) => Ok(false),
+                None => anyhow::bail!("run {run_id} not found"),
+            }
+        })
+        .await
+    }
+
     async fn get_run(&self, run_id: &str) -> Result<Option<RunRecord>> {
         super::retry::with_retry(&self.retry_config, || async {
             let mut result = self
@@ -1851,7 +1877,7 @@ impl StorageBackend for SurrealStorage {
         super::retry::with_retry(&self.retry_config, || async {
             let mut result = self
                 .db
-                .query("SELECT * FROM runs WHERE status = 'Queued'")
+                .query("SELECT * FROM runs WHERE status IN ['Queued', 'NotStarted']")
                 .await?;
             let runs: Vec<RunRecord> = result.take(0)?;
             Ok(runs)
@@ -2342,14 +2368,13 @@ impl StorageBackend for SurrealStorage {
                 .db
                 .query(
                     "UPDATE runs SET status = $new_status, end_time = $now \
-                         WHERE run_id = $run_id AND status = $queued_status; \
+                         WHERE run_id = $run_id AND status IN ['Queued', 'NotStarted']; \
                      DELETE FROM pending_steps WHERE run_id = $run_id; \
                      SELECT count() AS total FROM runs \
                          WHERE run_id = $run_id AND status = $new_status GROUP ALL",
                 )
                 .bind(("run_id", run_id.to_string()))
                 .bind(("new_status", RunStatus::Canceled))
-                .bind(("queued_status", RunStatus::Queued))
                 .bind(("now", now_ns))
                 .await?;
             let count: Option<u32> = result.take((2, "total"))?;
@@ -2747,6 +2772,58 @@ impl PerCodeLocationStorage for SurrealStorage {
         let in_progress: Vec<CoordinatorRunInfo> = result.take(2)?;
         let queued: Vec<CoordinatorRunInfo> = result.take(3)?;
         Ok((expired.unwrap_or(0), in_progress, queued))
+    }
+
+    async fn get_stalled_not_started_runs(
+        &self,
+        code_location_id: &str,
+        cutoff_ns: i64,
+    ) -> Result<Vec<String>> {
+        super::retry::with_retry(&self.retry_config, || async {
+            #[derive(Debug, SurrealValue, serde::Deserialize)]
+            struct Candidate {
+                run_id: String,
+                start_time: i64,
+            }
+            let mut result = self
+                .db
+                .query(
+                    "SELECT run_id, start_time FROM runs \
+                         WHERE code_location_id = $cl AND status = 'NotStarted'",
+                )
+                .bind(("cl", code_location_id.to_string()))
+                .await?;
+            let candidates: Vec<Candidate> = result.take(0)?;
+            if candidates.is_empty() {
+                return Ok(vec![]);
+            }
+
+            let ids: Vec<String> = candidates.iter().map(|c| c.run_id.clone()).collect();
+            #[derive(Debug, SurrealValue, serde::Deserialize)]
+            struct Dequeue {
+                run_id: String,
+                ts: i64,
+            }
+            let mut result = self
+                .db
+                .query(
+                    "SELECT run_id, math::max(timestamp) AS ts FROM events \
+                         WHERE event_type = 'RunDequeued' AND run_id IN $ids \
+                         GROUP BY run_id",
+                )
+                .bind(("ids", ids))
+                .await?;
+            let dequeues: Vec<Dequeue> = result.take(0)?;
+            let dequeue_ts: std::collections::HashMap<String, i64> =
+                dequeues.into_iter().map(|d| (d.run_id, d.ts)).collect();
+
+            Ok(candidates
+                .into_iter()
+                .filter(|c| *dequeue_ts.get(&c.run_id).unwrap_or(&c.start_time) < cutoff_ns)
+                .map(|c| c.run_id)
+                .collect())
+        })
+        .await
     }
 
     async fn add_dynamic_partitions(
@@ -8706,11 +8783,12 @@ mod tests {
             .await
             .unwrap();
 
-        // No longer in queued runs
+        // Still visible in the queue view (as dequeued-but-launching)…
         let queued = storage.get_all_queued_runs().await.unwrap();
-        assert_eq!(queued.len(), 0);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].status, RunStatus::NotStarted);
 
-        // Now counts as in-progress
+        // …while also counting as in-progress for capacity.
         let count = storage.count_in_progress_runs().await.unwrap();
         assert_eq!(count, 1);
     }
@@ -11037,6 +11115,227 @@ mod tests {
         let storage = make_storage().await;
         let canceled = storage.cancel_queued_run("nonexistent").await.unwrap();
         assert!(!canceled);
+    }
+
+    fn minimal_run(run_id: &str, status: RunStatus) -> RunRecord {
+        RunRecord {
+            run_id: run_id.to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: Some("j".into()),
+            status,
+            start_time: 1000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec![],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_queued_run_cancels_not_started() {
+        let storage = make_storage().await;
+        storage
+            .create_run(&minimal_run("ns1", RunStatus::NotStarted))
+            .await
+            .unwrap();
+
+        let canceled = storage.cancel_queued_run("ns1").await.unwrap();
+        assert!(canceled);
+
+        let run = storage.get_run("ns1").await.unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Canceled);
+        assert!(run.end_time.is_some());
+    }
+
+    // ── try_start_run ──
+
+    #[tokio::test]
+    async fn test_try_start_run_starts_not_started() {
+        let storage = make_storage().await;
+        storage
+            .create_run(&minimal_run("r1", RunStatus::NotStarted))
+            .await
+            .unwrap();
+
+        assert!(storage.try_start_run("r1").await.unwrap());
+
+        let run = storage.get_run("r1").await.unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Started);
+    }
+
+    #[tokio::test]
+    async fn test_try_start_run_refuses_canceled() {
+        let storage = make_storage().await;
+        let mut record = minimal_run("r1", RunStatus::Canceled);
+        record.end_time = Some(2000);
+        storage.create_run(&record).await.unwrap();
+
+        assert!(!storage.try_start_run("r1").await.unwrap());
+
+        let run = storage.get_run("r1").await.unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Canceled);
+        assert_eq!(run.end_time, Some(2000));
+    }
+
+    #[tokio::test]
+    async fn test_try_start_run_missing_run_errors() {
+        let storage = make_storage().await;
+        assert!(storage.try_start_run("nonexistent").await.is_err());
+    }
+
+    /// Concurrent cancel vs start on the same NotStarted run must settle on
+    /// exactly one winner. Embedded backend — kv-mem misses some write-write
+    /// conflicts.
+    #[tokio::test]
+    async fn test_cancel_vs_start_race_settles_consistently() {
+        let temp = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp.as_path_untracked().to_str().unwrap())
+            .await
+            .unwrap();
+        storage
+            .create_run(&minimal_run("r1", RunStatus::NotStarted))
+            .await
+            .unwrap();
+
+        let (canceled, started) =
+            tokio::join!(storage.cancel_queued_run("r1"), storage.try_start_run("r1"));
+        let (canceled, started) = (canceled.unwrap(), started.unwrap());
+        assert_ne!(canceled, started, "exactly one side must win");
+
+        let run = storage.get_run("r1").await.unwrap().unwrap();
+        let expected = if canceled {
+            RunStatus::Canceled
+        } else {
+            RunStatus::Started
+        };
+        assert_eq!(run.status, expected);
+    }
+
+    // ── get_stalled_not_started_runs ──
+
+    #[tokio::test]
+    async fn test_get_stalled_not_started_runs() {
+        let storage = make_storage().await;
+        for (id, status) in [
+            ("stale", RunStatus::NotStarted),
+            ("fresh", RunStatus::NotStarted),
+            ("orphan", RunStatus::NotStarted),
+            ("waiting", RunStatus::Queued),
+            ("running", RunStatus::Started),
+        ] {
+            let mut record = minimal_run(id, status);
+            record.start_time = if id == "orphan" { 2000 } else { 1000 };
+            storage.create_run(&record).await.unwrap();
+        }
+        for (run_id, ts) in [("stale", 5_000i64), ("fresh", 50_000)] {
+            storage
+                .store_event(&EventRecord {
+                    code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                    event_type: EventType::RunDequeued,
+                    asset_key: None,
+                    run_id: run_id.to_string(),
+                    partition_key: None,
+                    timestamp: ts,
+                    metadata: vec![],
+                    input_data_versions: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        // "stale" dequeued before the cutoff; "orphan" has no RunDequeued
+        // event, so its enqueue time counts; "fresh" dequeued after.
+        let mut stalled = storage
+            .get_stalled_not_started_runs(DEFAULT_CODE_LOCATION_ID, 10_000)
+            .await
+            .unwrap();
+        stalled.sort();
+        assert_eq!(stalled, vec!["orphan".to_string(), "stale".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_get_stalled_not_started_runs_scoped_to_cl() {
+        let storage = make_storage().await;
+        let mut record = minimal_run("other-cl-run", RunStatus::NotStarted);
+        record.code_location_id = "other".to_string();
+        storage.create_run(&record).await.unwrap();
+
+        let stalled = storage
+            .get_stalled_not_started_runs(DEFAULT_CODE_LOCATION_ID, 10_000)
+            .await
+            .unwrap();
+        assert!(stalled.is_empty());
+
+        let stalled = storage
+            .get_stalled_not_started_runs("other", 10_000)
+            .await
+            .unwrap();
+        assert_eq!(stalled, vec!["other-cl-run".to_string()]);
+    }
+
+    // ── queued view includes NotStarted ──
+
+    #[tokio::test]
+    async fn test_runs_page_queued_filter_includes_not_started() {
+        let storage = make_storage().await;
+        for (id, status) in [
+            ("w", RunStatus::Queued),
+            ("l", RunStatus::NotStarted),
+            ("s", RunStatus::Started),
+        ] {
+            storage.create_run(&minimal_run(id, status)).await.unwrap();
+        }
+
+        let filter = RunFilter {
+            status: Some(RunStatus::Queued),
+            ..Default::default()
+        };
+        let page = storage.get_all_runs_page(0, 10, &filter).await.unwrap();
+        assert_eq!(page.total, 2);
+        let mut ids: Vec<_> = page.rows.iter().map(|r| r.run_id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["l".to_string(), "w".to_string()]);
+
+        // Non-Queued filters stay exact.
+        let filter = RunFilter {
+            status: Some(RunStatus::Started),
+            ..Default::default()
+        };
+        let page = storage.get_all_runs_page(0, 10, &filter).await.unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].run_id, "s");
+    }
+
+    #[tokio::test]
+    async fn test_run_launch_failed_event_round_trip() {
+        let storage = make_storage().await;
+        storage
+            .store_event(&EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::RunLaunchFailed,
+                asset_key: None,
+                run_id: "r1".to_string(),
+                partition_key: None,
+                timestamp: 1000,
+                metadata: vec![("error".to_string(), "launch failed: boom".to_string())],
+                input_data_versions: vec![],
+            })
+            .await
+            .unwrap();
+
+        let (events, total) = storage
+            .get_run_structured_events_page("r1", None, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(events[0].event_type, EventType::RunLaunchFailed);
+        assert_eq!(
+            events[0].metadata,
+            vec![("error".to_string(), "launch failed: boom".to_string())]
+        );
     }
 
     // ── Run progress, outcome, cancellation, step events ──

@@ -63,11 +63,13 @@ class RunQueueConfig:
     max_concurrent_runs: int
     tag_concurrency_limits: list[TagConcurrencyLimit]
     dequeue_interval: str
+    start_timeout: str
     def __init__(
         self,
         max_concurrent_runs: int = 10,
         tag_concurrency_limits: list[TagConcurrencyLimit] = ...,
         dequeue_interval: str = "250ms",
+        start_timeout: str = "180s",
     ) -> None:
         """Build a run-queue configuration.
 
@@ -75,6 +77,8 @@ class RunQueueConfig:
             max_concurrent_runs: Maximum number of runs in-flight at once.
             tag_concurrency_limits: Per-tag concurrency caps applied on top.
             dequeue_interval: Polling interval for the queue worker (humantime).
+            start_timeout: How long a dequeued run may wait for its executor
+                to appear before the coordinator marks it failed (humantime).
         """
         ...
 
