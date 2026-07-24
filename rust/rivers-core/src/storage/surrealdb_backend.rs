@@ -1282,13 +1282,17 @@ impl SurrealStorage {
     /// [`Self::enqueue_runs`] plus linking the run ids onto the owning
     /// backfill, all in one transaction — `run_ids` can never disagree with
     /// the runs table.
+    /// Returns `false` when the backfill was canceled while the batch was in
+    /// flight — the runs are committed but immediately swept back out of the
+    /// queue, so no child outlives the cancel regardless of which side of
+    /// the race committed first.
     pub async fn enqueue_backfill_runs(
         &self,
         records: &[RunRecord],
         backfill_id: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if records.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         let events: Vec<DbEventWrite> = records
             .iter()
@@ -1318,7 +1322,45 @@ impl SurrealStorage {
             result,
             "enqueue_backfill_runs",
             &format!("batch[{}]", records.len()),
-        )
+        )?;
+        // Cancel-vs-submit race repair: a cancel can land between the
+        // InProgress flip and this commit, and its cascade over `run_ids`
+        // ran before these rows existed.
+        let backfill = self
+            .get_backfill(backfill_id)
+            .await?
+            .with_context(|| format!("backfill '{backfill_id}' not found"))?;
+        if backfill.status == BackfillStatus::InProgress {
+            return Ok(true);
+        }
+        for record in records {
+            self.cancel_queued_run(&record.run_id).await?;
+        }
+        Ok(false)
+    }
+
+    /// Conditionally link a run id to a live backfill — `false` when the
+    /// backfill is no longer `InProgress`, in which case the caller must not
+    /// create the run. Linked before the run exists, so a cancel cascade can
+    /// always reach every child that will ever exist.
+    pub async fn link_backfill_run(&self, backfill_id: &str, run_id: &str) -> Result<bool> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(
+                    "UPDATE backfills SET run_ids = array::union(run_ids, [$run_id]) \
+                         WHERE backfill_id = $id AND status = 'InProgress'; \
+                     SELECT count() AS total FROM backfills \
+                         WHERE backfill_id = $id AND status = 'InProgress' \
+                         AND $run_id IN run_ids GROUP ALL",
+                )
+                .bind(("id", backfill_id.to_string()))
+                .bind(("run_id", run_id.to_string()))
+                .await?;
+            let count: Option<u32> = result.take((1, "total"))?;
+            Ok(count.unwrap_or(0) > 0)
+        })
+        .await
     }
 
     /// Flip a zero-run `InProgress` backfill back to `Requested` so the
@@ -2364,6 +2406,33 @@ impl StorageBackend for SurrealStorage {
         self.update_backfill_status(backfill_id, new_status.clone(), Some(now))
             .await?;
         Ok(Some(new_status))
+    }
+
+    async fn cancel_backfill(&self, backfill_id: &str) -> Result<BackfillStatus> {
+        // Settle first: if every run already finished, the cancel prevented
+        // nothing and the derived outcome wins.
+        if let Some(settled) = self.try_complete_backfill(backfill_id, &[]).await? {
+            return Ok(settled);
+        }
+        let now = now_nanos();
+        super::retry::with_retry(&self.retry_config, || async {
+            self.db
+                .query(
+                    "UPDATE backfills SET status = 'Canceled', end_time = $now \
+                     WHERE backfill_id = $id AND status IN ['Requested', 'InProgress']",
+                )
+                .bind(("id", backfill_id.to_string()))
+                .bind(("now", now))
+                .await?
+                .check()?;
+            Ok(())
+        })
+        .await?;
+        Ok(self
+            .get_backfill(backfill_id)
+            .await?
+            .with_context(|| format!("backfill '{backfill_id}' not found"))?
+            .status)
     }
 
     // Concurrency pools
@@ -11338,6 +11407,110 @@ mod tests {
         assert!(!storage.delete_run("nonexistent").await.unwrap());
     }
 
+    #[tokio::test]
+    async fn test_cancel_backfill_late_cancel_settles_to_success() {
+        let storage = make_storage().await;
+        let mut bf = mk_isolation_backfill(
+            "bf-late",
+            DEFAULT_CODE_LOCATION_ID,
+            BackfillStatus::InProgress,
+            100,
+        );
+        bf.run_ids = vec!["bfr1".into(), "bfr2".into()];
+        storage.create_backfill(&bf).await.unwrap();
+        for id in ["bfr1", "bfr2"] {
+            let mut run = minimal_run(id, RunStatus::Success);
+            run.end_time = Some(2000);
+            storage.create_run(&run).await.unwrap();
+        }
+
+        let status = storage.cancel_backfill("bf-late").await.unwrap();
+        assert_eq!(status, BackfillStatus::CompletedSuccess);
+        let record = storage.get_backfill("bf-late").await.unwrap().unwrap();
+        assert_eq!(record.status, BackfillStatus::CompletedSuccess);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_backfill_late_cancel_keeps_failure_outcome() {
+        let storage = make_storage().await;
+        let mut bf = mk_isolation_backfill(
+            "bf-fail",
+            DEFAULT_CODE_LOCATION_ID,
+            BackfillStatus::InProgress,
+            100,
+        );
+        bf.run_ids = vec!["bff1".into()];
+        storage.create_backfill(&bf).await.unwrap();
+        let mut run = minimal_run("bff1", RunStatus::Failure);
+        run.end_time = Some(2000);
+        storage.create_run(&run).await.unwrap();
+
+        let status = storage.cancel_backfill("bf-fail").await.unwrap();
+        assert_eq!(status, BackfillStatus::CompletedFailed);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_backfill_never_overwrites_terminal_status() {
+        let storage = make_storage().await;
+        let mut bf = mk_isolation_backfill(
+            "bf-done",
+            DEFAULT_CODE_LOCATION_ID,
+            BackfillStatus::CompletedSuccess,
+            100,
+        );
+        bf.end_time = Some(2000);
+        storage.create_backfill(&bf).await.unwrap();
+
+        let status = storage.cancel_backfill("bf-done").await.unwrap();
+        assert_eq!(status, BackfillStatus::CompletedSuccess);
+        let record = storage.get_backfill("bf-done").await.unwrap().unwrap();
+        assert_eq!(record.status, BackfillStatus::CompletedSuccess);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_backfill_cancels_live_backfill() {
+        let storage = make_storage().await;
+        let mut bf = mk_isolation_backfill(
+            "bf-live",
+            DEFAULT_CODE_LOCATION_ID,
+            BackfillStatus::InProgress,
+            100,
+        );
+        bf.run_ids = vec!["bfl1".into()];
+        storage.create_backfill(&bf).await.unwrap();
+        storage
+            .create_run(&minimal_run("bfl1", RunStatus::Started))
+            .await
+            .unwrap();
+
+        let status = storage.cancel_backfill("bf-live").await.unwrap();
+        assert_eq!(status, BackfillStatus::Canceled);
+        let record = storage.get_backfill("bf-live").await.unwrap().unwrap();
+        assert_eq!(record.status, BackfillStatus::Canceled);
+        assert!(record.end_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_backfill_requested_flips_to_canceled() {
+        let storage = make_storage().await;
+        let bf = mk_isolation_backfill(
+            "bf-req",
+            DEFAULT_CODE_LOCATION_ID,
+            BackfillStatus::Requested,
+            100,
+        );
+        storage.create_backfill(&bf).await.unwrap();
+
+        let status = storage.cancel_backfill("bf-req").await.unwrap();
+        assert_eq!(status, BackfillStatus::Canceled);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_backfill_not_found() {
+        let storage = make_storage().await;
+        assert!(storage.cancel_backfill("nonexistent").await.is_err());
+    }
+
     fn minimal_run(run_id: &str, status: RunStatus) -> RunRecord {
         RunRecord {
             run_id: run_id.to_string(),
@@ -11573,10 +11746,11 @@ mod tests {
             minimal_run("bf1-r1", RunStatus::Queued),
             minimal_run("bf1-r2", RunStatus::Queued),
         ];
-        storage
+        let live = storage
             .enqueue_backfill_runs(&records, "bf1")
             .await
             .unwrap();
+        assert!(live);
 
         let bf = storage.get_backfill("bf1").await.unwrap().unwrap();
         let mut linked = bf.run_ids.clone();
@@ -11593,6 +11767,55 @@ mod tests {
             assert_eq!(total, 1);
             assert_eq!(events[0].event_type, EventType::RunQueued);
         }
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_backfill_runs_sweeps_batch_after_cancel() {
+        let storage = make_storage().await;
+        storage
+            .create_backfill(&make_backfill("bf-race", BackfillStatus::InProgress, 100))
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.cancel_backfill("bf-race").await.unwrap(),
+            BackfillStatus::Canceled
+        );
+
+        // The batch commits after the cancel — it must be swept, not left
+        // sitting in the queue.
+        let records = vec![
+            minimal_run("bfr-r1", RunStatus::Queued),
+            minimal_run("bfr-r2", RunStatus::Queued),
+        ];
+        let live = storage
+            .enqueue_backfill_runs(&records, "bf-race")
+            .await
+            .unwrap();
+        assert!(!live);
+
+        for run_id in ["bfr-r1", "bfr-r2"] {
+            let run = storage.get_run(run_id).await.unwrap().unwrap();
+            assert_eq!(run.status, RunStatus::Canceled);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_link_backfill_run_only_while_in_progress() {
+        let storage = make_storage().await;
+        storage
+            .create_backfill(&make_backfill("bf-link", BackfillStatus::InProgress, 100))
+            .await
+            .unwrap();
+
+        assert!(storage.link_backfill_run("bf-link", "lr1").await.unwrap());
+        assert_eq!(
+            storage.cancel_backfill("bf-link").await.unwrap(),
+            BackfillStatus::Canceled
+        );
+        assert!(!storage.link_backfill_run("bf-link", "lr2").await.unwrap());
+
+        let bf = storage.get_backfill("bf-link").await.unwrap().unwrap();
+        assert_eq!(bf.run_ids, vec!["lr1".to_string()]);
     }
 
     #[tokio::test]

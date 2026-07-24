@@ -242,7 +242,7 @@ impl DirectRunDispatcher {
 
             match self
                 .handle
-                .create_started_run(&job_name, py_pk.as_ref(), r.launched_by.clone())
+                .create_started_run(&job_name, py_pk.as_ref(), r.launched_by.clone(), None)
                 .await
             {
                 Ok(run_id) => {

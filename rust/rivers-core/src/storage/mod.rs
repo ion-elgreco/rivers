@@ -2289,6 +2289,15 @@ pub trait StorageBackend: PerCodeLocationStorage {
         extra_canceled: &[PartitionKey],
     ) -> impl Future<Output = Result<Option<BackfillStatus>>> + Send;
 
+    /// Cancel a backfill. If every run is already terminal the cancel came
+    /// too late to prevent anything — the record settles to its true derived
+    /// status instead. Otherwise Requested/InProgress flips to Canceled;
+    /// terminal states are never overwritten. Returns the resulting status.
+    fn cancel_backfill(
+        &self,
+        backfill_id: &str,
+    ) -> impl Future<Output = Result<BackfillStatus>> + Send;
+
     /// Release all concurrency slots held by a specific step (across all pools).
     fn free_concurrency_slots(
         &self,
