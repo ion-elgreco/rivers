@@ -2469,6 +2469,44 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
+    async fn delete_run(&self, run_id: &str) -> Result<bool> {
+        // Check-then-delete is race-free here: terminal statuses are
+        // permanent (re-execution mints a new run_id), so a run observed
+        // terminal can't be picked up by the coordinator afterwards. The
+        // runs row goes last so a partial failure stays re-deletable.
+        let run = match self.get_run(run_id).await? {
+            None => return Ok(false),
+            Some(r) => r,
+        };
+        if !matches!(
+            run.status,
+            RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
+        ) {
+            anyhow::bail!(
+                "run '{run_id}' is {:?} — cancel it and let it finish before deleting",
+                run.status
+            );
+        }
+        super::retry::with_retry(&self.retry_config, || async {
+            self.db
+                .query(
+                    "DELETE FROM events WHERE run_id = $run_id; \
+                     DELETE FROM run_logs WHERE run_id = $run_id; \
+                     DELETE FROM concurrency_slots WHERE run_id = $run_id; \
+                     DELETE FROM pending_steps WHERE run_id = $run_id; \
+                     DELETE FROM kv WHERE key = $cancel_key; \
+                     DELETE FROM runs WHERE run_id = $run_id",
+                )
+                .bind(("run_id", run_id.to_string()))
+                .bind(("cancel_key", format!("cancel:{run_id}")))
+                .await?
+                .check()?;
+            Ok(())
+        })
+        .await?;
+        Ok(true)
+    }
+
     async fn get_run_progress(&self, run_id: &str) -> Result<RunProgress> {
         super::retry::with_retry(&self.retry_config, || async {
             // Distinct steps, not raw events — a retried step re-emits
@@ -11201,6 +11239,103 @@ mod tests {
         let storage = make_storage().await;
         let canceled = storage.cancel_queued_run("nonexistent").await.unwrap();
         assert!(!canceled);
+    }
+
+    #[tokio::test]
+    async fn test_delete_run_removes_run_events_logs_and_cancel_flag() {
+        let storage = make_storage().await;
+        let mut run = minimal_run("del1", RunStatus::Success);
+        run.end_time = Some(2000);
+        storage.create_run(&run).await.unwrap();
+        storage
+            .store_event(&make_event("asset_a", "del1", 1500))
+            .await
+            .unwrap();
+        storage
+            .store_run_logs(&[LogRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                run_id: "del1".into(),
+                step_key: "asset_a".into(),
+                timestamp: 1500,
+                stdout: Some("out".into()),
+                stderr: None,
+                logs: None,
+            }])
+            .await
+            .unwrap();
+        storage.request_cancellation("del1").await.unwrap();
+
+        let deleted = storage.delete_run("del1").await.unwrap();
+        assert!(deleted);
+
+        assert!(storage.get_run("del1").await.unwrap().is_none());
+        assert!(storage.get_events_for_run("del1").await.unwrap().is_empty());
+        assert!(storage.get_run_logs("del1").await.unwrap().is_empty());
+        assert!(!storage.is_cancelled("del1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_delete_run_leaves_other_runs_untouched() {
+        let storage = make_storage().await;
+        let mut doomed = minimal_run("del2", RunStatus::Failure);
+        doomed.end_time = Some(2000);
+        storage.create_run(&doomed).await.unwrap();
+        storage
+            .store_event(&make_event("asset_a", "del2", 1500))
+            .await
+            .unwrap();
+        let mut kept = minimal_run("keep1", RunStatus::Success);
+        kept.end_time = Some(2000);
+        storage.create_run(&kept).await.unwrap();
+        storage
+            .store_event(&make_event("asset_a", "keep1", 1600))
+            .await
+            .unwrap();
+
+        assert!(storage.delete_run("del2").await.unwrap());
+
+        let kept_run = storage.get_run("keep1").await.unwrap().unwrap();
+        assert_eq!(kept_run.status, RunStatus::Success);
+        let kept_events = storage.get_events_for_run("keep1").await.unwrap();
+        assert_eq!(kept_events.len(), 1);
+        assert_eq!(kept_events[0].run_id, "keep1");
+    }
+
+    #[tokio::test]
+    async fn test_delete_run_refuses_active_runs() {
+        let storage = make_storage().await;
+        for (id, status) in [
+            ("act1", RunStatus::Started),
+            ("act2", RunStatus::Queued),
+            ("act3", RunStatus::NotStarted),
+        ] {
+            storage.create_run(&minimal_run(id, status)).await.unwrap();
+            let err = storage.delete_run(id).await.unwrap_err();
+            assert!(
+                err.to_string().contains("cancel it"),
+                "unexpected error for {id}: {err}"
+            );
+            assert!(
+                storage.get_run(id).await.unwrap().is_some(),
+                "active run {id} must survive a delete attempt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_run_deletes_canceled_run() {
+        let storage = make_storage().await;
+        let mut run = minimal_run("del3", RunStatus::Canceled);
+        run.end_time = Some(2000);
+        storage.create_run(&run).await.unwrap();
+        assert!(storage.delete_run("del3").await.unwrap());
+        assert!(storage.get_run("del3").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_delete_run_not_found() {
+        let storage = make_storage().await;
+        assert!(!storage.delete_run("nonexistent").await.unwrap());
     }
 
     fn minimal_run(run_id: &str, status: RunStatus) -> RunRecord {

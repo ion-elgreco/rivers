@@ -199,6 +199,15 @@ pub fn run_status_class(status: &RunStatus) -> &'static str {
     }
 }
 
+/// Whether a run is still in flight (queued, starting, or running) and can
+/// therefore be canceled.
+pub fn run_is_active(status: &RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Started | RunStatus::NotStarted | RunStatus::Queued
+    )
+}
+
 /// Chip kinds recognized by `StatusChip` — each maps to a `.dot-{kind}` CSS
 /// class and is displayed verbatim as the chip label.
 ///

@@ -2135,6 +2135,27 @@ impl RepoHandle {
         tracing::info!(target: "rivers::repo", run_id = %run_id, "run cancellation requested");
         Ok(true)
     }
+
+    /// Delete a terminal run and its history from storage. Errors if the
+    /// run is still active; `Ok(false)` if no such run exists.
+    pub(crate) async fn delete_run(&self, run_id: &str) -> PyResult<bool> {
+        let storage = {
+            let guard = self.state.read().unwrap();
+            let state = guard.as_ref().ok_or_else(|| {
+                ExecutionError::new_err("Repository not resolved — call resolve() first")
+            })?;
+            state.storage.clone()
+        };
+
+        let deleted = storage
+            .delete_run(run_id)
+            .await
+            .map_err(|e| ExecutionError::new_err(format!("failed to delete run: {e}")))?;
+        if deleted {
+            tracing::info!(target: "rivers::repo", run_id = %run_id, "run deleted");
+        }
+        Ok(deleted)
+    }
 }
 
 #[pyclass(name = "CodeRepository", frozen, module = "rivers._core")]

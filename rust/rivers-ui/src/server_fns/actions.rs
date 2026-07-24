@@ -357,3 +357,90 @@ pub async fn cancel_run(run_id: String) -> Result<bool, ServerFnError> {
 
     Ok(resp.into_inner().success)
 }
+
+/// Outcome of a bulk run action (cancel / delete). `requested` counts runs
+/// whose request was accepted; `failed` carries `(run_id, error)` for the
+/// rest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkRunActionResult {
+    pub requested: u32,
+    pub failed: Vec<(String, String)>,
+}
+
+#[cfg(feature = "ssr")]
+async fn cancel_one(run_id: &str) -> Result<(), ServerFnError> {
+    use rivers_api::rivers::CancelRunRequest;
+
+    let mut client = connect_to_run_owner(run_id).await?;
+    client
+        .cancel_run(CancelRunRequest {
+            run_id: run_id.to_string(),
+        })
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(())
+}
+
+/// Request cancellation of several runs in one round-trip. Each run routes
+/// to its own owning code location, so a selection spanning locations works;
+/// one run failing (unknown id, location not Ready) doesn't stop the rest.
+#[server]
+pub async fn cancel_runs(run_ids: Vec<String>) -> Result<BulkRunActionResult, ServerFnError> {
+    let mut requested = 0u32;
+    let mut failed = Vec::new();
+    for run_id in run_ids {
+        match cancel_one(&run_id).await {
+            Ok(()) => requested += 1,
+            Err(e) => failed.push((run_id, e.to_string())),
+        }
+    }
+    Ok(BulkRunActionResult { requested, failed })
+}
+
+#[cfg(feature = "ssr")]
+async fn delete_one(run_id: &str) -> Result<(), ServerFnError> {
+    use rivers_api::rivers::DeleteRunRequest;
+
+    let mut client = connect_to_run_owner(run_id).await?;
+    let resp = client
+        .delete_run(DeleteRunRequest {
+            run_id: run_id.to_string(),
+        })
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    if !resp.into_inner().success {
+        return Err(ServerFnError::new(format!("run '{run_id}' not found")));
+    }
+    Ok(())
+}
+
+/// Delete a terminal run and its history (events, step logs). The owning
+/// code location refuses runs that are still active — cancel those first.
+#[server]
+pub async fn delete_run(run_id: String) -> Result<bool, ServerFnError> {
+    use rivers_api::rivers::DeleteRunRequest;
+
+    let mut client = connect_to_run_owner(&run_id).await?;
+
+    let resp = client
+        .delete_run(DeleteRunRequest { run_id })
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    Ok(resp.into_inner().success)
+}
+
+/// Delete several terminal runs in one round-trip; same per-run routing and
+/// failure collection as [`cancel_runs`].
+#[server]
+pub async fn delete_runs(run_ids: Vec<String>) -> Result<BulkRunActionResult, ServerFnError> {
+    let mut requested = 0u32;
+    let mut failed = Vec::new();
+    for run_id in run_ids {
+        match delete_one(&run_id).await {
+            Ok(()) => requested += 1,
+            Err(e) => failed.push((run_id, e.to_string())),
+        }
+    }
+    Ok(BulkRunActionResult { requested, failed })
+}

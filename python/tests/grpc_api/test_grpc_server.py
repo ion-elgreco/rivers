@@ -5,6 +5,7 @@ import pytest
 
 import rivers as rs
 from _polling import wait_for_asset_materialized as _wait_for_asset_materialized
+from _polling import wait_until
 
 
 # ── Test helpers ──
@@ -405,6 +406,48 @@ def test_cancel_run_cancels_queued_run(queued_grpc_channel):
     assert run is not None
     assert run.status == "Canceled"
     assert resp.run_id not in [r.run_id for r in storage.get_queued_runs()]
+
+
+def test_delete_run_deletes_terminal_run(grpc_channel):
+    """DeleteRun removes a finished run; a repeat delete reports not-found."""
+    channel, pb2, pb2_grpc, repo = grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    resp = stub.Materialize(pb2.MaterializeRequest(selection=["upstream"]))
+    assert resp.run_id
+    storage = repo.storage
+    assert wait_until(
+        lambda: (
+            (r := storage.get_run(resp.run_id)) is not None
+            and r.status in ("Success", "Failure")
+        )
+    )
+    assert storage.get_run(resp.run_id).status == "Success"
+
+    delete_resp = stub.DeleteRun(pb2.DeleteRunRequest(run_id=resp.run_id))
+    assert delete_resp.success
+    assert storage.get_run(resp.run_id) is None
+
+    # Idempotent from the caller's view: the run is simply gone now.
+    delete_again = stub.DeleteRun(pb2.DeleteRunRequest(run_id=resp.run_id))
+    assert not delete_again.success
+
+
+def test_delete_run_refuses_active_run(queued_grpc_channel):
+    """DeleteRun on a still-queued run fails with FAILED_PRECONDITION and
+    leaves the run untouched — active runs must be canceled first."""
+    channel, pb2, pb2_grpc, _, storage = queued_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    resp = stub.ExecuteJob(pb2.ExecuteJobRequest(job_name="test_job"))
+    assert resp.run_id
+
+    with pytest.raises(grpc.RpcError) as excinfo:
+        stub.DeleteRun(pb2.DeleteRunRequest(run_id=resp.run_id))
+    assert excinfo.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+    assert "cancel it" in excinfo.value.details()
+
+    assert storage.get_run(resp.run_id) is not None
 
 
 def test_rerun_rejects_run_from_another_code_location(grpc_stubs, storage, monkeypatch):

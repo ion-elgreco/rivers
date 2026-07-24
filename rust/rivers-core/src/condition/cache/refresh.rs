@@ -86,11 +86,13 @@ impl AssetConditionCache {
                 .map(|r| r.run_id.as_str())
                 .collect();
 
-            let clearable: Vec<String> = self
+            let mut clearable: Vec<String> = self
                 .in_progress_assets
                 .values()
                 .flat_map(|runs| runs.keys().cloned())
                 .collect();
+            clearable.sort_unstable();
+            clearable.dedup();
             let mut swept_applied: HashSet<String> = HashSet::new();
             if !clearable.is_empty() {
                 let tracked_runs = storage.get_runs_by_ids(&clearable, None).await?;
@@ -110,6 +112,40 @@ impl AssetConditionCache {
                         invalidated_keys.extend(run.node_names.iter().cloned());
                         if self.apply_run_effects_to_delta(run, &mut delta) {
                             swept_applied.insert(run.run_id.clone());
+                        }
+                    }
+                }
+
+                // A tracked id missing from the lookup entirely: the runs row
+                // vanished. The only remover of runs rows is an explicit
+                // delete of a terminal run, so the run finished and was
+                // deleted before this sweep observed the terminal status —
+                // clear the in-progress guard or it wedges until restart.
+                // Ids still in `pending_runs` (dispatched, row not yet
+                // confirmed) are excluded: the pending grace-period eviction
+                // owns those. `run_id` is unique, so fewer rows than
+                // (deduped) ids is exactly "something vanished".
+                if tracked_runs.len() < clearable.len() {
+                    let found: HashSet<&str> =
+                        tracked_runs.iter().map(|r| r.run_id.as_str()).collect();
+                    for (asset_key, runs) in &self.in_progress_assets {
+                        for run_id in runs.keys() {
+                            if found.contains(run_id.as_str())
+                                || self.pending_runs.contains_key(run_id)
+                            {
+                                continue;
+                            }
+                            delta.in_progress_changes.push(InProgressChange::ClearRun {
+                                asset_key: asset_key.clone(),
+                                run_id: run_id.clone(),
+                            });
+                            invalidated_keys.push(asset_key.clone());
+                            tracing::info!(
+                                target: "rivers::daemon",
+                                run_id = %run_id,
+                                asset = %asset_key,
+                                "tracked run vanished from storage (deleted) — clearing in-progress guard"
+                            );
                         }
                     }
                 }

@@ -309,3 +309,65 @@ fn partition_keyed_success_clears_unpartitioned_asset_floor() {
         "the partitioned asset's outcome stays out of the asset-level floor"
     );
 }
+
+/// A tracked run whose row is deleted between completion and the next sweep
+/// must not wedge the in-progress guard: `delete_run` only removes terminal
+/// runs, so a vanished row implies the run finished — the sweep clears its
+/// tracking. A dispatched-but-unconfirmed (pending) id is NOT treated as
+/// vanished; the pending grace-period eviction owns that case.
+#[tokio::test]
+async fn deleted_tracked_run_clears_in_progress_guard() {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+    let mut cache = AssetConditionCache::new(cl.clone());
+
+    // Initial load on empty storage, then dispatch registers the run id
+    // eagerly (before any row exists).
+    cache.refresh(&storage, 0).await.unwrap();
+    cache.register_dispatched_run("a".to_string(), "run-del".to_string(), 1, None);
+    cache.register_dispatched_run("b".to_string(), "run-pending".to_string(), 1, None);
+
+    // run-del's row lands and a refresh confirms it; run-pending never lands.
+    let mut rec = mk_run("run-del", RunStatus::Started, &["a"], 1000);
+    rec.code_location_id = cl.clone();
+    storage.create_run(&rec).await.unwrap();
+    cache.refresh(&storage, 2).await.unwrap();
+    assert!(
+        !cache.pending_runs.contains_key("run-del"),
+        "observed run must leave pending"
+    );
+    assert!(
+        cache
+            .in_progress_assets
+            .get("a")
+            .is_some_and(|runs| runs.contains_key("run-del")),
+        "confirmed run stays tracked while active"
+    );
+
+    // The run completes and is deleted before the next sweep observes the
+    // terminal status.
+    storage
+        .update_run_status("run-del", RunStatus::Success, Some(2000))
+        .await
+        .unwrap();
+    assert!(storage.delete_run("run-del").await.unwrap());
+
+    let changed = cache.refresh(&storage, 3).await.unwrap();
+    assert!(changed, "clearing a vanished run is a meaningful change");
+    assert!(
+        cache
+            .in_progress_assets
+            .get("a")
+            .is_none_or(|runs| !runs.contains_key("run-del")),
+        "deleted run must not stay tracked as in-progress"
+    );
+    assert!(
+        cache
+            .in_progress_assets
+            .get("b")
+            .is_some_and(|runs| runs.contains_key("run-pending")),
+        "a pending id inside its grace window must not be swept as vanished"
+    );
+}

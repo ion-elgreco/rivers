@@ -23,15 +23,17 @@ use crate::components::ui_kit::{
     RiversSearch, StatusChip, Topbar, partition_scheme_for,
 };
 use crate::helpers::{
-    code_location_label, format_duration, format_timestamp, run_status_class, run_status_kind,
+    code_location_label, format_duration, format_timestamp, run_is_active, run_status_class,
+    run_status_kind,
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::now::RelTime;
+use crate::server_fns::actions::{BulkRunActionResult, cancel_runs, delete_runs};
 use crate::server_fns::locations::list_code_locations;
 use crate::server_fns::runs::{get_runs_page, get_runs_summary};
 use crate::types::{CodeLocationEntry, RunFilter, RunRecord, RunStatus, RunsSummary};
 
-const GRID: &str = "grid-template-columns: 80px 1.2fr 0.7fr 1.4fr 0.6fr 0.9fr 0.8fr 1fr";
+const GRID: &str = "grid-template-columns: 32px 80px 1.2fr 0.7fr 1.4fr 0.6fr 0.9fr 0.8fr 1fr";
 
 fn status_from_tab(tab: &str) -> Option<RunStatus> {
     match tab {
@@ -42,6 +44,59 @@ fn status_from_tab(tab: &str) -> Option<RunStatus> {
         "Starting" => Some(RunStatus::NotStarted),
         _ => None,
     }
+}
+
+type BulkAction = Action<Vec<String>, Result<BulkRunActionResult, ServerFnError>>;
+
+/// Wire a bulk action's completion: keep only the failed ids selected
+/// (retryable), refresh the page, and compose the result line shown in the
+/// bulk bar. `ok_verb` leads the success copy ("deleted", "cancel requested
+/// for"); `fail_verb` labels a whole-request failure.
+fn wire_bulk_completion(
+    action: BulkAction,
+    ok_verb: &'static str,
+    fail_verb: &'static str,
+    set_selected: WriteSignal<Vec<String>>,
+    set_refresh_tick: WriteSignal<u64>,
+    set_last_result: WriteSignal<Option<(String, bool, String)>>,
+) {
+    Effect::new(move |_| {
+        let Some(res) = action.value().get() else {
+            return;
+        };
+        match res {
+            Ok(r) => {
+                set_selected.set(r.failed.iter().map(|(id, _)| id.clone()).collect());
+                set_refresh_tick.update(|t| *t += 1);
+                let n = r.requested;
+                let noun = if n == 1 { "run" } else { "runs" };
+                if r.failed.is_empty() {
+                    set_last_result.set(Some((
+                        format!("{ok_verb} {n} {noun}"),
+                        false,
+                        String::new(),
+                    )));
+                } else {
+                    let detail = r
+                        .failed
+                        .iter()
+                        .map(|(id, e)| format!("{id}: {e}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    set_last_result.set(Some((
+                        format!("{ok_verb} {n} {noun} · {} failed", r.failed.len()),
+                        true,
+                        detail,
+                    )));
+                }
+            }
+            Err(e) => set_last_result.set(Some((
+                format!("{fail_verb} failed: {e}"),
+                true,
+                String::new(),
+            ))),
+        }
+    });
 }
 
 #[component]
@@ -81,6 +136,53 @@ pub fn RunsListPage() -> impl IntoView {
     });
 
     let locations = Resource::new(|| (), |_| list_code_locations());
+
+    // Multiselect for bulk cancel/delete. Ids only — rows come back from the
+    // page Resource. Pruned on every page fetch so the selection never
+    // outlives the visible page (a run that finishes mid-selection stays
+    // selected: it flips from cancellable to deletable).
+    let (selected, set_selected) = signal(Vec::<String>::new());
+    Effect::new(move |_| {
+        if let Some(Ok(p)) = runs_page.get() {
+            let live: std::collections::HashSet<&str> =
+                p.rows.iter().map(|r| r.run_id.as_str()).collect();
+            let cur = selected.get_untracked();
+            let keep: Vec<String> = cur
+                .iter()
+                .filter(|id| live.contains(id.as_str()))
+                .cloned()
+                .collect();
+            if keep.len() != cur.len() {
+                set_selected.set(keep);
+            }
+        }
+    });
+
+    let cancel_action: BulkAction = Action::new(move |ids: &Vec<String>| {
+        let ids = ids.clone();
+        async move { cancel_runs(ids).await }
+    });
+    let delete_action: BulkAction = Action::new(move |ids: &Vec<String>| {
+        let ids = ids.clone();
+        async move { delete_runs(ids).await }
+    });
+    let (last_result, set_last_result) = signal(None::<(String, bool, String)>);
+    wire_bulk_completion(
+        cancel_action,
+        "cancel requested for",
+        "cancel",
+        set_selected,
+        set_refresh_tick,
+        set_last_result,
+    );
+    wire_bulk_completion(
+        delete_action,
+        "deleted",
+        "delete",
+        set_selected,
+        set_refresh_tick,
+        set_last_result,
+    );
 
     // Summary is intentionally on a separate Resource with a narrower key:
     // only `refresh_tick` triggers a refetch, not filter/page/page_size.
@@ -223,18 +325,157 @@ pub fn RunsListPage() -> impl IntoView {
             }
             render={move |rows: Vec<RunRecord>| {
                 let locs = locations.get().and_then(|r| r.ok()).unwrap_or_default();
-                view! { <RunsTable rows=rows locations=locs/> }.into_any()
+                view! {
+                    <RunsTable
+                        rows=rows
+                        locations=locs
+                        selected=selected
+                        set_selected=set_selected
+                        cancel_action=cancel_action
+                        delete_action=delete_action
+                        last_result=last_result
+                    />
+                }.into_any()
             }}
         />
     }
 }
 
 #[component]
-fn RunsTable(rows: Vec<RunRecord>, locations: Vec<CodeLocationEntry>) -> impl IntoView {
+fn RunsTable(
+    rows: Vec<RunRecord>,
+    locations: Vec<CodeLocationEntry>,
+    selected: ReadSignal<Vec<String>>,
+    set_selected: WriteSignal<Vec<String>>,
+    cancel_action: BulkAction,
+    delete_action: BulkAction,
+    last_result: ReadSignal<Option<(String, bool, String)>>,
+) -> impl IntoView {
     let locations = std::sync::Arc::new(locations);
+    let cancel_pending = cancel_action.pending();
+    let delete_pending = delete_action.pending();
+    let any_pending = move || cancel_pending.get() || delete_pending.get();
+
+    // Split the visible rows once: active runs take the cancel path,
+    // terminal runs the delete path. A mixed selection shows both buttons,
+    // each acting only on its own subset.
+    let n_rows = rows.len();
+    let all_ids = StoredValue::new(rows.iter().map(|r| r.run_id.clone()).collect::<Vec<_>>());
+    let active = StoredValue::new(
+        rows.iter()
+            .filter(|r| run_is_active(&r.status))
+            .map(|r| r.run_id.clone())
+            .collect::<std::collections::HashSet<_>>(),
+    );
+    let selected_active = move || {
+        active.with_value(|a| {
+            selected
+                .get()
+                .into_iter()
+                .filter(|id| a.contains(id))
+                .collect::<Vec<_>>()
+        })
+    };
+    let selected_finished = move || {
+        active.with_value(|a| {
+            selected
+                .get()
+                .into_iter()
+                .filter(|id| !a.contains(id))
+                .collect::<Vec<_>>()
+        })
+    };
+
+    // Two-click confirm for delete; any selection change disarms. Local to
+    // the table on purpose: a live-kick re-render also resets to unarmed,
+    // which errs on the safe side.
+    let delete_armed = RwSignal::new(false);
+    Effect::new(move |_| {
+        selected.track();
+        delete_armed.set(false);
+    });
+
     view! {
+        {(n_rows > 0).then(|| view! {
+            <div class="bulk-actions">
+                <button
+                    class="bulk-link-btn"
+                    on:click=move |_| set_selected.set(all_ids.get_value())
+                >
+                    {format!("Select all ({n_rows})")}
+                </button>
+                <span class="bulk-sep">"·"</span>
+                <button class="bulk-link-btn" on:click=move |_| set_selected.set(Vec::new())>
+                    "Clear"
+                </button>
+                <Show when=move || !selected_active().is_empty()>
+                    <button
+                        class="btn btn-danger"
+                        on:click=move |_| { cancel_action.dispatch(selected_active()); }
+                        disabled=any_pending
+                    >
+                        <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+                            <rect x="3" y="2" width="2.5" height="8"/>
+                            <rect x="6.5" y="2" width="2.5" height="8"/>
+                        </svg>
+                        {move || {
+                            if cancel_pending.get() {
+                                "Canceling...".to_string()
+                            } else {
+                                let n = selected_active().len();
+                                format!("Cancel {n} run{}", if n == 1 { "" } else { "s" })
+                            }
+                        }}
+                    </button>
+                </Show>
+                <Show when=move || !selected_finished().is_empty()>
+                    <button
+                        class="btn btn-danger"
+                        on:click=move |_| {
+                            if delete_armed.get() {
+                                delete_armed.set(false);
+                                delete_action.dispatch(selected_finished());
+                            } else {
+                                delete_armed.set(true);
+                            }
+                        }
+                        disabled=any_pending
+                    >
+                        <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                            <path
+                                d="M2 3h8M4.5 3V1.8h3V3M3 3l.6 7.2h4.8L9 3M4.9 5v3.5M7.1 5v3.5"
+                                stroke="currentColor"
+                                stroke-width="1.1"
+                                stroke-linecap="round"
+                            />
+                        </svg>
+                        {move || {
+                            let n = selected_finished().len();
+                            let noun = if n == 1 { "run" } else { "runs" };
+                            if delete_pending.get() {
+                                "Deleting...".to_string()
+                            } else if delete_armed.get() {
+                                format!("Confirm delete {n} {noun}?")
+                            } else {
+                                format!("Delete {n} {noun}")
+                            }
+                        }}
+                    </button>
+                </Show>
+                {move || last_result.get().map(|(msg, is_err, detail)| view! {
+                    <span
+                        class=if is_err { "text-error" } else { "text-muted" }
+                        title=detail
+                    >
+                        {msg}
+                    </span>
+                })}
+                <span class="bulk-count">{move || format!("{} selected", selected.get().len())}</span>
+            </div>
+        })}
         <div class="grid-table">
             <div class="grid-table-head" style=GRID>
+                <span></span>
                 <span>"RUN"</span>
                 <span>"LAUNCHED BY"</span>
                 <span>"STATUS"</span>
@@ -249,7 +490,7 @@ fn RunsTable(rows: Vec<RunRecord>, locations: Vec<CodeLocationEntry>) -> impl In
                 key=|r: &RunRecord| r.run_id.clone()
                 children=move |r: RunRecord| {
                     let label = code_location_label(&r.code_location_id, &locations);
-                    view! { <RunRow record=r code_location_label=label/> }
+                    view! { <RunRow record=r code_location_label=label selected=selected set_selected=set_selected/> }
                 }
             />
         </div>
@@ -257,8 +498,15 @@ fn RunsTable(rows: Vec<RunRecord>, locations: Vec<CodeLocationEntry>) -> impl In
 }
 
 #[component]
-fn RunRow(record: RunRecord, code_location_label: String) -> impl IntoView {
+fn RunRow(
+    record: RunRecord,
+    code_location_label: String,
+    selected: ReadSignal<Vec<String>>,
+    set_selected: WriteSignal<Vec<String>>,
+) -> impl IntoView {
     let run_id = record.run_id.clone();
+    let id_for_check = run_id.clone();
+    let id_for_toggle = run_id.clone();
     let (ns, name) = use_current_location().get();
     let href = loc_path(&ns, &name, &format!("runs/{}", run_id));
     let short_id = if run_id.len() > 8 {
@@ -293,6 +541,21 @@ fn RunRow(record: RunRecord, code_location_label: String) -> impl IntoView {
     view! {
         <A href=href attr:class="grid-row" attr:style=GRID attr:title=created_abs>
             <span class=rail_cls></span>
+            <span on:click=move |ev: leptos::ev::MouseEvent| ev.stop_propagation()>
+                <input
+                    class="asset-row-check"
+                    type="checkbox"
+                    prop:checked=move || selected.get().contains(&id_for_check)
+                    on:click=move |ev| ev.stop_propagation()
+                    on:change=move |_| set_selected.update(|s| {
+                        if s.contains(&id_for_toggle) {
+                            s.retain(|x| x != &id_for_toggle);
+                        } else {
+                            s.push(id_for_toggle.clone());
+                        }
+                    })
+                />
+            </span>
             <span class="grid-cell-mono">{short_id}</span>
             {launched_cell}
             <StatusChip kind=st_kind small=true/>
