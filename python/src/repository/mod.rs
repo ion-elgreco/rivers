@@ -1590,10 +1590,28 @@ impl RepoHandle {
         // Backfill runs carry the run_ids link on the backfill record in the
         // same transaction, so the link can never lie about what exists.
         match &launched_by {
-            LaunchedBy::Backfill { backfill_id } => storage
-                .enqueue_backfill_runs(&records, backfill_id)
-                .await
-                .map_err(|e| ExecutionError::new_err(format!("Failed to enqueue runs: {e}")))?,
+            LaunchedBy::Backfill { backfill_id } => {
+                let live = storage
+                    .enqueue_backfill_runs(&records, backfill_id)
+                    .await
+                    .map_err(|e| ExecutionError::new_err(format!("Failed to enqueue runs: {e}")))?;
+                if !live {
+                    let canceled: Vec<rivers_core::storage::PartitionKey> = records
+                        .iter()
+                        .filter_map(|r| r.partition_key.as_ref())
+                        .flat_map(|pk| pk.members())
+                        .collect();
+                    let _ = storage
+                        .update_backfill_progress(backfill_id, &[], &[], &[], &canceled)
+                        .await;
+                    tracing::info!(
+                        target: "rivers::repo",
+                        backfill_id = %backfill_id,
+                        count = records.len(),
+                        "backfill canceled during submission — swept enqueued batch"
+                    );
+                }
+            }
             _ => storage
                 .enqueue_runs(&records)
                 .await
@@ -1625,6 +1643,7 @@ impl RepoHandle {
         job_name: &str,
         partition_key: Option<&PyPartitionKey>,
         launched_by: LaunchedBy,
+        run_id_override: Option<String>,
     ) -> PyResult<String> {
         let (record, storage, dyn_checks) = {
             let guard = self.state.read().unwrap();
@@ -1649,7 +1668,7 @@ impl RepoHandle {
                 partition_key,
             );
 
-            let run_id = uuid::Uuid::new_v4().to_string();
+            let run_id = run_id_override.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let now = now_ts();
             let core_pk = partition_key.map(|pk| pk.into());
 
@@ -2065,8 +2084,10 @@ impl RepoHandle {
     }
 
     /// Cancel an in-progress backfill: signal the in-process coordinator
-    /// (if any) and mark the record `Canceled`. Returns whether a live
-    /// coordinator was signalled.
+    /// (if any), settle or CAS the record via storage, and cancel any
+    /// still-live child runs. A backfill whose runs all finished keeps its
+    /// derived status — a late cancel prevented nothing. Returns whether a
+    /// live coordinator was signalled.
     pub(crate) async fn cancel_backfill(&self, backfill_id: String) -> PyResult<bool> {
         let signaled = {
             let flags = self.backfill_cancel_flags.lock().unwrap();
@@ -2085,10 +2106,51 @@ impl RepoHandle {
             })?;
             state.storage.clone()
         };
-        storage
-            .update_backfill_status(&backfill_id, BackfillStatus::Canceled, Some(now_ts()))
+        let status = storage
+            .cancel_backfill(&backfill_id)
             .await
             .map_err(|e| ExecutionError::new_err(format!("Failed to cancel backfill: {e}")))?;
+
+        // Cascade to live children — queued-mode runs would otherwise be
+        // dequeued and executed regardless of the parent's status. A linked
+        // id with no row yet is a run mid-creation: canceling it now plants
+        // the flag the executor honors at startup.
+        if status == BackfillStatus::Canceled {
+            let record = storage
+                .get_backfill(&backfill_id)
+                .await
+                .map_err(|e| ExecutionError::new_err(format!("{e}")))?;
+            if let Some(record) = record {
+                let runs = storage
+                    .get_runs_by_ids(&record.run_ids, None)
+                    .await
+                    .map_err(|e| ExecutionError::new_err(format!("{e}")))?;
+                let terminal: std::collections::HashSet<&str> = runs
+                    .iter()
+                    .filter(|r| {
+                        matches!(
+                            r.status,
+                            RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
+                        )
+                    })
+                    .map(|r| r.run_id.as_str())
+                    .collect();
+                for run_id in &record.run_ids {
+                    if terminal.contains(run_id.as_str()) {
+                        continue;
+                    }
+                    if let Err(e) = self.cancel_run(run_id).await {
+                        tracing::warn!(
+                            target: "rivers::repo",
+                            backfill_id = %backfill_id,
+                            run_id = %run_id,
+                            error = %e,
+                            "backfill child run cancel failed"
+                        );
+                    }
+                }
+            }
+        }
 
         Ok(signaled)
     }
@@ -4254,6 +4316,7 @@ impl PyCodeRepository {
         py_pk: PyPartitionKey,
         config: Option<HashMap<String, Py<PyAny>>>,
         backfill_id: &str,
+        run_id: String,
     ) -> PyResult<PyRunResult> {
         let run_id = io_rt().block_on(self.handle().create_started_run(
             job_name,
@@ -4261,6 +4324,7 @@ impl PyCodeRepository {
             LaunchedBy::Backfill {
                 backfill_id: backfill_id.to_string(),
             },
+            Some(run_id),
         ))?;
         Python::attach(|py| {
             job.bind(py)
@@ -4324,6 +4388,35 @@ impl PyCodeRepository {
                 continue;
             }
 
+            // Link the run id before the run exists so a cancel cascade can
+            // always reach it; a rejected link means the backfill was
+            // canceled under us — fold into the flag path.
+            let run_id = uuid::Uuid::new_v4().to_string();
+            match io_rt().block_on(state.storage.link_backfill_run(backfill_id, &run_id)) {
+                Ok(true) => {}
+                Ok(false) => {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    canceled_keys.extend(group.iter().cloned());
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "rivers::repo",
+                        backfill_id = %backfill_id,
+                        error = %e,
+                        "backfill run link failed"
+                    );
+                    let _ = io_rt().block_on(state.storage.update_backfill_progress(
+                        backfill_id,
+                        &[],
+                        &[],
+                        group,
+                        &[],
+                    ));
+                    continue;
+                }
+            }
+
             // Inherit backfill tags and default priority to -10 (lower than
             // scheduled runs) unless user explicitly set it. The backfill
             // origin is tracked via `LaunchedBy::Backfill`, not a tag.
@@ -4356,6 +4449,7 @@ impl PyCodeRepository {
                         batch_pk,
                         run_config,
                         backfill_id,
+                        run_id.clone(),
                     ),
                     None => Err(ExecutionError::new_err(format!(
                         "Job '{job_name}' not found"
@@ -4367,7 +4461,7 @@ impl PyCodeRepository {
                     Some(run_tags.clone()),
                     false,
                     run_config,
-                    None,
+                    Some(run_id.clone()),
                     false,
                     false,
                     None,
@@ -4418,8 +4512,11 @@ impl PyCodeRepository {
             tracing::error!(target: "rivers::repo", backfill_id = %backfill_id, error = %e, "backfill finalize failed");
         }
 
-        // External cancel takes precedence over the failure-derived status.
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        // External cancel takes precedence over the failure-derived status —
+        // but only when it actually prevented work. A cancel that landed
+        // after the last group launched changes nothing, so the derived
+        // completion stands.
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) && !canceled_keys.is_empty() {
             let _ = io_rt().block_on(state.storage.update_backfill_status(
                 backfill_id,
                 BackfillStatus::Canceled,

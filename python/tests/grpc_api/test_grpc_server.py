@@ -778,6 +778,96 @@ def test_get_backfill_status_carries_launched_by(backfill_grpc_channel):
     assert status.launched_by_user.name == "John Doe"
 
 
+def test_cancel_backfill_after_completion_keeps_outcome(backfill_grpc_channel):
+    """A cancel that lands after every run finished prevented nothing — the
+    backfill keeps its derived CompletedSuccess instead of flipping to
+    Canceled."""
+    channel, pb2, pb2_grpc, repo, _ = backfill_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    # Inline (blocking) execution: the backfill is CompletedSuccess before
+    # the cancel goes out.
+    result = repo.backfill(
+        selection=["partitioned_asset"],
+        partition_keys=[rs.PartitionKey.single("p1"), rs.PartitionKey.single("p2")],
+    )
+    assert result.status == "CompletedSuccess"
+
+    stub.CancelBackfill(pb2.CancelBackfillRequest(backfill_id=result.backfill_id))
+
+    status = stub.GetBackfillStatus(
+        pb2.GetBackfillStatusRequest(backfill_id=result.backfill_id)
+    )
+    assert status.status == "CompletedSuccess"
+
+
+@pytest.fixture
+def queued_backfill_grpc_channel(grpc_stubs, storage):
+    """gRPC server with a partitioned asset and a run queue — backfill runs
+    are submitted Queued and (with no coordinator running) stay there."""
+    handler = DictIOHandler()
+    pd = rs.PartitionsDefinition.static_(["p1", "p2", "p3"])
+
+    @rs.Asset(io_handler=handler, partitions_def=pd)
+    def qb_asset(context: rs.AssetExecutionContext):
+        return context.partition_key
+
+    repo = rs.CodeRepository(
+        assets=[qb_asset],
+        default_executor=rs.Executor.in_process(),
+        run_queue=rs.RunQueueConfig(max_concurrent_runs=2, dequeue_interval="50ms"),
+    )
+    repo.resolve(storage=storage)
+    port = repo._start_grpc_server("127.0.0.1", 0)
+
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+
+    pb2, pb2_grpc = grpc_stubs
+    yield channel, pb2, pb2_grpc, repo, storage
+    channel.close()
+    repo._stop_grpc_server()
+
+
+def test_cancel_backfill_cascades_to_queued_runs(queued_backfill_grpc_channel):
+    """Canceling a queued-mode backfill cancels its still-queued child runs —
+    regression: only the backfill record flipped Canceled while every child
+    run stayed in the queue and executed anyway."""
+    channel, pb2, pb2_grpc, repo, storage = queued_backfill_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    launch = stub.LaunchBackfill(
+        pb2.LaunchBackfillRequest(
+            selection=["qb_asset"],
+            partition_keys=[
+                _single_partition_key(pb2, "p1"),
+                _single_partition_key(pb2, "p2"),
+                _single_partition_key(pb2, "p3"),
+            ],
+            failure_policy="continue",
+            max_concurrency=2,
+        )
+    )
+    bf_id = launch.backfill_id
+
+    # Submit the queued run set synchronously (the daemon's job in
+    # production); with no coordinator running they stay Queued.
+    repo.execute_backfill_queued(bf_id)
+    status = stub.GetBackfillStatus(pb2.GetBackfillStatusRequest(backfill_id=bf_id))
+    assert len(status.run_ids) == 3
+    assert len(storage.get_queued_runs()) == 3
+
+    stub.CancelBackfill(pb2.CancelBackfillRequest(backfill_id=bf_id))
+
+    status = stub.GetBackfillStatus(pb2.GetBackfillStatusRequest(backfill_id=bf_id))
+    assert status.status == "Canceled"
+    for run_id in status.run_ids:
+        run = storage.get_run(run_id)
+        assert run is not None
+        assert run.status == "Canceled", f"child run {run_id} not canceled"
+    assert storage.get_queued_runs() == []
+
+
 def test_get_backfill_status_not_found(backfill_grpc_channel):
     channel, pb2, pb2_grpc, _, _ = backfill_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)
