@@ -13,7 +13,7 @@ use crate::helpers::{
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::now::use_now;
-use crate::server_fns::actions::{cancel_run, rerun_run};
+use crate::server_fns::actions::{cancel_run, delete_run, rerun_run};
 use crate::server_fns::locations::list_code_locations;
 use crate::server_fns::runs::{
     get_run, get_run_asset_events_page, get_run_logs, get_run_step_events,
@@ -180,6 +180,27 @@ pub fn RunDetailPage() -> impl IntoView {
     });
     let cancel_pending = cancel.pending();
 
+    let delete = Action::new(move |id: &String| {
+        let id = id.clone();
+        async move { delete_run(id).await }
+    });
+    let delete_pending = delete.pending();
+    // Two-click confirm; disarm when navigating to a different run.
+    let delete_armed = RwSignal::new(false);
+    Effect::new(move |_| {
+        run_id_memo.track();
+        delete_armed.set(false);
+    });
+    // A deleted run has no page to stay on — back to the list. Ok(false)
+    // means the run was already gone, which lands in the same place.
+    let navigate = leptos_router::hooks::use_navigate();
+    Effect::new(move |_| {
+        if let Some(Ok(_)) = delete.value().get() {
+            let (ns, name) = loc.get_untracked();
+            navigate(&loc_path(&ns, &name, "runs"), Default::default());
+        }
+    });
+
     let live_status = use_live_kick(
         &["runs", "events"],
         300,
@@ -255,6 +276,39 @@ pub fn RunDetailPage() -> impl IntoView {
                                                 <rect x="6.5" y="2" width="2.5" height="8"/>
                                             </svg>
                                             {move || if cancel_pending.get() { "Canceling..." } else { "Cancel run" }}
+                                        </button>
+                                    }
+                                })}
+                                {(!is_active_status).then(|| {
+                                    let delete_id = record.run_id.clone();
+                                    view! {
+                                        <button
+                                            class="btn btn-danger"
+                                            on:click=move |_| {
+                                                if delete_armed.get() {
+                                                    delete_armed.set(false);
+                                                    delete.dispatch(delete_id.clone());
+                                                } else {
+                                                    delete_armed.set(true);
+                                                }
+                                            }
+                                            disabled=move || delete_pending.get()
+                                        >
+                                            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                                                <path
+                                                    d="M2 3h8M4.5 3V1.8h3V3M3 3l.6 7.2h4.8L9 3M4.9 5v3.5M7.1 5v3.5"
+                                                    stroke="currentColor"
+                                                    stroke-width="1.1"
+                                                    stroke-linecap="round"
+                                                />
+                                            </svg>
+                                            {move || if delete_pending.get() {
+                                                "Deleting..."
+                                            } else if delete_armed.get() {
+                                                "Confirm delete?"
+                                            } else {
+                                                "Delete run"
+                                            }}
                                         </button>
                                     }
                                 })}

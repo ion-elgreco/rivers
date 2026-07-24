@@ -2317,6 +2317,11 @@ pub trait StorageBackend: PerCodeLocationStorage {
     /// NotStarted to Canceled).
     fn cancel_queued_run(&self, run_id: &str) -> impl Future<Output = Result<bool>> + Send;
 
+    /// Delete a terminal run and its history (events, step logs, cancel
+    /// flag). `Ok(false)` if no such run exists; errors if the run is still
+    /// active — cancel it and let it reach a terminal status first.
+    fn delete_run(&self, run_id: &str) -> impl Future<Output = Result<bool>> + Send;
+
     // ── K8s run coordination ──
 
     /// Get progress of a run by counting step events.

@@ -27,6 +27,7 @@ service CodeLocationService {
   rpc GetBackfillStatus(GetBackfillStatusRequest) returns (GetBackfillStatusResponse);
   rpc CancelBackfill(CancelBackfillRequest) returns (CancelBackfillResponse);
   rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
+  rpc DeleteRun(DeleteRunRequest) returns (DeleteRunResponse);
 }
 
 // --- Health & info ---
@@ -406,6 +407,16 @@ message CancelRunRequest {
 }
 
 message CancelRunResponse {
+  bool success = 1;
+}
+
+// --- Run deletion (terminal runs only — the server refuses active runs) ---
+
+message DeleteRunRequest {
+  string run_id = 1;
+}
+
+message DeleteRunResponse {
   bool success = 1;
 }
 

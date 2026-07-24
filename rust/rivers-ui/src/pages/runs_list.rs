@@ -28,7 +28,7 @@ use crate::helpers::{
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::now::RelTime;
-use crate::server_fns::actions::{CancelRunsResult, cancel_runs};
+use crate::server_fns::actions::{BulkRunActionResult, cancel_runs, delete_runs};
 use crate::server_fns::locations::list_code_locations;
 use crate::server_fns::runs::{get_runs_page, get_runs_summary};
 use crate::types::{CodeLocationEntry, RunFilter, RunRecord, RunStatus, RunsSummary};
@@ -44,6 +44,59 @@ fn status_from_tab(tab: &str) -> Option<RunStatus> {
         "Starting" => Some(RunStatus::NotStarted),
         _ => None,
     }
+}
+
+type BulkAction = Action<Vec<String>, Result<BulkRunActionResult, ServerFnError>>;
+
+/// Wire a bulk action's completion: keep only the failed ids selected
+/// (retryable), refresh the page, and compose the result line shown in the
+/// bulk bar. `ok_verb` leads the success copy ("deleted", "cancel requested
+/// for"); `fail_verb` labels a whole-request failure.
+fn wire_bulk_completion(
+    action: BulkAction,
+    ok_verb: &'static str,
+    fail_verb: &'static str,
+    set_selected: WriteSignal<Vec<String>>,
+    set_refresh_tick: WriteSignal<u64>,
+    set_last_result: WriteSignal<Option<(String, bool, String)>>,
+) {
+    Effect::new(move |_| {
+        let Some(res) = action.value().get() else {
+            return;
+        };
+        match res {
+            Ok(r) => {
+                set_selected.set(r.failed.iter().map(|(id, _)| id.clone()).collect());
+                set_refresh_tick.update(|t| *t += 1);
+                let n = r.requested;
+                let noun = if n == 1 { "run" } else { "runs" };
+                if r.failed.is_empty() {
+                    set_last_result.set(Some((
+                        format!("{ok_verb} {n} {noun}"),
+                        false,
+                        String::new(),
+                    )));
+                } else {
+                    let detail = r
+                        .failed
+                        .iter()
+                        .map(|(id, e)| format!("{id}: {e}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    set_last_result.set(Some((
+                        format!("{ok_verb} {n} {noun} · {} failed", r.failed.len()),
+                        true,
+                        detail,
+                    )));
+                }
+            }
+            Err(e) => set_last_result.set(Some((
+                format!("{fail_verb} failed: {e}"),
+                true,
+                String::new(),
+            ))),
+        }
+    });
 }
 
 #[component]
@@ -84,18 +137,15 @@ pub fn RunsListPage() -> impl IntoView {
 
     let locations = Resource::new(|| (), |_| list_code_locations());
 
-    // Multiselect for bulk cancel. Ids only — rows come back from the page
-    // Resource. Pruned on every page fetch so the selection never outlives
-    // the visible page or a run that finished mid-selection.
+    // Multiselect for bulk cancel/delete. Ids only — rows come back from the
+    // page Resource. Pruned on every page fetch so the selection never
+    // outlives the visible page (a run that finishes mid-selection stays
+    // selected: it flips from cancellable to deletable).
     let (selected, set_selected) = signal(Vec::<String>::new());
     Effect::new(move |_| {
         if let Some(Ok(p)) = runs_page.get() {
-            let live: std::collections::HashSet<&str> = p
-                .rows
-                .iter()
-                .filter(|r| run_is_active(&r.status))
-                .map(|r| r.run_id.as_str())
-                .collect();
+            let live: std::collections::HashSet<&str> =
+                p.rows.iter().map(|r| r.run_id.as_str()).collect();
             let cur = selected.get_untracked();
             let keep: Vec<String> = cur
                 .iter()
@@ -108,18 +158,31 @@ pub fn RunsListPage() -> impl IntoView {
         }
     });
 
-    let cancel_action = Action::new(move |ids: &Vec<String>| {
+    let cancel_action: BulkAction = Action::new(move |ids: &Vec<String>| {
         let ids = ids.clone();
         async move { cancel_runs(ids).await }
     });
-    // On completion keep only the failed ids selected (retryable); the
-    // refresh tick pulls the new statuses in.
-    Effect::new(move |_| {
-        if let Some(Ok(res)) = cancel_action.value().get() {
-            set_selected.set(res.failed.iter().map(|(id, _)| id.clone()).collect());
-            set_refresh_tick.update(|t| *t += 1);
-        }
+    let delete_action: BulkAction = Action::new(move |ids: &Vec<String>| {
+        let ids = ids.clone();
+        async move { delete_runs(ids).await }
     });
+    let (last_result, set_last_result) = signal(None::<(String, bool, String)>);
+    wire_bulk_completion(
+        cancel_action,
+        "cancel requested for",
+        "cancel",
+        set_selected,
+        set_refresh_tick,
+        set_last_result,
+    );
+    wire_bulk_completion(
+        delete_action,
+        "deleted",
+        "delete",
+        set_selected,
+        set_refresh_tick,
+        set_last_result,
+    );
 
     // Summary is intentionally on a separate Resource with a narrower key:
     // only `refresh_tick` triggers a refetch, not filter/page/page_size.
@@ -269,6 +332,8 @@ pub fn RunsListPage() -> impl IntoView {
                         selected=selected
                         set_selected=set_selected
                         cancel_action=cancel_action
+                        delete_action=delete_action
+                        last_result=last_result
                     />
                 }.into_any()
             }}
@@ -282,36 +347,72 @@ fn RunsTable(
     locations: Vec<CodeLocationEntry>,
     selected: ReadSignal<Vec<String>>,
     set_selected: WriteSignal<Vec<String>>,
-    cancel_action: Action<Vec<String>, Result<CancelRunsResult, ServerFnError>>,
+    cancel_action: BulkAction,
+    delete_action: BulkAction,
+    last_result: ReadSignal<Option<(String, bool, String)>>,
 ) -> impl IntoView {
     let locations = std::sync::Arc::new(locations);
     let cancel_pending = cancel_action.pending();
-    let cancellable: Vec<String> = rows
-        .iter()
-        .filter(|r| run_is_active(&r.status))
-        .map(|r| r.run_id.clone())
-        .collect();
-    let n_cancellable = cancellable.len();
-    let cancellable = StoredValue::new(cancellable);
+    let delete_pending = delete_action.pending();
+    let any_pending = move || cancel_pending.get() || delete_pending.get();
+
+    // Split the visible rows once: active runs take the cancel path,
+    // terminal runs the delete path. A mixed selection shows both buttons,
+    // each acting only on its own subset.
+    let n_rows = rows.len();
+    let all_ids = StoredValue::new(rows.iter().map(|r| r.run_id.clone()).collect::<Vec<_>>());
+    let active = StoredValue::new(
+        rows.iter()
+            .filter(|r| run_is_active(&r.status))
+            .map(|r| r.run_id.clone())
+            .collect::<std::collections::HashSet<_>>(),
+    );
+    let selected_active = move || {
+        active.with_value(|a| {
+            selected
+                .get()
+                .into_iter()
+                .filter(|id| a.contains(id))
+                .collect::<Vec<_>>()
+        })
+    };
+    let selected_finished = move || {
+        active.with_value(|a| {
+            selected
+                .get()
+                .into_iter()
+                .filter(|id| !a.contains(id))
+                .collect::<Vec<_>>()
+        })
+    };
+
+    // Two-click confirm for delete; any selection change disarms. Local to
+    // the table on purpose: a live-kick re-render also resets to unarmed,
+    // which errs on the safe side.
+    let delete_armed = RwSignal::new(false);
+    Effect::new(move |_| {
+        selected.track();
+        delete_armed.set(false);
+    });
 
     view! {
-        {(n_cancellable > 0).then(|| view! {
+        {(n_rows > 0).then(|| view! {
             <div class="bulk-actions">
                 <button
                     class="bulk-link-btn"
-                    on:click=move |_| set_selected.set(cancellable.get_value())
+                    on:click=move |_| set_selected.set(all_ids.get_value())
                 >
-                    {format!("Select all cancellable ({n_cancellable})")}
+                    {format!("Select all ({n_rows})")}
                 </button>
                 <span class="bulk-sep">"·"</span>
                 <button class="bulk-link-btn" on:click=move |_| set_selected.set(Vec::new())>
                     "Clear"
                 </button>
-                <Show when=move || !selected.get().is_empty()>
+                <Show when=move || !selected_active().is_empty()>
                     <button
                         class="btn btn-danger"
-                        on:click=move |_| { cancel_action.dispatch(selected.get()); }
-                        disabled=move || cancel_pending.get()
+                        on:click=move |_| { cancel_action.dispatch(selected_active()); }
+                        disabled=any_pending
                     >
                         <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
                             <rect x="3" y="2" width="2.5" height="8"/>
@@ -321,37 +422,53 @@ fn RunsTable(
                             if cancel_pending.get() {
                                 "Canceling...".to_string()
                             } else {
-                                let n = selected.get().len();
+                                let n = selected_active().len();
                                 format!("Cancel {n} run{}", if n == 1 { "" } else { "s" })
                             }
                         }}
                     </button>
                 </Show>
-                {move || cancel_action.value().get().map(|r| match r {
-                    Ok(res) if res.failed.is_empty() => {
-                        let n = res.requested;
-                        view! {
-                            <span class="text-muted">
-                                {format!("cancel requested for {n} run{}", if n == 1 { "" } else { "s" })}
-                            </span>
-                        }.into_any()
-                    }
-                    Ok(res) => {
-                        let detail = res
-                            .failed
-                            .iter()
-                            .map(|(id, e)| format!("{id}: {e}"))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        view! {
-                            <span class="text-error" title=detail>
-                                {format!("{} requested · {} failed", res.requested, res.failed.len())}
-                            </span>
-                        }.into_any()
-                    }
-                    Err(e) => view! {
-                        <span class="text-error">{format!("cancel failed: {e}")}</span>
-                    }.into_any(),
+                <Show when=move || !selected_finished().is_empty()>
+                    <button
+                        class="btn btn-danger"
+                        on:click=move |_| {
+                            if delete_armed.get() {
+                                delete_armed.set(false);
+                                delete_action.dispatch(selected_finished());
+                            } else {
+                                delete_armed.set(true);
+                            }
+                        }
+                        disabled=any_pending
+                    >
+                        <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                            <path
+                                d="M2 3h8M4.5 3V1.8h3V3M3 3l.6 7.2h4.8L9 3M4.9 5v3.5M7.1 5v3.5"
+                                stroke="currentColor"
+                                stroke-width="1.1"
+                                stroke-linecap="round"
+                            />
+                        </svg>
+                        {move || {
+                            let n = selected_finished().len();
+                            let noun = if n == 1 { "run" } else { "runs" };
+                            if delete_pending.get() {
+                                "Deleting...".to_string()
+                            } else if delete_armed.get() {
+                                format!("Confirm delete {n} {noun}?")
+                            } else {
+                                format!("Delete {n} {noun}")
+                            }
+                        }}
+                    </button>
+                </Show>
+                {move || last_result.get().map(|(msg, is_err, detail)| view! {
+                    <span
+                        class=if is_err { "text-error" } else { "text-muted" }
+                        title=detail
+                    >
+                        {msg}
+                    </span>
                 })}
                 <span class="bulk-count">{move || format!("{} selected", selected.get().len())}</span>
             </div>
@@ -388,7 +505,6 @@ fn RunRow(
     set_selected: WriteSignal<Vec<String>>,
 ) -> impl IntoView {
     let run_id = record.run_id.clone();
-    let can_cancel = run_is_active(&record.status);
     let id_for_check = run_id.clone();
     let id_for_toggle = run_id.clone();
     let (ns, name) = use_current_location().get();
@@ -429,8 +545,6 @@ fn RunRow(
                 <input
                     class="asset-row-check"
                     type="checkbox"
-                    disabled=!can_cancel
-                    title=(!can_cancel).then_some("only queued or in-progress runs can be canceled")
                     prop:checked=move || selected.get().contains(&id_for_check)
                     on:click=move |ev| ev.stop_propagation()
                     on:change=move |_| set_selected.update(|s| {

@@ -749,6 +749,20 @@ impl CodeLocationService for CodeLocationImpl {
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(CancelRunResponse { success }))
     }
+
+    #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.delete_run")]
+    async fn delete_run(
+        &self,
+        request: Request<DeleteRunRequest>,
+    ) -> Result<Response<DeleteRunResponse>, Status> {
+        let req = request.into_inner();
+        let success = self
+            .handle
+            .delete_run(&req.run_id)
+            .await
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        Ok(Response::new(DeleteRunResponse { success }))
+    }
 }
 
 // --- Helpers ---
