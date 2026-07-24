@@ -254,6 +254,7 @@ def test_async_assets_same_level_run_concurrently():
         assets=[slow_a, slow_b, merge],
         default_executor=rs.Executor.in_process(),
     )
+    repo.resolve()  # storage open + schema apply outside the timed window
     start = time.monotonic()
     repo.materialize()
     elapsed = time.monotonic() - start
@@ -499,6 +500,7 @@ def test_in_process_async_concurrency_timing():
             )
         ],
     )
+    repo.resolve()  # storage open + schema apply outside the timed window
     start = time.monotonic()
     repo.get_job("ae_timing").execute()
     elapsed = time.monotonic() - start
@@ -539,6 +541,7 @@ def test_parallel_async_runs_in_orchestrator(tmp_path):
             )
         ],
     )
+    repo.resolve()  # storage open + schema apply outside the timed window
     start = time.monotonic()
     repo.get_job("mp_orch").execute()
     elapsed = time.monotonic() - start
@@ -666,6 +669,7 @@ def test_graph_asset_concurrent_sub_steps_in_process():
         tasks=[slow_left, slow_right, combine],
         default_executor=rs.Executor.in_process(),
     )
+    repo.resolve()  # storage open + schema apply outside the timed window
     start = time.monotonic()
     result = repo.materialize()
     elapsed = time.monotonic() - start
@@ -991,6 +995,7 @@ def test_parallel_max_async_concurrent_none_is_unbounded(tmp_path):
             )
         ],
     )
+    repo.resolve()  # storage open + schema apply outside the timed window
     start = time.monotonic()
     repo.get_job("j").execute()
     elapsed = time.monotonic() - start
