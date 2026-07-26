@@ -181,6 +181,69 @@ def test_materialize_nonexistent_returns_error(grpc_channel):
     assert exc_info.value.code() == grpc.StatusCode.INTERNAL
 
 
+@pytest.fixture
+def no_handler_grpc_channel(grpc_stubs, storage):
+    """Repo whose assets have no io_handler — selecting a downstream asset on
+    its own can't build a plan, so the launch fails after the run record exists.
+    """
+
+    @rs.Asset
+    def users():
+        return [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+
+    @rs.Asset
+    def active_users(users: list):
+        return [u for u in users if u["name"] != "Bob"]
+
+    @rs.Asset
+    def user_count(active_users: list):
+        return len(active_users)
+
+    repo = rs.CodeRepository(assets=[users, active_users, user_count])
+    repo.resolve(storage=storage)
+    port = repo._start_grpc_server("127.0.0.1", 0)
+
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+
+    pb2, pb2_grpc = grpc_stubs
+    yield channel, pb2, pb2_grpc, repo, storage
+    channel.close()
+    repo._stop_grpc_server()
+
+
+def test_materialize_launch_failure_records_reason(no_handler_grpc_channel):
+    """A launch that dies before any step runs must leave the reason in storage.
+
+    The run status alone tells the UI "failed" but not why — without an event
+    the run detail renders an empty timeline and the error only ever reaches
+    the terminal (issue #52).
+    """
+    channel, pb2, pb2_grpc, _repo, storage = no_handler_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    run_id = stub.Materialize(pb2.MaterializeRequest(selection=["user_count"])).run_id
+
+    wait_until(
+        lambda: (
+            (r := storage.get_run(run_id)) is not None
+            and r.status in ("Success", "Failure", "Canceled")
+        )
+    )
+    run = storage.get_run(run_id)
+    assert run.status == "Failure"
+    assert run.end_time is not None
+
+    events = storage.get_events_for_run(run_id)
+    launch_failed = [e for e in events if e.event_type == "RunLaunchFailed"]
+    assert len(launch_failed) == 1, f"expected a RunLaunchFailed event, got {events}"
+
+    error = dict(launch_failed[0].metadata).get("error", "")
+    # The reason the terminal printed has to be the reason the UI can read.
+    assert "user_count" in error
+    assert "io_handler" in error
+
+
 # ── Tests using full_grpc_channel (jobs, schedules, sensors, observe) ──
 
 

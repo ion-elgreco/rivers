@@ -286,7 +286,10 @@ async fn sweep_stalled_not_started(
     }
 }
 
-async fn fail_unlaunched_run(
+/// Mark a run that never reached execution `Failure` and persist the reason as
+/// a `RunLaunchFailed` event. Shared by the queue coordinator's start-timeout
+/// sweep and the direct dispatcher's launch-error path.
+pub(crate) async fn fail_unlaunched_run(
     storage: &SurrealStorage,
     code_location_id: &str,
     run_id: &str,
