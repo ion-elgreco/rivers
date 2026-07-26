@@ -51,6 +51,10 @@ axum-server.workspace = true
 json-patch = "4"
 jsonptr = "0.7"
 mimalloc = "0.1"
+# git ref→commit resolution (RFC-044): pkt-line framing for the v0 ref
+# advertisement, parsed from a buffered byte slice — same parser for the
+# HTTPS and SSH transports.
+gix-packetline = { version = "0.22", features = ["blocking-io"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

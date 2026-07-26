@@ -2,6 +2,7 @@
 //! backing `Deployment` + `Service`, and image-pull-secret handling.
 
 pub mod directory;
+pub mod git;
 pub mod image_auth;
 pub mod reconcile;
 pub mod registry;
