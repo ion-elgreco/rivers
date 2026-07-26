@@ -1,0 +1,317 @@
+//! Smart-HTTP transport arm: fetch the ref advertisement over the operator's
+//! existing rustls `reqwest` client. One GET, buffered body, no negotiation:
+//!
+//! ```text
+//! GET <repo-url>/info/refs?service=git-upload-pack
+//! ```
+//!
+//! Status mapping mirrors the registry client's philosophy: 401/403 are
+//! terminal auth failures, 404 means the repository itself is absent
+//! (terminal until the CR changes), everything else transport-level is
+//! transient. Dumb-HTTP servers (which ignore the `service` parameter and
+//! return a plain refs file) are rejected on content-type rather than
+//! producing a confusing parse error.
+
+use std::time::Duration;
+
+use reqwest::StatusCode;
+use reqwest::header::CONTENT_TYPE;
+
+use super::GitError;
+
+/// Ceiling for a buffered advertisement. Protocol v0 lists every ref, so a
+/// pathological repo could answer with a huge body; past this size the CR is
+/// a v2 `ls-refs` candidate (deferred), not something to buffer blindly.
+pub const DEFAULT_MAX_ADVERTISEMENT_BYTES: usize = 32 * 1024 * 1024;
+
+const ADVERTISEMENT_CONTENT_TYPE: &str = "application/x-git-upload-pack-advertisement";
+
+/// Credentials resolved from the CR's Secret (`username`/`password` keys —
+/// a forge token is just a password with any username).
+#[derive(Clone, Debug, Default)]
+pub enum GitAuth {
+    #[default]
+    Anonymous,
+    Basic {
+        username: String,
+        password: String,
+    },
+}
+
+/// GET the smart-HTTP ref advertisement, fully buffered. The returned bytes
+/// still carry the `# service=` preamble — `parse_advertisement` strips it.
+pub async fn fetch_advertisement(
+    client: &reqwest::Client,
+    repo_url: &str,
+    auth: &GitAuth,
+    timeout: Duration,
+) -> Result<Vec<u8>, GitError> {
+    fetch_advertisement_with_cap(
+        client,
+        repo_url,
+        auth,
+        timeout,
+        DEFAULT_MAX_ADVERTISEMENT_BYTES,
+    )
+    .await
+}
+
+pub(crate) async fn fetch_advertisement_with_cap(
+    client: &reqwest::Client,
+    repo_url: &str,
+    auth: &GitAuth,
+    timeout: Duration,
+    cap: usize,
+) -> Result<Vec<u8>, GitError> {
+    let url = format!(
+        "{}/info/refs?service=git-upload-pack",
+        repo_url.trim_end_matches('/')
+    );
+    let mut request = client.get(&url).timeout(timeout);
+    if let GitAuth::Basic { username, password } = auth {
+        request = request.basic_auth(username, Some(password));
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| GitError::Unreachable(e.to_string()))?;
+
+    match response.status() {
+        s if s.is_success() => {}
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Err(GitError::AuthFailed),
+        StatusCode::NOT_FOUND => {
+            return Err(GitError::RefNotFound(format!(
+                "repository not found at {url} (HTTP 404)"
+            )));
+        }
+        s => {
+            return Err(GitError::Unreachable(format!("HTTP {s} from {url}")));
+        }
+    }
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if !content_type.starts_with(ADVERTISEMENT_CONTENT_TYPE) {
+        return Err(GitError::Malformed(format!(
+            "server did not answer smart HTTP (content-type '{content_type}'); \
+             dumb HTTP is not supported"
+        )));
+    }
+
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| GitError::Unreachable(e.to_string()))?
+    {
+        body.extend_from_slice(&chunk);
+        if body.len() > cap {
+            return Err(GitError::Malformed(format!(
+                "advertisement exceeds {cap} bytes"
+            )));
+        }
+    }
+    Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::fixtures;
+    use super::super::{GitError, commit_for_ref, parse_advertisement};
+    use super::*;
+    use base64::Engine as _;
+    use std::time::Duration;
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    fn advertisement_response() -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", ADVERTISEMENT_CONTENT_TYPE)
+            .set_body_bytes(fixtures::http_adv())
+    }
+
+    #[tokio::test]
+    async fn fetches_and_resolves_a_branch_end_to_end() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/acme/pipelines.git/info/refs"))
+            .and(query_param("service", "git-upload-pack"))
+            .respond_with(advertisement_response())
+            .mount(&server)
+            .await;
+
+        let repo = format!("{}/acme/pipelines.git", server.uri());
+        let bytes = fetch_advertisement(&client(), &repo, &GitAuth::Anonymous, TIMEOUT)
+            .await
+            .unwrap();
+        let adv = parse_advertisement(&bytes).unwrap();
+        let resolved = commit_for_ref(&adv, &fixtures::branch("main")).unwrap();
+        assert_eq!(resolved.commit, fixtures::oid('a'));
+        assert_eq!(resolved.ref_name.as_deref(), Some("refs/heads/main"));
+    }
+
+    #[tokio::test]
+    async fn sends_basic_auth_and_normalizes_trailing_slash() {
+        let server = MockServer::start().await;
+        let expected = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("bot:s3cret")
+        );
+        // The mock only matches when the Authorization header is exactly
+        // right and the path is not doubled by the trailing slash — a wrong
+        // request falls through to wiremock's 404 and fails the test.
+        Mock::given(method("GET"))
+            .and(path("/repo.git/info/refs"))
+            .and(header("authorization", expected.as_str()))
+            .respond_with(advertisement_response())
+            .mount(&server)
+            .await;
+
+        let repo = format!("{}/repo.git/", server.uri());
+        let auth = GitAuth::Basic {
+            username: "bot".to_string(),
+            password: "s3cret".to_string(),
+        };
+        let bytes = fetch_advertisement(&client(), &repo, &auth, TIMEOUT)
+            .await
+            .unwrap();
+        assert!(!bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unauthorized_and_forbidden_are_auth_failed() {
+        for status in [401u16, 403] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let err = fetch_advertisement(
+                &client(),
+                &format!("{}/r.git", server.uri()),
+                &GitAuth::Anonymous,
+                TIMEOUT,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, GitError::AuthFailed), "HTTP {status}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_not_found_is_ref_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let err = fetch_advertisement(
+            &client(),
+            &format!("{}/gone.git", server.uri()),
+            &GitAuth::Anonymous,
+            TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, GitError::RefNotFound(ref m) if m.contains("404")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_error_is_unreachable() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let err = fetch_advertisement(
+            &client(),
+            &format!("{}/r.git", server.uri()),
+            &GitAuth::Anonymous,
+            TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, GitError::Unreachable(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn connection_refused_is_unreachable() {
+        // Port 1 needs root to bind, so nothing listens there — unlike
+        // "drop a MockServer and reuse its port", which races against a
+        // concurrent test's server grabbing the freed port.
+        let err = fetch_advertisement(
+            &client(),
+            "http://127.0.0.1:1/r.git",
+            &GitAuth::Anonymous,
+            TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, GitError::Unreachable(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dumb_http_server_is_rejected_on_content_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain; charset=utf-8")
+                    .set_body_bytes(fixtures::ssh_adv()),
+            )
+            .mount(&server)
+            .await;
+        let err = fetch_advertisement(
+            &client(),
+            &format!("{}/r.git", server.uri()),
+            &GitAuth::Anonymous,
+            TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, GitError::Malformed(ref m) if m.contains("smart")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_advertisement_is_rejected() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", ADVERTISEMENT_CONTENT_TYPE)
+                    .set_body_bytes(vec![0u8; 256]),
+            )
+            .mount(&server)
+            .await;
+        let err = fetch_advertisement_with_cap(
+            &client(),
+            &format!("{}/r.git", server.uri()),
+            &GitAuth::Anonymous,
+            TIMEOUT,
+            64,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, GitError::Malformed(ref m) if m.contains("exceeds")),
+            "{err}"
+        );
+    }
+}

@@ -18,6 +18,8 @@
 //! peeled commit (`refs/tags/x^{}`); resolution prefers the peel so the
 //! pinned value is always a commit, matching `git ls-remote`'s behaviour.
 
+pub mod http;
+
 use gix_packetline::PacketLineRef;
 use gix_packetline::blocking_io::StreamingPeekableIter;
 use rivers_k8s::crd::code_location::GitRef;
@@ -28,10 +30,17 @@ const UPLOAD_PACK_SERVICE: &[u8] = b"git-upload-pack";
 
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
-    /// The requested ref is not in the advertisement. Terminal until the CR
-    /// or the remote changes.
+    /// The requested ref is not in the advertisement (or, over HTTP, the
+    /// repository itself was not found). Terminal until the CR or the
+    /// remote changes.
     #[error("ref not found: {0}")]
     RefNotFound(String),
+    /// Credentials rejected. Terminal until the Secret changes.
+    #[error("git authentication failed")]
+    AuthFailed,
+    /// Transport-level failure (connect, timeout, 5xx). Transient.
+    #[error("git host unreachable: {0}")]
+    Unreachable(String),
     /// The response was not a protocol-v0 ref advertisement.
     #[error("malformed advertisement: {0}")]
     Malformed(String),
@@ -211,33 +220,35 @@ pub fn commit_for_ref(adv: &Advertisement, wanted: &GitRef) -> Result<ResolvedRe
     ))
 }
 
+/// Byte-stream fixtures shared by the parser tests and the transport tests —
+/// the same table drives both, which is what proves the parser is shared.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod fixtures {
+    use rivers_k8s::crd::code_location::GitRef;
 
-    fn oid(c: char) -> String {
+    pub fn oid(c: char) -> String {
         c.to_string().repeat(40)
     }
 
-    fn pkt(payload: &str) -> Vec<u8> {
+    pub fn pkt(payload: &str) -> Vec<u8> {
         let mut v = format!("{:04x}", payload.len() + 4).into_bytes();
         v.extend_from_slice(payload.as_bytes());
         v
     }
 
-    fn flush() -> Vec<u8> {
+    pub fn flush() -> Vec<u8> {
         b"0000".to_vec()
     }
 
     /// pkt-encode `lines` and terminate with a flush-pkt.
-    fn body(lines: &[String]) -> Vec<u8> {
+    pub fn body(lines: &[String]) -> Vec<u8> {
         let mut v: Vec<u8> = lines.iter().flat_map(|l| pkt(l)).collect();
         v.extend(flush());
         v
     }
 
     /// The advertisement exactly as `git-upload-pack` emits it over SSH.
-    fn ssh_adv() -> Vec<u8> {
+    pub fn ssh_adv() -> Vec<u8> {
         body(&[
             format!(
                 "{} HEAD\0multi_ack thin-pack symref=HEAD:refs/heads/main agent=git/2.43.0\n",
@@ -253,26 +264,32 @@ mod tests {
     }
 
     /// The same advertisement behind the smart-HTTP service preamble.
-    fn http_adv() -> Vec<u8> {
+    pub fn http_adv() -> Vec<u8> {
         let mut v = pkt("# service=git-upload-pack\n");
         v.extend(flush());
         v.extend(ssh_adv());
         v
     }
 
-    fn branch(name: &str) -> GitRef {
+    pub fn branch(name: &str) -> GitRef {
         GitRef {
             branch: Some(name.to_string()),
             ..Default::default()
         }
     }
 
-    fn tag(name: &str) -> GitRef {
+    pub fn tag(name: &str) -> GitRef {
         GitRef {
             tag: Some(name.to_string()),
             ..Default::default()
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
 
     #[test]
     fn parses_ssh_form_and_matches_branch() {
