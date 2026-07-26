@@ -8,9 +8,8 @@ use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::materialize_dialog::MaterializeDialog;
 use crate::components::multi_select::{MultiSelect, SelectOption};
 use crate::components::ui_kit::{Crumb, DagMinimap, KindBadge, MinimapNode, Tag, Topbar};
-use crate::helpers::{JobPartitionPicker, partition_picker_for_assets, use_query_param_list};
+use crate::helpers::{partition_picker_for_assets, use_query_param_list};
 use crate::loc::{loc_path, use_current_location};
-use crate::server_fns::actions::trigger_materialize;
 use crate::server_fns::assets::{get_asset, get_assets};
 use crate::server_fns::graph::{get_graph_layout, get_graph_topology, get_node_lineage};
 use crate::server_fns::overview::get_assets_info;
@@ -30,6 +29,73 @@ fn get_element_size(target: &Option<leptos::web_sys::EventTarget>) -> (f64, f64)
         let _ = target;
     }
     (0.0, 0.0)
+}
+
+/// True when a click landed on empty canvas rather than on a node, an edge, or
+/// the overlay chrome (zoom buttons, legend, minimap, context menu). Blank space
+/// inside the graph targets the `<svg>` element itself; the zoom-control icons
+/// are also `<svg>`, so the parent must be the `.dag-container`.
+fn is_bare_canvas_click(ev: &leptos::ev::MouseEvent) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use leptos::wasm_bindgen::JsCast;
+        let Some(el) = ev
+            .target()
+            .and_then(|t| t.dyn_into::<leptos::web_sys::Element>().ok())
+        else {
+            return false;
+        };
+        if !el.tag_name().eq_ignore_ascii_case("svg") {
+            return false;
+        }
+        return el
+            .parent_element()
+            .map(|p| p.class_list().contains("dag-container"))
+            .unwrap_or(false);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = ev;
+        false
+    }
+}
+
+/// Client coordinates → coordinates relative to the viewport element, which
+/// is what the absolutely-positioned context menu is placed against.
+fn viewport_relative(
+    viewport_ref: NodeRef<leptos::html::Div>,
+    client_x: f64,
+    client_y: f64,
+) -> (f64, f64) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(el) = viewport_ref.get_untracked() {
+            let rect = el.get_bounding_client_rect();
+            return (client_x - rect.left(), client_y - rect.top());
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = viewport_ref;
+    }
+    (client_x, client_y)
+}
+
+/// Selection transition for a node click. A plain click replaces the whole
+/// selection; shift/ctrl/cmd toggles a single node. Click order is preserved
+/// so the last entry is always the focused node.
+fn apply_node_click(selected: &[String], node: &str, additive: bool) -> Vec<String> {
+    if !additive {
+        return vec![node.to_string()];
+    }
+    let mut next = selected.to_vec();
+    match next.iter().position(|k| k == node) {
+        Some(pos) => {
+            next.remove(pos);
+        }
+        None => next.push(node.to_string()),
+    }
+    next
 }
 
 #[component]
@@ -62,7 +128,9 @@ pub fn GraphPage() -> impl IntoView {
         300,
         Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
     );
-    let (selected_node, set_selected_node) = signal(None::<String>);
+    // Multi-selection in click order; the last entry is the focused node.
+    let (selected_nodes, set_selected_nodes) = signal(Vec::<String>::new());
+    let focused_node = Signal::derive(move || selected_nodes.get().last().cloned());
     let (filter_kind, set_filter_kind) = use_query_param_list("kind");
     let (filter_group, set_filter_group) = use_query_param_list("group");
 
@@ -74,6 +142,21 @@ pub fn GraphPage() -> impl IntoView {
                 t.nodes
                     .iter()
                     .filter(|n| n.kind == "graph_asset")
+                    .map(|n| n.name.clone())
+                    .collect::<std::collections::HashSet<String>>()
+            })
+            .unwrap_or_default()
+    });
+
+    // Task nodes can be selected for lineage tracing but never materialized.
+    let task_node_names = Signal::derive(move || {
+        topology
+            .get()
+            .and_then(|r| r.ok())
+            .map(|t| {
+                t.nodes
+                    .iter()
+                    .filter(|n| n.kind == "task")
                     .map(|n| n.name.clone())
                     .collect::<std::collections::HashSet<String>>()
             })
@@ -132,7 +215,7 @@ pub fn GraphPage() -> impl IntoView {
     });
 
     let asset_detail = Resource::new(
-        move || (loc.get(), selected_node.get()),
+        move || (loc.get(), focused_node.get()),
         |((ns, name), key)| async move {
             match key {
                 Some(k) => get_asset(ns, name, k).await,
@@ -142,7 +225,7 @@ pub fn GraphPage() -> impl IntoView {
     );
 
     let lineage = Resource::new(
-        move || (selected_node.get(), loc.get()),
+        move || (focused_node.get(), loc.get()),
         |(key, (ns, name))| async move {
             match key {
                 Some(k) => get_node_lineage(ns, name, k).await.ok(),
@@ -173,14 +256,8 @@ pub fn GraphPage() -> impl IntoView {
             .unwrap_or_default()
     });
 
-    let materialize_action = Action::new(move |key: &String| {
-        let k = key.clone();
-        let (ns, name) = loc.get();
-        async move { trigger_materialize(ns, name, Some(vec![k]), None, None).await }
-    });
-
-    // Materialize routing: partitioned node → picker dialog, else one-click run.
-    // `mat_target` is the asset the dialog acts on.
+    // Materialize always routes through the dialog so the user previews the
+    // asset list (and partition keys) before anything launches.
     let asset_info_by_key = Signal::derive(move || {
         assets_info
             .get()
@@ -190,25 +267,20 @@ pub fn GraphPage() -> impl IntoView {
             .map(|i| (i.asset_key.clone(), i))
             .collect::<std::collections::HashMap<String, crate::types::AssetDefinitionInfo>>()
     });
-    let (mat_target, set_mat_target) = signal(None::<String>);
+    let (mat_targets, set_mat_targets) = signal(Vec::<String>::new());
     let show_dialog = RwSignal::new(false);
-    let materialize_picker = Signal::derive(move || match mat_target.get() {
-        Some(k) => partition_picker_for_assets(&[k], &asset_info_by_key.get()),
-        None => JobPartitionPicker::None,
+    let materialize_picker = Signal::derive(move || {
+        partition_picker_for_assets(&mat_targets.get(), &asset_info_by_key.get())
     });
-    let dialog_asset_keys =
-        Signal::derive(move || mat_target.get().map(|k| vec![k]).unwrap_or_default());
-    let start_materialize: Callback<String> = Callback::new(move |key: String| {
-        let picker = partition_picker_for_assets(
-            std::slice::from_ref(&key),
-            &asset_info_by_key.get_untracked(),
-        );
-        if matches!(picker, JobPartitionPicker::None) {
-            materialize_action.dispatch(key);
-        } else {
-            set_mat_target.set(Some(key));
-            show_dialog.set(true);
+    let dialog_asset_keys = Signal::derive(move || mat_targets.get());
+    let start_materialize: Callback<Vec<String>> = Callback::new(move |keys: Vec<String>| {
+        let tasks = task_node_names.get_untracked();
+        let keys: Vec<String> = keys.into_iter().filter(|k| !tasks.contains(k)).collect();
+        if keys.is_empty() {
+            return;
         }
+        set_mat_targets.set(keys);
+        show_dialog.set(true);
     });
 
     let all_kinds = Signal::derive(move || {
@@ -437,6 +509,14 @@ pub fn GraphPage() -> impl IntoView {
                 }
                 on:mouseup=move |_| set_dragging.set(false)
                 on:mouseleave=move |_| set_dragging.set(false)
+                on:click=move |ev| {
+                    if is_bare_canvas_click(&ev)
+                        && !(ev.shift_key() || ev.ctrl_key() || ev.meta_key())
+                    {
+                        set_selected_nodes.set(Vec::new());
+                        set_ctx_menu.set(None);
+                    }
+                }
             >
                     {move || {
                         layout.get().map(|result| match result {
@@ -498,7 +578,9 @@ pub fn GraphPage() -> impl IntoView {
                                 let ext_keys = external_keys.get();
                                 let anc_keys = ancestor_keys.get();
                                 let desc_keys = descendant_keys.get();
-                                let sel_node = selected_node.get().unwrap_or_default();
+                                let sel_set: std::collections::HashSet<String> =
+                                    selected_nodes.get().into_iter().collect();
+                                let focus_node = focused_node.get().unwrap_or_default();
 
                                 let ga_names = graph_asset_names.get();
                                 let exp_graphs = expanded_graphs.get();
@@ -523,28 +605,34 @@ pub fn GraphPage() -> impl IntoView {
                                     .collect();
                                 let anc_for_mini = anc_keys.clone();
                                 let desc_for_mini = desc_keys.clone();
-                                let sel_for_mini = sel_node.clone();
+                                let sel_for_mini = focus_node.clone();
                                 view! {
                                     <DagGraph
                                         layout=layout_result
-                                        on_node_click=Callback::new(move |name: String| {
+                                        on_node_click=Callback::new(move |(name, additive): (String, bool)| {
                                             let ga = graph_asset_names.get_untracked();
-                                            if ga.contains(&name) {
+                                            if !additive && ga.contains(&name) {
                                                 set_expanded_graphs.update(|set| {
                                                     if !set.remove(&name) {
                                                         set.insert(name.clone());
                                                     }
                                                 });
                                             }
-                                            set_selected_node.set(Some(name));
+                                            set_selected_nodes
+                                                .update(|sel| *sel = apply_node_click(sel, &name, additive));
                                             set_ctx_menu.set(None);
+                                        })
+                                        on_node_context=Callback::new(move |(name, cx, cy): (String, f64, f64)| {
+                                            let (x, y) = viewport_relative(viewport_ref, cx, cy);
+                                            set_ctx_menu.set(Some((x, y, name)));
                                         })
                                         materialized_keys=mat_keys
                                         stale_keys=stl_keys
                                         external_keys=ext_keys
                                         ancestor_keys=anc_keys
                                         descendant_keys=desc_keys
-                                        selected_node=sel_node
+                                        selected_nodes=sel_set
+                                        focused_node=focus_node
                                         viewport=viewport
                                         graph_asset_names=ga_names
                                         expanded_graphs=exp_graphs
@@ -568,7 +656,7 @@ pub fn GraphPage() -> impl IntoView {
                     }}
 
                 <div class="dag-legend">
-                    <div class="dag-legend-hint">"hover a node to trace flow"</div>
+                    <div class="dag-legend-hint">"click to select · shift-click to add · right-click for actions"</div>
                     <div class="dag-legend-row">
                         <span class="dag-legend-item"><span class="dag-legend-dot dag-legend-dot--success"></span>"materialized"</span>
                         <span class="dag-legend-item"><span class="dag-legend-dot dag-legend-dot--running"></span>"running"</span>
@@ -580,15 +668,31 @@ pub fn GraphPage() -> impl IntoView {
                 {move || {
                     ctx_menu.get().map(|(x, y, node_name)| {
                         let name_for_mat = node_name.clone();
+                        let name_for_ctx_label = node_name.clone();
                         let name_for_detail = node_name.clone();
                         view! {
                             <div class="context-menu" style=format!("left: {x}px; top: {y}px")>
                                 <button class="context-menu-item" on:click=move |_| {
-                                    start_materialize.run(name_for_mat.clone());
+                                    // Right-clicking inside a multi-selection acts on the
+                                    // whole selection; outside it, on just that node.
+                                    let sel = selected_nodes.get_untracked();
+                                    let targets = if sel.contains(&name_for_mat) {
+                                        sel
+                                    } else {
+                                        vec![name_for_mat.clone()]
+                                    };
+                                    start_materialize.run(targets);
                                     set_ctx_menu.set(None);
-                                }>"Materialize"</button>
+                                }>{move || {
+                                    let sel = selected_nodes.get();
+                                    if sel.len() > 1 && sel.contains(&name_for_ctx_label) {
+                                        format!("Materialize {} assets…", sel.len())
+                                    } else {
+                                        "Materialize…".to_string()
+                                    }
+                                }}</button>
                                 <button class="context-menu-item" on:click=move |_| {
-                                    set_selected_node.set(Some(name_for_detail.clone()));
+                                    set_selected_nodes.set(vec![name_for_detail.clone()]);
                                     set_ctx_menu.set(None);
                                 }>"View Details"</button>
                             </div>
@@ -634,13 +738,90 @@ pub fn GraphPage() -> impl IntoView {
             </div>
 
             {move || {
-                selected_node.get().map(|node_name| {
+                let sel = selected_nodes.get();
+                if sel.is_empty() {
+                    return None;
+                }
+
+                // More than one node selected → summarize the selection instead of
+                // one asset's detail, so it's obvious what a materialize would cover.
+                if sel.len() > 1 {
+                    let tasks = task_node_names.get();
+                    let mat_keys: Vec<String> =
+                        sel.iter().filter(|k| !tasks.contains(*k)).cloned().collect();
+                    let n_mat = mat_keys.len();
+                    let n_skipped = sel.len() - n_mat;
+                    let sel_for_list = sel.clone();
+                    return Some(view! {
+                        <div class="dag-selected-sidebar">
+                            <div class="dag-sidebar-header">
+                                <div class="dag-sidebar-status dag-sidebar-status--healthy">
+                                    <span class="dag-sidebar-status-dot"></span>
+                                    <span>{format!("{} SELECTED", sel.len())}</span>
+                                </div>
+                                <button
+                                    class="dag-sidebar-close"
+                                    on:click=move |_| set_selected_nodes.set(Vec::new())
+                                    title="Clear selection"
+                                >"×"</button>
+                            </div>
+
+                            <div class="dag-sidebar-section">
+                                <div class="section-header-label">"SELECTION"</div>
+                                <div class="dag-sidebar-links">
+                                    {sel_for_list.into_iter().map(|k| {
+                                        let k_for_focus = k.clone();
+                                        let k_for_drop = k.clone();
+                                        view! {
+                                            <div class="dag-sidebar-sel-row">
+                                                <button
+                                                    class="dag-sidebar-link"
+                                                    title="Show details"
+                                                    on:click=move |_| set_selected_nodes.set(vec![k_for_focus.clone()])
+                                                >{k}</button>
+                                                <button
+                                                    class="dag-sidebar-sel-drop"
+                                                    title="Remove from selection"
+                                                    on:click=move |_| set_selected_nodes.update(|s| {
+                                                        *s = apply_node_click(s, &k_for_drop, true);
+                                                    })
+                                                >"×"</button>
+                                            </div>
+                                        }
+                                    }).collect::<Vec<_>>()}
+                                </div>
+                            </div>
+
+                            {(n_skipped > 0).then(|| view! {
+                                <div class="dag-sidebar-empty">
+                                    {format!("{n_skipped} task node(s) can't be materialized directly")}
+                                </div>
+                            })}
+
+                            <div class="dag-sidebar-footer">
+                                <button
+                                    class="btn btn-primary dag-sidebar-action"
+                                    disabled=n_mat == 0
+                                    on:click=move |_| { start_materialize.run(mat_keys.clone()); }
+                                >
+                                    <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+                                        <path d="M3 2l7 4-7 4V2z"/>
+                                    </svg>
+                                    {format!("Materialize {n_mat} assets…")}
+                                </button>
+                            </div>
+                        </div>
+                    }.into_any());
+                }
+
+                let node_name = sel[0].clone();
+                {
                     let topo = topology.get().and_then(|r| r.ok());
                     let (upstream, downstream): (Vec<String>, Vec<String>) = topo
                         .map(|t| (t.direct_upstream(&node_name), t.direct_downstream(&node_name)))
                         .unwrap_or_default();
 
-                    view! {
+                    Some(view! {
                         <div class="dag-selected-sidebar">
                             <Transition fallback=move || view! { <div class="loading">"Loading..."</div> }>
                                 {move || {
@@ -649,6 +830,7 @@ pub fn GraphPage() -> impl IntoView {
                                             let (lns, lnm) = loc.get();
                                             let href = loc_path(&lns, &lnm, &format!("assets/{}", record.asset_key));
                                             let mat_key = record.asset_key.clone();
+                                            let is_task = task_node_names.get().contains(&record.asset_key);
                                             let (status_word, status_cls) = match record.stale_status {
                                                 crate::types::StaleStatus::UpToDate => ("UP-TO-DATE", "dag-sidebar-status--healthy"),
                                                 crate::types::StaleStatus::Stale => ("STALE", "dag-sidebar-status--stale"),
@@ -673,7 +855,7 @@ pub fn GraphPage() -> impl IntoView {
                                                     </div>
                                                     <button
                                                         class="dag-sidebar-close"
-                                                        on:click=move |_| set_selected_node.set(None)
+                                                        on:click=move |_| set_selected_nodes.set(Vec::new())
                                                         title="Close"
                                                     >"×"</button>
                                                 </div>
@@ -707,7 +889,7 @@ pub fn GraphPage() -> impl IntoView {
                                                                     view! {
                                                                         <button
                                                                             class="dag-sidebar-link"
-                                                                            on:click=move |_| set_selected_node.set(Some(u_for_click.clone()))
+                                                                            on:click=move |_| set_selected_nodes.set(vec![u_for_click.clone()])
                                                                         >
                                                                             <span class="dag-sidebar-link-arrow">"↑"</span>{u}
                                                                         </button>
@@ -730,7 +912,7 @@ pub fn GraphPage() -> impl IntoView {
                                                                     view! {
                                                                         <button
                                                                             class="dag-sidebar-link"
-                                                                            on:click=move |_| set_selected_node.set(Some(d_for_click.clone()))
+                                                                            on:click=move |_| set_selected_nodes.set(vec![d_for_click.clone()])
                                                                         >
                                                                             <span class="dag-sidebar-link-arrow">"↓"</span>{d}
                                                                         </button>
@@ -745,12 +927,14 @@ pub fn GraphPage() -> impl IntoView {
                                                     <A href={href} attr:class="btn btn-tertiary dag-sidebar-action">"Details"</A>
                                                     <button
                                                         class="btn btn-primary dag-sidebar-action"
-                                                        on:click=move |_| { start_materialize.run(mat_key.clone()); }
+                                                        disabled=is_task
+                                                        title=if is_task { "Task nodes materialize with their parent graph asset" } else { "Preview and materialize this asset" }
+                                                        on:click=move |_| { start_materialize.run(vec![mat_key.clone()]); }
                                                     >
                                                         <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
                                                             <path d="M3 2l7 4-7 4V2z"/>
                                                         </svg>
-                                                        "Materialize"
+                                                        "Materialize…"
                                                     </button>
                                                 </div>
                                             }.into_any()
@@ -761,8 +945,8 @@ pub fn GraphPage() -> impl IntoView {
                                 }}
                             </Transition>
                         </div>
-                    }
-                })
+                    }.into_any())
+                }
             }}
         </div>
         </Transition>
@@ -772,5 +956,61 @@ pub fn GraphPage() -> impl IntoView {
             asset_keys=dialog_asset_keys
             picker=materialize_picker
         />
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_node_click;
+
+    fn keys(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn plain_click_replaces_selection() {
+        assert_eq!(
+            apply_node_click(&keys(&["a", "b"]), "c", false),
+            keys(&["c"])
+        );
+    }
+
+    #[test]
+    fn plain_click_on_selected_node_keeps_it_selected() {
+        assert_eq!(
+            apply_node_click(&keys(&["a", "b"]), "a", false),
+            keys(&["a"])
+        );
+    }
+
+    #[test]
+    fn additive_click_appends_in_click_order() {
+        assert_eq!(
+            apply_node_click(&keys(&["a"]), "b", true),
+            keys(&["a", "b"])
+        );
+    }
+
+    #[test]
+    fn additive_click_toggles_off_an_already_selected_node() {
+        assert_eq!(
+            apply_node_click(&keys(&["a", "b", "c"]), "b", true),
+            keys(&["a", "c"])
+        );
+    }
+
+    #[test]
+    fn additive_click_on_empty_selection_selects_one() {
+        assert_eq!(apply_node_click(&[], "a", true), keys(&["a"]));
+    }
+
+    #[test]
+    fn last_entry_is_the_focused_node() {
+        // The sidebar/lineage read `selected.last()`, so re-adding a node has to
+        // move focus to it rather than leaving focus on a stale entry.
+        let sel = apply_node_click(&keys(&["a", "b"]), "b", true);
+        assert_eq!(sel.last().map(String::as_str), Some("a"));
+        let sel = apply_node_click(&sel, "b", true);
+        assert_eq!(sel.last().map(String::as_str), Some("b"));
     }
 }
