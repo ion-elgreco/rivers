@@ -72,7 +72,7 @@ fn full_lod_renders_one_dag_node_group_per_layout_node() {
         view! {
             <DagGraph
                 layout=small_layout()
-                on_node_click=Callback::new(|_id: String| {})
+                on_node_click=Callback::new(|_: (String, bool)| {})
                 viewport=Signal::derive(move || viewport.get())
             />
         }
@@ -92,7 +92,7 @@ async fn micro_lod_collapses_edges_into_single_path() {
         view! {
             <DagGraph
                 layout=small_layout()
-                on_node_click=Callback::new(|_id: String| {})
+                on_node_click=Callback::new(|_: (String, bool)| {})
                 viewport=Signal::derive(move || viewport.get())
             />
         }
@@ -188,13 +188,15 @@ fn external_node_uses_dashed_capsule_stroke() {
 fn selected_node_emits_pulsing_halo_rect() {
     let target = fresh_mount_target();
     let viewport = RwSignal::new((-50.0_f64, -50.0_f64, 800.0_f64, 200.0_f64));
+    let sel: HashSet<String> = ["middle".to_string()].into_iter().collect();
     let _handle = mount_to(target.clone(), move || {
         view! {
             <DagGraph
                 layout=small_layout()
                 on_node_click=Callback::new(|_| {})
                 viewport=Signal::derive(move || viewport.get())
-                selected_node="middle".to_string()
+                selected_nodes=sel.clone()
+                focused_node="middle".to_string()
             />
         }
     });
@@ -208,6 +210,56 @@ fn selected_node_emits_pulsing_halo_rect() {
 }
 
 #[wasm_bindgen_test]
+fn every_selected_node_carries_the_selected_class() {
+    // Multi-select: the class is what CSS hangs the glow + no-dim rules on, so
+    // it has to land on all of them, not just the focused one.
+    let target = fresh_mount_target();
+    let viewport = RwSignal::new((-50.0_f64, -50.0_f64, 800.0_f64, 200.0_f64));
+    let sel: HashSet<String> = ["middle".to_string(), "upstream".to_string()]
+        .into_iter()
+        .collect();
+    let _handle = mount_to(target.clone(), move || {
+        view! {
+            <DagGraph
+                layout=small_layout()
+                on_node_click=Callback::new(|_| {})
+                viewport=Signal::derive(move || viewport.get())
+                selected_nodes=sel.clone()
+                focused_node="middle".to_string()
+            />
+        }
+    });
+
+    assert_eq!(query_all(&target, "g.dag-node--selected").len(), 2);
+}
+
+#[wasm_bindgen_test]
+async fn shift_click_reports_an_additive_selection() {
+    let target = fresh_mount_target();
+    let viewport = RwSignal::new((-50.0_f64, -50.0_f64, 800.0_f64, 200.0_f64));
+    let captured = RwSignal::new(Vec::<(String, bool)>::new());
+    let _handle = mount_to(target.clone(), move || {
+        view! {
+            <DagGraph
+                layout=small_layout()
+                on_node_click=Callback::new(move |hit: (String, bool)| {
+                    captured.update(|v| v.push(hit))
+                })
+                viewport=Signal::derive(move || viewport.get())
+            />
+        }
+    });
+
+    let first_node = query_one(&target, "g.dag-node");
+    common::click(&first_node, true);
+    flush_effects().await;
+
+    let got = captured.get_untracked();
+    assert_eq!(got.len(), 1);
+    assert!(got[0].1, "shift-click must be reported as additive");
+}
+
+#[wasm_bindgen_test]
 async fn click_on_node_invokes_callback_with_node_id() {
     let target = fresh_mount_target();
     let viewport = RwSignal::new((-50.0_f64, -50.0_f64, 800.0_f64, 200.0_f64));
@@ -216,7 +268,9 @@ async fn click_on_node_invokes_callback_with_node_id() {
         view! {
             <DagGraph
                 layout=small_layout()
-                on_node_click=Callback::new(move |id: String| { captured.update(|v| v.push(id)) })
+                on_node_click=Callback::new(move |(id, _additive): (String, bool)| {
+                    captured.update(|v| v.push(id))
+                })
                 viewport=Signal::derive(move || viewport.get())
             />
         }

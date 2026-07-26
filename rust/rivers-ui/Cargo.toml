@@ -113,6 +113,10 @@ web-sys = { version = "0.3", features = [
     "AbortController",
     "AbortSignal",
     "AddEventListenerOptions",
+    # Lineage canvas: context-menu placement (getBoundingClientRect) and
+    # distinguishing a bare-canvas click from the overlay chrome (classList).
+    "DomRect",
+    "DomTokenList",
 ], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
