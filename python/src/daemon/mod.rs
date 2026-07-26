@@ -41,6 +41,7 @@ pub(crate) use dispatchers::{BackfillDispatcherKind, RunDispatcherKind};
 use eval_dispatcher::EvalDispatcher;
 use schedule::ScheduleInfo;
 use sensors::SensorInfo;
+pub(crate) use subdaemons::fail_unlaunched_run;
 use subdaemons::{
     spawn_backfill_monitor, spawn_backfill_pickup_loop, spawn_run_queue_coordinator,
     spawn_schedule_sensor_loop,

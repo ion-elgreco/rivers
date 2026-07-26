@@ -1357,31 +1357,17 @@ pub(crate) struct RunSubmission {
 impl RepoHandle {
     /// Best-effort: fail a `Started` run whose launch never began (e.g. the
     /// interpreter was finalizing), so it can't wedge in-flight gating forever.
+    /// `reason` is persisted on a `RunLaunchFailed` event — without it the run
+    /// detail has an empty timeline and the error only reaches the terminal.
     pub(crate) async fn mark_run_launch_failed(&self, run_id: &str, reason: &str) {
-        let storage = {
+        let (storage, code_location_id) = {
             let guard = self.state.read().unwrap();
             match guard.as_ref() {
-                Some(state) => state.storage.clone(),
+                Some(state) => (state.storage.clone(), state.code_location_id.clone()),
                 None => return,
             }
         };
-        match storage
-            .update_run_status(run_id, RunStatus::Failure, Some(now_ts()))
-            .await
-        {
-            Ok(()) => tracing::error!(
-                target: "rivers::daemon",
-                run_id = %run_id,
-                reason,
-                "run never launched; marked failed"
-            ),
-            Err(e) => tracing::error!(
-                target: "rivers::daemon",
-                run_id = %run_id,
-                error = %e,
-                "failed to fail-out an unlaunched run; it will read as in-flight until manual intervention"
-            ),
-        }
+        crate::daemon::fail_unlaunched_run(&storage, &code_location_id, run_id, reason).await;
     }
 
     /// Look up a user-defined job's asset selection. `None` if the repo
