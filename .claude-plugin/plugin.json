@@ -1,0 +1,9 @@
+{
+  "name": "rivers",
+  "version": "0.1.0",
+  "description": "Skills for working with rivers, the Rust-powered asset orchestration platform",
+  "author": {
+    "name": "ion-elgreco",
+    "url": "https://github.com/ion-elgreco/rivers"
+  }
+}
