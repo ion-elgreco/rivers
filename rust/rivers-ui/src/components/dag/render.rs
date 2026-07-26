@@ -55,7 +55,12 @@ fn lod_level(viewport_w: f64) -> u8 {
 #[component]
 pub fn DagGraph(
     layout: LayoutResult,
-    #[prop(optional)] on_node_click: Option<Callback<String>>,
+    /// `(node id, additive)` — additive is true when shift/ctrl/cmd is held.
+    #[prop(optional)]
+    on_node_click: Option<Callback<(String, bool)>>,
+    /// Right-click on a node: `(node id, client_x, client_y)`.
+    #[prop(optional)]
+    on_node_context: Option<Callback<(String, f64, f64)>>,
     #[prop(optional)] materialized_keys: HashSet<String>,
     /// Subset of `materialized_keys` whose `stale_status == Stale` — drives the
     /// orange dot variant so the renderer doesn't fall back to the all-or-nothing
@@ -65,7 +70,10 @@ pub fn DagGraph(
     #[prop(optional)] external_keys: HashSet<String>,
     #[prop(optional)] ancestor_keys: HashSet<String>,
     #[prop(optional)] descendant_keys: HashSet<String>,
-    #[prop(optional)] selected_node: String,
+    #[prop(optional)] selected_nodes: HashSet<String>,
+    /// Last-clicked selected node — drives lineage flow coloring.
+    #[prop(optional)]
+    focused_node: String,
     #[prop(optional)] graph_asset_names: HashSet<String>,
     #[prop(optional)] expanded_graphs: HashSet<String>,
     /// Viewport bounds in SVG coordinates: (x, y, width, height)
@@ -76,7 +84,7 @@ pub fn DagGraph(
     #[prop(optional)]
     changed_keys: HashSet<String>,
 ) -> impl IntoView {
-    let has_selection = !selected_node.is_empty();
+    let has_selection = !selected_nodes.is_empty();
     let node_ref_map: HashMap<String, &LayoutNode> =
         layout.nodes.iter().map(|n| (n.id.clone(), n)).collect();
 
@@ -179,12 +187,14 @@ pub fn DagGraph(
                 {
                 let edge_anc = ancestor_keys.clone();
                 let edge_desc = descendant_keys.clone();
-                let edge_sel = selected_node.clone();
+                let edge_sel = selected_nodes.clone();
+                let edge_focus = focused_node.clone();
                 move || {
                     let cur_lod = lod.get();
                     let anc = &edge_anc;
                     let desc = &edge_desc;
                     let sel = &edge_sel;
+                    let focus = &edge_focus;
 
                     if cur_lod >= 2 {
                         // Micro LOD: batch all edges into a single path for minimal DOM
@@ -205,9 +215,7 @@ pub fn DagGraph(
                         // Build lineage node set for edge dimming
                         let lineage_set: HashSet<&str> = if has_selection {
                             let mut s: HashSet<&str> = HashSet::new();
-                            if !sel.is_empty() {
-                                s.insert(sel.as_str());
-                            }
+                            s.extend(sel.iter().map(|s| s.as_str()));
                             s.extend(anc.iter().map(|s| s.as_str()));
                             s.extend(desc.iter().map(|s| s.as_str()));
                             s
@@ -227,10 +235,10 @@ pub fn DagGraph(
                                     // Upstream (both endpoints are ancestors or the selected node): secondary/cyan.
                                     // Downstream (both are descendants or selected): primary/rust.
                                     let (edge_stroke, flowing) = if has_selection && edge_in_lineage {
-                                        let src_anc = anc.contains(&e.source) || sel == &e.source;
-                                        let tgt_anc = anc.contains(&e.target) || sel == &e.target;
-                                        let src_desc = desc.contains(&e.source) || sel == &e.source;
-                                        let tgt_desc = desc.contains(&e.target) || sel == &e.target;
+                                        let src_anc = anc.contains(&e.source) || focus == &e.source;
+                                        let tgt_anc = anc.contains(&e.target) || focus == &e.target;
+                                        let src_desc = desc.contains(&e.source) || focus == &e.source;
+                                        let tgt_desc = desc.contains(&e.target) || focus == &e.target;
                                         if src_anc && tgt_anc {
                                             ("#50e1f9", true)
                                         } else if src_desc && tgt_desc {
@@ -268,7 +276,7 @@ pub fn DagGraph(
                     let ext_keys = &external_keys;
                     let anc_keys = &ancestor_keys;
                     let desc_keys = &descendant_keys;
-                    let sel_node = &selected_node;
+                    let sel_nodes = &selected_nodes;
                     let ga_names = &graph_asset_names;
                     let exp_graphs = &expanded_graphs;
                     let chg_keys = &changed_keys;
@@ -280,12 +288,13 @@ pub fn DagGraph(
                             _ => render_node_full(
                                 &node,
                                 on_node_click,
+                                on_node_context,
                                 mat_keys,
                                 stl_keys,
                                 ext_keys,
                                 anc_keys,
                                 desc_keys,
-                                sel_node,
+                                sel_nodes,
                                 has_selection,
                                 ga_names,
                                 exp_graphs,
@@ -302,13 +311,14 @@ pub fn DagGraph(
 /// Full detail node rendering (LOD 0)
 fn render_node_full(
     node: &LayoutNode,
-    on_node_click: Option<Callback<String>>,
+    on_node_click: Option<Callback<(String, bool)>>,
+    on_node_context: Option<Callback<(String, f64, f64)>>,
     materialized_keys: &HashSet<String>,
     stale_keys: &HashSet<String>,
     external_keys: &HashSet<String>,
     ancestor_keys: &HashSet<String>,
     descendant_keys: &HashSet<String>,
-    selected_node: &str,
+    selected_nodes: &HashSet<String>,
     has_selection: bool,
     graph_asset_names: &HashSet<String>,
     expanded_graphs: &HashSet<String>,
@@ -322,7 +332,7 @@ fn render_node_full(
     let is_external = external_keys.contains(&node.id);
     let is_materialized = materialized_keys.contains(&node.id);
     let is_stale = stale_keys.contains(&node.id);
-    let is_selected = !selected_node.is_empty() && selected_node == node.id;
+    let is_selected = selected_nodes.contains(&node.id);
     let is_ancestor = ancestor_keys.contains(&node.id);
     let is_descendant = descendant_keys.contains(&node.id);
     let is_in_lineage = is_selected || is_ancestor || is_descendant;
@@ -374,7 +384,7 @@ fn render_node_full(
         "rgba(70,72,75,0.35)"
     };
     let stroke_width = if is_selected {
-        "1.5"
+        "2.5"
     } else if is_changed {
         "1.2"
     } else {
@@ -428,34 +438,26 @@ fn render_node_full(
 
     let tooltip = node.id.clone();
 
+    let node_id_ctx = node.id.clone();
     let node_view = view! {
         <g
-            class="dag-node"
+            class={if is_selected { "dag-node dag-node--selected" } else { "dag-node" }}
             opacity={opacity}
             on:click=move |ev| {
                 if let Some(ref cb) = on_node_click {
                     ev.prevent_default();
-                    cb.run(node_id.clone());
+                    let additive = ev.shift_key() || ev.ctrl_key() || ev.meta_key();
+                    cb.run((node_id.clone(), additive));
+                }
+            }
+            on:contextmenu=move |ev| {
+                if let Some(ref cb) = on_node_context {
+                    ev.prevent_default();
+                    ev.stop_propagation();
+                    cb.run((node_id_ctx.clone(), ev.client_x() as f64, ev.client_y() as f64));
                 }
             }
         >
-            // Selected-state halo — a slightly larger capsule ring that pulses
-            {is_selected.then(|| view! {
-                <rect
-                    x={(x - 3.0).to_string()}
-                    y={(y - 3.0).to_string()}
-                    width={(w + 6.0).to_string()}
-                    height={(h + 6.0).to_string()}
-                    rx={((h + 6.0) / 2.0).to_string()}
-                    fill="none"
-                    stroke="#ff8f78"
-                    stroke-width="1"
-                    opacity="0.4"
-                >
-                    <animate attributeName="opacity" values="0.2;0.6;0.2" dur="2s" repeatCount="indefinite"/>
-                </rect>
-            })}
-
             // Main capsule
             <rect
                 x={x.to_string()}
@@ -469,6 +471,23 @@ fn render_node_full(
                 stroke-dasharray=move || if is_external { "5 3" } else { "" }
                 filter="url(#node-shadow)"
             />
+
+            // Selected-state halo — a slightly larger capsule ring that pulses
+            {is_selected.then(|| view! {
+                <rect
+                    x={(x - 3.5).to_string()}
+                    y={(y - 3.5).to_string()}
+                    width={(w + 7.0).to_string()}
+                    height={(h + 7.0).to_string()}
+                    rx={((h + 7.0) / 2.0).to_string()}
+                    fill="none"
+                    stroke="#ff8f78"
+                    stroke-width="1.8"
+                    opacity="0.9"
+                >
+                    <animate attributeName="opacity" values="0.6;1;0.6" dur="2s" repeatCount="indefinite"/>
+                </rect>
+            })}
 
             // Status dot (LEFT side, inside the capsule)
             <circle

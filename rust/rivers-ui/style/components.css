@@ -374,6 +374,26 @@ tr:hover td { background: var(--bg-hover); }
 }
 .dag-sidebar-link:hover { color: var(--secondary); }
 .dag-sidebar-link-arrow { color: var(--text-comment); flex-shrink: 0; }
+/* Multi-selection rows: asset name + a per-row deselect */
+.dag-sidebar-sel-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.dag-sidebar-sel-row .dag-sidebar-link { flex: 1; min-width: 0; color: var(--text); }
+.dag-sidebar-sel-drop {
+    background: transparent;
+    border: 0;
+    color: var(--text-comment);
+    font-size: 13px;
+    line-height: 1;
+    padding: 2px 5px;
+    cursor: pointer;
+    border-radius: 3px;
+    flex-shrink: 0;
+    transition: background 120ms ease, color 120ms ease;
+}
+.dag-sidebar-sel-drop:hover { color: var(--text); background: var(--bg-hover); }
 .dag-sidebar-empty {
     color: var(--text-muted);
     font-size: 12px;
@@ -462,6 +482,12 @@ tr:hover td { background: var(--bg-hover); }
         drop-shadow(0 0 1px rgba(255, 143, 120, 0.4));
 }
 
+/* Selected nodes get a persistent glow so the selection reads at a glance */
+.dag-node--selected > rect:first-child {
+    filter: drop-shadow(0 0 6px rgba(255, 143, 120, 0.5))
+        drop-shadow(0 4px 12px rgba(255, 143, 120, 0.3));
+}
+
 .dag-edge { transition: stroke 160ms ease, stroke-width 160ms ease, opacity 160ms ease; }
 
 .dag-edge:hover {
@@ -470,8 +496,8 @@ tr:hover td { background: var(--bg-hover); }
     opacity: 1 !important;
 }
 
-/* Dim non-hovered nodes when a sibling is hovered */
-.dag-container svg:has(.dag-node:hover) .dag-node:not(:hover) {
+/* Dim non-hovered nodes when a sibling is hovered — selected nodes stay prominent */
+.dag-container svg:has(.dag-node:hover) .dag-node:not(:hover):not(.dag-node--selected) {
     opacity: 0.4;
     transition: opacity 200ms ease;
 }
