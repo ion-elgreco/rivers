@@ -19,6 +19,8 @@
 //! pinned value is always a commit, matching `git ls-remote`'s behaviour.
 
 pub mod http;
+pub mod known_hosts;
+pub mod ssh;
 
 use gix_packetline::PacketLineRef;
 use gix_packetline::blocking_io::StreamingPeekableIter;
@@ -35,15 +37,33 @@ pub enum GitError {
     /// remote changes.
     #[error("ref not found: {0}")]
     RefNotFound(String),
-    /// Credentials rejected. Terminal until the Secret changes.
-    #[error("git authentication failed")]
-    AuthFailed,
+    /// Credentials rejected (or unusable — e.g. an unreadable private key).
+    /// Terminal until the Secret changes.
+    #[error("git authentication failed: {0}")]
+    AuthFailed(String),
+    /// SSH host key not trusted: unknown host, or a changed key. Never
+    /// auto-accepted. Terminal until the Secret's `known_hosts` changes.
+    #[error("host key rejected: {0}")]
+    HostKeyRejected(String),
+    /// The `known_hosts` material itself is missing or unusable — distinct
+    /// from "unknown host" so a mis-mounted Secret is diagnosable.
+    #[error("known_hosts unavailable: {0}")]
+    KnownHostsUnavailable(String),
     /// Transport-level failure (connect, timeout, 5xx). Transient.
     #[error("git host unreachable: {0}")]
     Unreachable(String),
     /// The response was not a protocol-v0 ref advertisement.
     #[error("malformed advertisement: {0}")]
     Malformed(String),
+}
+
+/// Transport/protocol failures out of russh that we didn't classify
+/// ourselves land as transient — host-key and auth outcomes are produced
+/// explicitly before this conversion can occur.
+impl From<russh::Error> for GitError {
+    fn from(e: russh::Error) -> Self {
+        GitError::Unreachable(e.to_string())
+    }
 }
 
 /// One advertised `<oid> <refname>` pair, peel entries (`name^{}`) included.

@@ -55,6 +55,12 @@ mimalloc = "0.1"
 # advertisement, parsed from a buffered byte slice — same parser for the
 # HTTPS and SSH transports.
 gix-packetline = { version = "0.22", features = ["blocking-io"] }
+# In-process SSH for `git-upload-pack` polling — the only transport shape
+# that works in the distroless operator image (no ssh binary) without
+# pulling OpenSSL in via libssh2. `ring` matches the workspace's rustls
+# provider; `rsa`/`flate2` cover common deploy keys and transport compression.
+russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
+url = "2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -62,4 +68,5 @@ http = "1"
 bytes = "1"
 http-body-util = "0.1"
 wiremock = "0.6"
+tempfile = "3"
 tokio-stream = { workspace = true, features = ["net"] }

@@ -79,7 +79,12 @@ pub(crate) async fn fetch_advertisement_with_cap(
 
     match response.status() {
         s if s.is_success() => {}
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Err(GitError::AuthFailed),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            return Err(GitError::AuthFailed(format!(
+                "HTTP {} from {url}",
+                response.status()
+            )));
+        }
         StatusCode::NOT_FOUND => {
             return Err(GitError::RefNotFound(format!(
                 "repository not found at {url} (HTTP 404)"
@@ -205,7 +210,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert!(matches!(err, GitError::AuthFailed), "HTTP {status}: {err}");
+            assert!(
+                matches!(err, GitError::AuthFailed(_)),
+                "HTTP {status}: {err}"
+            );
         }
     }
 
