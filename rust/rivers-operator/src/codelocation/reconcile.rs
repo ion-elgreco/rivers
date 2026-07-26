@@ -146,6 +146,12 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         ready_replicas,
         message: None,
         conditions: Vec::new(),
+        // Image mode: the pinned digest ref doubles as the Source column.
+        // Git-mode display (`main@9f3c1ab`) arrives with resolve_source().
+        source: Some(resolved_image.clone()),
+        resolved_commit: prior_status.and_then(|s| s.resolved_commit.clone()),
+        resolved_ref: prior_status.and_then(|s| s.resolved_ref.clone()),
+        last_fetched_at: prior_status.and_then(|s| s.last_fetched_at.clone()),
     };
     push_condition(
         &mut status,
@@ -248,10 +254,18 @@ async fn resolve_image(
     ctx: &Context,
     secrets_api: &Api<Secret>,
 ) -> ImageOutcome {
+    // Git-mode source resolution is dispatched before this point; reaching
+    // here without an image is a bug or a git CL ahead of resolve_source().
+    let Some(image) = cl.spec.image.clone() else {
+        return ImageOutcome::Error(ImageError::Transient(
+            "spec.image is unset; git source resolution not yet wired".into(),
+        ));
+    };
+
     // Explicit digest wins immediately — no leader gating, no HTTP.
     if cl.spec.has_pinned_digest() {
         let digest = cl.spec.digest.as_deref().unwrap_or_default();
-        let resolved = format!("{}@{}", cl.spec.image, digest);
+        let resolved = format!("{image}@{digest}");
         return ImageOutcome::Resolved {
             resolved_image: resolved,
             reason: REASON_DIGEST_PINNED,
@@ -289,7 +303,7 @@ async fn resolve_image(
         .map(|r| r.name.clone())
         .collect();
 
-    let registry_host = first_component(&cl.spec.image).unwrap_or_default();
+    let registry_host = first_component(&image).unwrap_or_default();
     let auth: RegistryAuth = if secret_names.is_empty() {
         RegistryAuth::Anonymous
     } else {
@@ -297,7 +311,7 @@ async fn resolve_image(
     };
 
     let req = ResolveRequest {
-        image: cl.spec.image.clone(),
+        image: image.clone(),
         tag: cl.spec.effective_tag().to_string(),
         auth,
         immutable_hint,
@@ -306,7 +320,7 @@ async fn resolve_image(
 
     match ctx.registry.resolve(&req).await {
         Ok(res) => {
-            let resolved = format!("{}@{}", cl.spec.image, res.digest());
+            let resolved = format!("{}@{}", image, res.digest());
             let immutable = matches!(res, Resolution::Immutable { .. });
             ImageOutcome::Resolved {
                 resolved_image: resolved,
@@ -463,6 +477,9 @@ fn status_substantively_equal(
         && prior.ready_replicas == new.ready_replicas
         && prior.message == new.message
         && prior.conditions == new.conditions
+        && prior.source == new.source
+        && prior.resolved_commit == new.resolved_commit
+        && prior.resolved_ref == new.resolved_ref
 }
 
 /// Append a condition, preserving `last_transition_time` from the prior
@@ -527,6 +544,10 @@ async fn patch_waiting_status(
         ready_replicas: None,
         message: Some("awaiting leader replica".into()),
         conditions: Vec::new(),
+        source: prior.and_then(|s| s.source.clone()),
+        resolved_commit: prior.and_then(|s| s.resolved_commit.clone()),
+        resolved_ref: prior.and_then(|s| s.resolved_ref.clone()),
+        last_fetched_at: prior.and_then(|s| s.last_fetched_at.clone()),
     };
     push_condition(
         &mut status,
@@ -561,6 +582,10 @@ async fn patch_error_status(
         ready_replicas: None,
         message: Some(err.message()),
         conditions: Vec::new(),
+        source: prior.and_then(|s| s.source.clone()),
+        resolved_commit: prior.and_then(|s| s.resolved_commit.clone()),
+        resolved_ref: prior.and_then(|s| s.resolved_ref.clone()),
+        last_fetched_at: prior.and_then(|s| s.last_fetched_at.clone()),
     };
     push_condition(
         &mut status,
