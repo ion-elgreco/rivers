@@ -74,15 +74,33 @@ fn show_false_renders_no_modal() {
 }
 
 #[wasm_bindgen_test]
-async fn show_true_renders_modal_header_and_one_checkbox_per_asset() {
+async fn show_true_renders_modal_header_and_one_row_per_asset() {
     let show = RwSignal::new(true);
     let host = mount_no_picker(show, vec!["a".into(), "b".into(), "c".into()]);
     flush_effects().await;
 
     let header = query_one(&host, ".modal-header h2").text_content().unwrap();
-    assert_eq!(header, "Materialize Assets");
+    assert_eq!(header, "Materialize");
 
-    assert_eq!(query_all(&host, ".checkbox-list .checkbox-item").len(), 3);
+    assert_eq!(
+        query_all(&host, ".mat-dialog-asset-list .mat-dialog-asset-row").len(),
+        3
+    );
+}
+
+#[wasm_bindgen_test]
+async fn asset_rows_render_without_waiting_on_the_metadata_fetch() {
+    // There is no server in the CSR harness, so `get_assets` can only fail —
+    // the list must still render every key, just without status decoration.
+    let show = RwSignal::new(true);
+    let host = mount_no_picker(show, vec!["a".into(), "b".into()]);
+    flush_effects().await;
+
+    let names: Vec<String> = query_all(&host, ".mat-dialog-asset-name")
+        .into_iter()
+        .map(|el| el.text_content().unwrap_or_default())
+        .collect();
+    assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
 }
 
 #[wasm_bindgen_test]
@@ -91,7 +109,7 @@ async fn assets_default_to_all_selected_when_dialog_opens() {
     let host = mount_no_picker(show, vec!["a".into(), "b".into()]);
     flush_effects().await;
 
-    let checked: Vec<bool> = query_all(&host, ".checkbox-list input[type=checkbox]")
+    let checked: Vec<bool> = query_all(&host, ".mat-dialog-asset-row input[type=checkbox]")
         .into_iter()
         .map(|el| {
             let input: HtmlInputElement = el.dyn_into().unwrap();
@@ -102,12 +120,44 @@ async fn assets_default_to_all_selected_when_dialog_opens() {
 }
 
 #[wasm_bindgen_test]
+async fn clear_deselects_every_asset_and_select_all_restores_them() {
+    let show = RwSignal::new(true);
+    let host = mount_no_picker(show, vec!["a".into(), "b".into()]);
+    flush_effects().await;
+
+    let link_named = |name: &str| {
+        query_all(&host, ".mat-dialog-col-actions .bulk-link-btn")
+            .into_iter()
+            .find(|el| el.text_content().unwrap_or_default() == name)
+            .unwrap()
+    };
+
+    click(&link_named("Clear"), false);
+    flush_effects().await;
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "Nothing selected"
+    );
+
+    click(&link_named("Select all"), false);
+    flush_effects().await;
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "2 assets · 1 run"
+    );
+}
+
+#[wasm_bindgen_test]
 async fn deselecting_all_assets_disables_submit_button() {
     let show = RwSignal::new(true);
     let host = mount_no_picker(show, vec!["a".into()]);
     flush_effects().await;
 
-    let cb_el = query_one(&host, ".checkbox-list input[type=checkbox]");
+    let cb_el = query_one(&host, ".mat-dialog-asset-row input[type=checkbox]");
     let cb: HtmlInputElement = cb_el.clone().dyn_into().unwrap();
     cb.set_checked(false);
 
@@ -203,7 +253,7 @@ async fn cancel_hides_dialog() {
 }
 
 #[wasm_bindgen_test]
-async fn submit_button_label_reflects_partition_count_under_multi_picker() {
+async fn summary_rail_reflects_partition_count_under_multi_picker() {
     let show = RwSignal::new(true);
     let host = mount_with_picker(
         show,
@@ -229,10 +279,14 @@ async fn submit_button_label_reflects_partition_count_under_multi_picker() {
     );
     flush_effects().await;
 
-    // Initially no partitions selected → label = "Materialize" (n=0 → 1).
+    // Nothing picked yet — the rail asks for a partition and submit stays off.
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "1 asset · select a partition"
+    );
     let btn = query_one(&host, ".modal-footer .btn-primary");
-    assert_eq!(btn.text_content().unwrap(), "Materialize");
-    // Disabled because multi picker requires at least one selection.
     assert!(btn.has_attribute("disabled"));
 
     // Select two colors + the size → 2 cartesian combos.
@@ -244,7 +298,61 @@ async fn submit_button_label_reflects_partition_count_under_multi_picker() {
     click(&rows[2], false);
     flush_effects().await;
 
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "1 asset · 2 partitions · 2 runs"
+    );
     let btn = query_one(&host, ".modal-footer .btn-primary");
-    assert_eq!(btn.text_content().unwrap(), "Materialize 2 runs");
+    assert_eq!(btn.text_content().unwrap(), "Materialize");
     assert!(!btn.has_attribute("disabled"));
+}
+
+#[wasm_bindgen_test]
+async fn crossing_the_backfill_threshold_switches_the_rail_and_button() {
+    let show = RwSignal::new(true);
+    let host = mount_with_picker(
+        show,
+        vec!["asset.a".into()],
+        JobPartitionPicker::SingleDim {
+            keys: vec!["k1".into(), "k2".into(), "k3".into()],
+            truncated: false,
+        },
+    );
+    flush_effects().await;
+
+    let rows = query_all(&host, ".exec-dialog-partition-row");
+    for row in rows.iter().take(3) {
+        click(row, false);
+        flush_effects().await;
+    }
+
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "1 asset · 3 partitions · 1 backfill"
+    );
+    assert_eq!(
+        query_one(&host, ".modal-footer .btn-primary")
+            .text_content()
+            .unwrap(),
+        "Launch backfill"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn unpartitioned_selection_says_so_instead_of_showing_a_picker() {
+    let show = RwSignal::new(true);
+    let host = mount_no_picker(show, vec!["a".into()]);
+    flush_effects().await;
+
+    assert_eq!(query_all(&host, ".exec-dialog-partition-row").len(), 0);
+    assert!(
+        query_one(&host, ".mat-dialog-note")
+            .text_content()
+            .unwrap()
+            .contains("Not partitioned")
+    );
 }

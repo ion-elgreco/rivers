@@ -3,13 +3,16 @@
 //! ≤2 selected partitions fire one `trigger_materialize` run each; a larger
 //! selection lands as a single backfill over the assets + chosen keys.
 
+use std::collections::HashMap;
+
 use leptos::prelude::*;
 
 use crate::components::partition_picker::PartitionPicker;
 use crate::helpers::JobPartitionPicker;
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::actions::{launch_backfill, trigger_materialize};
-use crate::types::SubmitPartitionKey;
+use crate::server_fns::assets::get_assets;
+use crate::types::{AssetRecord, StaleStatus, SubmitPartitionKey};
 
 /// Above this many selected partitions, submit one backfill instead of a run each.
 const BACKFILL_THRESHOLD: usize = 2;
@@ -19,6 +22,48 @@ const BACKFILL_THRESHOLD: usize = 2;
 enum DialogOutcome {
     Run(String),
     Backfill(String),
+}
+
+/// One-line description of exactly what a submit will launch. Mirrors the
+/// branching in `materialize_action` — if that changes, this must too.
+fn launch_summary(n_assets: usize, n_partitions: usize, partitioned: bool) -> String {
+    if n_assets == 0 {
+        return "Nothing selected".to_string();
+    }
+    let assets = if n_assets == 1 {
+        "1 asset".to_string()
+    } else {
+        format!("{n_assets} assets")
+    };
+    if !partitioned {
+        return format!("{assets} · 1 run");
+    }
+    if n_partitions == 0 {
+        return format!("{assets} · select a partition");
+    }
+    let parts = if n_partitions == 1 {
+        "1 partition".to_string()
+    } else {
+        format!("{n_partitions} partitions")
+    };
+    if n_partitions > BACKFILL_THRESHOLD {
+        format!("{assets} · {parts} · 1 backfill")
+    } else if n_partitions > 1 {
+        format!("{assets} · {parts} · {n_partitions} runs")
+    } else {
+        format!("{assets} · {parts} · 1 run")
+    }
+}
+
+/// Status dot class + word for an asset's staleness. `None` = the record
+/// hasn't loaded (or the key isn't an asset), which reads as unknown.
+fn status_bits(record: Option<&AssetRecord>) -> (&'static str, &'static str) {
+    match record.map(|r| &r.stale_status) {
+        Some(StaleStatus::UpToDate) => ("mat-dialog-dot--ok", "up to date"),
+        Some(StaleStatus::Stale) => ("mat-dialog-dot--stale", "stale"),
+        Some(StaleStatus::Missing) => ("mat-dialog-dot--missing", "missing"),
+        None => ("mat-dialog-dot--missing", ""),
+    }
 }
 
 #[component]
@@ -46,6 +91,28 @@ pub fn MaterializeDialog(
     });
 
     let loc = use_current_location();
+
+    // Staleness / group / last-materialized decorate the rows. Kept in a plain
+    // signal rather than a Resource so a slow (or failed) fetch never withholds
+    // the asset list itself; fetched per open so the staleness is current.
+    let asset_meta = RwSignal::new(HashMap::<String, AssetRecord>::new());
+    Effect::new(move || {
+        if !show.get() {
+            return;
+        }
+        let (ns, name) = loc.get();
+        leptos::task::spawn_local(async move {
+            if let Ok(records) = get_assets(ns, name, None, None, None).await {
+                asset_meta.set(
+                    records
+                        .into_iter()
+                        .map(|r| (r.asset_key.clone(), r))
+                        .collect(),
+                );
+            }
+        });
+    });
+
     let materialize_action = Action::new(move |_: &()| {
         let sel = selected.get();
         let pks = partition_keys.get();
@@ -111,84 +178,166 @@ pub fn MaterializeDialog(
     let picker_signal: Signal<JobPartitionPicker> =
         picker.unwrap_or_else(|| Signal::derive(|| JobPartitionPicker::None));
 
+    let is_partitioned =
+        Signal::derive(move || !matches!(picker_signal.get(), JobPartitionPicker::None));
+    let summary = Signal::derive(move || {
+        launch_summary(
+            selected.get().len(),
+            partition_keys.get().len(),
+            is_partitioned.get(),
+        )
+    });
+    let submit_label = Signal::derive(move || {
+        if pending.get() {
+            "Submitting…"
+        } else if is_partitioned.get() && partition_keys.get().len() > BACKFILL_THRESHOLD {
+            "Launch backfill"
+        } else {
+            "Materialize"
+        }
+    });
+
     view! {
         <Show when=move || show.get()>
             <div class="modal-overlay" on:click=move |_| show.set(false)>
-                <div class="modal-content" on:click=move |ev| ev.stop_propagation()>
+                // Only the partition picker needs the second column; an
+                // unpartitioned selection would just leave it empty.
+                <div
+                    class=move || if is_partitioned.get() {
+                        "modal-content modal-content--wide"
+                    } else {
+                        "modal-content"
+                    }
+                    on:click=move |ev| ev.stop_propagation()
+                >
                     <div class="modal-header">
-                        <h2>"Materialize Assets"</h2>
+                        <h2>"Materialize"</h2>
                         <button class="btn btn-small" on:click=move |_| show.set(false)>"x"</button>
                     </div>
 
-                    <div class="modal-body">
-                        <div class="form-group">
-                            <label>"Assets"</label>
-                            <div class="checkbox-list">
-                                {move || {
-                                    asset_keys.get().into_iter().map(|key| {
-                                        let k = key.clone();
-                                        let k2 = key.clone();
-                                        let checked = move || selected.get().contains(&k);
-                                        view! {
-                                            <label class="checkbox-item">
-                                                <input
-                                                    type="checkbox"
-                                                    checked=checked
-                                                    on:change=move |_| {
-                                                        let k = k2.clone();
-                                                        set_selected.update(|s| {
-                                                            if s.contains(&k) {
-                                                                s.retain(|x| x != &k);
-                                                            } else {
-                                                                s.push(k);
+                    <div class="modal-body mat-dialog-body">
+                        <div class=move || if is_partitioned.get() {
+                            "mat-dialog-cols"
+                        } else {
+                            "mat-dialog-cols mat-dialog-cols--single"
+                        }>
+                            <div class="mat-dialog-col">
+                                <div class="mat-dialog-col-head">
+                                    <label>"Assets"</label>
+                                    <span class="mat-dialog-col-actions">
+                                        <button
+                                            class="bulk-link-btn"
+                                            on:click=move |_| set_selected.set(asset_keys.get())
+                                        >"Select all"</button>
+                                        <span class="bulk-sep">"·"</span>
+                                        <button
+                                            class="bulk-link-btn"
+                                            on:click=move |_| set_selected.set(Vec::new())
+                                        >"Clear"</button>
+                                    </span>
+                                </div>
+                                <div class="mat-dialog-asset-list">
+                                    {
+                                        {move || {
+                                            let meta = asset_meta.get();
+                                            asset_keys.get().into_iter().map(|key| {
+                                                let k_checked = key.clone();
+                                                let k_toggle = key.clone();
+                                                let checked = move || selected.get().contains(&k_checked);
+                                                let record = meta.get(&key);
+                                                let (dot_cls, status_word) = status_bits(record);
+                                                let group = record.and_then(|r| r.asset_group.clone());
+                                                let last_ts = record.and_then(|r| r.last_timestamp);
+                                                let sub_parts: Vec<String> = [group, (!status_word.is_empty()).then(|| status_word.to_string())]
+                                                    .into_iter()
+                                                    .flatten()
+                                                    .collect();
+                                                view! {
+                                                    <label class="mat-dialog-asset-row">
+                                                        <input
+                                                            class="asset-row-check"
+                                                            type="checkbox"
+                                                            prop:checked=checked
+                                                            on:change=move |_| {
+                                                                let k = k_toggle.clone();
+                                                                set_selected.update(|s| {
+                                                                    if s.contains(&k) {
+                                                                        s.retain(|x| x != &k);
+                                                                    } else {
+                                                                        s.push(k);
+                                                                    }
+                                                                });
                                                             }
-                                                        });
-                                                    }
-                                                />
-                                                <span>{key}</span>
-                                            </label>
-                                        }
-                                    }).collect::<Vec<_>>()
-                                }}
+                                                        />
+                                                        <span class=format!("mat-dialog-dot {dot_cls}") title=status_word></span>
+                                                        <span class="mat-dialog-asset-text">
+                                                            <span class="mat-dialog-asset-name">{key.clone()}</span>
+                                                            <span class="mat-dialog-asset-sub">
+                                                                {sub_parts.iter().map(|s| {
+                                                                    view! { <>{s.clone()}" · "</> }
+                                                                }).collect::<Vec<_>>()}
+                                                                <crate::now::RelTimeOpt ts=last_ts fallback="never materialized"/>
+                                                            </span>
+                                                        </span>
+                                                    </label>
+                                                }
+                                            }).collect::<Vec<_>>()
+                                        }}
+                                    }
+                                </div>
                             </div>
-                        </div>
 
-                        <PartitionPicker picker=picker_signal selected=partition_keys reset=show/>
+                            <div class="mat-dialog-col">
+                                <Show
+                                    when=move || is_partitioned.get()
+                                    fallback=move || view! {
+                                        <div class="form-group">
+                                            <label>"Partitions"</label>
+                                            <div class="mat-dialog-note">
+                                                "Not partitioned — one run covers the whole selection."
+                                            </div>
+                                        </div>
+                                    }
+                                >
+                                    <PartitionPicker picker=picker_signal selected=partition_keys reset=show/>
+                                </Show>
 
-                        <div class="form-group">
-                            <label>"Tags"</label>
-                            <div class="tag-input-row">
-                                <input
-                                    type="text"
-                                    class="form-input form-input-small"
-                                    placeholder="Key"
-                                    prop:value=move || tag_key.get()
-                                    on:input=move |ev| {
-                                        set_tag_key.set(event_target_value(&ev));
-                                    }
-                                />
-                                <input
-                                    type="text"
-                                    class="form-input form-input-small"
-                                    placeholder="Value"
-                                    prop:value=move || tag_val.get()
-                                    on:input=move |ev| {
-                                        set_tag_val.set(event_target_value(&ev));
-                                    }
-                                />
-                                <button class="btn btn-small" on:click=add_tag>"Add"</button>
-                            </div>
-                            <div class="tag-list">
-                                {move || tags.get().into_iter().enumerate().map(|(i, (k, v))| {
-                                    view! {
-                                        <span class="tag">
-                                            {format!("{k}={v}")}
-                                            <button class="tag-remove" on:click=move |_| {
-                                                set_tags.update(|t| { t.remove(i); });
-                                            }>"x"</button>
-                                        </span>
-                                    }
-                                }).collect::<Vec<_>>()}
+                                <div class="form-group">
+                                    <label>"Tags"</label>
+                                    <div class="tag-input-row">
+                                        <input
+                                            type="text"
+                                            class="form-input form-input-small"
+                                            placeholder="Key"
+                                            prop:value=move || tag_key.get()
+                                            on:input=move |ev| {
+                                                set_tag_key.set(event_target_value(&ev));
+                                            }
+                                        />
+                                        <input
+                                            type="text"
+                                            class="form-input form-input-small"
+                                            placeholder="Value"
+                                            prop:value=move || tag_val.get()
+                                            on:input=move |ev| {
+                                                set_tag_val.set(event_target_value(&ev));
+                                            }
+                                        />
+                                        <button class="btn btn-small" on:click=add_tag>"Add"</button>
+                                    </div>
+                                    <div class="tag-list">
+                                        {move || tags.get().into_iter().enumerate().map(|(i, (k, v))| {
+                                            view! {
+                                                <span class="tag">
+                                                    {format!("{k}={v}")}
+                                                    <button class="tag-remove" on:click=move |_| {
+                                                        set_tags.update(|t| { t.remove(i); });
+                                                    }>"x"</button>
+                                                </span>
+                                            }
+                                        }).collect::<Vec<_>>()}
+                                    </div>
+                                </div>
                             </div>
                         </div>
 
@@ -197,39 +346,23 @@ pub fn MaterializeDialog(
                         })}
                     </div>
 
-                    <div class="modal-footer">
-                        <button class="btn" on:click=move |_| show.set(false)>"Cancel"</button>
-                        <button
-                            class="btn btn-primary"
-                            on:click=move |_| { materialize_action.dispatch(()); }
-                            disabled=move || {
-                                if pending.get() || selected.get().is_empty() {
-                                    return true;
+                    <div class="modal-footer mat-dialog-footer">
+                        <div class="mat-dialog-summary">{move || summary.get()}</div>
+                        <div class="mat-dialog-actions">
+                            <button class="btn" on:click=move |_| show.set(false)>"Cancel"</button>
+                            <button
+                                class="btn btn-primary"
+                                on:click=move |_| { materialize_action.dispatch(()); }
+                                disabled=move || {
+                                    if pending.get() || selected.get().is_empty() {
+                                        return true;
+                                    }
+                                    is_partitioned.get() && partition_keys.get().is_empty()
                                 }
-                                let needs_partition = !matches!(
-                                    picker_signal.get(),
-                                    JobPartitionPicker::None
-                                );
-                                needs_partition && partition_keys.get().is_empty()
-                            }
-                        >
-                            {move || if pending.get() {
-                                "Submitting...".to_string()
-                            } else {
-                                let n = if matches!(picker_signal.get(), JobPartitionPicker::None) {
-                                    1
-                                } else {
-                                    partition_keys.get().len()
-                                };
-                                if n > BACKFILL_THRESHOLD {
-                                    format!("Backfill {n} partitions")
-                                } else if n > 1 {
-                                    format!("Materialize {n} runs")
-                                } else {
-                                    "Materialize".to_string()
-                                }
-                            }}
-                        </button>
+                            >
+                                {move || submit_label.get()}
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -238,5 +371,48 @@ pub fn MaterializeDialog(
         {move || nav_to.get().map(|path| view! {
             <leptos_router::components::Redirect path={path}/>
         })}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::launch_summary;
+
+    #[test]
+    fn empty_selection_reads_as_nothing() {
+        assert_eq!(launch_summary(0, 0, false), "Nothing selected");
+        assert_eq!(launch_summary(0, 5, true), "Nothing selected");
+    }
+
+    #[test]
+    fn unpartitioned_is_always_one_run() {
+        assert_eq!(launch_summary(1, 0, false), "1 asset · 1 run");
+        assert_eq!(launch_summary(3, 0, false), "3 assets · 1 run");
+    }
+
+    #[test]
+    fn partitioned_without_keys_asks_for_one() {
+        assert_eq!(launch_summary(2, 0, true), "2 assets · select a partition");
+    }
+
+    #[test]
+    fn one_run_per_partition_up_to_the_threshold() {
+        assert_eq!(launch_summary(1, 1, true), "1 asset · 1 partition · 1 run");
+        assert_eq!(
+            launch_summary(3, 2, true),
+            "3 assets · 2 partitions · 2 runs"
+        );
+    }
+
+    #[test]
+    fn past_the_threshold_it_is_a_backfill() {
+        assert_eq!(
+            launch_summary(3, 3, true),
+            "3 assets · 3 partitions · 1 backfill"
+        );
+        assert_eq!(
+            launch_summary(1, 400, true),
+            "1 asset · 400 partitions · 1 backfill"
+        );
     }
 }
