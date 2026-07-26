@@ -118,6 +118,13 @@ operator:
   # should leave this false. When false, CodeLocations against an HTTP-only
   # registry must pre-set spec.digest to skip the probe.
   allowInsecureRegistry: false
+  # Git-sourced CodeLocations (RFC-044).
+  git:
+    # Hosts spec.git.url may point at. Empty admits any host; the admission
+    # webhook rejects CRs pointing elsewhere.
+    allowedHosts: []
+    # Ref-resolution timeout per poll.
+    timeoutSeconds: 30
   registry:
     # gRPC port for the CodeLocationRegistry service.
     port: 50052
@@ -235,6 +242,18 @@ ui:
           - path:
               type: PathPrefix
               value: /
+
+codeLocation:
+  runtime:
+    # Default runtime for git-sourced CodeLocations that don't set spec.image.
+    # Empty resolves to
+    #   ghcr.io/ion-elgreco/rivers-runtime:{appVersion}-py{pythonVersion}.
+    # Point at an internal mirror for air-gapped clusters; pair with
+    # spec.imagePullSecrets on the CodeLocation.
+    image: ""
+    # Interpreter variant the default tag selects. Per-CodeLocation
+    # overrides go on spec.image / spec.tag.
+    pythonVersion: "3.12"
 
 executor:
   serviceAccountName: rivers-executor

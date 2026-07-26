@@ -61,6 +61,10 @@ gix-packetline = { version = "0.22", features = ["blocking-io"] }
 # provider; `rsa`/`flate2` cover common deploy keys and transport compression.
 russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
 url = "2"
+# The operator writes SSH Secret material to short-lived files for the poll
+# (russh's known_hosts API is file-path only). Backed by a Memory-medium
+# emptyDir at /tmp — the operator's root fs is read-only.
+tempfile = "3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -68,5 +72,4 @@ http = "1"
 bytes = "1"
 http-body-util = "0.1"
 wiremock = "0.6"
-tempfile = "3"
 tokio-stream = { workspace = true, features = ["net"] }

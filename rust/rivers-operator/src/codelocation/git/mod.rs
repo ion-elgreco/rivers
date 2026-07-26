@@ -240,6 +240,340 @@ pub fn commit_for_ref(adv: &Advertisement, wanted: &GitRef) -> Result<ResolvedRe
     ))
 }
 
+/// Credential material for a resolve, straight from the CR's Secret.
+/// SSH material arrives as *contents* (the operator reads the Secret over
+/// the API, it doesn't mount it); the resolver writes it to short-lived
+/// 0600 tempfiles because russh's key/known_hosts APIs are path-based.
+#[derive(Clone, Debug, Default)]
+pub enum GitCredentials {
+    #[default]
+    Anonymous,
+    Basic {
+        username: String,
+        password: String,
+    },
+    Ssh {
+        private_key_openssh: String,
+        known_hosts: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct GitResolveRequest {
+    /// `https://…` / `http://…` / `ssh://…` repository URL.
+    pub url: String,
+    pub r#ref: GitRef,
+    pub credentials: GitCredentials,
+    /// How long a branch resolution stays cached. Semver-like tags are
+    /// cached indefinitely (`registry::looks_immutable`), pinned commits
+    /// never hit the network at all.
+    pub cache_ttl: std::time::Duration,
+}
+
+struct CachedResolution {
+    resolved: ResolvedRef,
+    expires_at: std::time::Instant,
+    immutable: bool,
+}
+
+/// Ref→commit resolver with the same posture as [`super::registry`]'s
+/// digest resolver: cross-CR cache keyed on `(url, ref)`, immutable-tag
+/// short-circuit, leader gating left to the reconciler.
+pub struct GitResolver {
+    http: reqwest::Client,
+    timeout: std::time::Duration,
+    cache: tokio::sync::Mutex<std::collections::HashMap<(String, String), CachedResolution>>,
+}
+
+impl GitResolver {
+    pub fn new(timeout: std::time::Duration) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            timeout,
+            cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub async fn resolve(&self, req: &GitResolveRequest) -> Result<ResolvedRef, GitError> {
+        // Pinned commit: no lookup, no cache, no network.
+        if let Some(commit) = req.r#ref.commit.as_deref().filter(|c| !c.is_empty()) {
+            return Ok(ResolvedRef {
+                commit: commit.to_string(),
+                ref_name: None,
+            });
+        }
+
+        let cache_key = (req.url.clone(), ref_cache_key(&req.r#ref)?);
+        {
+            let cache = self.cache.lock().await;
+            if let Some(entry) = cache.get(&cache_key) {
+                if entry.immutable || entry.expires_at > std::time::Instant::now() {
+                    return Ok(entry.resolved.clone());
+                }
+            }
+        }
+
+        let bytes = self.fetch(req).await?;
+        let advertisement = parse_advertisement(&bytes)?;
+        let resolved = commit_for_ref(&advertisement, &req.r#ref)?;
+
+        let immutable = req
+            .r#ref
+            .tag
+            .as_deref()
+            .is_some_and(super::registry::looks_immutable);
+        self.cache.lock().await.insert(
+            cache_key,
+            CachedResolution {
+                resolved: resolved.clone(),
+                expires_at: std::time::Instant::now() + req.cache_ttl,
+                immutable,
+            },
+        );
+        Ok(resolved)
+    }
+
+    async fn fetch(&self, req: &GitResolveRequest) -> Result<Vec<u8>, GitError> {
+        let scheme = url::Url::parse(&req.url)
+            .map_err(|e| GitError::Malformed(format!("invalid git url '{}': {e}", req.url)))?
+            .scheme()
+            .to_string();
+        match scheme.as_str() {
+            "http" | "https" => {
+                let auth = match &req.credentials {
+                    GitCredentials::Anonymous => http::GitAuth::Anonymous,
+                    GitCredentials::Basic { username, password } => http::GitAuth::Basic {
+                        username: username.clone(),
+                        password: password.clone(),
+                    },
+                    GitCredentials::Ssh { .. } => {
+                        return Err(GitError::AuthFailed(
+                            "the Secret carries SSH material (identity/known_hosts) but the \
+                             url is http(s) — provide username/password instead"
+                                .to_string(),
+                        ));
+                    }
+                };
+                http::fetch_advertisement(&self.http, &req.url, &auth, self.timeout).await
+            }
+            "ssh" => {
+                let target = ssh::parse_ssh_url(&req.url)?;
+                let GitCredentials::Ssh {
+                    private_key_openssh,
+                    known_hosts,
+                } = &req.credentials
+                else {
+                    return Err(GitError::AuthFailed(
+                        "ssh:// urls need `identity` and `known_hosts` entries in the git Secret"
+                            .to_string(),
+                    ));
+                };
+                let material = SshTempMaterial::write(private_key_openssh, known_hosts)?;
+                ssh::fetch_advertisement(&target, &material.auth, self.timeout).await
+            }
+            other => Err(GitError::Malformed(format!(
+                "unsupported git url scheme '{other}' (https:// or ssh://)"
+            ))),
+        }
+    }
+}
+
+/// Secret contents written to 0600 tempfiles for the duration of one fetch.
+/// Backed by the operator's Memory-medium `/tmp` emptyDir (the root fs is
+/// read-only), so key material stays off disk and is unlinked on drop.
+struct SshTempMaterial {
+    _key: tempfile::NamedTempFile,
+    _known_hosts: tempfile::NamedTempFile,
+    auth: ssh::SshAuth,
+}
+
+impl SshTempMaterial {
+    fn write(private_key: &str, known_hosts: &str) -> Result<Self, GitError> {
+        use std::io::Write as _;
+        let scratch = |what: &str, contents: &str| -> Result<tempfile::NamedTempFile, GitError> {
+            let mut f = tempfile::NamedTempFile::new()
+                .map_err(|e| GitError::Unreachable(format!("cannot stage {what} in /tmp: {e}")))?;
+            f.write_all(contents.as_bytes())
+                .and_then(|()| f.flush())
+                .map_err(|e| GitError::Unreachable(format!("cannot stage {what}: {e}")))?;
+            Ok(f)
+        };
+        let key = scratch("ssh identity", private_key)?;
+        let kh = scratch("known_hosts", known_hosts)?;
+        let auth = ssh::SshAuth {
+            private_key_path: key.path().to_path_buf(),
+            known_hosts_path: kh.path().to_path_buf(),
+        };
+        Ok(Self {
+            _key: key,
+            _known_hosts: kh,
+            auth,
+        })
+    }
+}
+
+/// Stable cache-key fragment for a ref selector. Pinned commits never reach
+/// the cache, so only branch/tag shapes occur here.
+fn ref_cache_key(r#ref: &GitRef) -> Result<String, GitError> {
+    if let Some(b) = r#ref.branch.as_deref().filter(|s| !s.is_empty()) {
+        return Ok(format!("branch:{b}"));
+    }
+    if let Some(t) = r#ref.tag.as_deref().filter(|s| !s.is_empty()) {
+        return Ok(format!("tag:{t}"));
+    }
+    Err(GitError::Malformed(
+        "git ref selects nothing — admission validation should have rejected this".to_string(),
+    ))
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::ssh::test_server::{self, ServerBehaviour};
+    use super::*;
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    const TTL: Duration = Duration::from_secs(300);
+
+    fn adv_response() -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header(
+                "content-type",
+                "application/x-git-upload-pack-advertisement",
+            )
+            .set_body_bytes(fixtures::http_adv())
+    }
+
+    async fn mock_git_server(hits: u64) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/acme/pipelines.git/info/refs"))
+            .respond_with(adv_response())
+            .expect(hits)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn request(url: String, r#ref: rivers_k8s::crd::code_location::GitRef) -> GitResolveRequest {
+        GitResolveRequest {
+            url,
+            r#ref,
+            credentials: GitCredentials::Anonymous,
+            cache_ttl: TTL,
+        }
+    }
+
+    #[tokio::test]
+    async fn caches_branch_resolution_within_ttl() {
+        let server = mock_git_server(1).await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let req = request(
+            format!("{}/acme/pipelines.git", server.uri()),
+            fixtures::branch("main"),
+        );
+
+        let first = resolver.resolve(&req).await.unwrap();
+        let second = resolver.resolve(&req).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.commit, fixtures::oid('a'));
+        // MockServer verifies expect(1) on drop — a second HTTP hit fails.
+    }
+
+    #[tokio::test]
+    async fn expired_ttl_refetches() {
+        let server = mock_git_server(2).await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let mut req = request(
+            format!("{}/acme/pipelines.git", server.uri()),
+            fixtures::branch("main"),
+        );
+        req.cache_ttl = Duration::ZERO;
+
+        resolver.resolve(&req).await.unwrap();
+        resolver.resolve(&req).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn immutable_tag_is_cached_past_ttl() {
+        let server = mock_git_server(1).await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let mut req = request(
+            format!("{}/acme/pipelines.git", server.uri()),
+            fixtures::tag("v1.0.0"),
+        );
+        req.cache_ttl = Duration::ZERO; // would expire instantly if mutable
+
+        let first = resolver.resolve(&req).await.unwrap();
+        let second = resolver.resolve(&req).await.unwrap();
+        assert_eq!(first.commit, fixtures::oid('d')); // peeled commit
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn pinned_commit_never_touches_the_network() {
+        let server = mock_git_server(0).await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let pinned = rivers_k8s::crd::code_location::GitRef {
+            commit: Some(fixtures::oid('9')),
+            ..Default::default()
+        };
+        let req = request(format!("{}/acme/pipelines.git", server.uri()), pinned);
+
+        let resolved = resolver.resolve(&req).await.unwrap();
+        assert_eq!(resolved.commit, fixtures::oid('9'));
+        assert_eq!(resolved.ref_name, None);
+    }
+
+    #[tokio::test]
+    async fn ssh_scheme_dispatches_through_russh() {
+        let port = test_server::spawn_server(ServerBehaviour::default()).await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let req = GitResolveRequest {
+            url: format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git"),
+            r#ref: fixtures::branch("main"),
+            credentials: GitCredentials::Ssh {
+                private_key_openssh: test_server::CLIENT_KEY.to_string(),
+                known_hosts: format!("[127.0.0.1]:{port} {}", test_server::HOST_PUB),
+            },
+            cache_ttl: TTL,
+        };
+
+        let resolved = resolver.resolve(&req).await.unwrap();
+        assert_eq!(resolved.commit, fixtures::oid('a'));
+        assert_eq!(resolved.ref_name.as_deref(), Some("refs/heads/main"));
+    }
+
+    #[tokio::test]
+    async fn ssh_url_with_non_ssh_credentials_is_auth_failed() {
+        let resolver = GitResolver::new(TIMEOUT);
+        let req = GitResolveRequest {
+            url: "ssh://git@forge.example/r.git".to_string(),
+            r#ref: fixtures::branch("main"),
+            credentials: GitCredentials::Anonymous,
+            cache_ttl: TTL,
+        };
+        let err = resolver.resolve(&req).await.unwrap_err();
+        assert!(
+            matches!(err, GitError::AuthFailed(ref m) if m.contains("identity")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_scheme_is_malformed() {
+        let resolver = GitResolver::new(TIMEOUT);
+        let req = request(
+            "ftp://forge.example/r.git".to_string(),
+            fixtures::branch("m"),
+        );
+        let err = resolver.resolve(&req).await.unwrap_err();
+        assert!(matches!(err, GitError::Malformed(_)), "{err}");
+    }
+}
+
 /// Byte-stream fixtures shared by the parser tests and the transport tests —
 /// the same table drives both, which is what proves the parser is shared.
 #[cfg(test)]

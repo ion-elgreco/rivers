@@ -202,25 +202,26 @@ pub(crate) async fn fetch_advertisement_with_cap(
     }
 }
 
+/// In-process russh git server for tests — shared with the resolver tests in
+/// `super::mod`, which is why it lives outside the `tests` module.
 #[cfg(test)]
-mod tests {
-    use super::super::{commit_for_ref, fixtures, parse_advertisement};
-    use super::*;
+pub(crate) mod test_server {
+    use super::super::fixtures;
     use russh::keys::decode_secret_key;
     use russh::server::{self, Auth, ChannelOpenHandle, Msg, Server as _, Session};
     use russh::{Channel, ChannelId};
-    use std::io::Write as _;
+    use std::sync::Arc;
 
     // Fixed ed25519 fixtures generated once with ssh-keygen; the pubkeys
     // pair with the private keys below.
-    const CLIENT_PUB: &str =
+    pub(crate) const CLIENT_PUB: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDUahwZoxoHfJYcEqL7WsxYj1WdYMw8Tafk2Tk5Ful/y";
-    const HOST_PUB: &str =
+    pub(crate) const HOST_PUB: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFiXHrGv1EZGzi9tPYZ+mCp6mJ98ybVQvfbdNz3hrFeQ";
-    const ROGUE_PUB: &str =
+    pub(crate) const ROGUE_PUB: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDqeWXNsfD9+VE5aWkw91nguvO9RjLWqy87Xon+WA3w0";
 
-    const CLIENT_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+    pub(crate) const CLIENT_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
 QyNTUxOQAAACA1GocGaMaB3yWHBKi+1rMWI9VnWDMPE2n5Nk5ORbpf8gAAAJD7qj34+6o9
 +AAAAAtzc2gtZWQyNTUxOQAAACA1GocGaMaB3yWHBKi+1rMWI9VnWDMPE2n5Nk5ORbpf8g
@@ -228,7 +229,7 @@ AAAEBT/YSaZG7+P8QWodvIV/4Agh71GYW57RffMH/5hQKoijUahwZoxoHfJYcEqL7WsxYj
 1WdYMw8Tafk2Tk5Ful/yAAAABmNsaWVudAECAwQFBgc=
 -----END OPENSSH PRIVATE KEY-----
 ";
-    const HOST_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+    pub(crate) const HOST_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
 QyNTUxOQAAACBYlx6xr9RGRs4vbT2GfpgqepiffMm1UL323Tc94axXkAAAAIhLOkY7SzpG
 OwAAAAtzc2gtZWQyNTUxOQAAACBYlx6xr9RGRs4vbT2GfpgqepiffMm1UL323Tc94axXkA
@@ -238,12 +239,12 @@ mJ98ybVQvfbdNz3hrFeQAAAABGhvc3QB
 ";
 
     #[derive(Clone)]
-    struct ServerBehaviour {
-        advertisement: Vec<u8>,
-        expected_command: String,
-        exit_status: u32,
-        stderr: Option<&'static str>,
-        authorized_pub: &'static str,
+    pub(crate) struct ServerBehaviour {
+        pub(crate) advertisement: Vec<u8>,
+        pub(crate) expected_command: String,
+        pub(crate) exit_status: u32,
+        pub(crate) stderr: Option<&'static str>,
+        pub(crate) authorized_pub: &'static str,
     }
 
     impl Default for ServerBehaviour {
@@ -347,7 +348,7 @@ mJ98ybVQvfbdNz3hrFeQAAAABGhvc3QB
     }
 
     /// Boot a russh server on an ephemeral port; returns its port.
-    async fn spawn_server(behaviour: ServerBehaviour) -> u16 {
+    pub(crate) async fn spawn_server(behaviour: ServerBehaviour) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let config = Arc::new(server::Config {
@@ -360,6 +361,14 @@ mJ98ybVQvfbdNz3hrFeQAAAABGhvc3QB
         });
         port
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{commit_for_ref, fixtures, parse_advertisement};
+    use super::test_server::*;
+    use super::*;
+    use std::io::Write as _;
 
     struct TestAuth {
         _key: tempfile::NamedTempFile,

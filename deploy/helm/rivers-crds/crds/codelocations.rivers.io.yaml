@@ -18,8 +18,8 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
-    - jsonPath: .status.resolvedImage
-      name: Image
+    - jsonPath: .status.source
+      name: Source
       type: string
     - jsonPath: .status.readyReplicas
       name: Replicas
@@ -153,6 +153,104 @@ spec:
                   - name
                   type: object
                 type: array
+              git:
+                description: |-
+                  Git source for the pipeline code (RFC-044). Mutually composable with
+                  `image` (see there); at least one of the two must be set.
+                nullable: true
+                properties:
+                  dependencies:
+                    default:
+                      mode: auto
+                    properties:
+                      extras:
+                        description: '`uvSync` mode: `--extra` passthrough.'
+                        items:
+                          type: string
+                        type: array
+                      files:
+                        description: '`requirements` mode: files relative to `path`. Default `requirements.txt`.'
+                        items:
+                          type: string
+                        type: array
+                      groups:
+                        description: '`uvSync` mode: `--group` passthrough.'
+                        items:
+                          type: string
+                        type: array
+                      mode:
+                        default: auto
+                        description: |-
+                          `auto` picks `uvSync` when `uv.lock` exists, else `requirements` when
+                          `requirements.txt` exists, else installs nothing. Detection happens in
+                          the workspace pod — the operator never reads repo contents.
+                        enum:
+                        - auto
+                        - uvSync
+                        - requirements
+                        - none
+                        type: string
+                      timeoutSeconds:
+                        description: Wall-clock budget for fetch + install. Default 600s.
+                        format: uint64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                    type: object
+                  path:
+                    description: |-
+                      Subdirectory of the repo holding the project. Becomes the container's
+                      `workingDir`, so `spec.module` is imported relative to it.
+                    nullable: true
+                    type: string
+                  pollInterval:
+                    description: |-
+                      How often the operator re-resolves the ref. Same parser and 60s floor
+                      as `digestRefreshInterval`. Ignored when `ref.commit` is set.
+                    nullable: true
+                    type: string
+                  ref:
+                    description: Which revision to pin. Exactly one field set.
+                    properties:
+                      branch:
+                        nullable: true
+                        type: string
+                      commit:
+                        description: 'Full 40-hex commit. Pinned: no polling, no network at reconcile time.'
+                        nullable: true
+                        type: string
+                      tag:
+                        nullable: true
+                        type: string
+                    type: object
+                    x-kubernetes-validations:
+                    - message: exactly one of branch, tag or commit must be set
+                      rule: '(has(self.branch) ? 1 : 0) + (has(self.tag) ? 1 : 0) + (has(self.commit) ? 1 : 0) == 1'
+                  secretRef:
+                    description: |-
+                      Credentials Secret in the same namespace. Key names follow Flux:
+                      `username`/`password` for HTTPS, `identity` + `known_hosts` for SSH.
+                    nullable: true
+                    properties:
+                      name:
+                        description: 'Name of the referent. This field is effectively required, but due to backwards compatibility is allowed to be empty. Instances of this type with an empty value here are almost certainly wrong. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names'
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  url:
+                    description: '`https://host/org/repo.git` or `ssh://git@host/org/repo.git`.'
+                    type: string
+                  workspaceSize:
+                    description: |-
+                      Per-CL override for the workspace volume size: the PVC request in
+                      shared mode, the `emptyDir` cap in fallback mode.
+                    nullable: true
+                    x-kubernetes-int-or-string: true
+                required:
+                - ref
+                - url
+                type: object
               grpcPort:
                 default: 3001
                 description: gRPC port the `rivers serve` subcommand binds.
@@ -177,7 +275,15 @@ spec:
                   then `kubectl delete codelocation foo -n old`.
                 type: string
               image:
-                description: OCI image repository without tag or digest (e.g. `ghcr.io/acme/pipeline`).
+                description: |-
+                  OCI image repository without tag or digest (e.g. `ghcr.io/acme/pipeline`).
+
+                  This is always "the container image the pods run". Without `git` it
+                  also carries the code (today's behaviour). With `git` set it is the
+                  *runtime* image and the code comes from the repository; when omitted
+                  in git mode, the operator falls back to the chart-configured default
+                  runtime image.
+                nullable: true
                 type: string
               imagePullSecrets:
                 description: |-
@@ -252,9 +358,10 @@ spec:
                   `latest` if both are omitted.
                 nullable: true
                 type: string
-            required:
-            - image
             type: object
+            x-kubernetes-validations:
+            - message: spec.image is required unless spec.git is set
+              rule: has(self.image) || has(self.git)
           status:
             nullable: true
             properties:
@@ -285,6 +392,9 @@ spec:
                   e.g. `analytics.team-data.svc:50051`.
                 nullable: true
                 type: string
+              lastFetchedAt:
+                nullable: true
+                type: string
               lastReconciled:
                 nullable: true
                 type: string
@@ -308,11 +418,25 @@ spec:
                 format: int32
                 nullable: true
                 type: integer
+              resolvedCommit:
+                description: 'git mode: full 40-hex commit the reconciler pinned.'
+                nullable: true
+                type: string
               resolvedImage:
                 description: |-
                   Fully-qualified digest reference (`repo@sha256:...`) that the
                   reconciler has pinned. For multi-arch images this is the index digest,
                   so each node can still descend into per-platform manifests at pull time.
+                nullable: true
+                type: string
+              resolvedRef:
+                description: 'git mode: the ref that matched, e.g. `refs/heads/main`.'
+                nullable: true
+                type: string
+              source:
+                description: |-
+                  Short display of the pinned code version, for the print column.
+                  `ghcr.io/acme/p@sha256:abc1234` (image) or `main@9f3c1ab` (git).
                 nullable: true
                 type: string
             type: object

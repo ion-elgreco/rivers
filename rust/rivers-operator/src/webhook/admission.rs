@@ -261,6 +261,12 @@ fn mutate_codelocation_on_create(req: &AdmissionRequest<CodeLocation>) -> CodeLo
         return CodeLocationOutcome::Rejected("CREATE admission request missing object".into());
     };
 
+    // Source validation MUST precede identity stamping — the stamp path
+    // returns early, and stamping an invalid CR would accept it.
+    if let Err(message) = validate_git_source(cl, &git_allowed_hosts()) {
+        return CodeLocationOutcome::Rejected(message);
+    }
+
     let identity = cl.spec.identity.trim();
     if identity.is_empty() {
         // Mutating path: stamp a fresh UUID v4. The validating step on
@@ -289,7 +295,65 @@ fn check_codelocation_update(req: &AdmissionRequest<CodeLocation>) -> CodeLocati
             old.spec.identity, new.spec.identity
         ));
     }
+    if let Err(message) = validate_git_source(new, &git_allowed_hosts()) {
+        return CodeLocationOutcome::Rejected(message);
+    }
     CodeLocationOutcome::UpdateAllowed
+}
+
+/// Validate the source shape (RFC-044): at least one of `image`/`git`
+/// (re-checked here for API servers whose CEL support predates the CRD
+/// rule), a well-formed one-of `git.ref`, a supported URL scheme, and the
+/// operator's host allowlist.
+fn validate_git_source(cl: &CodeLocation, allowed_hosts: &[String]) -> Result<(), String> {
+    if cl.spec.image.is_none() && cl.spec.git.is_none() {
+        return Err("one of spec.image or spec.git must be set".to_string());
+    }
+    let Some(git) = &cl.spec.git else {
+        return Ok(());
+    };
+    git.r#ref.validate()?;
+    let url = url::Url::parse(&git.url)
+        .map_err(|e| format!("spec.git.url '{}' is not a valid url: {e}", git.url))?;
+    match url.scheme() {
+        "https" | "http" | "ssh" => {}
+        other => {
+            return Err(format!(
+                "spec.git.url scheme '{other}' is unsupported (use https:// or ssh://)"
+            ));
+        }
+    }
+    let Some(host) = url.host_str() else {
+        return Err(format!("spec.git.url '{}' has no host", git.url));
+    };
+    if !host_allowed(host, allowed_hosts) {
+        return Err(format!(
+            "git host '{host}' is not in the operator's allowed list — \
+             adjust operator.git.allowedHosts or use an approved host"
+        ));
+    }
+    Ok(())
+}
+
+fn host_allowed(host: &str, allowed: &[String]) -> bool {
+    allowed.is_empty() || allowed.iter().any(|a| a.eq_ignore_ascii_case(host))
+}
+
+/// `RIVERS_GIT_ALLOWED_HOSTS`, comma-separated; empty admits any host.
+/// Read once — the operator restarts on config change (it's pod env).
+fn git_allowed_hosts() -> Vec<String> {
+    static HOSTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    HOSTS
+        .get_or_init(|| {
+            std::env::var("RIVERS_GIT_ALLOWED_HOSTS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .clone()
 }
 
 fn codelocation_response_for(
@@ -789,6 +853,106 @@ mod tests {
             mutate_codelocation(&req),
             CodeLocationOutcome::UpdateAllowed
         );
+    }
+
+    fn build_git_cl(git_spec: serde_json::Value) -> CodeLocation {
+        let spec = serde_json::from_value(serde_json::json!({ "git": git_spec })).unwrap();
+        CodeLocation::new("analytics", spec)
+    }
+
+    #[test]
+    fn cl_source_validation_requires_image_or_git() {
+        let spec = serde_json::from_value(serde_json::json!({ "module": "m" })).unwrap();
+        let cl = CodeLocation::new("bare", spec);
+        let err = validate_git_source(&cl, &[]).unwrap_err();
+        assert!(err.contains("spec.image or spec.git"));
+    }
+
+    #[test]
+    fn cl_git_ref_one_of_enforced_at_admission() {
+        let cl = build_git_cl(serde_json::json!({
+            "url": "https://forge.example/r.git",
+            "ref": { "branch": "main", "tag": "v1" }
+        }));
+        let err = validate_git_source(&cl, &[]).unwrap_err();
+        assert!(err.contains("exactly one"), "{err}");
+    }
+
+    #[test]
+    fn cl_git_url_schemes_validated() {
+        let ok = build_git_cl(serde_json::json!({
+            "url": "ssh://git@forge.example/r.git",
+            "ref": { "branch": "main" }
+        }));
+        validate_git_source(&ok, &[]).unwrap();
+
+        let scp_style = build_git_cl(serde_json::json!({
+            "url": "git@forge.example:acme/r.git",
+            "ref": { "branch": "main" }
+        }));
+        assert!(validate_git_source(&scp_style, &[]).is_err());
+
+        let ftp = build_git_cl(serde_json::json!({
+            "url": "ftp://forge.example/r.git",
+            "ref": { "branch": "main" }
+        }));
+        let err = validate_git_source(&ftp, &[]).unwrap_err();
+        assert!(err.contains("unsupported"), "{err}");
+    }
+
+    #[test]
+    fn cl_git_host_allowlist() {
+        let cl = build_git_cl(serde_json::json!({
+            "url": "https://forge.example/r.git",
+            "ref": { "branch": "main" }
+        }));
+        // Empty list admits any host.
+        validate_git_source(&cl, &[]).unwrap();
+        // Listed host, case-insensitively.
+        validate_git_source(&cl, &["Forge.Example".to_string()]).unwrap();
+        // Unlisted host rejected with the knob named.
+        let err = validate_git_source(&cl, &["github.com".to_string()]).unwrap_err();
+        assert!(err.contains("allowedHosts"), "{err}");
+    }
+
+    #[test]
+    fn cl_create_validates_git_before_stamping_identity() {
+        // Invalid git + empty identity: must reject, not stamp-and-accept.
+        let cl = build_git_cl(serde_json::json!({
+            "url": "https://forge.example/r.git",
+            "ref": {}
+        }));
+        let req = cl_admission_request_create("uid-cl-git-1", "team-data", &cl);
+        match mutate_codelocation(&req) {
+            CodeLocationOutcome::Rejected(msg) => assert!(msg.contains("exactly one"), "{msg}"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // Valid git + empty identity still stamps.
+        let cl = build_git_cl(serde_json::json!({
+            "url": "https://forge.example/r.git",
+            "ref": { "branch": "main" }
+        }));
+        let req = cl_admission_request_create("uid-cl-git-2", "team-data", &cl);
+        assert!(matches!(
+            mutate_codelocation(&req),
+            CodeLocationOutcome::IdentityStamped(_)
+        ));
+    }
+
+    #[test]
+    fn cl_update_rejects_git_going_invalid() {
+        let old = build_git_cl(serde_json::json!({
+            "url": "https://forge.example/r.git",
+            "ref": { "branch": "main" }
+        }));
+        let mut new = old.clone();
+        new.spec.git.as_mut().unwrap().r#ref.tag = Some("v1".to_string());
+        let req = cl_admission_request_update("uid-cl-git-3", "team-data", &new, &old);
+        assert!(matches!(
+            mutate_codelocation(&req),
+            CodeLocationOutcome::Rejected(_)
+        ));
     }
 
     #[tokio::test]

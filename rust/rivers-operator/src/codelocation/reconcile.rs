@@ -22,12 +22,16 @@ use kube_client::ResourceExt;
 use kube_client::api::{Api, Patch, PatchParams};
 use kube_runtime::controller::Action;
 use rivers_k8s::crd::code_location::{
-    CONDITION_DEPLOYMENT_AVAILABLE, CONDITION_IMAGE_RESOLVED, CodeLocation, CodeLocationCondition,
-    CodeLocationPhase, CodeLocationStatus, IMMUTABLE_TAG_ANNOTATION, REASON_AUTH_FAILED,
-    REASON_AWAITING_LEADER, REASON_DIGEST_PINNED, REASON_DIGEST_RESOLVED, REASON_MIN_REPLICAS,
+    CONDITION_DEPLOYMENT_AVAILABLE, CONDITION_IMAGE_RESOLVED, CONDITION_SOURCE_RESOLVED,
+    CodeLocation, CodeLocationCondition, CodeLocationPhase, CodeLocationStatus,
+    IMMUTABLE_TAG_ANNOTATION, REASON_AUTH_FAILED, REASON_AWAITING_LEADER, REASON_COMMIT_PINNED,
+    REASON_COMMIT_RESOLVED, REASON_DIGEST_PINNED, REASON_DIGEST_RESOLVED, REASON_GIT_AUTH_FAILED,
+    REASON_GIT_HOST_KEY_REJECTED, REASON_GIT_UNREACHABLE, REASON_MIN_REPLICAS,
     REASON_NO_DEPLOYMENT_STATUS, REASON_PROGRESS_DEADLINE, REASON_RATE_LIMITED,
-    REASON_REGISTRY_ERROR, REASON_ROLLING_OUT, REASON_TAG_NOT_FOUND,
+    REASON_REF_NOT_FOUND, REASON_REGISTRY_ERROR, REASON_ROLLING_OUT, REASON_TAG_NOT_FOUND,
 };
+
+use super::git::{self, GitCredentials, GitResolveRequest};
 
 use super::image_auth::resolve_auth;
 use super::registry::{RegistryAuth, RegistryClient, RegistryError, Resolution, ResolveRequest};
@@ -57,6 +61,12 @@ pub struct Context {
     pub client: kube_client::Client,
     pub namespace: String,
     pub registry: Arc<RegistryClient>,
+    /// Ref→commit resolver for git-sourced CodeLocations (RFC-044). Same
+    /// caching/backoff posture as `registry`, same leader gating here.
+    pub git: Arc<super::git::GitResolver>,
+    /// Default runtime image for git CLs that don't set `spec.image`.
+    /// Chart-configured via `RIVERS_RUNTIME_IMAGE`.
+    pub runtime_image: String,
     pub leader: Arc<LeaderGate>,
     pub code_location_service_account: String,
     /// SurrealDB endpoint, scope (`use_ns` / `use_db`) and auth-secret
@@ -88,6 +98,10 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
     let deployments_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), &namespace);
     let services_api: Api<Service> = Api::namespaced(ctx.client.clone(), &namespace);
     let secrets_api: Api<Secret> = Api::namespaced(ctx.client.clone(), &namespace);
+
+    if cl.spec.is_git() {
+        return reconcile_git(&cl, &ctx, &code_locations_api, &secrets_api).await;
+    }
 
     let timer = Instant::now();
     let (resolved_image, image_reason, refresh_after, immutable) =
@@ -187,6 +201,306 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
     Ok(requeue)
 }
 
+/// Git-mode reconcile (RFC-044 phase 1): pin the runtime image digest and
+/// the commit, publish status. **No Deployment yet** — the workspace
+/// materializer is phase 2, so a git CL deliberately never reaches `Ready`
+/// here and the Run admission webhook keeps rejecting runs against it.
+async fn reconcile_git(
+    cl: &CodeLocation,
+    ctx: &Context,
+    code_locations_api: &Api<CodeLocation>,
+    secrets_api: &Api<Secret>,
+) -> Result<Action, Error> {
+    let name = cl.name_any();
+    let generation = cl.metadata.generation;
+    let git_spec = cl
+        .spec
+        .git
+        .as_ref()
+        .expect("reconcile_git dispatched for a non-git CodeLocation");
+
+    // Runtime image first, through the same registry pipeline as image mode.
+    let runtime_image = cl
+        .spec
+        .image
+        .clone()
+        .unwrap_or_else(|| ctx.runtime_image.clone());
+    let timer = Instant::now();
+    let (resolved_image, image_reason) =
+        match resolve_image_ref(cl, runtime_image, ctx, secrets_api).await {
+            ImageOutcome::Resolved {
+                resolved_image,
+                reason,
+                ..
+            } => {
+                metrics::observe_resolution_seconds(timer.elapsed().as_secs_f64());
+                (resolved_image, reason)
+            }
+            ImageOutcome::AwaitingLeader => {
+                patch_waiting_status(code_locations_api, &name, generation, cl).await?;
+                return Ok(Action::requeue(FOLLOWER_WAIT));
+            }
+            ImageOutcome::Error(err) => {
+                let retry = err.retry_after();
+                patch_error_status(code_locations_api, &name, generation, cl, &err).await?;
+                return Ok(Action::requeue(retry));
+            }
+        };
+
+    let poll = parse_refresh_interval(git_spec.poll_interval.as_deref());
+
+    // Followers reuse the leader's pinned commit instead of polling the
+    // remote — mirrors the registry follower path.
+    if !ctx.leader.is_leader() {
+        if let Some(prior_commit) = cl.status.as_ref().and_then(|s| s.resolved_commit.clone()) {
+            let resolved = git::ResolvedRef {
+                commit: prior_commit,
+                ref_name: cl.status.as_ref().and_then(|s| s.resolved_ref.clone()),
+            };
+            patch_git_status(
+                code_locations_api,
+                &name,
+                generation,
+                cl,
+                &resolved_image,
+                image_reason,
+                &resolved,
+                None,
+            )
+            .await?;
+        } else {
+            patch_waiting_status(code_locations_api, &name, generation, cl).await?;
+        }
+        return Ok(Action::requeue(FOLLOWER_WAIT));
+    }
+
+    let credentials = match git_credentials(git_spec, secrets_api).await {
+        Ok(credentials) => credentials,
+        Err(err) => {
+            let retry = patch_git_error(code_locations_api, &name, generation, cl, &err).await?;
+            return Ok(Action::requeue(retry));
+        }
+    };
+
+    let request = GitResolveRequest {
+        url: git_spec.url.clone(),
+        r#ref: git_spec.r#ref.clone(),
+        credentials,
+        cache_ttl: poll,
+    };
+    match ctx.git.resolve(&request).await {
+        Ok(resolved) => {
+            let now = chrono::Utc::now().to_rfc3339();
+            patch_git_status(
+                code_locations_api,
+                &name,
+                generation,
+                cl,
+                &resolved_image,
+                image_reason,
+                &resolved,
+                Some(now),
+            )
+            .await?;
+            let pinned = request
+                .r#ref
+                .commit
+                .as_deref()
+                .is_some_and(|c| !c.is_empty());
+            let immutable_tag = request
+                .r#ref
+                .tag
+                .as_deref()
+                .is_some_and(super::registry::looks_immutable);
+            let requeue = if pinned {
+                Action::await_change()
+            } else if immutable_tag {
+                Action::requeue(jitter(Duration::from_secs(3600)))
+            } else {
+                Action::requeue(jitter(poll))
+            };
+            Ok(requeue)
+        }
+        Err(err) => {
+            let retry = patch_git_error(code_locations_api, &name, generation, cl, &err).await?;
+            Ok(Action::requeue(retry))
+        }
+    }
+}
+
+/// Build [`GitCredentials`] from the CR's Secret. `identity` (+ mandatory
+/// `known_hosts`) selects SSH; `username`+`password` selects basic auth; an
+/// absent secretRef or empty Secret is anonymous.
+async fn git_credentials(
+    git_spec: &rivers_k8s::crd::code_location::GitSource,
+    secrets_api: &Api<Secret>,
+) -> Result<GitCredentials, git::GitError> {
+    let Some(secret_ref) = &git_spec.secret_ref else {
+        return Ok(GitCredentials::Anonymous);
+    };
+    let secret = secrets_api.get(&secret_ref.name).await.map_err(|e| {
+        git::GitError::Unreachable(format!("reading git Secret '{}': {e}", secret_ref.name))
+    })?;
+    let data = secret.data.unwrap_or_default();
+    let entry = |key: &str| {
+        data.get(key)
+            .map(|v| String::from_utf8_lossy(&v.0).into_owned())
+    };
+
+    if let Some(identity) = entry("identity") {
+        let known_hosts = entry("known_hosts").ok_or_else(|| {
+            git::GitError::KnownHostsUnavailable(format!(
+                "git Secret '{}' has `identity` but no `known_hosts` — refusing SSH without \
+                 host-key pinning",
+                secret_ref.name
+            ))
+        })?;
+        return Ok(GitCredentials::Ssh {
+            private_key_openssh: identity,
+            known_hosts,
+        });
+    }
+    match (entry("username"), entry("password")) {
+        (Some(username), Some(password)) => Ok(GitCredentials::Basic { username, password }),
+        (None, None) => Ok(GitCredentials::Anonymous),
+        _ => Err(git::GitError::AuthFailed(format!(
+            "git Secret '{}' needs both `username` and `password` (or `identity` + `known_hosts`)",
+            secret_ref.name
+        ))),
+    }
+}
+
+/// Condition reason + requeue delay for a git resolution failure. Mirrors
+/// `ImageError::retry_after`'s philosophy: auth/ref problems are terminal
+/// until the CR or Secret changes (slow recheck), transport is transient.
+fn git_error_reason_retry(err: &git::GitError) -> (&'static str, Duration) {
+    match err {
+        git::GitError::RefNotFound(_) => (REASON_REF_NOT_FOUND, TERMINAL_RETRY),
+        git::GitError::AuthFailed(_) => (REASON_GIT_AUTH_FAILED, TERMINAL_RETRY),
+        git::GitError::HostKeyRejected(_) | git::GitError::KnownHostsUnavailable(_) => {
+            (REASON_GIT_HOST_KEY_REJECTED, TERMINAL_RETRY)
+        }
+        git::GitError::Unreachable(_) => (REASON_GIT_UNREACHABLE, Duration::from_secs(60)),
+        git::GitError::Malformed(_) => (REASON_GIT_UNREACHABLE, TERMINAL_RETRY),
+    }
+}
+
+/// `main@9f3c1ab` for branches/tags, `9f3c1ab (pinned)` for explicit commits.
+fn git_source_display(
+    resolved: &git::ResolvedRef,
+    wanted: &rivers_k8s::crd::code_location::GitRef,
+) -> String {
+    let short = &resolved.commit[..resolved.commit.len().min(7)];
+    let name = wanted
+        .branch
+        .as_deref()
+        .or(wanted.tag.as_deref())
+        .filter(|s| !s.is_empty());
+    match name {
+        Some(name) => format!("{name}@{short}"),
+        None => format!("{short} (pinned)"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn patch_git_status(
+    code_locations_api: &Api<CodeLocation>,
+    name: &str,
+    generation: Option<i64>,
+    cl: &CodeLocation,
+    resolved_image: &str,
+    image_reason: &'static str,
+    resolved: &git::ResolvedRef,
+    fetched_at: Option<String>,
+) -> Result<(), kube_client::Error> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let prior = cl.status.as_ref();
+    let git_spec = cl.spec.git.as_ref().expect("git status for a git CL");
+    let source_reason = if resolved.ref_name.is_none() {
+        REASON_COMMIT_PINNED
+    } else {
+        REASON_COMMIT_RESOLVED
+    };
+    let mut status = CodeLocationStatus {
+        phase: Some(CodeLocationPhase::Pending),
+        observed_generation: generation,
+        resolved_image: Some(resolved_image.to_string()),
+        grpc_endpoint: None,
+        last_reconciled: Some(now.clone()),
+        ready_replicas: None,
+        message: Some(
+            "git source resolved; workspace materialization arrives with RFC-044 phase 2"
+                .to_string(),
+        ),
+        conditions: Vec::new(),
+        source: Some(git_source_display(resolved, &git_spec.r#ref)),
+        resolved_commit: Some(resolved.commit.clone()),
+        resolved_ref: resolved.ref_name.clone(),
+        last_fetched_at: fetched_at.or_else(|| prior.and_then(|s| s.last_fetched_at.clone())),
+    };
+    push_condition(
+        &mut status,
+        prior,
+        CONDITION_IMAGE_RESOLVED,
+        "True",
+        image_reason,
+        Some(resolved_image.to_string()),
+        &now,
+    );
+    push_condition(
+        &mut status,
+        prior,
+        CONDITION_SOURCE_RESOLVED,
+        "True",
+        source_reason,
+        Some(resolved.commit.clone()),
+        &now,
+    );
+    if status_substantively_equal(prior, &status) {
+        return Ok(());
+    }
+    patch_status(code_locations_api, name, &status).await
+}
+
+async fn patch_git_error(
+    code_locations_api: &Api<CodeLocation>,
+    name: &str,
+    generation: Option<i64>,
+    cl: &CodeLocation,
+    err: &git::GitError,
+) -> Result<Duration, kube_client::Error> {
+    let (reason, retry) = git_error_reason_retry(err);
+    let now = chrono::Utc::now().to_rfc3339();
+    let prior = cl.status.as_ref();
+    let mut status = CodeLocationStatus {
+        phase: Some(CodeLocationPhase::Failed),
+        observed_generation: generation,
+        resolved_image: prior.and_then(|s| s.resolved_image.clone()),
+        grpc_endpoint: None,
+        last_reconciled: Some(now.clone()),
+        ready_replicas: None,
+        message: Some(err.to_string()),
+        conditions: Vec::new(),
+        source: prior.and_then(|s| s.source.clone()),
+        resolved_commit: prior.and_then(|s| s.resolved_commit.clone()),
+        resolved_ref: prior.and_then(|s| s.resolved_ref.clone()),
+        last_fetched_at: prior.and_then(|s| s.last_fetched_at.clone()),
+    };
+    push_condition(
+        &mut status,
+        prior,
+        CONDITION_SOURCE_RESOLVED,
+        "False",
+        reason,
+        Some(err.to_string()),
+        &now,
+    );
+    if !status_substantively_equal(prior, &status) {
+        patch_status(code_locations_api, name, &status).await?;
+    }
+    Ok(retry)
+}
+
 /// Controller-runtime error policy: log the failure and requeue after 30s.
 /// Per-error retry tuning happens inside `reconcile()` itself; this is the
 /// catch-all for unhandled errors that escape that path.
@@ -254,14 +568,24 @@ async fn resolve_image(
     ctx: &Context,
     secrets_api: &Api<Secret>,
 ) -> ImageOutcome {
-    // Git-mode source resolution is dispatched before this point; reaching
-    // here without an image is a bug or a git CL ahead of resolve_source().
+    // Git CLs are dispatched to reconcile_git() before this point.
     let Some(image) = cl.spec.image.clone() else {
         return ImageOutcome::Error(ImageError::Transient(
-            "spec.image is unset; git source resolution not yet wired".into(),
+            "spec.image is unset on an image-mode CodeLocation".into(),
         ));
     };
+    resolve_image_ref(cl, image, ctx, secrets_api).await
+}
 
+/// Resolve a concrete image ref (repository string) to a pinned digest —
+/// shared by image mode (`spec.image`) and git mode (runtime image, which
+/// may be the chart default rather than a spec field).
+async fn resolve_image_ref(
+    cl: &CodeLocation,
+    image: String,
+    ctx: &Context,
+    secrets_api: &Api<Secret>,
+) -> ImageOutcome {
     // Explicit digest wins immediately — no leader gating, no HTTP.
     if cl.spec.has_pinned_digest() {
         let digest = cl.spec.digest.as_deref().unwrap_or_default();
@@ -748,6 +1072,78 @@ mod tests {
             first_component("localhost:5000/x"),
             Some("localhost:5000".into())
         );
+    }
+
+    #[test]
+    fn git_error_reasons_and_retries() {
+        use super::super::git::GitError;
+        let cases = [
+            (
+                GitError::RefNotFound("x".into()),
+                REASON_REF_NOT_FOUND,
+                TERMINAL_RETRY,
+            ),
+            (
+                GitError::AuthFailed("x".into()),
+                REASON_GIT_AUTH_FAILED,
+                TERMINAL_RETRY,
+            ),
+            (
+                GitError::HostKeyRejected("x".into()),
+                REASON_GIT_HOST_KEY_REJECTED,
+                TERMINAL_RETRY,
+            ),
+            (
+                GitError::KnownHostsUnavailable("x".into()),
+                REASON_GIT_HOST_KEY_REJECTED,
+                TERMINAL_RETRY,
+            ),
+            (
+                GitError::Unreachable("x".into()),
+                REASON_GIT_UNREACHABLE,
+                Duration::from_secs(60),
+            ),
+            (
+                GitError::Malformed("x".into()),
+                REASON_GIT_UNREACHABLE,
+                TERMINAL_RETRY,
+            ),
+        ];
+        for (err, reason, retry) in cases {
+            assert_eq!(git_error_reason_retry(&err), (reason, retry), "{err}");
+        }
+    }
+
+    #[test]
+    fn git_source_display_shapes() {
+        use rivers_k8s::crd::code_location::GitRef;
+        let commit = "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8".to_string();
+
+        let on_branch = git::ResolvedRef {
+            commit: commit.clone(),
+            ref_name: Some("refs/heads/main".into()),
+        };
+        let branch = GitRef {
+            branch: Some("main".into()),
+            ..Default::default()
+        };
+        assert_eq!(git_source_display(&on_branch, &branch), "main@9f3c1ab");
+
+        let tag = GitRef {
+            tag: Some("v1.2.3".into()),
+            ..Default::default()
+        };
+        assert_eq!(git_source_display(&on_branch, &tag), "v1.2.3@9f3c1ab");
+
+        let pinned_ref = GitRef {
+            commit: Some(commit.clone()),
+            ..Default::default()
+        };
+        let pinned = git::ResolvedRef {
+            commit,
+            ref_name: None,
+        };
+        assert_eq!(git_source_display(&pinned, &pinned_ref), "9f3c1ab (pinned)");
     }
 
     #[test]

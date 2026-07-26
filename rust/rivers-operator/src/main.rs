@@ -43,6 +43,9 @@ const WEBHOOK_DISABLED_ENV: &str = "RIVERS_WEBHOOK_DISABLED";
 // HTTPS. Only useful for trusted in-cluster or local-dev registries
 // (e.g. k3d's HTTP-only local registry). Default is HTTPS.
 const ALLOW_INSECURE_REGISTRY_ENV: &str = "RIVERS_ALLOW_INSECURE_REGISTRY";
+const RUNTIME_IMAGE_ENV: &str = "RIVERS_RUNTIME_IMAGE";
+const GIT_TIMEOUT_SECONDS_ENV: &str = "RIVERS_GIT_TIMEOUT_SECONDS";
+const DEFAULT_GIT_TIMEOUT_SECONDS: u64 = 30;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -108,12 +111,22 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    let git_timeout = std::env::var(GIT_TIMEOUT_SECONDS_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_GIT_TIMEOUT_SECONDS);
+
     let cl_ctx = Arc::new(codelocation::Context {
         client: client.clone(),
         namespace: namespace.clone(),
         registry: Arc::new(codelocation::RegistryClient::with_insecure(
             allow_insecure_registry,
         )),
+        git: Arc::new(codelocation::git::GitResolver::new(
+            std::time::Duration::from_secs(git_timeout),
+        )),
+        runtime_image: std::env::var(RUNTIME_IMAGE_ENV)
+            .unwrap_or_else(|_| rivers_k8s::defaults::RUNTIME_IMAGE.to_string()),
         leader: leader.clone(),
         code_location_service_account: std::env::var(CODE_LOCATION_SA_ENV)
             .unwrap_or_else(|_| DEFAULT_CODE_LOCATION_SA.to_string()),
