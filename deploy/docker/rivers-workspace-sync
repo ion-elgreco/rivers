@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# rivers-workspace-sync — RFC-044 workspace materializer.
+#
+# Runs as the init container of a git-sourced CodeLocation pod. Builds the
+# content-addressed tree at $RIVERS_WORKSPACE_DIR (checkout + venv), then
+# prunes sibling trees on the shared volume. Driven entirely by env:
+#
+#   RIVERS_GIT_URL                 repository url (https:// or ssh://)
+#   RIVERS_GIT_COMMIT              pinned 40-hex commit — always the SHA
+#   RIVERS_GIT_REF                 resolved ref (fallback when the server
+#                                  refuses SHA fetches; verified afterwards)
+#   RIVERS_GIT_PATH                subdir holding the project (optional)
+#   RIVERS_DEPS_MODE               auto | uvSync | requirements | none
+#   RIVERS_DEPS_FILES              csv, requirements mode (default requirements.txt)
+#   RIVERS_DEPS_EXTRAS             csv → uv sync --extra …
+#   RIVERS_DEPS_GROUPS             csv → uv sync --group …
+#   RIVERS_DEPS_TIMEOUT_SECONDS    fetch+install budget (default 600)
+#   RIVERS_WORKSPACE_KEEP          csv of workspace keys the prune must retain
+#   RIVERS_WORKSPACE_KEEP_REVISIONS  recency floor (default 3)
+#   RIVERS_WORKSPACE_MIN_AGE       age floor, Ns/Nm/Nh (default 1h)
+#
+# Layout contract (paths are identical in shared-PVC and emptyDir modes):
+#   /workspace        this tree (subPath mount): src/ venv/ .ready .lock
+#   /workspaces       PVC root — present only on the code-location pod,
+#                     only there does the prune step have siblings to walk
+#   /etc/rivers/git   mounted git Secret: username/password or
+#                     identity + known_hosts
+#
+# Ordering invariants (tested by the k3d integration suite):
+#   * .ready is written LAST — a crash mid-build leaves a tree that gets
+#     retried, never one that looks complete;
+#   * the prune runs on EVERY invocation, including the .ready
+#     short-circuit — reclamation triggers on pod starts, not commits;
+#   * prune failures are non-fatal — a full volume must not block the tree
+#     that was just built successfully.
+
+set -euo pipefail
+
+WORKSPACE="${RIVERS_WORKSPACE_DIR:-/workspace}"
+WORKSPACES_ROOT="${RIVERS_WORKSPACES_ROOT:-/workspaces}"
+CREDS_DIR="${RIVERS_GIT_CREDS_DIR:-/etc/rivers/git}"
+SRC="$WORKSPACE/src"
+VENV="$WORKSPACE/venv"
+READY="$WORKSPACE/.ready"
+LOCK="$WORKSPACE/.lock"
+
+log() { printf 'workspace-sync: %s\n' "$*" >&2; }
+die() {
+    log "ERROR: $*"
+    # Also land the message where terminationMessagePolicy picks it up even
+    # when FallbackToLogsOnError is misconfigured. `2>/dev/null` must come
+    # FIRST — redirections apply left to right, and a failing open of the
+    # termination log would otherwise print to the real stderr.
+    printf '%s\n' "$*" 2>/dev/null >/dev/termination-log || true
+    exit 1
+}
+
+# ---- git auth -------------------------------------------------------------
+
+GIT_ARGS=()
+
+setup_git_auth() {
+    if [ -f "$CREDS_DIR/identity" ]; then
+        [ -f "$CREDS_DIR/known_hosts" ] || die \
+            "git Secret has 'identity' but no 'known_hosts' — refusing SSH without host-key pinning"
+        export GIT_SSH_COMMAND="ssh -i $CREDS_DIR/identity -o UserKnownHostsFile=$CREDS_DIR/known_hosts -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
+    fi
+    if [ -f "$CREDS_DIR/username" ] && [ -f "$CREDS_DIR/password" ]; then
+        local basic
+        basic=$(printf '%s:%s' "$(cat "$CREDS_DIR/username")" "$(cat "$CREDS_DIR/password")" | base64 | tr -d '\n')
+        GIT_ARGS+=(-c "http.extraheader=Authorization: Basic $basic")
+    fi
+}
+
+# ---- build ----------------------------------------------------------------
+
+fetch_source() {
+    rm -rf "$SRC"
+    mkdir -p "$SRC"
+    git -C "$SRC" init -q
+    git -C "$SRC" remote add origin "$RIVERS_GIT_URL"
+
+    # Fetch by SHA so a force-push cannot change what we get. Some servers
+    # refuse SHA-in-want; fall back to the ref, then VERIFY. The
+    # `${GIT_ARGS[@]+…}` shape keeps `set -u` happy when the array is empty
+    # (anonymous https / ssh-via-GIT_SSH_COMMAND add no -c flags).
+    if ! git ${GIT_ARGS[@]+"${GIT_ARGS[@]}"} -C "$SRC" fetch -q --depth 1 origin "$RIVERS_GIT_COMMIT" 2>/dev/null; then
+        [ -n "${RIVERS_GIT_REF:-}" ] || die \
+            "server refused fetch-by-SHA for $RIVERS_GIT_COMMIT and RIVERS_GIT_REF is unset"
+        log "server refused fetch-by-SHA; fetching $RIVERS_GIT_REF and verifying"
+        git ${GIT_ARGS[@]+"${GIT_ARGS[@]}"} -C "$SRC" fetch -q --depth 1 origin "$RIVERS_GIT_REF"
+    fi
+    git -C "$SRC" checkout -q FETCH_HEAD
+
+    local actual
+    actual=$(git -C "$SRC" rev-parse HEAD)
+    [ "$actual" = "$RIVERS_GIT_COMMIT" ] || die \
+        "fetched commit $actual does not match pinned $RIVERS_GIT_COMMIT — ref moved between resolve and fetch; retrying on next pod start"
+}
+
+install_deps() {
+    local project_dir="$SRC/${RIVERS_GIT_PATH:-}"
+    project_dir="${project_dir%/}"
+    [ -d "$project_dir" ] || die "RIVERS_GIT_PATH '$RIVERS_GIT_PATH' does not exist in the repository"
+
+    local mode="${RIVERS_DEPS_MODE:-auto}"
+    if [ "$mode" = auto ]; then
+        if [ -f "$project_dir/uv.lock" ]; then
+            mode=uvSync
+        elif [ -f "$project_dir/requirements.txt" ]; then
+            mode=requirements
+        else
+            mode=none
+        fi
+        log "deps mode auto -> $mode"
+    fi
+
+    case "$mode" in
+        uvSync)
+            local args=(sync --locked --project "$project_dir")
+            local IFS=,
+            local item
+            for item in ${RIVERS_DEPS_EXTRAS:-}; do args+=(--extra "$item"); done
+            for item in ${RIVERS_DEPS_GROUPS:-}; do args+=(--group "$item"); done
+            # uv sync creates the env itself at UV_PROJECT_ENVIRONMENT.
+            UV_PROJECT_ENVIRONMENT="$VENV" uv "${args[@]}"
+            ;;
+        requirements)
+            # uv pip targets VIRTUAL_ENV, not UV_PROJECT_ENVIRONMENT —
+            # create the env explicitly first.
+            uv venv -q "$VENV"
+            local args=(pip install)
+            local IFS=,
+            local f
+            for f in ${RIVERS_DEPS_FILES:-requirements.txt}; do
+                args+=(-r "$project_dir/$f")
+            done
+            VIRTUAL_ENV="$VENV" uv "${args[@]}"
+            ;;
+        none)
+            log "deps mode none — installing nothing; the runtime image carries the deps"
+            ;;
+        *)
+            die "unknown RIVERS_DEPS_MODE '$mode' (auto|uvSync|requirements|none)"
+            ;;
+    esac
+}
+
+build() {
+    setup_git_auth
+    fetch_source
+    install_deps
+    # Read-only consumers can't write __pycache__ next to the source —
+    # bake the bytecode into the tree instead. Non-fatal: a syntax error in
+    # user code should surface at import time with a real traceback.
+    python3 -m compileall -q "$SRC" || log "compileall reported errors (non-fatal)"
+}
+
+# ---- prune (step 5) -------------------------------------------------------
+
+parse_duration_seconds() {
+    case "$1" in
+        *h) echo $((${1%h} * 3600)) ;;
+        *m) echo $((${1%m} * 60)) ;;
+        *s) echo "${1%s}" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+prune() {
+    # emptyDir mode has no /workspaces mount — nothing to reclaim.
+    [ -d "$WORKSPACES_ROOT" ] || return 0
+
+    local keep_csv=",${RIVERS_WORKSPACE_KEEP:-},"
+    local keep_n="${RIVERS_WORKSPACE_KEEP_REVISIONS:-3}"
+    local min_age_s
+    min_age_s=$(parse_duration_seconds "${RIVERS_WORKSPACE_MIN_AGE:-1h}")
+
+    # flock -n: at most one pruner at a time; the rest skip. A prune that
+    # finds nothing eligible is a directory listing — redundancy is free.
+    exec 8>"$WORKSPACES_ROOT/.prune.lock" || return 0
+    if ! flock -n 8; then
+        log "prune: another pod holds the prune lock — skipping"
+        return 0
+    fi
+
+    local now rank=0 tree dir age
+    now=$(date +%s)
+    # Newest-first by mtime; `cache/` (shared UV_CACHE_DIR) and dotfiles are
+    # not trees.
+    while IFS= read -r tree; do
+        dir="$WORKSPACES_ROOT/$tree"
+        [ -d "$dir" ] || continue
+        case "$tree" in cache | .*) continue ;; esac
+        rank=$((rank + 1))
+        case "$keep_csv" in *",$tree,"*)
+            continue # keep-set (current commit + non-terminal runs)
+            ;;
+        esac
+        if [ "$rank" -le "$keep_n" ]; then
+            continue # recency floor
+        fi
+        age=$((now - $(stat -c %Y "$dir" 2>/dev/null || echo "$now")))
+        if [ "$age" -lt "$min_age_s" ]; then
+            continue # age floor — closes the admission-vs-commit race
+        fi
+        log "prune: removing $tree (rank $rank, age ${age}s)"
+        rm -rf "$dir" || log "prune: failed to remove $tree (non-fatal)"
+    done < <(ls -1t "$WORKSPACES_ROOT" 2>/dev/null)
+}
+
+# ---- main -----------------------------------------------------------------
+
+# Re-exec target so the whole build sits under one timeout(1).
+if [ "${1:-}" = "__build" ]; then
+    build
+    exit 0
+fi
+
+[ -n "${RIVERS_GIT_URL:-}" ] || die "RIVERS_GIT_URL is unset"
+[ -n "${RIVERS_GIT_COMMIT:-}" ] || die "RIVERS_GIT_COMMIT is unset"
+mkdir -p "$WORKSPACE"
+
+if [ -f "$READY" ]; then
+    log "tree already ready — skipping build"
+    prune || log "prune failed (non-fatal)"
+    exit 0
+fi
+
+exec 9>"$LOCK"
+log "waiting for the build lock"
+flock 9
+if [ -f "$READY" ]; then
+    log "tree became ready while waiting — skipping build"
+    prune || log "prune failed (non-fatal)"
+    exit 0
+fi
+
+# timeout(1) is present in the runtime image (debian coreutils); degrade
+# gracefully where it isn't (local dev on macOS) — the budget is
+# belt-and-braces, not the only bound.
+if command -v timeout >/dev/null 2>&1; then
+    timeout "${RIVERS_DEPS_TIMEOUT_SECONDS:-600}" "$0" __build ||
+        die "workspace build failed or exceeded ${RIVERS_DEPS_TIMEOUT_SECONDS:-600}s"
+else
+    log "timeout(1) unavailable — running the build unbounded"
+    "$0" __build || die "workspace build failed"
+fi
+
+: >"$READY" # written LAST — the only "this tree is usable" signal
+log "workspace ready"
+prune || log "prune failed (non-fatal)"

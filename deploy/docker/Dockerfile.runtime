@@ -1,0 +1,49 @@
+# rivers-runtime — base image for git-sourced CodeLocations (RFC-044).
+#
+# Carries python, uv, git, CA certs, the rivers CLI, and
+# rivers-workspace-sync. Published per Python version:
+#   ghcr.io/ion-elgreco/rivers-runtime:<version>-py3.11|3.12|3.13
+#
+# Build context must contain the rivers wheel under wheels/ (CI drops the
+# release wheel there; `just k3d-runtime-image` stages a local build).
+# Deliberately NOT distroless: git + uv are hard requirements and
+# rivers-workspace-sync is a shell script. Hardening = pinned minimal base,
+# non-root, no build toolchain, CVE scanning in CI.
+ARG PYTHON_VERSION=3.12
+FROM python:${PYTHON_VERSION}-slim-bookworm
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# UV_PYTHON_DOWNLOADS=0 is load-bearing: the image's interpreter is
+# authoritative, which is what makes the runtime-image digest a complete
+# description of the environment (and the workspace key sound).
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=0
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git openssh-client ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY wheels/*.whl /tmp/wheels/
+RUN uv pip install --system --no-cache /tmp/wheels/*.whl && rm -rf /tmp/wheels
+
+COPY rivers-workspace-sync /usr/local/bin/rivers-workspace-sync
+RUN chmod 0755 /usr/local/bin/rivers-workspace-sync
+
+ARG RIVERS_VERSION=dev
+ARG RIVERS_REVISION=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="rivers-runtime" \
+      org.opencontainers.image.description="Runtime image for git-sourced Rivers code locations" \
+      org.opencontainers.image.source="https://github.com/ion-elgreco/rivers" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.version="${RIVERS_VERSION}" \
+      org.opencontainers.image.revision="${RIVERS_REVISION}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+
+# Non-root by default; matches the fsGroup the chart sets on workspace pods.
+RUN groupadd -g 65532 rivers && useradd -u 65532 -g 65532 -m rivers
+USER 65532:65532
+
+ENTRYPOINT ["rivers"]
