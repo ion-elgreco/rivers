@@ -6,3 +6,4 @@ pub mod env;
 pub mod executor;
 pub mod resume;
 pub mod run_backend;
+pub mod workspace;
