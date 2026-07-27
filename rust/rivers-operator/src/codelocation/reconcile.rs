@@ -457,11 +457,24 @@ async fn apply_git_workspace(
             build_workspace_pvc(cl, &pvc_size, ctx.workspace.storage_class.as_deref()),
         )
         .await?;
-        // Keep-set: the current tree only, until phase 3 adds the
-        // Run-derived half. The ConfigMap indirection means this refresh
+        // Keep-set: the current tree + every non-terminal run's tree. One
+        // LIST per reconcile is fine at reconcile cadence; a stale snapshot
+        // is covered by keepRevisions + minTreeAge (see the RFC's prune
+        // soundness argument). The ConfigMap indirection means this refresh
         // never rolls the Deployment.
+        let runs_api: Api<rivers_k8s::crd::run::Run> =
+            Api::namespaced(ctx.client.clone(), namespace);
+        let runs = runs_api
+            .list(&Default::default())
+            .await
+            .map(|l| l.items)
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "listing Runs for the keep-set; keeping current tree only");
+                Vec::new()
+            });
+        let keep = workspace_keep_csv(&key, &name, &runs);
         let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
-        apply_config_map(&cm_api, &build_keep_config_map(cl, &key)).await?;
+        apply_config_map(&cm_api, &build_keep_config_map(cl, &keep)).await?;
     }
 
     let deployment = build_git_deployment(
@@ -509,6 +522,42 @@ struct ObservedDeployment {
     deployment_reason: &'static str,
     deployment_ok: bool,
     endpoint: String,
+}
+
+/// Keep-set for the prune step: the CL's current tree plus the tree of
+/// every non-terminal Run referencing it — queued (`Pending`, or no status
+/// yet) and `Cancelling` included, not just `Running`; a run waiting on a
+/// concurrency pool is precisely the one most likely to sit through
+/// several commits. Keys, not commits: each run's tree is keyed on the
+/// runtime digest *it* pinned. Sorted + deduped so the ConfigMap value is
+/// deterministic and refreshes don't churn.
+fn workspace_keep_csv(
+    current_key: &str,
+    cl_name: &str,
+    runs: &[rivers_k8s::crd::run::Run],
+) -> String {
+    use rivers_k8s::crd::run::RunPhase;
+    let mut keys = std::collections::BTreeSet::new();
+    keys.insert(current_key.to_string());
+    for run in runs {
+        if run.spec.code_location_ref.name != cl_name {
+            continue;
+        }
+        let terminal = matches!(
+            run.status.as_ref().and_then(|s| s.phase.as_ref()),
+            Some(RunPhase::Succeeded) | Some(RunPhase::Failed) | Some(RunPhase::Cancelled)
+        );
+        if terminal {
+            continue;
+        }
+        if let Some(source) = &run.spec.source {
+            keys.insert(workspace::workspace_key(
+                &source.git.commit,
+                &run.spec.image,
+            ));
+        }
+    }
+    keys.into_iter().collect::<Vec<_>>().join(",")
 }
 
 /// PVC specs are largely immutable — create when absent, otherwise leave
@@ -1302,6 +1351,58 @@ mod tests {
             first_component("localhost:5000/x"),
             Some("localhost:5000".into())
         );
+    }
+
+    #[test]
+    fn keep_set_holds_current_and_non_terminal_runs() {
+        use rivers_k8s::crd::run::{Run, RunCrdStatus, RunPhase, RunSpec};
+
+        fn run_for(cl: &str, commit_char: char, phase: Option<RunPhase>) -> Run {
+            let spec: RunSpec = serde_json::from_value(serde_json::json!({
+                "codeLocationRef": { "name": cl },
+                "image": format!("ghcr.io/rt@sha256:{}", "1a2b3c4d000000".to_owned() + &"0".repeat(50)),
+                "target": "*",
+                "source": {
+                    "git": {
+                        "url": "https://forge.example/r.git",
+                        "commit": commit_char.to_string().repeat(40),
+                    },
+                },
+            }))
+            .unwrap();
+            let mut run = Run::new(&format!("run-{commit_char}"), spec);
+            run.status = phase.map(|p| RunCrdStatus {
+                phase: Some(p),
+                ..Default::default()
+            });
+            run
+        }
+
+        let runs = vec![
+            run_for("analytics", 'a', Some(RunPhase::Running)),
+            run_for("analytics", 'b', Some(RunPhase::Pending)),
+            run_for("analytics", 'c', Some(RunPhase::Cancelling)),
+            run_for("analytics", 'd', Some(RunPhase::Succeeded)), // released
+            run_for("analytics", 'e', Some(RunPhase::Failed)),    // released
+            run_for("analytics", 'a', None),                      // no status yet == not terminal
+            run_for("other", 'f', Some(RunPhase::Running)),       // different CL
+        ];
+
+        let keep = workspace_keep_csv("current-key", "analytics", &runs);
+        let entries: Vec<&str> = keep.split(',').collect();
+        assert!(entries.contains(&"current-key"));
+        // a (Running + statusless dedup), b (Pending — queued runs hold
+        // their tree), c (Cancelling).
+        let a_key = workspace::workspace_key(&"a".repeat(40), &runs[0].spec.image);
+        let b_key = workspace::workspace_key(&"b".repeat(40), &runs[1].spec.image);
+        let c_key = workspace::workspace_key(&"c".repeat(40), &runs[2].spec.image);
+        assert!(entries.contains(&a_key.as_str()), "{keep}");
+        assert!(entries.contains(&b_key.as_str()), "{keep}");
+        assert!(entries.contains(&c_key.as_str()), "{keep}");
+        // Terminal runs release; other CLs' runs are not ours.
+        assert_eq!(entries.len(), 4, "dedup + releases: {keep}");
+        let d_key = workspace::workspace_key(&"d".repeat(40), &runs[3].spec.image);
+        assert!(!entries.contains(&d_key.as_str()));
     }
 
     #[test]

@@ -133,6 +133,71 @@ spec:
     kubectl delete codelocation analytics -n old
     ```
 
+## Git-sourced CodeLocations
+
+Instead of baking your code into an image, point a `CodeLocation` at a
+**git repository**. The operator resolves the ref to a pinned commit, an
+init container fetches the code and installs dependencies with `uv` into a
+mounted workspace, and every run pins that exact commit — the release
+pipeline shrinks to `git push`.
+
+```yaml title="analytics-git.yaml"
+apiVersion: rivers.io/v1alpha1
+kind: CodeLocation
+metadata:
+  name: analytics
+  namespace: rivers
+spec:
+  git:
+    url: https://github.com/acme/pipelines.git
+    ref:
+      branch: main            # exactly one of branch | tag | commit
+    path: analytics           # subdirectory holding the project
+    secretRef:
+      name: git-creds
+  module: analytics.pipeline
+```
+
+```sh
+kubectl -n rivers get rcl
+# NAME        PHASE   SOURCE         REPLICAS   AGE
+# analytics   Ready   main@9f3c1ab   1/1        45s
+```
+
+How it composes with `image`: `spec.image` is always *the container the
+pods run*. Omit it in git mode to get the chart's default
+`rivers-runtime` (per-Python-version tags, `codeLocation.runtime.*`); set
+it to use a private mirror or a different interpreter
+(`image: harbor.internal/rivers/rivers-runtime`, `tag: 0.5.0-py3.11`).
+
+**Dependencies** come from the repo itself: `uv.lock` ⇒
+`uv sync --locked`, else `requirements.txt` ⇒ `uv pip install`, else
+nothing is installed (`dependencies.mode` overrides). The lockfile should
+include `rivers` — the venv's `rivers` is what runs.
+
+**Credentials Secret keys** (Flux-compatible): `username`/`password` for
+HTTPS (a forge token is a password), or `identity` + `known_hosts` for
+SSH. `known_hosts` is required with `identity` and supports exact and
+hashed (`|1|`) entries only — no `*` wildcards or `@cert-authority`
+lines; list each host explicitly.
+
+**Shared workspace** (recommended where you have RWX storage): set
+`codeLocation.workspace.shared.enabled=true` and the code+venv is built
+once per commit on a per-CL PVC, then mounted read-only by every run and
+step pod — a wide fan-out starts as fast as image mode. Without RWX
+storage every pod builds its own tree; that's fine for
+`executor: parallel` but slow for wide `executor: kubernetes` fan-outs.
+
+**Egress**: in shared mode only the code-location pod needs outbound
+access to the git host and the package index (run/step pods fetch
+nothing); in fallback mode every pod does. Adjust NetworkPolicies
+accordingly.
+
+**When things fail**, `kubectl describe rcl analytics` carries the
+answer: `RefNotFound` / `GitAuthFailed` / `GitHostKeyRejected` on the
+`SourceResolved` condition for resolution problems, and a failed install
+surfaces `uv`'s error tail in `status.message`.
+
 ## Helm chart customizations
 
 Drop these into a `values.yaml` and pass `-f values.yaml` on
