@@ -125,6 +125,33 @@ pub fn builder_pod_pieces(spec: &WorkspaceSpec) -> WorkspacePodPieces {
     }
 }
 
+/// The consumer-side [`WorkspaceSpec`] derived from a Run's stamped
+/// provenance. Shared by the operator (executor pod) and the in-pod
+/// step-Job builder so the two cannot disagree about the tree: same key
+/// computation, same coordinates, no prune surface.
+pub fn consumer_spec_from_run_source(
+    source: &crate::crd::run::RunSource,
+    runtime_image: &str,
+    volume: WorkspaceVolume,
+    extra_env: Vec<EnvVar>,
+) -> WorkspaceSpec {
+    WorkspaceSpec {
+        key: workspace_key(&source.git.commit, runtime_image),
+        volume,
+        runtime_image: runtime_image.to_string(),
+        git_url: source.git.url.clone(),
+        commit: source.git.commit.clone(),
+        git_ref: source.git.r#ref.clone(),
+        path: source.git.path.clone(),
+        secret_name: source.git.secret_name.clone(),
+        deps: source.dependencies.clone(),
+        keep_config_map: None,
+        keep_revisions: None,
+        min_tree_age: None,
+        extra_env,
+    }
+}
+
 /// Pieces for **run executor pods and step Jobs**. Shared mode: read-only
 /// mount, no init container, no credentials — the admission chain
 /// guarantees the tree exists (CL `Ready` ⟹ tree built). Fallback mode:

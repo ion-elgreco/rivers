@@ -272,6 +272,40 @@ pub fn build_surreal_pod_env(cfg: &SurrealPodConfig) -> Vec<EnvVar> {
     env
 }
 
+/// Git-workspace envs stamped on the run executor pod by the operator and
+/// read back inside the pod to attach the same tree to step Jobs
+/// (RFC-044). `RIVERS_RUN_SOURCE` carries the Run's stamped `spec.source`
+/// as JSON — one typed channel instead of a fan of `RIVERS_GIT_*` vars.
+pub const ENV_RUN_SOURCE: &str = "RIVERS_RUN_SOURCE";
+/// Shared-mode PVC claim name; unset/empty means emptyDir fallback.
+pub const ENV_WORKSPACE_PVC: &str = "RIVERS_WORKSPACE_PVC";
+pub const ENV_WORKSPACE_EMPTYDIR_LIMIT: &str = "RIVERS_WORKSPACE_EMPTYDIR_LIMIT";
+
+/// Rehydrate the git workspace coordinates inside the run executor pod.
+/// `None` for image-mode runs (no `RIVERS_RUN_SOURCE`).
+pub fn detect_git_workspace() -> Option<(
+    crate::crd::run::RunSource,
+    crate::workspace::WorkspaceVolume,
+)> {
+    let source_json = env_nonempty(ENV_RUN_SOURCE)?;
+    let source: crate::crd::run::RunSource = match serde_json::from_str(&source_json) {
+        Ok(s) => s,
+        Err(e) => {
+            // A malformed value is an operator/pod version skew bug — fail
+            // loudly rather than silently running image-mode.
+            panic!("{ENV_RUN_SOURCE} is not valid RunSource JSON: {e}");
+        }
+    };
+    let volume = match env_nonempty(ENV_WORKSPACE_PVC) {
+        Some(claim_name) => crate::workspace::WorkspaceVolume::SharedPvc { claim_name },
+        None => crate::workspace::WorkspaceVolume::EmptyDir {
+            size_limit: env_nonempty(ENV_WORKSPACE_EMPTYDIR_LIMIT)
+                .map(k8s_openapi::apimachinery::pkg::api::resource::Quantity),
+        },
+    };
+    Some((source, volume))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -85,11 +85,34 @@ async fn main() -> anyhow::Result<()> {
     // watcher + gRPC tasks are spawned later via `spawn_registry_service`.
     let directory_state = Arc::new(codelocation::DirectoryState::new());
 
+    let workspace_cfg = {
+        let mut cfg = codelocation::WorkspaceConfig::default();
+        let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        if let Some(v) = env("RIVERS_WORKSPACE_SHARED_ENABLED") {
+            cfg.shared_enabled = matches!(v.as_str(), "true" | "1");
+        }
+        cfg.storage_class = env("RIVERS_WORKSPACE_STORAGE_CLASS");
+        if let Some(v) = env("RIVERS_WORKSPACE_SHARED_SIZE") {
+            cfg.shared_size = v;
+        }
+        if let Some(v) = env("RIVERS_WORKSPACE_EMPTYDIR_LIMIT") {
+            cfg.empty_dir_limit = v;
+        }
+        if let Some(v) = env("RIVERS_WORKSPACE_KEEP_REVISIONS").and_then(|v| v.parse().ok()) {
+            cfg.keep_revisions = v;
+        }
+        if let Some(v) = env("RIVERS_WORKSPACE_MIN_AGE") {
+            cfg.min_tree_age = v;
+        }
+        cfg
+    };
+
     let run_ctx = Arc::new(run::Context {
         client: client.clone(),
         namespace: namespace.clone(),
         storage,
         directory: directory_state.clone(),
+        workspace: workspace_cfg.clone(),
         surreal_pod_cfg: surreal_pod_cfg.clone(),
     });
 
@@ -115,28 +138,6 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_GIT_TIMEOUT_SECONDS);
-
-    let workspace_cfg = {
-        let mut cfg = codelocation::WorkspaceConfig::default();
-        let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-        if let Some(v) = env("RIVERS_WORKSPACE_SHARED_ENABLED") {
-            cfg.shared_enabled = matches!(v.as_str(), "true" | "1");
-        }
-        cfg.storage_class = env("RIVERS_WORKSPACE_STORAGE_CLASS");
-        if let Some(v) = env("RIVERS_WORKSPACE_SHARED_SIZE") {
-            cfg.shared_size = v;
-        }
-        if let Some(v) = env("RIVERS_WORKSPACE_EMPTYDIR_LIMIT") {
-            cfg.empty_dir_limit = v;
-        }
-        if let Some(v) = env("RIVERS_WORKSPACE_KEEP_REVISIONS").and_then(|v| v.parse().ok()) {
-            cfg.keep_revisions = v;
-        }
-        if let Some(v) = env("RIVERS_WORKSPACE_MIN_AGE") {
-            cfg.min_tree_age = v;
-        }
-        cfg
-    };
 
     let cl_ctx = Arc::new(codelocation::Context {
         client: client.clone(),

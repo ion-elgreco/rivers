@@ -5,6 +5,32 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 use kube_client::ResourceExt;
 use rivers_k8s::crd::run::Run;
+use rivers_k8s::workspace::{self, WorkspaceSpec, WorkspaceVolume};
+
+use crate::codelocation::WorkspaceConfig;
+use crate::codelocation::resources::workspace_pvc_name;
+
+/// Consumer-side workspace for a git-mode run, or `None` for image mode.
+/// Derived from the Run's stamped `spec.source` + chart config; the same
+/// spec shape the step-Job builder rebuilds in-pod from `RIVERS_RUN_SOURCE`.
+fn run_workspace_spec(
+    run: &Run,
+    workspace_cfg: &WorkspaceConfig,
+    cl_env: &[EnvVar],
+) -> Option<WorkspaceSpec> {
+    run.spec.source.as_ref().map(|source| {
+        let volume = if workspace_cfg.shared_enabled {
+            WorkspaceVolume::SharedPvc {
+                claim_name: workspace_pvc_name(&run.spec.code_location_ref.name),
+            }
+        } else {
+            WorkspaceVolume::EmptyDir {
+                size_limit: Some(Quantity(workspace_cfg.empty_dir_limit.clone())),
+            }
+        };
+        workspace::consumer_spec_from_run_source(source, &run.spec.image, volume, cl_env.to_vec())
+    })
+}
 
 /// `resume = true` flips the `rivers execute` invocation to resume mode
 /// (skip already-completed steps); `cl_env` is the parent
@@ -22,10 +48,18 @@ pub fn build_executor_pod(
     resume: bool,
     cl_env: &[EnvVar],
     surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
+    workspace_cfg: &WorkspaceConfig,
 ) -> Pod {
     let spec = &run.spec;
     let run_uid = run.metadata.uid.as_deref().unwrap_or_default();
     let run_name = run.name_any();
+    let workspace_spec = run_workspace_spec(run, workspace_cfg, cl_env);
+    let pieces = workspace_spec.as_ref().map(workspace::consumer_pod_pieces);
+    let command = if workspace_spec.is_some() {
+        workspace::VENV_RIVERS_BIN.to_string()
+    } else {
+        "rivers".to_string()
+    };
 
     Pod {
         metadata: ObjectMeta {
@@ -52,11 +86,34 @@ pub fn build_executor_pod(
         spec: Some(PodSpec {
             service_account_name: Some(spec.service_account_name.clone()),
             restart_policy: Some("Never".to_string()),
+            init_containers: pieces
+                .as_ref()
+                .filter(|p| !p.init_containers.is_empty())
+                .map(|p| p.init_containers.clone()),
+            volumes: pieces
+                .as_ref()
+                .filter(|p| !p.volumes.is_empty())
+                .map(|p| p.volumes.clone()),
             containers: vec![Container {
                 name: "executor".to_string(),
                 image: Some(spec.image.clone()),
                 image_pull_policy: Some("IfNotPresent".to_string()),
-                command: Some(vec!["rivers".to_string()]),
+                command: Some(vec![command]),
+                working_dir: workspace_spec.as_ref().map(|w| {
+                    match w
+                        .path
+                        .as_deref()
+                        .map(|p| p.trim_matches('/'))
+                        .filter(|p| !p.is_empty())
+                    {
+                        Some(p) => format!("{}/src/{p}", workspace::WORKSPACE_MOUNT),
+                        None => format!("{}/src", workspace::WORKSPACE_MOUNT),
+                    }
+                }),
+                volume_mounts: pieces
+                    .as_ref()
+                    .filter(|p| !p.main_mounts.is_empty())
+                    .map(|p| p.main_mounts.clone()),
                 args: Some(build_execute_args(spec, run_id, resume)),
                 resources: Some(ResourceRequirements {
                     requests: Some(BTreeMap::from([
@@ -124,6 +181,40 @@ pub fn build_executor_pod(
                             .clone()
                             .with_endpoint(spec.surreal_endpoint.clone()),
                     ));
+                    if let (Some(pieces), Some(wspec)) = (&pieces, &workspace_spec) {
+                        env.extend(pieces.main_env.iter().cloned());
+                        // The hop to step Jobs: the in-pod builder rebuilds
+                        // the same WorkspaceSpec from these (RFC-044).
+                        env.push(EnvVar {
+                            name: rivers_k8s::env::ENV_RUN_SOURCE.to_string(),
+                            value: Some(
+                                serde_json::to_string(
+                                    spec.source.as_ref().expect("workspace implies source"),
+                                )
+                                .expect("RunSource serializes"),
+                            ),
+                            ..Default::default()
+                        });
+                        match &wspec.volume {
+                            rivers_k8s::workspace::WorkspaceVolume::SharedPvc { claim_name } => {
+                                env.push(EnvVar {
+                                    name: rivers_k8s::env::ENV_WORKSPACE_PVC.to_string(),
+                                    value: Some(claim_name.clone()),
+                                    ..Default::default()
+                                });
+                            }
+                            rivers_k8s::workspace::WorkspaceVolume::EmptyDir { size_limit } => {
+                                if let Some(limit) = size_limit {
+                                    env.push(EnvVar {
+                                        name: rivers_k8s::env::ENV_WORKSPACE_EMPTYDIR_LIMIT
+                                            .to_string(),
+                                        value: Some(limit.0.clone()),
+                                        ..Default::default()
+                                    });
+                                }
+                            }
+                        }
+                    }
                     env.extend(cl_env.iter().cloned());
                     env
                 }),
@@ -213,7 +304,113 @@ mod tests {
             resume,
             cl_env,
             &rivers_k8s::env::SurrealPodConfig::default(),
+            &WorkspaceConfig::default(),
         )
+    }
+
+    fn git_run() -> Run {
+        let mut run = test_run();
+        run.spec.source = Some(
+            serde_json::from_value(serde_json::json!({
+                "git": {
+                    "url": "https://forge.example/acme/pipelines.git",
+                    "commit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
+                    "ref": "refs/heads/main",
+                    "path": "analytics",
+                },
+                "dependencies": { "mode": "uvSync" },
+            }))
+            .unwrap(),
+        );
+        run
+    }
+
+    #[test]
+    fn git_run_executor_pod_mounts_shared_tree_and_stamps_the_hop() {
+        let run = git_run();
+        let shared = WorkspaceConfig {
+            shared_enabled: true,
+            ..Default::default()
+        };
+        let pod = build_executor_pod(
+            &run,
+            "p",
+            "run-123",
+            false,
+            &[],
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &shared,
+        );
+        let pod_spec = pod.spec.unwrap();
+        assert!(pod_spec.init_containers.is_none(), "shared consumer");
+        let c = &pod_spec.containers[0];
+        assert_eq!(
+            c.command.as_ref().unwrap(),
+            &vec!["/workspace/venv/bin/rivers".to_string()]
+        );
+        assert_eq!(c.working_dir.as_deref(), Some("/workspace/src/analytics"));
+
+        let env: std::collections::HashMap<&str, &str> = c
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|e| (e.name.as_str(), e.value.as_deref().unwrap_or("")))
+            .collect();
+        // The hop: the in-pod step-job builder rebuilds the workspace from
+        // these two.
+        assert_eq!(env["RIVERS_WORKSPACE_PVC"], "demo-workspace");
+        let hop: rivers_k8s::crd::run::RunSource =
+            serde_json::from_str(env["RIVERS_RUN_SOURCE"]).unwrap();
+        assert_eq!(hop, run.spec.source.clone().unwrap());
+        assert_eq!(env["VIRTUAL_ENV"], "/workspace/venv");
+
+        let mounts = serde_json::to_value(c.volume_mounts.as_ref().unwrap()).unwrap();
+        assert!(mounts.to_string().contains("\"readOnly\":true"), "{mounts}");
+    }
+
+    #[test]
+    fn git_run_fallback_carries_init_container_and_emptydir_limit() {
+        let run = git_run();
+        let pod = build_executor_pod(
+            &run,
+            "p",
+            "run-123",
+            false,
+            &[],
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &WorkspaceConfig::default(), // shared_enabled: false
+        );
+        let pod_spec = pod.spec.unwrap();
+        assert_eq!(pod_spec.init_containers.as_ref().unwrap().len(), 1);
+        let env: std::collections::HashMap<&str, &str> = pod_spec.containers[0]
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|e| (e.name.as_str(), e.value.as_deref().unwrap_or("")))
+            .collect();
+        assert!(!env.contains_key("RIVERS_WORKSPACE_PVC"));
+        assert_eq!(env["RIVERS_WORKSPACE_EMPTYDIR_LIMIT"], "2Gi");
+    }
+
+    #[test]
+    fn image_mode_executor_pod_untouched_by_workspace_wiring() {
+        let run = test_run();
+        let pod = build(&run, "p", "run-123", false, &[]);
+        let pod_spec = pod.spec.unwrap();
+        assert!(pod_spec.init_containers.is_none());
+        assert!(pod_spec.volumes.is_none());
+        let c = &pod_spec.containers[0];
+        assert_eq!(c.command.as_ref().unwrap(), &vec!["rivers".to_string()]);
+        assert!(c.working_dir.is_none());
+        assert!(
+            !c.env
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|e| e.name == "RIVERS_RUN_SOURCE")
+        );
     }
 
     #[test]

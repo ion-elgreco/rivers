@@ -166,7 +166,20 @@ impl KubernetesBackend {
             )
         })?;
 
+        // Git-mode runs (RFC-044): the operator stamped the run's source +
+        // volume coordinates onto this executor pod; rebuild the same
+        // WorkspaceSpec so step Jobs mount the identical tree.
+        let workspace = rivers_k8s::env::detect_git_workspace().map(|(source, volume)| {
+            rivers_k8s::workspace::consumer_spec_from_run_source(
+                &source,
+                &worker_image,
+                volume,
+                self.extra_env.clone(),
+            )
+        });
+
         Ok(rivers_k8s::executor::K8sStepExecutorConfig {
+            workspace,
             worker_image,
             namespace: self.namespace.clone(),
             service_account: self.service_account.clone(),

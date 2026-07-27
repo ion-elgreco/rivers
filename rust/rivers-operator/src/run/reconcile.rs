@@ -33,6 +33,9 @@ pub struct Context {
     /// transition; on cache miss (startup window before the watcher syncs)
     /// `fetch_cl_env` falls back to a live API GET.
     pub directory: Arc<DirectoryState>,
+    /// Chart-level workspace settings, needed to mount git-mode runs'
+    /// trees onto their executor pods (RFC-044).
+    pub workspace: crate::codelocation::WorkspaceConfig,
     /// SurrealDB connection bundle stamped onto every Run pod the operator
     /// creates.
     pub surreal_pod_cfg: rivers_k8s::env::SurrealPodConfig,
@@ -139,7 +142,15 @@ async fn reconcile_pending(
     let pod_name = executor_pod_name(name);
 
     let cl_env = fetch_cl_env(ctx, run).await?;
-    let pod = build_executor_pod(run, &pod_name, run_id, false, &cl_env, &ctx.surreal_pod_cfg);
+    let pod = build_executor_pod(
+        run,
+        &pod_name,
+        run_id,
+        false,
+        &cl_env,
+        &ctx.surreal_pod_cfg,
+        &ctx.workspace,
+    );
     match pods_api.create(&PostParams::default(), &pod).await {
         Ok(_) => {
             tracing::info!(run = %name, pod = %pod_name, "created executor pod");
