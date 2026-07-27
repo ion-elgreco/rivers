@@ -89,6 +89,11 @@ impl K8sRunBackendConfig {
                     identity: self.code_location_id.clone(),
                 },
                 image: self.image.clone(),
+                // Git provenance for daemon-dispatched runs is stamped here
+                // (not by the webhook — this path is the digest escape
+                // hatch) once the CL pod env carries the coordinates; until
+                // then git runs are dispatched without it. RFC-044 P3b.
+                source: None,
                 module: self.module.clone(),
                 target,
                 job_name: run_info.job_name.clone(),
@@ -294,6 +299,7 @@ mod tests {
             run.spec,
             RunSpec {
                 job_name: Some("nightly".to_string()),
+                source: None,
                 code_location_ref: CodeLocationRef {
                     name: "demo".to_string(),
                     identity: "demo".to_string(),

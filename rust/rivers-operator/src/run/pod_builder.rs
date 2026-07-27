@@ -189,6 +189,7 @@ mod tests {
             timeout_seconds: None,
             max_restarts: 3,
             cancel_grace_period_seconds: 300,
+            source: None,
             run_resources: ResourceSpec {
                 cpu: "500m".to_string(),
                 memory: "512Mi".to_string(),

@@ -106,6 +106,41 @@ pub struct RunSpec {
 
     #[serde(default = "default_service_account")]
     pub service_account_name: String,
+
+    /// Git provenance for runs against a git-sourced CodeLocation
+    /// (RFC-044). Stamped by the admission webhook from the CL's status on
+    /// CREATE; immutable after; absent for image-mode runs (including the
+    /// digest escape hatch, which is image-mode by definition). In shared
+    /// workspace mode nothing downstream fetches from these coordinates —
+    /// they are the run's provenance record and the UI's "which commit?".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<RunSource>,
+}
+
+/// Pinned git source of a run.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RunSource {
+    pub git: GitCoordinates,
+    #[serde(default)]
+    pub dependencies: crate::crd::code_location::Dependencies,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCoordinates {
+    pub url: String,
+    /// Full 40-hex commit — the pin.
+    pub commit: String,
+    /// Matched ref (`refs/heads/main`) — fetch fallback + display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Credentials Secret name — used only by fallback-mode consumers,
+    /// which fetch for themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_name: Option<String>,
 }
 
 /// Reference to a `CodeLocation` CR. Same-namespace only: every real caller

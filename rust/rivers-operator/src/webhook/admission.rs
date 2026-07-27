@@ -17,7 +17,7 @@ use kube_core::DynamicObject;
 use kube_core::admission::{AdmissionRequest, AdmissionResponse, AdmissionReview, Operation};
 use rivers_api::CodeLocationEntry;
 use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationPhase};
-use rivers_k8s::crd::run::{Run, is_digest_reference};
+use rivers_k8s::crd::run::{GitCoordinates, Run, RunSource, is_digest_reference};
 use uuid::Uuid;
 
 use crate::codelocation::DirectoryState;
@@ -48,11 +48,13 @@ impl AdmissionDeps {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum RunOutcome {
     /// CREATE that was allowed and produced a JSON Patch stamping
-    /// `image`, `module`, and `codeLocationRef.identity`.
+    /// `image`, `module`, `codeLocationRef.identity`, and — for
+    /// git-sourced CodeLocations — `spec.source`.
     Mutated {
         image: String,
         module: String,
         identity: String,
+        source: Option<RunSource>,
     },
     /// CREATE accepted without modification — escape-hatch path: caller
     /// pre-set `image` to a digest. Identity isn't stamped from the CL
@@ -128,7 +130,30 @@ async fn mutate_run_on_create(req: &AdmissionRequest<Run>, deps: &AdmissionDeps)
                 run.spec.image
             ));
         }
+        // On this path the caller is its own authority for provenance too:
+        // the in-cluster daemon dispatches runs with a pre-set digest AND
+        // stamps the commit its own code runs. Validate shape, not origin.
+        if let Some(source) = &run.spec.source {
+            let commit = &source.git.commit;
+            if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return RunOutcome::Rejected(format!(
+                    "spec.source.git.commit '{commit}' is not a full 40-hex commit SHA"
+                ));
+            }
+            if source.git.url.is_empty() {
+                return RunOutcome::Rejected("spec.source.git.url is empty".into());
+            }
+        }
         return RunOutcome::AcceptedAsIs;
+    }
+
+    // Normal path: the webhook is the sole author of spec.source.
+    if run.spec.source.is_some() {
+        return RunOutcome::Rejected(
+            "spec.source is stamped by the webhook from the CodeLocation — remove it \
+             (pre-set spec.image to a digest for the self-stamped escape hatch)"
+                .into(),
+        );
     }
 
     let entry = match lookup_with_fallback(deps, ref_ns, ref_name).await {
@@ -158,10 +183,38 @@ async fn mutate_run_on_create(req: &AdmissionRequest<Run>, deps: &AdmissionDeps)
         ));
     }
 
+    // Git-sourced CL: stamp provenance from spec (coordinates) + entry
+    // (pinned commit). The spec cache is populated by the same watcher that
+    // feeds entries, status-independent — a missing spec here means an
+    // image-mode CL, not a race.
+    let source = match deps.directory.lookup_spec(ref_ns, ref_name).await {
+        Some(spec) if spec.git.is_some() => {
+            let git = spec.git.as_ref().expect("checked");
+            if entry.resolved_commit.is_empty() {
+                return RunOutcome::Rejected(format!(
+                    "codeLocation '{ref_ns}/{ref_name}' has no resolved commit yet; \
+                     status.resolvedCommit is empty"
+                ));
+            }
+            Some(RunSource {
+                git: GitCoordinates {
+                    url: git.url.clone(),
+                    commit: entry.resolved_commit.clone(),
+                    r#ref: Some(entry.resolved_ref.clone()).filter(|r| !r.is_empty()),
+                    path: git.path.clone(),
+                    secret_name: git.secret_ref.as_ref().map(|s| s.name.clone()),
+                },
+                dependencies: git.dependencies.clone(),
+            })
+        }
+        _ => None,
+    };
+
     RunOutcome::Mutated {
         image: entry.image,
         module: entry.module,
         identity: entry.identity,
+        source,
     }
 }
 
@@ -179,6 +232,9 @@ fn check_run_update(req: &AdmissionRequest<Run>) -> RunOutcome {
     if new.spec.code_location_ref != old.spec.code_location_ref {
         return RunOutcome::Rejected("spec.codeLocationRef is immutable after creation".into());
     }
+    if new.spec.source != old.spec.source {
+        return RunOutcome::Rejected("spec.source is immutable after creation".into());
+    }
     RunOutcome::UpdateAllowed
 }
 
@@ -189,13 +245,13 @@ fn run_response_for(req: &AdmissionRequest<Run>, outcome: RunOutcome) -> Admissi
             image,
             module,
             identity,
+            source,
         } => {
             // `replace` for fields the admission request always carries
-            // (the existing Phase-4 wiring); `add` for the new identity field
-            // since `codeLocationRef.identity` may be absent from a user's
-            // raw apply payload — `add` both creates and overwrites, while
-            // `replace` would fail if the path doesn't exist.
-            let patch = Patch(vec![
+            // (the existing Phase-4 wiring); `add` for fields that may be
+            // absent from a user's raw apply payload — `add` both creates
+            // and overwrites, while `replace` would fail on a missing path.
+            let mut ops = vec![
                 PatchOperation::Replace(ReplaceOperation {
                     path: PointerBuf::from_tokens(["spec", "image"]),
                     value: serde_json::Value::String(image),
@@ -208,8 +264,14 @@ fn run_response_for(req: &AdmissionRequest<Run>, outcome: RunOutcome) -> Admissi
                     path: PointerBuf::from_tokens(["spec", "codeLocationRef", "identity"]),
                     value: serde_json::Value::String(identity),
                 }),
-            ]);
-            base.with_patch(patch)
+            ];
+            if let Some(source) = source {
+                ops.push(PatchOperation::Add(AddOperation {
+                    path: PointerBuf::from_tokens(["spec", "source"]),
+                    value: serde_json::to_value(&source).expect("RunSource serializes to JSON"),
+                }));
+            }
+            base.with_patch(Patch(ops))
                 .expect("RFC 6902 Patch serializes to JSON")
         }
         RunOutcome::AcceptedAsIs | RunOutcome::UpdateAllowed => base,
@@ -537,6 +599,131 @@ mod tests {
             phase: CodeLocationPhase::Ready.as_str().to_string(),
             observed_generation: 1,
             identity: identity.to_string(),
+            resolved_commit: String::new(),
+            resolved_ref: String::new(),
+        }
+    }
+
+    const COMMIT: &str = "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8";
+
+    /// Directory state for a git-sourced CL: entry with a pinned commit AND
+    /// the cached spec (the webhook stamps coordinates from both halves).
+    async fn git_directory(ns: &str, name: &str, commit: &str) -> Arc<DirectoryState> {
+        let state = Arc::new(DirectoryState::new());
+        let mut entry = ready_entry(
+            ns,
+            name,
+            "ghcr.io/rt@sha256:1a2b3c4dff",
+            "analytics.pipeline",
+            "11111111-1111-4111-8111-111111111111",
+        );
+        entry.resolved_commit = commit.to_string();
+        entry.resolved_ref = "refs/heads/main".to_string();
+        state.upsert(entry).await;
+        let spec: CodeLocationSpec = serde_json::from_value(serde_json::json!({
+            "git": {
+                "url": "https://forge.example/acme/pipelines.git",
+                "ref": { "branch": "main" },
+                "path": "analytics",
+                "secretRef": { "name": "git-creds" },
+                "dependencies": { "mode": "uvSync" },
+            },
+            "module": "analytics.pipeline",
+        }))
+        .unwrap();
+        state.upsert_spec(ns, name, Arc::new(spec)).await;
+        state
+    }
+
+    fn expected_run_source() -> RunSource {
+        RunSource {
+            git: rivers_k8s::crd::run::GitCoordinates {
+                url: "https://forge.example/acme/pipelines.git".to_string(),
+                commit: COMMIT.to_string(),
+                r#ref: Some("refs/heads/main".to_string()),
+                path: Some("analytics".to_string()),
+                secret_name: Some("git-creds".to_string()),
+            },
+            dependencies: serde_json::from_value(serde_json::json!({ "mode": "uvSync" })).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_stamps_source_for_git_cl() {
+        let state = git_directory("team-data", "analytics", COMMIT).await;
+        let run = build_run("analytics", "");
+        let req = admission_request_create("uid-git-1", "team-data", &run);
+        match mutate_run(&req, &AdmissionDeps::cache_only(state)).await {
+            RunOutcome::Mutated { image, source, .. } => {
+                assert_eq!(image, "ghcr.io/rt@sha256:1a2b3c4dff");
+                assert_eq!(source, Some(expected_run_source()));
+            }
+            other => panic!("expected Mutated, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_git_cl_whose_commit_is_unresolved() {
+        // Entry Ready but no pinned commit — must not admit a run that
+        // would have no tree to mount.
+        let state = git_directory("team-data", "analytics", "").await;
+        let run = build_run("analytics", "");
+        let req = admission_request_create("uid-git-2", "team-data", &run);
+        match mutate_run(&req, &AdmissionDeps::cache_only(state)).await {
+            RunOutcome::Rejected(msg) => assert!(msg.contains("commit"), "{msg}"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_hand_set_source_on_the_normal_path() {
+        let state = git_directory("team-data", "analytics", COMMIT).await;
+        let mut run = build_run("analytics", "");
+        run.spec.source = Some(expected_run_source());
+        let req = admission_request_create("uid-git-3", "team-data", &run);
+        match mutate_run(&req, &AdmissionDeps::cache_only(state)).await {
+            RunOutcome::Rejected(msg) => assert!(msg.contains("webhook"), "{msg}"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_accepts_daemon_stamped_source() {
+        // Daemon-dispatched runs pre-set a digest image AND their own
+        // provenance — the daemon pins the commit its own code runs.
+        let digest_image = format!("ghcr.io/x@sha256:{}", "a".repeat(64));
+        let state = Arc::new(DirectoryState::new());
+        let mut run = build_run("analytics", &digest_image);
+        run.spec.source = Some(expected_run_source());
+        let req = admission_request_create("uid-git-4", "team-data", &run);
+        assert_eq!(
+            mutate_run(&req, &AdmissionDeps::cache_only(state.clone())).await,
+            RunOutcome::AcceptedAsIs
+        );
+
+        // …but a malformed pin is still rejected.
+        let mut bad = build_run("analytics", &digest_image);
+        let mut src = expected_run_source();
+        src.git.commit = "not-a-sha".to_string();
+        bad.spec.source = Some(src);
+        let req = admission_request_create("uid-git-5", "team-data", &bad);
+        assert!(matches!(
+            mutate_run(&req, &AdmissionDeps::cache_only(state)).await,
+            RunOutcome::Rejected(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_rejects_source_change() {
+        let mut old = build_run("analytics", "ghcr.io/x@sha256:aaaa");
+        old.spec.source = Some(expected_run_source());
+        let mut new = old.clone();
+        new.spec.source.as_mut().unwrap().git.commit =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let req = admission_request_update("uid-git-6", "team-data", &new, &old);
+        match check_run_update(&req) {
+            RunOutcome::Rejected(msg) => assert!(msg.contains("source"), "{msg}"),
+            other => panic!("expected Rejected, got {other:?}"),
         }
     }
 
@@ -581,6 +768,7 @@ mod tests {
                 image: "ghcr.io/x@sha256:aaaa".to_string(),
                 module: "my.module".to_string(),
                 identity: "11111111-1111-4111-8111-111111111111".to_string(),
+                source: None,
             }
         );
     }

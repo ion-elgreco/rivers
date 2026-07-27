@@ -239,6 +239,8 @@ pub(crate) fn project_entry(cl: &CodeLocation) -> Option<CodeLocationEntry> {
             .to_string(),
         observed_generation: status.observed_generation.unwrap_or_default(),
         identity: cl.spec.identity.clone(),
+        resolved_commit: status.resolved_commit.clone().unwrap_or_default(),
+        resolved_ref: status.resolved_ref.clone().unwrap_or_default(),
     })
 }
 
@@ -410,6 +412,8 @@ mod tests {
             phase: phase.into(),
             observed_generation: 1,
             identity: format!("id-{name}"),
+            resolved_commit: String::new(),
+            resolved_ref: String::new(),
         }
     }
 
