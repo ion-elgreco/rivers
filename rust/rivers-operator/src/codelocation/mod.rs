@@ -9,5 +9,5 @@ pub mod registry;
 pub mod resources;
 
 pub use directory::{DirectoryState, run_watcher as run_directory_watcher};
-pub use reconcile::{Context, error_policy, reconcile};
+pub use reconcile::{Context, WorkspaceConfig, error_policy, reconcile};
 pub use registry::RegistryClient;

@@ -148,7 +148,192 @@ pub fn build_deployment(
     }
 }
 
+/// Deterministic name of the CL-owned workspace PVC (shared mode).
+pub fn workspace_pvc_name(cr_name: &str) -> String {
+    format!("{cr_name}-workspace")
+}
+
+/// Deterministic name of the CL-owned keep-set ConfigMap.
+pub fn keep_config_map_name(cr_name: &str) -> String {
+    format!("{cr_name}-workspace-keep")
+}
+
+/// `workingDir` for git-mode containers: the checkout (plus `spec.git.path`).
+pub fn git_working_dir(path: Option<&str>) -> String {
+    match path.map(|p| p.trim_matches('/')).filter(|p| !p.is_empty()) {
+        Some(p) => format!(
+            "{}/{p}",
+            rivers_k8s::workspace::WORKSPACE_MOUNT.to_owned() + "/src"
+        ),
+        None => format!("{}/src", rivers_k8s::workspace::WORKSPACE_MOUNT),
+    }
+}
+
+/// RWX PVC backing a git CL's shared workspace. Owned by the CR so kube
+/// garbage-collects it (and every tree on it) on CL delete.
+pub fn build_workspace_pvc(
+    cl: &CodeLocation,
+    size: &str,
+    storage_class: Option<&str>,
+) -> k8s_openapi::api::core::v1::PersistentVolumeClaim {
+    use k8s_openapi::api::core::v1::{PersistentVolumeClaim, PersistentVolumeClaimSpec};
+    use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+    PersistentVolumeClaim {
+        metadata: ObjectMeta {
+            name: Some(workspace_pvc_name(&cl.name_any())),
+            namespace: cl.namespace(),
+            labels: Some(labels(&cl.name_any())),
+            owner_references: Some(vec![owner_reference(cl)]),
+            ..Default::default()
+        },
+        spec: Some(PersistentVolumeClaimSpec {
+            access_modes: Some(vec!["ReadWriteMany".to_string()]),
+            storage_class_name: storage_class.map(str::to_string),
+            resources: Some(k8s_openapi::api::core::v1::VolumeResourceRequirements {
+                requests: Some(BTreeMap::from([(
+                    "storage".to_string(),
+                    Quantity(size.to_string()),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Keep-set ConfigMap: the prune's survival list, delivered to the init
+/// container via `configMapKeyRef` so refreshing it never touches the pod
+/// template (an inline env value would roll the Deployment on run
+/// lifecycle).
+pub fn build_keep_config_map(
+    cl: &CodeLocation,
+    keep_csv: &str,
+) -> k8s_openapi::api::core::v1::ConfigMap {
+    k8s_openapi::api::core::v1::ConfigMap {
+        metadata: ObjectMeta {
+            name: Some(keep_config_map_name(&cl.name_any())),
+            namespace: cl.namespace(),
+            labels: Some(labels(&cl.name_any())),
+            owner_references: Some(vec![owner_reference(cl)]),
+            ..Default::default()
+        },
+        data: Some(BTreeMap::from([(
+            rivers_k8s::workspace::KEEP_CONFIG_MAP_KEY.to_string(),
+            keep_csv.to_string(),
+        )])),
+        ..Default::default()
+    }
+}
+
+/// Git-mode `Deployment`: same envelope as [`build_deployment`], but the
+/// container runs out of the materialized workspace — absolute venv
+/// interpreter, `workingDir` at the checkout, workspace pieces grafted on.
+pub fn build_git_deployment(
+    cl: &CodeLocation,
+    resolved_runtime_image: &str,
+    code_location_service_account: &str,
+    surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
+    pieces: &rivers_k8s::workspace::WorkspacePodPieces,
+    working_dir: String,
+) -> Deployment {
+    let name = deployment_name(&cl.name_any());
+    let ns = cl.namespace();
+    let spec = &cl.spec;
+    let lbls = labels(&cl.name_any());
+
+    let pull_secrets = if spec.image_pull_secrets.is_empty() {
+        None
+    } else {
+        Some(spec.image_pull_secrets.clone())
+    };
+
+    // Base env minus user env, then workspace env (PYTHONPATH as the
+    // belt-and-braces for anything that chdirs; VIRTUAL_ENV;
+    // RIVERS_GIT_COMMIT — the rollout trigger), then user env last so it
+    // keeps today's override position.
+    let mut env = build_base_env(cl, resolved_runtime_image, surreal_pod_cfg);
+    env.push(EnvVar {
+        name: "PYTHONPATH".to_string(),
+        value: Some(working_dir.clone()),
+        ..Default::default()
+    });
+    env.extend(pieces.main_env.iter().cloned());
+    env.extend(cl.spec.env.iter().cloned());
+
+    Deployment {
+        metadata: ObjectMeta {
+            name: Some(name),
+            namespace: ns.clone(),
+            labels: Some(lbls.clone()),
+            owner_references: Some(vec![owner_reference(cl)]),
+            ..Default::default()
+        },
+        spec: Some(DeploymentSpec {
+            replicas: Some(spec.replicas),
+            selector: LabelSelector {
+                match_labels: Some(lbls.clone()),
+                ..Default::default()
+            },
+            template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    labels: Some(lbls.clone()),
+                    ..Default::default()
+                }),
+                spec: Some(PodSpec {
+                    service_account_name: Some(
+                        spec.service_account_name
+                            .clone()
+                            .unwrap_or_else(|| code_location_service_account.to_string()),
+                    ),
+                    image_pull_secrets: pull_secrets,
+                    init_containers: Some(pieces.init_containers.clone()),
+                    volumes: Some(pieces.volumes.clone()),
+                    containers: vec![Container {
+                        name: "code-location".to_string(),
+                        image: Some(resolved_runtime_image.to_string()),
+                        image_pull_policy: Some("IfNotPresent".to_string()),
+                        command: Some(vec![rivers_k8s::workspace::VENV_RIVERS_BIN.to_string()]),
+                        args: Some(vec![
+                            "serve".to_string(),
+                            spec.module.clone(),
+                            "--grpc-port".to_string(),
+                            spec.grpc_port.to_string(),
+                        ]),
+                        working_dir: Some(working_dir),
+                        ports: Some(vec![ContainerPort {
+                            name: Some("grpc".to_string()),
+                            container_port: spec.grpc_port,
+                            protocol: Some("TCP".to_string()),
+                            ..Default::default()
+                        }]),
+                        resources: Some(spec.resources.clone()),
+                        env: Some(env),
+                        volume_mounts: Some(pieces.main_mounts.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            },
+            ..Default::default()
+        }),
+        status: None,
+    }
+}
+
 fn build_env(
+    cl: &CodeLocation,
+    resolved_image: &str,
+    surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
+) -> Vec<EnvVar> {
+    let mut env = build_base_env(cl, resolved_image, surreal_pod_cfg);
+    env.extend(cl.spec.env.iter().cloned());
+    env
+}
+
+/// Operator-injected env common to both source modes, WITHOUT the user's
+/// `spec.env` (callers append it last so its override position is stable).
+fn build_base_env(
     cl: &CodeLocation,
     resolved_image: &str,
     surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
@@ -176,7 +361,6 @@ fn build_env(
         },
     ];
     env.extend(rivers_k8s::env::build_surreal_pod_env(surreal_pod_cfg));
-    env.extend(cl.spec.env.iter().cloned());
     env
 }
 
@@ -493,6 +677,161 @@ mod tests {
         )
         .unwrap();
         assert_eq!(container_resources, expected_resources);
+    }
+
+    fn git_spec_json() -> serde_json::Value {
+        json!({
+            "git": {
+                "url": "https://forge.example/acme/pipelines.git",
+                "ref": { "branch": "main" },
+                "path": "analytics",
+                "secretRef": { "name": "git-creds" },
+            },
+            "module": "analytics.pipeline",
+        })
+    }
+
+    fn git_pieces(cl: &CodeLocation) -> rivers_k8s::workspace::WorkspacePodPieces {
+        let git = cl.spec.git.as_ref().unwrap();
+        rivers_k8s::workspace::builder_pod_pieces(&rivers_k8s::workspace::WorkspaceSpec {
+            key: "9f3c1ab8d2e4-1a2b3c4d".to_string(),
+            volume: rivers_k8s::workspace::WorkspaceVolume::SharedPvc {
+                claim_name: workspace_pvc_name("analytics"),
+            },
+            runtime_image: "ghcr.io/rt@sha256:1a2b3c4dff".to_string(),
+            git_url: git.url.clone(),
+            commit: "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8".to_string(),
+            git_ref: Some("refs/heads/main".to_string()),
+            path: git.path.clone(),
+            secret_name: Some("git-creds".to_string()),
+            deps: git.dependencies.clone(),
+            keep_config_map: Some(keep_config_map_name("analytics")),
+            keep_revisions: Some(3),
+            min_tree_age: Some("1h".to_string()),
+            extra_env: cl.spec.env.clone(),
+        })
+    }
+
+    #[test]
+    fn git_working_dir_shapes() {
+        assert_eq!(git_working_dir(None), "/workspace/src");
+        assert_eq!(
+            git_working_dir(Some("analytics")),
+            "/workspace/src/analytics"
+        );
+        assert_eq!(
+            git_working_dir(Some("/deep/dir/")),
+            "/workspace/src/deep/dir"
+        );
+    }
+
+    #[test]
+    fn workspace_pvc_matches_golden() {
+        let cl = make_cl(git_spec_json(), "analytics", "team-data", "uid-1234");
+        let pvc = build_workspace_pvc(&cl, "20Gi", Some("nfs-rwx"));
+        let expected = json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": "analytics-workspace",
+                "namespace": "team-data",
+                "labels": expected_labels("analytics"),
+                "ownerReferences": [expected_owner_ref("analytics", "uid-1234")],
+            },
+            "spec": {
+                "accessModes": ["ReadWriteMany"],
+                "storageClassName": "nfs-rwx",
+                "resources": { "requests": { "storage": "20Gi" } },
+            },
+        });
+        assert_eq!(serde_json::to_value(&pvc).unwrap(), expected);
+    }
+
+    #[test]
+    fn keep_config_map_matches_golden() {
+        let cl = make_cl(git_spec_json(), "analytics", "team-data", "uid-1234");
+        let cm = build_keep_config_map(&cl, "9f3c1ab8d2e4-1a2b3c4d,7e21bb04c19f-1a2b3c4d");
+        let expected = json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "analytics-workspace-keep",
+                "namespace": "team-data",
+                "labels": expected_labels("analytics"),
+                "ownerReferences": [expected_owner_ref("analytics", "uid-1234")],
+            },
+            "data": { "keep": "9f3c1ab8d2e4-1a2b3c4d,7e21bb04c19f-1a2b3c4d" },
+        });
+        assert_eq!(serde_json::to_value(&cm).unwrap(), expected);
+    }
+
+    #[test]
+    fn git_deployment_runs_from_the_workspace() {
+        let cl = make_cl(git_spec_json(), "analytics", "team-data", "uid-1234");
+        let pieces = git_pieces(&cl);
+        let d = build_git_deployment(
+            &cl,
+            "ghcr.io/rt@sha256:1a2b3c4dff",
+            "rivers-code-location",
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &pieces,
+            git_working_dir(Some("analytics")),
+        );
+
+        let pod = d.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+        // Init container + volumes grafted verbatim from the pieces.
+        assert_eq!(
+            serde_json::to_value(pod.init_containers.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&pieces.init_containers).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(pod.volumes.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&pieces.volumes).unwrap()
+        );
+
+        let c = &pod.containers[0];
+        assert_eq!(c.image.as_deref(), Some("ghcr.io/rt@sha256:1a2b3c4dff"));
+        // Absolute interpreter path — $(VAR) PATH games do not work in k8s.
+        assert_eq!(
+            c.command.as_ref().unwrap(),
+            &vec!["/workspace/venv/bin/rivers".to_string()]
+        );
+        assert_eq!(
+            c.args.as_ref().unwrap(),
+            &vec![
+                "serve".to_string(),
+                "analytics.pipeline".to_string(),
+                "--grpc-port".to_string(),
+                "3001".to_string(),
+            ]
+        );
+        // workingDir is what makes spec.module importable (serve does
+        // sys.path.insert(0, ".")); PYTHONPATH is the belt-and-braces.
+        assert_eq!(c.working_dir.as_deref(), Some("/workspace/src/analytics"));
+        assert_eq!(
+            serde_json::to_value(c.volume_mounts.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&pieces.main_mounts).unwrap()
+        );
+
+        let env: std::collections::HashMap<&str, &str> = c
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|e| (e.name.as_str(), e.value.as_deref().unwrap_or("")))
+            .collect();
+        assert_eq!(env["PYTHONPATH"], "/workspace/src/analytics");
+        assert_eq!(env["VIRTUAL_ENV"], "/workspace/venv");
+        assert_eq!(
+            env["RIVERS_GIT_COMMIT"],
+            "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8"
+        );
+        assert_eq!(env["RIVERS_CODE_LOCATION_NAME"], "analytics");
+        assert_eq!(env["RIVERS_MODULE"], "analytics.pipeline");
+        assert_eq!(
+            env["RIVERS_CODE_LOCATION_IMAGE"],
+            "ghcr.io/rt@sha256:1a2b3c4dff"
+        );
     }
 
     #[test]

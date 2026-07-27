@@ -116,6 +116,28 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_GIT_TIMEOUT_SECONDS);
 
+    let workspace_cfg = {
+        let mut cfg = codelocation::WorkspaceConfig::default();
+        let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        if let Some(v) = env("RIVERS_WORKSPACE_SHARED_ENABLED") {
+            cfg.shared_enabled = matches!(v.as_str(), "true" | "1");
+        }
+        cfg.storage_class = env("RIVERS_WORKSPACE_STORAGE_CLASS");
+        if let Some(v) = env("RIVERS_WORKSPACE_SHARED_SIZE") {
+            cfg.shared_size = v;
+        }
+        if let Some(v) = env("RIVERS_WORKSPACE_EMPTYDIR_LIMIT") {
+            cfg.empty_dir_limit = v;
+        }
+        if let Some(v) = env("RIVERS_WORKSPACE_KEEP_REVISIONS").and_then(|v| v.parse().ok()) {
+            cfg.keep_revisions = v;
+        }
+        if let Some(v) = env("RIVERS_WORKSPACE_MIN_AGE") {
+            cfg.min_tree_age = v;
+        }
+        cfg
+    };
+
     let cl_ctx = Arc::new(codelocation::Context {
         client: client.clone(),
         namespace: namespace.clone(),
@@ -127,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
         )),
         runtime_image: std::env::var(RUNTIME_IMAGE_ENV)
             .unwrap_or_else(|_| rivers_k8s::defaults::RUNTIME_IMAGE.to_string()),
+        workspace: workspace_cfg,
         leader: leader.clone(),
         code_location_service_account: std::env::var(CODE_LOCATION_SA_ENV)
             .unwrap_or_else(|_| DEFAULT_CODE_LOCATION_SA.to_string()),

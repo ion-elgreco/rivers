@@ -36,10 +36,14 @@ use super::git::{self, GitCredentials, GitResolveRequest};
 use super::image_auth::resolve_auth;
 use super::registry::{RegistryAuth, RegistryClient, RegistryError, Resolution, ResolveRequest};
 use super::resources::{
-    build_deployment, build_service, deployment_name, grpc_endpoint, service_name,
+    build_deployment, build_git_deployment, build_keep_config_map, build_service,
+    build_workspace_pvc, deployment_name, git_working_dir, grpc_endpoint, keep_config_map_name,
+    service_name, workspace_pvc_name,
 };
 use crate::leader::LeaderGate;
 use crate::metrics;
+use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim};
+use rivers_k8s::workspace::{self, WorkspaceSpec, WorkspaceVolume};
 
 /// Default registry-refresh interval when the CR does not override it.
 const DEFAULT_REFRESH: Duration = Duration::from_secs(300);
@@ -69,12 +73,39 @@ pub struct Context {
     pub runtime_image: String,
     pub leader: Arc<LeaderGate>,
     pub code_location_service_account: String,
+    /// Chart-level workspace settings for git-sourced CLs.
+    pub workspace: WorkspaceConfig,
     /// SurrealDB endpoint, scope (`use_ns` / `use_db`) and auth-secret
     /// coordinates stamped onto every code-location pod the operator creates.
     /// Read once from the operator's own env at startup. When `auth_secret`
     /// is set, `RIVERS_SURREAL_USERNAME` / `_PASSWORD` are emitted via
     /// `valueFrom.secretKeyRef`; otherwise pods connect unauthenticated.
     pub surreal_pod_cfg: rivers_k8s::env::SurrealPodConfig,
+}
+
+/// `codeLocation.workspace.*` from the chart, via operator env.
+#[derive(Clone, Debug)]
+pub struct WorkspaceConfig {
+    /// Shared RWX PVC per CL (true) vs per-pod emptyDir (false).
+    pub shared_enabled: bool,
+    pub storage_class: Option<String>,
+    pub shared_size: String,
+    pub empty_dir_limit: String,
+    pub keep_revisions: u32,
+    pub min_tree_age: String,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            shared_enabled: false,
+            storage_class: None,
+            shared_size: "20Gi".to_string(),
+            empty_dir_limit: "2Gi".to_string(),
+            keep_revisions: 3,
+            min_tree_age: "1h".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -100,7 +131,16 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
     let secrets_api: Api<Secret> = Api::namespaced(ctx.client.clone(), &namespace);
 
     if cl.spec.is_git() {
-        return reconcile_git(&cl, &ctx, &code_locations_api, &secrets_api).await;
+        return reconcile_git(
+            &cl,
+            &ctx,
+            &namespace,
+            &code_locations_api,
+            &secrets_api,
+            &deployments_api,
+            &services_api,
+        )
+        .await;
     }
 
     let timer = Instant::now();
@@ -205,11 +245,15 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
 /// the commit, publish status. **No Deployment yet** — the workspace
 /// materializer is phase 2, so a git CL deliberately never reaches `Ready`
 /// here and the Run admission webhook keeps rejecting runs against it.
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_git(
     cl: &CodeLocation,
     ctx: &Context,
+    namespace: &str,
     code_locations_api: &Api<CodeLocation>,
     secrets_api: &Api<Secret>,
+    deployments_api: &Api<Deployment>,
+    services_api: &Api<Service>,
 ) -> Result<Action, Error> {
     let name = cl.name_any();
     let generation = cl.metadata.generation;
@@ -250,22 +294,27 @@ async fn reconcile_git(
     let poll = parse_refresh_interval(git_spec.poll_interval.as_deref());
 
     // Followers reuse the leader's pinned commit instead of polling the
-    // remote — mirrors the registry follower path.
+    // remote, and refresh status only — the leader owns the applies (a
+    // brief drift window until the next leader pass is acceptable).
     if !ctx.leader.is_leader() {
         if let Some(prior_commit) = cl.status.as_ref().and_then(|s| s.resolved_commit.clone()) {
             let resolved = git::ResolvedRef {
                 commit: prior_commit,
                 ref_name: cl.status.as_ref().and_then(|s| s.resolved_ref.clone()),
             };
+            let observed = observe_git_deployment(cl, &name, namespace, deployments_api).await;
             patch_git_status(
                 code_locations_api,
                 &name,
                 generation,
                 cl,
-                &resolved_image,
-                image_reason,
-                &resolved,
-                None,
+                GitStatusUpdate {
+                    resolved_image: &resolved_image,
+                    image_reason,
+                    resolved: &resolved,
+                    fetched_at: None,
+                    observed,
+                },
             )
             .await?;
         } else {
@@ -290,18 +339,33 @@ async fn reconcile_git(
     };
     match ctx.git.resolve(&request).await {
         Ok(resolved) => {
-            let now = chrono::Utc::now().to_rfc3339();
+            apply_git_workspace(
+                cl,
+                ctx,
+                namespace,
+                deployments_api,
+                services_api,
+                &resolved_image,
+                &resolved,
+            )
+            .await?;
+            let observed = observe_git_deployment(cl, &name, namespace, deployments_api).await;
+            let phase = observed.phase.clone();
             patch_git_status(
                 code_locations_api,
                 &name,
                 generation,
                 cl,
-                &resolved_image,
-                image_reason,
-                &resolved,
-                Some(now),
+                GitStatusUpdate {
+                    resolved_image: &resolved_image,
+                    image_reason,
+                    resolved: &resolved,
+                    fetched_at: Some(chrono::Utc::now().to_rfc3339()),
+                    observed,
+                },
             )
             .await?;
+
             let pinned = request
                 .r#ref
                 .commit
@@ -312,7 +376,9 @@ async fn reconcile_git(
                 .tag
                 .as_deref()
                 .is_some_and(super::registry::looks_immutable);
-            let requeue = if pinned {
+            let requeue = if !matches!(phase, CodeLocationPhase::Ready) {
+                Action::requeue(DEPLOYMENT_ROLLOUT_POLL)
+            } else if pinned {
                 Action::await_change()
             } else if immutable_tag {
                 Action::requeue(jitter(Duration::from_secs(3600)))
@@ -326,6 +392,154 @@ async fn reconcile_git(
             Ok(Action::requeue(retry))
         }
     }
+}
+
+/// Apply the git CL's owned resources: (shared mode) the workspace PVC and
+/// keep ConfigMap, then the Deployment + Service running out of the
+/// materialized tree.
+async fn apply_git_workspace(
+    cl: &CodeLocation,
+    ctx: &Context,
+    namespace: &str,
+    deployments_api: &Api<Deployment>,
+    services_api: &Api<Service>,
+    resolved_image: &str,
+    resolved: &git::ResolvedRef,
+) -> Result<(), Error> {
+    let name = cl.name_any();
+    let git_spec = cl.spec.git.as_ref().expect("git CL");
+    let key = workspace::workspace_key(&resolved.commit, resolved_image);
+
+    let volume = if ctx.workspace.shared_enabled {
+        WorkspaceVolume::SharedPvc {
+            claim_name: workspace_pvc_name(&name),
+        }
+    } else {
+        let limit = git_spec.workspace_size.clone().unwrap_or_else(|| {
+            k8s_openapi::apimachinery::pkg::api::resource::Quantity(
+                ctx.workspace.empty_dir_limit.clone(),
+            )
+        });
+        WorkspaceVolume::EmptyDir {
+            size_limit: Some(limit),
+        }
+    };
+
+    let wspec = WorkspaceSpec {
+        key: key.clone(),
+        volume,
+        runtime_image: resolved_image.to_string(),
+        git_url: git_spec.url.clone(),
+        commit: resolved.commit.clone(),
+        git_ref: resolved.ref_name.clone(),
+        path: git_spec.path.clone(),
+        secret_name: git_spec.secret_ref.as_ref().map(|s| s.name.clone()),
+        deps: git_spec.dependencies.clone(),
+        keep_config_map: ctx
+            .workspace
+            .shared_enabled
+            .then(|| keep_config_map_name(&name)),
+        keep_revisions: Some(ctx.workspace.keep_revisions),
+        min_tree_age: Some(ctx.workspace.min_tree_age.clone()),
+        extra_env: cl.spec.env.clone(),
+    };
+    let pieces = workspace::builder_pod_pieces(&wspec);
+
+    if ctx.workspace.shared_enabled {
+        let pvc_size = git_spec
+            .workspace_size
+            .as_ref()
+            .map(|q| q.0.clone())
+            .unwrap_or_else(|| ctx.workspace.shared_size.clone());
+        let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
+        ensure_workspace_pvc(
+            &pvc_api,
+            build_workspace_pvc(cl, &pvc_size, ctx.workspace.storage_class.as_deref()),
+        )
+        .await?;
+        // Keep-set: the current tree only, until phase 3 adds the
+        // Run-derived half. The ConfigMap indirection means this refresh
+        // never rolls the Deployment.
+        let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
+        apply_config_map(&cm_api, &build_keep_config_map(cl, &key)).await?;
+    }
+
+    let deployment = build_git_deployment(
+        cl,
+        resolved_image,
+        &ctx.code_location_service_account,
+        &ctx.surreal_pod_cfg,
+        &pieces,
+        git_working_dir(git_spec.path.as_deref()),
+    );
+    let service = build_service(cl);
+    tokio::try_join!(
+        apply_deployment(deployments_api, &deployment),
+        apply_service(services_api, &service),
+    )?;
+    Ok(())
+}
+
+/// Read the Deployment's phase + endpoint without mutating anything —
+/// shared by the leader (post-apply) and follower (status refresh) paths.
+async fn observe_git_deployment(
+    cl: &CodeLocation,
+    name: &str,
+    namespace: &str,
+    deployments_api: &Api<Deployment>,
+) -> ObservedDeployment {
+    let dep_status = deployments_api
+        .get_status(&deployment_name(name))
+        .await
+        .ok();
+    let (phase, ready_replicas, deployment_reason, deployment_ok) =
+        evaluate_deployment_phase(cl, dep_status.as_ref());
+    ObservedDeployment {
+        phase,
+        ready_replicas,
+        deployment_reason,
+        deployment_ok,
+        endpoint: grpc_endpoint(name, namespace, cl.spec.grpc_port),
+    }
+}
+
+struct ObservedDeployment {
+    phase: CodeLocationPhase,
+    ready_replicas: Option<i32>,
+    deployment_reason: &'static str,
+    deployment_ok: bool,
+    endpoint: String,
+}
+
+/// PVC specs are largely immutable — create when absent, otherwise leave
+/// the existing claim alone (a size change would need manual expansion).
+async fn ensure_workspace_pvc(
+    api: &Api<PersistentVolumeClaim>,
+    pvc: PersistentVolumeClaim,
+) -> Result<(), kube_client::Error> {
+    let name = pvc.metadata.name.clone().unwrap_or_default();
+    match api.get(&name).await {
+        Ok(_) => Ok(()),
+        Err(kube_client::Error::Api(ae)) if ae.code == 404 => api
+            .create(&kube_client::api::PostParams::default(), &pvc)
+            .await
+            .map(|_| ()),
+        Err(e) => Err(e),
+    }
+}
+
+async fn apply_config_map(
+    api: &Api<ConfigMap>,
+    desired: &ConfigMap,
+) -> Result<(), kube_client::Error> {
+    let name = desired.metadata.name.as_deref().unwrap_or_default();
+    api.patch(
+        name,
+        &PatchParams::apply(FIELD_MANAGER).force(),
+        &Patch::Apply(desired),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Build [`GitCredentials`] from the CR's Secret. `identity` (+ mandatory
@@ -402,49 +616,52 @@ fn git_source_display(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct GitStatusUpdate<'a> {
+    resolved_image: &'a str,
+    image_reason: &'static str,
+    resolved: &'a git::ResolvedRef,
+    fetched_at: Option<String>,
+    observed: ObservedDeployment,
+}
+
 async fn patch_git_status(
     code_locations_api: &Api<CodeLocation>,
     name: &str,
     generation: Option<i64>,
     cl: &CodeLocation,
-    resolved_image: &str,
-    image_reason: &'static str,
-    resolved: &git::ResolvedRef,
-    fetched_at: Option<String>,
+    update: GitStatusUpdate<'_>,
 ) -> Result<(), kube_client::Error> {
     let now = chrono::Utc::now().to_rfc3339();
     let prior = cl.status.as_ref();
     let git_spec = cl.spec.git.as_ref().expect("git status for a git CL");
-    let source_reason = if resolved.ref_name.is_none() {
+    let source_reason = if update.resolved.ref_name.is_none() {
         REASON_COMMIT_PINNED
     } else {
         REASON_COMMIT_RESOLVED
     };
     let mut status = CodeLocationStatus {
-        phase: Some(CodeLocationPhase::Pending),
+        phase: Some(update.observed.phase.clone()),
         observed_generation: generation,
-        resolved_image: Some(resolved_image.to_string()),
-        grpc_endpoint: None,
+        resolved_image: Some(update.resolved_image.to_string()),
+        grpc_endpoint: Some(update.observed.endpoint.clone()),
         last_reconciled: Some(now.clone()),
-        ready_replicas: None,
-        message: Some(
-            "git source resolved; workspace materialization arrives with RFC-044 phase 2"
-                .to_string(),
-        ),
+        ready_replicas: update.observed.ready_replicas,
+        message: None,
         conditions: Vec::new(),
-        source: Some(git_source_display(resolved, &git_spec.r#ref)),
-        resolved_commit: Some(resolved.commit.clone()),
-        resolved_ref: resolved.ref_name.clone(),
-        last_fetched_at: fetched_at.or_else(|| prior.and_then(|s| s.last_fetched_at.clone())),
+        source: Some(git_source_display(update.resolved, &git_spec.r#ref)),
+        resolved_commit: Some(update.resolved.commit.clone()),
+        resolved_ref: update.resolved.ref_name.clone(),
+        last_fetched_at: update
+            .fetched_at
+            .or_else(|| prior.and_then(|s| s.last_fetched_at.clone())),
     };
     push_condition(
         &mut status,
         prior,
         CONDITION_IMAGE_RESOLVED,
         "True",
-        image_reason,
-        Some(resolved_image.to_string()),
+        update.image_reason,
+        Some(update.resolved_image.to_string()),
         &now,
     );
     push_condition(
@@ -453,7 +670,20 @@ async fn patch_git_status(
         CONDITION_SOURCE_RESOLVED,
         "True",
         source_reason,
-        Some(resolved.commit.clone()),
+        Some(update.resolved.commit.clone()),
+        &now,
+    );
+    push_condition(
+        &mut status,
+        prior,
+        CONDITION_DEPLOYMENT_AVAILABLE,
+        if update.observed.deployment_ok {
+            "True"
+        } else {
+            "False"
+        },
+        update.observed.deployment_reason,
+        None,
         &now,
     );
     if status_substantively_equal(prior, &status) {

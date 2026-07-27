@@ -139,6 +139,17 @@ install_deps() {
             ;;
         none)
             log "deps mode none — installing nothing; the runtime image carries the deps"
+            # The pod command is uniformly /workspace/venv/bin/rivers so the
+            # operator never has to guess which mode `auto` landed on —
+            # provide the entrypoint as a shim to the image-level install.
+            if command -v rivers >/dev/null 2>&1; then
+                mkdir -p "$VENV/bin"
+                ln -sf "$(command -v rivers)" "$VENV/bin/rivers"
+            else
+                # Unreachable in the runtime image (its entrypoint IS rivers);
+                # only local smoke runs land here.
+                log "rivers not on PATH — skipping the venv shim"
+            fi
             ;;
         *)
             die "unknown RIVERS_DEPS_MODE '$mode' (auto|uvSync|requirements|none)"

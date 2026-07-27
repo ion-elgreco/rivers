@@ -81,6 +81,22 @@ spec:
               value: {{ include "rivers.runtimeImage" . | quote }}
             - name: RIVERS_GIT_TIMEOUT_SECONDS
               value: {{ .Values.operator.git.timeoutSeconds | quote }}
+            {{- with .Values.codeLocation.workspace }}
+            - name: RIVERS_WORKSPACE_SHARED_ENABLED
+              value: {{ .shared.enabled | quote }}
+            {{- if .shared.storageClass }}
+            - name: RIVERS_WORKSPACE_STORAGE_CLASS
+              value: {{ .shared.storageClass | quote }}
+            {{- end }}
+            - name: RIVERS_WORKSPACE_SHARED_SIZE
+              value: {{ .shared.size | quote }}
+            - name: RIVERS_WORKSPACE_EMPTYDIR_LIMIT
+              value: {{ .sizeLimit | quote }}
+            - name: RIVERS_WORKSPACE_KEEP_REVISIONS
+              value: {{ .keepRevisions | quote }}
+            - name: RIVERS_WORKSPACE_MIN_AGE
+              value: {{ .minTreeAge | quote }}
+            {{- end }}
             {{- if .Values.operator.git.allowedHosts }}
             - name: RIVERS_GIT_ALLOWED_HOSTS
               value: {{ join "," .Values.operator.git.allowedHosts | quote }}

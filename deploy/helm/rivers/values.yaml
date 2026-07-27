@@ -254,6 +254,21 @@ codeLocation:
     # Interpreter variant the default tag selects. Per-CodeLocation
     # overrides go on spec.image / spec.tag.
     pythonVersion: "3.12"
+  workspace:
+    # Shared workspace: one RWX PVC per git CodeLocation; trees (code+venv)
+    # built once and reused. Needs an RWX storage class — measure network
+    # filesystems first (a venv is tens of thousands of small files).
+    shared:
+      enabled: false
+      storageClass: ""
+      size: 20Gi
+    # emptyDir cap in fallback mode; spec.git.workspaceSize overrides per CL.
+    sizeLimit: 2Gi
+    # Trees always retained by recency, regardless of the keep-set.
+    keepRevisions: 3
+    # A tree is never deleted before this age — closes the
+    # admission-vs-commit-change race independently of commit rate.
+    minTreeAge: 1h
 
 executor:
   serviceAccountName: rivers-executor
