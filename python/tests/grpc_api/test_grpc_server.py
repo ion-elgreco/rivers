@@ -354,7 +354,12 @@ def queued_grpc_channel(grpc_stubs, storage):
     """gRPC server with run_queue configured — runs should be queued, not executed."""
     handler = DictIOHandler()
 
-    @rs.Asset(io_handler=handler)
+    def _compact(ctx):
+        return None
+
+    compact = rs.AssetAction(name="compact", outcome=rs.Outcome.Unchanged)(_compact)
+
+    @rs.Asset(io_handler=handler, actions=[compact])
     def alpha():
         return 1
 
@@ -396,6 +401,134 @@ def test_materialize_with_run_queue_creates_queued_run(queued_grpc_channel):
     matching = [r for r in runs if r.run_id == response.run_id]
     assert len(matching) == 1
     assert matching[0].status == "Queued"
+
+
+def test_run_action_with_run_queue_creates_queued_run(queued_grpc_channel):
+    """RunAction goes through the dispatcher like every other mutating RPC.
+
+    Running the verb inline skipped the queue entirely — no concurrency limit,
+    no tag limits, no priority, and under Kubernetes the verb executed in the
+    code-location server pod instead of a Run CR.
+    """
+    channel, pb2, pb2_grpc, _, storage = queued_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    response = stub.RunAction(
+        pb2.RunActionRequest(
+            action="compact",
+            selection=["alpha"],
+            tags=[pb2.Tag(key="team", value="data")],
+        )
+    )
+    assert response.success is True
+    assert response.run_id != ""
+
+    runs = storage.get_runs(limit=10)
+    matching = [r for r in runs if r.run_id == response.run_id]
+    assert len(matching) == 1
+    assert matching[0].status == "Queued"
+    assert matching[0].action == "compact"
+    # Tags reach the record, so tag-based queue limits and filters apply.
+    assert dict(matching[0].tags or {})["team"] == "data"
+
+
+@pytest.fixture
+def action_validation_channel(grpc_stubs, storage):
+    """gRPC server with a partitioned actionable asset and a partitioned
+    observable, for exercising the RunAction validation boundary."""
+    handler = DictIOHandler()
+
+    def _purge(ctx):
+        return None
+
+    purge = rs.AssetAction(name="purge", outcome=rs.Outcome.Unmaterialize)(_purge)
+
+    @rs.Asset(
+        io_handler=handler,
+        actions=[purge],
+        partitions_def=rs.PartitionsDefinition.static_(["p1", "p2"]),
+    )
+    def events():
+        return 1
+
+    class Feed(rs.ExternalAsset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+        @classmethod
+        def observe(cls) -> rs.Observation:
+            return rs.Observation(data_version="dv-1")
+
+    repo = rs.CodeRepository(
+        assets=[events, Feed],
+        default_executor=rs.Executor.in_process(),
+        run_queue=rs.RunQueueConfig(max_concurrent_runs=2, dequeue_interval="50ms"),
+    )
+    repo.resolve(storage=storage)
+    port = repo._start_grpc_server("127.0.0.1", 0)
+
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+
+    pb2, pb2_grpc = grpc_stubs
+    yield channel, pb2, pb2_grpc, repo, storage
+    channel.close()
+    repo._stop_grpc_server()
+
+
+def test_run_action_rejects_unknown_asset(action_validation_channel):
+    """gRPC is the system boundary: the dispatcher hands the request to the run
+    queue and swallows the error, so a typo'd asset would otherwise come back as
+    success plus a run_id for a run that never starts."""
+    channel, pb2, pb2_grpc, _, storage = action_validation_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    before = {r.run_id for r in storage.get_runs(limit=100)}
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.RunAction(pb2.RunActionRequest(action="purge", selection=["typo"]))
+    assert "typo" in exc.value.details()
+    assert {r.run_id for r in storage.get_runs(limit=100)} == before, (
+        "a rejected action must not leave a run record behind"
+    )
+
+
+def test_run_action_rejects_bad_partition_key(action_validation_channel):
+    """Same boundary, partition side: a key outside the asset's definition."""
+    channel, pb2, pb2_grpc, _, storage = action_validation_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    before = {r.run_id for r in storage.get_runs(limit=100)}
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.RunAction(
+            pb2.RunActionRequest(
+                action="purge",
+                selection=["events"],
+                partition_key=pb2.ProtoPartitionKey(
+                    single=pb2.SinglePartitionKey(keys=["nope"])
+                ),
+            )
+        )
+    assert "nope" in exc.value.details()
+    assert {r.run_id for r in storage.get_runs(limit=100)} == before
+
+    # And a missing key on a partitioned selection is equally invalid.
+    with pytest.raises(grpc.RpcError):
+        stub.RunAction(pb2.RunActionRequest(action="purge", selection=["events"]))
+
+
+def test_run_action_allows_keyless_observe_on_partitioned_observable(
+    action_validation_channel,
+):
+    """observe() is whole-asset, so the partition gate must not apply to it —
+    the carve-out the inline path had and the validation must preserve."""
+    channel, pb2, pb2_grpc, _, storage = action_validation_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    response = stub.RunAction(
+        pb2.RunActionRequest(action="observe", selection=["feed"])
+    )
+    assert response.success is True
+    assert response.run_id != ""
 
 
 def test_execute_job_with_run_queue_creates_queued_run(queued_grpc_channel):

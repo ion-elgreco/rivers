@@ -60,6 +60,31 @@ where
         .collect()
 }
 
+/// The verb a job's runs execute, for stamping on their `RunRecord`.
+/// `None` for materialize jobs (and unknown/unresolved names). Takes the
+/// borrowed map so callers that already hold the state guard can use it.
+fn job_action(jobs_info: &HashMap<String, JobSummary>, job_name: Option<&str>) -> Option<String> {
+    job_name.and_then(|j| jobs_info.get(j).and_then(|s| s.action.clone()))
+}
+
+/// Assets defining `action`, sorted. Single source of truth for what
+/// `selection=None` means for an action — a queued or Kubernetes-backed run
+/// carries its asset list on the record, so "everything" has to be spelled out.
+/// `node_map` is a HashMap, so the sort is what makes step order reproducible.
+fn assets_supporting_action(
+    node_map: &HashMap<String, ResolvedNode>,
+    py: Python,
+    action: &str,
+) -> Vec<String> {
+    let mut names: Vec<String> = node_map
+        .iter()
+        .filter(|(_, node)| node.supports_action(py, action))
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
 /// Reject submissions that either (a) omit a partition key when the
 /// selection contains partitioned assets, or (b) supply a key that doesn't
 /// match the asset's partition definition (wrong shape, out-of-range time
@@ -1410,14 +1435,16 @@ impl RepoHandle {
             .and_then(|s| s.jobs_info.get(name).map(|j| j.asset_names.clone()))
     }
 
-    /// The verb a job's runs execute, for stamping on their `RunRecord`.
-    /// `None` for materialize jobs (and unknown/unresolved names).
-    pub(crate) fn job_action(&self, name: &str) -> Option<String> {
-        self.state
-            .read()
-            .unwrap()
-            .as_ref()
-            .and_then(|s| s.jobs_info.get(name).and_then(|j| j.action.clone()))
+    /// Assets defining `action`, sorted. The caller must already hold the GIL —
+    /// `supports_action` reads Python attributes, and taking the GIL here while
+    /// holding the state guard inverts the lock order `resolve()` uses
+    /// (GIL, then `state.write()`).
+    pub(crate) fn assets_supporting_action(&self, py: Python, action: &str) -> PyResult<Vec<String>> {
+        let guard = self.state.read().unwrap();
+        let state = guard.as_ref().ok_or_else(|| {
+            ExecutionError::new_err("CodeRepository not resolved — call resolve() first")
+        })?;
+        Ok(assets_supporting_action(&state.node_map, py, action))
     }
 
     pub(crate) fn list_jobs(&self) -> Vec<JobSummary> {
@@ -1510,9 +1537,7 @@ impl RepoHandle {
             let run_tags = tags.unwrap_or_default();
             let core_pk = partition_key.map(|pk| pk.into());
             let priority = priority_from_tags(&run_tags);
-            let action = job_name
-                .as_deref()
-                .and_then(|j| state.jobs_info.get(j).and_then(|s| s.action.clone()));
+            let action = job_action(&state.jobs_info, job_name.as_deref());
 
             let record = RunRecord {
                 run_id,
@@ -1595,11 +1620,10 @@ impl RepoHandle {
                 let core_pk = sub.partition_key.as_ref().map(|pk| pk.into());
                 // A job target carries its own verb; `sub.action` is the
                 // selection-target verb from `backfill(action=...)`.
-                let action = sub.action.clone().or_else(|| {
-                    sub.job_name
-                        .as_deref()
-                        .and_then(|j| state.jobs_info.get(j).and_then(|s| s.action.clone()))
-                });
+                let action = sub
+                    .action
+                    .clone()
+                    .or_else(|| job_action(&state.jobs_info, sub.job_name.as_deref()));
 
                 records.push(RunRecord {
                     run_id,
@@ -1829,6 +1853,43 @@ impl RepoHandle {
                 state,
                 asset_names.iter().map(String::as_str),
                 partition_key,
+            )?;
+            (
+                dynamic_partition_checks(
+                    state,
+                    asset_names.iter().map(String::as_str),
+                    partition_key,
+                ),
+                state.storage.clone(),
+                state.code_location_id.clone(),
+            )
+        };
+        verify_dynamic_partition_keys(&storage, &code_location_id, &dyn_checks).await
+    }
+
+    /// Verb-aware twin of [`Self::validate_partition_for_selection`], for the
+    /// gRPC action boundary. An unkeyed observe is a whole-asset observation
+    /// (the observe fn takes no partition), so a partitioned observable must
+    /// not demand a key the verb has nowhere to put.
+    pub(crate) async fn validate_partition_for_action(
+        &self,
+        asset_names: &[String],
+        partition_key: Option<&PyPartitionKey>,
+        action: &str,
+    ) -> PyResult<()> {
+        if action == "observe" && partition_key.is_none() {
+            return Ok(());
+        }
+        let (dyn_checks, storage, code_location_id) = {
+            let guard = self.state.read().unwrap();
+            let state = guard.as_ref().ok_or_else(|| {
+                ExecutionError::new_err("Repository not resolved — call resolve() first")
+            })?;
+            validate_partition_for_verb(
+                state,
+                asset_names.iter().map(String::as_str),
+                partition_key,
+                Some(action),
             )?;
             (
                 dynamic_partition_checks(
@@ -2582,17 +2643,7 @@ impl PyCodeRepository {
                 }
                 sel
             }
-            None => Python::attach(|py| {
-                let mut names: Vec<String> = state
-                    .node_map
-                    .iter()
-                    .filter(|(_, node)| node.supports_action(py, &action))
-                    .map(|(name, _)| name.clone())
-                    .collect();
-                // node_map is a HashMap — sort so step order is reproducible.
-                names.sort();
-                names
-            }),
+            None => Python::attach(|py| assets_supporting_action(&state.node_map, py, &action)),
         };
         if selected_names.is_empty() {
             return Err(AssetNotFoundError::new_err(format!(
@@ -4240,18 +4291,14 @@ impl PyCodeRepository {
             match &action {
                 // An action backfill over "everything" means every asset
                 // that defines the verb, mirroring `run_action`.
-                Some(verb) => Python::attach(|py| {
-                    let mut names: Vec<String> = state
-                        .node_map
-                        .iter()
-                        .filter(|(_, node)| node.supports_action(py, verb))
-                        .map(|(name, _)| name.clone())
-                        .collect();
-                    // node_map is a HashMap — sort so step order is reproducible.
+                Some(verb) => {
+                    Python::attach(|py| assets_supporting_action(&state.node_map, py, verb))
+                }
+                None => {
+                    let mut names: Vec<String> = state.node_map.keys().cloned().collect();
                     names.sort();
                     names
-                }),
-                None => state.node_map.keys().cloned().collect(),
+                }
             }
         } else {
             selection

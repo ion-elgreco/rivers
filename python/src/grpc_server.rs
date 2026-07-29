@@ -548,43 +548,76 @@ impl CodeLocationService for CodeLocationImpl {
             .partition_key
             .map(proto_partition_key_to_py)
             .transpose()?;
-        let tags = proto_tags_to_pairs(req.tags);
+        let tags = proto_tags_to_pairs(req.tags).unwrap_or_default();
         let launched_by = manual_launch(req.user);
-        let resp = self
-            .run_on_python(move |_py, repo| {
-                let selection = if req.selection.is_empty() {
-                    None
-                } else {
-                    Some(req.selection)
-                };
-                match repo.get().run_action_with_launcher(
-                    req.action,
-                    selection,
-                    pk,
-                    tags,
-                    false,
-                    None,
-                    None,
-                    false,
-                    launched_by,
-                ) {
-                    Ok(result) => Ok(RunActionResponse {
-                        run_id: result.run_id.clone(),
-                        success: result.success,
-                        error: result
-                            .failed_assets
-                            .first()
-                            .map(|(name, err)| format!("{name}: {err}")),
-                    }),
-                    Err(e) => Ok(RunActionResponse {
-                        run_id: String::new(),
-                        success: false,
-                        error: Some(e.to_string()),
-                    }),
-                }
+
+        // An action selection is resolved here rather than left empty: the
+        // dispatcher hands the request to the run queue (and, on Kubernetes, to
+        // a Run CR), which needs the asset list up front.
+        let asset_selection = if req.selection.is_empty() {
+            // `supports_action` reads Python attributes. Run it on a GIL thread
+            // rather than attaching from this tokio worker — attaching while
+            // holding the state read guard inverts the lock order `resolve()`
+            // uses (GIL, then `state.write()`).
+            let handle = self.handle.clone();
+            let action = req.action.clone();
+            self.run_on_python(move |py, _repo| {
+                handle
+                    .assets_supporting_action(py, &action)
+                    .map_err(|e| e.to_string())
             })
-            .await?;
-        Ok(Response::new(resp))
+            .await?
+        } else {
+            let sel = req.selection;
+            self.handle
+                .validate_assets_exist(&sel)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            sel
+        };
+        if asset_selection.is_empty() {
+            return Err(Status::not_found(format!(
+                "no assets define action '{}'",
+                req.action
+            )));
+        }
+
+        // Same boundary rule as `materialize`: the dispatcher trusts its caller,
+        // so an unknown asset or a bad partition key has to be rejected here or
+        // it surfaces asynchronously against a run_id the caller already holds.
+        self.handle
+            .validate_partition_for_action(&asset_selection, pk.as_ref(), &req.action)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let action_request = crate::daemon::MaterializationRequestData {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            asset_selection,
+            partition_key: pk.as_ref().map(|k| k.into()),
+            tags,
+            launched_by,
+            action: Some(req.action),
+        };
+        let run_id = action_request.run_id.clone();
+
+        let mut outcome = self
+            .run_dispatcher
+            .dispatch_materialization(&[action_request])
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        if let Some(err) = outcome.errors.pop() {
+            return Ok(Response::new(RunActionResponse {
+                run_id: String::new(),
+                success: false,
+                error: Some(err.to_string()),
+            }));
+        }
+
+        Ok(Response::new(RunActionResponse {
+            run_id,
+            success: true,
+            error: None,
+        }))
     }
 
     #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.launch_backfill")]
