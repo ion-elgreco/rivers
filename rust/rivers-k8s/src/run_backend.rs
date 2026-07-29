@@ -274,6 +274,7 @@ mod tests {
             priority: 5,
             partition_key: None,
             start_time: 1000,
+            action: None,
         }
     }
 

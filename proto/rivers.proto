@@ -20,7 +20,7 @@ service CodeLocationService {
   rpc GetJobs(GetJobsRequest) returns (GetJobsResponse);
   rpc EvaluateSchedule(EvaluateScheduleRequest) returns (EvaluateScheduleResponse);
   rpc EvaluateSensor(EvaluateSensorRequest) returns (EvaluateSensorResponse);
-  rpc ObserveAsset(ObserveAssetRequest) returns (ObserveAssetResponse);
+  rpc RunAction(RunActionRequest) returns (RunActionResponse);
   rpc LaunchBackfill(LaunchBackfillRequest) returns (LaunchBackfillResponse);
   rpc MaterializeMissing(MaterializeMissingRequest) returns (LaunchBackfillResponse);
   rpc RerunBackfill(RerunBackfillRequest) returns (RerunBackfillResponse);
@@ -152,6 +152,15 @@ message AssetDefinitionInfo {
   optional string group = 11;
   optional string code_version = 12;
   string asset_type = 13;
+  repeated ActionInfo actions = 14;
+}
+
+message ActionInfo {
+  string name = 1;
+  // "unchanged" | "may_materialize" | "unmaterialize" | "observe"
+  string outcome = 2;
+  bool exclusive = 3;
+  optional string description = 4;
 }
 
 message PartitionDefInfo {
@@ -233,6 +242,8 @@ message JobInfo {
   string name = 1;
   repeated string asset_selection = 2;
   string executor_type = 3;
+  // The verb this job's runs execute. Unset means materialize.
+  optional string action = 4;
 }
 
 // --- Schedule & sensor evaluation ---
@@ -254,14 +265,20 @@ message EvaluateSensorResponse {
   optional string cursor = 3;
 }
 
-// --- External asset observation ---
+// --- Asset actions ---
+// One verb over a selection; `observe` is the built-in action on externals.
 
-message ObserveAssetRequest {
-  string asset_key = 1;
+message RunActionRequest {
+  string action = 1;
+  repeated string selection = 2;
+  optional ProtoPartitionKey partition_key = 3;
+  repeated Tag tags = 4;
+  optional UserRef user = 5;
 }
-message ObserveAssetResponse {
-  bool success = 1;
-  optional string error = 2;
+message RunActionResponse {
+  string run_id = 1;
+  bool success = 2;
+  optional string error = 3;
 }
 
 // --- Backfills ---
@@ -339,6 +356,9 @@ message LaunchBackfillRequest {
   // job's own plan + executor. Mutually exclusive with `selection`.
   optional string job_name = 9;
   optional UserRef user = 10;
+  // Verb child runs execute. Unset means materialize. Applies to
+  // `selection` targets only — a Job target carries its own action.
+  optional string action = 11;
 }
 
 message LaunchBackfillResponse {
