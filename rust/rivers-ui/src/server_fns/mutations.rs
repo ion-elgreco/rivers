@@ -1,4 +1,5 @@
-//! Server functions for write actions (materialize, observe) dispatched via gRPC.
+//! Server functions for UI mutations (materialize, asset actions, backfills,
+//! run cancel/delete) dispatched via gRPC.
 
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -147,6 +148,43 @@ pub async fn trigger_materialize(
     })
 }
 
+/// Run a named asset action over a selection. Returns the run id.
+#[server]
+pub async fn trigger_action(
+    loc_ns: String,
+    loc_name: String,
+    action: String,
+    selection: Vec<String>,
+    partition_key: Option<SubmitPartitionKey>,
+) -> Result<String, ServerFnError> {
+    use rivers_api::rivers::RunActionRequest;
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let resp = client
+        .run_action(RunActionRequest {
+            action,
+            selection,
+            partition_key: partition_key.map(submit_to_proto),
+            tags: vec![],
+            user: current_user_ref().await,
+        })
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let r = resp.into_inner();
+    if !r.success {
+        return Err(ServerFnError::new(
+            r.error.unwrap_or_else(|| "action failed".to_string()),
+        ));
+    }
+    Ok(r.run_id)
+}
+
 /// Re-execute a run by id, server-side: replays it on its original partition,
 /// reusing tags + job/materialization shape, routed to the run's owning code
 /// location. Returns the new `run_id`.
@@ -273,6 +311,9 @@ pub async fn launch_backfill(
     partition_keys: Vec<SubmitPartitionKey>,
     tags: Option<Vec<(String, String)>>,
     job_name: Option<String>,
+    /// The verb the child runs execute; `None` materializes. A job target
+    /// carries its own verb, so this is for `selection` targets.
+    action: Option<String>,
 ) -> Result<BackfillRerunResult, ServerFnError> {
     use rivers_api::rivers::{LaunchBackfillRequest, Tag};
 
@@ -284,6 +325,7 @@ pub async fn launch_backfill(
 
     let resp = client
         .launch_backfill(LaunchBackfillRequest {
+            action,
             selection: selection.unwrap_or_default(),
             partition_keys: partition_keys.into_iter().map(submit_to_proto).collect(),
             partition_range: None,

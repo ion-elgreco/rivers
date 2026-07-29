@@ -13,8 +13,8 @@ use crate::helpers::{
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::now::use_now;
-use crate::server_fns::actions::{cancel_run, delete_run, rerun_run};
 use crate::server_fns::locations::list_code_locations;
+use crate::server_fns::mutations::{cancel_run, delete_run, rerun_run};
 use crate::server_fns::runs::{
     get_run, get_run_asset_events_page, get_run_logs, get_run_step_events,
     get_run_structured_events_page,
@@ -323,6 +323,11 @@ pub fn RunDetailPage() -> impl IntoView {
                                 }</div>
                                 <div class="run-trigger-meta">
                                     <StatusChip kind=status_kind.to_string()/>
+                                    {record.action.clone().map(|verb| view! {
+                                        <span class="run-trigger-meta-item" title="asset action">
+                                            "action "<span class="run-trigger-meta-value">{verb}</span>
+                                        </span>
+                                    })}
                                     <span class="run-trigger-meta-item" title=format_relative_time(record.start_time, chrono::Utc::now().timestamp())>{format_timestamp(Some(record.start_time))}</span>
                                     <span class="run-trigger-meta-sep">"·"</span>
                                     <span class="run-trigger-meta-item">"elapsed "<span class="run-trigger-meta-value">{elapsed_label}</span></span>
@@ -1065,6 +1070,8 @@ fn event_type_label(evt: &StoredEvent) -> &'static str {
         EventType::StepSlotWaiting => "SLOT_WAITING",
         EventType::StepSlotRenewed => "SLOT_RENEWED",
         EventType::StepSlotReleased => "SLOT_RELEASED",
+        EventType::ActionCompleted => "ACTION_COMPLETED",
+        EventType::Deletion => "DELETION",
     }
 }
 
@@ -1081,6 +1088,8 @@ fn event_row_class(evt: &StoredEvent) -> &'static str {
         EventType::StepSlotClaimed | EventType::StepSlotReleased => "log-row--info",
         EventType::StepSlotWaiting => "log-row--warn",
         EventType::StepSlotRenewed => "log-row--muted",
+        EventType::ActionCompleted => "log-row--success",
+        EventType::Deletion => "log-row--warn",
     }
 }
 
@@ -1150,6 +1159,20 @@ fn event_info(evt: &StoredEvent) -> String {
         }
         EventType::StepSlotRenewed => "Lease renewed".to_string(),
         EventType::StepSlotReleased => "Released pool slots".to_string(),
+        EventType::ActionCompleted => {
+            let action = metadata_value(evt, "action");
+            format!(
+                "Action completed{}",
+                action.map(|a| format!(" ({a})")).unwrap_or_default()
+            )
+        }
+        EventType::Deletion => {
+            let action = metadata_value(evt, "action");
+            format!(
+                "Materialization state cleared{}",
+                action.map(|a| format!(" ({a})")).unwrap_or_default()
+            )
+        }
     }
 }
 

@@ -944,6 +944,7 @@ mod tests {
             group: None,
             code_version: None,
             asset_type: "asset".to_string(),
+            actions: vec![],
         }
     }
 

@@ -20,9 +20,9 @@ use crate::helpers::{
     run_status_class, run_status_kind, short_id,
 };
 use crate::loc::{loc_path, use_current_location};
-use crate::server_fns::actions::execute_job;
 use crate::server_fns::assets::get_assets;
 use crate::server_fns::automation::get_jobs;
+use crate::server_fns::mutations::execute_job;
 use crate::server_fns::overview::get_assets_info;
 use crate::server_fns::runs::get_runs_page;
 use crate::types::{AssetDefinitionInfo, RunFilter};
