@@ -191,6 +191,10 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         executor::parallel::worker::_reconstruct_partition_context,
         m
     )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        assets::action::_reconstruct_asset_action,
+        m
+    )?)?;
     m.add_function(pyo3::wrap_pyfunction!(runtime::runtime_info, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(
         daemon::eval_schedule_in_subprocess,

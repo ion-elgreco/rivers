@@ -128,6 +128,16 @@ impl From<PyActionOrdering> for ActionOrdering {
     }
 }
 
+impl From<ActionOrdering> for PyActionOrdering {
+    fn from(o: ActionOrdering) -> Self {
+        match o {
+            ActionOrdering::Unordered => Self::Unordered,
+            ActionOrdering::Topological => Self::Topological,
+            ActionOrdering::ReverseTopological => Self::ReverseTopological,
+        }
+    }
+}
+
 /// A named operation on an asset. Reusable: the same instance may be attached
 /// to any number of assets (decorator `actions=[...]` or class attribute).
 #[pyclass(name = "AssetAction", module = "rivers._core")]
@@ -248,6 +258,85 @@ impl PyAssetAction {
             if self.exclusive { "True" } else { "False" }
         )
     }
+
+    /// A locally-defined class asset ships to a loky worker by value, taking
+    /// every class attribute with it — including an `AssetAction` bound the
+    /// `optimize = some_action` way rather than through `@rs.action`.
+    fn __reduce__(&self, py: Python) -> PyResult<(Py<PyAny>, ActionParts)> {
+        let ctor = py
+            .import("rivers._core")?
+            .getattr("_reconstruct_asset_action")?
+            .unbind();
+        let retry = self
+            .retry
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                AssetDefinitionError::new_err(format!(
+                    "action '{}': retry policy is not serializable: {e}",
+                    self.name
+                ))
+            })?;
+        Ok((
+            ctor,
+            (
+                self.name.clone(),
+                self.outcome,
+                self.exclusive,
+                self.ordering.into(),
+                retry,
+                self.description.clone(),
+                self.func.as_ref().map(|f| f.clone_ref(py)),
+                self.is_async,
+            ),
+        ))
+    }
+}
+
+/// `PyAssetAction`'s pickled state, in `_reconstruct_asset_action` order.
+type ActionParts = (
+    String,
+    ActionOutcome,
+    bool,
+    PyActionOrdering,
+    Option<String>,
+    Option<String>,
+    Option<Py<PyAny>>,
+    bool,
+);
+
+/// Rebuild an `AssetAction` from `__reduce__`'s parts. The constructor can't
+/// serve here: it re-runs validation and has no way to carry the bound body.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn _reconstruct_asset_action(
+    name: String,
+    outcome: ActionOutcome,
+    exclusive: bool,
+    ordering: PyActionOrdering,
+    retry: Option<String>,
+    description: Option<String>,
+    func: Option<Py<PyAny>>,
+    is_async: bool,
+) -> PyResult<PyAssetAction> {
+    let retry = retry
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|e| {
+            AssetDefinitionError::new_err(format!("action '{name}': unreadable retry policy: {e}"))
+        })?;
+    Ok(PyAssetAction {
+        name,
+        outcome,
+        exclusive,
+        ordering: ordering.into(),
+        retry,
+        description,
+        func,
+        is_async,
+    })
 }
 
 /// What an action actually did, reported at runtime. The declared outcome is

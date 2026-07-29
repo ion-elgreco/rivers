@@ -90,6 +90,20 @@ def test_loky_multi_class_asset_per_output_handlers(class_mod):
     assert repo.load_node("m_side") == 7
 
 
+def test_loky_multi_class_asset_output_override_beats_class_handler(class_mod):
+    """A per-output AssetDef handler wins over the class-level one.
+
+    Both outputs ship the same `Class.materialize` callable, so a ref built
+    from it reconstructs to the *class* handler — right for `mo_plain`, wrong
+    for `mo_special`, whose data would land in the class-level store.
+    """
+    m = class_mod
+    repo = rs.CodeRepository(assets=[m.MOverride, m.MSide], default_executor=MP)
+    repo.materialize()
+    assert repo.load_node("mo_special") == 1
+    assert repo.load_node("mo_plain") == 2
+
+
 def test_loky_local_class_assets_fall_back_to_pickle(tmp_path):
     """Classes defined inside a function (<locals> qualname) can't ship by
     reference; the whole chain falls back to cloudpickle by value."""

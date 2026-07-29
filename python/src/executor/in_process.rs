@@ -170,18 +170,33 @@ pub(crate) fn execute_step_with_capture(
     // it so the Error variant can carry it to `run_failure_hooks` — same value
     // the success path puts on `StepResult.config_instance`.
     let mut resolved_config: Option<Py<PyAny>> = None;
-    let result = ops::execute_step(
-        py,
-        step,
-        ctx.repo.node_map,
-        ctx.scope.partition_key,
-        ctx.repo.resources,
-        ctx.repo.config_overrides,
-        ctx.repo.io_handler_registry,
-        input_overrides,
-        ctx.repo.bridge.map(|b| &b.task_locals),
-        &mut resolved_config,
-    );
+    let result = if let Some(verb) = &ctx.scope.plan.action {
+        ops::execute_action_step(
+            py,
+            verb,
+            step,
+            ctx.repo.node_map,
+            ctx.scope.partition_key,
+            ctx.repo.resources,
+            ctx.repo.config_overrides,
+            ctx.repo.io_handler_registry,
+            ctx.scope.run_id,
+            ctx.repo.bridge.map(|b| &b.task_locals),
+        )
+    } else {
+        ops::execute_step(
+            py,
+            step,
+            ctx.repo.node_map,
+            ctx.scope.partition_key,
+            ctx.repo.resources,
+            ctx.repo.config_overrides,
+            ctx.repo.io_handler_registry,
+            input_overrides,
+            ctx.repo.bridge.map(|b| &b.task_locals),
+            &mut resolved_config,
+        )
+    };
 
     let captured_logs = capture.and_then(|cap| {
         cap.call_method0("finish").ok().and_then(|out| {

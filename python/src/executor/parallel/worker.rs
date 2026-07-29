@@ -97,25 +97,47 @@ impl PyIOHandlerRef {
     }
 }
 
-/// Follows node_io_handler → io_handler → None.
+/// node_io_handler → io_handler → None, the one probe order for both child
+/// reconstruction and the parent-side shippability check. Requires the found
+/// object to expose `load_input`: on a class-form asset the attribute lookup
+/// reaches the `Asset` base's getset descriptors, which are not handlers.
+pub(super) fn handler_attr(py: Python, obj: &Py<PyAny>) -> Option<Py<PyAny>> {
+    for attr in ["node_io_handler", "io_handler"] {
+        if let Ok(h) = obj.getattr(py, attr)
+            && !h.is_none(py)
+            && h.bind(py).hasattr("load_input").unwrap_or(false)
+        {
+            return Some(h);
+        }
+    }
+    None
+}
+
+/// Resolve `module.qualname` and find its handler, walking up one qualname
+/// segment if the leaf has none — a class-form asset's callable is
+/// `Class.method`, and the handler lives on the class.
+pub(super) fn resolve_handler_from_path(
+    py: Python,
+    module: &str,
+    qualname: &str,
+) -> Option<Py<PyAny>> {
+    let obj = resolve_module_attr(py, module, qualname).ok()?;
+    if let Some(h) = handler_attr(py, &obj) {
+        return Some(h);
+    }
+    let (parent, _) = qualname.rsplit_once('.')?;
+    let parent_obj = resolve_module_attr(py, module, parent).ok()?;
+    handler_attr(py, &parent_obj)
+}
+
+/// Follows node_io_handler → io_handler on the leaf, then its parent → None.
 #[pyfunction]
 pub fn _reconstruct_io_handler_ref(
     py: Python,
     module: String,
     qualname: String,
 ) -> PyResult<Py<PyAny>> {
-    let obj = resolve_module_attr(py, &module, &qualname)?;
-    if let Ok(nio) = obj.getattr(py, "node_io_handler")
-        && !nio.is_none(py)
-    {
-        return Ok(nio);
-    }
-    if let Ok(io) = obj.getattr(py, "io_handler")
-        && !io.is_none(py)
-    {
-        return Ok(io);
-    }
-    Ok(py.None())
+    Ok(resolve_handler_from_path(py, &module, &qualname).unwrap_or_else(|| py.None()))
 }
 
 /// Describes how to load an upstream input from an IO handler in the worker.

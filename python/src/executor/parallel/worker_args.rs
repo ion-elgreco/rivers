@@ -241,7 +241,7 @@ fn build_io_load_spec(
     let pickled_handler = match source {
         IOHandlerSource::Definition | IOHandlerSource::GraphOverride => {
             let upstream_func = upstream_node.callable(py)?;
-            make_io_handler_ref(py, &upstream_func).unwrap_or(handler)
+            make_io_handler_ref(py, &upstream_func, &handler).unwrap_or(handler)
         }
         IOHandlerSource::InputOverride | IOHandlerSource::Default => handler,
     };
@@ -289,12 +289,34 @@ fn build_io_load_spec(
 
 /// Extract (module, qualname) from a callable for pickle-safe ref construction.
 /// Returns Err for closures/local functions (qualname contains `<locals>`).
+///
+/// A bound classmethod's `__qualname__` names the class that *defined* the
+/// function, not the class it is bound to — an inherited verb on a class-form
+/// asset would re-import bound to the base. Resolve through `__self__` so the
+/// child rebinds to the subclass the parent actually invoked.
 pub(crate) fn extract_module_qualname(py: Python, func: &Py<PyAny>) -> PyResult<(String, String)> {
-    let module: String = func.getattr(py, "__module__")?.extract(py)?;
-    let qualname: String = func.getattr(py, "__qualname__")?.extract(py)?;
+    let (module, qualname) = match func.getattr(py, "__self__") {
+        Ok(owner) if owner.bind(py).is_instance_of::<pyo3::types::PyType>() => {
+            let module: String = owner.getattr(py, "__module__")?.extract(py)?;
+            let owner_qualname: String = owner.getattr(py, "__qualname__")?.extract(py)?;
+            let name: String = func.getattr(py, "__name__")?.extract(py)?;
+            (module, format!("{owner_qualname}.{name}"))
+        }
+        _ => (
+            func.getattr(py, "__module__")?.extract(py)?,
+            func.getattr(py, "__qualname__")?.extract(py)?,
+        ),
+    };
     if qualname.contains("<") {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "qualname contains <locals>",
+        ));
+    }
+    // A spawned worker's __main__ is the loky bootstrap, not the user's
+    // script — such a ref can never resolve; fall back to pickling by value.
+    if module == "__main__" {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "__main__ is not importable in workers",
         ));
     }
     Ok((module, qualname))
@@ -308,10 +330,27 @@ pub(crate) fn make_func_ref(py: Python, func: &Py<PyAny>) -> PyResult<Py<PyAny>>
 }
 
 /// Wrap an IO handler in an `IOHandlerRef` for pickle-safe transport.
-/// Falls back to raw handler for closures/local functions.
-pub(super) fn make_io_handler_ref(py: Python, func: &Py<PyAny>) -> PyResult<Py<PyAny>> {
+/// Falls back to raw handler for closures/local functions, and whenever the
+/// path would not reconstruct to `expected` (probed parent-side; the module is
+/// already imported here, so the probe is cheap). Identity matters because one
+/// callable can back several handlers: every output of a class-form multi-asset
+/// ships the same `Class.materialize`, and the child's walk up to the class
+/// answers with the class-level handler for all of them, which would silently
+/// discard a per-output `AssetDef(io_handler=...)`.
+pub(super) fn make_io_handler_ref(
+    py: Python,
+    func: &Py<PyAny>,
+    expected: &Py<PyAny>,
+) -> PyResult<Py<PyAny>> {
     let (module, qualname) = extract_module_qualname(py, func)?;
-    Ok(Py::new(py, super::worker::PyIOHandlerRef::new(module, qualname))?.into_any())
+    match super::worker::resolve_handler_from_path(py, &module, &qualname) {
+        Some(found) if found.bind(py).is(expected.bind(py)) => {
+            Ok(Py::new(py, super::worker::PyIOHandlerRef::new(module, qualname))?.into_any())
+        }
+        _ => Err(pyo3::exceptions::PyValueError::new_err(
+            "module path does not reach this node's io_handler; ship raw handler",
+        )),
+    }
 }
 
 /// Resolve a node's *output* IO handler for pickle-safe transport to a loky
@@ -347,10 +386,12 @@ pub(super) fn resolve_io_handler_ref(
                 .and_then(|name| node_map.get(name))
                 .and_then(|gn| gn.callable(py).ok());
             parent_func
-                .and_then(|gf| make_io_handler_ref(py, &gf).ok())
+                .and_then(|gf| make_io_handler_ref(py, &gf, &handler).ok())
                 .unwrap_or(handler)
         }
-        IOHandlerSource::Definition => make_io_handler_ref(py, task_func).unwrap_or(handler),
+        IOHandlerSource::Definition => {
+            make_io_handler_ref(py, task_func, &handler).unwrap_or(handler)
+        }
         IOHandlerSource::Default | IOHandlerSource::InputOverride => handler,
     }
 }

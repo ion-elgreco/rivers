@@ -4,13 +4,13 @@
 //! the asset's identity, its IO handler as a config bag, and the per-asset
 //! metadata that IO resolution honors.
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyTuple, PyType};
 
-use crate::errors::PartitionValidationError;
-use crate::partitions::PartitionContext;
+use crate::errors::{ExecutionError, PartitionValidationError};
+use crate::partitions::{PartitionContext, PyPartitionKey};
 
 /// Context injected into action functions as their only parameter.
 #[pyclass(name = "ActionContext", frozen, module = "rivers._core")]
@@ -37,6 +37,7 @@ pub struct PyActionContext {
     #[pyo3(get)]
     pub config: Option<Py<PyAny>>,
     _logger: OnceLock<Py<PyAny>>,
+    _failed_partitions: Mutex<HashMap<PyPartitionKey, String>>,
 }
 
 impl PyActionContext {
@@ -59,7 +60,12 @@ impl PyActionContext {
             io_handler,
             config,
             _logger: OnceLock::new(),
+            _failed_partitions: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn drain_failed_partitions(&self) -> HashMap<PyPartitionKey, String> {
+        std::mem::take(&mut *self._failed_partitions.lock().unwrap())
     }
 }
 
@@ -96,6 +102,29 @@ impl PyActionContext {
                 "No partition key available — action run is not partitioned",
             )),
         }
+    }
+
+    /// Mark one key of a batched action run as failed. Unmarked keys count as
+    /// succeeded, so a `compact` over a range can skip a corrupt partition
+    /// without failing (or silently completing) the whole batch. Mirrors
+    /// `AssetExecutionContext.mark_partition_failed`.
+    fn mark_partition_failed(&self, partition_key: PyPartitionKey, error: String) -> PyResult<()> {
+        let valid = self
+            .partition
+            .as_ref()
+            .map(|p| p.keys.contains(&partition_key))
+            .unwrap_or(false);
+        if !valid {
+            return Err(ExecutionError::new_err(format!(
+                "partition key {} is not in this context's partition keys",
+                partition_key.__repr__()
+            )));
+        }
+        self._failed_partitions
+            .lock()
+            .unwrap()
+            .insert(partition_key, error);
+        Ok(())
     }
 
     /// The `(start, end)` datetime tuple for time-window partitions, or None.

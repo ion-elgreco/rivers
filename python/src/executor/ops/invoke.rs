@@ -42,6 +42,11 @@ pub(crate) fn is_task_context_annotation(py: Python, annotation: &Bound<PyAny>) 
     annotation_is(annotation, PyTaskExecutionContext::type_object(py).as_any())
 }
 
+pub(crate) fn is_action_context_annotation(py: Python, annotation: &Bound<PyAny>) -> bool {
+    let action_ctx = crate::context::action::PyActionContext::type_object(py);
+    annotation_is(annotation, action_ctx.as_any())
+}
+
 pub(crate) fn get_annotations<'py>(
     py: Python<'py>,
     func: &Py<PyAny>,
@@ -626,6 +631,222 @@ pub(crate) fn execute_step(
             step.name
         )))
     }
+}
+
+/// Execute one action step: bind an `ActionContext` — no dependency
+/// inputs, upstream is never executed for actions — and call the action's
+/// function. Everything around the call (capture, retry ladder, events) is
+/// the same lifecycle materialize steps use.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_action_step(
+    py: Python,
+    verb: &str,
+    step: &ExecutionStep,
+    node_map: &HashMap<String, ResolvedNode>,
+    partition_key: &Option<PyPartitionKey>,
+    resources: &HashMap<String, ResourceVariant>,
+    config_overrides: &Option<HashMap<String, Py<PyAny>>>,
+    registry: &IOHandlerRegistry,
+    run_id: &str,
+    task_locals: Option<&pyo3_async_runtimes::TaskLocals>,
+) -> PyResult<StepResult> {
+    let node = node_map.get(&step.name).ok_or_else(|| {
+        ExecutionError::new_err(format!("Node '{}' not found in execution plan", step.name))
+    })?;
+    let action = node.find_action(py, verb).ok_or_else(|| {
+        ExecutionError::new_err(format!(
+            "Asset '{}' does not define action '{}'",
+            step.name, verb
+        ))
+    })?;
+    let func = action.func.ok_or_else(|| {
+        ExecutionError::new_err(format!(
+            "Action '{}' on asset '{}' has no function",
+            verb, step.name
+        ))
+    })?;
+
+    let handler = registry.for_output(py, node);
+    let handler = (!handler.is_none(py)).then_some(handler);
+
+    let overrides_dict = config_overrides
+        .as_ref()
+        .and_then(|m| m.get(&step.name))
+        .map(|obj| obj.bind(py).cast::<PyDict>())
+        .transpose()?;
+
+    let is_observe = action.outcome == crate::assets::action::ActionOutcome::Observe;
+
+    // The built-in observe keeps its historical call convention: no-arg, or
+    // one `AssetExecutionContext` parameter (with the config generic). User
+    // actions receive an `ActionContext`.
+    let mut observe_ctx: Option<Py<PyAny>> = None;
+    let mut action_ctx: Option<Py<PyAny>> = None;
+    let call_result = (|| -> PyResult<Py<PyAny>> {
+        let (target, call_args): (&Py<PyAny>, Vec<Py<PyAny>>) = if is_observe {
+            let annotations = get_annotations(py, &func)?;
+            let has_context_param = annotations.iter().any(|(k, v)| {
+                k.extract::<String>().ok().as_deref() != Some("return")
+                    && is_context_annotation(py, &v)
+            });
+            if has_context_param {
+                let config_instance = annotations
+                    .iter()
+                    .find(|(k, _)| k.extract::<String>().ok().as_deref() != Some("return"))
+                    .map(|(_, v)| extract_config_from_annotation(py, &v, overrides_dict))
+                    .transpose()?
+                    .flatten();
+                // A keyed observe records its data version against that
+                // partition, so the body has to be able to read the key.
+                let ctx = PyAssetExecutionContext::new(
+                    step.name.clone(),
+                    node.tags(),
+                    node.kinds(),
+                    node.group(),
+                    None,
+                    node.metadata(),
+                    super::build_partition_context(node, partition_key)?,
+                    false,
+                    vec![],
+                )
+                .with_config(config_instance);
+                let ctx_py = Py::new(py, ctx)?.into_any();
+                observe_ctx = Some(ctx_py.clone_ref(py));
+                (&func, vec![ctx_py])
+            } else {
+                (&func, Vec::new())
+            }
+        } else {
+            let partition = super::build_partition_context(node, partition_key)?;
+            let config_instance = get_annotations(py, &func)?
+                .iter()
+                .find(|(k, v)| {
+                    k.extract::<String>().ok().as_deref() != Some("return")
+                        && is_action_context_annotation(py, v)
+                })
+                .map(|(_, v)| extract_config_from_annotation(py, &v, overrides_dict))
+                .transpose()?
+                .flatten();
+            let ctx = crate::context::action::PyActionContext::new(
+                step.name.clone(),
+                verb.to_string(),
+                run_id.to_string(),
+                node.metadata(),
+                partition,
+                handler,
+                config_instance,
+            );
+            // First parameter is the context; the rest are resources injected
+            // by name — the same rule materialize functions use.
+            let params = enumerate_params(py, &func)?;
+            let mut args: Vec<Py<PyAny>> = Vec::new();
+            if let Some((first_name, _)) = params.first()
+                && resources.contains_key(first_name)
+            {
+                return Err(ConfigurationError::new_err(format!(
+                    "Action '{}' on asset '{}': the first parameter is always the \
+                     ActionContext, but '{}' names a resource — move it after the \
+                     context",
+                    verb, step.name, first_name
+                )));
+            }
+            if !params.is_empty() {
+                let ctx_py = Py::new(py, ctx)?.into_any();
+                action_ctx = Some(ctx_py.clone_ref(py));
+                args.push(ctx_py);
+                for (param_name, annotation) in params.iter().skip(1) {
+                    if annotation
+                        .as_ref()
+                        .is_some_and(|a| is_action_context_annotation(py, a))
+                    {
+                        return Err(ExecutionError::new_err(format!(
+                            "Context must be the first parameter of action '{}' on asset '{}'",
+                            verb, step.name
+                        )));
+                    }
+                    if let Some(resource) = resources.get(param_name) {
+                        if overrides_dict.is_some() {
+                            args.push(resource.instantiate_config(py, overrides_dict)?);
+                        } else {
+                            args.push(resource.inner().clone_ref(py));
+                        }
+                    } else {
+                        return Err(ConfigurationError::new_err(format!(
+                            "Action '{}' on asset '{}': parameter '{}' does not \
+                             match any resource",
+                            verb, step.name, param_name
+                        )));
+                    }
+                }
+            }
+            (&func, args)
+        };
+
+        let raw = if call_args.is_empty() {
+            target.call0(py)?
+        } else {
+            target.call1(py, PyTuple::new(py, &call_args)?)?
+        };
+        if action.is_async {
+            let locals = task_locals.ok_or_else(|| {
+                ExecutionError::new_err(format!(
+                    "Async action '{}' requires TaskLocals — this is an internal error",
+                    verb
+                ))
+            })?;
+            let future = pyo3_async_runtimes::into_future_with_locals(locals, raw.into_bound(py))?;
+            py.detach(|| crate::runtime::rt().block_on(future))
+        } else {
+            Ok(raw)
+        }
+    })();
+
+    // The built-in observe returns an Observation — merge its metadata with
+    // anything set on the context, result-type data version winning, exactly
+    // like the retired `repo.observe` loop did.
+    let mut result = call_result?;
+    let mut output_metadata = Vec::new();
+    let mut data_version = None;
+    if is_observe {
+        if let Some(ctx) = &observe_ctx
+            && let Ok(bound) = ctx.bind(py).cast::<PyAssetExecutionContext>()
+        {
+            let ctx_ref = bound.borrow();
+            output_metadata = ctx_ref.drain_output_metadata();
+            data_version = ctx_ref.drain_data_version();
+        }
+        if let Some(ext) = crate::result_types::try_extract_result_type(py, &result)? {
+            super::merge_metadata(&mut output_metadata, &ext.metadata);
+            data_version = ext.data_version.or(data_version);
+            result = ext.value.unwrap_or_else(|| py.None());
+        }
+    }
+
+    // An observe body marks keys on its `AssetExecutionContext`; a user action
+    // marks them on its `ActionContext`. Exactly one of the two exists per call.
+    let mut failed_partitions: Vec<(crate::partitions::PyPartitionKey, String)> = action_ctx
+        .as_ref()
+        .and_then(|c| {
+            c.bind(py)
+                .cast::<crate::context::action::PyActionContext>()
+                .ok()
+                .map(|b| b.get().drain_failed_partitions().into_iter().collect())
+        })
+        .unwrap_or_default();
+    failed_partitions.extend(drain_failed_partitions(py, observe_ctx.as_ref()));
+
+    Ok(StepResult {
+        result,
+        return_hint: None,
+        output_metadata,
+        data_version,
+        config_instance: None,
+        tags: None,
+        dynamic_keys: None,
+        result_kind: ResultKind::Output,
+        generator: None,
+        failed_partitions,
+    })
 }
 
 pub(crate) fn drain_failed_partitions(

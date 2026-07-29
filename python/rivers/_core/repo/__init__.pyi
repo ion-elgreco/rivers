@@ -11,7 +11,13 @@ from rivers._core import (
     RunQueueConfig,
     Task,
 )
-from rivers._core.assets import ExternalAsset, GraphAsset, MultiAsset, SingleAsset
+from rivers._core.assets import (
+    Asset,
+    ExternalAsset,
+    GraphAsset,
+    MultiAsset,
+    SingleAsset,
+)
 from rivers._core.executor import Executor
 from rivers._core.partitions import (
     BackfillStrategy,
@@ -106,6 +112,8 @@ class BackfillStatus:
     """Tags attached to every run launched by the backfill."""
     launched_by: LaunchedBy
     """Origin of this backfill (manual with optional acting user, sensor, …)."""
+    action: str | None
+    """The verb child runs execute. ``None`` means materialize."""
 
 class CodeRepository:
     """Top-level container — declares the assets, tasks, jobs, and automations
@@ -138,7 +146,9 @@ class CodeRepository:
 
     def __init__(
         self,
-        assets: Sequence[Union[SingleAsset, MultiAsset, GraphAsset, ExternalAsset]],
+        assets: Sequence[
+            Union[SingleAsset, MultiAsset, GraphAsset, ExternalAsset, type[Asset]]
+        ],
         tasks: Sequence[Union[Task, BashTask]] | None = None,
         jobs: Sequence[Job] | None = None,
         schedules: Sequence[Schedule] | None = None,
@@ -155,7 +165,10 @@ class CodeRepository:
         """Declare the contents of a code location.
 
         Args:
-            assets: All assets exposed by this repository.
+            assets: All assets exposed by this repository — decorator-form
+                instances and/or class-form subclasses of :class:`Asset`,
+                :class:`MultiAsset`, :class:`GraphAsset`, :class:`ExternalAsset`
+                (classes desugar here, at registration).
             tasks: Standalone tasks that aren't asset producers.
             jobs: Custom jobs (a Job is a named selection over assets/tasks).
             schedules: Schedules attached to the repository.
@@ -289,6 +302,7 @@ class CodeRepository:
         config: dict[str, dict[str, Any]] | None = None,
         block: bool = True,
         dry_run: bool = False,
+        action: str | None = None,
     ) -> BackfillResult:
         """Backfill partitions for the selected assets.
 
@@ -303,6 +317,8 @@ class CodeRepository:
             config: Per-asset config, keyed by asset name.
             block: Wait for the backfill to finish before returning.
             dry_run: Plan only — return the would-be run shape without launching.
+            action: Verb child runs execute; ``None`` means materialize.
+                Every selected asset must define the action.
         """
         ...
 
@@ -366,11 +382,47 @@ class CodeRepository:
         """
         ...
 
-    def observe(self, asset_names: list[str] | None = None) -> dict[str, Any]:
-        """Run the observe function of external assets and return the resulting metadata.
+    def observe(self, asset_names: list[str] | None = None) -> RunResult:
+        """Observe external assets through the run spine.
+
+        ``observe`` is the built-in action on external assets, so this is
+        ``run_action("observe")`` over the observable externals — observation
+        metadata lands on the run's ``Observation`` events. With no observable
+        externals this is a successful no-op (empty ``run_id``).
 
         Args:
             asset_names: Restrict to these external assets (``None`` = all observable).
+        """
+        ...
+
+    def run_action(
+        self,
+        action: str,
+        selection: list[str] | None = None,
+        partition_key: PartitionKey | None = None,
+        tags: list[tuple[str, str]] | None = None,
+        raise_on_error: bool = True,
+        config: dict[str, dict[str, Any]] | None = None,
+        run_id_override: str | None = None,
+        resume: bool = False,
+    ) -> RunResult:
+        """Run a named asset action over a selection.
+
+        The plan has one step per target — upstream is never pulled in and the
+        producing function never runs. The run record carries the verb, and
+        each step emits ``ActionCompleted`` instead of ``Materialization``.
+
+        Args:
+            action: The verb to run; every targeted asset must define it.
+            selection: Asset names (``None`` = every asset defining the action).
+            partition_key: Partition to act on, like ``materialize``.
+            tags: Run tags.
+            raise_on_error: Raise the first failure instead of reporting it.
+            config: Per-asset config, keyed by asset name.
+            run_id_override: Re-execute an existing run record under its
+                original id (K8s run pods); a fresh id is minted otherwise.
+            resume: Skip steps this run already completed, so a crashed action
+                run does not re-apply their side effects.
         """
         ...
 

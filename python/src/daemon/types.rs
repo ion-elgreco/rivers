@@ -68,6 +68,9 @@ pub(crate) struct MaterializationRequestData {
     pub(crate) partition_key: Option<rivers_core::storage::PartitionKey>,
     pub(crate) tags: Vec<(String, String)>,
     pub(crate) launched_by: rivers_core::storage::LaunchedBy,
+    /// The verb the run executes; `None` means materialize. Reruns of action
+    /// runs carry the original verb.
+    pub(crate) action: Option<String>,
 }
 
 /// A run re-execution from a stored `RunRecord`: `Job` → `dispatch_jobs`,
@@ -104,6 +107,8 @@ pub(crate) struct BackfillRequestData {
     pub(crate) backfill_id: Option<String>,
     /// Provenance stamped on the `BackfillRecord`.
     pub(crate) launched_by: rivers_core::storage::LaunchedBy,
+    /// The verb child runs execute. `None` means materialize.
+    pub(crate) action: Option<String>,
 }
 
 pub(crate) enum TickOutcome {

@@ -409,19 +409,36 @@ class Compute:
 class Job:
     """A named bundle of assets/tasks executed together as one run."""
 
+    @property
+    def name(self) -> str:
+        """The job's registered name."""
+        ...
+
+    @property
+    def action(self) -> str | None:
+        """The verb this job's runs execute; ``None`` means materialize."""
+        ...
+
     def __init__(
         self,
         name: str,
-        assets: Sequence[Union[SingleAsset, MultiAsset, GraphAsset, Task, BashTask]],
+        assets: Sequence[
+            Union[SingleAsset, MultiAsset, GraphAsset, Task, BashTask, type[Asset]]
+        ],
         executor: "Executor | None" = None,
         allow_incomplete_deps: bool = False,
         retry: "RetryPolicy | str | None" = None,
+        action: str | None = None,
     ) -> None:
         """Construct a job.
 
         Args:
             name: Unique job name within the repository.
-            assets: Assets and tasks the job will materialize.
+            assets: Assets and tasks the job will materialize (or run the
+                action against, when ``action`` is set).
+            action: Asset action this job runs instead of materialize
+                — schedules the verb through the existing
+                Schedule machinery. Every targeted asset must define it.
             executor: Override the repository default executor for this job.
             allow_incomplete_deps: Tolerate missing upstream deps (debug / partial
                 graphs); production jobs should leave this ``False``.

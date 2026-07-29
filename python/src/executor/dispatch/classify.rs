@@ -45,8 +45,9 @@ pub(crate) fn classify_step(
         // pure composition (no code runs for them), so the dep-fail path is
         // their only failure surface — without this, hooks defined via
         // `Asset.from_graph(hooks=[…])` would never fire on internal-task
-        // failures.
-        if let Some(node) = ctx.repo.node_map.get(&step.name)
+        // failures. Action runs don't fire hooks at all, so they skip this too.
+        if ctx.scope.plan.is_materialize()
+            && let Some(node) = ctx.repo.node_map.get(&step.name)
             && node.is_graph_asset()
             && node.has_failure_hooks()
         {
@@ -90,8 +91,10 @@ pub(crate) fn classify_step(
         .get(&step.name)
         .expect("step must be in node_map — invalid plan");
 
-    // Graph assets are composition-only
-    if node.is_graph_asset() {
+    // Graph assets are composition-only in materialize plans. An action plan
+    // targets the graph's persisted output like any other step — fall through
+    // to Execute.
+    if node.is_graph_asset() && ctx.scope.plan.is_materialize() {
         if !ctx.state.was_failed(&step.name) {
             ctx.emit_materialization(
                 &step.name,

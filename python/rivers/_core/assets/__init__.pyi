@@ -597,6 +597,13 @@ class ActionContext(Generic[ConfigT]):
     ) -> tuple[datetime.datetime, datetime.datetime] | None: ...
     @property
     def log(self) -> logging.Logger: ...
+    def mark_partition_failed(self, partition_key: PartitionKey, error: str) -> None:
+        """Record one key of a batched run as failed; unmarked keys succeeded.
+
+        Lets an action over a partition range skip a bad key instead of being
+        all-or-nothing. Raises if the key is not in ``partition.keys``.
+        """
+        ...
 
 class ActionResult:
     """What an action actually did, reported at runtime.

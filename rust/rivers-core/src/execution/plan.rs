@@ -367,27 +367,69 @@ impl ExecutionPlan {
     }
 
     /// Group steps into levels for parallel execution; level-N steps depend only on 0..N-1.
+    ///
+    /// Each step's level is resolved by descending into its dependencies first,
+    /// so the result does not depend on the order `steps` happens to be in.
+    /// `from_graph`/`from_subgraph` emit topologically; `for_action` emits in
+    /// target order, which the caller derives from a HashMap.
     pub fn group_steps_by_level(&self) -> Vec<Vec<usize>> {
-        let mut levels: Vec<Vec<usize>> = Vec::new();
-        let mut step_levels: HashMap<String, usize> = HashMap::new();
-
+        // Multi-asset outputs resolve to their owning step.
+        let mut by_name: HashMap<&str, usize> = HashMap::new();
         for (idx, step) in self.steps.iter().enumerate() {
-            let level = if step.plan_dependencies.is_empty() {
-                0
-            } else {
-                step.plan_dependencies
-                    .iter()
-                    .map(|dep| step_levels.get(dep).copied().unwrap_or(0) + 1)
-                    .max()
-                    .unwrap_or(0)
-            };
-
-            step_levels.insert(step.name.clone(), level);
-            // Register all outputs at the same level so downstream deps resolve.
+            by_name.insert(step.name.as_str(), idx);
             for output in &step.outputs {
-                step_levels.insert(output.clone(), level);
+                by_name.insert(output.as_str(), idx);
             }
+        }
 
+        // Post-order DFS. A dep that is unknown, self-referential, or a
+        // back-edge counts as level 0, which bounds a malformed plan to
+        // finite work rather than a hang.
+        let mut level_of: Vec<Option<usize>> = vec![None; self.steps.len()];
+        let mut on_stack = vec![false; self.steps.len()];
+        for root in 0..self.steps.len() {
+            if level_of[root].is_some() {
+                continue;
+            }
+            let mut stack = vec![(root, false)];
+            while let Some((idx, settle)) = stack.pop() {
+                if settle {
+                    level_of[idx] = Some(
+                        self.steps[idx]
+                            .plan_dependencies
+                            .iter()
+                            .map(|dep| {
+                                by_name
+                                    .get(dep.as_str())
+                                    .and_then(|&d| level_of[d])
+                                    .unwrap_or(0)
+                                    + 1
+                            })
+                            .max()
+                            .unwrap_or(0),
+                    );
+                    on_stack[idx] = false;
+                    continue;
+                }
+                if level_of[idx].is_some() || on_stack[idx] {
+                    continue;
+                }
+                on_stack[idx] = true;
+                stack.push((idx, true));
+                for dep in &self.steps[idx].plan_dependencies {
+                    if let Some(&d) = by_name.get(dep.as_str())
+                        && level_of[d].is_none()
+                        && !on_stack[d]
+                    {
+                        stack.push((d, false));
+                    }
+                }
+            }
+        }
+
+        let mut levels: Vec<Vec<usize>> = Vec::new();
+        for (idx, level) in level_of.iter().enumerate() {
+            let level = level.unwrap_or(0);
             while levels.len() <= level {
                 levels.push(Vec::new());
             }
@@ -817,6 +859,58 @@ mod tests {
         assert_eq!(c.plan_dependencies, vec!["a".to_string()]);
         let a = plan.steps.iter().find(|s| s.name == "a").unwrap();
         assert!(a.plan_dependencies.is_empty());
+    }
+
+    /// Levels must not depend on the order targets arrive in — the caller
+    /// derives the target list from a HashMap, so every permutation is
+    /// reachable, and a level that puts `a` alongside its downstream `b` is
+    /// exactly the concurrent teardown `ReverseTopological` exists to prevent.
+    #[test]
+    fn test_for_action_levels_independent_of_target_order() {
+        let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"]), ("c", vec!["b"])]);
+
+        let level_names = |plan: &ExecutionPlan| -> Vec<Vec<String>> {
+            plan.group_steps_by_level()
+                .into_iter()
+                .map(|level| {
+                    let mut names: Vec<String> =
+                        level.iter().map(|&i| plan.steps[i].name.clone()).collect();
+                    names.sort();
+                    names
+                })
+                .collect()
+        };
+
+        for perm in [
+            ["a", "b", "c"],
+            ["a", "c", "b"],
+            ["b", "a", "c"],
+            ["b", "c", "a"],
+            ["c", "a", "b"],
+            ["c", "b", "a"],
+        ] {
+            let targets: Vec<String> = perm.iter().map(|s| s.to_string()).collect();
+
+            let plan = ExecutionPlan::for_action(
+                &graph,
+                "purge",
+                &targets,
+                ActionOrdering::ReverseTopological,
+            );
+            assert_eq!(
+                level_names(&plan),
+                vec![vec!["c"], vec!["b"], vec!["a"]],
+                "reverse-topological levels for targets {perm:?}"
+            );
+
+            let plan =
+                ExecutionPlan::for_action(&graph, "compact", &targets, ActionOrdering::Topological);
+            assert_eq!(
+                level_names(&plan),
+                vec![vec!["a"], vec!["b"], vec!["c"]],
+                "topological levels for targets {perm:?}"
+            );
+        }
     }
 
     #[test]

@@ -17,6 +17,10 @@ _store_dir = os.environ.get("RIVERS_TEST_CLASS_STORE")
 
 if _store_dir:
     handler = rs.PickleIOHandler(store=obstore.store.LocalStore(_store_dir, mkdir=True))
+    # Second store, so "which handler wrote it" is answerable by directory.
+    special_handler = rs.PickleIOHandler(
+        store=obstore.store.LocalStore(_store_dir + "-special", mkdir=True)
+    )
 
     # 2-wide levels so the batch escapes the single-instance InProcess
     # shortcut and actually crosses the loky transport.
@@ -102,6 +106,17 @@ if _store_dir:
         @classmethod
         def materialize(cls) -> int:
             return 7
+
+    # Class-level handler *and* a per-output override: the class-level probe
+    # resolves, so the ref must still be rejected for the overriding output.
+    class MOverride(rs.MultiAsset):
+        io_handler = handler
+        mo_special = rs.AssetDef(io_handler=special_handler)
+        mo_plain = rs.AssetDef()
+
+        @classmethod
+        def materialize(cls):
+            return {"mo_special": 1, "mo_plain": 2}
 
     # PID probes: prove the topology really crossed into a worker process.
     class PidLeft(rs.Asset):

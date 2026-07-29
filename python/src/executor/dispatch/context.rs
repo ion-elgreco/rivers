@@ -91,6 +91,7 @@ pub(crate) struct Repo<'a> {
     pub graph_nodes: &'a GraphNodeMap,
     pub io_handler_registry: &'a IOHandlerRegistry,
     pub resources: &'a HashMap<String, ResourceVariant>,
+    pub retries: &'a HashMap<String, rivers_core::execution::retry::RetryPolicy>,
     pub config_overrides: &'a Option<HashMap<String, Py<PyAny>>>,
     pub bridge: Option<&'a AsyncBridge>,
 }
@@ -111,13 +112,65 @@ pub(crate) struct BatchContext<'a> {
     pub repo: Repo<'a>,
 }
 
+/// The implicit one-slot pool an exclusive action shares with materialize.
+pub(crate) fn implicit_asset_pool(asset_key: &str) -> String {
+    format!("__asset__:{asset_key}")
+}
+
 impl<'a> BatchContext<'a> {
-    pub(crate) fn step_pools(&self, step_name: &str) -> Vec<(String, u32)> {
-        self.repo
+    pub(crate) fn step_pools(
+        &self,
+        step: &rivers_core::execution::plan::ExecutionStep,
+    ) -> Vec<(String, u32)> {
+        let mut pools = self
+            .repo
             .node_map
-            .get(step_name)
+            .get(&step.name)
             .map(|n| n.pool())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Exclusive actions: an exclusive action step joins its asset's
+        // implicit one-slot pool; a materialize step joins it for every
+        // output that declares one (a multi materializes all outputs in one
+        // step, so it claims each output's pool). Assets without exclusive
+        // actions never touch this.
+        Python::attach(|py| match self.scope.plan.verb() {
+            Some(verb) => {
+                let exclusive = self
+                    .repo
+                    .node_map
+                    .get(&step.name)
+                    .and_then(|n| n.find_action(py, verb))
+                    .map(|a| a.exclusive)
+                    .unwrap_or(false);
+                if exclusive {
+                    pools.push((implicit_asset_pool(&step.name), 1));
+                }
+            }
+            None => {
+                let has_exclusive = |name: &str| {
+                    self.repo
+                        .node_map
+                        .get(name)
+                        .map(|n| n.has_exclusive_action(py))
+                        .unwrap_or(false)
+                };
+                for name in step.event_names() {
+                    if has_exclusive(name) {
+                        pools.push((implicit_asset_pool(name), 1));
+                    }
+                }
+                // A graph asset's own step is composition-only and never
+                // executes — its inner tasks do the writing, so they carry
+                // the claim. Inner tasks of one such graph therefore also
+                // serialize against each other.
+                if let Some((parent, _)) = step.name.split_once('/')
+                    && has_exclusive(parent)
+                {
+                    pools.push((implicit_asset_pool(parent), 1));
+                }
+            }
+        });
+        pools
     }
 
     pub(crate) fn event_sender(&self) -> mpsc::UnboundedSender<WriterMsg> {
@@ -170,12 +223,31 @@ impl<'a> BatchContext<'a> {
     /// Effective retry policy for a plan step (`None` = fail fast). Multi-asset
     /// steps aren't node keys themselves — their outputs are; per-output
     /// policies are validated uniform at resolve, so any output's works.
+    ///
+    /// Action runs never inherit the asset's materialize policy — an action
+    /// declares its own retry, defaulting to none.
     pub(crate) fn retry_policy_for(
         &self,
         step: &rivers_core::execution::plan::ExecutionStep,
-    ) -> Option<&rivers_core::execution::retry::RetryPolicy> {
+    ) -> Option<rivers_core::execution::retry::RetryPolicy> {
+        if let Some(verb) = self.scope.plan.action.as_deref() {
+            return Python::attach(|py| {
+                self.repo
+                    .node_map
+                    .get(&step.name)
+                    .and_then(|n| n.find_action(py, verb))
+                    .and_then(|a| a.retry)
+                    .and_then(|r| match r {
+                        rivers_core::execution::retry::RetryRef::Inline(p) => Some(p),
+                        rivers_core::execution::retry::RetryRef::Named(key) => {
+                            self.repo.retries.get(&key).cloned()
+                        }
+                    })
+            });
+        }
         self.retry_policy(&step.name)
             .or_else(|| step.outputs.iter().find_map(|n| self.retry_policy(n)))
+            .cloned()
     }
 
     /// Retry policy of one resolved node (asset-level). Inside a K8s step pod
@@ -212,6 +284,14 @@ impl<'a> BatchContext<'a> {
     /// them all with one StepFailure carrying the whole key (a `Set` for a batched
     /// run); `get_failed_partitions` expands it. The None-keyed step-level failure
     /// (emitted separately) still drives run/step status.
+    ///
+    /// Action runs are skipped because the run record already says every member
+    /// failed — backfill accounting reads `RunStatus::Failure` directly and never
+    /// consults events for it, so the keyed event would be pure noise. Contrast
+    /// `surviving_members`, which *does* emit keyed failures on action runs: a
+    /// per-key `mark_partition_failed` inside an otherwise-successful run has no
+    /// other record. Neither one floors a materialization — `get_failed_partitions`
+    /// filters action runs out on the read side.
     pub(crate) fn emit_partition_failures(&self, step_name: &str, error: &str, ts: i64) {
         if let Some(pk) = self.scope.partition_key {
             ops::emit_partition_failure(
@@ -279,7 +359,101 @@ impl<'a> BatchContext<'a> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Members of a batched key the step actually completed, with the keys the
+    /// user marked failed peeled off into their own `StepFailure`. Unmarked
+    /// keys succeeded, so only they get the step's success event.
+    fn surviving_members(
+        &self,
+        step_name: &str,
+        pk: &PyPartitionKey,
+        ts: i64,
+    ) -> Vec<PyPartitionKey> {
+        let failed: HashMap<&PyPartitionKey, &str> = self
+            .state
+            .failed_partitions
+            .get(step_name)
+            .map(|f| f.iter().map(|(k, e)| (k, e.as_str())).collect())
+            .unwrap_or_default();
+        pk.members()
+            .into_iter()
+            .filter(|member| match failed.get(member) {
+                Some(&error) => {
+                    ops::emit_partition_failure(
+                        self.sink.writer,
+                        self.scope.run_id,
+                        step_name,
+                        member,
+                        error,
+                        ts,
+                    );
+                    false
+                }
+                None => true,
+            })
+            .collect()
+    }
+
+    /// Emit `Deletion` for one step (per member key when partitioned) — the
+    /// storage layer clears the matching materialization state on consume.
+    pub(crate) fn emit_deletion(&self, step_name: &str, action: &str, ts: i64) {
+        match self.scope.partition_key {
+            Some(pk) => {
+                for member in self.surviving_members(step_name, pk, ts) {
+                    ops::emit_deletion(
+                        self.sink.writer,
+                        self.scope.run_id,
+                        step_name,
+                        &Some(member),
+                        action,
+                        ts,
+                    );
+                }
+            }
+            None => ops::emit_deletion(
+                self.sink.writer,
+                self.scope.run_id,
+                step_name,
+                &None,
+                action,
+                ts,
+            ),
+        }
+    }
+
+    /// Emit `ActionCompleted` for one step (per member key when partitioned).
+    pub(crate) fn emit_action_completed(
+        &self,
+        step_name: &str,
+        action: &str,
+        metadata: &[(String, MetadataValue)],
+        ts: i64,
+    ) {
+        match self.scope.partition_key {
+            Some(pk) => {
+                for member in self.surviving_members(step_name, pk, ts) {
+                    ops::emit_action_completed(
+                        self.sink.writer,
+                        self.scope.run_id,
+                        step_name,
+                        &Some(member),
+                        action,
+                        metadata,
+                        ts,
+                    );
+                }
+            }
+            None => ops::emit_action_completed(
+                self.sink.writer,
+                self.scope.run_id,
+                step_name,
+                &None,
+                action,
+                metadata,
+                ts,
+            ),
+        }
+    }
+
     pub(crate) fn emit_observation(
         &self,
         step_name: &str,
@@ -289,7 +463,7 @@ impl<'a> BatchContext<'a> {
     ) {
         match self.scope.partition_key {
             Some(pk) => {
-                for member in pk.members() {
+                for member in self.surviving_members(step_name, pk, ts) {
                     ops::emit_observation(
                         self.sink.writer,
                         self.scope.run_id,

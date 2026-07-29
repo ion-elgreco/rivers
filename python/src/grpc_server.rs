@@ -145,6 +145,7 @@ impl CodeLocationService for CodeLocationImpl {
             partition_key: pk_core,
             tags,
             launched_by,
+            action: None,
         };
         let run_id = mat_request.run_id.clone();
         let status = self.run_dispatcher.mode_label().to_string();
@@ -364,6 +365,17 @@ impl CodeLocationService for CodeLocationImpl {
                             None
                         };
 
+                    let actions = node
+                        .list_actions(py)
+                        .into_iter()
+                        .map(|(name, outcome, exclusive, description)| ActionInfo {
+                            name,
+                            outcome,
+                            exclusive,
+                            description,
+                        })
+                        .collect();
+
                     assets.push(AssetDefinitionInfo {
                         asset_key: name.clone(),
                         description: None,
@@ -378,6 +390,7 @@ impl CodeLocationService for CodeLocationImpl {
                         group: node.group(),
                         code_version: node.code_version(),
                         asset_type: node.asset_type().to_string(),
+                        actions,
                     });
                 }
 
@@ -471,6 +484,7 @@ impl CodeLocationService for CodeLocationImpl {
                     name: j.name,
                     asset_selection: j.node_names,
                     executor_type,
+                    action: j.action,
                 }
             })
             .collect();
@@ -524,21 +538,50 @@ impl CodeLocationService for CodeLocationImpl {
         Ok(Response::new(resp))
     }
 
-    #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.observe_asset")]
-    async fn observe_asset(
+    #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.run_action")]
+    async fn run_action(
         &self,
-        request: Request<ObserveAssetRequest>,
-    ) -> Result<Response<ObserveAssetResponse>, Status> {
+        request: Request<RunActionRequest>,
+    ) -> Result<Response<RunActionResponse>, Status> {
         let req = request.into_inner();
+        let pk = req
+            .partition_key
+            .map(proto_partition_key_to_py)
+            .transpose()?;
+        let tags = proto_tags_to_pairs(req.tags);
+        let launched_by = manual_launch(req.user);
         let resp = self
-            .run_on_python(move |py, repo| {
-                repo.get()
-                    .observe(py, Some(vec![req.asset_key]))
-                    .map_err(|e| e.to_string())?;
-                Ok(ObserveAssetResponse {
-                    success: true,
-                    error: None,
-                })
+            .run_on_python(move |_py, repo| {
+                let selection = if req.selection.is_empty() {
+                    None
+                } else {
+                    Some(req.selection)
+                };
+                match repo.get().run_action_with_launcher(
+                    req.action,
+                    selection,
+                    pk,
+                    tags,
+                    false,
+                    None,
+                    None,
+                    false,
+                    launched_by,
+                ) {
+                    Ok(result) => Ok(RunActionResponse {
+                        run_id: result.run_id.clone(),
+                        success: result.success,
+                        error: result
+                            .failed_assets
+                            .first()
+                            .map(|(name, err)| format!("{name}: {err}")),
+                    }),
+                    Err(e) => Ok(RunActionResponse {
+                        run_id: String::new(),
+                        success: false,
+                        error: Some(e.to_string()),
+                    }),
+                }
             })
             .await?;
         Ok(Response::new(resp))
@@ -586,6 +629,7 @@ impl CodeLocationService for CodeLocationImpl {
             dry_run: req.dry_run,
             backfill_id: None,
             launched_by: manual_launch(req.user),
+            action: req.action,
         };
 
         let mut outcome = self

@@ -34,6 +34,9 @@ pub struct PyJob {
     pub(crate) executor: Option<Executor>,
     /// Job-level retry default; assets with their own policy keep it.
     retry: Option<RetryRef>,
+    /// The verb this job executes. `None` means materialize; when
+    /// set, the plan is built with `ExecutionPlan::for_action`.
+    pub(crate) action: Option<String>,
     allow_incomplete_deps: bool,
     /// `true` for the synthetic job built by `materialize_with_launcher`. The
     /// `name` field still holds an internal label for error messages, but the
@@ -47,6 +50,9 @@ pub struct PyJob {
     /// short-circuits when this is None) and `execute_run` for materialization.
     storage: Option<ScopedStorageHandle<SurrealStorage>>,
     pub(crate) resources: HashMap<String, ResourceVariant>,
+    /// Repository `retries` registry, copied in by `configure_for_repo` so
+    /// named refs on actions resolve at execution time.
+    pub(crate) retries: HashMap<String, RetryPolicy>,
     io_handler_registry: Option<IOHandlerRegistry>,
 }
 
@@ -100,6 +106,7 @@ impl PyJob {
         code_location_id: &str,
         resources: &HashMap<String, ResourceVariant>,
         io_handler_registry: &IOHandlerRegistry,
+        retries: &HashMap<String, RetryPolicy>,
     ) {
         self.set_storage(ScopedStorageHandle::new(
             Arc::clone(storage),
@@ -107,6 +114,7 @@ impl PyJob {
         ));
         self.set_resources(py, resources);
         self.set_io_handler_registry(py, io_handler_registry);
+        self.retries = retries.clone();
     }
 
     fn base(
@@ -120,12 +128,14 @@ impl PyJob {
             node_names,
             executor,
             retry: None,
+            action: None,
             allow_incomplete_deps,
             synthetic: false,
             plan: None,
             node_map: None,
             storage: None,
             resources: HashMap::new(),
+            retries: HashMap::new(),
             io_handler_registry: None,
         }
     }
@@ -204,7 +214,12 @@ impl PyJob {
         step_kinds: &HashMap<String, StepKind>,
         multi_asset_groups: &HashMap<String, String>,
         composition_order: &HashMap<String, usize>,
+        retries: &HashMap<String, RetryPolicy>,
     ) -> PyResult<()> {
+        if self.action.is_some() {
+            return self.validate_and_build_action_plan(graph, repo_node_map, retries);
+        }
+
         // Auto-include namespaced internal tasks for graph assets and collect steps.
         let mut seen: HashSet<String> = self.node_names.iter().cloned().collect();
         let mut extra_nodes: Vec<String> = Vec::new();
@@ -324,12 +339,102 @@ impl PyJob {
 
         Ok(())
     }
+
+    /// Plan an action run: one step per named target, no upstream pull-in, no
+    /// graph-task or collect expansion. Validates that every target defines
+    /// the verb and that declared orderings agree.
+    fn validate_and_build_action_plan(
+        &mut self,
+        graph: &AssetGraph,
+        repo_node_map: &HashMap<String, ResolvedNode>,
+        retries: &HashMap<String, RetryPolicy>,
+    ) -> PyResult<()> {
+        let verb = self.action.clone().expect("checked by caller");
+        let mut ordering: Option<rivers_core::execution::plan::ActionOrdering> = None;
+
+        for name in &self.node_names {
+            let node = repo_node_map.get(name).ok_or_else(|| {
+                NodeNotFoundError::new_err(format!(
+                    "Job '{}': node '{}' not found in repository",
+                    self.name, name
+                ))
+            })?;
+            // Externals define exactly the built-in `observe`; any other verb
+            // fails the find_action check below.
+            let found = Python::attach(|py| {
+                node.find_action(py, &verb).map(|a| {
+                    let named_retry = match &a.retry {
+                        Some(RetryRef::Named(key)) => Some(key.clone()),
+                        _ => None,
+                    };
+                    (a.ordering, named_retry)
+                })
+            });
+            let Some((ord, named_retry)) = found else {
+                return Err(GraphValidationError::new_err(format!(
+                    "Job '{}': asset '{}' does not define action '{}'",
+                    self.name, name, verb
+                )));
+            };
+            if let Some(key) = named_retry
+                && !retries.contains_key(&key)
+            {
+                return Err(ConfigurationError::new_err(format!(
+                    "unknown retry policy '{key}' referenced by action '{verb}' on \
+                     asset '{name}'; registered: {:?}",
+                    retries.keys().collect::<Vec<_>>()
+                )));
+            }
+            match ordering {
+                None => ordering = Some(ord),
+                Some(prev) if prev != ord => {
+                    return Err(GraphValidationError::new_err(format!(
+                        "Job '{}': action '{}' declares conflicting orderings across targets",
+                        self.name, verb
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        self.plan = Some(ExecutionPlan::for_action(
+            graph,
+            &verb,
+            &self.node_names,
+            ordering.unwrap_or_default(),
+        ));
+
+        let subset = Python::attach(|py| {
+            self.node_names
+                .iter()
+                .filter_map(|n| {
+                    repo_node_map
+                        .get(n)
+                        .map(|node| (n.clone(), node.clone_ref(py)))
+                })
+                .collect()
+        });
+        self.node_map = Some(subset);
+        Ok(())
+    }
 }
 
 #[pymethods]
 impl PyJob {
+    /// The verb this job's runs execute; `None` means materialize.
+    #[getter]
+    fn action(&self) -> Option<&str> {
+        self.action.as_deref()
+    }
+
+    /// The job's name as registered in the repository.
+    #[getter(name)]
+    fn name_py(&self) -> &str {
+        &self.name
+    }
+
     #[new]
-    #[pyo3(signature = (name, assets, executor=None, allow_incomplete_deps=false, retry=None))]
+    #[pyo3(signature = (name, assets, executor=None, allow_incomplete_deps=false, retry=None, action=None))]
     fn new<'py>(
         py: Python<'py>,
         name: String,
@@ -337,6 +442,7 @@ impl PyJob {
         executor: Option<Executor>,
         allow_incomplete_deps: bool,
         retry: Option<Bound<'py, PyAny>>,
+        action: Option<String>,
     ) -> PyResult<Self> {
         let mut node_names = Vec::new();
         for obj in &assets {
@@ -368,15 +474,29 @@ impl PyJob {
                 node_names.push(task_name);
             } else if let Ok(bash) = obj.cast_bound::<PyBashTask>(py) {
                 node_names.push(bash.borrow().name.clone());
+            } else if let Ok(t) = obj.bind(py).cast::<pyo3::types::PyType>()
+                && t.is_subclass_of::<PyAsset>()?
+            {
+                // Class-form asset: a job is a selection by name, so only the
+                // node names are derived here — desugaring stays in the repo.
+                node_names.extend(crate::assets::class_form::node_names(t.as_any())?);
             } else {
                 return Err(GraphValidationError::new_err(
-                    "Job assets must be Asset, Task, or BashTask instances",
+                    "Job assets must be Asset, Task, or BashTask instances, or Asset subclasses",
                 ));
             }
         }
 
         let mut job = Self::base(name, node_names, executor, allow_incomplete_deps);
         job.retry = crate::retry::extract_retry_ref(retry)?;
+        if job.retry.is_some() && action.is_some() {
+            return Err(ConfigurationError::new_err(format!(
+                "Job '{}': job-level retry does not apply to action runs — \
+                 declare the policy on the action itself",
+                job.name
+            )));
+        }
+        job.action = action;
         Ok(job)
     }
 
@@ -472,6 +592,7 @@ impl PyJob {
                 executor,
                 storage,
                 resources: &self.resources,
+                retries: &self.retries,
                 io_handler_registry: &registry,
                 job_name: self.record_name(),
                 run_id,
