@@ -18,7 +18,11 @@ from datetime import datetime
 import obstore.store
 from pydantic import BaseModel
 from rivers import (
+    ActionConcurrency,
+    ActionContext,
+    ActionResult,
     Asset,
+    AssetAction,
     AssetDef,
     AssetExecutionContext,
     AutomationCondition,
@@ -32,6 +36,7 @@ from rivers import (
     Job,
     MetadataValue,
     Observation,
+    Outcome,
     OutputContext,
     PartitionKey,
     PartitionMapping,
@@ -50,6 +55,7 @@ from rivers import (
     SkipReason,
     TagConcurrencyLimit,
     Task,
+    action,
 )
 
 # =============================================================================
@@ -328,12 +334,26 @@ def active_users(context: AssetExecutionContext, raw_users: dict) -> dict:
     return {"users": active}
 
 
+# Decorator-form assets attach actions as AssetAction objects;
+# `profile` shows up as a button on the enriched_orders asset page.
+def _profile_orders(ctx: ActionContext) -> None:
+    ctx.log.info("[profile] sampling join quality for %s", ctx.asset_key)
+
+
+profile_orders = AssetAction(
+    name="profile",
+    outcome=Outcome.Unchanged,
+    description="Sample the join output and log quality stats",
+)(_profile_orders)
+
+
 @Asset(
     io_handler=processed_io,
     tags=["processing"],
     kinds="transform",
     group="data_processing",
     code_version="1.0",
+    actions=[profile_orders],
 )
 def enriched_orders(
     context: AssetExecutionContext, raw_orders: dict, raw_products: dict
@@ -1133,6 +1153,69 @@ def metadata_showcase(context: AssetExecutionContext) -> dict:
 
 
 # =============================================================================
+# Asset Actions — class-form asset with maintenance verbs
+# =============================================================================
+# Every verb below is a button on the event_log asset page. `optimize` is
+# exclusive: it serializes against materialize and other exclusive verbs via
+# the implicit __asset__:event_log pool (watch the run Gantt while one runs).
+
+
+class EventLog(Asset):
+    """Append-only event log with maintenance actions."""
+
+    name = "event_log"
+    io_handler = output_io
+    tags = ["maintenance", "actions-demo"]
+    kinds = "table"
+    group = "maintenance_demo"
+    metadata = {"format": "pickle"}
+
+    @classmethod
+    def materialize(cls, context: AssetExecutionContext) -> dict:
+        rows = [{"id": i, "event": f"evt-{i:03d}"} for i in range(100)]
+        context.add_output_metadata({"rows": MetadataValue.int(len(rows))})
+        return {"rows": rows, "compacted": False}
+
+    @action(
+        outcome=Outcome.Unchanged,
+        concurrency=ActionConcurrency.Exclusive,
+        description="Compact the log in place; runs exclusively with materialize",
+    )
+    @classmethod
+    def optimize(cls, ctx: ActionContext) -> None:
+        ctx.log.info("[optimize] compacting %s (run=%s)", ctx.asset_key, ctx.run_id)
+        time.sleep(3)
+        ctx.log.info("[optimize] done")
+
+    @action(outcome=Outcome.Unchanged, description="Drop expired snapshots")
+    @classmethod
+    def vacuum(cls, ctx: ActionContext) -> None:
+        ctx.log.info("[vacuum] removing expired snapshots for %s", ctx.asset_key)
+
+    @action(
+        outcome=Outcome.MayMaterialize,
+        description="Pull late-arriving events; materializes only when data changed",
+    )
+    @classmethod
+    def refresh(cls, ctx: ActionContext) -> ActionResult:
+        if int(time.time()) % 2:
+            ctx.log.info("[refresh] no late events for %s", ctx.asset_key)
+            return ActionResult.unchanged()
+        data = {"rows": [{"id": "late", "event": "evt-late"}], "compacted": False}
+        output_io.handle_output(OutputContext(asset_name="event_log"), data)
+        ctx.log.info("[refresh] appended late events to %s", ctx.asset_key)
+        return ActionResult.materialized(metadata={"late_rows": 1})
+
+    @action(
+        outcome=Outcome.Unmaterialize,
+        description="Drop the log and clear materialization state",
+    )
+    @classmethod
+    def delete(cls, ctx: ActionContext) -> None:
+        ctx.log.info("[delete] dropping %s — state cleared", ctx.asset_key)
+
+
+# =============================================================================
 # Jobs
 # =============================================================================
 
@@ -1627,6 +1710,8 @@ all_assets = [
     slow_step_d,
     # Metadata showcase
     metadata_showcase,
+    # Actions demo (class form)
+    EventLog,
     # Backfill showcase
     daily_events,
     daily_aggregates,
