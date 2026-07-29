@@ -174,6 +174,7 @@ impl DirectRunDispatcher {
                     req.tags.clone(),
                     req.launched_by.clone(),
                     req.run_id.clone(),
+                    req.action.clone(),
                 )
                 .await
             {
@@ -188,23 +189,43 @@ impl DirectRunDispatcher {
             let run_id = req.run_id.clone();
             let py_pk = req.partition_key.as_ref().map(PyPartitionKey::from);
             let launched_by = req.launched_by.clone();
+            let action = req.action.clone();
             self.gil_threads.spawn(move || {
-                if let Err(e) = repo.get().materialize_with_launcher(
-                    Some(assets),
-                    py_pk,
-                    None,
-                    false,
-                    None,
-                    Some(run_id.clone()),
-                    false,
-                    false,
-                    None,
-                    launched_by,
-                ) {
+                let result = match action {
+                    Some(action) => repo
+                        .get()
+                        .run_action_with_launcher(
+                            action,
+                            Some(assets),
+                            py_pk,
+                            None,
+                            false,
+                            None,
+                            Some(run_id.clone()),
+                            launched_by,
+                        )
+                        .map(|_| ()),
+                    None => repo
+                        .get()
+                        .materialize_with_launcher(
+                            Some(assets),
+                            py_pk,
+                            None,
+                            false,
+                            None,
+                            Some(run_id.clone()),
+                            false,
+                            false,
+                            None,
+                            launched_by,
+                        )
+                        .map(|_| ()),
+                };
+                if let Err(e) = result {
                     tracing::error!(
                         target: "rivers::daemon",
                         error = %e,
-                        "materialize_with_launcher failed",
+                        "dispatched run launch failed",
                     );
                     // Mark the pre-created Started record Failed, else the asset reads
                     // in-flight forever (an early return leaves it Started).
@@ -293,6 +314,7 @@ impl QueuedRunDispatcher {
                 partition_key: req.partition_key.clone(),
                 block_reason: None,
                 launched_by: req.launched_by.clone(),
+                action: req.action.clone(),
             };
             if let Err(e) = self.storage.enqueue_run(&run_record).await {
                 errors.push(anyhow!(
@@ -435,6 +457,7 @@ impl LocalBackfillDispatcher {
                     bf.dry_run,
                     bf.backfill_id.clone(),
                     bf.launched_by.clone(),
+                    bf.action.clone(),
                 ) {
                     Ok(result) => {
                         tracing::info!(

@@ -169,6 +169,8 @@ pub struct PyBackfillRequest {
     pub max_concurrency: u32,
     /// Tags to attach to the backfill and all its runs.
     pub tags: Option<HashMap<String, String>>,
+    /// The verb child runs execute. `None` means materialize.
+    pub action: Option<String>,
 }
 
 #[pymethods]
@@ -182,6 +184,7 @@ impl PyBackfillRequest {
         failure_policy = None,
         max_concurrency = 4,
         tags = None,
+        action = None,
     ))]
     fn new(
         selection: Vec<String>,
@@ -191,6 +194,7 @@ impl PyBackfillRequest {
         failure_policy: Option<String>,
         max_concurrency: u32,
         tags: Option<HashMap<String, String>>,
+        action: Option<String>,
     ) -> Self {
         Self {
             selection,
@@ -200,6 +204,7 @@ impl PyBackfillRequest {
             failure_policy,
             max_concurrency,
             tags,
+            action,
         }
     }
 

@@ -367,6 +367,43 @@ class TestK8sGrpcFlow:
                     f"Expected 1 StepSuccess for '{step}', got {len(successes)}"
                 )
 
+    def test_action_backfill_children_run_the_verb(self, grpc_stubs):
+        """A queued action backfill's children carry the verb end-to-end: the
+        run pod reads it off the run record and executes the ACTION — events
+        show ActionCompleted, never Materialization."""
+        with GrpcChannel(grpc_stubs) as ch:
+            resp = ch.stub.LaunchBackfill(
+                ch.pb2.LaunchBackfillRequest(
+                    selection=["k8s_action_events"],
+                    partition_keys=[
+                        ch.pb2.ProtoPartitionKey(
+                            single=ch.pb2.SinglePartitionKey(keys=["p1"])
+                        )
+                    ],
+                    failure_policy="continue",
+                    max_concurrency=1,
+                    action="touch",
+                )
+            )
+            assert resp.backfill_id
+
+            run_name = _wait_for_run_cr(timeout=60)
+            assert run_name, "No Run CR appeared for the action backfill child"
+
+            phase = _wait_for_phase(run_name, TERMINAL_PHASES, timeout=180)
+            if phase != "Succeeded":
+                pytest.fail(
+                    f"Run '{run_name}' ended with phase '{phase}'\n{_dump_debug_info(run_name)}"
+                )
+
+            run_id = run_name.removeprefix("rivers-run-")
+            events = _query_run_events(run_id)
+            types = {e["event_type"] for e in events}
+            assert "ActionCompleted" in types, f"no ActionCompleted in {sorted(types)}"
+            assert "Materialization" not in types, (
+                f"action child materialized instead: {sorted(types)}"
+            )
+
     def test_graph_asset_inner_inprocess(self, grpc_stubs):
         """Graph asset with `rivers/node/executor=in_process` collapses its
         internal tasks into the orchestrator pod; they don't get scheduled

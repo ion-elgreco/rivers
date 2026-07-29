@@ -101,3 +101,24 @@ def make_repo(assets, storage=None, *, executor=None, **kwargs) -> rs.CodeReposi
     repo = rs.CodeRepository(assets=assets, default_executor=executor, **kwargs)
     repo.resolve(storage=storage)
     return repo
+
+
+def observation_metadata(repo) -> dict:
+    """{asset_key: {meta_key: raw_value}} from all Observation events.
+
+    repo.observe() runs through the run spine, so observation
+    metadata lives on the run's Observation events rather than a return dict.
+    """
+    import json
+
+    out: dict = {}
+    for run in repo.storage.get_runs(limit=50):
+        for ev in repo.storage.get_events_for_run(run.run_id):
+            if "Observation" not in str(ev.event_type):
+                continue
+            parsed = {}
+            for key, value in ev.metadata:
+                tagged = json.loads(value)
+                parsed[key] = next(iter(tagged.values()))["value"]
+            out[ev.asset_key] = parsed
+    return out

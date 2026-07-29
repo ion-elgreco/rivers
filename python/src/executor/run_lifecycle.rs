@@ -42,6 +42,7 @@ pub(crate) struct RunPlanArgs<'a> {
     pub executor: &'a Executor,
     pub storage: &'a ScopedStorageHandle<SurrealStorage>,
     pub resources: &'a HashMap<String, ResourceVariant>,
+    pub retries: &'a HashMap<String, rivers_core::execution::retry::RetryPolicy>,
     pub io_handler_registry: &'a IOHandlerRegistry,
 
     /// `None` for ad-hoc runs (`materialize`, asset-selection sensors); `Some`
@@ -80,6 +81,7 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
                     partition_key: args.partition_key.as_ref().map(|pk| pk.into()),
                     block_reason: None,
                     launched_by,
+                    action: args.plan.action.clone(),
                 };
                 io_rt()
                     .block_on(args.storage.backend().create_run(&record))
@@ -118,6 +120,7 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
         args.storage,
         &args.run_id,
         args.resources,
+        args.retries,
         &args.config,
         args.io_handler_registry,
         args.resume,

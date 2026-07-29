@@ -1,9 +1,9 @@
 //! Async executor: runs steps concurrently via tokio JoinSet + spawn_blocking.
 //!
 //! Each step runs in a `spawn_blocking` thread that acquires the GIL via
-//! `Python::try_attach` and calls `execute_step`. Async steps internally
-//! release the GIL via `bridge.run_coroutine()` → `py.detach()`, so multiple
-//! threads overlap their I/O naturally.
+//! `Python::try_attach` and calls `execute_step`. Async steps convert their
+//! coroutine via `into_future_with_locals` and block on it with the GIL
+//! released (`py.detach`), so multiple threads overlap their I/O naturally.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,6 +52,8 @@ struct SharedStepContext {
     io_handler_registry: IOHandlerRegistry,
     storage: ScopedStorageHandle<SurrealStorage>,
     run_id: String,
+    /// The verb every step executes when this batch belongs to an action run.
+    action: Option<String>,
 }
 
 impl SharedStepContext {
@@ -78,6 +80,7 @@ impl SharedStepContext {
             io_handler_registry: ctx.repo.io_handler_registry.clone_ref(py),
             storage: ctx.sink.storage.clone(),
             run_id: ctx.scope.run_id.to_string(),
+            action: ctx.scope.plan.action.clone(),
         }
     }
 }
@@ -105,18 +108,33 @@ fn execute_with_capture(
         });
 
     let mut resolved_config: Option<Py<PyAny>> = None;
-    let result = ops::execute_step(
-        py,
-        step,
-        &shared.node_map,
-        &shared.partition_key,
-        &shared.resources,
-        &shared.config_overrides,
-        &shared.io_handler_registry,
-        input_overrides,
-        locals,
-        &mut resolved_config,
-    );
+    let result = if let Some(verb) = &shared.action {
+        ops::execute_action_step(
+            py,
+            verb,
+            step,
+            &shared.node_map,
+            &shared.partition_key,
+            &shared.resources,
+            &shared.config_overrides,
+            &shared.io_handler_registry,
+            &shared.run_id,
+            locals,
+        )
+    } else {
+        ops::execute_step(
+            py,
+            step,
+            &shared.node_map,
+            &shared.partition_key,
+            &shared.resources,
+            &shared.config_overrides,
+            &shared.io_handler_registry,
+            input_overrides,
+            locals,
+            &mut resolved_config,
+        )
+    };
 
     let captured_logs = capture.and_then(|cap| {
         cap.call_method0("finish").ok().and_then(|out| {
@@ -264,7 +282,7 @@ impl ExecutorBackend for AsyncBackend {
                 }
                 let pool_step_name = inst.instance_name.clone();
                 let start_event_names = inst.event_names.clone();
-                let retry = ctx.retry_policy_for(&step).cloned();
+                let retry = ctx.retry_policy_for(&step);
                 (
                     inst.idx,
                     inst.instance_name,

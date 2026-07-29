@@ -178,6 +178,8 @@ class RunRecord:
     block_reason: str | None
     launched_by: LaunchedBy
     """Origin of this run (manual / schedule / sensor / backfill / condition)."""
+    action: str | None
+    """The verb this run executes. ``None`` means materialize."""
 
 class PoolLimit:
     """Configuration of a concurrency pool."""

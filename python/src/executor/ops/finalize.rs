@@ -363,6 +363,59 @@ pub(crate) fn emit_observation(
     );
 }
 
+pub(crate) fn emit_action_completed(
+    writer: &EventWriter,
+    run_id: &str,
+    step_name: &str,
+    partition_key: &Option<PyPartitionKey>,
+    action: &str,
+    metadata: &[(String, MetadataValue)],
+    ts: i64,
+) {
+    let mut entries = vec![(
+        "action".to_string(),
+        MetadataValue::Text {
+            value: action.to_string(),
+        },
+    )];
+    entries.extend(metadata.iter().cloned());
+    emit_event(
+        writer,
+        run_id,
+        step_name,
+        partition_key,
+        &entries,
+        EventType::ActionCompleted,
+        vec![],
+        ts,
+    );
+}
+
+pub(crate) fn emit_deletion(
+    writer: &EventWriter,
+    run_id: &str,
+    step_name: &str,
+    partition_key: &Option<PyPartitionKey>,
+    action: &str,
+    ts: i64,
+) {
+    emit_event(
+        writer,
+        run_id,
+        step_name,
+        partition_key,
+        &[(
+            "action".to_string(),
+            MetadataValue::Text {
+                value: action.to_string(),
+            },
+        )],
+        EventType::Deletion,
+        vec![],
+        ts,
+    );
+}
+
 pub(crate) fn register_assets_from_nodes(
     storage: &ScopedStorageHandle<SurrealStorage>,
     node_map: &HashMap<String, ResolvedNode>,

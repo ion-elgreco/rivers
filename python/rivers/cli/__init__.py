@@ -307,12 +307,25 @@ def execute(
     pk = _parse_partition_key(partition_key)
     selection = [a.strip() for a in target.split(",")] if target else None
 
+    # Ad-hoc action runs carry the verb only on their run record — the Run CR
+    # and pod args are verb-less, so route by what storage says the run is.
+    record = storage.get_run(run_id)
+    action = record.action if record is not None else None
+
     try:
         if job:
             result = repo_obj.get_job(job)._execute_run(
                 run_id,
                 partition_key=pk,
                 resume=resume,
+                raise_on_error=False,
+            )
+        elif action is not None:
+            result = repo_obj.run_action(
+                action,
+                selection=selection,
+                partition_key=pk,
+                run_id_override=run_id,
                 raise_on_error=False,
             )
         else:

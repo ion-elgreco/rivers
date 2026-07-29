@@ -107,6 +107,13 @@ pub(crate) fn process_step_result(
     step_result: ops::StepResult,
     failures: &mut Vec<(String, PyErr)>,
 ) {
+    // Action runs: the verb ran against existing data — no output iteration,
+    // no hooks. The runtime report decides what lands on the timeline.
+    if let Some(verb) = ctx.scope.plan.action.clone() {
+        handle_action_result(py, ctx, step, step_name, &verb, step_result, failures);
+        return;
+    }
+
     stash_failed_partitions(ctx, step, step_result.failed_partitions.clone());
     let node = ctx.repo.node_map.get(&step.name).unwrap();
 
@@ -319,6 +326,120 @@ pub(crate) fn process_step_result(
 
 /// External asset observation: emit Observation event (no IO write), record
 /// data_version for downstream provenance.
+/// Consume one action step's result. The declared outcome is the
+/// planning upper bound; the returned `ActionResult` is what actually
+/// happened: `materialized()` emits a real `Materialization` event (downstream
+/// goes stale exactly as after a materialize — the point of the dynamic
+/// report is that a no-op merge does NOT), anything else completes quietly.
+fn handle_action_result(
+    py: Python,
+    ctx: &mut BatchContext,
+    step: &ExecutionStep,
+    step_name: &str,
+    verb: &str,
+    step_result: ops::StepResult,
+    failures: &mut Vec<(String, PyErr)>,
+) {
+    use crate::assets::action::{ActionOutcome, PyActionResult};
+
+    let outcome = ctx
+        .repo
+        .node_map
+        .get(&step.name)
+        .and_then(|n| n.find_action(py, verb))
+        .map(|a| a.outcome);
+
+    if outcome == Some(ActionOutcome::Observe) {
+        py.detach(|| handle_observation_result(ctx, step_name, &step_result));
+        return;
+    }
+
+    enum Report {
+        Unchanged(Vec<(String, MetadataValue)>),
+        Materialized(Vec<(String, MetadataValue)>, Option<String>),
+    }
+
+    let report = if step_result.result.is_none(py) {
+        Report::Unchanged(Vec::new())
+    } else if let Ok(r) = step_result.result.bind(py).cast::<PyActionResult>() {
+        let r = r.get();
+        if r.materialized {
+            Report::Materialized(r.metadata.clone(), r.data_version.clone())
+        } else {
+            Report::Unchanged(r.metadata.clone())
+        }
+    } else {
+        let type_name = step_result.result.bind(py).get_type().to_string();
+        let event_names = vec![step_name.to_string()];
+        handle_failure(
+            py,
+            ctx,
+            step,
+            step_name,
+            &event_names,
+            ExecutionError::new_err(format!(
+                "action '{verb}' on '{step_name}' returned {type_name}; \
+                 actions return rs.ActionResult or None"
+            )),
+            None,
+            failures,
+        );
+        return;
+    };
+
+    match report {
+        Report::Materialized(metadata, data_version) => {
+            if outcome != Some(ActionOutcome::MayMaterialize) {
+                let declared = match outcome {
+                    Some(ActionOutcome::Unmaterialize) => "Outcome.Unmaterialize",
+                    _ => "Outcome.Unchanged",
+                };
+                let event_names = vec![step_name.to_string()];
+                handle_failure(
+                    py,
+                    ctx,
+                    step,
+                    step_name,
+                    &event_names,
+                    ExecutionError::new_err(format!(
+                        "action '{verb}' on '{step_name}' declared {declared} \
+                         but reported ActionResult.materialized()"
+                    )),
+                    None,
+                    failures,
+                );
+                return;
+            }
+            let final_dv = data_version.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            ctx.emit_materialization(
+                step_name,
+                &metadata,
+                Some(final_dv.clone()),
+                Vec::new(),
+                now_ts(),
+            );
+            ctx.state
+                .record_data_version(step_name.to_string(), final_dv);
+            ctx.emit_success(step_name);
+        }
+        // An explicit `unchanged()` return is a no-op report — even for an
+        // Unmaterialize action ("nothing to delete"): state is preserved.
+        Report::Unchanged(metadata) if !step_result.result.is_none(py) => {
+            ctx.emit_action_completed(step_name, verb, &metadata, now_ts());
+            ctx.emit_success(step_name);
+        }
+        Report::Unchanged(metadata) => {
+            if outcome == Some(ActionOutcome::Unmaterialize) {
+                // The declared outcome happened: clear materialization state.
+                ctx.emit_deletion(step_name, verb, now_ts());
+            } else {
+                ctx.emit_action_completed(step_name, verb, &metadata, now_ts());
+            }
+            ctx.emit_success(step_name);
+        }
+    }
+}
+
 fn handle_observation_result(
     ctx: &mut BatchContext,
     step_name: &str,
@@ -436,7 +557,10 @@ pub(crate) fn handle_failure(
         ctx.emit_partition_failures(name, &err_msg, ts);
         ctx.state.mark_failed(name.clone());
     }
-    if let Some(node) = ctx.repo.node_map.get(&step.name) {
+    // Asset hooks carry materialize semantics; action runs don't fire them.
+    if ctx.scope.plan.is_materialize()
+        && let Some(node) = ctx.repo.node_map.get(&step.name)
+    {
         ops::run_failure_hooks(
             py,
             node,
