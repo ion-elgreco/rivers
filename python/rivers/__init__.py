@@ -40,15 +40,22 @@ from rivers._core import (
     TagConcurrencyLimit,
 )
 from rivers._core.assets import (
+    ActionConcurrency,
+    ActionContext,
+    ActionOrdering,
+    ActionResult,
     Asset,
+    AssetAction,
     AssetDef,
     AssetExecutionContext,
     DepDef,
     ExternalAsset,
     GraphAsset,
     MultiAsset,
+    Outcome,
     SelfDependency,
     SingleAsset,
+    action,
 )
 from rivers._core.automation import AutomationCondition
 from rivers._core.executor import Executor
@@ -101,6 +108,13 @@ from rivers.resource import Resource
 
 __all__ = [
     "exceptions",
+    "action",
+    "ActionConcurrency",
+    "ActionContext",
+    "ActionOrdering",
+    "ActionResult",
+    "AssetAction",
+    "Outcome",
     "AssetDef",
     "Asset",
     "AssetExecutionContext",
