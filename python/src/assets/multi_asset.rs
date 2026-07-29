@@ -41,7 +41,7 @@ pub struct MultiAsset {
 }
 
 /// Python-exposed marker subclass created via `Asset.from_multi(...)`.
-#[pyclass(name = "MultiAsset", extends=PyAsset, module = "rivers._core")]
+#[pyclass(name = "MultiAsset", extends=PyAsset, subclass, module = "rivers._core")]
 pub struct PyMultiAsset;
 
 #[pymethods]
@@ -56,7 +56,7 @@ impl PyMultiAsset {
                 .assets
                 .iter()
                 .map(|a| AssetDef {
-                    name: a.name.clone().unwrap_or_default(),
+                    name: a.name.clone(),
                     tags: a.tags.clone(),
                     kinds: a.kinds.clone(),
                     group: a.group.clone(),
@@ -69,6 +69,7 @@ impl PyMultiAsset {
                     // from_multi consumed and merged the original DepDef list;
                     // the reconstructed view does not preserve it.
                     deps: Vec::new(),
+                    actions: a.actions.iter().map(|x| x.clone_ref(py)).collect(),
                 })
                 .collect(),
             _ => Vec::new(),

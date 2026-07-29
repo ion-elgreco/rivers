@@ -1468,3 +1468,54 @@ def test_backfill_merge_multi_key_partition_scope(tmp_path):
     result_apac = init_handler.load_input(ctx_in_apac)
     expected_apac = pa.table({"region": ["apac"], "id": [3], "val": [30]})
     assert result_apac.cast(expected_apac.schema).equals(expected_apac)
+
+
+# ── Public action helpers: asset_table_uri / partition_predicate ──
+
+
+def test_asset_table_uri_composes_leaf(tmp_path):
+    handler, uri = _make_handler(tmp_path)
+    assert handler.asset_table_uri("orders") == f"{uri}/orders"
+
+
+def test_asset_table_uri_honors_root_name_override(tmp_path):
+    handler, uri = _make_handler(tmp_path)
+    meta = {"delta/root_name": "orders_v2"}
+    assert handler.asset_table_uri("orders", meta) == f"{uri}/orders_v2"
+
+
+def test_partition_predicate_single_key(tmp_path):
+    handler, _ = _make_handler(tmp_path)
+    meta = {"delta/partition_expr": "date"}
+    partition = make_partition("2024-01-01")
+    assert handler.partition_predicate(meta, partition) == "date = '2024-01-01'"
+
+
+def test_partition_predicate_multi_dim(tmp_path):
+    handler, _ = _make_handler(tmp_path)
+    meta = {"delta/partition_expr": json.dumps({"date": "date", "region": "region"})}
+    partition = make_multi_partition({"date": "2024-01-01", "region": "eu"})
+    predicate = handler.partition_predicate(meta, partition)
+    assert "date = '2024-01-01'" in predicate
+    assert "region = 'eu'" in predicate
+
+
+def test_partition_predicate_matches_write_path(tmp_path):
+    """The predicate selects exactly the rows the partitioned write produced."""
+    handler, uri = _make_handler(tmp_path)
+    meta = {"delta/partition_expr": "day"}
+
+    for day, rows in (("a", [1, 2]), ("b", [3])):
+        ctx_out = rs.OutputContext(
+            asset_name="events", asset_metadata=meta, partition=make_partition(day)
+        )
+        handler.handle_output(
+            ctx_out, pl.DataFrame({"day": [day] * len(rows), "v": rows})
+        )
+
+    dt = DeltaTable(handler.asset_table_uri("events", meta))
+    predicate = handler.partition_predicate(meta, make_partition("a"))
+    dt.delete(predicate)
+
+    remaining = pl.read_delta(handler.asset_table_uri("events", meta))
+    assert remaining["day"].unique().to_list() == ["b"]

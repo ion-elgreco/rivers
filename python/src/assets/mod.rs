@@ -1,4 +1,6 @@
 //! Asset types: single assets, multi-assets, graph assets, external assets, and IO handlers.
+pub mod action;
+pub mod class_form;
 pub mod decorator;
 pub mod dep_def;
 pub mod external_asset;
@@ -9,6 +11,7 @@ pub mod multi_asset;
 pub mod self_dependency;
 pub mod single_asset;
 
+use action::{ActionOutcome, PyActionConcurrency, PyActionOrdering, PyActionResult, PyAssetAction};
 use decorator::{AssetDef, PyAsset};
 use dep_def::DepDef;
 use external_asset::PyExternalAsset;
@@ -17,6 +20,7 @@ use multi_asset::PyMultiAsset;
 use self_dependency::PySelfDependency;
 use single_asset::PySingleAsset;
 
+use crate::context::action::PyActionContext;
 use crate::context::asset::PyAssetExecutionContext;
 
 use pyo3::prelude::*;
@@ -32,5 +36,16 @@ pub fn register_asset_module(parent_module: &Bound<'_, PyModule>) -> PyResult<()
         PyExternalAsset as "ExternalAsset",
         PySelfDependency as "SelfDependency",
         PyAssetExecutionContext as "AssetExecutionContext",
+        PyAssetAction as "AssetAction",
+        ActionOutcome as "Outcome",
+        PyActionConcurrency as "ActionConcurrency",
+        PyActionOrdering as "ActionOrdering",
+        PyActionContext as "ActionContext",
+        PyActionResult as "ActionResult",
+    ], fns [
+        class_form::action,
+        class_form::desugar,
+        class_form::is_asset_class,
+        class_form::node_names,
     ])
 }
