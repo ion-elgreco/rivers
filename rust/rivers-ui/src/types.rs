@@ -199,6 +199,9 @@ pub struct RunRecord {
     pub launched_by: LaunchedBy,
     #[serde(default)]
     pub code_location_id: String,
+    /// The verb this run executes. `None` means materialize.
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
 /// Filter passed to the paginated runs server fn. Empty/`None` means no
@@ -216,6 +219,10 @@ pub struct RunFilter {
     pub asset_substring: Option<String>,
     #[serde(default)]
     pub partition_substring: Option<String>,
+    /// Verb the run executes: `Some(None)` selects materialize runs,
+    /// `Some(Some(verb))` that verb.
+    #[serde(default)]
+    pub action: Option<Option<String>>,
 }
 
 /// A page of rows + the matching total — what every paginated server-fn returns.
@@ -271,6 +278,8 @@ pub enum EventType {
     StepSlotWaiting,
     StepSlotRenewed,
     StepSlotReleased,
+    ActionCompleted,
+    Deletion,
 }
 
 /// One row from the events table — drives the run-detail / asset-detail
@@ -466,6 +475,9 @@ pub struct JobRecord {
     pub name: String,
     pub asset_selection: Vec<String>,
     pub executor_type: String,
+    /// The verb this job's runs execute; `None` means materialize.
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,6 +496,19 @@ pub struct AssetDefinitionInfo {
     pub code_version: Option<String>,
     #[serde(default)]
     pub asset_type: String,
+    /// Named actions this asset supports beyond materialize.
+    #[serde(default)]
+    pub actions: Vec<AssetActionInfo>,
+}
+
+/// Mirror of the gRPC `ActionInfo`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetActionInfo {
+    pub name: String,
+    /// "unchanged" | "may_materialize" | "unmaterialize" | "observe"
+    pub outcome: String,
+    pub exclusive: bool,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1017,6 +1042,7 @@ mod conversions {
                 block_reason: r.block_reason,
                 launched_by: r.launched_by.into(),
                 code_location_id: r.code_location_id,
+                action: r.action,
             }
         }
     }
@@ -1064,6 +1090,7 @@ mod conversions {
                 job_substring: f.job_substring.filter(|s| !s.is_empty()),
                 asset_substring: f.asset_substring.filter(|s| !s.is_empty()),
                 partition_substring: f.partition_substring.filter(|s| !s.is_empty()),
+                action: f.action,
             }
         }
     }
@@ -1084,6 +1111,8 @@ mod conversions {
                 rivers_core::storage::EventType::StepSlotWaiting => Self::StepSlotWaiting,
                 rivers_core::storage::EventType::StepSlotRenewed => Self::StepSlotRenewed,
                 rivers_core::storage::EventType::StepSlotReleased => Self::StepSlotReleased,
+                rivers_core::storage::EventType::ActionCompleted => Self::ActionCompleted,
+                rivers_core::storage::EventType::Deletion => Self::Deletion,
             }
         }
     }
@@ -1355,6 +1384,7 @@ mod conversions {
                 job_substring: Some(String::new()),
                 asset_substring: Some(String::new()),
                 partition_substring: Some(String::new()),
+                action: None,
             };
             let core: rivers_core::storage::RunFilter = ui.into();
             assert!(core.status.is_none());
@@ -1387,6 +1417,7 @@ mod conversions {
                 }),
                 block_reason: None,
                 launched_by: rivers_core::storage::LaunchedBy::Manual { user: None },
+                action: None,
             };
             let ui: RunRecord = core.into();
             let preview = ui
@@ -1434,6 +1465,7 @@ mod conversions {
                 job_substring: Some("daily".into()),
                 asset_substring: Some("orders".into()),
                 partition_substring: Some("2024-01".into()),
+                action: None,
             };
             let core: rivers_core::storage::RunFilter = ui.into();
             assert_eq!(core.status, Some(rivers_core::storage::RunStatus::Failure));

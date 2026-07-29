@@ -199,23 +199,38 @@ impl Executor {
                 service_account,
                 worker_cpu,
                 worker_memory,
-            } => dispatch::execute_level_batch(
-                &kubernetes::KubernetesBackend::new(
-                    worker_image
-                        .clone()
-                        .or_else(rivers_k8s::env::detect_code_location_image),
-                    *max_concurrent_steps,
-                    namespace
-                        .clone()
-                        .unwrap_or_else(rivers_k8s::env::detect_namespace),
-                    service_account.clone(),
-                    worker_cpu.clone(),
-                    worker_memory.clone(),
-                ),
-                py,
-                ctx,
-                step_indices,
-            ),
+            } => {
+                // Action steps run in the orchestrator process (like the
+                // parallel executor): they carry no dep inputs to ship and
+                // their by-ref transport is not shippable to step pods yet.
+                // Checked before backend construction — it requires the
+                // in-cluster CodeLocation environment.
+                if ctx.scope.plan.is_action() {
+                    return dispatch::execute_level_batch(
+                        &in_process::InProcessBackend,
+                        py,
+                        ctx,
+                        step_indices,
+                    );
+                }
+                dispatch::execute_level_batch(
+                    &kubernetes::KubernetesBackend::new(
+                        worker_image
+                            .clone()
+                            .or_else(rivers_k8s::env::detect_code_location_image),
+                        *max_concurrent_steps,
+                        namespace
+                            .clone()
+                            .unwrap_or_else(rivers_k8s::env::detect_namespace),
+                        service_account.clone(),
+                        worker_cpu.clone(),
+                        worker_memory.clone(),
+                    ),
+                    py,
+                    ctx,
+                    step_indices,
+                )
+            }
         }
     }
 
@@ -232,6 +247,7 @@ impl Executor {
         storage: StorageHandle,
         run_id: &str,
         resources: &HashMap<String, ResourceVariant>,
+        retries: &HashMap<String, rivers_core::execution::retry::RetryPolicy>,
         config_overrides: &Option<HashMap<String, Py<PyAny>>>,
         io_handler_registry: &IOHandlerRegistry,
         resume: bool,
@@ -251,10 +267,21 @@ impl Executor {
             }
         }
 
-        let needs_bridge = plan
-            .steps
-            .iter()
-            .any(|s| node_map.get(&s.name).map(|n| n.is_async()).unwrap_or(false));
+        let needs_bridge = match plan.action.as_deref() {
+            // The bridge requirement follows the executed verb, not the
+            // asset's materialize function.
+            Some(verb) => plan.steps.iter().any(|s| {
+                node_map
+                    .get(&s.name)
+                    .and_then(|n| n.find_action(py, verb))
+                    .map(|a| a.is_async)
+                    .unwrap_or(false)
+            }),
+            None => plan
+                .steps
+                .iter()
+                .any(|s| node_map.get(&s.name).map(|n| n.is_async()).unwrap_or(false)),
+        };
 
         let bridge = if needs_bridge {
             match async_exec::AsyncBridge::new(py) {
@@ -424,6 +451,7 @@ impl Executor {
                             graph_nodes: &graph_nodes,
                             io_handler_registry,
                             resources,
+                            retries,
                             config_overrides,
                             bridge: bridge.as_ref(),
                         },

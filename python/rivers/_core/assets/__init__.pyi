@@ -55,6 +55,7 @@ class Asset:
         pool_slots: int | dict[str, int] | None = ...,
         retry: "RetryPolicy | str | None" = ...,
         compute: Compute | None = ...,
+        actions: list["AssetAction"] | None = ...,
     ) -> Callable[[Callable[..., Any]], "SingleAsset"]: ...
     # @overload
     def __new__(
@@ -76,6 +77,7 @@ class Asset:
         pool_slots: int | dict[str, int] | None = None,
         retry: "RetryPolicy | str | None" = None,
         compute: Compute | None = None,
+        actions: list["AssetAction"] | None = None,
     ) -> Callable[[Callable[..., Any]], "SingleAsset"]: ...
 
     # from_multi: used as decorator (no wraps) or direct call (with wraps)
@@ -97,6 +99,7 @@ class Asset:
         automation_condition: AutomationCondition | None = None,
         compute: Compute | None = None,
         retry: "RetryPolicy | str | None" = None,
+        actions: list["AssetAction"] | None = None,
     ) -> "MultiAsset": ...
     @classmethod
     @overload
@@ -116,6 +119,7 @@ class Asset:
         automation_condition: AutomationCondition | None = None,
         compute: Compute | None = None,
         retry: "RetryPolicy | str | None" = None,
+        actions: list["AssetAction"] | None = None,
     ) -> Callable[[Callable[..., Any]], "MultiAsset"]: ...
 
     # from_graph: used as decorator (no wraps) or direct call (with wraps)
@@ -137,6 +141,7 @@ class Asset:
         hooks: list[Hook] | None = None,
         automation_condition: AutomationCondition | None = None,
         retry: "RetryPolicy | str | None" = None,
+        actions: list["AssetAction"] | None = None,
     ) -> "GraphAsset": ...
     @classmethod
     @overload
@@ -156,6 +161,7 @@ class Asset:
         hooks: list[Hook] | None = None,
         automation_condition: AutomationCondition | None = None,
         retry: "RetryPolicy | str | None" = None,
+        actions: list["AssetAction"] | None = None,
     ) -> Callable[[Callable[..., Any]], "GraphAsset"]: ...
 
     # external: used as decorator (no wraps) or direct call (with wraps)
@@ -202,44 +208,51 @@ class Asset:
         """Asset name as configured by the user (without defaulting to ``__name__``)."""
         ...
 
-    @property
-    def name(self) -> str:
-        """Resolved asset name."""
-        ...
+    # Declarable configuration — one attribute per decorator keyword, typed as
+    # the accepted input so class-form subclass bodies get completion and
+    # value checking (`class Orders(rs.Asset): io_handler = handler`).
+    name: str
+    """Resolved asset name; class form defaults it to the snake-cased class name."""
+    tags: list[str] | None
+    """Asset-level tags."""
+    kinds: str | list[str] | None
+    """Asset kinds (compute kind / type tags)."""
+    group: str | None
+    """Group the asset belongs to (UI grouping, ``None`` if ungrouped)."""
+    code_version: str | None
+    """Code version string used to detect stale materializations."""
+    io_handler: IOHandler | str | None
+    """IO handler instance, or the name of a repository resource providing one."""
+    metadata: dict[str, str] | None
+    """Static asset metadata configured at definition time."""
+    partitions_def: PartitionsDefinition | str | None
+    """Partitions definition, or ``None`` for non-partitioned assets.
 
-    @property
-    def tags(self) -> list[str] | None:
-        """Asset-level tags."""
-        ...
+    A ``str`` when the asset references a named definition from
+    ``CodeRepository(partition_defs={...})``.
+    """
+    deps: list["DepDef"] | None
+    """Lineage-only dependencies declared without a function parameter.
 
-    @property
-    def kinds(self) -> list[str]:
-        """Asset kinds (compute kind / type tags)."""
-        ...
+    Declaration-time input: set it in a class body; the resolved edges read
+    back off the repository graph, not the asset object.
+    """
+    backfill_strategy: BackfillStrategy | None
+    """How backfills chunk this asset's partitions."""
+    pool_slots: int | dict[str, int] | None
+    """Slots claimed from the asset's pool(s) while materializing.
 
-    @property
-    def group(self) -> str | None:
-        """Group the asset belongs to (UI grouping, ``None`` if ungrouped)."""
-        ...
+    Declaration-time input: it folds into :attr:`pool` as ``(name, slots)``
+    pairs, which is what reads back.
+    """
+    retry: "RetryPolicy | str | None"
+    """Retry policy, or the name of a policy registered on the repository.
 
-    @property
-    def metadata(self) -> dict[str, str] | None:
-        """Static asset metadata configured at definition time."""
-        ...
-
-    @property
-    def code_version(self) -> str | None:
-        """Code version string used to detect stale materializations."""
-        ...
-
-    @property
-    def partitions_def(self) -> PartitionsDefinition | str | None:
-        """Partitions definition, or ``None`` for non-partitioned assets.
-
-        A ``str`` when the asset references a named definition from
-        ``CodeRepository(partition_defs={...})``.
-        """
-        ...
+    Reads back as the :class:`RetryPolicy`, or as the registry name until the
+    repository resolves it.
+    """
+    compute: Compute | None
+    """Compute environment/escalation for this asset's steps."""
 
     @property
     def observe_fn(self) -> Callable | None:
@@ -271,24 +284,19 @@ class Asset:
         """``True`` for :class:`ExternalAsset` instances."""
         ...
 
-    @property
-    def hooks(self) -> list[Hook] | None:
-        """Hooks attached to this asset."""
-        ...
+    hooks: list[Hook] | None
+    """Hooks attached to this asset."""
+    automation_condition: AutomationCondition | None
+    """Automation condition driving auto-materialization, if any."""
+    pool: str | list[str] | list[tuple[str, int]] | None
+    """Concurrency pool(s) this asset claims when materializing.
 
-    @property
-    def automation_condition(self) -> AutomationCondition | None:
-        """Automation condition driving auto-materialization, if any."""
-        ...
+    Declared as a name or list of names; resolves to ``(name, slots)`` pairs.
+    """
 
     @property
     def partition_mapping(self) -> dict[str, PartitionMapping] | None:
         """Per-dependency partition-mapping overrides keyed by dep name."""
-        ...
-
-    @property
-    def pool(self) -> list[tuple[str, int]]:
-        """Concurrency pools and slot counts this asset claims when materializing."""
         ...
 
 class SingleAsset(Asset):
@@ -309,6 +317,9 @@ class MultiAsset(Asset):
 class GraphAsset(Asset):
     """An asset whose value is computed by composing tasks (``@Asset.from_graph``)."""
 
+    node_io_handler: IOHandler | str | None
+    """IO handler for intermediate node outputs inside the composition."""
+
 class ExternalAsset(Asset):
     """An asset materialized outside rivers whose state we observe / track.
 
@@ -323,7 +334,7 @@ class ExternalAsset(Asset):
 class AssetDef:
     """Output / dep definition used inside :meth:`Asset.from_multi` and :class:`DepDef`."""
 
-    name: str
+    name: str | None
     tags: list[str] | None
     kinds: list[str]
     group: str | None
@@ -336,7 +347,7 @@ class AssetDef:
 
     def __init__(
         self,
-        name: str,
+        name: str | None = ...,
         tags: list[str] | None = ...,
         kinds: str | list[str] | None = ...,
         group: str | None = ...,
@@ -348,11 +359,15 @@ class AssetDef:
         pool: str | list[str] | None = ...,
         pool_slots: int | dict[str, int] | None = ...,
         deps: list["DepDef"] = ...,
+        actions: list["AssetAction"] | None = ...,
     ) -> None:
         """Build an asset definition shared between multi-asset outputs and deps.
 
-        Step ``compute`` and ``retry`` are declared on :meth:`Asset.from_multi`
-        itself (a multi-asset runs and retries as one step), not per output.
+        ``name`` may be omitted only when the def is assigned as a class
+        attribute of a class-form ``MultiAsset`` subclass — the attribute name
+        is injected at registration. Step ``compute`` and ``retry`` are
+        declared on :meth:`Asset.from_multi` itself (a multi-asset runs and
+        retries as one step), not per output.
         """
         ...
 
@@ -495,3 +510,136 @@ class AssetExecutionContext(Generic[ConfigT]):
     def config(self) -> ConfigT:
         """Resolved asset config (typed via the generic parameter)."""
         ...
+
+class Outcome:
+    """Declared upper bound for what an action does to orchestration state.
+
+    The outcome describes materialization state, not physical bytes — a Delta
+    ``optimize`` rewrites every file and is still ``Unchanged``.
+    """
+
+    Unchanged: "Outcome"
+    MayMaterialize: "Outcome"
+    Unmaterialize: "Outcome"
+    Observe: "Outcome"
+
+class ActionConcurrency:
+    """Whether an action can overlap other work on the same asset."""
+
+    Shared: "ActionConcurrency"
+    Exclusive: "ActionConcurrency"
+
+class ActionOrdering:
+    """Asset order when one action run targets several related assets."""
+
+    Unordered: "ActionOrdering"
+    Topological: "ActionOrdering"
+    ReverseTopological: "ActionOrdering"
+
+class AssetAction:
+    """A named operation on an asset beyond materialize.
+
+    The interchange format between definition styles: build one once, list it
+    in decorator ``actions=[...]`` or assign it as a class attribute. Apply as
+    a decorator to bind the body::
+
+        delta_optimize = rs.AssetAction(
+            name="optimize",
+            outcome=rs.Outcome.Unchanged,
+            concurrency=rs.ActionConcurrency.Exclusive,
+        )(_optimize)
+    """
+
+    name: str
+    outcome: Outcome
+    exclusive: bool
+    description: str | None
+
+    def __init__(
+        self,
+        name: str,
+        outcome: Outcome,
+        concurrency: ActionConcurrency | None = ...,
+        ordering: ActionOrdering | None = ...,
+        retry: "RetryPolicy | str | None" = ...,
+        description: str | None = ...,
+    ) -> None: ...
+    def __call__(self, func: Callable[..., Any]) -> "AssetAction": ...
+
+class ActionContext(Generic[ConfigT]):
+    """Context injected into action functions as their first parameter.
+
+    Actions receive no upstream inputs — upstream is never executed. The
+    ``io_handler`` is the asset's resolved handler, usable as a config bag
+    (same storage options / URI resolution the write path uses). Parameters
+    after the context are resources, injected by name — the same rule
+    materialize functions use.
+
+    Annotate the parameter as ``rs.ActionContext[MyConfig]`` to receive a
+    config instance; override values come from ``run_action(config=...)``.
+    """
+
+    asset_key: str
+    action: str
+    run_id: str
+    asset_metadata: dict[str, str] | None
+    partition: PartitionContext | None
+    io_handler: Any
+    config: ConfigT | None
+
+    @property
+    def has_partition_key(self) -> bool: ...
+    @property
+    def partition_key(self) -> str: ...
+    @property
+    def partition_time_window(
+        self,
+    ) -> tuple[datetime.datetime, datetime.datetime] | None: ...
+    @property
+    def log(self) -> logging.Logger: ...
+
+class ActionResult:
+    """What an action actually did, reported at runtime.
+
+    The declared ``outcome`` is the planning upper bound; the report decides
+    whether downstream goes stale — without it, every no-op merge would
+    cascade the whole graph::
+
+        @rs.action(outcome=rs.Outcome.MayMaterialize)
+        @classmethod
+        def merge_late(cls, ctx) -> rs.ActionResult:
+            if nothing_to_merge:
+                return rs.ActionResult.unchanged()
+            return rs.ActionResult.materialized(metadata={"rows": n})
+    """
+
+    data_version: str | None
+
+    @staticmethod
+    def unchanged(metadata: dict[str, Any] | None = ...) -> "ActionResult": ...
+    @staticmethod
+    def materialized(
+        metadata: dict[str, Any] | None = ..., data_version: str | None = ...
+    ) -> "ActionResult": ...
+
+_F = TypeVar("_F")
+
+def action(
+    *,
+    outcome: Outcome,
+    concurrency: "ActionConcurrency | None" = ...,
+    ordering: "ActionOrdering | None" = ...,
+    retry: "RetryPolicy | str | None" = ...,
+    description: str | None = ...,
+    name: str | None = ...,
+) -> Callable[[_F], _F]:
+    """Mark a classmethod in an asset class body as an action."""
+
+def desugar(cls: type) -> Asset:
+    """Translate a class-form asset into the equivalent decorator-form object."""
+
+def is_asset_class(obj: object) -> bool:
+    """True for a user-defined subclass of one of the four asset bases."""
+
+def node_names(cls: type) -> list[str]:
+    """Graph node names a class-form asset registers under (Job selection)."""

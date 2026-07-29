@@ -104,6 +104,16 @@ pub async fn get_assets_info(
                     function_name: h.function_name,
                 })
                 .collect();
+            let actions = a
+                .actions
+                .into_iter()
+                .map(|act| crate::types::AssetActionInfo {
+                    name: act.name,
+                    outcome: act.outcome,
+                    exclusive: act.exclusive,
+                    description: act.description,
+                })
+                .collect();
             AssetDefinitionInfo {
                 asset_key: a.asset_key,
                 description: a.description,
@@ -118,6 +128,7 @@ pub async fn get_assets_info(
                 group: a.group,
                 code_version: a.code_version,
                 asset_type: a.asset_type,
+                actions,
             }
         })
         .collect();

@@ -48,6 +48,7 @@ nav:
       - Dagster: comparisons/dagster.md
   - Concepts:
       - Assets: concepts/assets.md
+      - Asset Actions: concepts/actions.md
       - Jobs & Executors: concepts/jobs.md
       - Partitions: concepts/partitions.md
       - IO Handlers: concepts/io-handlers.md
@@ -63,6 +64,7 @@ nav:
       - Kubernetes: installation/kubernetes.md
   - Guides:
       - Migrating from Dagster/Prefect: guides/migrating.md
+      - Class-Based Assets: guides/class-assets.md
       - Graph Assets: guides/graph-assets.md
       - Partitioned Assets: guides/partitioned-assets.md
       - Delta Lake: guides/delta-lake.md

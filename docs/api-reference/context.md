@@ -133,6 +133,41 @@ def partitioned_task(context: rs.TaskExecutionContext) -> str:
 
 ---
 
+## `ActionContext`
+
+The context an [asset action](../concepts/actions.md) receives. An action acts on data
+that already exists, so this context carries no upstream inputs and no output metadata —
+it identifies the target and hands over the asset's resolved IO handler.
+
+### Usage
+
+The **first parameter is always the context** (no annotation required); parameters after
+it are resources injected by name. Annotate it as `ActionContext[Config]` to receive
+typed config.
+
+```python
+@rs.action(outcome=rs.Outcome.Unchanged)
+@classmethod
+def compact(cls, ctx: rs.ActionContext, warehouse: DuckDB) -> None:
+    warehouse.execute(f"VACUUM {ctx.asset_key}")
+```
+
+### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `asset_key` | `str` | Asset the action is running on. |
+| `action` | `str` | The verb being run. |
+| `run_id` | `str` | Run this action belongs to. |
+| `partition` | `PartitionContext \| None` | Partition context (if partitioned). |
+| `partition_key` | `str \| None` | Partition being acted on, or `None`. |
+| `io_handler` | `Any` | The asset's resolved IO handler — the action's config bag for locating the data. |
+| `asset_metadata` | `dict[str, str]` | Per-asset metadata that IO resolution honors. |
+| `config` | `ConfigT \| None` | Typed config from an `ActionContext[Config]` annotation; `None` without one. |
+| `log` | `logging.Logger` | Logger for the action. |
+
+---
+
 ## Detection rules
 
 Both context types follow the same injection rules:
@@ -142,6 +177,10 @@ Both context types follow the same injection rules:
 3. Context as a non-first parameter raises `ExecutionError` (`"Context must be the first parameter of '<step>'"`)
 
 Tasks can use either `TaskExecutionContext` (recommended) or `AssetExecutionContext` (backward compatible).
+
+Actions differ: their **first parameter is always the `ActionContext`**, annotated or not
+(a zero-parameter action is allowed). Naming that parameter after a resource is an error
+rather than a silent context binding.
 
 ## Executor support
 

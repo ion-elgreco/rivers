@@ -391,6 +391,8 @@ pub struct PyRunRecord {
     pub partition_key: Option<PyPartitionKey>,
     pub block_reason: Option<String>,
     pub launched_by: PyLaunchedBy,
+    /// The verb this run executes. `None` means materialize.
+    pub action: Option<String>,
 }
 
 impl From<RunRecord> for PyRunRecord {
@@ -407,6 +409,7 @@ impl From<RunRecord> for PyRunRecord {
             partition_key: r.partition_key.as_ref().map(PyPartitionKey::from),
             block_reason: r.block_reason,
             launched_by: r.launched_by.into(),
+            action: r.action,
         }
     }
 }
@@ -1432,6 +1435,7 @@ impl PyStorage {
             partition_key: None,
             block_reason,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         py.detach(|| {
             io_rt()
@@ -1485,6 +1489,7 @@ impl PyStorage {
             end_time: None,
             error: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         py.detach(|| {
             io_rt()

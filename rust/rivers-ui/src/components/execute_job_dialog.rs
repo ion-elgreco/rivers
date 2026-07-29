@@ -10,7 +10,7 @@ use leptos::prelude::*;
 use crate::components::partition_picker::PartitionPicker;
 use crate::helpers::JobPartitionPicker;
 use crate::loc::{loc_path, use_current_location};
-use crate::server_fns::actions::{execute_job, launch_backfill};
+use crate::server_fns::mutations::{execute_job, launch_backfill};
 use crate::types::SubmitPartitionKey;
 
 /// Above this many selected partitions, submit one job-aware backfill instead of
@@ -50,7 +50,7 @@ pub fn ExecuteJobDialog(
             if keys.len() > BACKFILL_THRESHOLD {
                 // >2 partitions → one job-aware backfill. `None` selection: the
                 // server resolves the job's assets.
-                let r = launch_backfill(ns, name, None, keys, None, Some(job))
+                let r = launch_backfill(ns, name, None, keys, None, Some(job), None)
                     .await
                     .map_err(|e| format!("{e}"))?;
                 return Ok::<ExecOutcome, String>(ExecOutcome::Backfill(r.backfill_id));

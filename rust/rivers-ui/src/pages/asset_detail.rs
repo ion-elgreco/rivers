@@ -15,10 +15,10 @@ use crate::helpers::{
     partition_picker_for_assets, run_status_class, run_status_kind, short_id, use_query_param,
 };
 use crate::loc::{loc_path, use_current_location};
-use crate::server_fns::actions::{materialize_missing_partitions, trigger_materialize};
 use crate::server_fns::assets::{get_asset, get_asset_events, get_asset_events_page, get_assets};
 use crate::server_fns::automation::{get_condition_evals, observe_asset};
 use crate::server_fns::graph::get_graph_topology;
+use crate::server_fns::mutations::{materialize_missing_partitions, trigger_materialize};
 use crate::server_fns::overview::{get_assets_info, get_partition_status};
 use crate::server_fns::runs::get_runs_for_asset;
 
@@ -26,7 +26,8 @@ fn event_type_class(t: &str) -> &'static str {
     match t {
         "Materialization" | "StepSuccess" => "ok",
         "StepFailure" => "err",
-        "Observation" => "info",
+        "Observation" | "ActionCompleted" => "info",
+        "Deletion" => "warn",
         _ => "muted",
     }
 }
@@ -109,6 +110,10 @@ pub fn AssetDetailPage() -> impl IntoView {
     // Derive asset properties into signals (avoids reading Resource outside Transition)
     let is_external = RwSignal::new(false);
     let has_partitions = RwSignal::new(false);
+    let asset_actions = RwSignal::new(Vec::<crate::types::AssetActionInfo>::new());
+    // Externals without an observe fn expose no `observe` action — offering
+    // the button anyway produced a guaranteed failure.
+    let is_observable = RwSignal::new(false);
     Effect::new(move |_| {
         params.track();
         let current_key = key();
@@ -120,6 +125,22 @@ pub fn AssetDetailPage() -> impl IntoView {
         has_partitions.set(
             info.as_ref()
                 .map(|i| i.partition_def.is_some())
+                .unwrap_or(false),
+        );
+        asset_actions.set(
+            info.as_ref()
+                .map(|i| {
+                    i.actions
+                        .iter()
+                        .filter(|a| a.name != "observe")
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+        is_observable.set(
+            info.as_ref()
+                .map(|i| i.actions.iter().any(|a| a.name == "observe"))
                 .unwrap_or(false),
         );
     });
@@ -166,6 +187,18 @@ pub fn AssetDetailPage() -> impl IntoView {
     });
     let materialize_pending = materialize_action.pending();
 
+    // One dispatcher for every asset action button; the verb rides in the
+    // action input. Partitioned assets go through the dialog instead, which
+    // needs a key per run — `dialog_verb` tells it which verb to submit.
+    let run_asset_action = Action::new(move |verb: &String| {
+        let verb = verb.clone();
+        let k = key();
+        let (ns, lname) = loc.get();
+        async move { crate::server_fns::mutations::trigger_action(ns, lname, verb, vec![k], None).await }
+    });
+    let action_pending = run_asset_action.pending();
+    let dialog_verb = RwSignal::new(Option::<String>::None);
+
     let (ns_t, name_t) = loc.get();
     let assets_href = loc_path(&ns_t, &name_t, "assets");
     view! {
@@ -179,8 +212,12 @@ pub fn AssetDetailPage() -> impl IntoView {
             />
             {move || {
                 // External assets are read-only at this layer — we can only record
-                // an observation. Non-external assets are materialized instead.
+                // an observation, and only when they define an observe fn.
+                // Non-external assets are materialized instead.
                 if is_external.get() {
+                    if !is_observable.get() {
+                        return ().into_any();
+                    }
                     view! {
                         <button
                             class="btn btn-primary"
@@ -195,6 +232,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                         <button
                             class="btn btn-primary"
                             on:click=move |_| {
+                                dialog_verb.set(None);
                                 if matches!(materialize_picker.get(), JobPartitionPicker::None) {
                                     materialize_action.dispatch(());
                                 } else {
@@ -208,8 +246,36 @@ pub fn AssetDetailPage() -> impl IntoView {
                     }.into_any()
                 }
             }}
+            {move || {
+                asset_actions.get().into_iter().map(|act| {
+                    let verb = act.name.clone();
+                    let label = act.name.clone();
+                    let title = act.description.clone().unwrap_or_else(|| format!("Run action '{}'", act.name));
+                    view! {
+                        <button
+                            class="btn"
+                            title=title
+                            on:click=move |_| {
+                                if matches!(materialize_picker.get(), JobPartitionPicker::None) {
+                                    run_asset_action.dispatch(verb.clone());
+                                } else {
+                                    dialog_verb.set(Some(verb.clone()));
+                                    show_dialog.set(true);
+                                }
+                            }
+                            disabled=move || action_pending.get()
+                        >
+                            {label}
+                        </button>
+                    }
+                }).collect_view()
+            }}
             {move || observe_action.value().get().map(|result| match result {
                 Ok(_) => view! { <span class="text-success" style="margin-left: 0.5rem">"Observed"</span> }.into_any(),
+                Err(e) => view! { <span class="text-error" style="margin-left: 0.5rem">{format!("{e}")}</span> }.into_any(),
+            })}
+            {move || run_asset_action.value().get().map(|result| match result {
+                Ok(run_id) => view! { <span class="text-success" style="margin-left: 0.5rem">{format!("Action run {}", crate::helpers::short_id(&run_id, 8))}</span> }.into_any(),
                 Err(e) => view! { <span class="text-error" style="margin-left: 0.5rem">{format!("{e}")}</span> }.into_any(),
             })}
             {move || materialize_action.value().get().map(|result| match result {
@@ -502,6 +568,8 @@ pub fn AssetDetailPage() -> impl IntoView {
                                     crate::types::EventType::Materialization => ("◆", "ok"),
                                     crate::types::EventType::StepFailure => ("▲", "err"),
                                     crate::types::EventType::Observation => ("○", "info"),
+                                    crate::types::EventType::ActionCompleted => ("◇", "info"),
+                                    crate::types::EventType::Deletion => ("✕", "warn"),
                                     _ => return None,
                                 };
                                 let minutes_ago = ((now_ns - e.timestamp) as f64) / 60_000_000_000.0;
@@ -560,6 +628,8 @@ pub fn AssetDetailPage() -> impl IntoView {
                                                 "Materialization" | "StepSuccess" => "◆",
                                                 "StepFailure" => "▲",
                                                 "Observation" => "○",
+                                                "ActionCompleted" => "◇",
+                                                "Deletion" => "✕",
                                                 "StepStart" => "◐",
                                                 _ => "•",
                                             };
@@ -703,6 +773,7 @@ pub fn AssetDetailPage() -> impl IntoView {
             show=show_dialog
             asset_keys=dialog_asset_keys
             picker=materialize_picker
+            action=dialog_verb
         />
     }
 }

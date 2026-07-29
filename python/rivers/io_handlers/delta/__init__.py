@@ -15,6 +15,7 @@ from deltalake import CommitProperties, WriterProperties
 from pydantic_settings import SettingsConfigDict
 
 from rivers._core import InputContext, OutputContext
+from rivers._core.partitions import PartitionContext
 from rivers.io_handlers.base import BaseIOHandler
 from rivers.io_handlers.delta.base import (
     DeltaSchemaMode,
@@ -166,6 +167,40 @@ class DeltaIOHandler(BaseIOHandler):
     def _asset_uri(self, asset_name: str) -> str:
         """Compose the table URI used for ``asset_name``."""
         return f"{self.table_uri}/{asset_name}"
+
+    def asset_table_uri(
+        self, asset_name: str, asset_metadata: dict[str, str] | None = None
+    ) -> str:
+        """``{table_uri}/{leaf}``, honoring the ``delta/root_name`` override.
+
+        The same per-asset URI resolution the write path uses — an action body
+        resolves its ``DeltaTable`` from this plus ``storage_options``:
+
+        Args:
+            asset_name: The asset key (``ctx.asset_key`` in an action).
+            asset_metadata: Per-asset metadata (``ctx.asset_metadata``); the
+                ``delta/root_name`` entry overrides the leaf name.
+        """
+        meta = asset_metadata or {}
+        return self._asset_uri(meta.get("delta/root_name", asset_name))
+
+    def partition_predicate(
+        self,
+        asset_metadata: dict[str, str] | None,
+        partition: PartitionContext,
+    ) -> str:
+        """SQL predicate covering the partition(s), honoring ``delta/partition_expr``.
+
+        The same partition-to-predicate translation the overwrite path uses,
+        for action bodies (``delete``, targeted ``optimize``):
+
+        Args:
+            asset_metadata: Per-asset metadata (``ctx.asset_metadata``); the
+                ``delta/partition_expr`` entry names the predicate column(s).
+            partition: The partition context (``ctx.partition``).
+        """
+        partition_expr = _resolve_partition_expr(asset_metadata or {})
+        return _build_predicate(partition, partition_expr)
 
     def _resolve_write_request(self, context: OutputContext) -> DeltaWriteRequest:
         """Resolves the write request to be used for writing to the Delta table."""

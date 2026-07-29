@@ -1,6 +1,6 @@
 import rivers as rs
 
-from _helpers import DictIOHandler
+from _helpers import DictIOHandler, observation_metadata
 
 
 def test_external_asset_properties():
@@ -77,7 +77,7 @@ def test_external_asset_in_job():
 
 
 def test_external_asset_observe():
-    """Observation function called, metadata collected via repo.observe()."""
+    """Observation runs through the run spine; metadata lands on the event."""
     handler = DictIOHandler()
 
     @rs.Asset.external(io_handler=handler)
@@ -87,8 +87,11 @@ def test_external_asset_observe():
     repo = rs.CodeRepository(assets=[observed])
     result = repo.observe()
 
-    assert "observed" in result
-    assert result["observed"]["row_count"].raw_value() == 42
+    assert result.success
+    run = repo.storage.get_run(result.run_id)
+    assert run.action == "observe"
+    meta = observation_metadata(repo)
+    assert meta["observed"]["row_count"] == 42
 
 
 def test_external_asset_observe_decorator():
@@ -104,7 +107,8 @@ def test_external_asset_observe_decorator():
 
     repo = rs.CodeRepository(assets=[my_source])
     result = repo.observe()
-    assert result["my_source"]["status"].raw_value() == "fresh"
+    assert result.success
+    assert observation_metadata(repo)["my_source"]["status"] == "fresh"
 
 
 def test_external_asset_partitioned():
@@ -166,8 +170,11 @@ def test_external_asset_observe_filtered():
     repo = rs.CodeRepository(assets=[ext_a, ext_b])
     result = repo.observe(asset_names=["ext_a"])
 
-    assert "ext_a" in result
-    assert "ext_b" not in result
+    assert result.success
+    assert repo.storage.get_run(result.run_id).node_names == ["ext_a"]
+    meta = observation_metadata(repo)
+    assert meta["ext_a"]["val"] == 1
+    assert "ext_b" not in meta
 
 
 def test_external_asset_requires_observe_fn_with_condition():
@@ -202,8 +209,9 @@ def test_external_asset_observe_with_automation_condition():
     repo = rs.CodeRepository(assets=[monitored])
     result = repo.observe()
 
-    assert "monitored" in result
-    assert result["monitored"]["status"].raw_value() == "ok"
+    assert result.success
+    meta = observation_metadata(repo)
+    assert meta["monitored"]["status"] == "ok"
 
 
 def test_external_asset_with_condition_and_observe_fn_resolves():

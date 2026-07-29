@@ -5,7 +5,7 @@ import pytest
 
 import rivers as rs
 from _polling import wait_for_asset_materialized as _wait_for_asset_materialized
-from _polling import wait_until
+from _polling import wait_for_run_terminal, wait_until
 
 
 # ── Test helpers ──
@@ -334,11 +334,15 @@ def test_evaluate_sensor_nonexistent(full_grpc_channel):
     assert exc_info.value.code() == grpc.StatusCode.INTERNAL
 
 
-def test_observe_asset(full_grpc_channel):
+def test_run_action_observe(full_grpc_channel):
+    """Observe is the built-in action — triggered via RunAction."""
     channel, pb2, pb2_grpc, _ = full_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)
-    response = stub.ObserveAsset(pb2.ObserveAssetRequest(asset_key="observed"))
+    response = stub.RunAction(
+        pb2.RunActionRequest(action="observe", selection=["observed"])
+    )
     assert response.success is True
+    assert response.run_id != ""
     assert response.error == ""
 
 
@@ -1108,6 +1112,92 @@ def test_rerun_run_job_reuses_partition(rerun_grpc_channel):
     assert rerun_record.partition_key == rs.PartitionKey.single("p3")
     # No rerun_of-tag assertion here: job reruns don't persist per-run tags yet
     # (`RunRequestData.tags` is unused), so the marker only lands on materialization reruns.
+
+
+def test_execute_job_action_records_the_verb(grpc_stubs, storage):
+    """A dispatched run of an action job records its verb — regression: the
+    record was written verbless, so the condition cache treated the run as a
+    materialization attempt and the UI showed no verb."""
+    calls = []
+
+    class Events(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+
+        @classmethod
+        def materialize(cls):
+            return 1
+
+        @rs.action(outcome=rs.Outcome.Unchanged)
+        @classmethod
+        def compact(cls, ctx):
+            calls.append("c")
+
+    job = rs.Job(name="compact_job", assets=[Events], action="compact")
+    repo = rs.CodeRepository(
+        assets=[Events], jobs=[job], default_executor=rs.Executor.in_process()
+    )
+    repo.resolve(storage=storage)
+    port = repo._start_grpc_server("127.0.0.1", 0)
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+    pb2, pb2_grpc = grpc_stubs
+    try:
+        stub = pb2_grpc.CodeLocationServiceStub(channel)
+        resp = stub.ExecuteJob(pb2.ExecuteJobRequest(job_name="compact_job"))
+        assert resp.run_id
+
+        record = wait_for_run_terminal(storage, resp.run_id, timeout=15)
+        assert record is not None and record.status == "Success"
+        assert record.action == "compact"
+        assert calls == ["c"]
+    finally:
+        channel.close()
+        repo._stop_grpc_server()
+
+
+def test_rerun_run_action_replays_the_action(grpc_stubs, storage):
+    """Rerunning an action run replays the ACTION — regression: the verb was
+    dropped from the rerun request and a rerun of e.g. `delete` silently
+    re-materialized the asset."""
+    calls = []
+    materialized = []
+
+    class Events(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext):
+            materialized.append("m")
+            return 1
+
+        @rs.action(outcome=rs.Outcome.Unchanged)
+        @classmethod
+        def compact(cls, ctx):
+            calls.append("c")
+
+    repo = rs.CodeRepository(assets=[Events], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+    port = repo._start_grpc_server("127.0.0.1", 0)
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+    pb2, pb2_grpc = grpc_stubs
+    try:
+        stub = pb2_grpc.CodeLocationServiceStub(channel)
+        original = repo.run_action("compact")
+        assert original.success
+        assert calls == ["c"]
+
+        rerun = stub.RerunRun(pb2.RerunRunRequest(run_id=original.run_id))
+        assert rerun.run_id != original.run_id
+
+        record = wait_for_run_terminal(storage, rerun.run_id, timeout=15)
+        assert record is not None and record.status == "Success"
+        assert record.action == "compact"
+        assert calls == ["c", "c"]
+        assert materialized == []
+    finally:
+        channel.close()
+        repo._stop_grpc_server()
 
 
 def test_rerun_run_not_found(rerun_grpc_channel):

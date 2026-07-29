@@ -107,7 +107,8 @@ def test_external_asset_observe_no_fn_skipped():
     ext = rs.Asset.external(name="x", io_handler=DummyHandler())
     repo = rs.CodeRepository(assets=[ext])
     result = repo.observe()
-    assert "x" not in result
+    assert result.success
+    assert "x" not in result.materialized_assets
 
 
 def test_in_latest_time_window_requires_time_partitioning():
@@ -178,14 +179,17 @@ def test_repo_empty_assets():
 
 
 def test_repo_observe_no_externals():
-    """repo.observe() returns empty dict when no external assets exist."""
+    """repo.observe() is a successful no-op when no external assets exist."""
 
     @rs.Asset
     def a():
         return 1
 
     repo = rs.CodeRepository(assets=[a])
-    assert repo.observe() == {}
+    result = repo.observe()
+    assert result.success
+    assert result.run_id == ""
+    assert result.materialized_assets == []
 
 
 # ---------------------------------------------------------------------------

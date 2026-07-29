@@ -145,6 +145,13 @@ pub enum EventType {
     StepSlotRenewed,
     /// Step released pool slots.
     StepSlotReleased,
+    /// An asset action ran to completion without changing materialization
+    /// state. The action name rides in the event metadata (`action` key) and
+    /// on the run's `RunRecord::action`.
+    ActionCompleted,
+    /// An `Unmaterialize` action cleared the asset's (or partition's)
+    /// materialization state. The action name rides in the event metadata.
+    Deletion,
 }
 
 impl EventType {
@@ -174,6 +181,8 @@ impl EventType {
             Self::StepSlotWaiting => "StepSlotWaiting",
             Self::StepSlotRenewed => "StepSlotRenewed",
             Self::StepSlotReleased => "StepSlotReleased",
+            Self::ActionCompleted => "ActionCompleted",
+            Self::Deletion => "Deletion",
         }
     }
 
@@ -196,6 +205,8 @@ impl EventType {
             "StepSlotWaiting" => Ok(Self::StepSlotWaiting),
             "StepSlotRenewed" => Ok(Self::StepSlotRenewed),
             "StepSlotReleased" => Ok(Self::StepSlotReleased),
+            "ActionCompleted" => Ok(Self::ActionCompleted),
+            "Deletion" => Ok(Self::Deletion),
             _ => Err(format!("unknown EventType: {name}")),
         }
     }
@@ -208,12 +219,16 @@ impl EventType {
         matches!(self, Self::Observation { .. })
     }
 
+    pub fn is_deletion(&self) -> bool {
+        matches!(self, Self::Deletion)
+    }
+
     /// Sort priority within the same timestamp.
     pub fn sort_order(&self) -> i64 {
         match self {
             Self::StepStart => 0,
             Self::Observation { .. } => 2,
-            Self::Materialization { .. } => 3,
+            Self::Materialization { .. } | Self::ActionCompleted | Self::Deletion => 3,
             Self::StepSuccess | Self::StepFailure | Self::StepRetry => 4,
             Self::RunQueued | Self::RunDequeued | Self::RunLaunchFailed => 5,
             Self::StepSlotClaimed
@@ -767,6 +782,9 @@ pub struct RunRecord {
     pub block_reason: Option<String>,
     #[serde(default)]
     pub launched_by: LaunchedBy,
+    /// The verb this run executes. `None` means materialize (rows predate actions).
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
 pub fn default_code_location_id() -> String {
@@ -799,6 +817,9 @@ pub struct CoordinatorRunInfo {
     pub partition_key: Option<PartitionKey>,
     #[serde(default)]
     pub start_time: i64,
+    /// See [`RunRecord::action`] — the backend must execute this verb, not materialize.
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
 impl crate::concurrency::Tagged for CoordinatorRunInfo {
@@ -816,6 +837,9 @@ pub struct RunFilter {
     pub job_substring: Option<String>,
     pub asset_substring: Option<String>,
     pub partition_substring: Option<String>,
+    /// Which verb the run executes. `Some(None)` selects materialize runs
+    /// (rows with no action), `Some(Some(verb))` that verb.
+    pub action: Option<Option<String>>,
 }
 
 /// One page of run records plus the total number of rows matching the filter.
@@ -1028,6 +1052,9 @@ pub struct BackfillRecord {
     #[serde(default)]
     #[surreal(default)]
     pub launched_by: LaunchedBy,
+    /// The verb child runs execute. `None` means materialize.
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
 // ── Concurrency pool records ──
@@ -1537,6 +1564,15 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         since_timestamp: i64,
     ) -> impl Future<Output = Result<Vec<(PartitionKey, i64)>>> + Send;
 
+    /// Timestamps for exactly `keys` — keys with no row (e.g. deleted
+    /// partitions) are simply absent from the result.
+    fn get_partition_timestamps_for_keys(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        keys: &[PartitionKey],
+    ) -> impl Future<Output = Result<Vec<(PartitionKey, i64)>>> + Send;
+
     fn get_in_progress_partitions(
         &self,
         code_location_id: &str,
@@ -1920,6 +1956,16 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
     ) -> Result<Vec<(PartitionKey, i64)>> {
         self.backend
             .get_partition_timestamps_since(self.code_location_id, asset_key, since_timestamp)
+            .await
+    }
+
+    pub async fn get_partition_timestamps_for_keys(
+        &self,
+        asset_key: &str,
+        keys: &[PartitionKey],
+    ) -> Result<Vec<(PartitionKey, i64)>> {
+        self.backend
+            .get_partition_timestamps_for_keys(self.code_location_id, asset_key, keys)
             .await
     }
 
@@ -2404,6 +2450,8 @@ mod event_type_tests {
             EventType::StepSlotWaiting,
             EventType::StepSlotRenewed,
             EventType::StepSlotReleased,
+            EventType::ActionCompleted,
+            EventType::Deletion,
         ];
         for ev in variants {
             let name = ev.type_name();

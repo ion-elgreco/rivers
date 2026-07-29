@@ -289,12 +289,34 @@ fn build_io_load_spec(
 
 /// Extract (module, qualname) from a callable for pickle-safe ref construction.
 /// Returns Err for closures/local functions (qualname contains `<locals>`).
+///
+/// A bound classmethod's `__qualname__` names the class that *defined* the
+/// function, not the class it is bound to — an inherited verb on a class-form
+/// asset would re-import bound to the base. Resolve through `__self__` so the
+/// child rebinds to the subclass the parent actually invoked.
 pub(crate) fn extract_module_qualname(py: Python, func: &Py<PyAny>) -> PyResult<(String, String)> {
-    let module: String = func.getattr(py, "__module__")?.extract(py)?;
-    let qualname: String = func.getattr(py, "__qualname__")?.extract(py)?;
+    let (module, qualname) = match func.getattr(py, "__self__") {
+        Ok(owner) if owner.bind(py).is_instance_of::<pyo3::types::PyType>() => {
+            let module: String = owner.getattr(py, "__module__")?.extract(py)?;
+            let owner_qualname: String = owner.getattr(py, "__qualname__")?.extract(py)?;
+            let name: String = func.getattr(py, "__name__")?.extract(py)?;
+            (module, format!("{owner_qualname}.{name}"))
+        }
+        _ => (
+            func.getattr(py, "__module__")?.extract(py)?,
+            func.getattr(py, "__qualname__")?.extract(py)?,
+        ),
+    };
     if qualname.contains("<") {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "qualname contains <locals>",
+        ));
+    }
+    // A spawned worker's __main__ is the loky bootstrap, not the user's
+    // script — such a ref can never resolve; fall back to pickling by value.
+    if module == "__main__" {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "__main__ is not importable in workers",
         ));
     }
     Ok((module, qualname))
@@ -308,9 +330,16 @@ pub(crate) fn make_func_ref(py: Python, func: &Py<PyAny>) -> PyResult<Py<PyAny>>
 }
 
 /// Wrap an IO handler in an `IOHandlerRef` for pickle-safe transport.
-/// Falls back to raw handler for closures/local functions.
+/// Falls back to raw handler for closures/local functions, and for refs the
+/// child could not resolve to a handler (probed parent-side; the module is
+/// already imported here, so the probe is cheap).
 pub(super) fn make_io_handler_ref(py: Python, func: &Py<PyAny>) -> PyResult<Py<PyAny>> {
     let (module, qualname) = extract_module_qualname(py, func)?;
+    if super::worker::resolve_handler_from_path(py, &module, &qualname).is_none() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "no io_handler reachable via module path; ship raw handler",
+        ));
+    }
     Ok(Py::new(py, super::worker::PyIOHandlerRef::new(module, qualname))?.into_any())
 }
 

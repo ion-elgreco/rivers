@@ -5,6 +5,10 @@ from pathlib import Path
 from pyright import run as pyright_run
 
 STUBS_FILE = str(Path(__file__).parent / "stubs.py")
+BAD_CLASS_FORM_FILE = str(Path(__file__).parent / "stubs_class_form_bad.py")
+# Run pyright from the repo root: python/pyproject.toml excludes **/tests from
+# package-wide checks, which would silently skip these sample files.
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 EXPECTED_TYPES = {
     "ext": "ExternalAsset",
@@ -22,6 +26,8 @@ EXPECTED_TYPES = {
     "load_any": "Any",
     "load_typed": "int",
     "load_typed_str": "str",
+    "class_repo": "CodeRepository",
+    "ctx.config": "TuneConfig | None",
 }
 
 
@@ -39,7 +45,9 @@ def _parse_reveal_types(output: str) -> dict[str, str]:
 
 
 def test_stub_types():
-    result = pyright_run(STUBS_FILE, capture_output=True, text=True, timeout=60)
+    result = pyright_run(
+        STUBS_FILE, capture_output=True, text=True, timeout=60, cwd=REPO_ROOT
+    )
 
     revealed = _parse_reveal_types(result.stdout)  # type: ignore
 
@@ -50,3 +58,34 @@ def test_stub_types():
         assert actual == expected_type, (
             f"reveal_type({var_name}): expected {expected_type!r}, got {actual!r}"
         )
+
+
+def test_class_form_bad_values_flagged():
+    """Wrong-typed declarable attributes must be errors — proves they aren't Any."""
+    expected = {
+        lineno
+        for lineno, line in enumerate(
+            Path(BAD_CLASS_FORM_FILE).read_text().splitlines(), start=1
+        )
+        if "# EXPECT-ERROR" in line
+    }
+    assert expected, "marker scan found no # EXPECT-ERROR lines"
+
+    result = pyright_run(
+        BAD_CLASS_FORM_FILE, capture_output=True, text=True, timeout=60, cwd=REPO_ROOT
+    )
+    assert result.returncode != 0, "pyright reported no errors on the bad sample"
+
+    flagged = set()
+    for line in result.stdout.splitlines():  # "  /path/file.py:11:13 - error: ..."
+        location, sep, _ = line.partition(" - error:")
+        if not sep:
+            continue
+        parts = location.strip().rsplit(":", 2)
+        if len(parts) == 3 and parts[0].endswith("stubs_class_form_bad.py"):
+            flagged.add(int(parts[1]))
+
+    assert expected <= flagged, (
+        f"expected errors on lines {sorted(expected)}, pyright flagged "
+        f"{sorted(flagged)}:\n{result.stdout}"
+    )

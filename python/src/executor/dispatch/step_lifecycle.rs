@@ -90,7 +90,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
         ctx.emit_start(name, now_ts());
     }
 
-    let policy = ctx.retry_policy_for(step).cloned();
+    let policy = ctx.retry_policy_for(step);
     let mut attempt: u32 = 1;
     if ctx.scope.resume
         && policy.is_some()
