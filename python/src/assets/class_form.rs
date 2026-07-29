@@ -1,13 +1,10 @@
 //! Class-form asset definitions — registration-time desugar.
 //!
-//! An asset class is a class whose body lists its verbs: subclass one of the
-//! four bases (`rs.Asset`, `rs.MultiAsset`, `rs.GraphAsset`, `rs.ExternalAsset`)
-//! and pass the class to `CodeRepository(assets=[...])`. `desugar` translates
-//! the class body into the exact decorator-form calls — one resolution path,
-//! one executor. Mixins are plain classes never listed in `assets`.
-//!
-//! This module must never grow execution knowledge; it only translates a
-//! class body into decorator-call arguments.
+//! An asset class subclasses one of the four bases (`rs.Asset`, `rs.MultiAsset`,
+//! `rs.GraphAsset`, `rs.ExternalAsset`) and lists its verbs in the class body.
+//! `desugar` translates that body into the exact decorator-form calls — one
+//! resolution path, one executor. Mixins are plain classes never listed in
+//! `assets`. This module must never grow execution knowledge.
 
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict, PyType};
@@ -23,8 +20,8 @@ use super::single_asset::PySingleAsset;
 
 const ACTION_META_ATTR: &str = "__rivers_action_meta__";
 
-// Constructor params desugar computes itself; every other keyword of the
-// target constructor is forwarded 1:1 from a class attribute of the same name.
+// Computed by desugar; every other constructor keyword is forwarded 1:1 from a
+// class attribute of the same name.
 const NON_CONFIG_PARAMS: &[&str] = &["cls", "wraps", "name", "output_defs", "actions"];
 
 /// Forwardable config keys, derived from the constructor's own signature so

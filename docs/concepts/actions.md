@@ -165,14 +165,11 @@ def merge_late_arrivals(cls, ctx) -> rs.ActionResult:
 indistinguishable downstream from a normal materialize, which is exactly
 correct. An action declaring `Unchanged` that reports `materialized()` fails
 the step, as does returning anything other than an `ActionResult` or `None`.
-Per-action `retry=` takes an inline `RetryPolicy` or the name of a policy
-registered in `CodeRepository(retries={...})` — the same two spellings
-asset-level retry accepts.
 
 An action run's steps emit `ActionCompleted` events; the built-in `observe` emits the
-same `Observation` events it always has. Actions declare their own `retry` and never
-inherit the asset's materialize policy — auto-retrying a half-completed merge has
-different safety properties from retrying a pure materialize.
+same `Observation` events it always has. Per-action `retry=` takes an inline
+`RetryPolicy` or the name of one registered in `CodeRepository(retries={...})` — the
+same two spellings asset-level retry accepts.
 
 ## Delete
 
@@ -222,7 +219,8 @@ like any action: `rs.Job(name="obs", assets=[VendorFeed], action="observe")`.
   materialize path — a `Deletion` or `ActionCompleted` is not a materialization, and
   firing success hooks for one would misreport data as fresh. An action that needs a
   side effect performs it in its own body.
-- **Actions never inherit a materialize retry policy.** A verb declares its own
-  `retry=`, defaulting to none; a job-level `retry` together with `action=` is
-  rejected rather than silently dropped.
+- **Actions never inherit a materialize retry policy.** Auto-retrying a
+  half-completed merge has different safety properties from retrying a pure
+  materialize, so a verb declares its own `retry=`, defaulting to none; a job-level
+  `retry` together with `action=` is rejected rather than silently dropped.
 - **Upstream is never pulled in.** An action plan has one step per named target.
