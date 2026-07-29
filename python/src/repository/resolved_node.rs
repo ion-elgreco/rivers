@@ -541,7 +541,7 @@ impl ResolvedNode {
     }
 
     /// True when this node declares at least one `Exclusive` action — such an
-    /// asset carries an implicit one-slot pool that materialize also joins.
+    /// asset carries an implicit pool that materialize takes one slot of.
     pub(crate) fn has_exclusive_action(&self, py: Python) -> bool {
         let ResolvedNode::Asset(node) = self else {
             return false;

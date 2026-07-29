@@ -126,6 +126,7 @@ impl InProcessBackend {
             &instance.instance_name,
             &instance.event_names,
             instance.pools.clone(),
+            instance.asset_scope.clone(),
             InProcessStepWorker {
                 step,
                 input_overrides: overrides_ref,

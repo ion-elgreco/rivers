@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionPlan;
-use rivers_core::storage::ScopedStorageHandle;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::{AssetScope, ScopedStorageHandle};
 use tokio::sync::mpsc;
 
 use crate::assets::io_handler_registry::IOHandlerRegistry;
@@ -112,30 +112,62 @@ pub(crate) struct BatchContext<'a> {
     pub repo: Repo<'a>,
 }
 
-/// The implicit one-slot pool an exclusive action shares with materialize.
+/// The implicit pool an exclusive action shares with materialize.
 pub(crate) fn implicit_asset_pool(asset_key: &str) -> String {
     format!("__asset__:{asset_key}")
 }
 
+/// Capacity of that pool. Exclusion is decided by partition overlap
+/// ([`AssetScope`]), not by counting, so every step takes a single slot and
+/// this only has to be high enough never to bind.
+pub(crate) const EXCLUSIVE_POOL_CAPACITY: u32 = 1_000_000;
+
 impl<'a> BatchContext<'a> {
+    /// What this step touches on the implicit asset pool. `exclusive` marks an
+    /// action; `partitions` is `None` for an unpartitioned run, which conflicts
+    /// with everything on that asset.
+    pub(crate) fn asset_scope(&self, exclusive: bool) -> AssetScope {
+        let partitions = self
+            .scope
+            .partition_key
+            .as_ref()
+            .map(|pk| {
+                pk.members()
+                    .into_iter()
+                    .map(|m| rivers_core::storage::PartitionKey::from(&m).to_display())
+                    .collect::<Vec<_>>()
+            })
+            // An empty set intersects nothing, so it would neither block nor be
+            // blocked. Fall back to whole-asset, the conservative reading.
+            .filter(|members| !members.is_empty());
+        AssetScope {
+            partitions,
+            exclusive,
+        }
+    }
+
+    /// Pools this step claims, and the scope for any implicit asset pool among
+    /// them (`None` when it claims none).
     pub(crate) fn step_pools(
         &self,
         step: &rivers_core::execution::plan::ExecutionStep,
-    ) -> Vec<(String, u32)> {
+    ) -> (Vec<(String, u32)>, Option<AssetScope>) {
         let mut pools = self
             .repo
             .node_map
             .get(&step.name)
             .map(|n| n.pool())
             .unwrap_or_default();
-        // Exclusive actions: an exclusive action step joins its asset's
-        // implicit one-slot pool; a materialize step joins it for every
-        // output that declares one (a multi materializes all outputs in one
-        // step, so it claims each output's pool). Assets without exclusive
-        // actions never touch this.
+        let user_pools = pools.len();
+        let mut exclusive = false;
+        // Exclusive actions: both sides take one slot of the asset's implicit
+        // pool and the claim carries an `AssetScope`, so admission is decided by
+        // which partitions each side touches rather than by slot count. A multi
+        // materializes all outputs in one step, so it claims each output's pool.
+        // Assets without exclusive actions never touch this.
         Python::attach(|py| match self.scope.plan.verb() {
             Some(verb) => {
-                let exclusive = self
+                exclusive = self
                     .repo
                     .node_map
                     .get(&step.name)
@@ -170,7 +202,8 @@ impl<'a> BatchContext<'a> {
                 }
             }
         });
-        pools
+        let scope = (pools.len() > user_pools).then(|| self.asset_scope(exclusive));
+        (pools, scope)
     }
 
     pub(crate) fn event_sender(&self) -> mpsc::UnboundedSender<WriterMsg> {

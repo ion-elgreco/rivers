@@ -1322,7 +1322,7 @@ impl PyStorage {
             let status = io_rt()
                 .block_on(
                     self.scoped()
-                        .claim_concurrency_slots(&pools, run_id, step_key, priority, secs),
+                        .claim_concurrency_slots(&pools, run_id, step_key, priority, secs, None),
                 )
                 .map_err(to_py_err)?;
             Ok(PyConcurrencyClaimStatus::from(status))

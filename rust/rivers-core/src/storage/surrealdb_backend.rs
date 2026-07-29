@@ -10,12 +10,12 @@ use surrealdb::types::{Bytes, RecordId, SurrealValue};
 #[cfg(test)]
 use super::DEFAULT_CODE_LOCATION_ID;
 use super::{
-    AssetRecord, BackfillFilter, BackfillRecord, BackfillStatus, BackfillsPage, BackfillsSummary,
-    BlockReason, ConcurrencyClaimStatus, ConditionEvalRecord, ConditionTickRecord,
-    CoordinatorRunInfo, EventRecord, EventType, LogRecord, PartitionKey, PerCodeLocationStorage,
-    PoolBlockDetail, PoolInfo, PoolLimit, RunFilter, RunOutcome, RunProgress, RunRecord, RunStatus,
-    RunsPage, RunsSummary, SlotHolder, StorageBackend, StoredConditionEval, StoredConditionTick,
-    StoredEvent, StoredLog, StoredTick, TickRecord,
+    ASSET_POOL_PREFIX, AssetRecord, AssetScope, BackfillFilter, BackfillRecord, BackfillStatus,
+    BackfillsPage, BackfillsSummary, BlockReason, ConcurrencyClaimStatus, ConditionEvalRecord,
+    ConditionTickRecord, CoordinatorRunInfo, EventRecord, EventType, LogRecord, PartitionKey,
+    PerCodeLocationStorage, PoolBlockDetail, PoolInfo, PoolLimit, RunFilter, RunOutcome,
+    RunProgress, RunRecord, RunStatus, RunsPage, RunsSummary, SlotHolder, StorageBackend,
+    StoredConditionEval, StoredConditionTick, StoredEvent, StoredLog, StoredTick, TickRecord,
 };
 #[cfg(test)]
 use crate::assets::graph::GraphTopology;
@@ -1538,8 +1538,46 @@ impl SurrealStorage {
         Ok((pool, claimed.unwrap_or(0)))
     }
 
+    /// SurrealQL fragment that finds a live slot conflicting with `scope` on an
+    /// implicit asset pool. Empty result = free to claim.
+    ///
+    /// Two non-exclusive holders never conflict, so the cheap `exclusive` test
+    /// is first and the set comparison is skipped entirely on the hot path
+    /// (concurrent materializes). Beyond that a whole-asset scope (`NONE`)
+    /// conflicts with everything, and otherwise the partition sets must
+    /// actually intersect.
+    fn asset_conflict_clause(i: usize, scope: Option<&AssetScope>) -> String {
+        let (mine_exclusive, mine_is_whole_asset) = match scope {
+            Some(s) => (s.exclusive, s.partitions.is_none()),
+            // No scope supplied: treat as whole-asset exclusive, matching how a
+            // pre-V5 row (partitions NONE) reads back.
+            None => (true, true),
+        };
+        let overlap = if mine_is_whole_asset {
+            "true".to_string()
+        } else {
+            format!("(partitions IS NONE OR partitions CONTAINSANY $parts{i})")
+        };
+        format!(
+            "LET $conf_{i} = (SELECT VALUE id FROM concurrency_slots \
+                 WHERE code_location_id = $cl AND pool_key = $p{i} \
+                 AND lease_expires_at > $now \
+                 AND (run_id != $run_id OR step_key != $step_key) \
+                 AND ({mine_exclusive} OR exclusive) \
+                 AND {overlap} LIMIT 1);\n"
+        )
+    }
+
     /// Build a SurrealQL transaction that atomically checks capacity and claims slots.
-    fn build_claim_transaction(pools: &[(String, u32)]) -> String {
+    ///
+    /// `asset_pools` are the indices of `pools` whose admission is by partition
+    /// overlap instead of slot count; they still take their slot so the shared
+    /// `claim_version` bump keeps concurrent claims serialized.
+    fn build_claim_transaction(
+        pools: &[(String, u32)],
+        asset_pools: &[usize],
+        scope: Option<&AssetScope>,
+    ) -> String {
         let mut q = String::from("BEGIN TRANSACTION;\n");
 
         for (i, (_, _slots)) in pools.iter().enumerate() {
@@ -1554,12 +1592,25 @@ impl SurrealStorage {
                      GROUP ALL)[0] ?? 0;\n"
             );
         }
+        for &i in asset_pools {
+            q += &Self::asset_conflict_clause(i, scope);
+        }
 
-        let conditions: Vec<String> = pools
+        // Asset pools carry no capacity condition — they are admitted purely by
+        // partition overlap, so a limit of -1 (or any value) cannot switch the
+        // exclusion off. They still take a slot, which is what bumps
+        // `claim_version` and serializes concurrent claims.
+        let mut conditions: Vec<String> = pools
             .iter()
             .enumerate()
+            .filter(|(i, _)| !asset_pools.contains(i))
             .map(|(i, (_, slots))| format!("($used_{i} + {slots}) <= $lim_{i}"))
             .collect();
+        conditions.extend(
+            asset_pools
+                .iter()
+                .map(|i| format!("array::len($conf_{i}) == 0")),
+        );
         q += &format!("IF {} {{\n", conditions.join(" AND "));
 
         for i in 0..pools.len() {
@@ -1571,12 +1622,26 @@ impl SurrealStorage {
         }
 
         for (i, (_, slots)) in pools.iter().enumerate() {
+            let scope_fields = if asset_pools.contains(&i) {
+                match scope {
+                    Some(s) if s.partitions.is_some() => {
+                        format!(
+                            ", partitions = <set<string>> $parts{i}, exclusive = {}",
+                            s.exclusive
+                        )
+                    }
+                    Some(s) => format!(", partitions = NONE, exclusive = {}", s.exclusive),
+                    None => ", partitions = NONE, exclusive = true".to_string(),
+                }
+            } else {
+                String::new()
+            };
             q += &format!(
                 "  CREATE concurrency_slots SET \
                      code_location_id = $cl, \
                      pool_key = $p{i}, run_id = $run_id, step_key = $step_key, \
                      slots_consumed = {slots}, claimed_at = $now, \
-                     lease_expires_at = $lease_exp, last_heartbeat = $now;\n"
+                     lease_expires_at = $lease_exp, last_heartbeat = $now{scope_fields};\n"
             );
         }
 
@@ -1590,8 +1655,10 @@ impl SurrealStorage {
     }
 
     /// Statement index of the post-COMMIT SELECT in the claim transaction query.
-    fn claim_check_statement_index(num_pools: usize) -> usize {
-        2 * num_pools + 3
+    /// Counts the pools actually in the transaction, plus one conflict `LET`
+    /// per asset-scoped pool.
+    fn claim_check_statement_index(num_pools: usize, num_asset_pools: usize) -> usize {
+        2 * num_pools + num_asset_pools + 3
     }
 
     async fn kv_get_json<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
@@ -3811,6 +3878,7 @@ impl PerCodeLocationStorage for SurrealStorage {
         step_key: &str,
         priority: i32,
         lease_duration_secs: u32,
+        scope: Option<&AssetScope>,
     ) -> Result<ConcurrencyClaimStatus> {
         anyhow::ensure!(!pools.is_empty(), "pools must not be empty");
 
@@ -3825,6 +3893,7 @@ impl PerCodeLocationStorage for SurrealStorage {
                 step_key,
                 priority,
                 lease_duration_secs,
+                scope,
             )
             .await
         })
@@ -3989,6 +4058,49 @@ impl PerCodeLocationStorage for SurrealStorage {
 }
 
 impl SurrealStorage {
+    /// Whether a live slot on `pool_key` conflicts with `scope`. Mirrors
+    /// [`Self::asset_conflict_clause`] so the pre-check and the transaction
+    /// agree on what "blocked" means.
+    async fn asset_scope_conflict(
+        &self,
+        code_location_id: &str,
+        pool_key: &str,
+        run_id: &str,
+        step_key: &str,
+        now_ns: i64,
+        scope: Option<&AssetScope>,
+    ) -> Result<bool> {
+        let (mine_exclusive, mine_parts) = match scope {
+            Some(s) => (s.exclusive, s.partitions.clone()),
+            None => (true, None),
+        };
+        let overlap = if mine_parts.is_none() {
+            "true".to_string()
+        } else {
+            "(partitions IS NONE OR partitions CONTAINSANY $parts)".to_string()
+        };
+        let mut q = self
+            .db
+            .query(format!(
+                "SELECT VALUE id FROM concurrency_slots \
+                 WHERE code_location_id = $cl AND pool_key = $pool_key \
+                 AND lease_expires_at > $now \
+                 AND (run_id != $run_id OR step_key != $step_key) \
+                 AND ({mine_exclusive} OR exclusive) \
+                 AND {overlap} LIMIT 1"
+            ))
+            .bind(("cl", code_location_id.to_string()))
+            .bind(("pool_key", pool_key.to_string()))
+            .bind(("run_id", run_id.to_string()))
+            .bind(("step_key", step_key.to_string()))
+            .bind(("now", now_ns));
+        if let Some(parts) = mine_parts {
+            q = q.bind(("parts", parts));
+        }
+        let hits: Vec<RecordId> = q.await?.take(0)?;
+        Ok(!hits.is_empty())
+    }
+
     /// One attempt of the [`PerCodeLocationStorage::claim_concurrency_slots`] flow.
     async fn try_claim_concurrency_slots_once(
         &self,
@@ -3998,25 +4110,55 @@ impl SurrealStorage {
         step_key: &str,
         priority: i32,
         lease_duration_secs: u32,
+        scope: Option<&AssetScope>,
     ) -> Result<ConcurrencyClaimStatus> {
         let now_ns = now_nanos();
         let lease_exp = now_ns + (lease_duration_secs as i64) * 1_000_000_000;
 
         let mut blocked = Vec::new();
         let mut limited_pools: Vec<(String, u32)> = Vec::new();
+        let mut asset_pools: Vec<usize> = Vec::new();
         for (pool_key, slots_needed) in pools {
             let (pool, current_used) = self
                 .query_pool_usage(code_location_id, pool_key, now_ns)
                 .await?;
-            if pool.slot_limit < 0 {
+            let is_asset_pool = pool_key.starts_with(ASSET_POOL_PREFIX);
+            // An implicit asset pool is never "unlimited": its admission is by
+            // partition overlap, not capacity, so dropping it here would remove
+            // the exclusion *and* the shared `claim_version` write that fences
+            // concurrent claims. `rivers pools set __asset__:x -1` must not be
+            // able to switch destructive-action exclusion off.
+            if pool.slot_limit < 0 && !is_asset_pool {
                 continue;
             }
+            if is_asset_pool {
+                asset_pools.push(limited_pools.len());
+            }
             limited_pools.push((pool_key.clone(), *slots_needed));
-            if current_used + *slots_needed > pool.slot_limit as u32 {
+            if !is_asset_pool && current_used + *slots_needed > pool.slot_limit as u32 {
                 blocked.push(PoolBlockDetail {
                     pool_key: pool_key.clone(),
                     claimed: current_used,
                     limit: pool.slot_limit,
+                });
+            }
+        }
+
+        // The same overlap rule the transaction enforces. Without it a step
+        // blocked purely by scope would fall through to the transaction, fail
+        // its `IF`, and surface as PoolContended — which is retried and then
+        // hard-fails, instead of waiting like any other blocked claim.
+        for &i in &asset_pools {
+            let (pool_key, _) = &limited_pools[i];
+            if self
+                .asset_scope_conflict(code_location_id, pool_key, run_id, step_key, now_ns, scope)
+                .await?
+                && !blocked.iter().any(|b| &b.pool_key == pool_key)
+            {
+                blocked.push(PoolBlockDetail {
+                    pool_key: pool_key.clone(),
+                    claimed: 1,
+                    limit: 1,
                 });
             }
         }
@@ -4070,10 +4212,15 @@ impl SurrealStorage {
             });
         }
 
-        let txn_query = Self::build_claim_transaction(&limited_pools);
+        let txn_query = Self::build_claim_transaction(&limited_pools, &asset_pools, scope);
         let mut q = self.db.query(&txn_query);
         for (i, (pool_key, _)) in limited_pools.iter().enumerate() {
             q = q.bind((format!("p{i}"), pool_key.clone()));
+        }
+        if let Some(parts) = scope.and_then(|s| s.partitions.as_ref()) {
+            for &i in &asset_pools {
+                q = q.bind((format!("parts{i}"), parts.clone()));
+            }
         }
         q = q
             .bind(("cl", code_location_id.to_string()))
@@ -4084,7 +4231,11 @@ impl SurrealStorage {
 
         let mut response = q.await?.check()?;
 
-        let check_idx = Self::claim_check_statement_index(pools.len());
+        // Indexed by the pools actually in the transaction: unlimited ones were
+        // dropped above. Counting `pools` instead reads a statement past the
+        // end, so a transaction that committed is reported as contention — and
+        // the retry then finds the slots it already claimed.
+        let check_idx = Self::claim_check_statement_index(limited_pools.len(), asset_pools.len());
         let count: Option<u32> = response.take((check_idx, "total"))?;
 
         if count.unwrap_or(0) > 0 {
@@ -9842,7 +9993,7 @@ mod tests {
         for n in 1..=5 {
             let pools: Vec<(String, u32)> =
                 pool_names[..n].iter().map(|k| (k.to_string(), 1)).collect();
-            let query = SurrealStorage::build_claim_transaction(&pools);
+            let query = SurrealStorage::build_claim_transaction(&pools, &[], None);
             let now_ns = now_nanos();
             let lease_exp = now_ns + 300_000_000_000i64;
 
@@ -9858,7 +10009,7 @@ mod tests {
                 .bind(("lease_exp", lease_exp));
 
             let mut response = q.await.unwrap().check().unwrap();
-            let idx = SurrealStorage::claim_check_statement_index(n);
+            let idx = SurrealStorage::claim_check_statement_index(n, 0);
             let count: Option<u32> = response.take((idx, "total")).unwrap();
             assert_eq!(
                 count,
@@ -9884,6 +10035,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9916,6 +10068,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9930,6 +10083,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9967,6 +10121,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9992,10 +10147,431 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
         assert_eq!(s, ConcurrencyClaimStatus::Claimed);
+    }
+
+    /// Claim `pool` for `(run, step)` with the given scope, asserting the
+    /// storage call itself succeeded, and return whether it got in.
+    async fn claim_scoped(
+        storage: &SurrealStorage,
+        pool: &str,
+        run: &str,
+        step: &str,
+        partitions: Option<&[&str]>,
+        exclusive: bool,
+    ) -> bool {
+        let scope = AssetScope {
+            partitions: partitions.map(|p| p.iter().map(|s| s.to_string()).collect()),
+            exclusive,
+        };
+        let status = storage
+            .claim_concurrency_slots(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                &[(pool.to_string(), 1)],
+                run,
+                step,
+                0,
+                300,
+                Some(&scope),
+            )
+            .await
+            .unwrap();
+        matches!(status, ConcurrencyClaimStatus::Claimed)
+    }
+
+    /// The whole point of scoping the implicit pool: an action on one partition
+    /// must not block work on a different one.
+    #[tokio::test]
+    async fn test_asset_scope_disjoint_partitions_do_not_conflict() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        // delete(p1) — exclusive on p1 only.
+        assert!(
+            claim_scoped(&storage, pool, "r1", "delete", Some(&["p1"]), true).await,
+            "first claim on an empty pool always lands"
+        );
+        // materialize(p2) — different partition, must not be blocked.
+        assert!(
+            claim_scoped(&storage, pool, "r2", "mat_p2", Some(&["p2"]), false).await,
+            "materialize of p2 must run beside delete(p1)"
+        );
+        // delete(p3) — a second exclusive action, disjoint from both holders.
+        assert!(
+            claim_scoped(&storage, pool, "r3", "delete_p3", Some(&["p3"]), true).await,
+            "two actions on disjoint partitions must run together"
+        );
+        // delete(p2) overlaps the running materialize of p2, so it must wait.
+        assert!(
+            !claim_scoped(&storage, pool, "r5", "delete_p2", Some(&["p2"]), true).await,
+            "an action must wait for a materialize of the same partition"
+        );
+        // materialize(p1) — same partition as the running delete, must wait.
+        assert!(
+            !claim_scoped(&storage, pool, "r4", "mat_p1", Some(&["p1"]), false).await,
+            "materialize of p1 must block on delete(p1)"
+        );
+    }
+
+    /// The safety-critical cell: two exclusive actions on the SAME partition
+    /// must serialize, and two whole-asset actions must serialize too — the old
+    /// slot-count rule gave both for free, the overlap rule has to re-earn them.
+    #[tokio::test]
+    async fn test_asset_scope_exclusive_conflicts_with_exclusive() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        assert!(claim_scoped(&storage, pool, "r1", "del_a", Some(&["p1"]), true).await);
+        assert!(
+            !claim_scoped(&storage, pool, "r2", "del_b", Some(&["p1"]), true).await,
+            "two exclusive actions on the same partition must serialize"
+        );
+
+        let storage2 = make_storage().await;
+        storage2
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+        assert!(claim_scoped(&storage2, pool, "r1", "opt_a", None, true).await);
+        assert!(
+            !claim_scoped(&storage2, pool, "r2", "opt_b", None, true).await,
+            "two whole-asset actions must serialize"
+        );
+    }
+
+    /// `CONTAINSANY` must mean *any* member, on both sides. Every other test
+    /// uses a single-element set, which a wrong all-vs-any operator would pass.
+    #[tokio::test]
+    async fn test_asset_scope_batched_sets_overlap_by_any_member() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        // A batched *exclusive* action — the only place a multi-member set is
+        // written with exclusive = true.
+        assert!(
+            claim_scoped(
+                &storage,
+                pool,
+                "r1",
+                "del_batch",
+                Some(&["p1", "p2", "p3"]),
+                true
+            )
+            .await
+        );
+        // Overlap on the tail member only.
+        assert!(
+            !claim_scoped(&storage, pool, "r2", "mat_b", Some(&["p3", "p9"]), false).await,
+            "one shared member is enough to conflict"
+        );
+        // Fully disjoint batch.
+        assert!(
+            claim_scoped(&storage, pool, "r3", "mat_c", Some(&["p9", "p10"]), false).await,
+            "disjoint batches must not conflict"
+        );
+        // A second exclusive batch, disjoint from the first.
+        assert!(
+            claim_scoped(&storage, pool, "r4", "del_d", Some(&["p4", "p5"]), true).await,
+            "disjoint exclusive batches run together"
+        );
+    }
+
+    /// Whole-asset scope on the *claimant* side with `exclusive: false` — an
+    /// unpartitioned materialize while a partition action runs.
+    #[tokio::test]
+    async fn test_asset_scope_whole_asset_shared_blocks_on_partition_action() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        assert!(claim_scoped(&storage, pool, "r1", "del_p1", Some(&["p1"]), true).await);
+        assert!(
+            !claim_scoped(&storage, pool, "r2", "mat_all", None, false).await,
+            "a whole-asset materialize covers p1, so it must wait for delete(p1)"
+        );
+    }
+
+    /// The pre-check and the transaction both read other rows' scopes before
+    /// writing their own. Concurrency is fenced by the shared `claim_version`
+    /// bump on the pool row; without it both would see "no conflict" and commit.
+    #[tokio::test]
+    async fn test_asset_scope_concurrent_exclusive_claims_admit_one() {
+        let storage = std::sync::Arc::new(make_storage().await);
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let s = storage.clone();
+            tasks.push(tokio::spawn(async move {
+                claim_scoped(&s, pool, &format!("r{i}"), "del", Some(&["p1"]), true).await
+            }));
+        }
+        let mut claimed = 0;
+        for t in tasks {
+            if t.await.unwrap() {
+                claimed += 1;
+            }
+        }
+        assert_eq!(
+            claimed, 1,
+            "exactly one exclusive claim on a partition may be admitted"
+        );
+        let holders = storage
+            .get_pool_slot_holders(crate::storage::DEFAULT_CODE_LOCATION_ID, pool)
+            .await
+            .unwrap();
+        assert_eq!(holders.len(), 1, "and only one slot row exists");
+    }
+
+    #[tokio::test]
+    async fn test_asset_scope_shared_never_conflicts() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        // Fan-out: many materialize instances of the SAME partition coexist.
+        for i in 0..5 {
+            assert!(
+                claim_scoped(
+                    &storage,
+                    pool,
+                    "r1",
+                    &format!("inst_{i}"),
+                    Some(&["p1"]),
+                    false
+                )
+                .await,
+                "non-exclusive holders never conflict, even on one partition"
+            );
+        }
+        // An action on that partition now has to wait for all of them.
+        assert!(
+            !claim_scoped(&storage, pool, "r2", "delete", Some(&["p1"]), true).await,
+            "an action must wait for the materializes it overlaps"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_asset_scope_batch_overlap_blocks() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        // A batched materialize over p1..p3 — one row carrying the whole set.
+        assert!(
+            claim_scoped(
+                &storage,
+                pool,
+                "r1",
+                "batch",
+                Some(&["p1", "p2", "p3"]),
+                false
+            )
+            .await
+        );
+        // An action inside the batch's range overlaps it.
+        assert!(
+            !claim_scoped(&storage, pool, "r2", "del_p2", Some(&["p2"]), true).await,
+            "delete(p2) overlaps the batch and must wait"
+        );
+        // An action outside it does not — no threshold, no over-blocking.
+        assert!(
+            claim_scoped(&storage, pool, "r3", "del_p9", Some(&["p9"]), true).await,
+            "delete(p9) is disjoint from the batch and must run"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_asset_scope_whole_asset_conflicts_with_everything() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        // An unpartitioned action: `partitions: None` = the whole asset.
+        assert!(claim_scoped(&storage, pool, "r1", "optimize", None, true).await);
+        assert!(
+            !claim_scoped(&storage, pool, "r2", "mat_p1", Some(&["p1"]), false).await,
+            "a whole-asset action blocks every partition"
+        );
+
+        // And the reverse order: a partition holder blocks a whole-asset action.
+        let storage2 = make_storage().await;
+        storage2
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+        assert!(claim_scoped(&storage2, pool, "r1", "mat_p1", Some(&["p1"]), false).await);
+        assert!(
+            !claim_scoped(&storage2, pool, "r2", "optimize", None, true).await,
+            "a whole-asset action waits for any partition holder"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_asset_scope_released_slot_unblocks() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        assert!(claim_scoped(&storage, pool, "r1", "delete", Some(&["p1"]), true).await);
+        assert!(!claim_scoped(&storage, pool, "r2", "mat_p1", Some(&["p1"]), false).await);
+
+        storage
+            .free_concurrency_slots("r1", "delete")
+            .await
+            .unwrap();
+        assert!(
+            claim_scoped(&storage, pool, "r2", "mat_p1", Some(&["p1"]), false).await,
+            "releasing the action's slot must unblock the partition"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_mixing_unlimited_and_limited_pools() {
+        // Unlimited pools are dropped from the transaction, so the post-COMMIT
+        // check has to be indexed by the pools actually in it. An asset that
+        // declares a pool with no explicit limit (auto-registered as -1) and an
+        // exclusive action (its implicit pool) hits exactly this shape.
+        let storage = make_storage().await;
+        storage
+            .set_pool_limit(crate::storage::DEFAULT_CODE_LOCATION_ID, "db", -1, 300)
+            .await
+            .unwrap();
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                "__asset__:orders",
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        let status = storage
+            .claim_concurrency_slots(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                &[
+                    ("db".to_string(), 1),
+                    ("__asset__:orders".to_string(), 1_000_000),
+                ],
+                "run1",
+                "step_a",
+                0,
+                300,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            ConcurrencyClaimStatus::Claimed,
+            "an unlimited pool alongside a limited one must not be read as contention"
+        );
+
+        // And the limited pool really was claimed, so exclusion still holds.
+        let blocked = storage
+            .claim_concurrency_slots(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                &[("__asset__:orders".to_string(), 1)],
+                "run2",
+                "step_b",
+                0,
+                300,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(blocked, ConcurrencyClaimStatus::Pending { .. }));
     }
 
     #[tokio::test]
@@ -10015,6 +10591,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10029,6 +10606,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10043,6 +10621,7 @@ mod tests {
                 "step_c",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10077,6 +10656,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10091,6 +10671,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10130,6 +10711,7 @@ mod tests {
                 "s1",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10141,6 +10723,7 @@ mod tests {
                 "s2",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10154,6 +10737,7 @@ mod tests {
                 "s3",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10188,6 +10772,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10199,6 +10784,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10239,6 +10825,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10250,6 +10837,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10291,6 +10879,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10302,6 +10891,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10322,6 +10912,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10346,6 +10937,7 @@ mod tests {
                 "s1",
                 0,
                 300,
+                None,
             )
             .await;
         assert!(result.is_err());
@@ -10363,6 +10955,7 @@ mod tests {
                 "s1",
                 0,
                 300,
+                None,
             )
             .await;
         assert!(result.is_err());
@@ -10393,6 +10986,7 @@ mod tests {
                         &format!("step_{i}"),
                         0,
                         300,
+                        None,
                     )
                     .await
                     .unwrap()
@@ -10435,6 +11029,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10446,6 +11041,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10484,6 +11080,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10498,6 +11095,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10530,6 +11128,7 @@ mod tests {
                 "step_a",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -10570,6 +11169,7 @@ mod tests {
                 "step_a",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -10583,6 +11183,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10600,6 +11201,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10623,6 +11225,7 @@ mod tests {
                 "step_a",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -10669,6 +11272,7 @@ mod tests {
                 "step_a",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -10722,6 +11326,7 @@ mod tests {
                 "step_a",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -10733,6 +11338,7 @@ mod tests {
                 "step_b",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -10744,6 +11350,7 @@ mod tests {
                 "step_c",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10779,6 +11386,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10817,6 +11425,7 @@ mod tests {
                 "step_a",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -10865,6 +11474,7 @@ mod tests {
                     step,
                     0,
                     300,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -10906,6 +11516,7 @@ mod tests {
                 "step_1",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10917,6 +11528,7 @@ mod tests {
                 "step_2",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10932,6 +11544,7 @@ mod tests {
                 "step_3",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10950,6 +11563,7 @@ mod tests {
                 "step_3",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10978,6 +11592,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10989,6 +11604,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -11010,6 +11626,7 @@ mod tests {
                 "other",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -11021,6 +11638,7 @@ mod tests {
                 "step_c",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -11069,6 +11687,7 @@ mod tests {
                 "step_a",
                 0,
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -11456,6 +12075,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -11469,6 +12089,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -11507,6 +12128,7 @@ mod tests {
                 "step_a",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -11559,6 +12181,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -11629,6 +12252,7 @@ mod tests {
                 "blocker",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -11640,6 +12264,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();

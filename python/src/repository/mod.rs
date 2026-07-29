@@ -3064,7 +3064,7 @@ impl PyCodeRepository {
 
     /// Register concurrency pools: explicit limits from `pool_limits`, then
     /// auto-register any asset-declared pools not already configured
-    /// (unlimited), plus the implicit one-slot per-asset pool for every asset
+    /// (unlimited), plus the implicit per-asset pool for every asset
     /// declaring an `Exclusive` action.
     fn register_pools(
         &self,
@@ -3115,7 +3115,7 @@ impl PyCodeRepository {
             for pool_key in &exclusive_pools {
                 let _ = io_rt().block_on(storage_handle.scoped().set_pool_limit(
                     pool_key,
-                    1,
+                    crate::executor::dispatch::EXCLUSIVE_POOL_CAPACITY as i32,
                     DEFAULT_LEASE_DURATION_SECS,
                 ));
             }

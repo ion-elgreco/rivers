@@ -102,7 +102,7 @@ impl AsyncMigrate for SurrealMigrate {
 
 /// Highest embedded migration version. Bump by adding a `Vn__*.surql` + an
 /// [`embedded_migrations`] entry; a test pins this to that max.
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 /// One compat row per migration (the floors it set), folded by the open guard.
 const MIGRATION_META_TABLE: &str = "migration_meta";
@@ -127,6 +127,11 @@ fn embedded_migrations() -> Vec<Migration> {
             include_str!("migrations/V4__run_action.surql"),
         )
         .expect("V4__run_action migration name is well-formed"),
+        Migration::unapplied(
+            "V5__slot_partition_scope",
+            include_str!("migrations/V5__slot_partition_scope.surql"),
+        )
+        .expect("V5__slot_partition_scope migration name is well-formed"),
     ]
 }
 
@@ -635,8 +640,9 @@ mod tests {
         let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
         assert_eq!(
             (stamps.version, stamps.min_reader, stamps.min_writer),
-            (4, 2, 2),
-            "v2 raised both floors; v3/v4 are additive and leave them at 2"
+            (SCHEMA_VERSION, 2, 5),
+            "v2 raised the read floor to 2; v5 raised the write floor to 5, because a \
+             pre-v5 writer records an exclusive action in a way a v5 reader can't see"
         );
     }
 
@@ -701,6 +707,81 @@ mod tests {
             .unwrap()
             .check()
             .expect("legacy backfill row must be writable after V3");
+    }
+
+    /// V5 adds `exclusive`/`partitions` to a SCHEMAFULL table. `DEFAULT` only
+    /// fills at create time, so live pre-V5 slot rows must be backfilled: the
+    /// conflict clause reads a missing `exclusive` as NONE (falsy), which would
+    /// let a materialize run straight past an in-flight exclusive action, and
+    /// lease renewal would trip field coercion on the next UPDATE.
+    #[tokio::test]
+    async fn test_v5_backfills_exclusive_on_legacy_slot_rows() {
+        let db = any::connect("mem://").await.unwrap();
+        db.use_ns(DEFAULT_NAMESPACE)
+            .use_db(DEFAULT_DATABASE)
+            .await
+            .unwrap();
+
+        let pre_v5: Vec<Migration> = embedded_migrations().into_iter().take(4).collect();
+        let mut backend = SurrealMigrate { db: db.clone() };
+        backend
+            .migrate(
+                &pre_v5,
+                true,
+                false,
+                false,
+                Target::Latest,
+                REFINERY_HISTORY_TABLE,
+            )
+            .await
+            .expect("apply V1..V4");
+
+        // Two legacy holders of one asset pool: an exclusive action (which took
+        // the whole pool under the old rule) and an ordinary materialize.
+        for (step, slots) in [("action", 1_000_000), ("mat", 1)] {
+            db.query(format!(
+                "INSERT INTO concurrency_slots {{ code_location_id: 'default', \
+                 pool_key: '__asset__:orders', run_id: 'legacy', step_key: '{step}', \
+                 slots_consumed: {slots}, claimed_at: 1, lease_expires_at: 9223372036854775807, \
+                 last_heartbeat: 1 }} RETURN NONE"
+            ))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        }
+
+        apply_migrations(&db).await.expect("apply V5");
+
+        let exclusive_of = async |step: &str| -> Vec<bool> {
+            db.query(format!(
+                "SELECT VALUE exclusive FROM concurrency_slots WHERE step_key = '{step}'"
+            ))
+            .await
+            .unwrap()
+            .take(0)
+            .expect("legacy slot rows must read back after V5")
+        };
+        assert_eq!(
+            exclusive_of("action").await,
+            vec![true],
+            "the whole-pool holder is recovered as an exclusive action"
+        );
+        assert_eq!(
+            exclusive_of("mat").await,
+            vec![false],
+            "a one-slot holder is a materialize"
+        );
+
+        // Lease renewal is an UPDATE — it must not trip coercion on these rows.
+        db.query(
+            "UPDATE concurrency_slots SET lease_expires_at = 99, last_heartbeat = 99 \
+             WHERE run_id = 'legacy'",
+        )
+        .await
+        .unwrap()
+        .check()
+        .expect("legacy slot rows must stay writable after V5");
     }
 
     /// Editing an already-applied migration is caught by refinery's checksum

@@ -1078,6 +1078,26 @@ fn default_lease_duration() -> u32 {
     DEFAULT_LEASE_DURATION_SECS
 }
 
+/// Prefix of the pool every asset with an exclusive action implicitly gets.
+/// Claims on such a pool are admitted by [`AssetScope`] overlap rather than by
+/// slot count, so the storage layer has to recognise the key.
+pub const ASSET_POOL_PREFIX: &str = "__asset__:";
+
+/// What a step touches on an asset's implicit pool, and whether it needs the
+/// touched partitions to itself.
+///
+/// Admission is set overlap, not counting: two non-exclusive holders never
+/// conflict, and an exclusive one conflicts only where the partitions actually
+/// intersect. That is what lets `delete(p1)` run beside a materialize of `p2`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AssetScope {
+    /// Rendered partition keys the step touches. `None` = the whole asset,
+    /// which conflicts with every other scope.
+    pub partitions: Option<Vec<String>>,
+    /// True for an action step — the side that demands exclusivity.
+    pub exclusive: bool,
+}
+
 /// Runtime pool info: configuration + current usage.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PoolInfo {
@@ -1618,6 +1638,9 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         code_location_id: &str,
     ) -> impl Future<Output = Result<Vec<PoolInfo>>> + Send;
 
+    /// `scope` applies to every `__asset__:`-prefixed pool in `pools`; a step
+    /// carries one partition key and one exclusivity, so one scope covers all
+    /// of them. `None` on a non-implicit claim.
     fn claim_concurrency_slots(
         &self,
         code_location_id: &str,
@@ -1626,6 +1649,7 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         step_key: &str,
         priority: i32,
         lease_duration_secs: u32,
+        scope: Option<&AssetScope>,
     ) -> impl Future<Output = Result<ConcurrencyClaimStatus>> + Send;
 
     fn get_pool_slot_holders(
@@ -2027,6 +2051,7 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
         step_key: &str,
         priority: i32,
         lease_duration_secs: u32,
+        scope: Option<&AssetScope>,
     ) -> Result<ConcurrencyClaimStatus> {
         self.backend
             .claim_concurrency_slots(
@@ -2036,6 +2061,7 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
                 step_key,
                 priority,
                 lease_duration_secs,
+                scope,
             )
             .await
     }

@@ -68,7 +68,7 @@ pub(crate) fn execute_level_batch(
                 StepAction::Execute => {
                     let step = &ctx.scope.plan.steps[idx];
                     let node = ctx.repo.node_map.get(&step.name).unwrap();
-                    let pools = ctx.step_pools(step);
+                    let (pools, asset_scope) = ctx.step_pools(step);
                     // Async-ness of an action step is the action's, not the
                     // asset materialize function's.
                     let is_async = match ctx.scope.plan.verb() {
@@ -91,6 +91,7 @@ pub(crate) fn execute_level_batch(
                         fan_out: None,
                         is_async,
                         pools,
+                        asset_scope,
                     });
                 }
             }
@@ -164,7 +165,7 @@ fn build_mapped_instances(
         .get(fan_out_source)
         .expect("fan-out source must be in node_map");
 
-    let pools = ctx.step_pools(step);
+    let (pools, asset_scope) = ctx.step_pools(step);
     let is_async = node.is_async();
 
     let source_output = match ops::load_fan_out_source(
@@ -231,6 +232,7 @@ fn build_mapped_instances(
                 fan_out: Some((fan_out_source.to_string(), value)),
                 is_async,
                 pools: pools.clone(),
+                asset_scope: asset_scope.clone(),
             }
         };
 

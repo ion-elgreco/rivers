@@ -600,6 +600,7 @@ impl ParallelBackend {
         struct PreparedPoolStep {
             base: PreparedStep,
             pools: Vec<(String, u32)>,
+            asset_scope: Option<rivers_core::storage::AssetScope>,
             event_names: Vec<String>,
             instance_name: String,
             retry: Option<rivers_core::execution::retry::RetryPolicy>,
@@ -613,6 +614,7 @@ impl ParallelBackend {
             prepared.push(PreparedPoolStep {
                 base,
                 pools: inst.pools.clone(),
+                asset_scope: inst.asset_scope.clone(),
                 event_names: inst.event_names.clone(),
                 instance_name: inst.instance_name.clone(),
                 retry: ctx.retry_policy_for(&ctx.scope.plan.steps[inst.idx]),
@@ -639,6 +641,7 @@ impl ParallelBackend {
                     let PreparedPoolStep {
                         base,
                         pools,
+                        asset_scope,
                         event_names,
                         instance_name,
                         retry,
@@ -661,6 +664,7 @@ impl ParallelBackend {
                         let outcome = run_step_async_lifecycle(
                             storage,
                             pools,
+                            asset_scope,
                             run_id,
                             pool_step_name,
                             event_names,

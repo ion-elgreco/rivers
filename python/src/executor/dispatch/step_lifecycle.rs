@@ -60,6 +60,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
     step_name: &str,
     event_names: &[String],
     pools: Vec<(String, u32)>,
+    asset_scope: Option<rivers_core::storage::AssetScope>,
     worker: W,
     failures: &mut Vec<(String, PyErr)>,
 ) {
@@ -70,6 +71,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
             py,
             ctx.sink.storage,
             &pools,
+            asset_scope.as_ref(),
             ctx.scope.run_id,
             step_name,
             ctx.event_sender(),
@@ -140,6 +142,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
                     py,
                     ctx.sink.storage,
                     &pools,
+                    asset_scope.as_ref(),
                     ctx.scope.run_id,
                     step_name,
                     ctx.event_sender(),
@@ -188,6 +191,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
 pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
     storage: ScopedStorageHandle<SurrealStorage>,
     pools: Vec<(String, u32)>,
+    asset_scope: Option<rivers_core::storage::AssetScope>,
     run_id: String,
     pool_step_name: String,
     start_event_names: Vec<String>,
@@ -213,6 +217,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         match PoolGuard::acquire(
             &storage,
             &pools,
+            asset_scope.as_ref(),
             &run_id,
             &pool_step_name,
             events_tx.clone(),
@@ -320,6 +325,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
                 match PoolGuard::acquire(
                     &storage,
                     &pools,
+                    asset_scope.as_ref(),
                     &run_id,
                     &pool_step_name,
                     events_tx.clone(),

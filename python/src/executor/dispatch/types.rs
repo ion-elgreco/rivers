@@ -33,6 +33,8 @@ pub(crate) struct StepInstance {
     /// Resolved pool config — same value for every instance of a mapped step,
     /// snapshotted up-front so the lifecycle can claim under the GIL.
     pub pools: Vec<(String, u32)>,
+    /// Partition scope for the implicit asset pool, when this step claims one.
+    pub asset_scope: Option<rivers_core::storage::AssetScope>,
 }
 
 /// (stdout, stderr, rust_logs) captured around a step's invocation. Populated

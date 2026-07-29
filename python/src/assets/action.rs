@@ -96,8 +96,9 @@ impl PyActionOrdering {
 pub enum PyActionConcurrency {
     /// May run alongside materialize and other actions.
     Shared,
-    /// Joins the asset's implicit one-slot pool: never overlaps materialize
-    /// or another exclusive action on the same asset.
+    /// Takes the asset's implicit pool whole: never overlaps materialize or
+    /// another exclusive action on the same asset. Materialize steps take one
+    /// slot each, so they still run alongside each other.
     Exclusive,
 }
 

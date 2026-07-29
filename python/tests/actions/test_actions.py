@@ -11,7 +11,7 @@ import pytest
 from pydantic import BaseModel
 
 import rivers as rs
-from _polling import wait_for_run_terminal
+from _polling import wait_for_run_terminal, wait_until
 from rivers._core import AutomationDaemon
 from rivers.exceptions import AssetDefinitionError, GraphValidationError
 
@@ -27,6 +27,17 @@ def event_types(repo, run_id):
 
 def action_run(repo, verb):
     return next(r for r in repo.storage.get_runs(limit=20) if r.action == verb)
+
+
+# Module-level so loky workers can import them by reference.
+@rs.Task
+def _fan_echo(x: int) -> int:
+    return x
+
+
+@rs.Task
+def _fan_total(values: list) -> int:
+    return sum(values)
 
 
 # ---------------------------------------------------------------------------
@@ -753,14 +764,17 @@ class _ExclusiveTable(rs.Asset):
         return None
 
 
-def test_exclusive_action_registers_one_slot_pool():
+def test_exclusive_action_registers_multi_slot_pool():
+    """Exclusion is decided by partition overlap, not slot count, so the pool's
+    capacity only has to be high enough never to bind."""
     from rivers.testing import memory_storage
 
     storage = memory_storage()
     repo = rs.CodeRepository(assets=[_ExclusiveTable], default_executor=IP)
     repo.resolve(storage=storage)
     info = storage.get_pool_info("__asset__:_exclusive_table")
-    assert info.slot_limit == 1
+    # EXCLUSIVE_POOL_CAPACITY in python/src/executor/dispatch/context.rs.
+    assert info.slot_limit == 1_000_000
 
 
 def test_exclusive_action_and_materialize_claim_the_pool():
@@ -920,6 +934,57 @@ def test_resume_skips_completed_action_steps():
     assert calls.count("second") == 2
 
 
+def test_declaring_exclusive_action_does_not_serialize_materialize(tmp_path):
+    """The implicit pool is a reader/writer lock, not a global mutex.
+
+    Merely *declaring* an exclusive action must not make ordinary materialize
+    steps contend for a single slot — that collapses graph-asset fan-out for an
+    action nobody invoked, and serializes every run of the asset.
+    """
+    import obstore.store
+
+    store = obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    handler = rs.PickleIOHandler(store=store)
+
+    @rs.Asset(io_handler=handler)
+    def items() -> list:
+        return [1, 2, 3, 4, 5, 6]
+
+    class Fanned(rs.GraphAsset):
+        io_handler = handler
+        node_io_handler = handler
+
+        @classmethod
+        def compose(cls):
+            return _fan_total(items().map(_fan_echo).collect())
+
+        @rs.action(
+            outcome=rs.Outcome.Unchanged, concurrency=rs.ActionConcurrency.Exclusive
+        )
+        @classmethod
+        def optimize(cls, ctx):
+            return None
+
+    repo = rs.CodeRepository(
+        assets=[items, Fanned],
+        tasks=[_fan_echo, _fan_total],
+        default_executor=MP,
+    )
+    result = repo.materialize()
+    assert result.success
+    assert repo.load_node("fanned") == 21
+
+    waiting = [
+        e
+        for e in repo.storage.get_events_for_run(result.run_id)
+        if str(e.event_type) == "StepSlotWaiting"
+    ]
+    assert not waiting, (
+        f"{len(waiting)} fan-out instances queued behind each other on the "
+        "exclusive action's pool"
+    )
+
+
 def test_exclusive_action_serializes_with_materialize():
     import threading
 
@@ -977,6 +1042,193 @@ def test_exclusive_action_serializes_with_materialize():
         e.event_type for e in repo.storage.get_events_for_run(result["r"].run_id)
     ]
     assert "StepSlotWaiting" in waiting
+
+
+def _slow_partitioned_exclusive(started, release, windows):
+    """Asset whose exclusive `purge` blocks until the driver releases it."""
+
+    class Events(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext):
+            import time
+
+            key = context.partition_key
+            windows[f"mat_{key}"] = (time.monotonic(), None)
+            windows[f"mat_{key}"] = (windows[f"mat_{key}"][0], time.monotonic())
+            return key
+
+        @rs.action(
+            outcome=rs.Outcome.Unchanged, concurrency=rs.ActionConcurrency.Exclusive
+        )
+        @classmethod
+        def purge(cls, ctx):
+            import time
+
+            start = time.monotonic()
+            started.set()
+            assert release.wait(timeout=30), "test driver never released the action"
+            windows["purge"] = (start, time.monotonic())
+
+    return Events
+
+
+def test_exclusive_action_does_not_block_a_different_partition():
+    """The point of scoping the pool by partition: `purge(p1)` holds the asset's
+    implicit pool, but a materialize of p2 touches different data and must not
+    queue behind it."""
+    import threading
+    import time
+
+    started, release, windows = threading.Event(), threading.Event(), {}
+    repo = rs.CodeRepository(
+        assets=[_slow_partitioned_exclusive(started, release, windows)],
+        default_executor=IP,
+    )
+    for p in ("p1", "p2"):
+        repo.materialize(partition_key=rs.PartitionKey.single(p))
+    windows.clear()
+
+    t_action = threading.Thread(
+        target=lambda: repo.run_action(
+            "purge", partition_key=rs.PartitionKey.single("p1")
+        )
+    )
+    t_action.start()
+    assert started.wait(timeout=30)
+
+    result = {}
+    t_mat = threading.Thread(
+        target=lambda: result.update(
+            r=repo.materialize(partition_key=rs.PartitionKey.single("p2"))
+        )
+    )
+    t_mat.start()
+    try:
+        t_mat.join(timeout=60)
+        assert not t_mat.is_alive(), "materialize of p2 never finished"
+        # The assertions below only mean anything while purge(p1) still holds
+        # the pool — otherwise they pass vacuously on a slow machine.
+        assert t_action.is_alive(), (
+            "purge(p1) already exited, so this proves nothing about scoping"
+        )
+        assert result["r"].success
+        assert windows["mat_p2"][1] is not None
+        waiting = [
+            e.event_type for e in repo.storage.get_events_for_run(result["r"].run_id)
+        ]
+        assert "StepSlotWaiting" not in waiting, (
+            "a disjoint partition must not wait on the pool"
+        )
+    finally:
+        release.set()
+        t_action.join(timeout=60)
+
+    # The action really did outlive the disjoint materialize.
+    assert windows["purge"][1] >= windows["mat_p2"][1]
+
+
+def test_exclusive_action_still_blocks_its_own_partition():
+    """The other half: the same partition must still serialize."""
+    import threading
+    import time
+
+    started, release, windows = threading.Event(), threading.Event(), {}
+    repo = rs.CodeRepository(
+        assets=[_slow_partitioned_exclusive(started, release, windows)],
+        default_executor=IP,
+    )
+    repo.materialize(partition_key=rs.PartitionKey.single("p1"))
+    windows.clear()
+
+    t_action = threading.Thread(
+        target=lambda: repo.run_action(
+            "purge", partition_key=rs.PartitionKey.single("p1")
+        )
+    )
+    t_action.start()
+    assert started.wait(timeout=30)
+
+    result = {}
+    t_mat = threading.Thread(
+        target=lambda: result.update(
+            r=repo.materialize(partition_key=rs.PartitionKey.single("p1"))
+        )
+    )
+    t_mat.start()
+    try:
+        # Wait for the materialize to actually reach the claim loop and report
+        # itself blocked, rather than sleeping and hoping.
+        def _is_waiting():
+            return any(
+                e.event_type == "StepSlotWaiting"
+                for r in repo.storage.get_runs(limit=10)
+                for e in repo.storage.get_events_for_run(r.run_id)
+            )
+
+        wait_until(_is_waiting, timeout=30)
+    finally:
+        release.set()
+        t_action.join(timeout=60)
+        t_mat.join(timeout=60)
+
+    assert result["r"].success
+    # Same partition — the materialize body may only run after purge released.
+    assert windows["mat_p1"][0] >= windows["purge"][1]
+    waiting = [
+        e.event_type for e in repo.storage.get_events_for_run(result["r"].run_id)
+    ]
+    assert "StepSlotWaiting" in waiting
+
+
+def test_two_exclusive_actions_on_different_partitions_overlap():
+    """The reported bug, directly: a partition-by-partition `delete` backfill
+    serialized every run on one asset-wide lock and the tail timed out at
+    CLAIM_TIMEOUT. Two actions on disjoint partitions must now overlap."""
+    import threading
+
+    started, release, windows = threading.Event(), threading.Event(), {}
+    repo = rs.CodeRepository(
+        assets=[_slow_partitioned_exclusive(started, release, windows)],
+        default_executor=IP,
+    )
+    for p in ("p1", "p2"):
+        repo.materialize(partition_key=rs.PartitionKey.single(p))
+
+    # purge(p1) blocks until released, holding the asset's implicit pool.
+    t1 = threading.Thread(
+        target=lambda: repo.run_action(
+            "purge", partition_key=rs.PartitionKey.single("p1")
+        )
+    )
+    t1.start()
+    assert started.wait(timeout=30)
+
+    # purge(p2) is a second *exclusive* action. It must not queue behind p1.
+    started.clear()
+    result = {}
+    t2 = threading.Thread(
+        target=lambda: result.update(
+            r=repo.run_action("purge", partition_key=rs.PartitionKey.single("p2"))
+        )
+    )
+    t2.start()
+    try:
+        assert started.wait(timeout=30), (
+            "purge(p2) never entered its body — it is queued behind purge(p1)"
+        )
+        assert t1.is_alive(), "purge(p1) exited early, so the overlap proves nothing"
+    finally:
+        release.set()
+        t1.join(timeout=60)
+        t2.join(timeout=60)
+    assert result["r"].success
+    waiting = [
+        e.event_type for e in repo.storage.get_events_for_run(result["r"].run_id)
+    ]
+    assert "StepSlotWaiting" not in waiting
 
 
 def test_action_attribute_survives_cloudpickle(tmp_path):

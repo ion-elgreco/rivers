@@ -11,7 +11,7 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{
-    ConcurrencyClaimStatus, DEFAULT_LEASE_DURATION_SECS, EventRecord, EventType,
+    AssetScope, ConcurrencyClaimStatus, DEFAULT_LEASE_DURATION_SECS, EventRecord, EventType,
     ScopedStorageHandle, StorageBackend,
 };
 use tokio::sync::mpsc;
@@ -75,11 +75,12 @@ impl PoolGuard {
     pub async fn acquire(
         storage: &ScopedStorageHandle<SurrealStorage>,
         pools: &[(String, u32)],
+        scope: Option<&AssetScope>,
         run_id: &str,
         step_key: &str,
         events: mpsc::UnboundedSender<WriterMsg>,
     ) -> anyhow::Result<Self> {
-        claim_async_poll(storage, pools, run_id, step_key, &events).await?;
+        claim_async_poll(storage, pools, scope, run_id, step_key, &events).await?;
         let renewal = AbortOnDrop(spawn_lease_renewal(
             storage.clone(),
             run_id.to_string(),
@@ -100,12 +101,14 @@ impl PoolGuard {
         py: Python,
         storage: &ScopedStorageHandle<SurrealStorage>,
         pools: &[(String, u32)],
+        scope: Option<&AssetScope>,
         run_id: &str,
         step_key: &str,
         events: mpsc::UnboundedSender<WriterMsg>,
     ) -> anyhow::Result<Self> {
         let storage_c = storage.clone();
         let pools = pools.to_vec();
+        let scope = scope.cloned();
         let run_id_s = run_id.to_string();
         let step_key_s = step_key.to_string();
         let events_c = events.clone();
@@ -113,6 +116,7 @@ impl PoolGuard {
             io_rt().block_on(claim_async_poll(
                 &storage_c,
                 &pools,
+                scope.as_ref(),
                 &run_id_s,
                 &step_key_s,
                 &events_c,
@@ -182,6 +186,7 @@ impl PoolGuard {
 async fn claim_async_poll(
     storage: &ScopedStorageHandle<SurrealStorage>,
     pools: &[(String, u32)],
+    scope: Option<&AssetScope>,
     run_id: &str,
     step_key: &str,
     events: &mpsc::UnboundedSender<WriterMsg>,
@@ -196,7 +201,14 @@ async fn claim_async_poll(
     loop {
         match storage
             .scoped()
-            .claim_concurrency_slots(pools, run_id, step_key, 0, DEFAULT_LEASE_DURATION_SECS)
+            .claim_concurrency_slots(
+                pools,
+                run_id,
+                step_key,
+                0,
+                DEFAULT_LEASE_DURATION_SECS,
+                scope,
+            )
             .await?
         {
             ConcurrencyClaimStatus::Claimed => {
