@@ -380,7 +380,7 @@ fn action_runs_are_not_materialization_attempts() {
     // count as a materialization for condition bookkeeping — its effects
     // reach the cache through the record refresh instead. A failed action
     // run must not raise the failure floor either.
-    let mut cache = AssetConditionCache::new("default".to_string());
+    let cache = AssetConditionCache::new("default".to_string());
     let mut delta = RefreshDelta::default();
 
     let mut ok = mk_run("act-ok", RunStatus::Success, &["R"], 100);

@@ -5660,7 +5660,11 @@ mod tests {
             page.rows.iter().all(|r| r.action.is_none()),
             "materialize filter must exclude action runs"
         );
-        assert!(page.total >= 3, "materialize runs still match, got {}", page.total);
+        assert!(
+            page.total >= 3,
+            "materialize runs still match, got {}",
+            page.total
+        );
 
         // Job substring (case-insensitive)
         let filter = RunFilter {

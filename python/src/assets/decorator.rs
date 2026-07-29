@@ -1690,7 +1690,11 @@ impl PyAsset {
             RetryRef::Inline(p) => Py::new(py, crate::retry::PyRetryPolicy { inner: p.clone() })
                 .ok()
                 .map(|v| v.into_any()),
-            RetryRef::Named(key) => key.clone().into_pyobject(py).ok().map(|v| v.unbind().into_any()),
+            RetryRef::Named(key) => key
+                .clone()
+                .into_pyobject(py)
+                .ok()
+                .map(|v| v.unbind().into_any()),
         }
     }
 

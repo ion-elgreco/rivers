@@ -303,14 +303,19 @@ enum ActionEntry<'py> {
 fn collect_actions<'py>(cls: &Bound<'py, PyType>) -> PyResult<Vec<Bound<'py, PyAny>>> {
     let py = cls.py();
     let mut entries: Vec<(String, ActionEntry<'py>)> = Vec::new();
-    let upsert = |entries: &mut Vec<(String, ActionEntry<'py>)>, attr: &str, e| {
-        match entries.iter_mut().find(|(k, _)| k == attr) {
-            Some(slot) => slot.1 = e,
-            None => entries.push((attr.to_string(), e)),
-        }
+    let upsert = |entries: &mut Vec<(String, ActionEntry<'py>)>, attr: &str, e| match entries
+        .iter_mut()
+        .find(|(k, _)| k == attr)
+    {
+        Some(slot) => slot.1 = e,
+        None => entries.push((attr.to_string(), e)),
     };
     for klass in user_mro(cls)?.iter().rev() {
-        for item in klass.getattr("__dict__")?.call_method0("items")?.try_iter()? {
+        for item in klass
+            .getattr("__dict__")?
+            .call_method0("items")?
+            .try_iter()?
+        {
             let (attr, val): (String, Bound<PyAny>) = item?.extract()?;
             if let Some(meta) = action_meta(&val)? {
                 if !is_classmethod_or_static(&val)? {
@@ -460,7 +465,9 @@ fn require_verb<'py>(
                 "materialize" => {
                     "a class with no executable verb is a mixin — leave it out of assets=[...]"
                 }
-                "compose" => "GraphAsset subclasses compose other assets in a compose() classmethod",
+                "compose" => {
+                    "GraphAsset subclasses compose other assets in a compose() classmethod"
+                }
                 _ => "ExternalAsset subclasses may define observe() to track freshness",
             };
             Err(definition_error(format!(
@@ -485,7 +492,11 @@ fn reject_verb(cls: &Bound<'_, PyType>, verb: &str, why: &str) -> PyResult<()> {
 fn asset_def_attrs<'py>(cls: &Bound<'py, PyType>) -> PyResult<Vec<(String, Bound<'py, AssetDef>)>> {
     let mut defs: Vec<(String, Bound<AssetDef>)> = Vec::new();
     for klass in user_mro(cls)?.iter().rev() {
-        for item in klass.getattr("__dict__")?.call_method0("items")?.try_iter()? {
+        for item in klass
+            .getattr("__dict__")?
+            .call_method0("items")?
+            .try_iter()?
+        {
             let (attr, val): (String, Bound<PyAny>) = item?.extract()?;
             if let Ok(ad) = val.cast_into::<AssetDef>() {
                 match defs.iter_mut().find(|(k, _)| k == &attr) {
@@ -514,7 +525,11 @@ fn desugar_single(cls: &Bound<'_, PyType>) -> PyResult<Py<PyAny>> {
     let py = cls.py();
     let defined_on = require_verb(cls, "materialize", "Asset")?;
     reject_verb(cls, "observe", "only ExternalAsset subclasses are observed")?;
-    reject_verb(cls, "compose", "composition belongs on a GraphAsset subclass")?;
+    reject_verb(
+        cls,
+        "compose",
+        "composition belongs on a GraphAsset subclass",
+    )?;
     if !asset_def_attrs(cls)?.is_empty() {
         return Err(definition_error(format!(
             "{} declares AssetDef attributes; multiple outputs need a MultiAsset subclass",
@@ -549,7 +564,10 @@ fn desugar_multi(cls: &Bound<'_, PyType>) -> PyResult<Py<PyAny>> {
     let f = bound_verb(cls, "materialize", &defined_on)?;
     let ctor = py.get_type::<PyAsset>().getattr("from_multi")?;
     let cfg = collect_config(cls, &ctor)?;
-    cfg.set_item("output_defs", defs.iter().map(|(_, ad)| ad).collect::<Vec<_>>())?;
+    cfg.set_item(
+        "output_defs",
+        defs.iter().map(|(_, ad)| ad).collect::<Vec<_>>(),
+    )?;
     cfg.set_item("name", asset_name(cls)?)?;
     cfg.set_item("actions", collect_actions(cls)?)?;
     let factory = ctor.call((), Some(&cfg))?;

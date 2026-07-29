@@ -840,7 +840,7 @@ pub(crate) fn build_unresolved_graph(
                             per_output_deps.push(NodeRef::ByName(dep_name.clone()));
                         }
                     }
-                        claim(&mut claimed, &asset_name)?;
+                    claim(&mut claimed, &asset_name)?;
                     unresolved_graph.insert(asset_name.clone(), per_output_deps);
                     node_map.insert(
                         asset_name,
@@ -1439,7 +1439,11 @@ impl RepoHandle {
     /// `supports_action` reads Python attributes, and taking the GIL here while
     /// holding the state guard inverts the lock order `resolve()` uses
     /// (GIL, then `state.write()`).
-    pub(crate) fn assets_supporting_action(&self, py: Python, action: &str) -> PyResult<Vec<String>> {
+    pub(crate) fn assets_supporting_action(
+        &self,
+        py: Python,
+        action: &str,
+    ) -> PyResult<Vec<String>> {
         let guard = self.state.read().unwrap();
         let state = guard.as_ref().ok_or_else(|| {
             ExecutionError::new_err("CodeRepository not resolved — call resolve() first")

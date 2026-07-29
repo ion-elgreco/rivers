@@ -17367,7 +17367,10 @@ async fn deleted_asset_reads_missing_again() {
     let ctx_cl = crate::storage::CodeLocationContext::new(cl.clone());
     let scoped = storage.for_code_location(&ctx_cl);
 
-    scoped.register_assets(&[make_record("table")]).await.unwrap();
+    scoped
+        .register_assets(&[make_record("table")])
+        .await
+        .unwrap();
     let event = |event_type, ts| crate::storage::EventRecord {
         code_location_id: cl.clone(),
         event_type,
@@ -17392,7 +17395,11 @@ async fn deleted_asset_reads_missing_again() {
     let records = HashMap::from([("table".to_string(), record.clone())]);
     let deps = HashMap::new();
     assert!(
-        !evaluate(&ConditionNode::Missing, &make_ctx("table", &record, &records, &deps)).fired,
+        !evaluate(
+            &ConditionNode::Missing,
+            &make_ctx("table", &record, &records, &deps)
+        )
+        .fired,
         "a materialized asset must not read Missing"
     );
 
@@ -17403,7 +17410,11 @@ async fn deleted_asset_reads_missing_again() {
     let record = scoped.get_asset_record("table").await.unwrap().unwrap();
     let records = HashMap::from([("table".to_string(), record.clone())]);
     assert!(
-        evaluate(&ConditionNode::Missing, &make_ctx("table", &record, &records, &deps)).fired,
+        evaluate(
+            &ConditionNode::Missing,
+            &make_ctx("table", &record, &records, &deps)
+        )
+        .fired,
         "a deleted asset must read Missing so automation can rebuild it"
     );
     assert_eq!(
