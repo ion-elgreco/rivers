@@ -1461,17 +1461,21 @@ impl SurrealStorage {
                     .check()?;
             }
             None => {
+                // `last_timestamp` is cleared with the rest: downstream reads
+                // it as "this dependency produced something new", so leaving it
+                // to advance would make deleting an asset trigger a
+                // materialization from data that no longer exists. The event id
+                // still points at the deletion so timelines resolve.
                 self.db
                     .query(
                         "UPDATE assets SET last_event_id = $event_id, last_run_id = NONE, \
-                         last_timestamp = $timestamp, last_data_version = NONE, \
+                         last_timestamp = NONE, last_data_version = NONE, \
                          last_materialization_code_version = NONE, last_input_data_versions = [] \
                          WHERE code_location_id = $cl AND asset_key = $asset_key",
                     )
                     .bind(("cl", cl.to_string()))
                     .bind(("asset_key", asset_key.to_string()))
                     .bind(("event_id", event_id.to_string()))
-                    .bind(("timestamp", event.timestamp))
                     .await?
                     .check()?;
                 self.db
@@ -1635,6 +1639,16 @@ fn swallow_phantom_commit(result: Result<()>, op: &'static str, id: &str) -> Res
     }
 }
 
+/// Roll an `assets` row forward to a materialization event.
+const MATERIALIZE_ASSET_UPDATE: &str = "UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv, last_input_data_versions = $idv WHERE code_location_id = $cl AND asset_key = $asset_key";
+
+/// Same, minus provenance. An event that consumed no inputs — an action's
+/// `ActionResult.materialized()`, a mapped fan-out instance — reports an empty
+/// list because it never read upstream, not because upstream is gone. Writing
+/// it through would erase the real provenance and leave the asset permanently
+/// Stale against every dependency.
+const MATERIALIZE_ASSET_UPDATE_KEEP_IDV: &str = "UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv WHERE code_location_id = $cl AND asset_key = $asset_key";
+
 impl StorageBackend for SurrealStorage {
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(cl = %event.code_location_id, asset_key = event.asset_key))]
     async fn store_event(&self, event: &EventRecord) -> Result<String> {
@@ -1666,17 +1680,25 @@ impl StorageBackend for SurrealStorage {
                 let input_data_versions = event.input_data_versions.clone();
 
                 let data_version = event.event_type.data_version().map(|s| s.to_string());
-                self.db
-                    .query("UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv, last_input_data_versions = $idv WHERE code_location_id = $cl AND asset_key = $asset_key")
+                let keep_idv = input_data_versions.is_empty();
+                let mut query = self
+                    .db
+                    .query(if keep_idv {
+                        MATERIALIZE_ASSET_UPDATE_KEEP_IDV
+                    } else {
+                        MATERIALIZE_ASSET_UPDATE
+                    })
                     .bind(("cl", cl.to_string()))
                     .bind(("asset_key", asset_key.clone()))
                     .bind(("event_id", event_id.clone()))
                     .bind(("run_id", event.run_id.clone()))
                     .bind(("timestamp", event.timestamp))
                     .bind(("data_version", data_version))
-                    .bind(("mcv", code_version))
-                    .bind(("idv", input_data_versions))
-                    .await?;
+                    .bind(("mcv", code_version));
+                if !keep_idv {
+                    query = query.bind(("idv", input_data_versions));
+                }
+                query.await?;
 
                 if let Some(partition_key) = &event.partition_key {
                     self.upsert_asset_partitions(vec![DbAssetPartitionWrite {
@@ -1734,6 +1756,11 @@ impl StorageBackend for SurrealStorage {
         // Group materializations by asset (latest wins), then one bulk upsert.
         let mut latest_mat: std::collections::HashMap<(&str, &str), usize> =
             std::collections::HashMap::new();
+        // Latest event that actually consumed inputs, tracked apart from
+        // `latest_mat` so an action's provenance-free materialization landing
+        // in the same drain doesn't drop a real materialize's provenance.
+        let mut latest_idv: std::collections::HashMap<(&str, &str), usize> =
+            std::collections::HashMap::new();
         let mut part_rows: std::collections::HashMap<
             (&str, &str, &PartitionKey),
             DbAssetPartitionWrite,
@@ -1748,6 +1775,9 @@ impl StorageBackend for SurrealStorage {
             }
             let cl = event.code_location_id.as_str();
             latest_mat.insert((cl, asset_key.as_str()), idx);
+            if !event.input_data_versions.is_empty() {
+                latest_idv.insert((cl, asset_key.as_str()), idx);
+            }
             if let Some(partition_key) = &event.partition_key {
                 part_rows.insert(
                     (cl, asset_key.as_str(), partition_key),
@@ -1769,17 +1799,27 @@ impl StorageBackend for SurrealStorage {
             let event_id = &event_ids[idx];
             let code_version = self.get_code_version(cl, asset_key).await?;
             let data_version = event.event_type.data_version().map(|s| s.to_string());
-            self.db
-                .query("UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv, last_input_data_versions = $idv WHERE code_location_id = $cl AND asset_key = $asset_key")
+            let idv = latest_idv
+                .get(&(cl, asset_key))
+                .map(|&i| events[i].input_data_versions.clone());
+            let mut query = self
+                .db
+                .query(if idv.is_some() {
+                    MATERIALIZE_ASSET_UPDATE
+                } else {
+                    MATERIALIZE_ASSET_UPDATE_KEEP_IDV
+                })
                 .bind(("cl", cl.to_string()))
                 .bind(("asset_key", asset_key.to_string()))
                 .bind(("event_id", event_id.clone()))
                 .bind(("run_id", event.run_id.clone()))
                 .bind(("timestamp", event.timestamp))
                 .bind(("data_version", data_version))
-                .bind(("mcv", code_version))
-                .bind(("idv", event.input_data_versions.clone()))
-                .await?;
+                .bind(("mcv", code_version));
+            if let Some(idv) = idv {
+                query = query.bind(("idv", idv));
+            }
+            query.await?;
         }
 
         // Upsert the affected partition rows in one bulk statement.
@@ -3539,16 +3579,35 @@ impl PerCodeLocationStorage for SurrealStorage {
         asset_key: &str,
         materialized: &std::collections::HashMap<PartitionKey, i64>,
     ) -> Result<std::collections::HashMap<PartitionKey, i64>> {
+        // A failed action did not fail to *materialize* anything, so it must not
+        // floor a partition here: the floor is cleared only by a materialization,
+        // which the floor itself then suppresses. Keyed StepFailure events from
+        // action runs stay in storage — backfill accounting reads them — so the
+        // filtering belongs on this reader, not on the emitter.
+        let mut action_runs = self
+            .db
+            .query(
+                "SELECT VALUE run_id FROM runs \
+                 WHERE code_location_id = $cl AND $asset_key IN node_names \
+                 AND action IS NOT NONE",
+            )
+            .bind(("cl", code_location_id.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .await?;
+        let action_runs: Vec<String> = action_runs.take(0)?;
+
         let mut result = self
             .db
             .query(
                 "SELECT partition_key, math::max(timestamp) AS ts FROM events \
                  WHERE code_location_id = $cl AND asset_key = $asset_key \
                  AND event_type = 'StepFailure' AND partition_key IS NOT NONE \
+                 AND run_id NOT IN $action_runs \
                  GROUP BY partition_key",
             )
             .bind(("cl", code_location_id.to_string()))
             .bind(("asset_key", asset_key.to_string()))
+            .bind(("action_runs", action_runs))
             .await?;
 
         #[derive(Debug, SurrealValue)]
@@ -3574,7 +3633,8 @@ impl PerCodeLocationStorage for SurrealStorage {
             .query(
                 "SELECT partition_key, start_time FROM runs \
                  WHERE code_location_id = $cl AND status = 'Failure' \
-                 AND $asset_key IN node_names AND partition_key IS NOT NONE",
+                 AND $asset_key IN node_names AND partition_key IS NOT NONE \
+                 AND action IS NONE",
             )
             .bind(("cl", code_location_id.to_string()))
             .bind(("asset_key", asset_key.to_string()))
@@ -4992,6 +5052,42 @@ mod tests {
         assert!(updated.last_run_id.is_none());
         assert!(updated.last_materialization_code_version.is_none());
         assert!(updated.last_input_data_versions.is_empty());
+    }
+
+    /// An action's `ActionResult.materialized()` reports no upstream
+    /// provenance — it merged existing data rather than consuming inputs.
+    /// Writing that empty list through would erase the asset's real
+    /// provenance and flip it to Stale forever.
+    #[tokio::test]
+    async fn test_empty_input_data_versions_preserves_existing() {
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let consumed = vec![("a".to_string(), "dv-a".to_string())];
+
+        for batched in [false, true] {
+            let storage = make_storage().await;
+            register(&storage, &["a", "b"]).await;
+
+            let mut materialize = make_event("b", "run-1", 1000);
+            materialize.input_data_versions = consumed.clone();
+            let mut action = make_event("b", "run-2", 2000);
+            action.event_type = EventType::Materialization {
+                data_version: Some("merged-v2".to_string()),
+            };
+
+            if batched {
+                storage.store_events(&[materialize, action]).await.unwrap();
+            } else {
+                storage.store_event(&materialize).await.unwrap();
+                storage.store_event(&action).await.unwrap();
+            }
+
+            let record = storage.get_asset_record(cl, "b").await.unwrap().unwrap();
+            assert_eq!(
+                record.last_input_data_versions, consumed,
+                "provenance erased by an empty write (batched={batched})"
+            );
+            assert_eq!(record.last_data_version.as_deref(), Some("merged-v2"));
+        }
     }
 
     #[tokio::test]
@@ -8583,6 +8679,102 @@ mod tests {
             keys,
             vec!["a", "b", "c"],
             "Set failure expands to its members"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_failed_partitions_ignores_action_runs() {
+        // A failed `delete` did not fail to *materialize* anything. Both sources
+        // this reads — keyed StepFailure events and Failure run records — must
+        // skip action runs, or the partition takes a materialization floor that
+        // only a materialization can clear (and the floor suppresses it).
+        let storage = make_storage().await;
+        register(&storage, &["asset"]).await;
+
+        let single = |k: &str| PartitionKey::Single {
+            keys: vec![k.to_string()],
+        };
+        let run = |id: &str, action: Option<&str>, status, pk: &str| RunRecord {
+            run_id: id.to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status,
+            start_time: 1000,
+            end_time: Some(1500),
+            tags: vec![],
+            node_names: vec!["asset".to_string()],
+            priority: 0,
+            partition_key: Some(single(pk)),
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: action.map(str::to_string),
+        };
+
+        // A failed partitioned `delete` — floors p1 via the runs query.
+        storage
+            .create_run(&run("run_del", Some("delete"), RunStatus::Failure, "p1"))
+            .await
+            .unwrap();
+        // A *successful* batched `delete` that marked p2 failed — floors p2 via
+        // the events query. The event itself is legitimate (backfill accounting
+        // reads it); only the failure-floor reader must ignore it.
+        storage
+            .create_run(&run("run_mark", Some("delete"), RunStatus::Success, "p2"))
+            .await
+            .unwrap();
+        storage
+            .store_event(&EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("asset".to_string()),
+                run_id: "run_mark".to_string(),
+                partition_key: Some(single("p2")),
+                timestamp: 1000,
+                metadata: vec![("error".to_string(), "corrupt".to_string())],
+                input_data_versions: vec![],
+            })
+            .await
+            .unwrap();
+        // A real materialization failure on p3 — must still be reported.
+        storage
+            .create_run(&run("run_mat", None, RunStatus::Failure, "p3"))
+            .await
+            .unwrap();
+        storage
+            .store_event(&EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("asset".to_string()),
+                run_id: "run_mat".to_string(),
+                partition_key: Some(single("p3")),
+                timestamp: 1000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            })
+            .await
+            .unwrap();
+
+        let failed = storage
+            .get_failed_partitions(
+                DEFAULT_CODE_LOCATION_ID,
+                "asset",
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let mut keys: Vec<String> = failed
+            .keys()
+            .map(|pk| match pk {
+                PartitionKey::Single { keys } => keys[0].clone(),
+                other => panic!("expected Single, got {other:?}"),
+            })
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["p3"],
+            "only the materialization failure floors a partition; \
+             action runs (failed or marking) must not"
         );
     }
 

@@ -340,11 +340,15 @@ impl AssetConditionCache {
         // ExecutionFailed on a fresh cache — persisted eval-state floors are
         // only a rehydration shortcut, not the source of truth. Mirrors the
         // steady-state gates (materialized-by-the-failed-run, or outranked by
-        // a newer materialization, clears the floor).
+        // a newer materialization, clears the floor), including the one in
+        // `apply_run_effects_to_delta` that skips action runs.
         let failed_runs = scoped
             .get_runs_since(0, Some(RunStatus::Failure), crate::storage::SortOrder::Asc)
             .await?;
         for run in &failed_runs {
+            if run.action.is_some() {
+                continue;
+            }
             let run_ts = run.end_time.unwrap_or(run.start_time);
             for asset in &run.node_names {
                 if run.partition_key.is_some() && self.is_partitioned(asset) {

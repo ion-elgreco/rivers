@@ -293,6 +293,9 @@ impl<'a> BatchContext<'a> {
     /// other record. Neither one floors a materialization — `get_failed_partitions`
     /// filters action runs out on the read side.
     pub(crate) fn emit_partition_failures(&self, step_name: &str, error: &str, ts: i64) {
+        if self.scope.plan.is_action() {
+            return;
+        }
         if let Some(pk) = self.scope.partition_key {
             ops::emit_partition_failure(
                 self.sink.writer,

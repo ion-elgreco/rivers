@@ -1089,6 +1089,43 @@ def test_merge_with_data_emits_materialization():
     assert "ActionCompleted" not in [e.event_type for e in events]
 
 
+def test_merge_preserves_upstream_provenance():
+    """A merge consumes no upstream, so it must not erase what was consumed.
+
+    Reporting `materialized()` writes an empty input-data-version list; if that
+    reaches the asset row, the asset loses its provenance and reads Stale
+    against a dependency nothing has touched.
+    """
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler())
+    def source() -> int:
+        return 1
+
+    class Derived(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+
+        @classmethod
+        def materialize(cls, source: int) -> int:
+            return source + 1
+
+        @rs.action(outcome=rs.Outcome.MayMaterialize)
+        @classmethod
+        def merge_late(cls, ctx):
+            return rs.ActionResult.materialized(data_version="merged-v2")
+
+    repo = rs.CodeRepository(assets=[source, Derived], default_executor=IP)
+    repo.materialize()
+    before = repo.storage.get_asset_record("derived").last_input_data_versions
+    assert before, "precondition: derived consumed source"
+
+    assert repo.run_action("merge_late", selection=["derived"]).success
+
+    record = repo.storage.get_asset_record("derived")
+    assert record.last_input_data_versions == before
+    assert record.last_data_version == "merged-v2"
+    assert repo.storage.compute_staleness()["derived"][0] == "UpToDate"
+
+
 def test_unchanged_action_reporting_materialized_fails():
     class Table(rs.Asset):
         @classmethod
@@ -1273,6 +1310,43 @@ def test_partitioned_delete_clears_only_that_partition():
     assert "p2" in remaining[0]
     # Whole-asset state is untouched by a partition-scoped delete.
     assert repo.storage.get_asset_record("events").last_data_version is not None
+
+
+def test_failed_partitioned_action_does_not_floor_the_partition():
+    """A failed action is not a failed materialization attempt.
+
+    A partition-scoped StepFailure feeds ``get_failed_partitions``, which the
+    condition cache reads as "this partition failed to materialize" and uses to
+    suppress the partition from ``eager()`` — wedging exactly the automation
+    that would have to run to clear the floor.
+    """
+
+    class Events(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext):
+            return context.partition_key
+
+        @rs.action(outcome=rs.Outcome.Unmaterialize)
+        @classmethod
+        def delete(cls, ctx):
+            raise RuntimeError("boom")
+
+    repo = rs.CodeRepository(assets=[Events], default_executor=IP)
+    pk = rs.PartitionKey.single("p1")
+    repo.materialize(partition_key=pk)
+
+    result = repo.run_action("delete", partition_key=pk, raise_on_error=False)
+    assert not result.success
+
+    events = repo.storage.get_events_for_run(result.run_id)
+    failures = [e for e in events if e.event_type == "StepFailure"]
+    assert failures, "the run itself must still report the failure"
+    assert all(e.partition_key is None for e in failures), (
+        "an action failure must not land as a per-partition materialization failure"
+    )
 
 
 def test_delete_reporting_unchanged_preserves_state():

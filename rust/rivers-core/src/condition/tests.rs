@@ -8169,6 +8169,69 @@ async fn test_initial_load_derives_failure_floor_from_run_history() {
 }
 
 #[tokio::test]
+async fn test_initial_load_ignores_failed_action_runs() {
+    // A failed `compact` is not a failed materialization attempt. The steady
+    // state already knows that (apply_run_effects_to_delta); after a daemon
+    // restart initial_load rebuilds the floor from run history and must reach
+    // the same answer, or a failed action latches ExecutionFailed forever.
+    use crate::condition::pass::{AssetConditionInfo, ConditionPass};
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[make_record("a")])
+        .await
+        .unwrap();
+
+    storage
+        .create_run(&RunRecord {
+            run_id: "run-compact".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Started,
+            start_time: 2_000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: Some("compact".to_string()),
+        })
+        .await
+        .unwrap();
+    storage
+        .update_run_status("run-compact", RunStatus::Failure, Some(2_500))
+        .await
+        .unwrap();
+
+    let mut pass = ConditionPass::new(
+        AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+        ConditionEvalState {
+            is_initial: true,
+            ..Default::default()
+        },
+        vec![AssetConditionInfo {
+            asset_key: "a".to_string(),
+            condition: ConditionNode::ExecutionFailed,
+            partition_info: None,
+            backfill_strategy: None,
+        }],
+        HashMap::new(),
+    );
+    pass.refresh_cache(&storage, 10_000).await.unwrap();
+    let out = pass.run(10_000, false);
+    assert!(
+        !out.plan.unpartitioned.contains(&"a".to_string()),
+        "a failed action run must not raise the materialization failure floor"
+    );
+}
+
+#[tokio::test]
 async fn test_recover_pending_dispatch_clears_is_initial() {
     // V-06: a first-tick crash restarts with a fresh state (is_initial=true) plus
     // a persisted intent. Recovery must clear the global is_initial, or the next
@@ -17347,5 +17410,86 @@ async fn deleted_asset_reads_missing_again() {
         record.last_event_id.is_some(),
         true,
         "the deletion still owns the asset's last event for timelines"
+    );
+}
+
+/// Deleting an asset must not read to downstream as "the dependency produced
+/// something new" — `NewlyUpdated` compares `last_timestamp` against the
+/// downstream's own, so a deletion that moves it forward triggers a
+/// materialization from data that no longer exists.
+#[tokio::test]
+async fn deleted_asset_does_not_read_newly_updated_downstream() {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = DEFAULT_CODE_LOCATION_ID.to_string();
+    let ctx_cl = crate::storage::CodeLocationContext::new(cl.clone());
+    let scoped = storage.for_code_location(&ctx_cl);
+
+    scoped
+        .register_assets(&[make_record("events"), make_record("rollups")])
+        .await
+        .unwrap();
+    let event = |asset: &str, event_type, ts| crate::storage::EventRecord {
+        code_location_id: cl.clone(),
+        event_type,
+        asset_key: Some(asset.to_string()),
+        run_id: format!("run-{asset}-{ts}"),
+        partition_key: None,
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+    let mat = |dv: &str| crate::storage::EventType::Materialization {
+        data_version: Some(dv.to_string()),
+    };
+
+    storage
+        .store_events(&[event("events", mat("dv-e"), 1000)])
+        .await
+        .unwrap();
+    storage
+        .store_events(&[event("rollups", mat("dv-r"), 1100)])
+        .await
+        .unwrap();
+    storage
+        .store_events(&[event("events", crate::storage::EventType::Deletion, 2000)])
+        .await
+        .unwrap();
+
+    let events = scoped.get_asset_record("events").await.unwrap().unwrap();
+    let rollups = scoped.get_asset_record("rollups").await.unwrap().unwrap();
+    let records = HashMap::from([
+        ("events".to_string(), events.clone()),
+        ("rollups".to_string(), rollups.clone()),
+    ]);
+    let deps = HashMap::from([("rollups".to_string(), vec!["events".to_string()])]);
+
+    // NewlyUpdated(events) as evaluated for rollups: target is the dep, root
+    // is the asset whose automation would fire.
+    let ctx = EvalContext {
+        target_key: "events",
+        root_key: "rollups",
+        target_record: &events,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &EMPTY_SET,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &DEFAULT_STATE,
+        all_asset_states: &EMPTY_ASSET_STATES,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: 3_000,
+        is_initial: false,
+        partitions: None,
+        root_partition_floor: None,
+    };
+    assert!(
+        !evaluate(&ConditionNode::NewlyUpdated, &ctx).fired,
+        "a deleted upstream must not look freshly materialized to downstream"
     );
 }
