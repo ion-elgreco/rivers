@@ -15,6 +15,7 @@ fn mk_run(run_id: &str, status: RunStatus, assets: &[&str], ts: i64) -> RunRecor
         partition_key: None,
         block_reason: None,
         launched_by: crate::storage::LaunchedBy::default(),
+        action: None,
     }
 }
 
@@ -201,6 +202,7 @@ async fn initial_load_run_completing_mid_load_is_not_lost() {
             partition_key: None,
             block_reason: None,
             launched_by: crate::storage::LaunchedBy::Manual { user: None },
+            action: None,
         };
     let mat_event = |asset: &str, run_id: &str, ts: i64| crate::storage::EventRecord {
         code_location_id: cl.clone(),
@@ -369,5 +371,120 @@ async fn deleted_tracked_run_clears_in_progress_guard() {
             .get("b")
             .is_some_and(|runs| runs.contains_key("run-pending")),
         "a pending id inside its grace window must not be swept as vanished"
+    );
+}
+
+#[test]
+fn action_runs_are_not_materialization_attempts() {
+    // a successful action run (optimize/delete/observe) must not
+    // count as a materialization for condition bookkeeping — its effects
+    // reach the cache through the record refresh instead. A failed action
+    // run must not raise the failure floor either.
+    let mut cache = AssetConditionCache::new("default".to_string());
+    let mut delta = RefreshDelta::default();
+
+    let mut ok = mk_run("act-ok", RunStatus::Success, &["R"], 100);
+    ok.action = Some("optimize".to_string());
+    let mut boom = mk_run("act-boom", RunStatus::Failure, &["R"], 200);
+    boom.action = Some("optimize".to_string());
+
+    assert!(cache.apply_run_effects_to_delta(&ok, &mut delta));
+    assert!(cache.apply_run_effects_to_delta(&boom, &mut delta));
+
+    assert!(
+        delta.materialized_overrides.is_empty(),
+        "action success must not register a materialized override"
+    );
+    assert!(
+        delta.failed_adds.is_empty(),
+        "action failure must not raise the failure floor"
+    );
+    assert!(
+        delta.last_run_updates.is_empty(),
+        "action runs must not become per-partition materialization attempts"
+    );
+    // Both runs are still marked applied so the cursor dedup works.
+    assert_eq!(delta.applied_runs.len(), 2);
+}
+
+/// A deleted partition must leave the cached partition status: the
+/// incremental timestamp fetch only sees rows whose timestamp advanced, so
+/// a row deletion is invisible to it — completed action runs get their
+/// touched keys re-checked by key and evicted when the row is gone.
+#[tokio::test]
+async fn deleted_partition_evicted_from_partition_status() {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+    let single = |k: &str| PartitionKey::Single {
+        keys: vec![k.to_string()],
+    };
+
+    storage
+        .create_run(&mk_run("r0", RunStatus::Success, &["events"], 1000))
+        .await
+        .unwrap();
+    let mat_event = |pk: &str, ts: i64| crate::storage::EventRecord {
+        code_location_id: cl.clone(),
+        event_type: crate::storage::EventType::Materialization {
+            data_version: Some(format!("dv_{pk}_{ts}")),
+        },
+        asset_key: Some("events".to_string()),
+        run_id: "r0".to_string(),
+        partition_key: Some(single(pk)),
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+    storage
+        .store_events(&[mat_event("p1", 1000), mat_event("p2", 1000)])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(cl.clone());
+    cache.set_partitioned_assets(vec!["events".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let ts = &cache.partition_status.get("events").unwrap().timestamps;
+    assert!(
+        ts.contains_key(&single("p1")) && ts.contains_key(&single("p2")),
+        "both materialized partitions must be cached after initial load"
+    );
+
+    // Delete p1 via an action run — executor write order: events, then status.
+    let mut del = mk_run("r1", RunStatus::Started, &["events"], 2000);
+    del.end_time = None;
+    del.partition_key = Some(single("p1"));
+    del.action = Some("delete".to_string());
+    storage.create_run(&del).await.unwrap();
+    storage
+        .store_events(&[crate::storage::EventRecord {
+            code_location_id: cl.clone(),
+            event_type: crate::storage::EventType::Deletion,
+            asset_key: Some("events".to_string()),
+            run_id: "r1".to_string(),
+            partition_key: Some(single("p1")),
+            timestamp: 2000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        }])
+        .await
+        .unwrap();
+    storage
+        .update_run_status("r1", RunStatus::Success, Some(2000))
+        .await
+        .unwrap();
+
+    let changed = cache.refresh(&storage, 1).await.unwrap();
+    assert!(changed, "a completed delete is a meaningful change");
+    let status = cache.partition_status.get("events").unwrap();
+    assert!(
+        !status.timestamps.contains_key(&single("p1")),
+        "deleted partition must be evicted from the cached timestamps"
+    );
+    assert!(
+        status.timestamps.contains_key(&single("p2")),
+        "untouched partition must stay cached"
     );
 }

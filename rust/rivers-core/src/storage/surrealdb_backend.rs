@@ -735,6 +735,11 @@ impl SurrealStorage {
                      AND string::contains(string::lowercase($t[1]), $partition_pat))",
                 );
             }
+            match &filter.action {
+                Some(Some(_)) => wheres.push("action = $action"),
+                Some(None) => wheres.push("action IS NONE"),
+                None => {}
+            }
             let where_clause = if wheres.is_empty() {
                 String::new()
             } else {
@@ -768,6 +773,9 @@ impl SurrealStorage {
             }
             if let Some(pat) = &filter.partition_substring {
                 q = q.bind(("partition_pat", pat.to_lowercase()));
+            }
+            if let Some(Some(verb)) = &filter.action {
+                q = q.bind(("action", verb.clone()));
             }
 
             let mut result = q.await?;
@@ -1423,6 +1431,63 @@ impl SurrealStorage {
     }
 
     /// Bulk upsert `asset_partitions` rows, matched on the table's UNIQUE (code_location_id, asset_key, partition_key) index.
+    /// Apply one Deletion event's state clearing.
+    /// Partition-scoped deletions drop that partition's row; whole-asset
+    /// deletions clear the asset's materialization state and every partition
+    /// row. `last_event_id`/`last_timestamp` point timelines at the deletion,
+    /// while `last_run_id` is cleared with the rest of the materialization
+    /// state — conditions read it as "the run whose data this asset holds",
+    /// and a deleted asset holds none (so `Missing` fires again). A
+    /// partition-scoped deletion leaves the asset's `last_data_version`
+    /// alone — other partitions may still hold data.
+    async fn consolidate_deletion(
+        &self,
+        cl: &str,
+        asset_key: &str,
+        event: &EventRecord,
+        event_id: &str,
+    ) -> Result<()> {
+        match &event.partition_key {
+            Some(pk) => {
+                self.db
+                    .query(
+                        "DELETE FROM asset_partitions WHERE code_location_id = $cl \
+                         AND asset_key = $asset_key AND partition_key = $pk",
+                    )
+                    .bind(("cl", cl.to_string()))
+                    .bind(("asset_key", asset_key.to_string()))
+                    .bind(("pk", pk.clone()))
+                    .await?
+                    .check()?;
+            }
+            None => {
+                self.db
+                    .query(
+                        "UPDATE assets SET last_event_id = $event_id, last_run_id = NONE, \
+                         last_timestamp = $timestamp, last_data_version = NONE, \
+                         last_materialization_code_version = NONE, last_input_data_versions = [] \
+                         WHERE code_location_id = $cl AND asset_key = $asset_key",
+                    )
+                    .bind(("cl", cl.to_string()))
+                    .bind(("asset_key", asset_key.to_string()))
+                    .bind(("event_id", event_id.to_string()))
+                    .bind(("timestamp", event.timestamp))
+                    .await?
+                    .check()?;
+                self.db
+                    .query(
+                        "DELETE FROM asset_partitions WHERE code_location_id = $cl \
+                         AND asset_key = $asset_key",
+                    )
+                    .bind(("cl", cl.to_string()))
+                    .bind(("asset_key", asset_key.to_string()))
+                    .await?
+                    .check()?;
+            }
+        }
+        Ok(())
+    }
+
     async fn upsert_asset_partitions(&self, rows: Vec<DbAssetPartitionWrite>) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
@@ -1639,6 +1704,11 @@ impl StorageBackend for SurrealStorage {
                     .await?;
             }
 
+        if let Some(asset_key) = &event.asset_key
+            && event.event_type.is_deletion() {
+                self.consolidate_deletion(cl, asset_key, event, &event_id).await?;
+            }
+
         Ok(event_id)
         })
         .await
@@ -1716,6 +1786,9 @@ impl StorageBackend for SurrealStorage {
         self.upsert_asset_partitions(part_rows.into_values().collect())
             .await?;
 
+        // Partition-scoped deletions collapse to one DELETE per asset — a
+        // purge over a date range lands thousands of them in one drain.
+        let mut part_deletes: HashMap<(&str, &str), Vec<PartitionKey>> = HashMap::new();
         for (event, event_id) in events.iter().zip(event_ids.iter()) {
             let cl = event.code_location_id.as_str();
             if let Some(asset_key) = &event.asset_key
@@ -1730,6 +1803,30 @@ impl StorageBackend for SurrealStorage {
                         .bind(("data_version", data_version))
                         .await?;
                 }
+            if let Some(asset_key) = &event.asset_key
+                && event.event_type.is_deletion() {
+                    match &event.partition_key {
+                        Some(pk) => part_deletes
+                            .entry((cl, asset_key.as_str()))
+                            .or_default()
+                            .push(pk.clone()),
+                        None => {
+                            self.consolidate_deletion(cl, asset_key, event, event_id).await?
+                        }
+                    }
+                }
+        }
+        for ((cl, asset_key), keys) in part_deletes {
+            self.db
+                .query(
+                    "DELETE FROM asset_partitions WHERE code_location_id = $cl \
+                     AND asset_key = $asset_key AND partition_key IN $keys",
+                )
+                .bind(("cl", cl.to_string()))
+                .bind(("asset_key", asset_key.to_string()))
+                .bind(("keys", keys))
+                .await?
+                .check()?;
         }
 
         Ok(event_ids)
@@ -2952,9 +3049,9 @@ impl PerCodeLocationStorage for SurrealStorage {
                 "SELECT count() AS total FROM concurrency_slots \
                      WHERE lease_expires_at <= $now GROUP ALL; \
                  DELETE FROM concurrency_slots WHERE lease_expires_at <= $now; \
-                 SELECT run_id, code_location_id, tags, node_names, job_name, priority, partition_key, start_time \
+                 SELECT run_id, code_location_id, tags, node_names, job_name, priority, partition_key, start_time, action \
                      FROM runs WHERE status IN ['NotStarted', 'Started'] AND code_location_id = $cl; \
-                 SELECT run_id, code_location_id, tags, node_names, job_name, priority, partition_key, start_time \
+                 SELECT run_id, code_location_id, tags, node_names, job_name, priority, partition_key, start_time, action \
                      FROM runs WHERE status = 'Queued' AND code_location_id = $cl",
             )
             .bind(("now", now_ns))
@@ -3360,6 +3457,40 @@ impl PerCodeLocationStorage for SurrealStorage {
             .bind(("cl", code_location_id.to_string()))
             .bind(("asset_key", asset_key.to_string()))
             .bind(("since", since_timestamp))
+            .await?;
+
+        #[derive(Debug, SurrealValue)]
+        struct PartTsRow {
+            partition_key: PartitionKey,
+            last_timestamp: i64,
+        }
+
+        let rows: Vec<PartTsRow> = result.take(0)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.partition_key, r.last_timestamp))
+            .collect())
+    }
+
+    async fn get_partition_timestamps_for_keys(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        keys: &[PartitionKey],
+    ) -> Result<Vec<(PartitionKey, i64)>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut result = self
+            .db
+            .query(
+                "SELECT partition_key, last_timestamp FROM asset_partitions \
+                 WHERE code_location_id = $cl AND asset_key = $asset_key \
+                 AND partition_key IN $keys",
+            )
+            .bind(("cl", code_location_id.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .bind(("keys", keys.to_vec()))
             .await?;
 
         #[derive(Debug, SurrealValue)]
@@ -4901,6 +5032,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
         let mat_event = EventRecord {
@@ -4974,6 +5106,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
 
@@ -5028,6 +5161,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
 
         // First CREATE succeeds.
@@ -5074,6 +5208,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             };
             storage.create_run(&run).await.unwrap();
             all_runs.push(run);
@@ -5104,6 +5239,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         let run_fail = RunRecord {
             run_id: "fail".to_string(),
@@ -5118,6 +5254,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run_ok).await.unwrap();
         storage.create_run(&run_fail).await.unwrap();
@@ -5147,6 +5284,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             };
             storage.create_run(&run).await.unwrap();
         }
@@ -5222,6 +5360,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             };
             storage.create_run(&run).await.unwrap();
         }
@@ -5234,6 +5373,47 @@ mod tests {
         let page = storage.get_all_runs_page(0, 10, &filter).await.unwrap();
         assert_eq!(page.total, 2);
         assert!(page.rows.iter().all(|r| r.status == RunStatus::Success));
+
+        // Verb filter: action runs are separable from materializations, so a
+        // "what did the purge touch" question doesn't scan every run.
+        let mut action_run = RunRecord {
+            run_id: "run-delete".into(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Success,
+            start_time: 9000,
+            end_time: Some(9001),
+            tags: vec![],
+            node_names: vec!["events".into()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: Some("delete".into()),
+        };
+        storage.create_run(&action_run).await.unwrap();
+        action_run.run_id = "run-compact".into();
+        action_run.action = Some("compact".into());
+        storage.create_run(&action_run).await.unwrap();
+
+        let filter = RunFilter {
+            action: Some(Some("delete".into())),
+            ..Default::default()
+        };
+        let page = storage.get_all_runs_page(0, 10, &filter).await.unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].run_id, "run-delete");
+
+        let filter = RunFilter {
+            action: Some(None),
+            ..Default::default()
+        };
+        let page = storage.get_all_runs_page(0, 50, &filter).await.unwrap();
+        assert!(
+            page.rows.iter().all(|r| r.action.is_none()),
+            "materialize filter must exclude action runs"
+        );
+        assert!(page.total >= 3, "materialize runs still match, got {}", page.total);
 
         // Job substring (case-insensitive)
         let filter = RunFilter {
@@ -5308,6 +5488,7 @@ mod tests {
                     partition_key: None,
                     block_reason: None,
                     launched_by: LaunchedBy::Manual { user: None },
+                    action: None,
                 })
                 .await
                 .unwrap();
@@ -5359,6 +5540,7 @@ mod tests {
                         partition_key: None,
                         block_reason: None,
                         launched_by: LaunchedBy::Manual { user: None },
+                        action: None,
                     })
                     .await
                     .unwrap();
@@ -5417,6 +5599,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             };
             storage.create_run(&run).await.unwrap();
         }
@@ -5457,6 +5640,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             };
             storage_w.create_run(&run).await.unwrap();
         });
@@ -5514,6 +5698,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             };
             storage.create_run(&run).await.unwrap();
         })
@@ -5573,6 +5758,7 @@ mod tests {
                 end_time: None,
                 error: None,
                 launched_by: LaunchedBy::default(),
+                action: None,
             };
             storage.create_backfill(&bf).await.unwrap();
         })
@@ -5683,6 +5869,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .collect();
 
@@ -5722,6 +5909,7 @@ mod tests {
                 }),
                 block_reason: Some("global run limit".to_string()),
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             },
             RunRecord {
                 run_id: "queued_2".to_string(),
@@ -5736,6 +5924,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             },
         ];
 
@@ -6555,6 +6744,7 @@ mod tests {
                     partition_key: None,
                     block_reason: None,
                     launched_by: LaunchedBy::Manual { user: None },
+                    action: None,
                 })
                 .await
                 .unwrap();
@@ -6609,6 +6799,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -6626,6 +6817,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -6643,6 +6835,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -6745,6 +6938,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -6762,6 +6956,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -7351,6 +7546,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         let run2 = RunRecord {
             run_id: "run_2".to_string(),
@@ -7365,6 +7561,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         let run3 = RunRecord {
             run_id: "run_3".to_string(),
@@ -7379,6 +7576,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run1).await.unwrap();
         storage.create_run(&run2).await.unwrap();
@@ -7426,6 +7624,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&mk("zzz", 1000)).await.unwrap();
         storage.create_run(&mk("mmm", 2000)).await.unwrap();
@@ -7463,6 +7662,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         let run2 = RunRecord {
             run_id: "run_2".to_string(),
@@ -7477,6 +7677,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         let run3 = RunRecord {
             run_id: "run_3".to_string(),
@@ -7491,6 +7692,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run1).await.unwrap();
         storage.create_run(&run2).await.unwrap();
@@ -8002,6 +8204,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
 
@@ -8070,6 +8273,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
 
@@ -8142,6 +8346,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
 
@@ -8194,6 +8399,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
 
@@ -8262,6 +8468,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
 
@@ -8333,6 +8540,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
 
@@ -8599,6 +8807,7 @@ mod tests {
                     name: None,
                 }),
             },
+            action: None,
         };
         storage.create_backfill(&record).await.unwrap();
 
@@ -8653,6 +8862,7 @@ mod tests {
             end_time: None,
             error: None,
             launched_by: LaunchedBy::default(),
+            action: None,
         }
     }
 
@@ -8752,6 +8962,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -8786,6 +8997,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -8805,6 +9017,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -8824,6 +9037,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -8861,6 +9075,7 @@ mod tests {
                     partition_key: None,
                     block_reason: None,
                     launched_by: LaunchedBy::Manual { user: None },
+                    action: None,
                 })
                 .await
                 .unwrap();
@@ -8890,6 +9105,7 @@ mod tests {
                 }),
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .collect();
 
@@ -8939,6 +9155,7 @@ mod tests {
                     partition_key: None,
                     block_reason: None,
                     launched_by: LaunchedBy::Manual { user: None },
+                    action: None,
                 })
                 .await
                 .unwrap();
@@ -8966,6 +9183,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -9005,6 +9223,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -9024,6 +9243,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -10788,6 +11008,7 @@ mod tests {
                         partition_key: None,
                         block_reason: None,
                         launched_by: LaunchedBy::Manual { user: None },
+                        action: None,
                     })
                     .await
                     .unwrap();
@@ -10809,6 +11030,7 @@ mod tests {
                         partition_key: None,
                         block_reason: None,
                         launched_by: LaunchedBy::Manual { user: None },
+                        action: None,
                     })
                     .await
                     .unwrap();
@@ -10878,6 +11100,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -10976,6 +11199,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -11011,6 +11235,7 @@ mod tests {
             EventType::StepSlotWaiting,
             EventType::StepSlotRenewed,
             EventType::StepSlotReleased,
+            EventType::ActionCompleted,
         ];
 
         for evt in types {
@@ -11198,6 +11423,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -11263,6 +11489,7 @@ mod tests {
                 partition_key: None,
                 block_reason: Some("global limit".into()),
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -11292,6 +11519,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -11525,6 +11753,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         }
     }
 
@@ -12547,6 +12776,7 @@ mod tests {
                     partition_key: None,
                     block_reason: None,
                     launched_by: LaunchedBy::Manual { user: None },
+                    action: None,
                 })
                 .await
                 .unwrap();
@@ -12566,6 +12796,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -12649,6 +12880,7 @@ mod tests {
                     partition_key: None,
                     block_reason: None,
                     launched_by: LaunchedBy::Manual { user: None },
+                    action: None,
                 })
                 .await
                 .unwrap();
@@ -12692,6 +12924,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         // CL-A: 2 success, 1 failure
         for r in [
@@ -12747,6 +12980,7 @@ mod tests {
                     partition_key: None,
                     block_reason: None,
                     launched_by: LaunchedBy::Manual { user: None },
+                    action: None,
                 })
                 .await
                 .unwrap();
@@ -12792,6 +13026,7 @@ mod tests {
             end_time: None,
             error: None,
             launched_by: LaunchedBy::default(),
+            action: None,
         }
     }
 

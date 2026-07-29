@@ -69,12 +69,47 @@ impl ExecutionStep {
     }
 }
 
+/// Asset order within an action run. Ordering bounds partial failure — it
+/// decides which half-completed states are reachable — it cannot make a
+/// multi-asset action atomic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActionOrdering {
+    /// Targets are independent (optimize, merge).
+    #[default]
+    Unordered,
+    /// Upstream targets first.
+    Topological,
+    /// Downstream targets first (delete) — an asset exists only while its
+    /// upstream does, the LIFO rule of FK teardown.
+    ReverseTopological,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionPlan {
     pub steps: Vec<ExecutionStep>,
+    /// The verb every step executes. `None` means materialize — read it
+    /// through [`ExecutionPlan::verb`] / [`ExecutionPlan::is_action`] rather
+    /// than matching the field, so the default reads as a decision. Every
+    /// executor backend must make that decision: a backend that ignores the
+    /// verb silently materializes whatever it was handed.
+    pub action: Option<String>,
 }
 
 impl ExecutionPlan {
+    /// The verb this plan runs, or `None` for materialize.
+    pub fn verb(&self) -> Option<&str> {
+        self.action.as_deref()
+    }
+
+    /// True when this plan runs a named action rather than materializing.
+    pub fn is_action(&self) -> bool {
+        self.action.is_some()
+    }
+
+    /// True when this plan materializes (no named verb).
+    pub fn is_materialize(&self) -> bool {
+        self.action.is_none()
+    }
     /// Build an execution plan from a resolved asset graph (deps before dependents).
     #[tracing::instrument(skip_all, target = "rivers::execution")]
     pub fn from_graph(graph: &AssetGraph) -> Self {
@@ -100,7 +135,75 @@ impl ExecutionPlan {
             })
             .collect();
 
-        Self { steps }
+        Self {
+            steps,
+            action: None,
+        }
+    }
+
+    /// Build a plan that runs `action` once per target, without pulling in
+    /// upstream nodes — an action operates on existing data and never invokes
+    /// the producing function. `ordering` sequences targets that are related
+    /// in the asset graph; unrelated targets stay parallel.
+    #[tracing::instrument(skip_all, target = "rivers::execution", fields(targets = targets.len()))]
+    pub fn for_action(
+        graph: &AssetGraph,
+        action: &str,
+        targets: &[String],
+        ordering: ActionOrdering,
+    ) -> Self {
+        let name_to_idx: HashMap<&str, petgraph::graph::NodeIndex> = graph
+            .node_indices()
+            .map(|idx| (graph[idx].name.as_str(), idx))
+            .collect();
+
+        // Edges point dependent → dependency, so `a` reachable-to `b` means
+        // `b` is upstream of `a`.
+        let upstream_targets = |of: &str| -> Vec<String> {
+            let Some(&from) = name_to_idx.get(of) else {
+                return Vec::new();
+            };
+            targets
+                .iter()
+                .filter(|t| t.as_str() != of)
+                .filter(|t| {
+                    name_to_idx.get(t.as_str()).is_some_and(|&to| {
+                        petgraph::algo::has_path_connecting(graph, from, to, None)
+                    })
+                })
+                .cloned()
+                .collect()
+        };
+
+        let steps = targets
+            .iter()
+            .map(|target| {
+                let plan_dependencies = match ordering {
+                    ActionOrdering::Unordered => Vec::new(),
+                    // Wait for every related target upstream of this one.
+                    ActionOrdering::Topological => upstream_targets(target),
+                    // Wait for every related target this one is upstream of.
+                    ActionOrdering::ReverseTopological => targets
+                        .iter()
+                        .filter(|t| t.as_str() != target.as_str())
+                        .filter(|t| upstream_targets(t).iter().any(|u| u == target))
+                        .cloned()
+                        .collect(),
+                };
+                ExecutionStep {
+                    name: target.clone(),
+                    kind: StepKind::Normal,
+                    outputs: Vec::new(),
+                    plan_dependencies,
+                    graph_dependencies: Vec::new(),
+                }
+            })
+            .collect();
+
+        Self {
+            steps,
+            action: Some(action.to_string()),
+        }
     }
 
     /// Build an execution plan from a subset of nodes, grouping multi-asset outputs
@@ -239,7 +342,10 @@ impl ExecutionPlan {
             });
         }
 
-        Self { steps }
+        Self {
+            steps,
+            action: None,
+        }
     }
 
     /// Apply step kinds from a map; steps not in the map remain Normal.
@@ -555,6 +661,7 @@ mod tests {
     #[test]
     fn test_all_asset_names_with_multi_output() {
         let plan = ExecutionPlan {
+            action: None,
             steps: vec![
                 ExecutionStep {
                     name: "step_1".to_string(),
@@ -640,6 +747,76 @@ mod tests {
         assert_eq!(level0_names, vec!["a", "b"]);
         assert_eq!(levels[1].len(), 1);
         assert_eq!(plan.steps[levels[1][0]].name, "c");
+    }
+
+    #[test]
+    fn test_for_action_unordered_is_flat() {
+        let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"]), ("c", vec!["b"])]);
+        let plan = ExecutionPlan::for_action(
+            &graph,
+            "optimize",
+            &["a".into(), "b".into(), "c".into()],
+            ActionOrdering::Unordered,
+        );
+
+        assert_eq!(plan.action.as_deref(), Some("optimize"));
+        assert_eq!(plan.steps.len(), 3);
+        for step in &plan.steps {
+            assert!(step.plan_dependencies.is_empty());
+            assert!(step.graph_dependencies.is_empty());
+            assert!(step.outputs.is_empty());
+        }
+        assert_eq!(plan.group_steps_by_level().len(), 1);
+    }
+
+    #[test]
+    fn test_for_action_never_pulls_in_upstream() {
+        let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"])]);
+        let plan =
+            ExecutionPlan::for_action(&graph, "optimize", &["b".into()], ActionOrdering::Unordered);
+        let names: Vec<&str> = plan.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["b"]);
+    }
+
+    #[test]
+    fn test_for_action_reverse_topological_downstream_first() {
+        // events -> rollups (rollups depends on events); delete must run
+        // rollups before events. Unrelated "other" stays parallel.
+        let graph = make_graph(vec![
+            ("events", vec![]),
+            ("rollups", vec!["events"]),
+            ("other", vec![]),
+        ]);
+        let plan = ExecutionPlan::for_action(
+            &graph,
+            "delete",
+            &["events".into(), "rollups".into(), "other".into()],
+            ActionOrdering::ReverseTopological,
+        );
+
+        let events = plan.steps.iter().find(|s| s.name == "events").unwrap();
+        assert_eq!(events.plan_dependencies, vec!["rollups".to_string()]);
+        let rollups = plan.steps.iter().find(|s| s.name == "rollups").unwrap();
+        assert!(rollups.plan_dependencies.is_empty());
+        let other = plan.steps.iter().find(|s| s.name == "other").unwrap();
+        assert!(other.plan_dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_for_action_topological_upstream_first() {
+        let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"]), ("c", vec!["b"])]);
+        let plan = ExecutionPlan::for_action(
+            &graph,
+            "compact",
+            &["a".into(), "c".into()],
+            ActionOrdering::Topological,
+        );
+
+        let c = plan.steps.iter().find(|s| s.name == "c").unwrap();
+        // b is not a target, but a is transitively upstream of c.
+        assert_eq!(c.plan_dependencies, vec!["a".to_string()]);
+        let a = plan.steps.iter().find(|s| s.name == "a").unwrap();
+        assert!(a.plan_dependencies.is_empty());
     }
 
     #[test]

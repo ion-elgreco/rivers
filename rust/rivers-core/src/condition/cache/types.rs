@@ -45,6 +45,9 @@ pub(super) struct PartitionStatusPatch {
     pub(super) fresh_timestamps: Vec<(PartitionKey, i64)>,
     pub(super) in_progress: HashSet<PartitionKey>,
     pub(super) failed: HashMap<PartitionKey, i64>,
+    /// Keys whose `asset_partitions` row no longer exists (deleted by an
+    /// action) — evicted from the cached timestamps at apply.
+    pub(super) deleted: Vec<PartitionKey>,
 }
 
 /// Backfill tracking state — which assets are in active backfills and which partitions they target.
@@ -126,6 +129,10 @@ pub(super) struct RefreshDelta {
     pub(super) tick_tag_updates: Vec<RunTagUpdate>,
     /// Incremental partition-status patches (asset_key → patch).
     pub(super) partition_status: HashMap<String, PartitionStatusPatch>,
+    /// Partition keys touched by completed action runs this refresh — the
+    /// incremental timestamp fetch can't see row deletions, so these keys
+    /// are re-checked for existence and evicted when gone.
+    pub(super) action_partition_checks: HashMap<String, HashSet<PartitionKey>>,
     /// Replacement `BackfillState`, if any backfill query happened.
     pub(super) backfill: Option<BackfillState>,
     /// New cursor values; `None` means don't advance.

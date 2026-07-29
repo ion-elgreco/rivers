@@ -237,9 +237,14 @@ impl AssetConditionCache {
                 .await?;
             delta.record_updates.extend(downstream_records);
 
-            delta.partition_status = self
-                .fetch_partition_status_for_invalidated(storage, &invalidated_keys)
+            let partition_status = self
+                .fetch_partition_status_for_invalidated(
+                    storage,
+                    &invalidated_keys,
+                    &delta.action_partition_checks,
+                )
                 .await?;
+            delta.partition_status = partition_status;
         }
 
         // BackfillStatus has two live states and load_active_backfills returns
@@ -351,6 +356,28 @@ impl AssetConditionCache {
         delta
             .applied_runs
             .push((run.run_id.clone(), run.start_time));
+        // Action runs are not materialization attempts: their effects reach
+        // the cache through the record + partition-status refresh of
+        // `invalidated_keys` (a delete's cleared record, a merge's new data
+        // version). The failed/materialized bookkeeping below is materialize
+        // semantics only — applying it would make an `optimize` count as a
+        // materialization for condition evaluation. The touched partition
+        // keys are recorded so the plan phase can detect row deletions the
+        // incremental timestamp fetch can't see.
+        if run.action.is_some() {
+            if let Some(pk) = &run.partition_key {
+                for asset in &run.node_names {
+                    if self.is_partitioned(asset) {
+                        delta
+                            .action_partition_checks
+                            .entry(asset.clone())
+                            .or_default()
+                            .extend(pk.members());
+                    }
+                }
+            }
+            return true;
+        }
         let run_asset_names: Arc<[String]> = Arc::from(run.node_names.as_slice());
         let run_tags: Arc<[(String, String)]> = Arc::from(run.tags.as_slice());
         let is_failure = matches!(run.status, RunStatus::Failure);
@@ -434,10 +461,14 @@ impl AssetConditionCache {
     }
 
     /// Plan-phase helper: re-fetch partition status for invalidated assets.
+    /// `action_checks` holds partition keys touched by completed action runs:
+    /// their rows are re-fetched by key, and keys with no row (deleted) are
+    /// marked for eviction — the incremental fetch can't observe deletions.
     pub(super) async fn fetch_partition_status_for_invalidated<S: StorageBackend>(
         &self,
         storage: &S,
         invalidated_keys: &[String],
+        action_checks: &HashMap<String, HashSet<PartitionKey>>,
     ) -> anyhow::Result<HashMap<String, PartitionStatusPatch>> {
         let scoped = storage.for_code_location(&self.ctx);
         let mut out: HashMap<String, PartitionStatusPatch> = HashMap::new();
@@ -467,16 +498,34 @@ impl AssetConditionCache {
                 .into_iter()
                 .collect();
             // Supersession against fresh timestamps is reconciled at apply
-            // (timestamps only grow, so recomputing there is sound).
+            // (timestamps only grow outside action eviction, so recomputing
+            // there is sound).
             let failed = scoped
                 .get_failed_partitions(asset_key, &current.timestamps)
                 .await?;
+            let deleted = match action_checks.get(asset_key.as_str()) {
+                Some(touched) if !touched.is_empty() => {
+                    let touched: Vec<PartitionKey> = touched.iter().cloned().collect();
+                    let existing: HashSet<PartitionKey> = scoped
+                        .get_partition_timestamps_for_keys(asset_key, &touched)
+                        .await?
+                        .into_iter()
+                        .map(|(pk, _)| pk)
+                        .collect();
+                    touched
+                        .into_iter()
+                        .filter(|pk| !existing.contains(pk))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
             out.insert(
                 asset_key.clone(),
                 PartitionStatusPatch {
                     fresh_timestamps,
                     in_progress,
                     failed,
+                    deleted,
                 },
             );
         }
@@ -513,6 +562,8 @@ impl AssetConditionCache {
             last_run_updates,
             tick_tag_updates,
             partition_status,
+            // Consumed by the plan-phase invalidated fetch, not the apply.
+            action_partition_checks: _,
             backfill,
             new_last_seen_run_ts,
             new_last_observation_ts,
@@ -599,13 +650,22 @@ impl AssetConditionCache {
             for (pk, ts) in patch.fresh_timestamps {
                 entry.timestamps.insert(pk, ts);
             }
+            // Deleted rows can't appear in the fresh fetch — a key both
+            // deleted and re-materialized this window has a live row again
+            // and never lands in `deleted`.
+            for pk in &patch.deleted {
+                entry.timestamps.remove(pk);
+            }
             entry.in_progress = patch.in_progress;
             // Drop failures superseded by the freshly merged timestamps (the
             // plan-phase supersession ran against the pre-merge view).
             entry.failed_timestamps = patch
                 .failed
                 .into_iter()
-                .filter(|(pk, fail_ts)| entry.timestamps.get(pk).is_none_or(|mat| fail_ts > mat))
+                .filter(|(pk, fail_ts)| {
+                    !patch.deleted.contains(pk)
+                        && entry.timestamps.get(pk).is_none_or(|mat| fail_ts > mat)
+                })
                 .collect();
             entry.failed = entry.failed_timestamps.keys().cloned().collect();
         }
