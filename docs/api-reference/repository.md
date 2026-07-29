@@ -195,6 +195,7 @@ def run_action(
     raise_on_error: bool = True,
     config: dict[str, dict[str, Any]] | None = None,
     run_id_override: str | None = None,
+    resume: bool = False,
 ) -> RunResult
 ```
 
@@ -209,6 +210,7 @@ Run a named [asset action](../concepts/actions.md) over a selection. The plan ha
 | `raise_on_error` | `bool` | `True` | Raise the first failure instead of reporting it on the result. |
 | `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config overrides, keyed by asset name. Python API only — gRPC and UI launches use the definition's defaults. |
 | `run_id_override` | `str \| None` | `None` | Re-execute an existing run record under its own id (used by K8s run pods). |
+| `resume` | `bool` | `False` | Skip already-completed steps from a crashed prior run with the same `run_id_override`. |
 
 ```python
 result = repo.run_action("optimize", selection=["events"])

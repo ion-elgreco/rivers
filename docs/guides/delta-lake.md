@@ -324,6 +324,19 @@ class DeltaAsset(rs.Asset):
         ).vacuum(retention_hours=168, dry_run=False)
 ```
 
+`DeltaAsset` defines no `materialize()`, so it is a mixin — registering it directly
+raises `AssetDefinitionError`. Subclasses supply the verb and inherit both actions:
+
+```python
+class Orders(DeltaAsset):
+    @classmethod
+    def materialize(cls) -> pl.DataFrame:
+        return pl.DataFrame({"id": [1, 2, 3]})
+
+
+repo = rs.CodeRepository(assets=[Orders])
+```
+
 - `asset_table_uri(asset_key, asset_metadata)` — `{table_uri}/{leaf}`, honoring the
   `delta/root_name` override.
 - `partition_predicate(asset_metadata, ctx.partition)` — the SQL predicate for the

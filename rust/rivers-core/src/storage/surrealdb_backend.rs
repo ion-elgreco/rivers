@@ -1430,16 +1430,16 @@ impl SurrealStorage {
         Ok(rows.first().and_then(|r| r.value.clone()))
     }
 
-    /// Bulk upsert `asset_partitions` rows, matched on the table's UNIQUE (code_location_id, asset_key, partition_key) index.
     /// Apply one Deletion event's state clearing.
     /// Partition-scoped deletions drop that partition's row; whole-asset
     /// deletions clear the asset's materialization state and every partition
-    /// row. `last_event_id`/`last_timestamp` point timelines at the deletion,
-    /// while `last_run_id` is cleared with the rest of the materialization
-    /// state — conditions read it as "the run whose data this asset holds",
-    /// and a deleted asset holds none (so `Missing` fires again). A
-    /// partition-scoped deletion leaves the asset's `last_data_version`
-    /// alone — other partitions may still hold data.
+    /// row. `last_event_id` points the timeline at the deletion, while
+    /// `last_run_id`, `last_timestamp` and `last_data_version` are cleared with
+    /// the rest of the materialization state — conditions read them as "the run
+    /// whose data this asset holds" and "when it acquired that data", and a
+    /// deleted asset holds none (so `Missing` fires again, and `NewlyUpdated`
+    /// does not). A partition-scoped deletion leaves the asset's
+    /// `last_data_version` alone — other partitions may still hold data.
     async fn consolidate_deletion(
         &self,
         cl: &str,

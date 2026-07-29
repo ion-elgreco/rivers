@@ -166,6 +166,25 @@ def compact(cls, ctx: rs.ActionContext, warehouse: DuckDB) -> None:
 | `config` | `ConfigT \| None` | Typed config from an `ActionContext[Config]` annotation; `None` without one. |
 | `log` | `logging.Logger` | Logger for the action. |
 
+### Methods
+
+#### `mark_partition_failed(partition_key, error)`
+
+Mirrors [`AssetExecutionContext.mark_partition_failed`](#mark_partition_failedpartition_key-error) for batched action runs: record that one key of the batch failed while the rest count as succeeded, so a `compact` over a range can skip a corrupt partition without failing — or silently completing — the whole batch.
+
+```python
+@rs.action(outcome=rs.Outcome.Unmaterialize)
+@classmethod
+def delete(cls, ctx: rs.ActionContext) -> None:
+    for key in ctx.partition.keys:
+        try:
+            drop_partition(key)
+        except Exception as exc:
+            ctx.mark_partition_failed(key, str(exc))
+```
+
+The key must be in `ctx.partition.keys`. Marked keys are peeled out of the `Deletion` / `ActionCompleted` event the run emits and roll up into the backfill's failed counters — but unlike a materialization failure they do **not** floor the partition for automation, since a failed action is not a failed materialization attempt.
+
 ---
 
 ## Detection rules

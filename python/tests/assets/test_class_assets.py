@@ -271,6 +271,7 @@ def test_near_miss_names_are_allowed_for_non_config_values():
 
 def test_near_miss_config_value_still_rejected():
     """A plain data value under a near-miss name is the case the guard is for."""
+
     class Orders(rs.Asset):
         kind = "delta"
 

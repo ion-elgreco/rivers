@@ -698,7 +698,9 @@ def test_batched_observe_can_fail_one_partition():
     observed = sorted(
         str(e.partition_key) for e in events if e.event_type == "Observation"
     )
-    assert len(observed) == 1, f"eu was marked failed, so only us is observed: {observed}"
+    assert len(observed) == 1, (
+        f"eu was marked failed, so only us is observed: {observed}"
+    )
     assert "us" in observed[0]
 
     failures = [
@@ -1676,29 +1678,42 @@ def test_delete_backfill_over_partition_range():
     assert "p3" in remaining[0]
 
 
-def test_batched_action_can_fail_one_partition():
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize("style", ["sync", "async"])
+def test_batched_action_can_fail_one_partition(executor, style):
     """A batched action is not all-or-nothing.
 
     Over a key range, one corrupt partition must be reportable without either
-    claiming it succeeded or throwing away the keys that did.
+    claiming it succeeded or throwing away the keys that did. The async backend
+    takes its own branch through the invoke path, and the marks are read back
+    off the context *after* the call returns — so both styles must be covered.
     """
+    if style == "sync":
+
+        def _delete(ctx):
+            for key in ctx.partition.keys:
+                if "p2" in str(key):
+                    ctx.mark_partition_failed(key, "corrupt segment")
+    else:
+
+        async def _delete(ctx):
+            await asyncio.sleep(0)
+            for key in ctx.partition.keys:
+                if "p2" in str(key):
+                    ctx.mark_partition_failed(key, "corrupt segment")
+
+    delete = rs.AssetAction(name="delete", outcome=rs.Outcome.Unmaterialize)(_delete)
 
     class Events(rs.Asset):
         io_handler = rs.InMemoryIOHandler()
         partitions_def = rs.PartitionsDefinition.static_(["p1", "p2", "p3"])
+        actions = [delete]
 
         @classmethod
         def materialize(cls, context: rs.AssetExecutionContext):
             return context.partition_key
 
-        @rs.action(outcome=rs.Outcome.Unmaterialize)
-        @classmethod
-        def delete(cls, ctx):
-            for key in ctx.partition.keys:
-                if "p2" in str(key):
-                    ctx.mark_partition_failed(key, "corrupt segment")
-
-    repo = rs.CodeRepository(assets=[Events], default_executor=IP)
+    repo = rs.CodeRepository(assets=[Events], default_executor=executor)
     for p in ("p1", "p2", "p3"):
         repo.materialize(partition_key=rs.PartitionKey.single(p))
 

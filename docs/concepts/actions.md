@@ -80,7 +80,10 @@ rs.Schedule(cron_schedule="0 3 * * *", job_name="nightly_optimize")
 ```
 
 The UI shows a button per action on the asset page, and action runs display their
-verb in the runs list and run header.
+verb in the runs list and run header. A verb declaring `Outcome.Unmaterialize`
+renders as a danger button and always routes through the confirmation dialog,
+which names the verb and says it clears materialization state — nothing else in
+the product distinguishes a destructive verb from a benign one.
 
 ## ActionContext
 
@@ -94,6 +97,10 @@ Actions receive a single `ActionContext` — no upstream inputs:
 | `asset_metadata` | per-asset overrides IO resolution honors |
 | `config` | typed config from an `ActionContext[Config]` annotation (see below) |
 | `log` | Python logger |
+
+It also carries `mark_partition_failed(key, error)`, which reports one key of a
+batched run as failed while the rest still complete — see
+[the context reference](../api-reference/context.md#mark_partition_failedpartition_key-error-1).
 
 Parameters after the context are **resources, injected by name** — the same rule
 materialize functions use; a parameter matching no resource is a resolution error:

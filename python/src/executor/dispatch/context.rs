@@ -352,34 +352,17 @@ impl<'a> BatchContext<'a> {
     ) {
         match self.scope.partition_key {
             Some(pk) => {
-                let failed: HashMap<&PyPartitionKey, &str> = self
-                    .state
-                    .failed_partitions
-                    .get(step_name)
-                    .map(|f| f.iter().map(|(k, e)| (k, e.as_str())).collect())
-                    .unwrap_or_default();
-                for member in pk.members() {
-                    if let Some(&error) = failed.get(&member) {
-                        ops::emit_partition_failure(
-                            self.sink.writer,
-                            self.scope.run_id,
-                            step_name,
-                            &member,
-                            error,
-                            ts,
-                        );
-                    } else {
-                        ops::emit_materialization(
-                            self.sink.writer,
-                            self.scope.run_id,
-                            step_name,
-                            &Some(member),
-                            metadata,
-                            data_version.clone(),
-                            input_versions.clone(),
-                            ts,
-                        );
-                    }
+                for member in self.surviving_members(step_name, pk, ts) {
+                    ops::emit_materialization(
+                        self.sink.writer,
+                        self.scope.run_id,
+                        step_name,
+                        &Some(member),
+                        metadata,
+                        data_version.clone(),
+                        input_versions.clone(),
+                        ts,
+                    );
                 }
             }
             None => ops::emit_materialization(
