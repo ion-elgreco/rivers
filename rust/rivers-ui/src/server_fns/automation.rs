@@ -144,6 +144,7 @@ pub async fn get_jobs(loc_ns: String, loc_name: String) -> Result<Vec<JobRecord>
             name: j.name,
             asset_selection: j.asset_selection,
             executor_type: j.executor_type,
+            action: j.action,
         })
         .collect())
 }
@@ -241,27 +242,16 @@ pub async fn observe_asset(
     loc_name: String,
     asset_key: String,
 ) -> Result<bool, ServerFnError> {
-    use rivers_api::rivers::ObserveAssetRequest;
-
-    let state = expect_context::<crate::state::AppState>();
-    let (_, mut client) = state
-        .connect_to(&loc_ns, &loc_name)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let resp = client
-        .observe_asset(ObserveAssetRequest { asset_key })
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let inner = resp.into_inner();
-    if !inner.success {
-        return Err(ServerFnError::new(
-            inner
-                .error
-                .unwrap_or_else(|| "Observation failed".to_string()),
-        ));
-    }
+    // Observe is the built-in action on external assets.
+    crate::server_fns::mutations::trigger_action(
+        loc_ns,
+        loc_name,
+        "observe".to_string(),
+        vec![asset_key],
+        None,
+        None,
+    )
+    .await?;
     Ok(true)
 }
 

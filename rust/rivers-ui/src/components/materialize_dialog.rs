@@ -10,8 +10,8 @@ use leptos::prelude::*;
 use crate::components::partition_picker::PartitionPicker;
 use crate::helpers::JobPartitionPicker;
 use crate::loc::{loc_path, use_current_location};
-use crate::server_fns::actions::{launch_backfill, trigger_materialize};
 use crate::server_fns::assets::get_assets;
+use crate::server_fns::mutations::{launch_backfill, trigger_action, trigger_materialize};
 use crate::types::{AssetRecord, StaleStatus, SubmitPartitionKey};
 
 /// Above this many selected partitions, submit one backfill instead of a run each.
@@ -76,7 +76,18 @@ pub fn MaterializeDialog(
     /// backfill (more).
     #[prop(optional, into)]
     picker: Option<Signal<JobPartitionPicker>>,
+    /// Verb to run instead of materialize. Same partition selection, submitted
+    /// as action runs (or an action backfill above the threshold).
+    #[prop(optional, into)]
+    action: Option<Signal<Option<String>>>,
+    /// The verb clears materialization state (`Outcome.Unmaterialize`). Says so
+    /// on the dialog — nothing else in the product distinguishes a destructive
+    /// verb from a benign one.
+    #[prop(optional, into)]
+    destructive: Option<Signal<bool>>,
 ) -> impl IntoView {
+    let verb: Signal<Option<String>> = action.unwrap_or_else(|| Signal::derive(|| None));
+    let destructive: Signal<bool> = destructive.unwrap_or_else(|| Signal::derive(|| false));
     let (selected, set_selected) = signal(Vec::<String>::new());
     let partition_keys = RwSignal::new(Vec::<SubmitPartitionKey>::new());
     let (tag_key, set_tag_key) = signal(String::new());
@@ -87,6 +98,15 @@ pub fn MaterializeDialog(
     Effect::new(move || {
         if show.get() {
             set_selected.set(asset_keys.get());
+            // `PartitionPicker` clears this too, but it is only mounted for a
+            // partitioned selection — without this an unpartitioned open would
+            // submit the previous open's keys.
+            partition_keys.set(Vec::new());
+            // Tags feed the submitted run (including `rivers/priority`), so a
+            // tag typed for one open must not ride along on the next.
+            set_tags.set(Vec::new());
+            set_tag_key.set(String::new());
+            set_tag_val.set(String::new());
         }
     });
 
@@ -118,10 +138,11 @@ pub fn MaterializeDialog(
         let pks = partition_keys.get();
         let t = tags.get();
         let (ns, name) = loc.get();
+        let verb = verb.get();
         async move {
             let tags_opt = if t.is_empty() { None } else { Some(t) };
             if pks.len() > BACKFILL_THRESHOLD {
-                let r = launch_backfill(ns, name, Some(sel), pks, tags_opt, None).await?;
+                let r = launch_backfill(ns, name, Some(sel), pks, tags_opt, None, verb).await?;
                 return Ok::<_, ServerFnError>(DialogOutcome::Backfill(r.backfill_id));
             }
             // ≤2 keys → a run each; empty pks (unpartitioned / None picker) → one
@@ -133,15 +154,30 @@ pub fn MaterializeDialog(
             };
             let mut run_id = String::new();
             for pk in keys {
-                run_id = trigger_materialize(
-                    ns.clone(),
-                    name.clone(),
-                    Some(sel.clone()),
-                    pk,
-                    tags_opt.clone(),
-                )
-                .await?
-                .run_id;
+                run_id = match &verb {
+                    Some(verb) => {
+                        trigger_action(
+                            ns.clone(),
+                            name.clone(),
+                            verb.clone(),
+                            sel.clone(),
+                            pk,
+                            tags_opt.clone(),
+                        )
+                        .await?
+                    }
+                    None => {
+                        trigger_materialize(
+                            ns.clone(),
+                            name.clone(),
+                            Some(sel.clone()),
+                            pk,
+                            tags_opt.clone(),
+                        )
+                        .await?
+                        .run_id
+                    }
+                };
             }
             Ok(DialogOutcome::Run(run_id))
         }
@@ -189,11 +225,11 @@ pub fn MaterializeDialog(
     });
     let submit_label = Signal::derive(move || {
         if pending.get() {
-            "Submitting…"
+            "Submitting…".to_string()
         } else if is_partitioned.get() && partition_keys.get().len() > BACKFILL_THRESHOLD {
-            "Launch backfill"
+            "Launch backfill".to_string()
         } else {
-            "Materialize"
+            verb.get().unwrap_or_else(|| "Materialize".to_string())
         }
     });
 
@@ -211,9 +247,15 @@ pub fn MaterializeDialog(
                     on:click=move |ev| ev.stop_propagation()
                 >
                     <div class="modal-header">
-                        <h2>"Materialize"</h2>
+                        <h2>{move || verb.get().unwrap_or_else(|| "Materialize".to_string())}</h2>
                         <button class="btn btn-small" on:click=move |_| show.set(false)>"x"</button>
                     </div>
+
+                    <Show when=move || destructive.get()>
+                        <p class="text-error mat-dialog-warning">
+                            "Clears materialization state for the selected assets."
+                        </p>
+                    </Show>
 
                     <div class="modal-body mat-dialog-body">
                         <div class=move || if is_partitioned.get() {
@@ -351,7 +393,11 @@ pub fn MaterializeDialog(
                         <div class="mat-dialog-actions">
                             <button class="btn" on:click=move |_| show.set(false)>"Cancel"</button>
                             <button
-                                class="btn btn-primary"
+                                class=move || if destructive.get() {
+                                    "btn btn-danger"
+                                } else {
+                                    "btn btn-primary"
+                                }
                                 on:click=move |_| { materialize_action.dispatch(()); }
                                 disabled=move || {
                                     if pending.get() || selected.get().is_empty() {

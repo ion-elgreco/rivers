@@ -166,7 +166,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                                 leptos::task::spawn_local(async move {
                                                     let path_ns = ns.clone();
                                                     let path_name = lname.clone();
-                                                    match crate::server_fns::actions::rerun_backfill(ns, lname, id).await {
+                                                    match crate::server_fns::mutations::rerun_backfill(ns, lname, id).await {
                                                         Ok(result) if !result.backfill_id.is_empty() => {
                                                             let path = loc_path(&path_ns, &path_name, &format!("backfills/{}", result.backfill_id));
                                                             navigate(&path, Default::default());

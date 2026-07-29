@@ -205,6 +205,50 @@ async fn add_tag_button_appends_to_tag_list() {
     assert!(tags[0].text_content().unwrap().contains("env=prod"));
 }
 
+/// Tags are submitted with the run (including `rivers/priority`), so one left
+/// over from a previous open would silently attach to the next action run.
+#[wasm_bindgen_test]
+async fn reopening_drops_the_previous_tags() {
+    let show = RwSignal::new(true);
+    let host = mount_no_picker(show, vec!["a".into()]);
+    flush_effects().await;
+
+    let inputs = query_all(&host, ".tag-input-row .form-input");
+    let key_input: HtmlInputElement = inputs[0].clone().dyn_into().unwrap();
+    let val_input: HtmlInputElement = inputs[1].clone().dyn_into().unwrap();
+    key_input.set_value("env");
+    val_input.set_value("prod");
+
+    let init = web_sys::EventInit::new();
+    init.set_bubbles(true);
+    key_input
+        .dispatch_event(&web_sys::Event::new_with_event_init_dict("input", &init).unwrap())
+        .unwrap();
+    val_input
+        .dispatch_event(&web_sys::Event::new_with_event_init_dict("input", &init).unwrap())
+        .unwrap();
+    flush_effects().await;
+
+    click(&query_one(&host, ".tag-input-row .btn"), false);
+    flush_effects().await;
+    assert_eq!(query_all(&host, ".tag-list .tag").len(), 1);
+
+    show.set(false);
+    flush_effects().await;
+    show.set(true);
+    flush_effects().await;
+
+    assert!(
+        query_all(&host, ".tag-list .tag").is_empty(),
+        "tags from the previous open must not carry over"
+    );
+    let inputs = query_all(&host, ".tag-input-row .form-input");
+    let key_input: HtmlInputElement = inputs[0].clone().dyn_into().unwrap();
+    let val_input: HtmlInputElement = inputs[1].clone().dyn_into().unwrap();
+    assert_eq!(key_input.value(), "");
+    assert_eq!(val_input.value(), "");
+}
+
 #[wasm_bindgen_test]
 async fn removing_a_tag_drops_it_from_the_list() {
     let show = RwSignal::new(true);
@@ -355,4 +399,93 @@ async fn unpartitioned_selection_says_so_instead_of_showing_a_picker() {
             .unwrap()
             .contains("Not partitioned")
     );
+}
+
+/// The picker owns the reset, but it is only mounted for a partitioned
+/// selection — reopening on an unpartitioned asset used to submit the previous
+/// open's keys.
+#[wasm_bindgen_test]
+async fn reopening_unpartitioned_drops_the_previous_partition_keys() {
+    let show = RwSignal::new(true);
+    let picker = RwSignal::new(JobPartitionPicker::SingleDim {
+        keys: vec!["k1".into(), "k2".into()],
+        truncated: false,
+    });
+    nav_to("/locations/default/demo");
+    let target = fresh_mount_target();
+    let host = target.clone();
+    mount_to(target, move || {
+        view! {
+            <Router>
+                <MaterializeDialog
+                    show=show
+                    asset_keys=Signal::derive(|| vec!["a".to_string()])
+                    picker=Signal::derive(move || picker.get())
+                />
+            </Router>
+        }
+    })
+    .forget();
+    flush_effects().await;
+
+    let rows = query_all(&host, ".exec-dialog-partition-row");
+    click(&rows[0], false);
+    flush_effects().await;
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "1 asset · 1 partition · 1 run"
+    );
+
+    // Cancel, then reopen against an unpartitioned asset.
+    show.set(false);
+    flush_effects().await;
+    picker.set(JobPartitionPicker::None);
+    show.set(true);
+    flush_effects().await;
+
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "1 asset · 1 run",
+        "an unpartitioned open inherited the previous selection's keys"
+    );
+}
+
+/// Nothing else in the product distinguishes an `Outcome.Unmaterialize` verb
+/// from a benign one, so the dialog has to.
+#[wasm_bindgen_test]
+async fn destructive_verb_is_named_and_flagged() {
+    let show = RwSignal::new(true);
+    nav_to("/locations/default/demo");
+    let target = fresh_mount_target();
+    let host = target.clone();
+    mount_to(target, move || {
+        view! {
+            <Router>
+                <MaterializeDialog
+                    show=show
+                    asset_keys=Signal::derive(|| vec!["a".to_string()])
+                    action=Signal::derive(|| Some("purge".to_string()))
+                    destructive=Signal::derive(|| true)
+                />
+            </Router>
+        }
+    })
+    .forget();
+    flush_effects().await;
+
+    assert_eq!(
+        query_one(&host, ".modal-header h2").text_content().unwrap(),
+        "purge"
+    );
+    assert!(
+        query_one(&host, ".mat-dialog-warning")
+            .text_content()
+            .unwrap()
+            .contains("Clears materialization state")
+    );
+    assert_eq!(query_all(&host, ".modal-footer .btn-danger").len(), 1);
 }
