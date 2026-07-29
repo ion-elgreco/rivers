@@ -138,6 +138,7 @@ CodeRepository.backfill(
     config: dict[str, dict[str, Any]] | None = None,
     block: bool = True,
     dry_run: bool = False,
+    action: str | None = None,
 ) -> BackfillResult
 ```
 
@@ -155,6 +156,7 @@ Launch a backfill to reprocess partitions.
 | `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config overrides (keyed by asset name). |
 | `block` | `bool` | `True` | If `True`, wait for the backfill to complete before returning. |
 | `dry_run` | `bool` | `False` | If `True`, compute the plan without executing. |
+| `action` | `str \| None` | `None` | Run this [action](../concepts/actions.md) on every partition instead of materializing. Every selected asset must define the verb; child runs and `rerun_backfill` inherit it. |
 
 !!! note
     Provide either `partition_keys` or `partition_range`, not both.

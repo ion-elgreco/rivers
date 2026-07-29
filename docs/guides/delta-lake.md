@@ -293,3 +293,42 @@ Read a specific table version:
 def historical(users: pl.DataFrame) -> pl.DataFrame:
     ...
 ```
+
+## Maintenance actions
+
+`DeltaIOHandler` exposes the same per-asset resolution the write path uses, so
+[asset actions](../concepts/actions.md) stay symmetric with writes — same URI, same
+credentials, same commit configuration:
+
+```python
+class DeltaAsset(rs.Asset):
+    io_handler = WAREHOUSE
+
+    @rs.action(outcome=rs.Outcome.Unchanged, concurrency=rs.ActionConcurrency.Exclusive)
+    @classmethod
+    def optimize(cls, ctx: rs.ActionContext) -> None:
+        h = ctx.io_handler
+        dt = DeltaTable(
+            h.asset_table_uri(ctx.asset_key, ctx.asset_metadata),
+            storage_options=h.storage_options,
+        )
+        dt.optimize.compact(writer_properties=h.writer_properties)
+
+    @rs.action(outcome=rs.Outcome.Unchanged)
+    @classmethod
+    def vacuum(cls, ctx: rs.ActionContext) -> None:
+        h = ctx.io_handler
+        DeltaTable(
+            h.asset_table_uri(ctx.asset_key, ctx.asset_metadata),
+            storage_options=h.storage_options,
+        ).vacuum(retention_hours=168, dry_run=False)
+```
+
+- `asset_table_uri(asset_key, asset_metadata)` — `{table_uri}/{leaf}`, honoring the
+  `delta/root_name` override.
+- `partition_predicate(asset_metadata, ctx.partition)` — the SQL predicate for the
+  partition(s) being acted on, honoring `delta/partition_expr`.
+
+Because `optimize` declares `Exclusive`, it joins the asset's implicit one-slot pool:
+it never overlaps a materialize of the same asset, and contention shows up in the UI
+as `StepSlotWaiting`.

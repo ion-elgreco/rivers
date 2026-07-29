@@ -1,8 +1,7 @@
 //! Asset actions — named operations on an asset beyond materialize.
 //!
-//! An `AssetAction` is the interchange format between the two definition
-//! styles: build one once, list it in decorator `actions=[...]`, assign it as
-//! a class attribute, or let `@rs.action` build it from a marked classmethod.
+//! `AssetAction` is the interchange format between the two definition styles:
+//! decorator `actions=[...]`, class attribute, or `@rs.action` on a classmethod.
 
 use pyo3::prelude::*;
 
@@ -170,9 +169,8 @@ impl PyAssetAction {
 /// Verbs with built-in meaning that user actions may not claim.
 pub(crate) const RESERVED_ACTION_NAMES: [&str; 3] = ["materialize", "observe", "compose"];
 
-/// Snapshot of one action resolved for execution (refs cloned out under the
-/// GIL so dispatch can carry it without borrowing the asset). `exclusive`
-/// feeds the phase-3 pool claim and `retry` the phase-4 ladder.
+/// Snapshot of one action resolved for execution — refs cloned out so dispatch
+/// can carry it without borrowing the asset.
 pub(crate) struct ResolvedActionRef {
     pub func: Option<Py<PyAny>>,
     pub is_async: bool,
@@ -349,6 +347,20 @@ pub struct PyActionResult {
     pub data_version: Option<String>,
 }
 
+fn coerce_metadata(
+    py: Python,
+    metadata: Option<pyo3::Bound<'_, pyo3::types::PyDict>>,
+) -> PyResult<Vec<(String, crate::metadata::MetadataValue)>> {
+    let mut entries = Vec::new();
+    for (k, v) in metadata.iter().flat_map(|md| md.iter()) {
+        entries.push((
+            k.extract()?,
+            crate::metadata::coerce_to_metadata_value(py, &v)?,
+        ));
+    }
+    Ok(entries)
+}
+
 #[pymethods]
 impl PyActionResult {
     /// The action left materialization state untouched — downstream stays put.
@@ -359,16 +371,9 @@ impl PyActionResult {
         py: Python,
         metadata: Option<pyo3::Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<Self> {
-        let mut entries = Vec::new();
-        if let Some(md) = metadata {
-            for (k, v) in md.iter() {
-                let key: String = k.extract()?;
-                entries.push((key, crate::metadata::coerce_to_metadata_value(py, &v)?));
-            }
-        }
         Ok(Self {
             materialized: false,
-            metadata: entries,
+            metadata: coerce_metadata(py, metadata)?,
             data_version: None,
         })
     }
@@ -382,16 +387,9 @@ impl PyActionResult {
         metadata: Option<pyo3::Bound<'_, pyo3::types::PyDict>>,
         data_version: Option<String>,
     ) -> PyResult<Self> {
-        let mut entries = Vec::new();
-        if let Some(md) = metadata {
-            for (k, v) in md.iter() {
-                let key: String = k.extract()?;
-                entries.push((key, crate::metadata::coerce_to_metadata_value(py, &v)?));
-            }
-        }
         Ok(Self {
             materialized: true,
-            metadata: entries,
+            metadata: coerce_metadata(py, metadata)?,
             data_version,
         })
     }

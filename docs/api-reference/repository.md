@@ -125,10 +125,11 @@ def backfill(
     config: dict[str, dict[str, Any]] | None = None,
     block: bool = True,
     dry_run: bool = False,
+    action: str | None = None,
 ) -> BackfillResult
 ```
 
-Backfill partitions for the selected assets. See [Backfills](backfills.md) for the full reference.
+Backfill partitions for the selected assets. `action` runs that verb on every partition instead of materializing (every selected asset must define it). See [Backfills](backfills.md) for the full reference.
 
 ### `cancel_backfill()`
 
@@ -159,16 +160,16 @@ Re-launch the failed and canceled partitions of a previous backfill.
 ### `observe()`
 
 ```python
-def observe(self, asset_names: list[str] | None = None) -> dict[str, Any]
+def observe(self, asset_names: list[str] | None = None) -> RunResult
 ```
 
-Run observation functions on external assets. Only external assets with an `observe_fn` (set via the `@Asset.external()` decorator) are observed.
+Run observation functions on external assets. Only external assets with an `observe_fn` (set via the `@Asset.external()` decorator) are observed; names that don't match one are skipped. `observe` is the built-in action, so this executes as a run — the observation metadata lands on the run's `Observation` events.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `asset_names` | `list[str] \| None` | `None` | Filter to specific asset names. Observes all observable external assets when `None`. |
 
-**Returns:** `dict[str, dict[str, MetadataValue]]` mapping asset names to their observation metadata.
+**Returns:** [`RunResult`](#runresult). With nothing observable to run, a successful no-op with an empty `run_id`.
 
 ```python
 @rs.Asset.external(io_handler=handler)
@@ -177,7 +178,42 @@ def source(context: rs.AssetExecutionContext):
 
 repo = rs.CodeRepository(assets=[source])
 result = repo.observe()
-print(result["source"]["row_count"].raw_value())  # 1000
+assert result.success
+
+events = repo.storage.get_events_for_run(result.run_id)
+```
+
+### `run_action()`
+
+```python
+def run_action(
+    self,
+    action: str,
+    selection: list[str] | None = None,
+    partition_key: PartitionKey | None = None,
+    tags: list[tuple[str, str]] | None = None,
+    raise_on_error: bool = True,
+    config: dict[str, dict[str, Any]] | None = None,
+    run_id_override: str | None = None,
+) -> RunResult
+```
+
+Run a named [asset action](../concepts/actions.md) over a selection. The plan has one step per target — upstream is never pulled in and the producing function never runs. The run record carries the verb, and each step emits `ActionCompleted` (or `Deletion`, for an `Unmaterialize` outcome) instead of `Materialization`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `action` | `str` | required | The verb to run; every targeted asset must define it. |
+| `selection` | `list[str] \| None` | `None` | Asset names. `None` targets every asset that defines the action. |
+| `partition_key` | `PartitionKey \| None` | `None` | Partition to act on. Required when any target is partitioned. |
+| `tags` | `list[tuple[str, str]] \| None` | `None` | Run tags. |
+| `raise_on_error` | `bool` | `True` | Raise the first failure instead of reporting it on the result. |
+| `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config overrides, keyed by asset name. Python API only — gRPC and UI launches use the definition's defaults. |
+| `run_id_override` | `str \| None` | `None` | Re-execute an existing run record under its own id (used by K8s run pods). |
+
+```python
+result = repo.run_action("optimize", selection=["events"])
+assert result.success
+assert repo.storage.get_run(result.run_id).action == "optimize"
 ```
 
 ### `load_node()`
