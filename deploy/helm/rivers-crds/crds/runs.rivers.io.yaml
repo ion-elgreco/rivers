@@ -37,6 +37,13 @@ spec:
         properties:
           spec:
             properties:
+              action:
+                description: |-
+                  Verb this run executes; absent means materialize. Mirrors the run
+                  record so the pod routes by its launch args instead of trusting a
+                  storage re-read alone — a lost verb silently materializes.
+                nullable: true
+                type: string
               cancelGracePeriodSeconds:
                 default: 300
                 format: uint64

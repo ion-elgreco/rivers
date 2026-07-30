@@ -70,6 +70,82 @@ def test_execute_without_a_run_record_fails_loudly(resolved_tmp_path, monkeypatc
     assert "no run record for 'no-such-run'" in result.output
 
 
+ACTION_REPO_MODULE = """
+import rivers as rs
+
+
+def _touch(ctx):
+    return None
+
+
+touch = rs.AssetAction(name="touch", outcome=rs.Outcome.Unchanged)(_touch)
+
+
+@rs.Asset(name="tiny", actions=[touch])
+def tiny() -> int:
+    return 1
+
+
+repo = rs.CodeRepository(assets=[tiny])
+"""
+
+
+def test_execute_action_flag_must_match_the_record(resolved_tmp_path, monkeypatch):
+    """The Run CR carries the verb; if it contradicts the record, neither
+    source can be trusted — refuse rather than pick one."""
+    (resolved_tmp_path / "defs_exec3.py").write_text(REPO_MODULE)
+    store = _cloud_env(monkeypatch, resolved_tmp_path / "storage3")
+    seed = rs.CodeRepository(assets=[rs.Asset(name="tiny")(lambda: 1)])
+    seed.resolve(storage=store)
+    seed.materialize(run_id_override="pod-run-2")
+
+    result = runner.invoke(
+        app,
+        [
+            "execute",
+            "defs_exec3",
+            "--run-id",
+            "pod-run-2",
+            "--surreal-endpoint",
+            "ws://unused",
+            "--action",
+            "compact",
+        ],
+    )
+    assert result.exit_code == 1, result.output
+    assert "materialize" in result.output and "compact" in result.output
+
+
+def test_execute_action_flag_routes_the_verb(resolved_tmp_path, monkeypatch):
+    """A matching --action executes the action run under its original id."""
+    (resolved_tmp_path / "defs_exec4.py").write_text(ACTION_REPO_MODULE)
+    store = _cloud_env(monkeypatch, resolved_tmp_path / "storage4")
+
+    def _touch(ctx):
+        return None
+
+    touch = rs.AssetAction(name="touch", outcome=rs.Outcome.Unchanged)(_touch)
+    seed = rs.CodeRepository(assets=[rs.Asset(name="tiny", actions=[touch])(lambda: 1)])
+    seed.resolve(storage=store)
+    seed.run_action("touch", run_id_override="pod-run-3")
+
+    result = runner.invoke(
+        app,
+        [
+            "execute",
+            "defs_exec4",
+            "--run-id",
+            "pod-run-3",
+            "--surreal-endpoint",
+            "ws://unused",
+            "--action",
+            "touch",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert store.get_run("pod-run-3").action == "touch"
+
+
 def test_execute_routes_a_materialize_run(resolved_tmp_path, monkeypatch):
     """Falsifier: a record with no verb still routes to materialize."""
     (resolved_tmp_path / "defs_exec2.py").write_text(REPO_MODULE)

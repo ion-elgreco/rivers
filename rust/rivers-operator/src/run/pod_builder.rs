@@ -155,6 +155,10 @@ fn build_execute_args(
         args.extend(["--job".to_string(), job.clone()]);
     }
 
+    if let Some(ref verb) = spec.action {
+        args.extend(["--action".to_string(), verb.clone()]);
+    }
+
     if let Some(ref pk) = spec.partition_key {
         args.extend(["--partition-key".to_string(), pk.clone()]);
     }
@@ -174,6 +178,7 @@ mod tests {
     fn test_run() -> Run {
         let spec = RunSpec {
             job_name: None,
+            action: None,
             code_location_ref: CodeLocationRef {
                 name: "demo".to_string(),
                 identity: "demo-id".to_string(),
@@ -271,6 +276,19 @@ mod tests {
         );
         assert_eq!(env_map["RIVERS_MODULE"], "my_project.definitions");
         assert_eq!(env_map["RIVERS_RUN_CR_NAME"], "test-run");
+    }
+
+    #[test]
+    fn action_verb_rides_the_pod_args() {
+        let mut run = test_run();
+        run.spec.action = Some("compact".to_string());
+        let args = build_execute_args(&run.spec, "test-run-id", false);
+        let pos = args.iter().position(|a| a == "--action").unwrap();
+        assert_eq!(args[pos + 1], "compact");
+
+        // Materialize runs stay verb-less.
+        let args = build_execute_args(&test_run().spec, "test-run-id", false);
+        assert!(!args.contains(&"--action".to_string()));
     }
 
     #[test]

@@ -275,6 +275,11 @@ def execute(
         "(retry, executor) applies; takes precedence over --target",
     ),
     partition_key: str | None = typer.Option(None, help="Partition key to materialize"),
+    action: str | None = typer.Option(
+        None,
+        help="Verb this run executes (from the Run CR); absent means "
+        "materialize. Cross-checked against the run record.",
+    ),
     resume: bool = typer.Option(
         False, help="Resume a crashed run, skipping completed steps"
     ),
@@ -307,10 +312,10 @@ def execute(
     pk = _parse_partition_key(partition_key)
     selection = [a.strip() for a in target.split(",")] if target else None
 
-    # Ad-hoc action runs carry the verb only on their run record — the Run CR
-    # and pod args are verb-less, so route by what storage says the run is.
-    # A missing record is fatal: defaulting to materialize would run something
-    # other than what was queued, and for a destructive verb that is silent.
+    # The Run CR carries the verb (--action); the run record stores it too.
+    # They must agree — on drift neither source can be trusted, and picking
+    # one could run a destructive verb nobody queued (or silently
+    # materialize). A missing record is equally fatal.
     record = storage.get_run(run_id)
     if record is None:
         typer.echo(
@@ -319,7 +324,15 @@ def execute(
             err=True,
         )
         raise typer.Exit(1)
-    action = record.action
+    if action is not None and record.action != action:
+        typer.echo(
+            f"Error: run '{run_id}' is recorded as "
+            f"'{record.action or 'materialize'}' but the pod was launched for "
+            f"'{action}' — refusing to guess",
+            err=True,
+        )
+        raise typer.Exit(1)
+    action = action or record.action
 
     try:
         if job:

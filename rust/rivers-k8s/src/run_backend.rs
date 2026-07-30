@@ -92,6 +92,7 @@ impl K8sRunBackendConfig {
                 module: self.module.clone(),
                 target,
                 job_name: run_info.job_name.clone(),
+                action: run_info.action.clone(),
                 surreal_endpoint: self.surreal_endpoint.clone(),
                 executor: Executor::Kubernetes,
                 parameters: None,
@@ -302,6 +303,7 @@ mod tests {
                 image: "myrepo/myimage:latest".to_string(),
                 module: "my_project.repo".to_string(),
                 target: "asset_a,asset_b".to_string(),
+                action: None,
                 surreal_endpoint: "ws://surrealdb:8000".to_string(),
                 executor: Executor::Kubernetes,
                 parameters: None,
@@ -323,6 +325,16 @@ mod tests {
             }
         );
         assert!(run.status.is_none());
+    }
+
+    #[test]
+    fn build_cr_carries_the_verb() {
+        // The CR is what the operator launches from — a dropped verb here
+        // meant the pod could only recover it by re-reading storage.
+        let mut info = test_run_info();
+        info.action = Some("compact".to_string());
+        let run = test_config().build_run_cr(&info);
+        assert_eq!(run.spec.action.as_deref(), Some("compact"));
     }
 
     #[test]
