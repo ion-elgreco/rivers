@@ -1,10 +1,55 @@
 """Declarative step retries (``@Asset(retry=...)``, repo ``retries`` registry)."""
 
 import json
+import pickle
 
 import pytest
 
 import rivers as rs
+
+
+class TestRetryPickling:
+    """An inline policy rides ``@rs.action`` marker metadata through cloudpickle
+    when a locally-defined class asset ships to a worker by value, so the retry
+    types have to pickle on their own.
+    """
+
+    def test_retry_policy_roundtrips(self):
+        policy = rs.RetryPolicy(
+            max_retries=4,
+            backoff=rs.Backoff.exponential(1.5, jitter=0.25, max_delay=30.0),
+            retry_on=[ValueError],
+        )
+        restored = pickle.loads(pickle.dumps(policy))
+        assert restored.max_retries == 4
+
+    def test_backoff_roundtrips(self):
+        backoff = rs.Backoff.linear(2.0, initial=1.0, jitter=0.1)
+        restored = pickle.loads(pickle.dumps(backoff))
+        assert repr(restored) == repr(backoff)
+
+    def test_retry_on_preset_roundtrips(self):
+        assert pickle.loads(pickle.dumps(rs.RetryOn.TRANSIENT)) is rs.RetryOn.TRANSIENT
+        assert pickle.loads(pickle.dumps(rs.RetryOn.ALL)) is rs.RetryOn.ALL
+
+    def test_action_marker_with_inline_policy_pickles(self):
+        """The real failure shape: the marker dict holds the policy object."""
+
+        class Table(rs.Asset):
+            @classmethod
+            def materialize(cls):
+                return 1
+
+            @rs.action(
+                outcome=rs.Outcome.Unchanged, retry=rs.RetryPolicy(max_retries=2)
+            )
+            @classmethod
+            def compact(cls, ctx):
+                return None
+
+        meta = Table.compact.__func__.__rivers_action_meta__
+        restored = pickle.loads(pickle.dumps(meta))
+        assert restored["retry"].max_retries == 2
 
 
 def test_retry_succeeds_after_transient_failures(storage):

@@ -167,6 +167,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         executor::parallel::worker::worker_execute_step,
         m
     )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(retry::_reconstruct_retry_policy, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(retry::_reconstruct_backoff, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(
         executor::parallel::worker::_reconstruct_func_ref,
         m

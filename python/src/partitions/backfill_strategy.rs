@@ -1,5 +1,6 @@
 //! BackfillStrategy — controls how partition dimensions map to runs during backfills.
 use pyo3::prelude::*;
+use pyo3::types::PyTuple;
 
 use crate::errors::PartitionDefinitionError;
 use rivers_core::storage::BackfillStrategy;
@@ -110,5 +111,26 @@ impl PyBackfillStrategy {
 
     fn __eq__(&self, other: &Self) -> bool {
         self == other
+    }
+
+    /// Rebuild through the public constructors. A pyclass enum carrying fields
+    /// has no default pickle support, and this rides in `BackfillRequest`'s
+    /// reduce tuple on the subprocess schedule/sensor eval path.
+    fn __reduce__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyTuple>)> {
+        let cls = py.get_type::<Self>();
+        match self {
+            Self::MultiRun {} => Ok((cls.getattr("multi_run")?, PyTuple::empty(py))),
+            Self::SingleRun {} => Ok((cls.getattr("single_run")?, PyTuple::empty(py))),
+            Self::PerDimension {
+                multi_run_dims,
+                single_run_dims,
+            } => Ok((
+                cls.getattr("per_dimension")?,
+                PyTuple::new(py, [multi_run_dims.clone(), single_run_dims.clone()])?,
+            )),
+        }
     }
 }

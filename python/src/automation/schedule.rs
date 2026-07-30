@@ -232,6 +232,7 @@ impl PyBackfillRequest {
             Option<String>,
             u32,
             Option<HashMap<String, String>>,
+            Option<String>,
         ),
     ) {
         let s = slf.borrow();
@@ -245,6 +246,7 @@ impl PyBackfillRequest {
                 s.failure_policy.clone(),
                 s.max_concurrency,
                 s.tags.clone(),
+                s.action.clone(),
             ),
         )
     }
