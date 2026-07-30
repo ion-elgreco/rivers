@@ -326,6 +326,11 @@ impl AssetConditionCache {
                 .get_runs_since(0, Some(status), crate::storage::SortOrder::Asc)
                 .await?;
             for run in &live_runs {
+                // An action run is not a materialization attempt, exactly as in
+                // the steady-state push and the failure floors below.
+                if run.action.is_some() {
+                    continue;
+                }
                 for asset in &run.node_names {
                     self.track_in_progress_run(
                         asset.clone(),

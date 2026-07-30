@@ -3530,7 +3530,7 @@ impl PerCodeLocationStorage for SurrealStorage {
     ) -> Result<Vec<(PartitionKey, i64)>> {
         let mut result = self
             .db
-            .query("SELECT partition_key, last_timestamp FROM asset_partitions WHERE code_location_id = $cl AND asset_key = $asset_key AND last_timestamp IS NOT NULL")
+            .query("SELECT partition_key, last_timestamp FROM asset_partitions WHERE code_location_id = $cl AND asset_key = $asset_key AND last_timestamp IS NOT NONE")
             .bind(("cl", code_location_id.to_string()))
             .bind(("asset_key", asset_key.to_string()))
             .await?;
@@ -3593,7 +3593,7 @@ impl PerCodeLocationStorage for SurrealStorage {
             .query(
                 "SELECT partition_key, last_timestamp FROM asset_partitions \
                  WHERE code_location_id = $cl AND asset_key = $asset_key \
-                 AND partition_key IN $keys",
+                 AND partition_key IN $keys AND last_timestamp IS NOT NONE",
             )
             .bind(("cl", code_location_id.to_string()))
             .bind(("asset_key", asset_key.to_string()))
@@ -3618,13 +3618,16 @@ impl PerCodeLocationStorage for SurrealStorage {
         code_location_id: &str,
         asset_key: &str,
     ) -> Result<Vec<PartitionKey>> {
+        // `action IS NONE`: an in-flight action is not an in-flight
+        // materialization. Without it a long `optimize` reads as in-flight and
+        // `eager()` suppresses the asset and every dependent for its duration.
         let mut result = self
             .db
             .query(
                 "SELECT partition_key FROM events WHERE code_location_id = $cl AND asset_key = $asset_key \
                  AND event_type = 'StepStart' AND partition_key IS NOT NONE \
                  AND run_id IN (SELECT VALUE run_id FROM runs WHERE code_location_id = $cl AND status = 'Started' \
-                 AND $asset_key IN node_names) \
+                 AND action IS NONE AND $asset_key IN node_names) \
                  GROUP BY partition_key",
             )
             .bind(("cl", code_location_id.to_string()))
@@ -8437,6 +8440,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_partition_timestamps_for_keys_skips_null_timestamps() {
+        // `last_timestamp` is `option<int>` in the schema, so an unset row is
+        // schema-legal and reads back as NONE. Every reader here deserializes
+        // into a non-Option `i64`, so one such row fails the whole
+        // condition-cache refresh tick for the asset rather than one partition.
+        // `IS NOT NULL` does *not* exclude NONE in SurrealDB — the guard has to
+        // be `IS NOT NONE`, which is why both readers are asserted below.
+        let storage = make_storage().await;
+        register(&storage, &["asset"]).await;
+
+        let single = |k: &str| PartitionKey::Single {
+            keys: vec![k.to_string()],
+        };
+        for (pk, ts) in [("p1", 1000), ("p2", 1500)] {
+            storage
+                .store_event(&EventRecord {
+                    code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                    event_type: EventType::Materialization { data_version: None },
+                    asset_key: Some("asset".to_string()),
+                    run_id: "r1".to_string(),
+                    partition_key: Some(single(pk)),
+                    timestamp: ts,
+                    metadata: vec![],
+                    input_data_versions: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        // Legacy/foreign writer shape: the row exists with no timestamp.
+        storage
+            .db
+            .query(
+                "UPDATE asset_partitions SET last_timestamp = NONE \
+                 WHERE code_location_id = $cl AND asset_key = 'asset' \
+                 AND partition_key = $pk",
+            )
+            .bind(("cl", DEFAULT_CODE_LOCATION_ID.to_string()))
+            .bind(("pk", single("p1")))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let timestamps = storage
+            .get_partition_timestamps_for_keys(
+                DEFAULT_CODE_LOCATION_ID,
+                "asset",
+                &[single("p1"), single("p2")],
+            )
+            .await
+            .expect("an unset last_timestamp must not fail the whole keyed read");
+        assert_eq!(
+            timestamps,
+            vec![(single("p2"), 1500)],
+            "the unset row must be skipped, the real one still returned"
+        );
+
+        let all = storage
+            .get_partition_timestamps(DEFAULT_CODE_LOCATION_ID, "asset")
+            .await
+            .expect("an unset last_timestamp must not fail the whole-asset read");
+        assert_eq!(
+            all,
+            vec![(single("p2"), 1500)],
+            "the whole-asset reader needs the same NONE guard"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_in_progress_partitions() {
         let storage = make_storage().await;
         register(&storage, &["asset"]).await;
@@ -8503,6 +8576,74 @@ mod tests {
             .await
             .unwrap();
         assert!(in_progress.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_in_progress_partitions_ignores_action_runs() {
+        // An in-flight `optimize` is not an in-flight *materialization*. Counting
+        // it here makes `eager()`'s `!in_flight()` (and `!any_deps_in_progress()`)
+        // suppress the asset and every dependent for the action's whole duration.
+        // Mirrors the action filter `get_failed_partitions` already applies.
+        let storage = make_storage().await;
+        register(&storage, &["asset"]).await;
+
+        let single = |k: &str| PartitionKey::Single {
+            keys: vec![k.to_string()],
+        };
+        let run = |id: &str, action: Option<&str>| RunRecord {
+            run_id: id.to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Started,
+            start_time: 1000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["asset".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: action.map(str::to_string),
+        };
+
+        storage
+            .create_run(&run("run_opt", Some("optimize")))
+            .await
+            .unwrap();
+        storage.create_run(&run("run_mat", None)).await.unwrap();
+
+        for (run_id, pk) in [("run_opt", "p1"), ("run_mat", "p2")] {
+            storage
+                .store_event(&EventRecord {
+                    code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                    event_type: EventType::StepStart,
+                    asset_key: Some("asset".to_string()),
+                    run_id: run_id.to_string(),
+                    partition_key: Some(single(pk)),
+                    timestamp: 1000,
+                    metadata: vec![],
+                    input_data_versions: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        let in_progress = storage
+            .get_in_progress_partitions(DEFAULT_CODE_LOCATION_ID, "asset")
+            .await
+            .unwrap();
+        let keys: Vec<String> = in_progress
+            .iter()
+            .map(|pk| match pk {
+                PartitionKey::Single { keys } => keys[0].clone(),
+                other => panic!("expected Single, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["p2"],
+            "an in-flight action must not count as an in-flight materialization"
+        );
     }
 
     #[tokio::test]

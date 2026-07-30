@@ -184,7 +184,11 @@ impl AssetConditionCache {
                     !self.applied_run_ids.contains_key(&r.run_id)
                         && !swept_terminal.contains(&r.run_id)
                 } else {
-                    !known_in_flight(r)
+                    // A live action run is never tracked in-flight (below), so
+                    // `known_in_flight` could never go true for it and every tick
+                    // would read as changed for the verb's whole duration. Its
+                    // completion still arrives through the terminal branch.
+                    r.action.is_none() && !known_in_flight(r)
                 }
             });
             if has_new_work {
@@ -196,7 +200,11 @@ impl AssetConditionCache {
 
                 match run.status {
                     RunStatus::Started | RunStatus::NotStarted | RunStatus::Queued => {
-                        if !swept_terminal.contains(&run.run_id) {
+                        // Action runs are not materialization attempts: tracking a
+                        // live `optimize` makes `eager()`'s `!in_flight()` (and
+                        // dependents' `!any_deps_in_progress()`) suppress the asset
+                        // until the verb finishes. Mirrors initial_load.
+                        if !swept_terminal.contains(&run.run_id) && run.action.is_none() {
                             for asset in &run.node_names {
                                 delta.in_progress_changes.push(InProgressChange::Push {
                                     asset_key: asset.clone(),

@@ -8231,6 +8231,146 @@ async fn test_initial_load_ignores_failed_action_runs() {
     );
 }
 
+/// Storage + cache fixture for the live-action-run tests: one asset `a` and a
+/// `Started` run carrying `action`, created before the caller's first refresh.
+async fn storage_with_live_action_run(
+    action: Option<&str>,
+) -> crate::storage::surrealdb_backend::SurrealStorage {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[make_record("a")])
+        .await
+        .unwrap();
+    storage
+        .create_run(&crate::storage::RunRecord {
+            run_id: "run-compact".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: crate::storage::RunStatus::Started,
+            start_time: 2_000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: action.map(str::to_string),
+        })
+        .await
+        .unwrap();
+    storage
+}
+
+fn in_progress_pass(cache: AssetConditionCache) -> crate::condition::pass::ConditionPass {
+    use crate::condition::pass::{AssetConditionInfo, ConditionPass};
+    ConditionPass::new(
+        cache,
+        ConditionEvalState::default(),
+        vec![AssetConditionInfo {
+            asset_key: "a".to_string(),
+            condition: ConditionNode::InProgress,
+            partition_info: None,
+            backfill_strategy: None,
+        }],
+        HashMap::new(),
+    )
+}
+
+#[tokio::test]
+async fn test_initial_load_ignores_live_action_runs() {
+    // An in-flight `compact` is not an in-flight *materialization*. If
+    // initial_load tracks it, `eager()`'s `!in_flight()` — and every dependent's
+    // `!any_deps_in_progress()` — stays suppressed until the action finishes.
+    // Twin of test_initial_load_ignores_failed_action_runs, live side.
+    use crate::storage::DEFAULT_CODE_LOCATION_ID;
+
+    let storage = storage_with_live_action_run(Some("compact")).await;
+    let mut pass = in_progress_pass(AssetConditionCache::new(
+        DEFAULT_CODE_LOCATION_ID.to_string(),
+    ));
+    pass.refresh_cache(&storage, 10_000).await.unwrap();
+    let out = pass.run(10_000, false);
+    assert!(
+        !out.plan.unpartitioned.contains(&"a".to_string()),
+        "a live action run must not read as an in-flight materialization"
+    );
+}
+
+#[tokio::test]
+async fn test_initial_load_still_tracks_live_materialize_runs() {
+    // Falsifies the guard above: the same fixture without a verb must still be
+    // tracked, or the fix would simply disable in-flight tracking.
+    use crate::storage::DEFAULT_CODE_LOCATION_ID;
+
+    let storage = storage_with_live_action_run(None).await;
+    let mut pass = in_progress_pass(AssetConditionCache::new(
+        DEFAULT_CODE_LOCATION_ID.to_string(),
+    ));
+    pass.refresh_cache(&storage, 10_000).await.unwrap();
+    let out = pass.run(10_000, false);
+    assert!(
+        out.plan.unpartitioned.contains(&"a".to_string()),
+        "a live materialize run must still read as in-flight"
+    );
+}
+
+#[tokio::test]
+async fn test_steady_state_refresh_ignores_live_action_runs() {
+    // Steady-state twin: the new-runs path in fetch_refresh_delta pushes
+    // InProgressChange::Push for every non-terminal run and must apply the same
+    // guard initial_load does, or the answer flips depending on whether the
+    // action started before or after the daemon did.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[make_record("a")])
+        .await
+        .unwrap();
+
+    let mut pass = in_progress_pass(AssetConditionCache::new(
+        DEFAULT_CODE_LOCATION_ID.to_string(),
+    ));
+    // First refresh initializes the cache with no runs at all.
+    pass.refresh_cache(&storage, 1_000).await.unwrap();
+
+    storage
+        .create_run(&crate::storage::RunRecord {
+            run_id: "run-compact".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: crate::storage::RunStatus::Started,
+            start_time: 2_000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: Some("compact".to_string()),
+        })
+        .await
+        .unwrap();
+
+    // Second refresh takes the steady-state delta path.
+    pass.refresh_cache(&storage, 10_000).await.unwrap();
+    let out = pass.run(10_000, false);
+    assert!(
+        !out.plan.unpartitioned.contains(&"a".to_string()),
+        "a live action run must not read as in-flight on the steady-state path"
+    );
+}
+
 #[tokio::test]
 async fn test_recover_pending_dispatch_clears_is_initial() {
     // V-06: a first-tick crash restarts with a fresh state (is_initial=true) plus
