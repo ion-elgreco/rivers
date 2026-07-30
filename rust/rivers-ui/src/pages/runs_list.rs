@@ -31,7 +31,7 @@ use crate::now::RelTime;
 use crate::server_fns::locations::list_code_locations;
 use crate::server_fns::mutations::{BulkRunActionResult, cancel_runs, delete_runs};
 use crate::server_fns::runs::{get_runs_page, get_runs_summary};
-use crate::types::{CodeLocationEntry, RunFilter, RunRecord, RunStatus, RunsSummary};
+use crate::types::{CodeLocationEntry, RunFilter, RunRecord, RunStatus, RunsSummary, VerbFilter};
 
 const GRID: &str = "grid-template-columns: 32px 80px 1.2fr 0.7fr 1.4fr 0.6fr 0.9fr 0.8fr 1fr";
 
@@ -131,7 +131,7 @@ pub fn RunsListPage() -> impl IntoView {
             job_substring: Some(job),
             asset_substring: Some(asset),
             partition_substring: Some(partition),
-            action: None,
+            action: VerbFilter::Any,
         };
         async move { get_runs_page(p * ps, ps, filter).await }
     });

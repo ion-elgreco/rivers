@@ -155,6 +155,7 @@ pub fn RunDetailPage() -> impl IntoView {
     // reset it. Reset only when the selected asset or the run changes.
     let (mat_page, set_mat_page) = signal(0u64);
     let (obs_page, set_obs_page) = signal(0u64);
+    let (act_page, set_act_page) = signal(0u64);
     Effect::new(move |_| {
         selected_step.track();
         run_id_memo.track();
@@ -436,6 +437,8 @@ pub fn RunDetailPage() -> impl IntoView {
                             set_mat_page=set_mat_page
                             obs_page=obs_page
                             set_obs_page=set_obs_page
+                            act_page=act_page
+                            set_act_page=set_act_page
                             on_close=set_selected_step
                         />
                     })
@@ -542,6 +545,8 @@ fn RunAssetDrawer(
     set_mat_page: WriteSignal<u64>,
     obs_page: ReadSignal<u64>,
     set_obs_page: WriteSignal<u64>,
+    act_page: ReadSignal<u64>,
+    set_act_page: WriteSignal<u64>,
     on_close: WriteSignal<Option<String>>,
 ) -> impl IntoView {
     // Status/timing from this asset's step events; materializations paginated below.
@@ -639,6 +644,30 @@ fn RunAssetDrawer(
             },
         )
     };
+    // Action runs report through ActionCompleted events — without this third
+    // card the metadata an action attaches is unreachable from the run page.
+    let (act_page_size, set_act_page_size) = signal(25u64);
+    let actions_page = {
+        let run_id = run_id.clone();
+        let asset_key = asset_key.clone();
+        Resource::new(
+            move || (act_page.get(), act_page_size.get()),
+            move |(p, ps)| {
+                let run_id = run_id.clone();
+                let asset_key = asset_key.clone();
+                async move {
+                    get_run_asset_events_page(
+                        run_id,
+                        asset_key,
+                        "ActionCompleted".to_string(),
+                        p * ps,
+                        ps,
+                    )
+                    .await
+                }
+            },
+        )
+    };
     let mat_total = Signal::derive(move || {
         materializations_page
             .get()
@@ -648,6 +677,13 @@ fn RunAssetDrawer(
     });
     let obs_total = Signal::derive(move || {
         observations_page
+            .get()
+            .and_then(|r| r.ok())
+            .map(|p| p.total)
+            .unwrap_or(0)
+    });
+    let act_total = Signal::derive(move || {
+        actions_page
             .get()
             .and_then(|r| r.ok())
             .map(|p| p.total)
@@ -690,7 +726,7 @@ fn RunAssetDrawer(
                     </div>
                     <div class="run-asset-drawer-kv">
                         <div class="run-asset-drawer-kv-label">"EVENTS"</div>
-                        <div class="run-asset-drawer-kv-value">{move || (mat_total.get() + obs_total.get() + step_count).to_string()}</div>
+                        <div class="run-asset-drawer-kv-value">{move || (mat_total.get() + obs_total.get() + act_total.get() + step_count).to_string()}</div>
                     </div>
                     <div class="run-asset-drawer-kv">
                         <div class="run-asset-drawer-kv-label">"UPSTREAM"</div>
@@ -704,6 +740,12 @@ fn RunAssetDrawer(
                         <div class="run-asset-drawer-kv-label">"OBSERVATIONS"</div>
                         <div class="run-asset-drawer-kv-value">{move || obs_total.get().to_string()}</div>
                     </div>
+                    <Show when={move || act_total.get() > 0}>
+                        <div class="run-asset-drawer-kv">
+                            <div class="run-asset-drawer-kv-label">"ACTIONS"</div>
+                            <div class="run-asset-drawer-kv-value">{move || act_total.get().to_string()}</div>
+                        </div>
+                    </Show>
                 </div>
             </div>
 
@@ -750,6 +792,22 @@ fn RunAssetDrawer(
                         set_page_size=set_obs_page_size
                         render={move |rows: Vec<crate::types::StoredEvent>| view! {
                             <div class="run-asset-drawer-materializations">{render_event_cards(rows, "observation")}</div>
+                        }.into_any()}
+                    />
+                </div>
+            </Show>
+
+            <Show when={move || act_total.get() > 0}>
+                <div class="run-asset-drawer-section">
+                    <div class="section-header-label" style="margin-bottom:8px">"ACTION"</div>
+                    <PaginatedView
+                        data=actions_page
+                        page=act_page
+                        set_page=set_act_page
+                        page_size=act_page_size
+                        set_page_size=set_act_page_size
+                        render={move |rows: Vec<crate::types::StoredEvent>| view! {
+                            <div class="run-asset-drawer-materializations">{render_event_cards(rows, "action")}</div>
                         }.into_any()}
                     />
                 </div>

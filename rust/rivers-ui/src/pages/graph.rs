@@ -8,7 +8,7 @@ use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::materialize_dialog::MaterializeDialog;
 use crate::components::multi_select::{MultiSelect, SelectOption};
 use crate::components::ui_kit::{Crumb, DagMinimap, KindBadge, MinimapNode, Tag, Topbar};
-use crate::helpers::{partition_picker_for_assets, use_query_param_list};
+use crate::helpers::{common_actions, partition_picker_for_assets, use_query_param_list};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::{get_asset, get_assets};
 use crate::server_fns::graph::{get_graph_layout, get_graph_topology, get_node_lineage};
@@ -269,6 +269,8 @@ pub fn GraphPage() -> impl IntoView {
     });
     let (mat_targets, set_mat_targets) = signal(Vec::<String>::new());
     let show_dialog = RwSignal::new(false);
+    let dialog_verb = RwSignal::new(Option::<String>::None);
+    let dialog_destructive = RwSignal::new(false);
     let materialize_picker = Signal::derive(move || {
         partition_picker_for_assets(&mat_targets.get(), &asset_info_by_key.get())
     });
@@ -279,9 +281,25 @@ pub fn GraphPage() -> impl IntoView {
         if keys.is_empty() {
             return;
         }
+        dialog_verb.set(None);
+        dialog_destructive.set(false);
         set_mat_targets.set(keys);
         show_dialog.set(true);
     });
+    // Same dialog and partition flow, but the submission carries a verb.
+    let start_action: Callback<(Vec<String>, String, bool)> = Callback::new(
+        move |(keys, verb, destructive): (Vec<String>, String, bool)| {
+            let tasks = task_node_names.get_untracked();
+            let keys: Vec<String> = keys.into_iter().filter(|k| !tasks.contains(k)).collect();
+            if keys.is_empty() {
+                return;
+            }
+            dialog_verb.set(Some(verb));
+            dialog_destructive.set(destructive);
+            set_mat_targets.set(keys);
+            show_dialog.set(true);
+        },
+    );
 
     let all_kinds = Signal::derive(move || {
         layout
@@ -802,13 +820,34 @@ pub fn GraphPage() -> impl IntoView {
                                 <button
                                     class="btn btn-primary dag-sidebar-action"
                                     disabled=n_mat == 0
-                                    on:click=move |_| { start_materialize.run(mat_keys.clone()); }
+                                    on:click={
+                                        let keys = mat_keys.clone();
+                                        move |_| { start_materialize.run(keys.clone()); }
+                                    }
                                 >
                                     <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
                                         <path d="M3 2l7 4-7 4V2z"/>
                                     </svg>
                                     {format!("Materialize {n_mat} assets…")}
                                 </button>
+                                {common_actions(&mat_keys, &asset_info_by_key.get()).into_iter().map(|act| {
+                                    let destructive = act.is_destructive();
+                                    let verb = act.name.clone();
+                                    let label = act.name.clone();
+                                    let keys = mat_keys.clone();
+                                    let title = act.description.clone().unwrap_or_else(|| if destructive {
+                                        format!("Run '{}' on the selection — clears materialization state", act.name)
+                                    } else {
+                                        format!("Run action '{}' on the selection", act.name)
+                                    });
+                                    view! {
+                                        <button
+                                            class=if destructive { "btn btn-danger dag-sidebar-action" } else { "btn dag-sidebar-action" }
+                                            title=title
+                                            on:click=move |_| { start_action.run((keys.clone(), verb.clone(), destructive)); }
+                                        >{label}</button>
+                                    }
+                                }).collect::<Vec<_>>()}
                             </div>
                         </div>
                     }.into_any());
@@ -847,6 +886,11 @@ pub fn GraphPage() -> impl IntoView {
                                             let tags = record.tags.clone();
                                             let ups = upstream.clone();
                                             let downs = downstream.clone();
+                                            let node_verbs = common_actions(
+                                                std::slice::from_ref(&record.asset_key),
+                                                &asset_info_by_key.get(),
+                                            );
+                                            let key_for_actions = record.asset_key.clone();
                                             view! {
                                                 <div class="dag-sidebar-header">
                                                     <div class=format!("dag-sidebar-status {status_cls}")>
@@ -936,6 +980,24 @@ pub fn GraphPage() -> impl IntoView {
                                                         </svg>
                                                         "Materialize…"
                                                     </button>
+                                                    {node_verbs.into_iter().map(|act| {
+                                                        let destructive = act.is_destructive();
+                                                        let verb = act.name.clone();
+                                                        let label = act.name.clone();
+                                                        let k = key_for_actions.clone();
+                                                        let title = act.description.clone().unwrap_or_else(|| if destructive {
+                                                            format!("Run '{}' — clears materialization state", act.name)
+                                                        } else {
+                                                            format!("Run action '{}'", act.name)
+                                                        });
+                                                        view! {
+                                                            <button
+                                                                class=if destructive { "btn btn-danger dag-sidebar-action" } else { "btn dag-sidebar-action" }
+                                                                title=title
+                                                                on:click=move |_| { start_action.run((vec![k.clone()], verb.clone(), destructive)); }
+                                                            >{label}</button>
+                                                        }
+                                                    }).collect::<Vec<_>>()}
                                                 </div>
                                             }.into_any()
                                         }
@@ -955,6 +1017,8 @@ pub fn GraphPage() -> impl IntoView {
             show=show_dialog
             asset_keys=dialog_asset_keys
             picker=materialize_picker
+            action=dialog_verb
+            destructive=dialog_destructive
         />
     }
 }

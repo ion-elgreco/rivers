@@ -204,6 +204,32 @@ pub struct RunRecord {
     pub action: Option<String>,
 }
 
+/// Which verb a run filter selects. Explicit variants rather than a nested
+/// `Option` so every state survives a JSON round-trip.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub enum VerbFilter {
+    /// No restriction — materializes and actions alike.
+    #[default]
+    Any,
+    /// Materialize runs only (the ones storing no verb).
+    MaterializeOnly,
+    /// Runs executing exactly this verb.
+    Verb(String),
+}
+
+impl VerbFilter {
+    /// Map to the core filter's nested-`Option` encoding, which is in-process
+    /// only and so never has to survive serialization.
+    #[cfg(feature = "ssr")]
+    fn to_core(self) -> Option<Option<String>> {
+        match self {
+            Self::Any => None,
+            Self::MaterializeOnly => Some(None),
+            Self::Verb(v) => Some(Some(v)),
+        }
+    }
+}
+
 /// Filter passed to the paginated runs server fn. Empty/`None` means no
 /// restriction on that dimension. Mirrors `rivers_core::storage::RunFilter`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -219,10 +245,11 @@ pub struct RunFilter {
     pub asset_substring: Option<String>,
     #[serde(default)]
     pub partition_substring: Option<String>,
-    /// Verb the run executes: `Some(None)` selects materialize runs,
-    /// `Some(Some(verb))` that verb.
+    /// Verb the run executes. A nested `Option` cannot cross this boundary:
+    /// `get_runs_page` is `#[server(input = Json)]`, and both `None` and
+    /// `Some(None)` encode as `null`, so "materialize only" was unrepresentable.
     #[serde(default)]
-    pub action: Option<Option<String>>,
+    pub action: VerbFilter,
 }
 
 /// A page of rows + the matching total — what every paginated server-fn returns.
@@ -511,6 +538,14 @@ pub struct AssetActionInfo {
     pub description: Option<String>,
 }
 
+impl AssetActionInfo {
+    /// The verb clears materialization state — every surface offering it must
+    /// derive its warning styling from here, not a local string compare.
+    pub fn is_destructive(&self) -> bool {
+        self.outcome == "unmaterialize"
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartitionDefinitionInfo {
     pub kind: String,
@@ -725,6 +760,11 @@ pub struct BackfillInfo {
     pub code_location_id: String,
     #[serde(default)]
     pub launched_by: LaunchedBy,
+    /// Verb the child runs execute. `None` means materialize. Without it a
+    /// destructive backfill is indistinguishable from a rebuild, and re-running
+    /// one from the detail page repeats the destruction.
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1090,7 +1130,7 @@ mod conversions {
                 job_substring: f.job_substring.filter(|s| !s.is_empty()),
                 asset_substring: f.asset_substring.filter(|s| !s.is_empty()),
                 partition_substring: f.partition_substring.filter(|s| !s.is_empty()),
-                action: f.action,
+                action: f.action.to_core(),
             }
         }
     }
@@ -1310,6 +1350,7 @@ mod conversions {
                 error: b.error,
                 code_location_id: b.code_location_id,
                 launched_by: b.launched_by.into(),
+                action: b.action,
             }
         }
     }
@@ -1384,7 +1425,7 @@ mod conversions {
                 job_substring: Some(String::new()),
                 asset_substring: Some(String::new()),
                 partition_substring: Some(String::new()),
-                action: None,
+                action: VerbFilter::Any,
             };
             let core: rivers_core::storage::RunFilter = ui.into();
             assert!(core.status.is_none());
@@ -1392,6 +1433,64 @@ mod conversions {
             assert!(core.job_substring.is_none());
             assert!(core.asset_substring.is_none());
             assert!(core.partition_substring.is_none());
+        }
+
+        /// `get_runs_page` is `#[server(input = Json)]`, so every filter state
+        /// has to survive a JSON round-trip. A nested `Option` did not: both
+        /// `None` and `Some(None)` encode as `null`, so "materialize only"
+        /// silently degraded to "no filter" on the way to the server.
+        #[test]
+        fn verb_filter_survives_json_and_maps_to_core() {
+            for (filter, expected) in [
+                (VerbFilter::Any, None),
+                (VerbFilter::MaterializeOnly, Some(None)),
+                (
+                    VerbFilter::Verb("purge".into()),
+                    Some(Some("purge".to_string())),
+                ),
+            ] {
+                let json = serde_json::to_string(&RunFilter {
+                    action: filter.clone(),
+                    ..Default::default()
+                })
+                .expect("filter serializes");
+                let back: RunFilter = serde_json::from_str(&json).expect("filter deserializes");
+                assert_eq!(back.action, filter, "round-trip changed the verb filter");
+                let core: rivers_core::storage::RunFilter = back.into();
+                assert_eq!(core.action, expected, "core encoding for {filter:?}");
+            }
+        }
+
+        /// A destructive backfill has to stay distinguishable from a rebuild:
+        /// the detail page's "Re-run" threads the record's verb, so dropping it
+        /// in the DTO makes a delete sweep look like a materialize and repeat.
+        #[test]
+        fn backfill_info_keeps_the_verb() {
+            let core = rivers_core::storage::BackfillRecord {
+                backfill_id: "bf1".into(),
+                code_location_id: rivers_core::storage::default_code_location_id(),
+                status: rivers_core::storage::BackfillStatus::InProgress,
+                strategy: rivers_core::storage::BackfillStrategy::MultiRun,
+                failure_policy: rivers_core::storage::BackfillFailurePolicy::Continue,
+                asset_selection: vec!["orders".into()],
+                job_name: None,
+                partition_keys: vec![rivers_core::storage::PartitionKey::Single {
+                    keys: vec!["p1".into()],
+                }],
+                run_ids: vec![],
+                completed_partitions: vec![],
+                failed_partitions: vec![],
+                canceled_partitions: vec![],
+                max_concurrency: 4,
+                tags: vec![],
+                create_time: 0,
+                end_time: None,
+                error: None,
+                launched_by: rivers_core::storage::LaunchedBy::Manual { user: None },
+                action: Some("purge".into()),
+            };
+            let ui: BackfillInfo = core.into();
+            assert_eq!(ui.action.as_deref(), Some("purge"));
         }
 
         /// Run-list partition labels must use the same canonical `dim=v|dim=v`
@@ -1465,7 +1564,7 @@ mod conversions {
                 job_substring: Some("daily".into()),
                 asset_substring: Some("orders".into()),
                 partition_substring: Some("2024-01".into()),
-                action: None,
+                action: VerbFilter::Any,
             };
             let core: rivers_core::storage::RunFilter = ui.into();
             assert_eq!(core.status, Some(rivers_core::storage::RunStatus::Failure));

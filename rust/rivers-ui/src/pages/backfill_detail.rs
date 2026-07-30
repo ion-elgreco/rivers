@@ -209,6 +209,15 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                         }
                                     </div>
                                 </div>
+                                // Without this the page is verb-blind, and
+                                // "Re-run" threads the record's verb — so a
+                                // delete sweep re-deletes on one click.
+                                {record.action.clone().map(|verb| view! {
+                                    <div class="backfill-meta-tile">
+                                        <div class="backfill-meta-label">"Action"</div>
+                                        <div class="backfill-meta-value grid-cell-mono">{verb}</div>
+                                    </div>
+                                })}
                                 {record.job_name.clone().map(|job| view! {
                                     <div class="backfill-meta-tile">
                                         <div class="backfill-meta-label">"Job"</div>

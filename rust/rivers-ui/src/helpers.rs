@@ -574,6 +574,34 @@ pub fn partition_picker_for_assets(
     }
 }
 
+/// Actions every asset in `assets` declares, in the first asset's declaration
+/// order. An action run targets the whole selection, so a verb any member
+/// lacks (or an asset with no info yet) offers nothing. `observe` is excluded
+/// — external assets surface it through their own Observe button.
+pub fn common_actions(
+    assets: &[String],
+    asset_info_by_key: &std::collections::HashMap<String, AssetDefinitionInfo>,
+) -> Vec<crate::types::AssetActionInfo> {
+    let Some(first) = assets.first() else {
+        return Vec::new();
+    };
+    let Some(base) = asset_info_by_key.get(first) else {
+        return Vec::new();
+    };
+    base.actions
+        .iter()
+        .filter(|a| a.name != "observe")
+        .filter(|a| {
+            assets[1..].iter().all(|k| {
+                asset_info_by_key
+                    .get(k)
+                    .is_some_and(|i| i.actions.iter().any(|b| b.name == a.name))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// Cartesian product of per-dimension selections — used by the Multi
 /// dialog flow to expand the user's `{color: [r,g], size: [s]}` choices
 /// into individual partition keys, one per concrete combination. Each
@@ -974,6 +1002,67 @@ mod tests {
             .into_iter()
             .map(|i| (i.asset_key.clone(), i))
             .collect()
+    }
+
+    fn with_actions(asset_key: &str, verbs: &[(&str, &str)]) -> AssetDefinitionInfo {
+        let mut info = make_info(asset_key, None);
+        info.actions = verbs
+            .iter()
+            .map(|(name, outcome)| crate::types::AssetActionInfo {
+                name: name.to_string(),
+                outcome: outcome.to_string(),
+                exclusive: false,
+                description: None,
+            })
+            .collect();
+        info
+    }
+
+    #[test]
+    fn common_actions_intersects_and_keeps_declaration_order() {
+        let infos = make_map(vec![
+            with_actions(
+                "a",
+                &[
+                    ("compact", "unchanged"),
+                    ("destroy", "unmaterialize"),
+                    ("refresh", "may_materialize"),
+                ],
+            ),
+            with_actions(
+                "b",
+                &[("refresh", "may_materialize"), ("compact", "unchanged")],
+            ),
+        ]);
+        let verbs: Vec<String> = common_actions(&["a".into(), "b".into()], &infos)
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        // "destroy" only on `a`; order follows `a`'s declaration.
+        assert_eq!(verbs, vec!["compact", "refresh"]);
+    }
+
+    #[test]
+    fn common_actions_excludes_observe_and_unknown_assets() {
+        let infos = make_map(vec![
+            with_actions("a", &[("observe", "observe"), ("compact", "unchanged")]),
+            with_actions("b", &[("observe", "observe"), ("compact", "unchanged")]),
+        ]);
+        let both = common_actions(&["a".into(), "b".into()], &infos);
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].name, "compact");
+        assert!(!both[0].is_destructive());
+        // A selected asset with no info yet must offer nothing rather than a
+        // verb that may fail on it.
+        assert!(common_actions(&["a".into(), "ghost".into()], &infos).is_empty());
+        assert!(common_actions(&[], &infos).is_empty());
+    }
+
+    #[test]
+    fn destructive_verbs_are_flagged() {
+        let infos = make_map(vec![with_actions("a", &[("destroy", "unmaterialize")])]);
+        let acts = common_actions(&["a".into()], &infos);
+        assert!(acts[0].is_destructive());
     }
 
     fn picker(assets: &[&str], infos: &HashMap<String, AssetDefinitionInfo>) -> JobPartitionPicker {

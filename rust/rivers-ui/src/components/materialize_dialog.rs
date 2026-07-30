@@ -116,19 +116,26 @@ pub fn MaterializeDialog(
     // signal rather than a Resource so a slow (or failed) fetch never withholds
     // the asset list itself; fetched per open so the staleness is current.
     let asset_meta = RwSignal::new(HashMap::<String, AssetRecord>::new());
+    // A failed fetch must say so — silently unlabeled rows read as healthy in
+    // a dialog that may be confirming a destructive verb.
+    let meta_failed = RwSignal::new(false);
     Effect::new(move || {
         if !show.get() {
             return;
         }
         let (ns, name) = loc.get();
         leptos::task::spawn_local(async move {
-            if let Ok(records) = get_assets(ns, name, None, None, None).await {
-                asset_meta.set(
-                    records
-                        .into_iter()
-                        .map(|r| (r.asset_key.clone(), r))
-                        .collect(),
-                );
+            match get_assets(ns, name, None, None, None).await {
+                Ok(records) => {
+                    meta_failed.set(false);
+                    asset_meta.set(
+                        records
+                            .into_iter()
+                            .map(|r| (r.asset_key.clone(), r))
+                            .collect(),
+                    );
+                }
+                Err(_) => meta_failed.set(true),
             }
         });
     });
@@ -214,8 +221,10 @@ pub fn MaterializeDialog(
     let picker_signal: Signal<JobPartitionPicker> =
         picker.unwrap_or_else(|| Signal::derive(|| JobPartitionPicker::None));
 
+    // Memo, not Signal::derive — read from six places per render, and the
+    // sibling execute_job_dialog already memoizes the same predicate.
     let is_partitioned =
-        Signal::derive(move || !matches!(picker_signal.get(), JobPartitionPicker::None));
+        Memo::new(move |_| !matches!(picker_signal.get(), JobPartitionPicker::None));
     let summary = Signal::derive(move || {
         launch_summary(
             selected.get().len(),
@@ -278,6 +287,11 @@ pub fn MaterializeDialog(
                                         >"Clear"</button>
                                     </span>
                                 </div>
+                                <Show when=move || meta_failed.get()>
+                                    <div class="mat-dialog-meta-warning">
+                                        "Couldn't load asset status — staleness not shown."
+                                    </div>
+                                </Show>
                                 <div class="mat-dialog-asset-list">
                                     {
                                         {move || {
@@ -422,7 +436,31 @@ pub fn MaterializeDialog(
 
 #[cfg(test)]
 mod tests {
-    use super::launch_summary;
+    use super::{launch_summary, status_bits};
+
+    #[test]
+    fn status_bits_covers_every_arm() {
+        use crate::types::{AssetRecord, StaleStatus};
+        let record = |s: StaleStatus| AssetRecord {
+            asset_key: "a".into(),
+            tags: vec![],
+            kinds: vec![],
+            asset_group: None,
+            code_version: None,
+            last_event_id: None,
+            last_run_id: None,
+            last_timestamp: None,
+            last_data_version: None,
+            pool: vec![],
+            stale_status: s,
+        };
+        let word = |r: Option<&AssetRecord>| status_bits(r).1;
+        assert_eq!(word(Some(&record(StaleStatus::UpToDate))), "up to date");
+        assert_eq!(word(Some(&record(StaleStatus::Stale))), "stale");
+        assert_eq!(word(Some(&record(StaleStatus::Missing))), "missing");
+        // Unlabeled ≠ missing: an unloaded record shows no status word.
+        assert_eq!(word(None), "");
+    }
 
     #[test]
     fn empty_selection_reads_as_nothing() {

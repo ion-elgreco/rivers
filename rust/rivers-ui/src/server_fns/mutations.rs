@@ -68,6 +68,14 @@ async fn connect_to_run_owner(
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
+#[cfg(feature = "ssr")]
+fn tags_to_proto(tags: Option<Vec<(String, String)>>) -> Vec<rivers_api::rivers::Tag> {
+    tags.unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| rivers_api::rivers::Tag { key: k, value: v })
+        .collect()
+}
+
 /// Convert a UI-side `SubmitPartitionKey` into the proto wire type
 /// `ProtoPartitionKey`. SSR-only because `rivers_api` isn't compiled on
 /// WASM.
@@ -119,7 +127,7 @@ pub async fn trigger_materialize(
     partition_key: Option<SubmitPartitionKey>,
     tags: Option<Vec<(String, String)>>,
 ) -> Result<MaterializeResult, ServerFnError> {
-    use rivers_api::rivers::{MaterializeRequest, Tag};
+    use rivers_api::rivers::MaterializeRequest;
 
     let state = expect_context::<crate::state::AppState>();
     let (_, mut client) = state
@@ -131,11 +139,7 @@ pub async fn trigger_materialize(
         .materialize(MaterializeRequest {
             selection: selection.unwrap_or_default(),
             partition_key: partition_key.map(submit_to_proto),
-            tags: tags
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(k, v)| Tag { key: k, value: v })
-                .collect(),
+            tags: tags_to_proto(tags),
             user: current_user_ref().await,
         })
         .await
@@ -158,7 +162,7 @@ pub async fn trigger_action(
     partition_key: Option<SubmitPartitionKey>,
     tags: Option<Vec<(String, String)>>,
 ) -> Result<String, ServerFnError> {
-    use rivers_api::rivers::{RunActionRequest, Tag};
+    use rivers_api::rivers::RunActionRequest;
 
     // A `#[server]` fn is a public HTTP endpoint, so an empty selection must not
     // reach the backend and read as "every asset declaring the verb".
@@ -179,11 +183,7 @@ pub async fn trigger_action(
             action,
             selection,
             partition_key: partition_key.map(submit_to_proto),
-            tags: tags
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(k, v)| Tag { key: k, value: v })
-                .collect(),
+            tags: tags_to_proto(tags),
             user: current_user_ref().await,
             all_assets: false,
         })
@@ -329,7 +329,7 @@ pub async fn launch_backfill(
     /// carries its own verb, so this is for `selection` targets.
     action: Option<String>,
 ) -> Result<BackfillRerunResult, ServerFnError> {
-    use rivers_api::rivers::{LaunchBackfillRequest, Tag};
+    use rivers_api::rivers::LaunchBackfillRequest;
 
     let state = expect_context::<crate::state::AppState>();
     let (_, mut client) = state
@@ -346,11 +346,7 @@ pub async fn launch_backfill(
             strategy: None,
             failure_policy: String::new(),
             max_concurrency: 4,
-            tags: tags
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(k, v)| Tag { key: k, value: v })
-                .collect(),
+            tags: tags_to_proto(tags),
             dry_run: false,
             job_name,
             user: current_user_ref().await,

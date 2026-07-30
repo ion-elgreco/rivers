@@ -22,13 +22,29 @@ use crate::server_fns::mutations::{materialize_missing_partitions, trigger_mater
 use crate::server_fns::overview::{get_assets_info, get_partition_status};
 use crate::server_fns::runs::get_runs_for_asset;
 
-fn event_type_class(t: &str) -> &'static str {
+/// Status-class vocabulary for this page's event list and glyph timeline.
+/// ActionCompleted is "ok" to match the run page's success styling.
+fn event_type_class(t: &crate::types::EventType) -> &'static str {
+    use crate::types::EventType as E;
     match t {
-        "Materialization" | "StepSuccess" => "ok",
-        "StepFailure" => "err",
-        "Observation" | "ActionCompleted" => "info",
-        "Deletion" => "warn",
+        E::Materialization | E::StepSuccess | E::ActionCompleted => "ok",
+        E::StepFailure => "err",
+        E::Observation => "info",
+        E::Deletion => "warn",
         _ => "muted",
+    }
+}
+
+fn event_glyph(t: &crate::types::EventType) -> &'static str {
+    use crate::types::EventType as E;
+    match t {
+        E::Materialization | E::StepSuccess => "◆",
+        E::StepFailure => "▲",
+        E::Observation => "○",
+        E::ActionCompleted => "◇",
+        E::Deletion => "✕",
+        E::StepStart => "◐",
+        _ => "•",
     }
 }
 
@@ -257,7 +273,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                     // An Unmaterialize verb throws the asset's materialization
                     // state away — it never fires on a bare click, and the
                     // dialog it opens says what it does.
-                    let destructive = act.outcome == "unmaterialize";
+                    let destructive = act.is_destructive();
                     let title = act.description.clone().unwrap_or_else(|| {
                         if destructive {
                             format!("Run '{}' — clears materialization state", act.name)
@@ -583,14 +599,19 @@ pub fn AssetDetailPage() -> impl IntoView {
                         let glyph_events: Vec<GlyphEvent> = evts
                             .iter()
                             .filter_map(|e| {
-                                let (glyph, status) = match e.event_type {
-                                    crate::types::EventType::Materialization => ("◆", "ok"),
-                                    crate::types::EventType::StepFailure => ("▲", "err"),
-                                    crate::types::EventType::Observation => ("○", "info"),
-                                    crate::types::EventType::ActionCompleted => ("◇", "info"),
-                                    crate::types::EventType::Deletion => ("✕", "warn"),
-                                    _ => return None,
-                                };
+                                use crate::types::EventType as E;
+                                if !matches!(
+                                    e.event_type,
+                                    E::Materialization
+                                        | E::StepFailure
+                                        | E::Observation
+                                        | E::ActionCompleted
+                                        | E::Deletion
+                                ) {
+                                    return None;
+                                }
+                                let (glyph, status) =
+                                    (event_glyph(&e.event_type), event_type_class(&e.event_type));
                                 let minutes_ago = ((now_ns - e.timestamp) as f64) / 60_000_000_000.0;
                                 Some(GlyphEvent {
                                     minutes_ago: minutes_ago.clamp(0.0, 180.0),
@@ -642,16 +663,8 @@ pub fn AssetDetailPage() -> impl IntoView {
                                                 .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
                                                 .unwrap_or_default();
                                             let type_label = format!("{:?}", evt.event_type);
-                                            let type_cls = event_type_class(&type_label);
-                                            let glyph = match type_label.as_str() {
-                                                "Materialization" | "StepSuccess" => "◆",
-                                                "StepFailure" => "▲",
-                                                "Observation" => "○",
-                                                "ActionCompleted" => "◇",
-                                                "Deletion" => "✕",
-                                                "StepStart" => "◐",
-                                                _ => "•",
-                                            };
+                                            let type_cls = event_type_class(&evt.event_type);
+                                            let glyph = event_glyph(&evt.event_type);
                                             let mut msg_parts: Vec<String> = Vec::new();
                                             if let Some(ref v) = evt.data_version {
                                                 msg_parts.push(format!("v:{}", short_id(v, 8)));

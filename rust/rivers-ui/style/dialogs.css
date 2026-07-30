@@ -519,6 +519,11 @@ th.sortable:hover { color: var(--text); }
 .mat-dialog-dot--ok { background: var(--success); }
 .mat-dialog-dot--stale { background: var(--warning); }
 .mat-dialog-dot--missing { background: var(--text-muted); }
+.mat-dialog-meta-warning {
+    color: var(--warning);
+    font-size: 11px;
+    margin-bottom: 6px;
+}
 
 .mat-dialog-asset-text {
     display: flex;
