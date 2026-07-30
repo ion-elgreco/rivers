@@ -55,6 +55,43 @@ These metadata keys override handler defaults per-asset:
 | `delta/version` | `int` | Delta table version after write. |
 | `rivers/schema` | `Schema` | Arrow schema of the written table. |
 
+### Methods for action bodies
+
+An [action](../concepts/actions.md) receives the asset's resolved handler as
+`ctx.io_handler`. These two methods expose the same URI and partition resolution
+the write path uses, so a `delete`/`optimize` body targets exactly the rows the
+materialize path would have written.
+
+#### `asset_table_uri(asset_name, asset_metadata=None)`
+
+Returns `{table_uri}/{leaf}`, honoring a `delta/root_name` override in
+`asset_metadata`. Pass `ctx.asset_key` and `ctx.asset_metadata`.
+
+```python
+@rs.action(outcome=rs.Outcome.Unchanged)
+@classmethod
+def optimize(cls, ctx: rs.ActionContext) -> None:
+    uri = ctx.io_handler.asset_table_uri(ctx.asset_key, ctx.asset_metadata)
+    DeltaTable(uri, storage_options=ctx.io_handler.storage_options).optimize.compact()
+```
+
+#### `partition_predicate(asset_metadata, partition)`
+
+Returns a SQL predicate covering the partition(s), honoring
+`delta/partition_expr`. Pass `ctx.asset_metadata` and `ctx.partition`.
+
+```python
+@rs.action(outcome=rs.Outcome.Unmaterialize)
+@classmethod
+def delete(cls, ctx: rs.ActionContext) -> None:
+    uri = ctx.io_handler.asset_table_uri(ctx.asset_key, ctx.asset_metadata)
+    predicate = ctx.io_handler.partition_predicate(ctx.asset_metadata, ctx.partition)
+    DeltaTable(uri, storage_options=ctx.io_handler.storage_options).delete(predicate)
+```
+
+`partition` is required: reach these only from a keyed action run. On a
+non-partitioned asset, delete the whole table instead of building a predicate.
+
 ---
 
 ## `DeltaTypeHandler`

@@ -36,6 +36,7 @@ def my_asset():
 | `pool_slots` | `int \| dict[str, int] \| None` | `None` | Slots consumed per pool (default 1). |
 | `retry` | `RetryPolicy \| str \| None` | `None` | Retry policy for this asset's step, or the name of a policy registered in `CodeRepository(retries=...)`. See [Retries & Compute](retries.md). |
 | `compute` | `Compute \| None` | `None` | Per-asset compute (Kubernetes executor). See [Retries & Compute](retries.md#compute). |
+| `actions` | `list[AssetAction] \| None` | `None` | Verbs that can be run against this asset besides materialize. See [`AssetAction`](#assetaction) and [Actions](../concepts/actions.md). |
 
 **Properties:**
 
@@ -52,6 +53,8 @@ def my_asset():
 | `hooks` | `list[Hook] \| None` | Attached hooks. |
 | `automation_condition` | `AutomationCondition \| None` | Automation condition. |
 | `pool` | `list[tuple[str, int]]` | Normalized pool membership: `(pool_key, slots)` pairs. |
+| `pool_slots` | `dict[str, int]` | Slots claimed per pool — the normalized form of the `pool_slots=` declaration. |
+| `deps` | `list[DepDef]` | Lineage-only dependencies from `deps=`. Input deps become function parameters and are not repeated here. |
 | `observe_fn` | `Callable \| None` | Observation function (external assets only). |
 | `is_async` | `bool` | True when the wrapped function is a coroutine function. |
 | `is_single` | `bool` | True for `SingleAsset`. |
@@ -80,6 +83,7 @@ asset = Asset.from_multi(
 | `deps` | `list[DepDef]` | Input and lineage-only dependencies. Created via `AssetDef.input()` and `AssetDef.dep()`. |
 | `compute` | `Compute \| None` | Compute for the whole step — a multi-asset runs as one step (one pod), so this is declared here, not per output. |
 | `retry` | `RetryPolicy \| str \| None` | Retry policy for the whole step — a multi-asset retries as one unit, so this is declared here, not per output. See [Retries & Compute](retries.md). |
+| `actions` | `list[AssetAction] \| None` | Verbs applied to **every** output. Merged with each output's own `AssetDef(actions=...)`, which overrides a top-level action of the same name. An action plan has one step per output. See [`AssetAction`](#assetaction). |
 
 #### Top-level `partitions_def`
 
@@ -138,6 +142,7 @@ def my_pipeline():
 |-----------|------|---------|-------------|
 | `node_io_handler` | `BaseIOHandler \| str \| None` | `None` | IO handler for internal tasks. Falls back to `io_handler`, then default. |
 | `retry` | `RetryPolicy \| str \| None` | `None` | Retry policy for the graph asset's own step. Internal tasks are independent steps — they carry their own `Task(retry=)` policies. See [Retries & Compute](retries.md). |
+| `actions` | `list[AssetAction] \| None` | `None` | Verbs that can be run against the graph asset. See [`AssetAction`](#assetaction). |
 
 `deps` is inherited from `Asset` — partition mappings, IO handler overrides, and metadata overrides are propagated to internal tasks.
 
@@ -226,7 +231,7 @@ rs.AssetDef(
 
 | Parameter | Type | Default |
 |-----------|------|---------|
-| `name` | `str` | required |
+| `name` | `str \| None` | `None` — required except in a class-form `MultiAsset` body, where the attribute name is injected at registration. `from_multi()` rejects an unnamed def. |
 | `tags` | `list[str] \| None` | `None` |
 | `kinds` | `str \| list[str] \| None` | `None` |
 | `group` | `str \| None` | `None` |
@@ -239,6 +244,7 @@ rs.AssetDef(
 | `pool_slots` | `int \| dict[str, int] \| None` | `None` |
 | `retry` | `RetryPolicy \| str \| None` | `None` |
 | `deps` | `list[DepDef]` | `[]` |
+| `actions` | `list[AssetAction] \| None` | `None` |
 
 A multi-asset retries as one unit: every output that sets `retry` must set the same policy (checked at `resolve()`). Step compute is declared on `Asset.from_multi(compute=...)`, not per output.
 
@@ -428,3 +434,130 @@ Can be combined with `context.add_output_metadata()` and `context.register_data_
 | `data_version` | `str \| None` | `None` | Explicit data version (overrides auto UUID). |
 | `tags` | `list[str] \| None` | `None` | Tags to record with the event. |
 | `output_name` | `str \| None` | `None` | For multi-asset generator yields, identifies which output this belongs to. |
+
+## `AssetAction`
+
+A verb that can be run against an asset besides materialize. Attach via
+`actions=[...]` on any asset constructor, or declare one inline in a class body
+with [`@action`](#action). A class body may also assign a prebuilt
+`AssetAction` to an attribute (the mixin pattern); listing the same verb in
+`actions = [...]` overrides that entry rather than double-registering it.
+See [Actions](../concepts/actions.md) for the model.
+
+```python
+def _optimize(ctx: rs.ActionContext) -> None:
+    DeltaTable(ctx.io_handler.asset_table_uri(ctx.asset_key, ctx.asset_metadata)).optimize.compact()
+
+
+delta_optimize = rs.AssetAction(
+    name="optimize",
+    outcome=rs.Outcome.Unchanged,
+    concurrency=rs.ActionConcurrency.Exclusive,
+)(_optimize)
+
+
+@rs.Asset(actions=[delta_optimize], kinds="delta")
+def orders() -> pl.DataFrame: ...
+```
+
+An `AssetAction` is reusable: the same object can be attached to many assets.
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | `str` | required | The verb, as passed to `repo.run_action("<name>")`. Must be unique per asset. |
+| `outcome` | `Outcome` | required | What the verb does to materialization state. See [`Outcome`](#outcome). |
+| `concurrency` | `ActionConcurrency \| None` | `None` | Whether the verb may run alongside a materialize. See [`ActionConcurrency`](#actionconcurrency). |
+| `ordering` | `ActionOrdering \| None` | `None` | Step order across several targets in one run. See [`ActionOrdering`](#actionordering). |
+| `retry` | `RetryPolicy \| str \| None` | `None` | Retry policy for this verb. Actions never inherit the asset's materialize policy. |
+| `description` | `str \| None` | `None` | Shown next to the verb in the UI. |
+
+Applying the instance to a function (`AssetAction(...)(fn)`) binds the body and
+returns the action. An action with no bound function is rejected at registration.
+
+## `Outcome`
+
+What an action does to the asset's materialization state. The declared outcome is
+the planning upper bound; [`ActionResult`](#actionresult) reports what actually happened.
+
+| Value | Meaning |
+|-------|---------|
+| `Outcome.Unchanged` | State is untouched — downstream stays put. |
+| `Outcome.MayMaterialize` | May or may not materialize; the body reports which via `ActionResult`. |
+| `Outcome.Unmaterialize` | Clears materialization state (a delete/purge). Surfaced as destructive in the UI. |
+| `Outcome.Observe` | Reserved for the built-in `observe` on external assets; not declarable. |
+
+## `ActionConcurrency`
+
+| Value | Meaning |
+|-------|---------|
+| `ActionConcurrency.Shared` | No special claim (the default when omitted). |
+| `ActionConcurrency.Exclusive` | Takes the asset's implicit pool whole, so the verb and a materialize of the same asset never overlap. A blocked run shows as `StepSlotWaiting`. |
+
+## `ActionOrdering`
+
+Step order when one run targets several related assets. Only meaningful across
+multiple targets — an action plan has one step per named target.
+
+| Value | Meaning |
+|-------|---------|
+| `ActionOrdering.Unordered` | No ordering (the default when omitted). |
+| `ActionOrdering.Topological` | Each target waits for the related targets upstream of it. |
+| `ActionOrdering.ReverseTopological` | Each target waits for the related targets it is upstream of — the safe order for a delete. |
+
+## `ActionResult`
+
+What an action actually did, returned from its body. Required for
+`Outcome.MayMaterialize`; optional elsewhere, where returning `None` means "the
+declared outcome happened".
+
+```python
+@rs.action(outcome=rs.Outcome.MayMaterialize)
+@classmethod
+def merge_late(cls, ctx: rs.ActionContext) -> rs.ActionResult:
+    if not rows:
+        return rs.ActionResult.unchanged()
+    return rs.ActionResult.materialized(metadata={"rows": len(rows)})
+```
+
+**Constructors:**
+
+| Method | Description |
+|--------|-------------|
+| `ActionResult.unchanged(metadata=None)` | Nothing materialized — downstream stays put. `metadata` lands on the `ActionCompleted` event. |
+| `ActionResult.materialized(metadata=None, data_version=None)` | The data changed — downstream goes stale, as after a materialize. Rejected unless the verb declared `Outcome.MayMaterialize`. |
+
+**Properties:**
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `is_materialized` | `bool` | Whether a materialization was reported. Spelled `is_materialized` because `materialized` is the constructor. |
+| `metadata` | `dict[str, MetadataValue]` | Metadata reported by the body, coerced at construction. |
+| `data_version` | `str \| None` | Explicit data version, when one was supplied. |
+
+## `@action`
+
+Declare an action inside a class-form asset body, next to the verb it implements.
+The decorated classmethod becomes the action body.
+
+```python
+class Orders(rs.Asset):
+    io_handler = delta
+
+    @classmethod
+    def materialize(cls) -> pl.DataFrame: ...
+
+    @rs.action(outcome=rs.Outcome.Unmaterialize)
+    @classmethod
+    def purge(cls, ctx: rs.ActionContext) -> None:
+        DeltaTable(ctx.io_handler.asset_table_uri(ctx.asset_key)).delete()
+```
+
+**Parameters:** `name`, `outcome`, `concurrency`, `ordering`, `retry`,
+`description` — the same set [`AssetAction`](#assetaction) takes. `name` defaults
+to the method name.
+
+A reusable `AssetAction` can also be assigned as a class attribute
+(`optimize = delta_optimize`), which participates in MRO so a subclass can
+override a base's verb. See [Class-form assets](../guides/class-assets.md).

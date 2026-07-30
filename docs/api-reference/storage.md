@@ -232,6 +232,7 @@ table (not the events stream); streams the step didn't produce are `None`.
 | `partition_key` | `PartitionKey \| None` |
 | `block_reason` | `str \| None` |
 | `launched_by` | `LaunchedBy` |
+| `action` | `str \| None` |
 
 ### `LaunchedBy`
 

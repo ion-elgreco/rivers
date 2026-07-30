@@ -39,7 +39,7 @@ Context is optional — assets without it continue to work as before.
 | `output_selection` | `list[str]` | Output names being materialized (multi-asset only). |
 | `partition` | `PartitionContext \| None` | Partition context (if partitioned). |
 | `has_partition_key` | `bool` | Whether a partition key is available. |
-| `partition_key` | `str` | Single partition key string (raises `ValueError` if not partitioned). |
+| `partition_key` | `str` | Single partition key string (raises `PartitionValidationError` if not partitioned). |
 | `partition_time_window` | `tuple[datetime, datetime] \| None` | Time window for time-partitioned assets. |
 | `config` | `ConfigT` | Config instance (if the asset function uses a config type hint). |
 | `log` | `logging.Logger` | Logger named `rivers.assets.<asset_name>`. |
@@ -118,7 +118,7 @@ def my_task(context: TaskExecutionContext, source: int) -> str:
 | `tags` | `list[str] \| None` | Tags from the task definition. |
 | `partition` | `PartitionContext \| None` | Partition context (if partitioned). |
 | `has_partition_key` | `bool` | Whether a partition key is available. |
-| `partition_key` | `str` | Single partition key string (raises `ValueError` if not partitioned). |
+| `partition_key` | `str` | Single partition key string (raises `PartitionValidationError` if not partitioned). |
 | `partition_time_window` | `tuple[datetime, datetime] \| None` | Time window for time-partitioned tasks. |
 | `config` | `ConfigT` | Config instance (if the task function uses a config type hint). |
 | `log` | `logging.Logger` | Logger named `rivers.tasks.<task_name>`. |
@@ -160,7 +160,8 @@ def compact(cls, ctx: rs.ActionContext, warehouse: DuckDB) -> None:
 | `action` | `str` | The verb being run. |
 | `run_id` | `str` | Run this action belongs to. |
 | `partition` | `PartitionContext \| None` | Partition context (if partitioned). |
-| `partition_key` | `str \| None` | Partition being acted on, or `None`. |
+| `has_partition_key` | `bool` | Whether a partition key is available. |
+| `partition_key` | `str` | Partition being acted on (raises `PartitionValidationError` if not partitioned). |
 | `io_handler` | `Any` | The asset's resolved IO handler — the action's config bag for locating the data. |
 | `asset_metadata` | `dict[str, str]` | Per-asset metadata that IO resolution honors. |
 | `config` | `ConfigT \| None` | Typed config from an `ActionContext[Config]` annotation; `None` without one. |

@@ -35,6 +35,7 @@ Returned by `CodeRepository.get_backfill()`.
 | `error` | `str \| None` | Error message if the backfill failed |
 | `tags` | `list[tuple[str, str]]` | Tags attached to every run launched by the backfill |
 | `launched_by` | `LaunchedBy` | Origin of the backfill; manual launches from the authenticated UI carry the acting `user` |
+| `action` | `str \| None` | The verb the child runs execute. `None` means materialize |
 
 ---
 
