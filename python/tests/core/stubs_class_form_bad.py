@@ -18,6 +18,19 @@ class Bad(rs.Asset):
     retry = 3.5  # EXPECT-ERROR
     pool_slots = "two"  # EXPECT-ERROR
     metadata = {"owner": 1}  # EXPECT-ERROR
+    name = 123  # EXPECT-ERROR
+    tags = "raw"  # EXPECT-ERROR
+    group = 1.5  # EXPECT-ERROR
+    code_version = 7  # EXPECT-ERROR
+    io_handler = 42  # EXPECT-ERROR
+    partitions_def = 99  # EXPECT-ERROR
+    deps = "upstream"  # EXPECT-ERROR
+    backfill_strategy = "single"  # EXPECT-ERROR
+    compute = 42  # EXPECT-ERROR
+    pool = 9  # EXPECT-ERROR
+    hooks = "hook"  # EXPECT-ERROR
+    automation_condition = "cond"  # EXPECT-ERROR
+    actions = "compact"  # EXPECT-ERROR
 
     @classmethod
     def materialize(cls) -> int:

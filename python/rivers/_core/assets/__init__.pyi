@@ -253,6 +253,12 @@ class Asset:
     """
     compute: Compute | None
     """Compute environment/escalation for this asset's steps."""
+    actions: list["AssetAction"] | None
+    """Named actions this asset supports, mirroring the decorator's ``actions=``.
+
+    Declaration-time input: a class body may list actions built elsewhere
+    (e.g. a mixin's verb); ``@rs.action`` bodies register themselves.
+    """
 
     @property
     def observe_fn(self) -> Callable | None:
