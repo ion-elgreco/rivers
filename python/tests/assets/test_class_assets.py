@@ -400,9 +400,14 @@ def test_external_class_asset_observe(tmp_path):
                 metadata={"rows": rs.MetadataValue.int(1)}, data_version="abc"
             )
 
+    from _helpers import observation_metadata
+
     repo = rs.CodeRepository(assets=[VendorFeed], default_executor=IP)
     out = repo.observe()
-    assert out is not None
+    assert out.success
+    assert repo.storage.get_run(out.run_id).action == "observe"
+    assert repo.storage.get_asset_record("vendor_feed").last_data_version == "abc"
+    assert observation_metadata(repo, run_id=out.run_id)["vendor_feed"]["rows"] == 1
 
 
 def test_external_without_observe_is_allowed(tmp_path):
@@ -450,6 +455,69 @@ def test_materialize_on_external_asset_is_an_error(tmp_path):
             return 1
 
     with pytest.raises(AssetDefinitionError, match="observed, not produced"):
+        desugar(Wrong)
+
+
+def test_foreign_verb_on_multi_asset_is_an_error():
+    """A stray verb must not be silently dropped on a MultiAsset either.
+
+    ``desugar_single`` rejects both foreign verbs; without the same guard here a
+    misplaced ``observe()`` registers cleanly, ``repo.observe()`` never runs it,
+    and no freshness metadata is ever recorded.
+    """
+
+    class WithObserve(rs.MultiAsset):
+        a = rs.AssetDef()
+
+        @classmethod
+        def materialize(cls) -> int:
+            return 1
+
+        @classmethod
+        def observe(cls) -> int:
+            return 2
+
+    with pytest.raises(AssetDefinitionError, match="only ExternalAsset"):
+        desugar(WithObserve)
+
+    class WithCompose(rs.MultiAsset):
+        a = rs.AssetDef()
+
+        @classmethod
+        def materialize(cls) -> int:
+            return 1
+
+        @classmethod
+        def compose(cls) -> int:
+            return 2
+
+    with pytest.raises(AssetDefinitionError, match="GraphAsset subclass"):
+        desugar(WithCompose)
+
+
+def test_observe_on_graph_asset_is_an_error():
+    class Wrong(rs.GraphAsset):
+        @classmethod
+        def compose(cls) -> int:
+            return 1
+
+        @classmethod
+        def observe(cls) -> int:
+            return 2
+
+    with pytest.raises(AssetDefinitionError, match="only ExternalAsset"):
+        desugar(Wrong)
+
+
+def test_compose_on_external_asset_is_an_error(tmp_path):
+    class Wrong(rs.ExternalAsset):
+        io_handler = _pickle_handler(tmp_path)
+
+        @classmethod
+        def compose(cls) -> int:
+            return 1
+
+    with pytest.raises(AssetDefinitionError, match="GraphAsset subclass"):
         desugar(Wrong)
 
 
@@ -539,6 +607,7 @@ def test_unsupported_config_attribute_is_an_error():
         ("pools", "pool"),
         ("retries", "retry"),
         ("backfill", "backfill_strategy"),
+        ("action", "actions"),
     ],
 )
 def test_misspelled_config_attribute_is_an_error(wrong, right):
@@ -554,7 +623,9 @@ def test_misspelled_config_attribute_is_an_error(wrong, right):
     }
     Orders = type("Orders", (rs.Asset,), body)
 
-    with pytest.raises(AssetDefinitionError, match=right):
+    # Pin the suggestion clause: `right` alone can be a substring of `wrong`
+    # ("pool" in "pools"), which would pass without any did-you-mean at all.
+    with pytest.raises(AssetDefinitionError, match=rf"did you mean '{right}'"):
         desugar(Orders)
 
 
@@ -578,6 +649,75 @@ def test_actions_list_attribute_registers_the_actions():
     repo = rs.CodeRepository(assets=[asset], default_executor=IP)
     repo.materialize()
     assert repo.run_action("touch").success
+
+
+def test_actions_list_overrides_attribute_attached_verb():
+    """A mixin attaches the verb as a class attribute; a subclass repeating it
+    in `actions = [...]` must override the inherited entry, not register the
+    verb twice ("duplicate action 'compact'")."""
+
+    def _compact(ctx):
+        return None
+
+    compact = rs.AssetAction(name="compact", outcome=rs.Outcome.Unchanged)(_compact)
+
+    class CompactMixin(rs.Asset):
+        compact_verb = compact
+
+    class Table(CompactMixin):
+        actions = [compact]
+
+        @classmethod
+        def materialize(cls):
+            return 1
+
+    asset = desugar(Table)
+    repo = rs.CodeRepository(assets=[asset], default_executor=IP)
+    repo.materialize()
+    assert repo.run_action("compact").success
+
+
+def test_action_marker_without_classmethod_is_an_error():
+    """@rs.action on a plain method would read its first parameter as data —
+    reject at definition, like materialize."""
+
+    class Table(rs.Asset):
+        @classmethod
+        def materialize(cls):
+            return 1
+
+        @rs.action(outcome=rs.Outcome.Unchanged)
+        def compact(cls, ctx):
+            return None
+
+    with pytest.raises(AssetDefinitionError, match="@classmethod"):
+        desugar(Table)
+
+
+def test_actions_list_with_non_action_element_is_an_error():
+    class Table(rs.Asset):
+        actions = ["compact"]
+
+        @classmethod
+        def materialize(cls):
+            return 1
+
+    with pytest.raises(AssetDefinitionError, match="AssetAction objects"):
+        desugar(Table)
+
+
+def test_external_actions_list_is_an_error():
+    """Externals take no user verbs; the list must error, not silently drop."""
+    compact = rs.AssetAction(name="compact", outcome=rs.Outcome.Unchanged)(
+        lambda ctx: None
+    )
+
+    class Feed(rs.ExternalAsset):
+        io_handler = rs.InMemoryIOHandler()
+        actions = [compact]
+
+    with pytest.raises(AssetDefinitionError, match="no user-defined actions"):
+        desugar(Feed)
 
 
 def test_assetdef_shared_across_classes_is_an_error():

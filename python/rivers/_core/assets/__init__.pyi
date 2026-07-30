@@ -621,6 +621,14 @@ class ActionResult:
     """
 
     data_version: str | None
+    is_materialized: bool
+    """Whether the action reported a materialization.
+
+    Spelled ``is_materialized`` because a ``materialized`` attribute would be
+    shadowed by the :meth:`materialized` constructor.
+    """
+    metadata: dict[str, MetadataValue]
+    """Metadata the action reported, coerced at construction time."""
 
     @staticmethod
     def unchanged(metadata: dict[str, Any] | None = ...) -> "ActionResult": ...

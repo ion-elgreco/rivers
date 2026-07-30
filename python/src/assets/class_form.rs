@@ -107,7 +107,13 @@ fn user_mro<'py>(cls: &Bound<'py, PyType>) -> PyResult<Vec<Bound<'py, PyType>>> 
 /// Every key some asset base can carry, derived from the four constructors —
 /// what a class body may legally declare. An attribute in this set that the
 /// *target* base can't take is a definition error rather than a silent drop.
+/// Cached: the signatures are fixed per build, and the four
+/// `inspect.signature` calls otherwise repeat for every class-form asset.
 fn declarable_keys(py: Python<'_>) -> PyResult<Vec<String>> {
+    static CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    if let Some(keys) = CACHE.get() {
+        return Ok(keys.clone());
+    }
     let asset = py.get_type::<PyAsset>();
     let mut keys = config_keys(asset.as_any())?;
     for name in ["from_multi", "from_graph", "external"] {
@@ -117,7 +123,7 @@ fn declarable_keys(py: Python<'_>) -> PyResult<Vec<String>> {
             }
         }
     }
-    Ok(keys)
+    Ok(CACHE.get_or_init(|| keys).clone())
 }
 
 /// Near-misses of a real declaration. A class body accepts arbitrary user
@@ -127,7 +133,8 @@ fn declarable_keys(py: Python<'_>) -> PyResult<Vec<String>> {
 /// TypeError for the same typo.
 ///
 /// Only plain data values are checked; see [`is_config_shaped`].
-const MISSPELLED_KEYS: [(&str, &str); 8] = [
+const MISSPELLED_KEYS: [(&str, &str); 9] = [
+    ("action", "actions"),
     ("automation", "automation_condition"),
     ("backfill", "backfill_strategy"),
     ("kind", "kinds"),
@@ -361,19 +368,36 @@ fn collect_actions<'py>(cls: &Bound<'py, PyType>) -> PyResult<Vec<Bound<'py, PyA
         }
     }
 
+    // A verb in `actions` overrides an attribute-attached action of the same
+    // name — a mixin's `compact = <AssetAction>` repeated by a subclass's
+    // `actions = [compact]` is one action, not a duplicate-verb error.
+    let listed_names: std::collections::HashSet<String> = listed
+        .iter()
+        .filter_map(|a| a.getattr("name").ok()?.extract().ok())
+        .collect();
+
     let mut built = Vec::with_capacity(entries.len() + listed.len());
     built.extend(listed);
     for (attr, entry) in entries {
         match entry {
-            ActionEntry::Ready(v) => built.push(v),
+            ActionEntry::Ready(v) => {
+                let name: String = v.getattr("name")?.extract()?;
+                if !listed_names.contains(&name) {
+                    built.push(v);
+                }
+            }
             ActionEntry::Marker(meta) => {
                 let kwargs = PyDict::new(py);
                 let name_v = meta.get_item("name")?;
-                if name_v.is_truthy()? {
-                    kwargs.set_item("name", name_v)?;
+                let name: String = if name_v.is_truthy()? {
+                    name_v.extract()?
                 } else {
-                    kwargs.set_item("name", &attr)?;
+                    attr.clone()
+                };
+                if listed_names.contains(&name) {
+                    continue;
                 }
+                kwargs.set_item("name", &name)?;
                 for key in ["outcome", "concurrency", "ordering", "retry", "description"] {
                     kwargs.set_item(key, meta.get_item(key)?)?;
                 }
@@ -548,6 +572,12 @@ fn desugar_single(cls: &Bound<'_, PyType>) -> PyResult<Py<PyAny>> {
 fn desugar_multi(cls: &Bound<'_, PyType>) -> PyResult<Py<PyAny>> {
     let py = cls.py();
     let defined_on = require_verb(cls, "materialize", "MultiAsset")?;
+    reject_verb(cls, "observe", "only ExternalAsset subclasses are observed")?;
+    reject_verb(
+        cls,
+        "compose",
+        "composition belongs on a GraphAsset subclass",
+    )?;
     let defs = asset_def_attrs(cls)?;
     if defs.is_empty() {
         return Err(definition_error(format!(
@@ -582,6 +612,7 @@ fn desugar_graph(cls: &Bound<'_, PyType>) -> PyResult<Py<PyAny>> {
         "materialize",
         "a graph asset materializes through its composition",
     )?;
+    reject_verb(cls, "observe", "only ExternalAsset subclasses are observed")?;
     let f = bound_verb(cls, "compose", &defined_on)?;
     let ctor = py.get_type::<PyAsset>().getattr("from_graph")?;
     let cfg = collect_config(cls, &ctor)?;
@@ -599,6 +630,11 @@ fn desugar_external(cls: &Bound<'_, PyType>) -> PyResult<Py<PyAny>> {
         cls,
         "materialize",
         "external assets are observed, not produced — subclass rs.Asset",
+    )?;
+    reject_verb(
+        cls,
+        "compose",
+        "composition belongs on a GraphAsset subclass",
     )?;
     if !collect_actions(cls)?.is_empty() {
         return Err(definition_error(format!(

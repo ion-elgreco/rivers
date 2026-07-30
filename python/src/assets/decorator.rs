@@ -479,10 +479,9 @@ pub fn normalize_pool(
 }
 
 /// Describes a single output within a multi-asset.
-#[pyclass(
-    str = "AssetDef(name={name:?}, tags={tags:?}, kinds={kinds:?}, group={group:?}, code_version={code_version:?})",
-    module = "rivers._core"
-)]
+// `__str__` is hand-written rather than the `str = "..."` pyclass attribute:
+// `name` is an `Option`, and a format string can only render it as `Some("x")`.
+#[pyclass(module = "rivers._core")]
 pub struct AssetDef {
     /// `None` only in class-form multi assets, where the adapter injects the
     /// attribute name at registration. `from_multi` rejects unnamed defs.
@@ -517,6 +516,17 @@ pub struct AssetDef {
 
 #[pymethods]
 impl AssetDef {
+    fn __str__(&self) -> String {
+        format!(
+            "AssetDef(name={}, tags={:?}, kinds={:?}, group={:?}, code_version={:?})",
+            self.name.as_deref().unwrap_or("<unnamed>"),
+            self.tags,
+            self.kinds,
+            self.group,
+            self.code_version,
+        )
+    }
+
     fn __eq__(&self, py: Python, other: &AssetDef) -> bool {
         self.name == other.name
             && self.tags == other.tags
@@ -554,7 +564,7 @@ impl AssetDef {
         pool = None,
         pool_slots = None,
         deps = vec![],
-        actions = vec![],
+        actions = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new<'py>(
@@ -571,8 +581,9 @@ impl AssetDef {
         pool: Option<&Bound<'py, PyAny>>,
         pool_slots: Option<&Bound<'py, PyAny>>,
         deps: Vec<Py<DepDef>>,
-        actions: Vec<Py<super::action::PyAssetAction>>,
+        actions: Option<Vec<Py<super::action::PyAssetAction>>>,
     ) -> PyResult<Self> {
+        let actions = actions.unwrap_or_default();
         let pool = normalize_pool(pool, pool_slots)?;
         Ok(Self {
             name,
@@ -1143,7 +1154,7 @@ impl PyAsset {
         pool_slots = None,
         retry = None,
         compute = None,
-        actions = vec![],
+        actions = None,
     ))]
     #[allow(clippy::too_many_arguments, clippy::new_ret_no_self)]
     fn new<'py>(
@@ -1165,8 +1176,9 @@ impl PyAsset {
         pool_slots: Option<&Bound<'py, PyAny>>,
         retry: Option<Bound<'py, PyAny>>,
         compute: Option<crate::compute::PyCompute>,
-        actions: Vec<Py<super::action::PyAssetAction>>,
+        actions: Option<Vec<Py<super::action::PyAssetAction>>>,
     ) -> PyResult<Py<PyAny>> {
+        let actions = actions.unwrap_or_default();
         let py = cls.py();
 
         ensure_callable(cls.py(), &wraps)?;
@@ -1241,7 +1253,7 @@ impl PyAsset {
         automation_condition = None,
         compute = None,
         retry = None,
-        actions = vec![],
+        actions = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn from_multi(
@@ -1260,8 +1272,9 @@ impl PyAsset {
         automation_condition: Option<PyAutomationCondition>,
         compute: Option<crate::compute::PyCompute>,
         retry: Option<Bound<'_, PyAny>>,
-        actions: Vec<Py<super::action::PyAssetAction>>,
+        actions: Option<Vec<Py<super::action::PyAssetAction>>>,
     ) -> PyResult<Py<PyAny>> {
+        let actions = actions.unwrap_or_default();
         let py = cls.py();
         let handler = io_handler;
         let top_level_deps: Vec<&DepDef> = deps.iter().map(|d| d.get()).collect();
@@ -1316,7 +1329,9 @@ impl PyAsset {
                     .clone()
                     .or_else(|| code_version.clone()),
                 io_handler,
-                metadata: None,
+                // `from_multi` has no `metadata=`, so the per-output AssetDef is
+                // the only source — and `ActionContext.asset_metadata` reads it.
+                metadata: borrow_asset_def.metadata.clone(),
                 backfill_strategy: None,
                 partitions_def: partitions_def
                     .as_ref()
@@ -1399,7 +1414,7 @@ impl PyAsset {
         hooks = None,
         automation_condition = None,
         retry = None,
-        actions = vec![],
+        actions = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn from_graph(
@@ -1418,8 +1433,9 @@ impl PyAsset {
         hooks: Option<Vec<Py<PyHook>>>,
         automation_condition: Option<PyAutomationCondition>,
         retry: Option<Bound<'_, PyAny>>,
-        actions: Vec<Py<super::action::PyAssetAction>>,
+        actions: Option<Vec<Py<super::action::PyAssetAction>>>,
     ) -> PyResult<Py<PyAny>> {
+        let actions = actions.unwrap_or_default();
         let py = cls.py();
         let handler = io_handler;
 
@@ -1679,6 +1695,41 @@ impl PyAsset {
     #[getter]
     fn pool(&self) -> Vec<(String, u32)> {
         self.inner.pool().clone()
+    }
+
+    /// Slots claimed per pool, the normalized form of the `pool_slots=`
+    /// declaration. Declared as an `int` or a per-pool dict; reads back as the
+    /// dict so the stub's attribute is not a promise that raises.
+    #[getter]
+    fn pool_slots(&self) -> HashMap<String, u32> {
+        self.inner.pool().iter().cloned().collect()
+    }
+
+    /// Lineage-only dependencies declared via `deps=`. Input deps become
+    /// function parameters and are not repeated here.
+    #[getter]
+    fn deps(&self, py: Python) -> PyResult<Vec<Py<DepDef>>> {
+        let Asset::Single(a) = &self.inner else {
+            return Ok(Vec::new());
+        };
+        a.dep_only_names
+            .iter()
+            .map(|name| {
+                Py::new(
+                    py,
+                    DepDef {
+                        name: name.clone(),
+                        is_input: false,
+                        partition_mapping: a
+                            .partition_mapping
+                            .as_ref()
+                            .and_then(|pm| pm.0.get(name).cloned()),
+                        io_handler: None,
+                        metadata: None,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Retry policy governing this asset's step. A `retry="name"` reference

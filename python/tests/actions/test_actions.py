@@ -1293,6 +1293,33 @@ def test_action_attribute_survives_cloudpickle(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+class TestActionResultAccessors:
+    """An ``ActionResult`` must be readable from Python.
+
+    The ``materialized`` field shares its name with the ``materialized()``
+    constructor, so a plain ``#[pyo3(get)]`` would be shadowed by the
+    staticmethod and read as a truthy bound function for every result,
+    including ``unchanged()``. The outcome is exposed under its own name.
+    """
+
+    def test_unchanged_reports_no_materialization(self):
+        r = rs.ActionResult.unchanged(metadata={"files_scanned": 12})
+        assert r.is_materialized is False
+        assert r.data_version is None
+        assert r.metadata == {"files_scanned": rs.MetadataValue.int(12)}
+
+    def test_materialized_reports_materialization(self):
+        r = rs.ActionResult.materialized(
+            metadata={"rows_merged": 3}, data_version="v9"
+        )
+        assert r.is_materialized is True
+        assert r.data_version == "v9"
+        assert r.metadata == {"rows_merged": rs.MetadataValue.int(3)}
+
+    def test_metadata_defaults_to_empty(self):
+        assert rs.ActionResult.unchanged().metadata == {}
+
+
 class _MergeTable(rs.Asset):
     io_handler = rs.InMemoryIOHandler()
     late_rows = 0

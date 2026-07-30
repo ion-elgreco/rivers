@@ -46,6 +46,89 @@ def test_single_asset_use_function():
     assert foo._asset_fn() == 10
 
 
+def test_declared_deps_and_pool_slots_read_back():
+    """The stub declares every decorator keyword as a readable attribute, so
+    reading one must not raise: ``deps`` and ``pool_slots`` type-checked clean
+    and raised ``AttributeError`` at runtime.
+    """
+
+    @rs.Asset(
+        pool="heavy",
+        pool_slots=2,
+        deps=[rs.AssetDef.dep("upstream")],
+    )
+    def a() -> int:
+        return 1
+
+    assert a.pool == [("heavy", 2)]
+    assert a.pool_slots == {"heavy": 2}
+    assert [d.name for d in a.deps] == ["upstream"]
+    assert [d.is_input for d in a.deps] == [False]
+
+
+def test_actions_none_is_accepted_everywhere():
+    """The stub types ``actions`` as optional, matching its ``hooks`` sibling, so
+    a factory helper forwarding ``actions=None`` must not raise.
+    """
+
+    @rs.Asset(actions=None)
+    def single():
+        return 1
+
+    @rs.Asset.from_multi(output_defs=[rs.AssetDef("x")], actions=None)
+    def multi():
+        return {"x": 1}
+
+    @rs.Asset
+    def inner():
+        return 1
+
+    @rs.Asset.from_graph(actions=None)
+    def graph(inner: int) -> int:
+        return inner
+
+    assert isinstance(single, rs.SingleAsset)
+    assert isinstance(multi, rs.MultiAsset)
+    assert isinstance(graph, rs.GraphAsset)
+    assert rs.AssetDef("y", actions=None).name == "y"
+
+    # `external` takes no `actions` at all — external assets are observed, not
+    # operated on — and the stub omits it there too.
+    with pytest.raises(TypeError, match="actions"):
+        rs.Asset.external(name="src", io_handler=DuckHandler(), actions=None)  # type: ignore[call-arg]
+
+
+def test_asset_def_str_does_not_leak_rust_option():
+    """``AssetDef.name`` is ``Option<String>`` so the class form can inject the
+    attribute name later. The pyclass format string must still print the name,
+    not the Rust wrapper around it.
+    """
+    s = str(rs.AssetDef("orders"))
+    assert "Some(" not in s, s
+    assert s.startswith("AssetDef(name=orders,"), s
+
+
+def test_multi_asset_output_keeps_assetdef_metadata():
+    """``from_multi`` takes no ``metadata=``, so the per-output ``AssetDef`` is
+    the only place to set it — and ``ActionContext.asset_metadata`` reads it.
+    Dropping it makes a Delta action resolve the default table name instead of
+    the configured one.
+    """
+
+    @rs.Asset.from_multi(
+        output_defs=[
+            rs.AssetDef("orders", metadata={"delta/root_name": "orders_v2"}),
+            rs.AssetDef("events"),
+        ]
+    )
+    def multi():
+        return 1, 2
+
+    by_name = {d.name: d for d in multi.output_defs}
+    assert by_name["orders"].metadata == {"delta/root_name": "orders_v2"}
+    assert by_name["events"].metadata is None
+
+
 def test_multi_asset_name_derived():
     defs = [rs.AssetDef("foo"), rs.AssetDef("bar")]
 

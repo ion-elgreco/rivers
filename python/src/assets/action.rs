@@ -400,6 +400,23 @@ impl PyActionResult {
         self.data_version.as_ref()
     }
 
+    /// Whether the action reported a materialization. Named `is_materialized`
+    /// because a `materialized` getter would be shadowed by the constructor of
+    /// the same name and read as a truthy bound function for every result.
+    #[getter]
+    fn is_materialized(&self) -> bool {
+        self.materialized
+    }
+
+    #[getter(metadata)]
+    fn metadata_py(&self, py: Python) -> PyResult<Py<pyo3::types::PyDict>> {
+        let dict = pyo3::types::PyDict::new(py);
+        for (k, v) in &self.metadata {
+            dict.set_item(k, v.clone())?;
+        }
+        Ok(dict.unbind())
+    }
+
     fn __repr__(&self) -> String {
         if self.materialized {
             format!(
