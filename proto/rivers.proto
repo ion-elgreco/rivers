@@ -274,6 +274,11 @@ message RunActionRequest {
   optional ProtoPartitionKey partition_key = 3;
   repeated Tag tags = 4;
   optional UserRef user = 5;
+  // Target every asset declaring the verb. `repeated` has no presence, so
+  // without this an empty `selection` is indistinguishable from "not set" —
+  // and a caller that computed an empty list would silently fan a destructive
+  // verb across the whole code location. Empty + unset is rejected instead.
+  bool all_assets = 6;
 }
 message RunActionResponse {
   string run_id = 1;

@@ -8,15 +8,23 @@ from rivers.cli.config import _find_toml
 
 @pytest.fixture(autouse=True)
 def clear_rivers_env(monkeypatch):
-    """Remove any ``RIVERS_*`` environment variables before each test.
+    """Remove any ``RIVERS_*`` environment variables around each test.
 
     Ambient ``RIVERS_*`` vars set in the developer's shell or CI environment
     would silently override config values and cause spurious failures.  This
     fixture runs automatically for every test in the suite so individual tests
     never need to clean up after themselves.
+
+    The sweep must also run *after* the test: commands write ``RIVERS_*`` vars
+    in place (``execute`` switches the process into cloud mode), monkeypatch
+    only restores keys it saw before, and a leaked ``RIVERS_DEPLOYMENT=cloud``
+    makes every later ``Storage`` construction in the process panic.
     """
     for key in [k for k in os.environ if k.startswith("RIVERS_")]:
         monkeypatch.delenv(key, raising=False)
+    yield
+    for key in [k for k in os.environ if k.startswith("RIVERS_")]:
+        os.environ.pop(key, None)
 
 
 @pytest.fixture(autouse=True)

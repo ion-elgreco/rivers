@@ -644,6 +644,102 @@ def test_observe_with_partitioned_observable_external():
     assert repo.storage.get_run(result.run_id).action == "observe"
 
 
+def test_keyless_action_job_on_partitioned_asset_is_rejected():
+    """A job carrying a verb must get the same partition gate as `run_action`.
+
+    `PyJob::run_inner` validated nothing, so `Job(action="purge")` with no key
+    on a partitioned asset emitted a whole-asset Deletion and cleared *every*
+    partition's materialization state — a silent, unrecoverable wipe.
+    """
+
+    class Orders(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = rs.PartitionsDefinition.static_(["p1", "p2", "p3"])
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext):
+            return context.partition_key
+
+        @rs.action(outcome=rs.Outcome.Unmaterialize)
+        @classmethod
+        def purge(cls, ctx):
+            return None
+
+    repo = rs.CodeRepository(
+        assets=[Orders],
+        jobs=[rs.Job(name="purge_job", assets=[Orders], action="purge", executor=IP)],
+        default_executor=IP,
+    )
+    for p in ["p1", "p2", "p3"]:
+        repo.materialize(partition_key=rs.PartitionKey.single(p))
+    before = {str(k) for k in repo.storage.get_materialized_partitions("orders")}
+    assert len(before) == 3
+
+    with pytest.raises(Exception, match="Cannot run 'purge' without partition_key"):
+        repo.get_job("purge_job").execute()
+
+    after = {str(k) for k in repo.storage.get_materialized_partitions("orders")}
+    assert after == before, "a rejected action job must not clear any state"
+
+
+def test_keyed_action_job_on_partitioned_asset_runs():
+    """Falsifier for the guard above: with a key the same job must still work."""
+    purged = []
+
+    class Orders(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext):
+            return context.partition_key
+
+        @rs.action(outcome=rs.Outcome.Unmaterialize)
+        @classmethod
+        def purge(cls, ctx):
+            purged.append(ctx.partition_key)
+            return None
+
+    repo = rs.CodeRepository(
+        assets=[Orders],
+        jobs=[rs.Job(name="purge_job", assets=[Orders], action="purge", executor=IP)],
+        default_executor=IP,
+    )
+    for p in ["p1", "p2"]:
+        repo.materialize(partition_key=rs.PartitionKey.single(p))
+
+    result = repo.get_job("purge_job").execute(
+        partition_key=rs.PartitionKey.single("p1")
+    )
+    assert result.success
+    assert purged == ["p1"]
+    remaining = {str(k) for k in repo.storage.get_materialized_partitions("orders")}
+    assert remaining == {'PartitionKey("p2")'}
+
+
+def test_keyless_observe_job_on_partitioned_observable_is_allowed():
+    """The keyless-observe carve-out applies to the job path too: `observe()` is
+    whole-asset, so a partitioned observable must not be forced to supply a key.
+    """
+
+    class Feed(rs.ExternalAsset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+        @classmethod
+        def observe(cls) -> rs.Observation:
+            return rs.Observation(data_version="dv-1")
+
+    repo = rs.CodeRepository(
+        assets=[Feed],
+        jobs=[rs.Job(name="refresh", assets=[Feed], action="observe", executor=IP)],
+        default_executor=IP,
+    )
+    result = repo.get_job("refresh").execute()
+    assert result.success
+    assert repo.storage.get_run(result.run_id).action == "observe"
+
+
 def test_keyed_observe_sees_its_partition_key():
     """A keyed observe records its result against that partition, so the body
     has to be able to see which one it is."""

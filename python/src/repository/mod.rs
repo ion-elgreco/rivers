@@ -109,7 +109,24 @@ fn validate_partition_for_verb<'a>(
     partition_key: Option<&PyPartitionKey>,
     verb: Option<&str>,
 ) -> PyResult<()> {
-    let partitioned = iter_partitioned_assets(&state.node_map, asset_names);
+    validate_partition_in_map(&state.node_map, asset_names, partition_key, verb)
+}
+
+/// An unkeyed `observe` is a whole-asset observation — the observe fn takes no
+/// partition — so a partitioned observable must not be made to supply a key.
+pub(crate) fn is_keyless_observe(verb: Option<&str>, partition_key: Option<&PyPartitionKey>) -> bool {
+    verb == Some("observe") && partition_key.is_none()
+}
+
+/// `validate_partition_for_verb` over a borrowed node map, for callers that
+/// hold the map but not the whole `ResolvedState` (the job execution path).
+pub(crate) fn validate_partition_in_map<'a>(
+    node_map: &'a HashMap<String, ResolvedNode>,
+    asset_names: impl IntoIterator<Item = &'a str>,
+    partition_key: Option<&PyPartitionKey>,
+    verb: Option<&str>,
+) -> PyResult<()> {
+    let partitioned = iter_partitioned_assets(node_map, asset_names);
 
     let Some(pk) = partition_key else {
         if partitioned.is_empty() {
@@ -1723,11 +1740,14 @@ impl RepoHandle {
             let asset_names = summary.asset_names.clone();
             let action = summary.action.clone();
 
-            validate_partition_for_selection(
-                state,
-                asset_names.iter().map(String::as_str),
-                partition_key,
-            )?;
+            if !is_keyless_observe(action.as_deref(), partition_key) {
+                validate_partition_for_verb(
+                    state,
+                    asset_names.iter().map(String::as_str),
+                    partition_key,
+                    action.as_deref(),
+                )?;
+            }
             let dyn_checks = dynamic_partition_checks(
                 state,
                 asset_names.iter().map(String::as_str),
@@ -2655,10 +2675,7 @@ impl PyCodeRepository {
             )));
         }
 
-        // An unkeyed observe is a whole-asset observation (the observe fn
-        // takes no partition), so a partitioned observable must not demand a
-        // key the verb has nowhere to put.
-        let keyless_observe = action == "observe" && partition_key.is_none();
+        let keyless_observe = is_keyless_observe(Some(&action), partition_key.as_ref());
         if !keyless_observe {
             validate_partition_for_verb(
                 state,

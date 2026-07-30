@@ -124,7 +124,7 @@ impl CodeLocationService for CodeLocationImpl {
             let sel = req.selection;
             self.handle
                 .validate_assets_exist(&sel)
-                .map_err(|e| Status::internal(e.to_string()))?;
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
             sel
         };
 
@@ -137,7 +137,7 @@ impl CodeLocationService for CodeLocationImpl {
         self.handle
             .validate_partition_for_selection(&asset_selection, pk.as_ref())
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         let mat_request = crate::daemon::MaterializationRequestData {
             run_id: uuid::Uuid::new_v4().to_string(),
@@ -553,7 +553,16 @@ impl CodeLocationService for CodeLocationImpl {
 
         // An action selection is resolved here rather than left empty: the
         // dispatcher hands the request to the run queue (and, on Kubernetes, to
-        // a Run CR), which needs the asset list up front.
+        // a Run CR), which needs the asset list up front. Fanning out is opt-in:
+        // `repeated` has no presence, so a bare empty list is a caller bug, not
+        // a request to run a destructive verb across the code location.
+        if !req.all_assets && req.selection.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "RunAction '{}' needs a non-empty selection, or all_assets to \
+                 target every asset declaring it",
+                req.action
+            )));
+        }
         let asset_selection = if req.selection.is_empty() {
             // `supports_action` reads Python attributes. Run it on a GIL thread
             // rather than attaching from this tokio worker — attaching while
@@ -571,7 +580,7 @@ impl CodeLocationService for CodeLocationImpl {
             let sel = req.selection;
             self.handle
                 .validate_assets_exist(&sel)
-                .map_err(|e| Status::internal(e.to_string()))?;
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
             sel
         };
         if asset_selection.is_empty() {
@@ -587,7 +596,7 @@ impl CodeLocationService for CodeLocationImpl {
         self.handle
             .validate_partition_for_action(&asset_selection, pk.as_ref(), &req.action)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         let action_request = crate::daemon::MaterializationRequestData {
             run_id: uuid::Uuid::new_v4().to_string(),

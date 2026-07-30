@@ -309,8 +309,17 @@ def execute(
 
     # Ad-hoc action runs carry the verb only on their run record — the Run CR
     # and pod args are verb-less, so route by what storage says the run is.
+    # A missing record is fatal: defaulting to materialize would run something
+    # other than what was queued, and for a destructive verb that is silent.
     record = storage.get_run(run_id)
-    action = record.action if record is not None else None
+    if record is None:
+        typer.echo(
+            f"Error: no run record for '{run_id}' — cannot tell whether this pod "
+            "should materialize or run an action",
+            err=True,
+        )
+        raise typer.Exit(1)
+    action = record.action
 
     try:
         if job:

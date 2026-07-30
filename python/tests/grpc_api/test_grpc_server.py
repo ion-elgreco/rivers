@@ -178,7 +178,9 @@ def test_materialize_nonexistent_returns_error(grpc_channel):
     stub = pb2_grpc.CodeLocationServiceStub(channel)
     with pytest.raises(grpc.RpcError) as exc_info:
         stub.Materialize(pb2.MaterializeRequest(selection=["nonexistent"]))
-    assert exc_info.value.code() == grpc.StatusCode.INTERNAL
+    # A caller error, not a server fault — the boundary validates and says so.
+    assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "nonexistent" in exc_info.value.details()
 
 
 @pytest.fixture
@@ -336,7 +338,7 @@ def test_evaluate_sensor_nonexistent(full_grpc_channel):
 
 def test_run_action_observe(full_grpc_channel):
     """Observe is the built-in action — triggered via RunAction."""
-    channel, pb2, pb2_grpc, _ = full_grpc_channel
+    channel, pb2, pb2_grpc, repo = full_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)
     response = stub.RunAction(
         pb2.RunActionRequest(action="observe", selection=["observed"])
@@ -344,6 +346,11 @@ def test_run_action_observe(full_grpc_channel):
     assert response.success is True
     assert response.run_id != ""
     assert response.error == ""
+    # Fire-and-forget response — still prove the observation itself landed.
+    record = wait_for_run_terminal(repo.storage, response.run_id, timeout=15)
+    assert record is not None and record.status == "Success"
+    assert record.action == "observe"
+    assert repo.storage.get_asset_record("observed").last_timestamp is not None
 
 
 # ── Tests: Run queue via gRPC ──
@@ -385,6 +392,18 @@ def queued_grpc_channel(grpc_stubs, storage):
     yield channel, pb2, pb2_grpc, repo, storage
     channel.close()
     repo._stop_grpc_server()
+
+
+def test_launch_backfill_action_with_job_target_is_rejected(queued_grpc_channel):
+    """A Job target carries its own verb — `action` on top must refuse rather
+    than pick one."""
+    channel, pb2, pb2_grpc, _, _ = queued_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.LaunchBackfill(
+            pb2.LaunchBackfillRequest(job_name="test_job", action="compact")
+        )
+    assert "carries its own action" in exc.value.details()
 
 
 def test_materialize_with_run_queue_creates_queued_run(queued_grpc_channel):
@@ -492,6 +511,45 @@ def test_run_action_rejects_unknown_asset(action_validation_channel):
     )
 
 
+def test_run_action_rejects_empty_selection(action_validation_channel):
+    """`repeated` has no presence, so an empty selection read as "every asset
+    declaring the verb". A caller that computed an empty list would silently fan
+    a destructive verb across the whole code location; fan-out is now opt-in.
+    """
+    channel, pb2, pb2_grpc, _, storage = action_validation_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    before = {r.run_id for r in storage.get_runs(limit=100)}
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.RunAction(pb2.RunActionRequest(action="purge", selection=[]))
+    assert "all_assets" in exc.value.details()
+    assert {r.run_id for r in storage.get_runs(limit=100)} == before, (
+        "a rejected action must not leave a run record behind"
+    )
+
+
+def test_run_action_all_assets_fans_out(action_validation_channel):
+    """Falsifier for the guard above: with `all_assets` the verb still reaches
+    every asset declaring it (here the one partitioned `purge` target).
+    """
+    channel, pb2, pb2_grpc, _, storage = action_validation_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    response = stub.RunAction(
+        pb2.RunActionRequest(
+            action="purge",
+            all_assets=True,
+            partition_key=pb2.ProtoPartitionKey(
+                single=pb2.SinglePartitionKey(keys=["p1"])
+            ),
+        )
+    )
+    assert response.success is True
+    assert response.run_id != ""
+    record = storage.get_run(response.run_id)
+    assert record is not None and record.action == "purge"
+
+
 def test_run_action_rejects_bad_partition_key(action_validation_channel):
     """Same boundary, partition side: a key outside the asset's definition."""
     channel, pb2, pb2_grpc, _, storage = action_validation_channel
@@ -508,12 +566,15 @@ def test_run_action_rejects_bad_partition_key(action_validation_channel):
                 ),
             )
         )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert "nope" in exc.value.details()
     assert {r.run_id for r in storage.get_runs(limit=100)} == before
 
     # And a missing key on a partitioned selection is equally invalid.
-    with pytest.raises(grpc.RpcError):
+    with pytest.raises(grpc.RpcError) as exc:
         stub.RunAction(pb2.RunActionRequest(action="purge", selection=["events"]))
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "partition" in exc.value.details()
 
 
 def test_run_action_allows_keyless_observe_on_partitioned_observable(
@@ -1252,12 +1313,14 @@ def test_execute_job_action_records_the_verb(grpc_stubs, storage):
     record was written verbless, so the condition cache treated the run as a
     materialization attempt and the UI showed no verb."""
     calls = []
+    materialized = []
 
     class Events(rs.Asset):
         io_handler = rs.InMemoryIOHandler()
 
         @classmethod
         def materialize(cls):
+            materialized.append("m")
             return 1
 
         @rs.action(outcome=rs.Outcome.Unchanged)
@@ -1283,6 +1346,7 @@ def test_execute_job_action_records_the_verb(grpc_stubs, storage):
         assert record is not None and record.status == "Success"
         assert record.action == "compact"
         assert calls == ["c"]
+        assert materialized == [], "an action job must not run materialize"
     finally:
         channel.close()
         repo._stop_grpc_server()

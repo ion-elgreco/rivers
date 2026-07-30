@@ -2,6 +2,7 @@ import json
 
 import polars as pl
 import pyarrow as pa
+import pytest
 import rivers as rs
 from deltalake import DeltaTable
 from polars.testing import assert_frame_equal
@@ -1489,6 +1490,17 @@ def test_partition_predicate_single_key(tmp_path):
     meta = {"delta/partition_expr": "date"}
     partition = make_partition("2024-01-01")
     assert handler.partition_predicate(meta, partition) == "date = '2024-01-01'"
+
+
+def test_partition_predicate_rejects_missing_partition(tmp_path):
+    """`ctx.partition` is `PartitionContext | None`, and the docs tell action
+    bodies to pass it straight through. A `None` used to reach `_build_predicate`
+    and die on a missing attribute instead of saying what was wrong.
+    """
+    handler, _ = _make_handler(tmp_path)
+    meta = {"delta/partition_expr": "date"}
+    with pytest.raises(ValueError, match="needs a partition context"):
+        handler.partition_predicate(meta, None)
 
 
 def test_partition_predicate_multi_dim(tmp_path):

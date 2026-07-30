@@ -160,6 +160,14 @@ pub async fn trigger_action(
 ) -> Result<String, ServerFnError> {
     use rivers_api::rivers::{RunActionRequest, Tag};
 
+    // A `#[server]` fn is a public HTTP endpoint, so an empty selection must not
+    // reach the backend and read as "every asset declaring the verb".
+    if selection.is_empty() {
+        return Err(ServerFnError::new(format!(
+            "action '{action}' needs at least one asset"
+        )));
+    }
+
     let state = expect_context::<crate::state::AppState>();
     let (_, mut client) = state
         .connect_to(&loc_ns, &loc_name)
@@ -177,6 +185,7 @@ pub async fn trigger_action(
                 .map(|(k, v)| Tag { key: k, value: v })
                 .collect(),
             user: current_user_ref().await,
+            all_assets: false,
         })
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;

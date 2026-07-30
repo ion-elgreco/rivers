@@ -187,7 +187,7 @@ class DeltaIOHandler(BaseIOHandler):
     def partition_predicate(
         self,
         asset_metadata: dict[str, str] | None,
-        partition: PartitionContext,
+        partition: PartitionContext | None,
     ) -> str:
         """SQL predicate covering the partition(s), honoring ``delta/partition_expr``.
 
@@ -197,8 +197,20 @@ class DeltaIOHandler(BaseIOHandler):
         Args:
             asset_metadata: Per-asset metadata (``ctx.asset_metadata``); the
                 ``delta/partition_expr`` entry names the predicate column(s).
-            partition: The partition context (``ctx.partition``).
+            partition: The partition context (``ctx.partition``). Typed as
+                optional because that is what an ``ActionContext`` exposes, but a
+                predicate needs a key — ``None`` raises rather than reaching
+                ``_build_predicate`` and failing on a missing attribute.
+
+        Raises:
+            ValueError: If ``partition`` is ``None``.
         """
+        if partition is None:
+            raise ValueError(
+                "partition_predicate needs a partition context; this action run "
+                "has no partition key, so there is no predicate to build — "
+                "operate on the whole table instead"
+            )
         partition_expr = _resolve_partition_expr(asset_metadata or {})
         return _build_predicate(partition, partition_expr)
 
