@@ -175,11 +175,9 @@ pub(crate) const RESERVED_ACTION_NAMES: [&str; 3] = ["materialize", "observe", "
 pub(crate) struct ResolvedActionRef {
     pub func: Option<Py<PyAny>>,
     pub is_async: bool,
-    #[allow(dead_code)]
     pub exclusive: bool,
     pub ordering: ActionOrdering,
     pub outcome: ActionOutcome,
-    #[allow(dead_code)]
     pub retry: Option<rivers_core::execution::retry::RetryRef>,
 }
 

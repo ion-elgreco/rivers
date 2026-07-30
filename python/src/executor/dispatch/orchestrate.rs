@@ -70,13 +70,10 @@ pub(crate) fn execute_level_batch(
                     let node = ctx.repo.node_map.get(&step.name).unwrap();
                     let (pools, asset_scope) = ctx.step_pools(step);
                     // Async-ness of an action step is the action's, not the
-                    // asset materialize function's.
+                    // asset materialize function's. Cached at resolve — no
+                    // GIL per step.
                     let is_async = match ctx.scope.plan.verb() {
-                        Some(verb) => Python::attach(|py| {
-                            node.find_action(py, verb)
-                                .map(|a| a.is_async)
-                                .unwrap_or(false)
-                        }),
+                        Some(verb) => node.action_is_async(verb),
                         None => node.is_async(),
                     };
                     singles.push(StepInstance {

@@ -46,8 +46,9 @@ pub(super) struct PartitionStatusPatch {
     pub(super) in_progress: HashSet<PartitionKey>,
     pub(super) failed: HashMap<PartitionKey, i64>,
     /// Keys whose `asset_partitions` row no longer exists (deleted by an
-    /// action) — evicted from the cached timestamps at apply.
-    pub(super) deleted: Vec<PartitionKey>,
+    /// action) — evicted from the cached timestamps at apply. A set: the
+    /// apply loop probes it per failed partition.
+    pub(super) deleted: HashSet<PartitionKey>,
 }
 
 /// Backfill tracking state — which assets are in active backfills and which partitions they target.

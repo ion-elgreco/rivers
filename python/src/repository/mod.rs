@@ -114,7 +114,10 @@ fn validate_partition_for_verb<'a>(
 
 /// An unkeyed `observe` is a whole-asset observation — the observe fn takes no
 /// partition — so a partitioned observable must not be made to supply a key.
-pub(crate) fn is_keyless_observe(verb: Option<&str>, partition_key: Option<&PyPartitionKey>) -> bool {
+pub(crate) fn is_keyless_observe(
+    verb: Option<&str>,
+    partition_key: Option<&PyPartitionKey>,
+) -> bool {
     verb == Some("observe") && partition_key.is_none()
 }
 
@@ -2472,10 +2475,15 @@ impl PyCodeRepository {
         resume: bool,
         raise_on_error: bool,
     ) -> PyResult<PyRunResult> {
-        let run_id = run_id_override.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let existing = rt()
-            .block_on(state.storage.get_run(&run_id))
-            .unwrap_or(None);
+        // Only an override can name an existing record — a minted UUID can't,
+        // so skip the storage read (and do it on the io runtime).
+        let (run_id, existing) = match run_id_override {
+            Some(id) => {
+                let existing = io_rt().block_on(state.storage.get_run(&id)).unwrap_or(None);
+                (id, existing)
+            }
+            None => (uuid::Uuid::new_v4().to_string(), None),
+        };
         let tags_vec = tags.unwrap_or_default();
         if existing.is_none() {
             let core_pk = partition_key.as_ref().map(|pk| pk.into());
@@ -3148,21 +3156,20 @@ impl PyCodeRepository {
 
         let exclusive_pools: Vec<String> = node_map
             .iter()
-            .filter(|(_, node)| node.has_exclusive_action(py))
+            .filter(|(_, node)| node.has_exclusive_action())
             .map(|(name, _)| crate::executor::dispatch::implicit_asset_pool(name))
             .collect();
 
         py.detach(|| {
+            // One write per pool, all in flight together — resolve() otherwise
+            // pays a storage round-trip per pool, sequentially. Later inserts
+            // win, preserving the old write order (exclusive over explicit).
+            let mut writes: HashMap<String, i32> = HashMap::new();
             if let Some(ref limits) = self.pool_limits {
                 for (pool_key, limit) in limits {
-                    let _ = io_rt().block_on(storage_handle.scoped().set_pool_limit(
-                        pool_key,
-                        *limit,
-                        DEFAULT_LEASE_DURATION_SECS,
-                    ));
+                    writes.insert(pool_key.clone(), *limit);
                 }
             }
-
             let mut seen_pools: HashSet<String> = HashSet::new();
             for node in node_map.values() {
                 for (pool_key, _) in node.pool() {
@@ -3176,21 +3183,22 @@ impl PyCodeRepository {
                 .unwrap_or_default();
             for pool_key in &seen_pools {
                 if !explicit_keys.contains(pool_key) {
-                    let _ = io_rt().block_on(storage_handle.scoped().set_pool_limit(
-                        pool_key,
-                        -1,
-                        DEFAULT_LEASE_DURATION_SECS,
-                    ));
+                    writes.insert(pool_key.clone(), -1);
                 }
             }
-
             for pool_key in &exclusive_pools {
-                let _ = io_rt().block_on(storage_handle.scoped().set_pool_limit(
-                    pool_key,
+                writes.insert(
+                    pool_key.clone(),
                     crate::executor::dispatch::EXCLUSIVE_POOL_CAPACITY as i32,
-                    DEFAULT_LEASE_DURATION_SECS,
-                ));
+                );
             }
+            io_rt().block_on(async {
+                let scoped = storage_handle.scoped();
+                futures_util::future::join_all(writes.iter().map(|(pool_key, limit)| {
+                    scoped.set_pool_limit(pool_key, *limit, DEFAULT_LEASE_DURATION_SECS)
+                }))
+                .await;
+            });
         });
     }
 

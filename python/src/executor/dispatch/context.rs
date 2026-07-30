@@ -164,15 +164,15 @@ impl<'a> BatchContext<'a> {
         // pool and the claim carries an `AssetScope`, so admission is decided by
         // which partitions each side touches rather than by slot count. A multi
         // materializes all outputs in one step, so it claims each output's pool.
-        // Assets without exclusive actions never touch this.
-        Python::attach(|py| match self.scope.plan.verb() {
+        // Assets without exclusive actions never touch this. Reads only the
+        // exclusivity cached at resolve — no GIL inside the detached region.
+        match self.scope.plan.verb() {
             Some(verb) => {
                 exclusive = self
                     .repo
                     .node_map
                     .get(&step.name)
-                    .and_then(|n| n.find_action(py, verb))
-                    .map(|a| a.exclusive)
+                    .map(|n| n.action_is_exclusive(verb))
                     .unwrap_or(false);
                 if exclusive {
                     pools.push((implicit_asset_pool(&step.name), 1));
@@ -183,7 +183,7 @@ impl<'a> BatchContext<'a> {
                     self.repo
                         .node_map
                         .get(name)
-                        .map(|n| n.has_exclusive_action(py))
+                        .map(|n| n.has_exclusive_action())
                         .unwrap_or(false)
                 };
                 for name in step.event_names() {
@@ -201,7 +201,7 @@ impl<'a> BatchContext<'a> {
                     pools.push((implicit_asset_pool(parent), 1));
                 }
             }
-        });
+        }
         let scope = (pools.len() > user_pools).then(|| self.asset_scope(exclusive));
         (pools, scope)
     }

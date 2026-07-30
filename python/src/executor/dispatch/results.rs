@@ -359,12 +359,15 @@ fn handle_action_result(
     }
 
     enum Report {
+        /// Body returned None — the declared outcome is presumed done.
+        Completed,
+        /// Explicit `ActionResult.unchanged()` — a no-op report.
         Unchanged(Vec<(String, MetadataValue)>),
         Materialized(Vec<(String, MetadataValue)>, Option<String>),
     }
 
     let report = if step_result.result.is_none(py) {
-        Report::Unchanged(Vec::new())
+        Report::Completed
     } else if let Ok(r) = step_result.result.bind(py).cast::<PyActionResult>() {
         let r = r.get();
         if r.materialized {
@@ -428,16 +431,16 @@ fn handle_action_result(
         }
         // An explicit `unchanged()` return is a no-op report — even for an
         // Unmaterialize action ("nothing to delete"): state is preserved.
-        Report::Unchanged(metadata) if !step_result.result.is_none(py) => {
+        Report::Unchanged(metadata) => {
             ctx.emit_action_completed(step_name, verb, &metadata, now_ts());
             ctx.emit_success(step_name);
         }
-        Report::Unchanged(metadata) => {
+        Report::Completed => {
             if outcome == Some(ActionOutcome::Unmaterialize) {
                 // The declared outcome happened: clear materialization state.
                 ctx.emit_deletion(step_name, verb, now_ts());
             } else {
-                ctx.emit_action_completed(step_name, verb, &metadata, now_ts());
+                ctx.emit_action_completed(step_name, verb, &[], now_ts());
             }
             ctx.emit_success(step_name);
         }

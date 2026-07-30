@@ -525,7 +525,7 @@ impl AssetConditionCache {
                         .filter(|pk| !existing.contains(pk))
                         .collect()
                 }
-                _ => Vec::new(),
+                _ => HashSet::new(),
             };
             out.insert(
                 asset_key.clone(),

@@ -1465,26 +1465,21 @@ impl SurrealStorage {
                 // it as "this dependency produced something new", so leaving it
                 // to advance would make deleting an asset trigger a
                 // materialization from data that no longer exists. The event id
-                // still points at the deletion so timelines resolve.
+                // still points at the deletion so timelines resolve. Both
+                // statements ride one request — a drain full of whole-asset
+                // deletions otherwise pays two round-trips per event.
                 self.db
                     .query(
                         "UPDATE assets SET last_event_id = $event_id, last_run_id = NONE, \
                          last_timestamp = NONE, last_data_version = NONE, \
                          last_materialization_code_version = NONE, last_input_data_versions = [] \
-                         WHERE code_location_id = $cl AND asset_key = $asset_key",
-                    )
-                    .bind(("cl", cl.to_string()))
-                    .bind(("asset_key", asset_key.to_string()))
-                    .bind(("event_id", event_id.to_string()))
-                    .await?
-                    .check()?;
-                self.db
-                    .query(
-                        "DELETE FROM asset_partitions WHERE code_location_id = $cl \
+                         WHERE code_location_id = $cl AND asset_key = $asset_key; \
+                         DELETE FROM asset_partitions WHERE code_location_id = $cl \
                          AND asset_key = $asset_key",
                     )
                     .bind(("cl", cl.to_string()))
                     .bind(("asset_key", asset_key.to_string()))
+                    .bind(("event_id", event_id.to_string()))
                     .await?
                     .check()?;
             }
@@ -1896,6 +1891,7 @@ impl StorageBackend for SurrealStorage {
         // Partition-scoped deletions collapse to one DELETE per asset — a
         // purge over a date range lands thousands of them in one drain.
         let mut part_deletes: HashMap<(&str, &str), Vec<PartitionKey>> = HashMap::new();
+        let mut whole_deletes: HashMap<(&str, &str), (&EventRecord, &String)> = HashMap::new();
         for (event, event_id) in events.iter().zip(event_ids.iter()) {
             let cl = event.code_location_id.as_str();
             if let Some(asset_key) = &event.asset_key
@@ -1917,11 +1913,17 @@ impl StorageBackend for SurrealStorage {
                             .entry((cl, asset_key.as_str()))
                             .or_default()
                             .push(pk.clone()),
+                        // Latest deletion per asset wins — repeats in one drain
+                        // only re-clear the same row.
                         None => {
-                            self.consolidate_deletion(cl, asset_key, event, event_id).await?
+                            whole_deletes.insert((cl, asset_key.as_str()), (event, event_id));
                         }
                     }
                 }
+        }
+        for ((cl, asset_key), (event, event_id)) in whole_deletes {
+            self.consolidate_deletion(cl, asset_key, event, event_id)
+                .await?;
         }
         for ((cl, asset_key), keys) in part_deletes {
             self.db
