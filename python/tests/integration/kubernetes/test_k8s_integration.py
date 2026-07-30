@@ -62,10 +62,15 @@ def _cluster_reachable() -> bool:
         return False
 
 
-pytestmark = cluster_gate(
-    _cluster_reachable(),
-    f"k3d cluster '{KUBECTL_CONTEXT}' not reachable or namespace '{NAMESPACE}' missing",
-)
+pytestmark = [
+    cluster_gate(
+        _cluster_reachable(),
+        f"k3d cluster '{KUBECTL_CONTEXT}' not reachable or namespace '{NAMESPACE}' missing",
+    ),
+    # Pod waits here run to 240s — far past the 60s project default, whose
+    # thread method os._exit()s the whole run instead of failing one test.
+    pytest.mark.timeout(600),
+]
 
 
 class GrpcChannel:

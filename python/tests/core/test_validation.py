@@ -105,9 +105,17 @@ def test_asset_invalid_io_handler_raises():
 def test_external_asset_observe_no_fn_skipped():
     """External asset without observe_fn is skipped by repo.observe()."""
     ext = rs.Asset.external(name="x", io_handler=DummyHandler())
-    repo = rs.CodeRepository(assets=[ext])
+
+    @rs.Asset.external(io_handler=DummyHandler())
+    def watched(context: rs.AssetExecutionContext):
+        return rs.Observation(data_version="v1")
+
+    repo = rs.CodeRepository(assets=[ext, watched])
     result = repo.observe()
     assert result.success
+    # The observable sibling proves a real run happened — without it the
+    # empty-targets early return also yields "x not in []", vacuously.
+    assert "watched" in result.materialized_assets
     assert "x" not in result.materialized_assets
 
 

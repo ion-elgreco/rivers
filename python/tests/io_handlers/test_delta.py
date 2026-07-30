@@ -1531,3 +1531,33 @@ def test_partition_predicate_matches_write_path(tmp_path):
 
     remaining = pl.read_delta(handler.asset_table_uri("events", meta))
     assert remaining["day"].unique().to_list() == ["b"]
+
+
+def test_action_body_helpers_through_run_action(tmp_path):
+    """The two action-body helpers work with real ActionContext fields — an
+    actual `run_action` wires asset_key/asset_metadata/partition through."""
+    handler, uri = _make_handler(tmp_path)
+    seen = {}
+
+    def _delete(ctx):
+        seen["uri"] = handler.asset_table_uri(ctx.asset_key, ctx.asset_metadata)
+        seen["pred"] = handler.partition_predicate(ctx.asset_metadata, ctx.partition)
+
+    delete = rs.AssetAction(name="delete", outcome=rs.Outcome.Unmaterialize)(_delete)
+
+    @rs.Asset(
+        io_handler=handler,
+        partitions_def=rs.PartitionsDefinition.static_(["2024-01-01"]),
+        metadata={"delta/partition_expr": "date"},
+        actions=[delete],
+    )
+    def events(context: rs.AssetExecutionContext):
+        return pa.table({"date": ["2024-01-01"], "v": [1]})
+
+    repo = rs.CodeRepository(assets=[events], default_executor=rs.Executor.in_process())
+    repo.materialize(partition_key=rs.PartitionKey.single("2024-01-01"))
+    assert repo.run_action(
+        "delete", ["events"], partition_key=rs.PartitionKey.single("2024-01-01")
+    ).success
+    assert seen["uri"] == f"{uri}/events"
+    assert seen["pred"] == "date = '2024-01-01'"

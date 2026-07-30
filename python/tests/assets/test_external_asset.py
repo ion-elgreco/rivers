@@ -94,6 +94,31 @@ def test_external_asset_observe():
     assert meta["observed"]["row_count"] == 42
 
 
+def test_observation_metadata_helper_reports_the_newest_observation():
+    """Eight assertions across the suite read this helper.
+
+    `get_runs` returns runs newest-first, so the helper's last-write-wins loop
+    reported the *oldest* observation — a re-observe could not be detected, and
+    `run_id` scoping did not exist.
+    """
+    handler = DictIOHandler()
+    gen = {"n": 0}
+
+    @rs.Asset.external(io_handler=handler, name="feed")
+    def feed(context: rs.AssetExecutionContext):
+        gen["n"] += 1
+        context.add_output_metadata({"gen": rs.MetadataValue.int(gen["n"])})
+
+    repo = rs.CodeRepository(assets=[feed])
+    first = repo.observe()
+    repo.observe()
+    third = repo.observe()
+
+    assert observation_metadata(repo)["feed"]["gen"] == 3, "newest must win"
+    assert observation_metadata(repo, run_id=first.run_id)["feed"]["gen"] == 1
+    assert observation_metadata(repo, run_id=third.run_id)["feed"]["gen"] == 3
+
+
 def test_external_asset_observe_decorator():
     """@Asset.external(io_handler=h) decorator sets observe_fn from decorated function."""
     handler = DictIOHandler()

@@ -132,3 +132,40 @@ if _store_dir:
         @classmethod
         def materialize(cls) -> int:
             return os.getpid()
+
+    # Async class-form pair — async bodies run on the orchestrator's runtime
+    # while sync siblings in the same level cross loky.
+    class AsyncLeft(rs.Asset):
+        io_handler = handler
+
+        @classmethod
+        async def materialize(cls) -> int:
+            return 5
+
+    class AsyncRight(rs.Asset):
+        io_handler = handler
+
+        @classmethod
+        async def materialize(cls) -> int:
+            return 7
+
+    # Graph asset for the by-ref suite: its 2-wide seed level ships through
+    # loky; the composed task runs with the parent handler override.
+    @rs.Asset(io_handler=handler)
+    def g_seed() -> int:
+        return 3
+
+    @rs.Asset(io_handler=handler)
+    def g_seed_b() -> int:
+        return 4
+
+    @rs.Task
+    def g_add_one(value: int) -> int:
+        return value + 1
+
+    class GLokyPipeline(rs.GraphAsset):
+        io_handler = handler
+
+        @classmethod
+        def compose(cls, g_seed: int):
+            return g_add_one(g_seed)

@@ -17532,6 +17532,7 @@ async fn deleted_asset_reads_missing_again() {
         .await
         .unwrap();
     let record = scoped.get_asset_record("table").await.unwrap().unwrap();
+    let mat_event_id = record.last_event_id.clone();
     let records = HashMap::from([("table".to_string(), record.clone())]);
     let deps = HashMap::new();
     assert!(
@@ -17557,10 +17558,12 @@ async fn deleted_asset_reads_missing_again() {
         .fired,
         "a deleted asset must read Missing so automation can rebuild it"
     );
-    assert_eq!(
-        record.last_event_id.is_some(),
-        true,
-        "the deletion still owns the asset's last event for timelines"
+    // `is_some()` alone is vacuous — the materialization already set it. The
+    // deletion event itself must own the pointer for timelines to resolve.
+    assert!(record.last_event_id.is_some());
+    assert_ne!(
+        record.last_event_id, mat_event_id,
+        "the deletion, not the prior materialization, owns the last event"
     );
 }
 

@@ -940,3 +940,25 @@ class TestRangeDefinitionOrdering:
                     {"size": ("medium", "large"), "regon": ["us"]}
                 ),
             )
+
+
+def test_selectionless_backfill_expands_sorted():
+    """selection=None expands to every asset in sorted order — the expansion
+    lands on child runs, so it must not depend on map iteration order."""
+    pd = rs.PartitionsDefinition.static_(["p1"])
+
+    @rs.Asset(partitions_def=pd, io_handler=rs.InMemoryIOHandler())
+    def zeta(context: rs.AssetExecutionContext) -> int:
+        return 1
+
+    @rs.Asset(partitions_def=pd, io_handler=rs.InMemoryIOHandler())
+    def alpha(context: rs.AssetExecutionContext) -> int:
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[zeta, alpha], default_executor=rs.Executor.in_process()
+    )
+    res = repo.backfill(partition_keys=[rs.PartitionKey.single("p1")])
+    assert res.completed == 1
+    (rid,) = res.run_ids
+    assert repo.storage.get_run(rid).node_names == ["alpha", "zeta"]

@@ -103,22 +103,35 @@ def make_repo(assets, storage=None, *, executor=None, **kwargs) -> rs.CodeReposi
     return repo
 
 
-def observation_metadata(repo) -> dict:
-    """{asset_key: {meta_key: raw_value}} from all Observation events.
+def observation_metadata(repo, run_id: str | None = None) -> dict:
+    """{asset_key: {meta_key: raw_value}} from Observation events.
 
     repo.observe() runs through the run spine, so observation
     metadata lives on the run's Observation events rather than a return dict.
+
+    The **newest** observation per asset wins. `get_runs` returns runs
+    newest-first, so a plain last-write-wins loop reports the *oldest* — the
+    opposite of what a caller checking "what did observe record" means. Pass
+    `run_id` to scope to a single run; a partitioned observable still collapses
+    to one entry per asset, so scope by run when the per-partition value matters.
     """
     import json
 
-    out: dict = {}
-    for run in repo.storage.get_runs(limit=50):
-        for ev in repo.storage.get_events_for_run(run.run_id):
+    latest: dict = {}
+    if run_id is not None:
+        run_ids = [run_id]
+    else:
+        run_ids = [r.run_id for r in repo.storage.get_runs(limit=50)]
+    for rid in run_ids:
+        for ev in repo.storage.get_events_for_run(rid):
             if "Observation" not in str(ev.event_type):
+                continue
+            seen = latest.get(ev.asset_key)
+            if seen is not None and seen[0] >= ev.timestamp:
                 continue
             parsed = {}
             for key, value in ev.metadata:
                 tagged = json.loads(value)
                 parsed[key] = next(iter(tagged.values()))["value"]
-            out[ev.asset_key] = parsed
-    return out
+            latest[ev.asset_key] = (ev.timestamp, parsed)
+    return {key: parsed for key, (_, parsed) in latest.items()}

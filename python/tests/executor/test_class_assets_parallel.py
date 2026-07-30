@@ -143,3 +143,31 @@ def test_loky_local_class_assets_fall_back_to_pickle(tmp_path):
     repo.materialize()
     assert repo.load_node("lc") == 11
     assert repo.load_node("ld") == 22
+
+
+def test_loky_async_class_assets_coexist(class_mod):
+    """Async bodies run on the orchestrator while sync siblings cross loky —
+    the submit-before-async ordering must hold for class-form assets too."""
+    m = class_mod
+    repo = rs.CodeRepository(
+        assets=[m.AsyncLeft, m.AsyncRight, m.PidLeft, m.PidRight],
+        default_executor=MP,
+    )
+    repo.materialize()
+    assert repo.load_node("async_left") == 5
+    assert repo.load_node("async_right") == 7
+    assert repo.load_node("pid_left") != os.getpid()
+
+
+def test_loky_graph_asset_by_reference(class_mod):
+    """A graph asset's 2-wide seed level ships by reference; the composed
+    task's output lands like any other asset."""
+    m = class_mod
+    repo = rs.CodeRepository(
+        assets=[m.g_seed, m.g_seed_b, m.GLokyPipeline],
+        tasks=[m.g_add_one],
+        default_executor=MP,
+    )
+    repo.materialize()
+    assert repo.load_node("g_loky_pipeline") == 4
+    assert repo.load_node("g_seed_b") == 4

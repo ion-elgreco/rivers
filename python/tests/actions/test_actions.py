@@ -25,10 +25,6 @@ def event_types(repo, run_id):
     return sorted(str(e.event_type) for e in repo.storage.get_events_for_run(run_id))
 
 
-def action_run(repo, verb):
-    return next(r for r in repo.storage.get_runs(limit=20) if r.action == verb)
-
-
 # Module-level so loky workers can import them by reference.
 @rs.Task
 def _fan_echo(x: int) -> int:
@@ -527,6 +523,12 @@ def test_run_action_run_id_override_reuses_record():
     assert result.run_id == "fixed-rid"
     assert repo.storage.get_run("fixed-rid").action == "compact"
 
+    # Run again under the same id: the record must be reused (the pod
+    # re-executes an existing run), not minted a second time.
+    again = repo.run_action("compact", run_id_override="fixed-rid")
+    assert again.success and again.run_id == "fixed-rid"
+    assert [r.run_id for r in repo.storage.get_runs(limit=10)] == ["fixed-rid"]
+
 
 def test_queued_backfill_action_children_run_the_action(storage):
     """Queued-mode backfill children must carry and execute the backfill's
@@ -807,6 +809,25 @@ def test_batched_observe_can_fail_one_partition():
     assert len(failures) == 1 and "eu" in str(failures[0].partition_key)
 
 
+def test_keyed_observe_rejects_invalid_key():
+    """The keyless-observe carve-out must not skip validation once a key IS
+    given — a bad key on observe is still a caller error."""
+
+    class Feed(rs.ExternalAsset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = rs.PartitionsDefinition.static_(["us", "eu"])
+
+        @classmethod
+        def observe(cls, ctx: rs.AssetExecutionContext) -> rs.Observation:
+            return rs.Observation(data_version="dv")
+
+    repo = rs.CodeRepository(assets=[Feed], default_executor=IP)
+    with pytest.raises(rs.exceptions.ExecutionError, match="Invalid partition_key"):
+        repo.run_action(
+            "observe", ["feed"], partition_key=rs.PartitionKey.single("nope")
+        )
+
+
 def test_observe_skips_non_observable_names():
     """`observe(asset_names=...)` filters to the observable externals it can
     serve; unknown or non-observable names are skipped, not fatal. Regression:
@@ -1083,6 +1104,11 @@ def test_declaring_exclusive_action_does_not_serialize_materialize(tmp_path):
     )
 
 
+# Internal budget (Event waits + thread joins) exceeds the 60s project-wide
+# `timeout`, and `timeout_method = "thread"` calls os._exit(1) — which kills the
+# whole pytest run with no report. Raise the ceiling so this test's own
+# assertions fire first and name what actually stalled.
+@pytest.mark.timeout(180)
 def test_exclusive_action_serializes_with_materialize():
     import threading
 
@@ -1117,22 +1143,36 @@ def test_exclusive_action_serializes_with_materialize():
     repo = rs.CodeRepository(assets=[SlowTable], default_executor=IP)
     repo.materialize()
 
-    t_action = threading.Thread(target=lambda: repo.run_action("optimize"))
+    action_result = {}
+    t_action = threading.Thread(
+        target=lambda: action_result.update(
+            r=repo.run_action("optimize", raise_on_error=False)
+        )
+    )
     t_action.start()
     assert started.wait(timeout=30)
 
     result = {}
     t_mat = threading.Thread(target=lambda: result.update(r=repo.materialize()))
     t_mat.start()
-    # Give the materialize step time to hit the claim loop and emit
-    # StepSlotWaiting while the action still holds the slot.
-    import time
-
-    time.sleep(2.0)
+    # Wait for the materialize step to actually reach the claim loop and emit
+    # StepSlotWaiting, rather than sleeping a guessed interval.
+    wait_until(
+        lambda: any(
+            e.event_type == "StepSlotWaiting"
+            for r in repo.storage.get_runs(limit=10)
+            for e in repo.storage.get_events_for_run(r.run_id)
+        ),
+        timeout=30,
+    )
     release.set()
     t_action.join(timeout=60)
     t_mat.join(timeout=60)
 
+    # A bare thread swallows the action's outcome — `raise_on_error=True`
+    # turns a failure into an exception threading only prints. Assert it, or
+    # the timing assertions above prove nothing about a verb that never ran.
+    assert action_result["r"].success
     assert result["r"].success
     # The materialize body may only run after the action released the slot.
     assert windows["mat"][0] >= windows["opt"][1]
@@ -1173,12 +1213,16 @@ def _slow_partitioned_exclusive(started, release, windows):
     return Events
 
 
+# Internal budget (Event waits + thread joins) exceeds the 60s project-wide
+# `timeout`, and `timeout_method = "thread"` calls os._exit(1) — which kills the
+# whole pytest run with no report. Raise the ceiling so this test's own
+# assertions fire first and name what actually stalled.
+@pytest.mark.timeout(180)
 def test_exclusive_action_does_not_block_a_different_partition():
     """The point of scoping the pool by partition: `purge(p1)` holds the asset's
     implicit pool, but a materialize of p2 touches different data and must not
     queue behind it."""
     import threading
-    import time
 
     started, release, windows = threading.Event(), threading.Event(), {}
     repo = rs.CodeRepository(
@@ -1189,9 +1233,14 @@ def test_exclusive_action_does_not_block_a_different_partition():
         repo.materialize(partition_key=rs.PartitionKey.single(p))
     windows.clear()
 
+    action_result = {}
     t_action = threading.Thread(
-        target=lambda: repo.run_action(
-            "purge", partition_key=rs.PartitionKey.single("p1")
+        target=lambda: action_result.update(
+            r=repo.run_action(
+                "purge",
+                partition_key=rs.PartitionKey.single("p1"),
+                raise_on_error=False,
+            )
         )
     )
     t_action.start()
@@ -1224,14 +1273,21 @@ def test_exclusive_action_does_not_block_a_different_partition():
         release.set()
         t_action.join(timeout=60)
 
+    # A bare thread swallows the action's outcome, so assert it: otherwise a
+    # failed purge leaves the timing assertions above proving nothing.
+    assert action_result["r"].success
     # The action really did outlive the disjoint materialize.
     assert windows["purge"][1] >= windows["mat_p2"][1]
 
 
+# Internal budget (Event waits + thread joins) exceeds the 60s project-wide
+# `timeout`, and `timeout_method = "thread"` calls os._exit(1) — which kills the
+# whole pytest run with no report. Raise the ceiling so this test's own
+# assertions fire first and name what actually stalled.
+@pytest.mark.timeout(180)
 def test_exclusive_action_still_blocks_its_own_partition():
     """The other half: the same partition must still serialize."""
     import threading
-    import time
 
     started, release, windows = threading.Event(), threading.Event(), {}
     repo = rs.CodeRepository(
@@ -1241,9 +1297,14 @@ def test_exclusive_action_still_blocks_its_own_partition():
     repo.materialize(partition_key=rs.PartitionKey.single("p1"))
     windows.clear()
 
+    action_result = {}
     t_action = threading.Thread(
-        target=lambda: repo.run_action(
-            "purge", partition_key=rs.PartitionKey.single("p1")
+        target=lambda: action_result.update(
+            r=repo.run_action(
+                "purge",
+                partition_key=rs.PartitionKey.single("p1"),
+                raise_on_error=False,
+            )
         )
     )
     t_action.start()
@@ -1272,6 +1333,9 @@ def test_exclusive_action_still_blocks_its_own_partition():
         t_action.join(timeout=60)
         t_mat.join(timeout=60)
 
+    # A bare thread swallows the action's outcome, so assert it: otherwise a
+    # failed purge leaves the timing assertions above proving nothing.
+    assert action_result["r"].success
     assert result["r"].success
     # Same partition — the materialize body may only run after purge released.
     assert windows["mat_p1"][0] >= windows["purge"][1]
@@ -1281,6 +1345,11 @@ def test_exclusive_action_still_blocks_its_own_partition():
     assert "StepSlotWaiting" in waiting
 
 
+# Internal budget (Event waits + thread joins) exceeds the 60s project-wide
+# `timeout`, and `timeout_method = "thread"` calls os._exit(1) — which kills the
+# whole pytest run with no report. Raise the ceiling so this test's own
+# assertions fire first and name what actually stalled.
+@pytest.mark.timeout(180)
 def test_two_exclusive_actions_on_different_partitions_overlap():
     """The reported bug, directly: a partition-by-partition `delete` backfill
     serialized every run on one asset-wide lock and the tail timed out at
@@ -1296,9 +1365,14 @@ def test_two_exclusive_actions_on_different_partitions_overlap():
         repo.materialize(partition_key=rs.PartitionKey.single(p))
 
     # purge(p1) blocks until released, holding the asset's implicit pool.
+    first_result = {}
     t1 = threading.Thread(
-        target=lambda: repo.run_action(
-            "purge", partition_key=rs.PartitionKey.single("p1")
+        target=lambda: first_result.update(
+            r=repo.run_action(
+                "purge",
+                partition_key=rs.PartitionKey.single("p1"),
+                raise_on_error=False,
+            )
         )
     )
     t1.start()
@@ -1322,6 +1396,8 @@ def test_two_exclusive_actions_on_different_partitions_overlap():
         release.set()
         t1.join(timeout=60)
         t2.join(timeout=60)
+    # A bare thread swallows the first action's outcome, so assert it too.
+    assert first_result["r"].success
     assert result["r"].success
     waiting = [
         e.event_type for e in repo.storage.get_events_for_run(result["r"].run_id)
@@ -1405,9 +1481,7 @@ class TestActionResultAccessors:
         assert r.metadata == {"files_scanned": rs.MetadataValue.int(12)}
 
     def test_materialized_reports_materialization(self):
-        r = rs.ActionResult.materialized(
-            metadata={"rows_merged": 3}, data_version="v9"
-        )
+        r = rs.ActionResult.materialized(metadata={"rows_merged": 3}, data_version="v9")
         assert r.is_materialized is True
         assert r.data_version == "v9"
         assert r.metadata == {"rows_merged": rs.MetadataValue.int(3)}
@@ -1857,6 +1931,65 @@ def test_batched_action_can_fail_one_partition(executor, style):
     assert "p2" in remaining[0]
 
 
+def _batched_action_repo(body):
+    delete = rs.AssetAction(name="delete", outcome=rs.Outcome.Unmaterialize)(body)
+
+    class Events(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = rs.PartitionsDefinition.static_(["p1", "p2"])
+        actions = [delete]
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext):
+            return context.partition_key
+
+    repo = rs.CodeRepository(assets=[Events], default_executor=IP)
+    for p in ("p1", "p2"):
+        repo.materialize(partition_key=rs.PartitionKey.single(p))
+    return repo
+
+
+def _run_batched(repo):
+    return repo.backfill(
+        selection=["events"],
+        partition_keys=[rs.PartitionKey.single(p) for p in ("p1", "p2")],
+        action="delete",
+        strategy=rs.BackfillStrategy.single_run(),
+    )
+
+
+def test_batched_action_partition_key_is_ambiguous():
+    """A batched run has no single key — `ctx.partition_key` must refuse and
+    point at `ctx.partition.keys`, not hand back an arbitrary member."""
+    seen = {}
+
+    def _delete(ctx):
+        try:
+            _ = ctx.partition_key
+        except rs.exceptions.PartitionValidationError as e:
+            seen["err"] = str(e)
+
+    repo = _batched_action_repo(_delete)
+    assert _run_batched(repo).completed == 2
+    assert "ambiguous" in seen["err"] and "partition.keys" in seen["err"]
+
+
+def test_action_mark_partition_failed_rejects_foreign_key():
+    """Marking a key outside the batch is a body bug — rejected, so a typo
+    can't silently exempt a real key from the outcome."""
+    seen = {}
+
+    def _delete(ctx):
+        try:
+            ctx.mark_partition_failed(rs.PartitionKey.single("zz"), "typo")
+        except Exception as e:
+            seen["err"] = f"{type(e).__name__}: {e}"
+
+    repo = _batched_action_repo(_delete)
+    assert _run_batched(repo).completed == 2
+    assert "not in this context's partition keys" in seen["err"]
+
+
 # ---------------------------------------------------------------------------
 # Action config: ActionContext[Config]
 # ---------------------------------------------------------------------------
@@ -1964,6 +2097,11 @@ def test_action_config_validation_error_fails_run():
         raise_on_error=False,
     )
     assert not result.success
+    # The tripwire also yields success=False — pin that validation rejected
+    # the config before the body ran, not that the body tripwired.
+    assert result.failed_assets, "expected the validation error on failed_assets"
+    assert "action body must not run" not in result.failed_assets[0][1]
+    assert "target_size_mb" in result.failed_assets[0][1]
 
 
 def test_observe_config_override():
