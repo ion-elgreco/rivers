@@ -217,7 +217,8 @@ def test_materialize_launch_failure_records_reason(no_handler_grpc_channel):
 
     The run status alone tells the UI "failed" but not why — without an event
     the run detail renders an empty timeline and the error only ever reaches
-    the terminal (issue #52).
+    the terminal (issue #52). The reason has to be committed *before* the
+    status flips, or a reader polling on status sees an empty timeline.
     """
     channel, pb2, pb2_grpc, _repo, storage = no_handler_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)
@@ -237,6 +238,8 @@ def test_materialize_launch_failure_records_reason(no_handler_grpc_channel):
     events = storage.get_events_for_run(run_id)
     launch_failed = [e for e in events if e.event_type == "RunLaunchFailed"]
     assert len(launch_failed) == 1, f"expected a RunLaunchFailed event, got {events}"
+
+    assert launch_failed[0].timestamp <= run.end_time
 
     error = dict(launch_failed[0].metadata).get("error", "")
     # The reason the terminal printed has to be the reason the UI can read.

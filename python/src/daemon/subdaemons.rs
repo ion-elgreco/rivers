@@ -295,18 +295,8 @@ pub(crate) async fn fail_unlaunched_run(
     run_id: &str,
     error: &str,
 ) {
-    if let Err(e) = storage
-        .update_run_status(run_id, RunStatus::Failure, Some(now_ts()))
-        .await
-    {
-        tracing::error!(
-            target: "rivers::coordinator",
-            run_id = %run_id,
-            error = %e,
-            "failed to fail-out an unlaunched run; it will read as in-flight until the next sweep"
-        );
-        return;
-    }
+    // Event first: the terminal status is what readers poll on, so writing it
+    // last means anyone who sees `Failure` already sees the reason.
     if let Err(e) = storage
         .store_event(&EventRecord {
             code_location_id: code_location_id.to_string(),
@@ -325,6 +315,17 @@ pub(crate) async fn fail_unlaunched_run(
             run_id = %run_id,
             error = %e,
             "failed to persist RunLaunchFailed event"
+        );
+    }
+    if let Err(e) = storage
+        .update_run_status(run_id, RunStatus::Failure, Some(now_ts()))
+        .await
+    {
+        tracing::error!(
+            target: "rivers::coordinator",
+            run_id = %run_id,
+            error = %e,
+            "failed to fail-out an unlaunched run; it will read as in-flight until the next sweep"
         );
     }
 }
