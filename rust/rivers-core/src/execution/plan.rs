@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::assets::graph::AssetGraph;
+use crate::assets::graph::{ancestors, descendants, AssetGraph};
 use crate::composition::InvocationKind;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -162,25 +162,14 @@ impl ExecutionPlan {
             .cloned()
             .collect();
 
-        let name_to_idx: HashMap<&str, petgraph::graph::NodeIndex> = graph
-            .node_indices()
-            .map(|idx| (graph[idx].name.as_str(), idx))
-            .collect();
-
-        // Edges point dependent → dependency, so `a` reachable-to `b` means
-        // `b` is upstream of `a`.
-        let upstream_targets = |of: &str| -> Vec<String> {
-            let Some(&from) = name_to_idx.get(of) else {
-                return Vec::new();
-            };
+        // One transitive-closure walk per target, O(T·(V+E)) overall — pairwise
+        // reachability probes made ReverseTopological T·(T−1)² whole-graph
+        // walks: minutes of pure planning at a few hundred targets, re-run per
+        // backfill child under the repository's state read lock.
+        let related_targets = |closure: HashSet<String>| -> Vec<String> {
             targets
                 .iter()
-                .filter(|t| t.as_str() != of)
-                .filter(|t| {
-                    name_to_idx.get(t.as_str()).is_some_and(|&to| {
-                        petgraph::algo::has_path_connecting(graph, from, to, None)
-                    })
-                })
+                .filter(|t| closure.contains(t.as_str()))
                 .cloned()
                 .collect()
         };
@@ -191,14 +180,12 @@ impl ExecutionPlan {
                 let plan_dependencies = match ordering {
                     ActionOrdering::Unordered => Vec::new(),
                     // Wait for every related target upstream of this one.
-                    ActionOrdering::Topological => upstream_targets(target),
-                    // Wait for every related target this one is upstream of.
-                    ActionOrdering::ReverseTopological => targets
-                        .iter()
-                        .filter(|t| t.as_str() != target.as_str())
-                        .filter(|t| upstream_targets(t).iter().any(|u| u == target))
-                        .cloned()
-                        .collect(),
+                    ActionOrdering::Topological => related_targets(ancestors(graph, target)),
+                    // Wait for every related target this one is upstream of
+                    // (its dependents).
+                    ActionOrdering::ReverseTopological => {
+                        related_targets(descendants(graph, target))
+                    }
                 };
                 ExecutionStep {
                     name: target.clone(),
@@ -869,6 +856,45 @@ mod tests {
         assert_eq!(c.plan_dependencies, vec!["a".to_string()]);
         let a = plan.steps.iter().find(|s| s.name == "a").unwrap();
         assert!(a.plan_dependencies.is_empty());
+    }
+
+    /// Ordered action planning must stay linear in the graph: it re-runs per
+    /// backfill child, under the repository's state read lock. The old
+    /// T·(T−1)² whole-graph reachability walks took over a minute of pure
+    /// planning at 400 targets.
+    #[test]
+    fn test_for_action_ordering_scales_linearly() {
+        let n = 200;
+        let names: Vec<String> = (0..n).map(|i| format!("a{i}")).collect();
+        let defs: Vec<(&str, Vec<&str>)> = (0..n)
+            .map(|i| {
+                let deps = if i == 0 {
+                    vec![]
+                } else {
+                    vec![names[i - 1].as_str()]
+                };
+                (names[i].as_str(), deps)
+            })
+            .collect();
+        let graph = make_graph(defs);
+
+        let start = std::time::Instant::now();
+        let plan = ExecutionPlan::for_action(
+            &graph,
+            "delete",
+            &names,
+            ActionOrdering::ReverseTopological,
+        );
+        let elapsed = start.elapsed();
+
+        assert_eq!(plan.steps.len(), n);
+        // The root of the chain waits on every downstream target.
+        let root = plan.steps.iter().find(|s| s.name == "a0").unwrap();
+        assert_eq!(root.plan_dependencies.len(), n - 1);
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "reverse-topological planning took {elapsed:?} for {n} chained targets"
+        );
     }
 
     /// Duplicate names in an action selection must collapse to one step — a
