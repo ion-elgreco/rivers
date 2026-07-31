@@ -642,6 +642,74 @@ async fn action_completion_survives_daemon_restart() {
     );
 }
 
+/// Restart must not adopt an action run as an asset's "last run" for the
+/// `LastExecutedWithTags`/`LastRunIncludesTarget` maps — steady state never
+/// does (`apply_run_effects_to_delta` skips action runs), so seeding them
+/// at initial load makes those conditions flip on every daemon restart.
+#[tokio::test]
+async fn initial_load_skips_action_runs_in_last_run_maps() {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::PerCodeLocationStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+
+    // The assets row must exist for the event rollforward to stamp it.
+    storage
+        .register_assets(
+            &cl,
+            &[AssetRecord {
+                code_location_id: cl.clone(),
+                asset_key: "events".to_string(),
+                tags: vec![],
+                kinds: vec![],
+                asset_group: None,
+                code_version: None,
+                last_event_id: None,
+                last_run_id: None,
+                last_timestamp: None,
+                last_data_version: None,
+                last_materialization_code_version: None,
+                last_input_data_versions: vec![],
+                pool: vec![],
+            }],
+        )
+        .await
+        .unwrap();
+
+    // A MayMaterialize action run is the asset's newest run at restart.
+    let mut act = mk_run("ra", RunStatus::Success, &["events"], 2000);
+    act.action = Some("optimize".to_string());
+    act.tags = vec![("team".to_string(), "data".to_string())];
+    storage.create_run(&act).await.unwrap();
+    storage
+        .store_events(&[crate::storage::EventRecord {
+            code_location_id: cl.clone(),
+            event_type: crate::storage::EventType::Materialization {
+                data_version: Some("dv_1".to_string()),
+            },
+            asset_key: Some("events".to_string()),
+            run_id: "ra".to_string(),
+            partition_key: None,
+            timestamp: 2000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        }])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(cl.clone());
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        cache.last_run_tags.get("events").is_none(),
+        "action run must not seed the last-run tag map on restart"
+    );
+    assert!(
+        cache.last_run_asset_names.get("events").is_none(),
+        "action run must not seed the last-run asset-names map on restart"
+    );
+}
+
 /// Deleting a partition wipes the timestamp row that superseded its old
 /// failures, so a daemon restart would resurrect it as failed — and
 /// `eager()`'s `!ExecutionFailed` gate then keeps it from ever being

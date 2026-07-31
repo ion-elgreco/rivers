@@ -426,6 +426,12 @@ impl AssetConditionCache {
                 .values()
                 .filter_map(|record| {
                     let run = runs_by_id.get(record.last_run_id.as_deref()?)?;
+                    // Not a materialization attempt — steady state never routes
+                    // action runs into the last-run maps, so a restart must not
+                    // adopt one either.
+                    if run.action.is_some() {
+                        return None;
+                    }
                     let run_ts = run.end_time.unwrap_or(run.start_time);
                     let partitions =
                         run_partition_slots(self.is_partitioned(&record.asset_key), run);
