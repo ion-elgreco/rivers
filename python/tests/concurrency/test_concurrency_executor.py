@@ -6,6 +6,10 @@ run-level cleanup. Covers InProcess, Parallel, and Async executor paths.
 """
 
 import asyncio
+import os
+import subprocess
+import sys
+import textwrap
 import time
 
 import obstore.store
@@ -451,6 +455,51 @@ def test_run_level_cleanup(storage):
 
     info = storage.get_pool_info("db")
     assert info.claimed_count == 0
+
+
+def test_step_pod_keeps_sibling_run_slots():
+    """A K8s step pod re-enters execute_plan for its single step; finishing
+    must not run the run-scoped slot GC — that deletes sibling step pods'
+    live claims for the same run, and an exclusive verb fired after that
+    instant would admit concurrently with the sibling's in-flight write.
+    Subprocess because the step-pod flag is read once per process."""
+    script = textwrap.dedent(
+        """
+        import rivers as rs
+        from rivers.testing import memory_storage
+
+        storage = memory_storage()
+
+        @rs.Asset(io_handler=rs.InMemoryIOHandler())
+        def solo():
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[solo], default_executor=rs.Executor.in_process()
+        )
+        repo.resolve(storage=storage)
+
+        run_id = "step-pod-run"
+        storage.set_pool_limit("db", 2)
+        storage._claim_concurrency_slots([("db", 1)], run_id, "sibling_step")
+        holders = [h.step_key for h in storage.get_pool_slot_holders("db")]
+        assert holders == ["sibling_step"], f"setup: {holders}"
+
+        repo.materialize(selection=["solo"], run_id_override=run_id)
+
+        holders = [h.step_key for h in storage.get_pool_slot_holders("db")]
+        assert holders == ["sibling_step"], f"sibling slots freed: {holders}"
+        """
+    )
+    env = dict(os.environ, RIVERS_STEP_POD="1")
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
 
 
 def test_mixed_pool_and_nonpool_steps(storage):

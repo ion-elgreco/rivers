@@ -466,11 +466,15 @@ impl Executor {
                 Python::attach(|py| b.shutdown(py));
             }
 
-            // Defense-in-depth: catch leaked slots from crashed steps.
-            if let Err(e) =
-                io_rt().block_on(storage.backend().free_concurrency_slots_for_run(run_id))
-            {
-                tracing::warn!(run_id = %run_id, error = %e, "failed to free run-level concurrency slots");
+            // Defense-in-depth: catch leaked slots from crashed steps. Not in
+            // a step pod — there the run isn't over, and the run-scoped delete
+            // would take sibling pods' live claims with it.
+            if !in_step_pod() {
+                if let Err(e) =
+                    io_rt().block_on(storage.backend().free_concurrency_slots_for_run(run_id))
+                {
+                    tracing::warn!(run_id = %run_id, error = %e, "failed to free run-level concurrency slots");
+                }
             }
 
             writer.flush();
