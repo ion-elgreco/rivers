@@ -2615,6 +2615,42 @@ impl PyCodeRepository {
             true,
             retry,
         );
+        self.launch_synthetic_job(
+            state,
+            graph,
+            synthetic_job,
+            true,
+            run_id_override,
+            partition_key,
+            tags,
+            config,
+            launched_by,
+            None,
+            resume,
+            raise_on_error,
+        )
+    }
+
+    /// Shared tail of the two launchers: configure the synthetic job for this
+    /// repo, build its plan, and launch. Materialize resolves asset-level
+    /// retry defaults after the build; an action declares its own retry, so
+    /// its synthetic job deliberately skips that pass.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_synthetic_job(
+        &self,
+        state: &ResolvedState,
+        graph: &rivers_core::assets::graph::AssetGraph,
+        mut synthetic_job: PyJob,
+        resolve_retry_defaults: bool,
+        run_id_override: Option<String>,
+        partition_key: Option<PyPartitionKey>,
+        tags: Option<Vec<(String, String)>>,
+        config: Option<HashMap<String, Py<PyAny>>>,
+        launched_by: LaunchedBy,
+        action: Option<String>,
+        resume: bool,
+        raise_on_error: bool,
+    ) -> PyResult<PyRunResult> {
         Python::attach(|py| {
             synthetic_job.configure_for_repo(
                 py,
@@ -2633,8 +2669,10 @@ impl PyCodeRepository {
             &state.composition_order,
             &self.raw_retries,
         )?;
-        synthetic_job.resolve_retry_ref(&self.raw_retries)?;
-        synthetic_job.fill_retry_defaults(self.resolved_default_retry()?.as_ref());
+        if resolve_retry_defaults {
+            synthetic_job.resolve_retry_ref(&self.raw_retries)?;
+            synthetic_job.fill_retry_defaults(self.resolved_default_retry()?.as_ref());
+        }
 
         self.launch_prepared_job(
             state,
@@ -2644,7 +2682,7 @@ impl PyCodeRepository {
             tags,
             config,
             launched_by,
-            None,
+            action,
             resume,
             raise_on_error,
         )
@@ -2714,28 +2752,11 @@ impl PyCodeRepository {
         let mut synthetic_job =
             PyJob::new_synthetic(selected_names, self.effective_executor(), true, None);
         synthetic_job.action = Some(action.clone());
-        Python::attach(|py| {
-            synthetic_job.configure_for_repo(
-                py,
-                &state.storage,
-                &state.code_location_id,
-                &state.resources,
-                &state.io_handler_registry,
-                &self.raw_retries,
-            );
-        });
-        synthetic_job.validate_and_build_plan(
-            graph,
-            &state.node_map,
-            &state.step_kinds,
-            &state.multi_asset_groups,
-            &state.composition_order,
-            &self.raw_retries,
-        )?;
-
-        self.launch_prepared_job(
+        self.launch_synthetic_job(
             state,
+            graph,
             synthetic_job,
+            false,
             run_id_override,
             partition_key,
             tags,
