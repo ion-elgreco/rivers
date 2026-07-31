@@ -489,7 +489,12 @@ async fn deleted_partition_evicted_from_partition_status() {
     );
 }
 
-fn mat_events_for(cl: &str, asset: &str, keys: &[&str], ts: i64) -> Vec<crate::storage::EventRecord> {
+fn mat_events_for(
+    cl: &str,
+    asset: &str,
+    keys: &[&str],
+    ts: i64,
+) -> Vec<crate::storage::EventRecord> {
     keys.iter()
         .map(|pk| crate::storage::EventRecord {
             code_location_id: cl.to_string(),
@@ -508,7 +513,13 @@ fn mat_events_for(cl: &str, asset: &str, keys: &[&str], ts: i64) -> Vec<crate::s
         .collect()
 }
 
-fn deletion_event(cl: &str, asset: &str, run_id: &str, pk: &str, ts: i64) -> crate::storage::EventRecord {
+fn deletion_event(
+    cl: &str,
+    asset: &str,
+    run_id: &str,
+    pk: &str,
+    ts: i64,
+) -> crate::storage::EventRecord {
     crate::storage::EventRecord {
         code_location_id: cl.to_string(),
         event_type: crate::storage::EventType::Deletion,
@@ -648,8 +659,8 @@ async fn action_completion_survives_daemon_restart() {
 /// at initial load makes those conditions flip on every daemon restart.
 #[tokio::test]
 async fn initial_load_skips_action_runs_in_last_run_maps() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
     use crate::storage::PerCodeLocationStorage;
+    use crate::storage::surrealdb_backend::SurrealStorage;
 
     let storage = SurrealStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();

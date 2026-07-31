@@ -1490,10 +1490,7 @@ impl SurrealStorage {
     /// Which of `ids` belong to action runs. Events don't carry the verb, so
     /// the materialization consolidation reads it off the run record; a
     /// missing row reads as materialize (fail-open to the old behavior).
-    async fn action_run_ids(
-        &self,
-        ids: Vec<String>,
-    ) -> Result<std::collections::HashSet<String>> {
+    async fn action_run_ids(&self, ids: Vec<String>) -> Result<std::collections::HashSet<String>> {
         if ids.is_empty() {
             return Ok(std::collections::HashSet::new());
         }
@@ -4518,7 +4515,10 @@ mod tests {
             "store_event: an action's materialized() must not clear the pending rebuild"
         );
 
-        storage.store_events(&[mat_event("r2", 3000)]).await.unwrap();
+        storage
+            .store_events(&[mat_event("r2", 3000)])
+            .await
+            .unwrap();
         let records = storage.get_asset_records(cl).await.unwrap();
         assert_eq!(
             mcv(&records).as_deref(),
@@ -10288,8 +10288,8 @@ mod tests {
         let single = |k: &str| PartitionKey::Single {
             keys: vec![k.to_string()],
         };
-        let run = |id: &str, status: RunStatus, action: Option<&str>, pk: &str, ts: i64| {
-            RunRecord {
+        let run =
+            |id: &str, status: RunStatus, action: Option<&str>, pk: &str, ts: i64| RunRecord {
                 run_id: id.to_string(),
                 code_location_id: cl.to_string(),
                 job_name: None,
@@ -10303,8 +10303,7 @@ mod tests {
                 block_reason: None,
                 launched_by: LaunchedBy::default(),
                 action: action.map(String::from),
-            }
-        };
+            };
 
         // p1: a real keyed failure — floors.
         storage

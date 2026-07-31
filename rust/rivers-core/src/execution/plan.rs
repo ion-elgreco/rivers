@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::assets::graph::{ancestors, descendants, AssetGraph};
+use crate::assets::graph::{AssetGraph, ancestors, descendants};
 use crate::composition::InvocationKind;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -879,12 +879,8 @@ mod tests {
         let graph = make_graph(defs);
 
         let start = std::time::Instant::now();
-        let plan = ExecutionPlan::for_action(
-            &graph,
-            "delete",
-            &names,
-            ActionOrdering::ReverseTopological,
-        );
+        let plan =
+            ExecutionPlan::for_action(&graph, "delete", &names, ActionOrdering::ReverseTopological);
         let elapsed = start.elapsed();
 
         assert_eq!(plan.steps.len(), n);
