@@ -598,7 +598,19 @@ pub fn common_actions(
                     .is_some_and(|i| i.actions.iter().any(|b| b.name == a.name))
             })
         })
-        .cloned()
+        .map(|a| {
+            // Outcomes may diverge per asset for one verb name, and this row
+            // only drives the confirmation styling (execution re-resolves per
+            // target) — so a destructive variant on ANY member wins over the
+            // first asset's.
+            assets
+                .iter()
+                .filter_map(|k| asset_info_by_key.get(k))
+                .filter_map(|i| i.actions.iter().find(|b| b.name == a.name))
+                .find(|b| b.is_destructive())
+                .unwrap_or(a)
+                .clone()
+        })
         .collect()
 }
 
@@ -1063,6 +1075,26 @@ mod tests {
         let infos = make_map(vec![with_actions("a", &[("destroy", "unmaterialize")])]);
         let acts = common_actions(&["a".into()], &infos);
         assert!(acts[0].is_destructive());
+    }
+
+    /// Outcomes may legally diverge per asset for one verb name, and the
+    /// merged entry drives the confirmation styling — so the destructive
+    /// variant must win no matter which asset was shift-clicked first.
+    #[test]
+    fn destructive_variant_wins_regardless_of_selection_order() {
+        let infos = make_map(vec![
+            with_actions("benign", &[("purge", "unchanged")]),
+            with_actions("dangerous", &[("purge", "unmaterialize")]),
+        ]);
+        for order in [["benign", "dangerous"], ["dangerous", "benign"]] {
+            let sel: Vec<String> = order.iter().map(|s| s.to_string()).collect();
+            let acts = common_actions(&sel, &infos);
+            assert_eq!(acts.len(), 1);
+            assert!(
+                acts[0].is_destructive(),
+                "a destructive variant on any member must flag the merged entry (order {order:?})"
+            );
+        }
     }
 
     fn picker(assets: &[&str], infos: &HashMap<String, AssetDefinitionInfo>) -> JobPartitionPicker {
