@@ -170,15 +170,19 @@ impl PyAssetAction {
 /// Verbs with built-in meaning that user actions may not claim.
 pub(crate) const RESERVED_ACTION_NAMES: [&str; 3] = ["materialize", "observe", "compose"];
 
-/// Snapshot of one action resolved for execution — refs cloned out so dispatch
-/// can carry it without borrowing the asset.
-pub(crate) struct ResolvedActionRef {
+/// One action resolved at `resolve()` — the per-output table that executors,
+/// planners, and the gRPC projection all read. Not a live view: actions are
+/// declarative, so post-resolve mutation of the Python object is not
+/// reflected.
+pub(crate) struct ResolvedAction {
+    pub name: String,
     pub func: Option<Py<PyAny>>,
     pub is_async: bool,
     pub exclusive: bool,
     pub ordering: ActionOrdering,
     pub outcome: ActionOutcome,
     pub retry: Option<rivers_core::execution::retry::RetryRef>,
+    pub description: Option<String>,
 }
 
 #[pymethods]

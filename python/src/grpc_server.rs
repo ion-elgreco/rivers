@@ -366,7 +366,7 @@ impl CodeLocationService for CodeLocationImpl {
                         };
 
                     let actions = node
-                        .list_actions(py)
+                        .list_actions()
                         .into_iter()
                         .map(|(name, outcome, exclusive, description)| ActionInfo {
                             name,
@@ -564,18 +564,11 @@ impl CodeLocationService for CodeLocationImpl {
             )));
         }
         let asset_selection = if req.selection.is_empty() {
-            // `supports_action` reads Python attributes. Run it on a GIL thread
-            // rather than attaching from this tokio worker — attaching while
-            // holding the state read guard inverts the lock order `resolve()`
-            // uses (GIL, then `state.write()`).
-            let handle = self.handle.clone();
-            let action = req.action.clone();
-            self.run_on_python(move |py, _repo| {
-                handle
-                    .assets_supporting_action(py, &action)
-                    .map_err(|e| e.to_string())
-            })
-            .await?
+            // Reads the action table cached at resolve — no GIL, safe from
+            // this tokio worker.
+            self.handle
+                .assets_supporting_action(&req.action)
+                .map_err(|e| Status::internal(e.to_string()))?
         } else {
             let sel = req.selection;
             self.handle
@@ -583,17 +576,10 @@ impl CodeLocationService for CodeLocationImpl {
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
             // An asset that exists but doesn't define the verb would otherwise
             // come back as success plus a run_id for a run that can only fail
-            // at plan build. Same GIL rule as the fan-out branch above.
-            let handle = self.handle.clone();
-            let action = req.action.clone();
-            let names = sel.clone();
-            self.run_on_python(move |py, _repo| {
-                Ok(handle
-                    .validate_assets_support_action(py, &names, &action)
-                    .map_err(|e| e.to_string()))
-            })
-            .await?
-            .map_err(Status::invalid_argument)?;
+            // at plan build.
+            self.handle
+                .validate_assets_support_action(&sel, &req.action)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
             sel
         };
         if asset_selection.is_empty() {

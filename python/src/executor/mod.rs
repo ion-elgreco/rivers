@@ -267,16 +267,13 @@ impl Executor {
             }
         }
 
-        let needs_bridge = match plan.action.as_deref() {
+        let needs_bridge = match plan.verb() {
             // The bridge requirement follows the executed verb, not the
             // asset's materialize function.
-            Some(verb) => plan.steps.iter().any(|s| {
-                node_map
-                    .get(&s.name)
-                    .and_then(|n| n.find_action(py, verb))
-                    .map(|a| a.is_async)
-                    .unwrap_or(false)
-            }),
+            Some(verb) => plan
+                .steps
+                .iter()
+                .any(|s| node_map.get(&s.name).is_some_and(|n| n.action_is_async(verb))),
             None => plan
                 .steps
                 .iter()

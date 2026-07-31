@@ -263,20 +263,19 @@ impl<'a> BatchContext<'a> {
         &self,
         step: &rivers_core::execution::plan::ExecutionStep,
     ) -> Option<rivers_core::execution::retry::RetryPolicy> {
-        if let Some(verb) = self.scope.plan.action.as_deref() {
-            return Python::attach(|py| {
-                self.repo
-                    .node_map
-                    .get(&step.name)
-                    .and_then(|n| n.find_action(py, verb))
-                    .and_then(|a| a.retry)
-                    .and_then(|r| match r {
-                        rivers_core::execution::retry::RetryRef::Inline(p) => Some(p),
-                        rivers_core::execution::retry::RetryRef::Named(key) => {
-                            self.repo.retries.get(&key).cloned()
-                        }
-                    })
-            });
+        if let Some(verb) = self.scope.plan.verb() {
+            return self
+                .repo
+                .node_map
+                .get(&step.name)
+                .and_then(|n| n.find_action(verb))
+                .and_then(|a| a.retry.as_ref())
+                .and_then(|r| match r {
+                    rivers_core::execution::retry::RetryRef::Inline(p) => Some(p.clone()),
+                    rivers_core::execution::retry::RetryRef::Named(key) => {
+                        self.repo.retries.get(key).cloned()
+                    }
+                });
         }
         self.retry_policy(&step.name)
             .or_else(|| step.outputs.iter().find_map(|n| self.retry_policy(n)))

@@ -350,7 +350,7 @@ fn handle_action_result(
         .repo
         .node_map
         .get(&step.name)
-        .and_then(|n| n.find_action(py, verb))
+        .and_then(|n| n.find_action(verb))
         .map(|a| a.outcome);
 
     if outcome == Some(ActionOutcome::Observe) {

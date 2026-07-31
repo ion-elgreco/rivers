@@ -361,14 +361,12 @@ impl PyJob {
             })?;
             // Externals define exactly the built-in `observe`; any other verb
             // fails the find_action check below.
-            let found = Python::attach(|py| {
-                node.find_action(py, &verb).map(|a| {
-                    let named_retry = match &a.retry {
-                        Some(RetryRef::Named(key)) => Some(key.clone()),
-                        _ => None,
-                    };
-                    (a.ordering, named_retry)
-                })
+            let found = node.find_action(&verb).map(|a| {
+                let named_retry = match &a.retry {
+                    Some(RetryRef::Named(key)) => Some(key.clone()),
+                    _ => None,
+                };
+                (a.ordering, named_retry)
             });
             let Some((ord, named_retry)) = found else {
                 return Err(GraphValidationError::new_err(format!(

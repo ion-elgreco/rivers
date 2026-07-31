@@ -5,11 +5,13 @@
 //! holds an `inner: Py<...>` back-reference to the originating Python object —
 //! refcount-cheap, accessible for fields not pre-flattened on the struct.
 //!
-//! Invariant fields are pre-flattened at construction; mutable / late-resolved
-//! values (io_handler, input_io_handler, input_metadata, callable) are still
-//! read through `inner` so they reflect any post-construction mutation in the
+//! Invariant fields are pre-flattened at construction — including the
+//! per-output action table (`find_action`/`list_actions`), which is
+//! declarative and never live-read. Mutable / late-resolved values
+//! (io_handler, input_io_handler, input_metadata, callable) are still read
+//! through `inner` so they reflect any post-construction mutation in the
 //! underlying Python object.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -76,12 +78,10 @@ pub(crate) struct ResolvedAsset {
     pub observe_fn: Option<Py<PyAny>>,
     /// Automation condition attached to the asset, if any.
     pub automation_condition: Option<PyAutomationCondition>,
-    /// Verbs this output declares `Exclusive`. Cached at construction so pool
-    /// claims (computed inside the executor's detached region) never take the GIL.
-    pub exclusive_verbs: HashSet<String>,
-    /// Verbs whose body is async — the executor reads this per step, and the
-    /// verb's own async-ness is what matters, not the materialize function's.
-    pub async_verbs: HashSet<String>,
+    /// Every action this output declares, resolved at construction. The one
+    /// place the external `observe` synthetic exists; executors, planners,
+    /// and the gRPC projection all read it.
+    pub actions: Vec<crate::assets::action::ResolvedAction>,
 }
 
 /// Composition tasks carry override fields propagated from their parent
@@ -271,31 +271,41 @@ impl ResolvedAsset {
 
         let automation_condition = asset.automation_condition().cloned();
 
-        let (exclusive_verbs, async_verbs): (HashSet<String>, HashSet<String>) = match kind {
+        let actions: Vec<crate::assets::action::ResolvedAction> = match kind {
             // Externals carry only the built-in observe, which is never
             // exclusive and is async iff the observe function is.
-            AssetKind::External => (
-                HashSet::new(),
-                if is_observable_external && is_async {
-                    std::iter::once("observe".to_string()).collect()
-                } else {
-                    HashSet::new()
-                },
-            ),
+            AssetKind::External => match &observe_fn {
+                Some(f) => vec![crate::assets::action::ResolvedAction {
+                    name: "observe".to_string(),
+                    func: Some(f.clone_ref(py)),
+                    is_async,
+                    exclusive: false,
+                    ordering: rivers_core::execution::plan::ActionOrdering::Unordered,
+                    outcome: crate::assets::action::ActionOutcome::Observe,
+                    retry: None,
+                    description: Some("Record an observation of external data".to_string()),
+                }],
+                None => Vec::new(),
+            },
             _ => {
                 let lookup = output_name.as_deref().unwrap_or(&name);
-                let mut exclusive = HashSet::new();
-                let mut asynchronous = HashSet::new();
-                for a in asset.output_actions(lookup) {
-                    let a = a.borrow(py);
-                    if a.exclusive {
-                        exclusive.insert(a.name.clone());
-                    }
-                    if a.is_async {
-                        asynchronous.insert(a.name.clone());
-                    }
-                }
-                (exclusive, asynchronous)
+                asset
+                    .output_actions(lookup)
+                    .iter()
+                    .map(|a| {
+                        let a = a.borrow(py);
+                        crate::assets::action::ResolvedAction {
+                            name: a.name.clone(),
+                            func: a.func.as_ref().map(|f| f.clone_ref(py)),
+                            is_async: a.is_async,
+                            exclusive: a.exclusive,
+                            ordering: a.ordering,
+                            outcome: a.outcome,
+                            retry: a.retry.clone(),
+                            description: a.description.clone(),
+                        }
+                    })
+                    .collect()
             }
         };
 
@@ -329,8 +339,7 @@ impl ResolvedAsset {
             graph_invocation_order,
             observe_fn,
             automation_condition,
-            exclusive_verbs,
-            async_verbs,
+            actions,
         })
     }
 
@@ -361,8 +370,20 @@ impl ResolvedAsset {
             graph_invocation_order: self.graph_invocation_order.clone(),
             observe_fn: self.observe_fn.as_ref().map(|f| f.clone_ref(py)),
             automation_condition: self.automation_condition.clone(),
-            exclusive_verbs: self.exclusive_verbs.clone(),
-            async_verbs: self.async_verbs.clone(),
+            actions: self
+                .actions
+                .iter()
+                .map(|a| crate::assets::action::ResolvedAction {
+                    name: a.name.clone(),
+                    func: a.func.as_ref().map(|f| f.clone_ref(py)),
+                    is_async: a.is_async,
+                    exclusive: a.exclusive,
+                    ordering: a.ordering,
+                    outcome: a.outcome,
+                    retry: a.retry.clone(),
+                    description: a.description.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -532,112 +553,58 @@ impl ResolvedNode {
         matches!(self, ResolvedNode::BashTask(_))
     }
 
-    /// The named action for this node, or None. Multi-asset output nodes
-    /// resolve against their own output's action list. External assets carry
-    /// exactly one action — the built-in `observe` (when an observe function
-    /// exists) — and never any user-defined verb.
-    pub(crate) fn find_action(
-        &self,
-        py: Python,
-        verb: &str,
-    ) -> Option<crate::assets::action::ResolvedActionRef> {
-        let ResolvedNode::Asset(node) = self else {
-            return None;
-        };
-        if node.kind == AssetKind::External {
-            if verb == "observe"
-                && let Some(f) = &node.observe_fn
-            {
-                return Some(crate::assets::action::ResolvedActionRef {
-                    func: Some(f.clone_ref(py)),
-                    is_async: node.is_async,
-                    exclusive: false,
-                    ordering: rivers_core::execution::plan::ActionOrdering::Unordered,
-                    outcome: crate::assets::action::ActionOutcome::Observe,
-                    retry: None,
-                });
-            }
-            return None;
+    /// The named action for this node, or None — from the table resolved at
+    /// construction. Multi-asset output nodes carry their own output's
+    /// actions; external assets exactly the built-in `observe` (when an
+    /// observe function exists) and never any user-defined verb.
+    pub(crate) fn find_action(&self, verb: &str) -> Option<&crate::assets::action::ResolvedAction> {
+        match self {
+            ResolvedNode::Asset(node) => node.actions.iter().find(|a| a.name == verb),
+            _ => None,
         }
-        let asset = node.inner.borrow(py);
-        let lookup = node.output_name.as_deref().unwrap_or(&node.name);
-        asset.inner().output_actions(lookup).iter().find_map(|a| {
-            let a = a.borrow(py);
-            (a.name == verb).then(|| crate::assets::action::ResolvedActionRef {
-                func: a.func.as_ref().map(|f| f.clone_ref(py)),
-                is_async: a.is_async,
-                exclusive: a.exclusive,
-                ordering: a.ordering,
-                outcome: a.outcome,
-                retry: a.retry.clone(),
-            })
-        })
     }
 
-    pub(crate) fn supports_action(&self, py: Python, verb: &str) -> bool {
-        self.find_action(py, verb).is_some()
+    pub(crate) fn supports_action(&self, verb: &str) -> bool {
+        self.find_action(verb).is_some()
     }
 
     /// True when this node declares at least one `Exclusive` action — such an
     /// asset carries an implicit pool that materialize takes one slot of.
-    /// GIL-free: reads the set cached at resolve.
     pub(crate) fn has_exclusive_action(&self) -> bool {
         match self {
-            ResolvedNode::Asset(node) => !node.exclusive_verbs.is_empty(),
+            ResolvedNode::Asset(node) => node.actions.iter().any(|a| a.exclusive),
             _ => false,
         }
     }
 
-    /// Whether this node declares `verb` as `Exclusive`. GIL-free.
+    /// Whether this node declares `verb` as `Exclusive`.
     pub(crate) fn action_is_exclusive(&self, verb: &str) -> bool {
-        match self {
-            ResolvedNode::Asset(node) => node.exclusive_verbs.contains(verb),
-            _ => false,
-        }
+        self.find_action(verb).is_some_and(|a| a.exclusive)
     }
 
-    /// Whether `verb`'s body is async. GIL-free; false for an unknown verb.
+    /// Whether `verb`'s body is async; false for an unknown verb.
     pub(crate) fn action_is_async(&self, verb: &str) -> bool {
-        match self {
-            ResolvedNode::Asset(node) => node.async_verbs.contains(verb),
-            _ => false,
-        }
+        self.find_action(verb).is_some_and(|a| a.is_async)
     }
 
     /// `(name, outcome, exclusive, description)` for every action this node
     /// supports — the gRPC `ActionInfo` projection.
-    pub(crate) fn list_actions(&self, py: Python) -> Vec<(String, String, bool, Option<String>)> {
-        let ResolvedNode::Asset(node) = self else {
-            return Vec::new();
-        };
-        if node.kind == AssetKind::External {
-            return if node.observe_fn.is_some() {
-                vec![(
-                    "observe".to_string(),
-                    "observe".to_string(),
-                    false,
-                    Some("Record an observation of external data".to_string()),
-                )]
-            } else {
-                Vec::new()
-            };
+    pub(crate) fn list_actions(&self) -> Vec<(String, String, bool, Option<String>)> {
+        match self {
+            ResolvedNode::Asset(node) => node
+                .actions
+                .iter()
+                .map(|a| {
+                    (
+                        a.name.clone(),
+                        a.outcome.as_str().to_string(),
+                        a.exclusive,
+                        a.description.clone(),
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
         }
-        let asset = node.inner.borrow(py);
-        let lookup = node.output_name.as_deref().unwrap_or(&node.name);
-        asset
-            .inner()
-            .output_actions(lookup)
-            .iter()
-            .map(|a| {
-                let a = a.borrow(py);
-                (
-                    a.name.clone(),
-                    a.outcome.as_str().to_string(),
-                    a.exclusive,
-                    a.description.clone(),
-                )
-            })
-            .collect()
     }
 
     pub fn is_graph_asset(&self) -> bool {

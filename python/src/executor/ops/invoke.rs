@@ -653,18 +653,22 @@ pub(crate) fn execute_action_step(
     let node = node_map.get(&step.name).ok_or_else(|| {
         ExecutionError::new_err(format!("Node '{}' not found in execution plan", step.name))
     })?;
-    let action = node.find_action(py, verb).ok_or_else(|| {
+    let action = node.find_action(verb).ok_or_else(|| {
         ExecutionError::new_err(format!(
             "Asset '{}' does not define action '{}'",
             step.name, verb
         ))
     })?;
-    let func = action.func.ok_or_else(|| {
-        ExecutionError::new_err(format!(
-            "Action '{}' on asset '{}' has no function",
-            verb, step.name
-        ))
-    })?;
+    let func = action
+        .func
+        .as_ref()
+        .map(|f| f.clone_ref(py))
+        .ok_or_else(|| {
+            ExecutionError::new_err(format!(
+                "Action '{}' on asset '{}' has no function",
+                verb, step.name
+            ))
+        })?;
 
     let handler = registry.for_output(py, node);
     let handler = (!handler.is_none(py)).then_some(handler);

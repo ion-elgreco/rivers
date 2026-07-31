@@ -71,14 +71,10 @@ fn job_action(jobs_info: &HashMap<String, JobSummary>, job_name: Option<&str>) -
 /// `selection=None` means for an action — a queued or Kubernetes-backed run
 /// carries its asset list on the record, so "everything" has to be spelled out.
 /// `node_map` is a HashMap, so the sort is what makes step order reproducible.
-fn assets_supporting_action(
-    node_map: &HashMap<String, ResolvedNode>,
-    py: Python,
-    action: &str,
-) -> Vec<String> {
+fn assets_supporting_action(node_map: &HashMap<String, ResolvedNode>, action: &str) -> Vec<String> {
     let mut names: Vec<String> = node_map
         .iter()
-        .filter(|(_, node)| node.supports_action(py, action))
+        .filter(|(_, node)| node.supports_action(action))
         .map(|(name, _)| name.clone())
         .collect();
     names.sort();
@@ -1455,27 +1451,19 @@ impl RepoHandle {
             .and_then(|s| s.jobs_info.get(name).map(|j| j.asset_names.clone()))
     }
 
-    /// Assets defining `action`, sorted. The caller must already hold the GIL —
-    /// `supports_action` reads Python attributes, and taking the GIL here while
-    /// holding the state guard inverts the lock order `resolve()` uses
-    /// (GIL, then `state.write()`).
-    pub(crate) fn assets_supporting_action(
-        &self,
-        py: Python,
-        action: &str,
-    ) -> PyResult<Vec<String>> {
+    /// Assets defining `action`, sorted. Reads the action table cached at
+    /// resolve — no GIL involved.
+    pub(crate) fn assets_supporting_action(&self, action: &str) -> PyResult<Vec<String>> {
         let guard = self.state.read().unwrap();
         let state = guard.as_ref().ok_or_else(|| {
             ExecutionError::new_err("CodeRepository not resolved — call resolve() first")
         })?;
-        Ok(assets_supporting_action(&state.node_map, py, action))
+        Ok(assets_supporting_action(&state.node_map, action))
     }
 
-    /// Reject any selected asset that doesn't define `action`. Same GIL rule
-    /// as [`Self::assets_supporting_action`]: the caller must already hold it.
+    /// Reject any selected asset that doesn't define `action`.
     pub(crate) fn validate_assets_support_action(
         &self,
-        py: Python,
         selection: &[String],
         action: &str,
     ) -> PyResult<()> {
@@ -1487,7 +1475,7 @@ impl RepoHandle {
             let node = state.node_map.get(name).ok_or_else(|| {
                 AssetNotFoundError::new_err(format!("Selection contains unknown asset: '{name}'"))
             })?;
-            if !node.supports_action(py, action) {
+            if !node.supports_action(action) {
                 return Err(GraphValidationError::new_err(format!(
                     "Asset '{name}' does not define action '{action}'"
                 )));
@@ -2700,7 +2688,7 @@ impl PyCodeRepository {
                 }
                 sel
             }
-            None => Python::attach(|py| assets_supporting_action(&state.node_map, py, &action)),
+            None => assets_supporting_action(&state.node_map, &action),
         };
         if selected_names.is_empty() {
             return Err(AssetNotFoundError::new_err(format!(
@@ -3715,7 +3703,7 @@ impl PyCodeRepository {
                 .node_map
                 .iter()
                 .filter(|(name, node)| {
-                    node.supports_action(py, "observe")
+                    node.supports_action("observe")
                         && asset_names.as_ref().is_none_or(|n| n.contains(name))
                 })
                 .map(|(name, _)| name.clone())
@@ -4354,9 +4342,7 @@ impl PyCodeRepository {
             match &action {
                 // An action backfill over "everything" means every asset
                 // that defines the verb, mirroring `run_action`.
-                Some(verb) => {
-                    Python::attach(|py| assets_supporting_action(&state.node_map, py, verb))
-                }
+                Some(verb) => assets_supporting_action(&state.node_map, verb),
                 None => {
                     let mut names: Vec<String> = state.node_map.keys().cloned().collect();
                     names.sort();
@@ -4379,21 +4365,18 @@ impl PyCodeRepository {
                     "No assets define action '{verb}'"
                 )));
             }
-            Python::attach(|py| -> PyResult<()> {
-                for name in &selection {
-                    let node = state.node_map.get(name).ok_or_else(|| {
-                        AssetNotFoundError::new_err(format!(
-                            "Selection contains unknown asset: '{name}'"
-                        ))
-                    })?;
-                    if !node.supports_action(py, verb) {
-                        return Err(GraphValidationError::new_err(format!(
-                            "Asset '{name}' does not define action '{verb}'"
-                        )));
-                    }
+            for name in &selection {
+                let node = state.node_map.get(name).ok_or_else(|| {
+                    AssetNotFoundError::new_err(format!(
+                        "Selection contains unknown asset: '{name}'"
+                    ))
+                })?;
+                if !node.supports_action(verb) {
+                    return Err(GraphValidationError::new_err(format!(
+                        "Asset '{name}' does not define action '{verb}'"
+                    )));
                 }
-                Ok(())
-            })?;
+            }
         }
 
         // Keys/ranges against an unpartitioned selection would bypass every
