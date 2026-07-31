@@ -1594,7 +1594,13 @@ impl SurrealStorage {
     ) -> String {
         let mut q = String::from("BEGIN TRANSACTION;\n");
 
+        // Asset pools are admitted by overlap, not capacity — their `$lim`/
+        // `$used` would be computed (a full slot aggregate inside the write
+        // transaction) and referenced by nothing.
         for (i, (_, _slots)) in pools.iter().enumerate() {
+            if asset_pools.contains(&i) {
+                continue;
+            }
             q += &format!(
                 "LET $lim_{i} = (SELECT VALUE slot_limit \
                      FROM concurrency_pools \
@@ -1669,10 +1675,10 @@ impl SurrealStorage {
     }
 
     /// Statement index of the post-COMMIT SELECT in the claim transaction query.
-    /// Counts the pools actually in the transaction, plus one conflict `LET`
-    /// per asset-scoped pool.
+    /// Two capacity `LET`s per counted pool, one conflict `LET` per
+    /// asset-scoped pool.
     fn claim_check_statement_index(num_pools: usize, num_asset_pools: usize) -> usize {
-        2 * num_pools + num_asset_pools + 3
+        2 * (num_pools - num_asset_pools) + num_asset_pools + 3
     }
 
     async fn kv_get_json<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
@@ -4192,7 +4198,12 @@ impl SurrealStorage {
     /// Whether a live slot on `pool_key` conflicts with `scope`. Mirrors
     /// [`Self::asset_conflict_clause`] so the pre-check and the transaction
     /// agree on what "blocked" means.
-    async fn asset_scope_conflict(
+    /// Asset-pool pre-check, one round trip: the existence probe (whose
+    /// missing-row error is load-bearing — without a `concurrency_pools` row
+    /// the claim transaction's `claim_version` bump matches nothing, silently
+    /// removing the fence that serializes claims) plus the same conflict rule
+    /// the transaction enforces. Returns whether a live slot conflicts.
+    async fn asset_pool_precheck(
         &self,
         code_location_id: &str,
         pool_key: &str,
@@ -4213,7 +4224,9 @@ impl SurrealStorage {
         let mut q = self
             .db
             .query(format!(
-                "SELECT VALUE id FROM concurrency_slots \
+                "SELECT VALUE 1 FROM concurrency_pools \
+                 WHERE code_location_id = $cl AND pool_key = $pool_key LIMIT 1; \
+                 SELECT VALUE id FROM concurrency_slots \
                  WHERE code_location_id = $cl AND pool_key = $pool_key \
                  AND lease_expires_at > $now \
                  AND (run_id != $run_id OR step_key != $step_key) \
@@ -4228,7 +4241,10 @@ impl SurrealStorage {
         if let Some(parts) = mine_parts {
             q = q.bind(("parts", parts));
         }
-        let hits: Vec<RecordId> = q.await?.take(0)?;
+        let mut response = q.await?;
+        let exists: Vec<i64> = response.take(0)?;
+        anyhow::ensure!(!exists.is_empty(), "pool '{}' not configured", pool_key);
+        let hits: Vec<RecordId> = response.take(1)?;
         Ok(!hits.is_empty())
     }
 
@@ -4250,46 +4266,49 @@ impl SurrealStorage {
         let mut limited_pools: Vec<(String, u32)> = Vec::new();
         let mut asset_pools: Vec<usize> = Vec::new();
         for (pool_key, slots_needed) in pools {
-            let (pool, current_used) = self
-                .query_pool_usage(code_location_id, pool_key, now_ns)
-                .await?;
-            let is_asset_pool = pool_key.starts_with(ASSET_POOL_PREFIX);
             // An implicit asset pool is never "unlimited": its admission is by
             // partition overlap, not capacity, so dropping it here would remove
             // the exclusion *and* the shared `claim_version` write that fences
             // concurrent claims. `rivers pools set __asset__:x -1` must not be
-            // able to switch destructive-action exclusion off.
-            if pool.slot_limit < 0 && !is_asset_pool {
+            // able to switch destructive-action exclusion off. The pre-check
+            // enforces the same overlap rule as the transaction — without it a
+            // step blocked purely by scope would fall through, fail the
+            // transaction's `IF`, and surface as PoolContended, which retries
+            // and then hard-fails instead of waiting like any blocked claim.
+            if pool_key.starts_with(ASSET_POOL_PREFIX) {
+                let conflict = self
+                    .asset_pool_precheck(
+                        code_location_id,
+                        pool_key,
+                        run_id,
+                        step_key,
+                        now_ns,
+                        scope,
+                    )
+                    .await?;
+                if conflict {
+                    blocked.push(PoolBlockDetail {
+                        pool_key: pool_key.clone(),
+                        claimed: 1,
+                        limit: 1,
+                    });
+                }
+                asset_pools.push(limited_pools.len());
+                limited_pools.push((pool_key.clone(), *slots_needed));
                 continue;
             }
-            if is_asset_pool {
-                asset_pools.push(limited_pools.len());
+            let (pool, current_used) = self
+                .query_pool_usage(code_location_id, pool_key, now_ns)
+                .await?;
+            if pool.slot_limit < 0 {
+                continue;
             }
             limited_pools.push((pool_key.clone(), *slots_needed));
-            if !is_asset_pool && current_used + *slots_needed > pool.slot_limit as u32 {
+            if current_used + *slots_needed > pool.slot_limit as u32 {
                 blocked.push(PoolBlockDetail {
                     pool_key: pool_key.clone(),
                     claimed: current_used,
                     limit: pool.slot_limit,
-                });
-            }
-        }
-
-        // The same overlap rule the transaction enforces. Without it a step
-        // blocked purely by scope would fall through to the transaction, fail
-        // its `IF`, and surface as PoolContended — which is retried and then
-        // hard-fails, instead of waiting like any other blocked claim.
-        for &i in &asset_pools {
-            let (pool_key, _) = &limited_pools[i];
-            if self
-                .asset_scope_conflict(code_location_id, pool_key, run_id, step_key, now_ns, scope)
-                .await?
-                && !blocked.iter().any(|b| &b.pool_key == pool_key)
-            {
-                blocked.push(PoolBlockDetail {
-                    pool_key: pool_key.clone(),
-                    claimed: 1,
-                    limit: 1,
                 });
             }
         }
@@ -10247,6 +10266,35 @@ mod tests {
         // Pool should be updated to new config
         assert_eq!(stored.pool, vec![("api".to_string(), 1)]);
         assert_eq!(stored.code_version, Some("v2".to_string()));
+    }
+
+    /// Asset pools are admitted by partition overlap, not capacity — the
+    /// claim transaction must not compute `$lim`/`$used` for them (a second
+    /// full slot aggregate inside the write transaction, referenced by
+    /// nothing, paid per attempt and per ~1s blocked poll).
+    #[test]
+    fn claim_transaction_skips_capacity_lets_for_asset_pools() {
+        let pools = vec![
+            ("__asset__:orders".to_string(), 1u32),
+            ("db".to_string(), 2u32),
+        ];
+        let q = SurrealStorage::build_claim_transaction(&pools, &[0], None);
+        assert!(
+            !q.contains("LET $lim_0") && !q.contains("LET $used_0"),
+            "asset pool must not compute unused capacity:\n{q}"
+        );
+        assert!(
+            q.contains("LET $lim_1") && q.contains("LET $used_1"),
+            "counted pool must keep its capacity check:\n{q}"
+        );
+        assert!(
+            q.contains("$conf_0") && q.contains("array::len($conf_0) == 0"),
+            "asset pool must keep its conflict clause:\n{q}"
+        );
+        assert!(
+            q.contains("($used_1 + 2) <= $lim_1"),
+            "counted pool must keep its admission condition:\n{q}"
+        );
     }
 
     /// `set_pool_limit` rows are load-bearing: a lost `__asset__:` registration
