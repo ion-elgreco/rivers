@@ -68,6 +68,20 @@ pub(crate) fn get_annotations<'py>(
 /// Callers fall back to the param NAME when annotation is `None` (e.g.
 /// matching against asset / resource names) and skip annotation-typed checks
 /// like `is_context_annotation`.
+/// One resource argument: config-instantiated when per-run overrides exist,
+/// else the shared instance.
+fn resource_arg(
+    py: Python<'_>,
+    resource: &ResourceVariant,
+    overrides_dict: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    if overrides_dict.is_some() {
+        resource.instantiate_config(py, overrides_dict)
+    } else {
+        Ok(resource.inner().clone_ref(py))
+    }
+}
+
 pub(crate) fn enumerate_params<'py>(
     py: Python<'py>,
     func: &Py<PyAny>,
@@ -394,11 +408,7 @@ pub(crate) fn build_step_args(
             )?;
             args.push(loaded);
         } else if let Some(resource) = resources.get(&param_name) {
-            if overrides_dict.is_some() {
-                args.push(resource.instantiate_config(py, overrides_dict)?);
-            } else {
-                args.push(resource.inner().clone_ref(py));
-            }
+            args.push(resource_arg(py, resource, overrides_dict)?);
         } else {
             return Err(ConfigurationError::new_err(format!(
                 "Asset '{}': parameter '{}' does not match any upstream asset or resource",
@@ -769,11 +779,7 @@ pub(crate) fn execute_action_step(
                         )));
                     }
                     if let Some(resource) = resources.get(param_name) {
-                        if overrides_dict.is_some() {
-                            args.push(resource.instantiate_config(py, overrides_dict)?);
-                        } else {
-                            args.push(resource.inner().clone_ref(py));
-                        }
+                        args.push(resource_arg(py, resource, overrides_dict)?);
                     } else {
                         return Err(ConfigurationError::new_err(format!(
                             "Action '{}' on asset '{}': parameter '{}' does not \
