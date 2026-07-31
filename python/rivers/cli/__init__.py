@@ -275,11 +275,6 @@ def execute(
         "(retry, executor) applies; takes precedence over --target",
     ),
     partition_key: str | None = typer.Option(None, help="Partition key to materialize"),
-    action: str | None = typer.Option(
-        None,
-        help="Verb this run executes (from the Run CR); absent means "
-        "materialize. Cross-checked against the run record.",
-    ),
     resume: bool = typer.Option(
         False, help="Resume a crashed run, skipping completed steps"
     ),
@@ -312,32 +307,14 @@ def execute(
     pk = _parse_partition_key(partition_key)
     selection = [a.strip() for a in target.split(",")] if target else None
 
-    # The Run CR carries the verb (--action); the run record stores it too.
-    # They must agree — on drift neither source can be trusted, and picking
-    # one could run a destructive verb nobody queued (or silently
-    # materialize). A missing record is equally fatal.
+    # The run record is the only place the verb lives; without the record
+    # nothing can run. Exit 1 lets the operator retry — the record may be
+    # missing transiently, or the run was deleted.
     record = storage.get_run(run_id)
     if record is None:
-        typer.echo(
-            f"Error: no run record for '{run_id}' — cannot tell whether this pod "
-            "should materialize or run an action",
-            err=True,
-        )
+        typer.echo(f"Error: no run record for '{run_id}' — cannot execute", err=True)
         raise typer.Exit(1)
-    if action is not None and record.action != action:
-        msg = (
-            f"run '{run_id}' is recorded as "
-            f"'{record.action or 'materialize'}' but the pod was launched for "
-            f"'{action}' — refusing to guess"
-        )
-        typer.echo(f"Error: {msg}", err=True)
-        # A deliberate refusal, not a crash: exit 1 makes the operator burn its
-        # restart budget re-launching a pod that can never proceed, then blame
-        # "restarts without progress" while this message dies with the deleted
-        # pods. The outcome travels via storage like any completed run.
-        storage.set_run_outcome(run_id, "Failure", 0, 0, message=msg)
-        return
-    action = action or record.action
+    action = record.action
 
     try:
         if job:

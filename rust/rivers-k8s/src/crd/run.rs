@@ -64,8 +64,8 @@ pub struct RunSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_name: Option<String>,
 
-    /// Verb this run executes; absent means materialize. Mirrors the run
-    /// record so the pod routes by its launch args.
+    /// Verb this run executes; absent means materialize. Informational
+    /// (kubectl) — the pod reads the verb from the run record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
 
