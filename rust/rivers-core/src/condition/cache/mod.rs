@@ -362,6 +362,11 @@ impl AssetConditionCache {
         let failed_runs = scoped
             .get_runs_since(0, Some(RunStatus::Failure), crate::storage::SortOrder::Asc)
             .await?;
+        // A whole-asset delete supersedes older failures the same way a newer
+        // materialization does — it also cleared the `last_timestamp` that
+        // `outranked` would otherwise read, so without this every restart
+        // resurrects a deleted asset's long-superseded floors.
+        let deletion_ts = scoped.get_asset_deletion_timestamps().await?;
         for run in &failed_runs {
             if run.action.is_some() {
                 continue;
@@ -377,7 +382,10 @@ impl AssetConditionCache {
                 let outranked = record
                     .and_then(|r| r.last_timestamp)
                     .is_some_and(|mat| mat >= run_ts);
-                if materialized_here || outranked {
+                let deleted_after = deletion_ts
+                    .get(asset.as_str())
+                    .is_some_and(|&del| del >= run_ts);
+                if materialized_here || outranked || deleted_after {
                     continue;
                 }
                 self.failed_assets.insert(asset.clone());
@@ -388,14 +396,16 @@ impl AssetConditionCache {
             }
         }
         // Floors rehydrated from persisted eval-state predate this load; drop
-        // any outranked by a newer materialization (the asset recovered while
-        // the daemon was down — steady state would have cleared them).
+        // any outranked by a newer materialization or deletion (the asset
+        // recovered or was deleted while the daemon was down — steady state
+        // would have cleared them).
         let records = &self.records;
         self.failed_asset_timestamps.retain(|asset, ts| {
             records
                 .get(asset)
                 .and_then(|r| r.last_timestamp)
                 .is_none_or(|mat| mat < *ts)
+                && deletion_ts.get(asset).is_none_or(|&del| del < *ts)
         });
         let floors = &self.failed_asset_timestamps;
         self.failed_assets

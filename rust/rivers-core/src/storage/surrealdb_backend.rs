@@ -3728,10 +3728,80 @@ impl PerCodeLocationStorage for SurrealStorage {
             }
         }
 
+        // A deletion supersedes older failures the same way a newer
+        // materialization does: deleting a partition removes the timestamp row
+        // that superseded them, so without this the partition resurrects as
+        // failed on the next load — and `eager()`'s failure gate then keeps it
+        // from ever being rebuilt. A whole-asset deletion covers every key.
+        let mut result = self
+            .db
+            .query(
+                "SELECT partition_key, math::max(timestamp) AS ts FROM events \
+                 WHERE code_location_id = $cl AND asset_key = $asset_key \
+                 AND event_type = 'Deletion' \
+                 GROUP BY partition_key",
+            )
+            .bind(("cl", code_location_id.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .await?;
+
+        #[derive(Debug, SurrealValue)]
+        struct DelRow {
+            partition_key: Option<PartitionKey>,
+            ts: i64,
+        }
+
+        let del_rows: Vec<DelRow> = result.take(0)?;
+        let mut latest_deletion: std::collections::HashMap<PartitionKey, i64> =
+            std::collections::HashMap::new();
+        let mut asset_deletion_ts: Option<i64> = None;
+        for row in del_rows {
+            match row.partition_key {
+                Some(pk) => {
+                    for member in pk.members() {
+                        latest_deletion
+                            .entry(member)
+                            .and_modify(|t| *t = (*t).max(row.ts))
+                            .or_insert(row.ts);
+                    }
+                }
+                None => asset_deletion_ts = asset_deletion_ts.max(Some(row.ts)),
+            }
+        }
+
         Ok(latest_failure
             .into_iter()
-            .filter(|(pk, ts)| materialized.get(pk).is_none_or(|&mat_ts| mat_ts < *ts))
+            .filter(|(pk, ts)| {
+                let deleted_at = latest_deletion.get(pk).copied().max(asset_deletion_ts);
+                materialized.get(pk).is_none_or(|&mat_ts| mat_ts < *ts)
+                    && deleted_at.is_none_or(|del_ts| del_ts < *ts)
+            })
             .collect())
+    }
+
+    async fn get_asset_deletion_timestamps(
+        &self,
+        code_location_id: &str,
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        let mut result = self
+            .db
+            .query(
+                "SELECT asset_key, math::max(timestamp) AS ts FROM events \
+                 WHERE code_location_id = $cl AND event_type = 'Deletion' \
+                 AND partition_key IS NONE AND asset_key IS NOT NONE \
+                 GROUP BY asset_key",
+            )
+            .bind(("cl", code_location_id.to_string()))
+            .await?;
+
+        #[derive(Debug, SurrealValue)]
+        struct DelTsRow {
+            asset_key: String,
+            ts: i64,
+        }
+
+        let rows: Vec<DelTsRow> = result.take(0)?;
+        Ok(rows.into_iter().map(|r| (r.asset_key, r.ts)).collect())
     }
 
     async fn get_backfills(

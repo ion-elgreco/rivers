@@ -1599,13 +1599,19 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         asset_key: &str,
     ) -> impl Future<Output = Result<Vec<PartitionKey>>> + Send;
 
-    /// Partitions whose latest failure isn't superseded by a later materialization, with that failure's timestamp.
+    /// Partitions whose latest failure isn't superseded by a later materialization or deletion, with that failure's timestamp.
     fn get_failed_partitions(
         &self,
         code_location_id: &str,
         asset_key: &str,
         materialized: &HashMap<PartitionKey, i64>,
     ) -> impl Future<Output = Result<HashMap<PartitionKey, i64>>> + Send;
+
+    /// Latest whole-asset Deletion event timestamp per asset (partition-scoped deletions excluded).
+    fn get_asset_deletion_timestamps(
+        &self,
+        code_location_id: &str,
+    ) -> impl Future<Output = Result<HashMap<String, i64>>> + Send;
 
     fn get_backfills(
         &self,
@@ -2006,6 +2012,12 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
     ) -> Result<HashMap<PartitionKey, i64>> {
         self.backend
             .get_failed_partitions(self.code_location_id, asset_key, materialized)
+            .await
+    }
+
+    pub async fn get_asset_deletion_timestamps(&self) -> Result<HashMap<String, i64>> {
+        self.backend
+            .get_asset_deletion_timestamps(self.code_location_id)
             .await
     }
 

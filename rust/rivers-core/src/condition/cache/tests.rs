@@ -641,3 +641,112 @@ async fn action_completion_survives_daemon_restart() {
         "untouched partition must stay cached"
     );
 }
+
+/// Deleting a partition wipes the timestamp row that superseded its old
+/// failures, so a daemon restart would resurrect it as failed — and
+/// `eager()`'s `!ExecutionFailed` gate then keeps it from ever being
+/// rebuilt. A deletion supersedes a failure like a newer materialization.
+#[tokio::test]
+async fn deleted_partition_does_not_resurrect_as_failed() {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+    let single = |k: &str| PartitionKey::Single {
+        keys: vec![k.to_string()],
+    };
+
+    // p1 fails, then materializes successfully (failure superseded)…
+    let mut fail = mk_run("rf", RunStatus::Failure, &["events"], 1000);
+    fail.partition_key = Some(single("p1"));
+    storage.create_run(&fail).await.unwrap();
+    storage
+        .create_run(&mk_run("r0", RunStatus::Success, &["events"], 2000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&mat_events_for(&cl, "events", &["p1"], 2000))
+        .await
+        .unwrap();
+    // …then an action deletes it.
+    let mut del = mk_run("rd", RunStatus::Success, &["events"], 3000);
+    del.partition_key = Some(single("p1"));
+    del.action = Some("delete".to_string());
+    storage.create_run(&del).await.unwrap();
+    storage
+        .store_events(&[deletion_event(&cl, "events", "rd", "p1", 3000)])
+        .await
+        .unwrap();
+
+    // Daemon restart: the partition is missing, not failed.
+    let mut cache = AssetConditionCache::new(cl.clone());
+    cache.set_partitioned_assets(vec!["events".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+    let status = cache.partition_status.get("events").unwrap();
+    assert!(
+        !status.failed.contains(&single("p1")),
+        "deleted partition must not resurrect as failed on restart"
+    );
+    assert!(
+        !status.timestamps.contains_key(&single("p1")),
+        "deleted partition must not be cached as materialized"
+    );
+}
+
+/// Whole-asset analog: deletion clears the record's `last_timestamp`, so
+/// the initial-load failure floors would re-apply a long-superseded failed
+/// run after every restart.
+#[tokio::test]
+async fn deleted_asset_does_not_resurrect_failure_floor() {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+
+    storage
+        .create_run(&mk_run("rf", RunStatus::Failure, &["report"], 1000))
+        .await
+        .unwrap();
+    storage
+        .create_run(&mk_run("r0", RunStatus::Success, &["report"], 2000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[crate::storage::EventRecord {
+            code_location_id: cl.clone(),
+            event_type: crate::storage::EventType::Materialization {
+                data_version: Some("dv_1".to_string()),
+            },
+            asset_key: Some("report".to_string()),
+            run_id: "r0".to_string(),
+            partition_key: None,
+            timestamp: 2000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        }])
+        .await
+        .unwrap();
+    let mut del = mk_run("rd", RunStatus::Success, &["report"], 3000);
+    del.action = Some("delete".to_string());
+    storage.create_run(&del).await.unwrap();
+    storage
+        .store_events(&[crate::storage::EventRecord {
+            code_location_id: cl.clone(),
+            event_type: crate::storage::EventType::Deletion,
+            asset_key: Some("report".to_string()),
+            run_id: "rd".to_string(),
+            partition_key: None,
+            timestamp: 3000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        }])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(cl.clone());
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        !cache.failed_assets.contains("report"),
+        "deleted asset must not resurrect its failure floor on restart"
+    );
+}
