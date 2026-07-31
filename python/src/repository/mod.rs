@@ -1884,27 +1884,8 @@ impl RepoHandle {
         asset_names: &[String],
         partition_key: Option<&PyPartitionKey>,
     ) -> PyResult<()> {
-        let (dyn_checks, storage, code_location_id) = {
-            let guard = self.state.read().unwrap();
-            let state = guard.as_ref().ok_or_else(|| {
-                ExecutionError::new_err("Repository not resolved — call resolve() first")
-            })?;
-            validate_partition_for_selection(
-                state,
-                asset_names.iter().map(String::as_str),
-                partition_key,
-            )?;
-            (
-                dynamic_partition_checks(
-                    state,
-                    asset_names.iter().map(String::as_str),
-                    partition_key,
-                ),
-                state.storage.clone(),
-                state.code_location_id.clone(),
-            )
-        };
-        verify_dynamic_partition_keys(&storage, &code_location_id, &dyn_checks).await
+        self.validate_partition_inner(asset_names, partition_key, None)
+            .await
     }
 
     /// Verb-aware twin of [`Self::validate_partition_for_selection`], for the
@@ -1917,7 +1898,17 @@ impl RepoHandle {
         partition_key: Option<&PyPartitionKey>,
         action: &str,
     ) -> PyResult<()> {
-        if action == "observe" && partition_key.is_none() {
+        self.validate_partition_inner(asset_names, partition_key, Some(action))
+            .await
+    }
+
+    async fn validate_partition_inner(
+        &self,
+        asset_names: &[String],
+        partition_key: Option<&PyPartitionKey>,
+        verb: Option<&str>,
+    ) -> PyResult<()> {
+        if is_keyless_observe(verb, partition_key) {
             return Ok(());
         }
         let (dyn_checks, storage, code_location_id) = {
@@ -1929,7 +1920,7 @@ impl RepoHandle {
                 state,
                 asset_names.iter().map(String::as_str),
                 partition_key,
-                Some(action),
+                verb,
             )?;
             (
                 dynamic_partition_checks(
