@@ -235,7 +235,7 @@ impl AssetConditionCache {
                     // condition input reads its watch entry, so it is not new
                     // work; its completion arrives through the terminal branch
                     // or the watched-action sweep.
-                    r.action.is_none() && !known_in_flight(r)
+                    !r.is_action() && !known_in_flight(r)
                 }
             });
             if has_new_work {
@@ -249,7 +249,7 @@ impl AssetConditionCache {
                     RunStatus::Started | RunStatus::NotStarted | RunStatus::Queued => {
                         if swept_terminal.contains(&run.run_id) {
                             // Sweep observed the terminal status; this snapshot is stale.
-                        } else if run.action.is_none() {
+                        } else if !run.is_action() {
                             for asset in &run.node_names {
                                 delta.in_progress_changes.push(InProgressChange::Push {
                                     asset_key: asset.clone(),
@@ -432,7 +432,7 @@ impl AssetConditionCache {
         // materialization for condition evaluation. The touched partition
         // keys are recorded so the plan phase can detect row deletions the
         // incremental timestamp fetch can't see.
-        if run.action.is_some() {
+        if run.is_action() {
             if let Some(pk) = &run.partition_key {
                 for asset in &run.node_names {
                     if self.is_partitioned(asset) {

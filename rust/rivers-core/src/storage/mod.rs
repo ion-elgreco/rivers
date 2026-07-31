@@ -787,6 +787,14 @@ pub struct RunRecord {
     pub action: Option<String>,
 }
 
+impl RunRecord {
+    /// True when this run executes a named action rather than materializing.
+    /// Mirrors [`crate::execution::plan::ExecutionPlan::is_action`].
+    pub fn is_action(&self) -> bool {
+        self.action.is_some()
+    }
+}
+
 pub fn default_code_location_id() -> String {
     DEFAULT_CODE_LOCATION_ID.to_string()
 }

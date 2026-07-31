@@ -333,7 +333,7 @@ impl AssetConditionCache {
                 // the steady-state push and the failure floors below — but its
                 // start_time is already below the cursor set above, so watch it
                 // or its completion is never observed.
-                if run.action.is_some() {
+                if run.is_action() {
                     self.live_action_runs.insert(
                         run.run_id.clone(),
                         LiveActionRun {
@@ -368,7 +368,7 @@ impl AssetConditionCache {
         // resurrects a deleted asset's long-superseded floors.
         let deletion_ts = scoped.get_asset_deletion_timestamps().await?;
         for run in &failed_runs {
-            if run.action.is_some() {
+            if run.is_action() {
                 continue;
             }
             let run_ts = run.end_time.unwrap_or(run.start_time);
@@ -429,7 +429,7 @@ impl AssetConditionCache {
                     // Not a materialization attempt — steady state never routes
                     // action runs into the last-run maps, so a restart must not
                     // adopt one either.
-                    if run.action.is_some() {
+                    if run.is_action() {
                         return None;
                     }
                     let run_ts = run.end_time.unwrap_or(run.start_time);
