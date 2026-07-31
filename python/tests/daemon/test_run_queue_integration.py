@@ -484,6 +484,59 @@ class TestOrphanedNotStartedRuns:
         finally:
             daemon.stop()
 
+    def test_queued_launch_failure_fails_run_fast(self, storage):
+        """A pre-execution launch failure on the queued path must fail the
+        run with the true reason immediately — not pin it NotStarted until
+        the start-timeout sweep fabricates "no executor appeared"."""
+
+        @rs.Asset(name="idle", io_handler=rs.InMemoryIOHandler())
+        def idle() -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[idle],
+            default_executor=rs.Executor.in_process(),
+            run_queue=rs.RunQueueConfig(
+                dequeue_interval="100ms",
+                # Far away: the sweep must not be the one failing it.
+                start_timeout="120s",
+            ),
+        )
+        repo.resolve(storage=storage)
+
+        # A queued action run whose asset doesn't define the verb —
+        # validation lives at the submission boundary, so a stale or
+        # cross-version record reaches the coordinator unchecked.
+        storage._create_run(
+            "bad-verb-run",
+            "",
+            "Queued",
+            1_000,
+            node_names=["idle"],
+            action="purge",
+        )
+
+        daemon = AutomationDaemon(
+            repo=repo,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            record = _wait_for_run_terminal(storage, "bad-verb-run", timeout=15)
+            assert record is not None, "run disappeared from storage"
+            assert record.status == "Failure", (
+                f"expected a fast launch failure, got {record.status}"
+            )
+
+            events = storage.get_events_for_run("bad-verb-run")
+            launch_failed = [e for e in events if e.event_type == "RunLaunchFailed"]
+            assert len(launch_failed) == 1
+            error = dict(launch_failed[0].metadata).get("error", "")
+            assert "does not define action 'purge'" in error, error
+        finally:
+            daemon.stop()
+
     def test_cancel_covers_not_started(self, storage):
         storage._create_run("orphan", "j", "NotStarted", 1_000)
 

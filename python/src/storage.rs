@@ -1405,7 +1405,8 @@ impl PyStorage {
     }
 
     /// Create a run record (test helper). Not part of the public API.
-    #[pyo3(name = "_create_run", signature = (run_id, job_name, status, start_time, priority=0, tags=vec![], block_reason=None))]
+    #[pyo3(name = "_create_run", signature = (run_id, job_name, status, start_time, priority=0, tags=vec![], block_reason=None, node_names=vec![], action=None))]
+    #[allow(clippy::too_many_arguments)]
     fn create_run(
         &self,
         py: Python<'_>,
@@ -1416,6 +1417,8 @@ impl PyStorage {
         priority: i32,
         tags: Vec<(String, String)>,
         block_reason: Option<String>,
+        node_names: Vec<String>,
+        action: Option<String>,
     ) -> PyResult<()> {
         use rivers_core::storage::RunRecord;
         let record = RunRecord {
@@ -1430,12 +1433,12 @@ impl PyStorage {
             start_time,
             end_time: None,
             tags,
-            node_names: vec![],
+            node_names,
             priority,
             partition_key: None,
             block_reason,
             launched_by: LaunchedBy::Manual { user: None },
-            action: None,
+            action,
         };
         py.detach(|| {
             io_rt()

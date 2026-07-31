@@ -94,6 +94,12 @@ impl RunBackend for LocalRunBackend {
                     error = %e,
                     "dequeued run execution failed"
                 );
+                // Mark the dequeued record Failed with the real reason, else it
+                // pins a queue slot as NotStarted until the start-timeout sweep
+                // writes a fabricated one. Mirrors the direct dispatcher's arm.
+                let handle = repo.get().handle();
+                crate::runtime::rt()
+                    .block_on(handle.mark_run_launch_failed(&run_id, &e.to_string()));
             }
             done_for_thread.store(true, Ordering::Release);
         });
