@@ -65,13 +65,13 @@ materialize path would have written.
 #### `asset_table_uri(asset_name, asset_metadata=None)`
 
 Returns `{table_uri}/{leaf}`, honoring a `delta/root_name` override in
-`asset_metadata`. Pass `ctx.asset_key` and `ctx.asset_metadata`.
+`asset_metadata`. Pass `ctx.asset_name` and `ctx.asset_metadata`.
 
 ```python
 @rs.action(outcome=rs.Outcome.Unchanged)
 @classmethod
 def optimize(cls, ctx: rs.ActionContext) -> None:
-    uri = ctx.io_handler.asset_table_uri(ctx.asset_key, ctx.asset_metadata)
+    uri = ctx.io_handler.asset_table_uri(ctx.asset_name, ctx.asset_metadata)
     DeltaTable(uri, storage_options=ctx.io_handler.storage_options).optimize.compact()
 ```
 
@@ -84,7 +84,7 @@ Returns a SQL predicate covering the partition(s), honoring
 @rs.action(outcome=rs.Outcome.Unmaterialize)
 @classmethod
 def delete(cls, ctx: rs.ActionContext) -> None:
-    uri = ctx.io_handler.asset_table_uri(ctx.asset_key, ctx.asset_metadata)
+    uri = ctx.io_handler.asset_table_uri(ctx.asset_name, ctx.asset_metadata)
     predicate = ctx.io_handler.partition_predicate(ctx.asset_metadata, ctx.partition)
     DeltaTable(uri, storage_options=ctx.io_handler.storage_options).delete(predicate)
 ```

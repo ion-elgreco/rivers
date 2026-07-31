@@ -49,6 +49,7 @@ pub(super) fn resolve_worker_args(
     output_selection: &[String],
     registry: &IOHandlerRegistry,
     config_overrides_for_step: Option<&Bound<'_, PyDict>>,
+    run_id: &str,
 ) -> PyResult<WorkerArgs> {
     let node = node_map.get(step_name).expect("step must be in node_map");
 
@@ -90,6 +91,7 @@ pub(super) fn resolve_worker_args(
                     step_name.to_string()
                 };
                 kwargs.set_item("asset_name", context_name)?;
+                kwargs.set_item("run_id", run_id)?;
                 kwargs.set_item("tags", node.tags())?;
                 kwargs.set_item("kinds", node.kinds())?;
                 kwargs.set_item("group", node.group())?;

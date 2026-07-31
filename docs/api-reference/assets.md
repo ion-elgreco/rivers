@@ -79,11 +79,15 @@ asset = Asset.from_multi(
 |-----------|------|-------------|
 | `wraps` | `Callable \| None` | The function to wrap. |
 | `output_defs` | `list[AssetDef]` | Output definitions for each output. |
-| `partitions_def` | `PartitionsDefinition \| str \| None` | Top-level partition definition applied to all outputs. Takes precedence over per-output `AssetDef.partitions_def`. |
-| `deps` | `list[DepDef]` | Input and lineage-only dependencies. Created via `AssetDef.input()` and `AssetDef.dep()`. |
-| `compute` | `Compute \| None` | Compute for the whole step — a multi-asset runs as one step (one pod), so this is declared here, not per output. |
-| `retry` | `RetryPolicy \| str \| None` | Retry policy for the whole step — a multi-asset retries as one unit, so this is declared here, not per output. See [Retries & Compute](retries.md). |
-| `actions` | `list[AssetAction] \| None` | Verbs applied to **every** output. Merged with each output's own `AssetDef(actions=...)`, which overrides a top-level action of the same name. An action plan has one step per output. See [`AssetAction`](#assetaction). |
+
+Because a multi-asset executes as **one step with many outputs**, some shared parameters change meaning here:
+
+| Parameter | Multi-asset behavior |
+|-----------|----------------------|
+| `partitions_def` | Applied to every output; takes precedence over per-output `AssetDef.partitions_def`. |
+| `compute` | Compute for the whole step (one pod), so it is declared here, not per output. |
+| `retry` | The step retries as one unit, so the policy is declared here, not per output. See [Retries & Compute](retries.md). |
+| `actions` | Registered on **every** output. Merged with each output's own `AssetDef(actions=...)`, which overrides a top-level action of the same name. An action plan has one step per output. See [`AssetAction`](#assetaction). |
 
 #### Top-level `partitions_def`
 
@@ -446,7 +450,7 @@ See [Actions](../concepts/actions.md) for the model.
 
 ```python
 def _optimize(ctx: rs.ActionContext) -> None:
-    DeltaTable(ctx.io_handler.asset_table_uri(ctx.asset_key, ctx.asset_metadata)).optimize.compact()
+    DeltaTable(ctx.io_handler.asset_table_uri(ctx.asset_name, ctx.asset_metadata)).optimize.compact()
 
 
 delta_optimize = rs.AssetAction(
@@ -551,7 +555,7 @@ class Orders(rs.Asset):
     @rs.action(outcome=rs.Outcome.Unmaterialize)
     @classmethod
     def purge(cls, ctx: rs.ActionContext) -> None:
-        DeltaTable(ctx.io_handler.asset_table_uri(ctx.asset_key)).delete()
+        DeltaTable(ctx.io_handler.asset_table_uri(ctx.asset_name)).delete()
 ```
 
 **Parameters:** `name`, `outcome`, `concurrency`, `ordering`, `retry`,

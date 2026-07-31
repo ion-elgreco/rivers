@@ -430,6 +430,8 @@ class AssetExecutionContext(Generic[ConfigT]):
 
     asset_name: str
     """Name of the asset being materialized."""
+    run_id: str | None
+    """Run this materialization belongs to; ``None`` for a directly-constructed context."""
     tags: list[str] | None
     """Asset-level tags."""
     kinds: list[str]
@@ -462,6 +464,7 @@ class AssetExecutionContext(Generic[ConfigT]):
         is_multi_asset: bool = False,
         output_selection: list[str] | None = None,
         config: ConfigT | None = None,
+        run_id: str | None = None,
     ) -> None:
         """Construct a context (typically only the executor calls this)."""
         ...
@@ -585,7 +588,7 @@ class ActionContext(Generic[ConfigT]):
     config instance; override values come from ``run_action(config=...)``.
     """
 
-    asset_key: str
+    asset_name: str
     action: str
     run_id: str
     asset_metadata: dict[str, str] | None

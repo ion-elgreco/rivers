@@ -91,7 +91,7 @@ Actions receive a single `ActionContext` — no upstream inputs:
 
 | Field | Purpose |
 |---|---|
-| `asset_key`, `action`, `run_id` | identity |
+| `asset_name`, `action`, `run_id` | identity |
 | `partition_key` / `partition` | the partition being acted on |
 | `io_handler` | the asset's resolved handler — the action's config bag (same storage options and URI resolution the write path uses) |
 | `asset_metadata` | per-asset overrides IO resolution honors |
@@ -109,7 +109,7 @@ materialize functions use; a parameter matching no resource is a resolution erro
 @rs.action(outcome=rs.Outcome.Unchanged)
 @classmethod
 def compact(cls, ctx: rs.ActionContext, warehouse: DuckDB) -> None:
-    warehouse.execute(f"VACUUM {ctx.asset_key}")
+    warehouse.execute(f"VACUUM {ctx.asset_name}")
 ```
 
 Handlers must carry **configuration, not live connections** — an action may run in a
@@ -134,7 +134,7 @@ class EventLog(rs.Asset):
     @classmethod
     def tune(cls, ctx: rs.ActionContext[TuneConfig]) -> None:
         compact(
-            ctx.io_handler.asset_table_uri(ctx.asset_key, ctx.asset_metadata),
+            ctx.io_handler.asset_table_uri(ctx.asset_name, ctx.asset_metadata),
             target_mb=ctx.config.target_size_mb,
         )
 
@@ -164,7 +164,7 @@ def merge_late_arrivals(cls, ctx) -> rs.ActionResult:
     late = fetch_late_arrivals(ctx.partition_key)
     if late.is_empty():
         return rs.ActionResult.unchanged()          # downstream stays put
-    merge_into(ctx.io_handler.asset_table_uri(ctx.asset_key, ctx.asset_metadata), late)
+    merge_into(ctx.io_handler.asset_table_uri(ctx.asset_name, ctx.asset_metadata), late)
     return rs.ActionResult.materialized(metadata={"rows_merged": len(late)})
 ```
 
@@ -195,7 +195,7 @@ class GdprDeletable(rs.Asset):
     def delete(cls, ctx) -> None:
         h = ctx.io_handler
         DeltaTable(
-            h.asset_table_uri(ctx.asset_key, ctx.asset_metadata),
+            h.asset_table_uri(ctx.asset_name, ctx.asset_metadata),
             storage_options=h.storage_options,
         ).delete(h.partition_predicate(ctx.asset_metadata, ctx.partition))
 

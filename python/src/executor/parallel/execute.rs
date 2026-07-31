@@ -302,6 +302,7 @@ impl ParallelBackend {
             outputs_for_meta,
             ctx.repo.io_handler_registry,
             config_overrides_for_step,
+            ctx.scope.run_id,
         ) {
             Ok(a) => a,
             Err(e) => {

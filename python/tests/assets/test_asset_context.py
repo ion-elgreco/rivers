@@ -435,6 +435,44 @@ def test_context_partition_time_window_returns_tuple():
     assert end == datetime(2025, 1, 2)
 
 
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_context_run_id_matches_run(executor_env, storage, is_async):
+    """ctx.run_id is the id of the run the materialization lands under."""
+    executor, handler_factory = executor_env
+
+    if is_async:
+
+        @rs.Asset(io_handler=handler_factory())
+        async def rid_probe(context: rs.AssetExecutionContext) -> str:
+            return context.run_id
+
+    else:
+
+        @rs.Asset(io_handler=handler_factory())
+        def rid_probe(context: rs.AssetExecutionContext) -> str:
+            return context.run_id
+
+    repo = rs.CodeRepository(assets=[rid_probe], default_executor=executor)
+    repo.resolve(storage=storage)
+    repo.materialize()
+
+    seen = repo.load_node("rid_probe")
+    mats = [
+        e
+        for e in storage.get_events_for_asset("rid_probe")
+        if e.event_type == "Materialization"
+    ]
+    assert len(mats) == 1
+    assert seen == mats[0].run_id
+    assert seen
+
+
+def test_context_run_id_none_when_hand_built():
+    """A directly-constructed context has no run, so run_id is None."""
+    ctx = rs.AssetExecutionContext("standalone")
+    assert ctx.run_id is None
+
+
 def test_output_context_add_output_metadata_duplicate_keys_last_wins():
     """OutputContext.add_output_metadata with duplicate keys keeps the last value."""
     ctx = rs.OutputContext("test_asset")

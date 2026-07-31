@@ -272,6 +272,7 @@ pub(crate) fn build_step_args(
     config_overrides: &Option<HashMap<String, Py<PyAny>>>,
     registry: &IOHandlerRegistry,
     input_overrides: &HashMap<String, Py<PyAny>>,
+    run_id: &str,
     config_out: &mut Option<Py<PyAny>>,
 ) -> PyResult<BuiltStepArgs> {
     let partition = build_partition_context(node, partition_key)?;
@@ -328,6 +329,7 @@ pub(crate) fn build_step_args(
                     };
                     let ctx = PyAssetExecutionContext::new(
                         context_name,
+                        Some(run_id.to_string()),
                         tags,
                         node.kinds(),
                         node.group(),
@@ -519,6 +521,7 @@ pub(crate) fn execute_step(
     config_overrides: &Option<HashMap<String, Py<PyAny>>>,
     registry: &IOHandlerRegistry,
     input_overrides: &HashMap<String, Py<PyAny>>,
+    run_id: &str,
     task_locals: Option<&pyo3_async_runtimes::TaskLocals>,
     config_out: &mut Option<Py<PyAny>>,
 ) -> PyResult<StepResult> {
@@ -539,6 +542,7 @@ pub(crate) fn execute_step(
             config_overrides,
             registry,
             input_overrides,
+            run_id,
             config_out,
         )?;
 
@@ -714,6 +718,7 @@ pub(crate) fn execute_action_step(
                 // partition, so the body has to be able to read the key.
                 let ctx = PyAssetExecutionContext::new(
                     step.name.clone(),
+                    Some(run_id.to_string()),
                     node.tags(),
                     node.kinds(),
                     node.group(),

@@ -194,6 +194,7 @@ pub(crate) fn execute_step_with_capture(
             ctx.repo.config_overrides,
             ctx.repo.io_handler_registry,
             input_overrides,
+            ctx.scope.run_id,
             ctx.repo.bridge.map(|b| &b.task_locals),
             &mut resolved_config,
         )

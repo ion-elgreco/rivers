@@ -136,7 +136,7 @@ def test_run_action_executes_and_records_verb(executor, form, tmp_path):
     if form == "decorator":
 
         def _opt(ctx):
-            calls.append(ctx.asset_key)
+            calls.append(ctx.asset_name)
 
         opt = rs.AssetAction(name="optimize", outcome=rs.Outcome.Unchanged)(_opt)
 
@@ -157,7 +157,7 @@ def test_run_action_executes_and_records_verb(executor, form, tmp_path):
             @rs.action(outcome=rs.Outcome.Unchanged)
             @classmethod
             def optimize(cls, ctx):
-                calls.append(ctx.asset_key)
+                calls.append(ctx.asset_name)
 
         class Orders(OptBase):
             @classmethod
@@ -198,7 +198,7 @@ def test_async_action(executor):
         @classmethod
         async def refresh(cls, ctx):
             await asyncio.sleep(0)
-            calls.append(ctx.asset_key)
+            calls.append(ctx.asset_name)
 
     repo = rs.CodeRepository(assets=[Nightly], default_executor=executor)
     repo.materialize()
@@ -227,7 +227,7 @@ def test_action_context_surface(tmp_path):
         @classmethod
         def compact(cls, ctx):
             seen.update(
-                asset_key=ctx.asset_key,
+                asset_name=ctx.asset_name,
                 action=ctx.action,
                 partition_key=ctx.partition_key,
                 handler_is_ours=ctx.io_handler is handler,
@@ -240,7 +240,7 @@ def test_action_context_surface(tmp_path):
     repo.materialize(partition_key=pk)
     assert repo.run_action("compact", partition_key=pk).success
 
-    assert seen["asset_key"] == "events"
+    assert seen["asset_name"] == "events"
     assert seen["action"] == "compact"
     assert seen["partition_key"] == "a"
     assert seen["handler_is_ours"] is True
@@ -311,7 +311,7 @@ def test_reverse_topological_ordering_downstream_first():
         )
         @classmethod
         def purge(cls, ctx):
-            order.append(ctx.asset_key)
+            order.append(ctx.asset_name)
 
     class Events(Purgeable):
         @classmethod
@@ -333,7 +333,7 @@ def test_multi_asset_per_output_actions():
     calls = []
 
     def _zorder(ctx):
-        calls.append(("zorder", ctx.asset_key))
+        calls.append(("zorder", ctx.asset_name))
 
     zorder = rs.AssetAction(name="zorder", outcome=rs.Outcome.Unchanged)(_zorder)
 
@@ -348,7 +348,7 @@ def test_multi_asset_per_output_actions():
         @rs.action(outcome=rs.Outcome.Unchanged)
         @classmethod
         def compact(cls, ctx):
-            calls.append(("compact", ctx.asset_key))
+            calls.append(("compact", ctx.asset_name))
 
     repo = rs.CodeRepository(assets=[Ingest], default_executor=IP)
     repo.materialize()
@@ -388,7 +388,7 @@ def test_graph_asset_action_targets_output_only():
         @rs.action(outcome=rs.Outcome.Unchanged)
         @classmethod
         def refresh_views(cls, ctx):
-            ran.append(("action", ctx.asset_key))
+            ran.append(("action", ctx.asset_name))
 
     repo = rs.CodeRepository(
         assets=[g_src, Pipe], tasks=[g_double], default_executor=IP
@@ -488,7 +488,7 @@ def test_action_with_kubernetes_executor_runs_in_orchestrator(storage):
         @rs.action(outcome=rs.Outcome.Unchanged)
         @classmethod
         def compact(cls, ctx):
-            calls.append(ctx.asset_key)
+            calls.append(ctx.asset_name)
 
     repo = rs.CodeRepository(
         assets=[Events],
@@ -1022,8 +1022,8 @@ def test_resume_skips_completed_action_steps():
         @rs.action(outcome=rs.Outcome.Unchanged)
         @classmethod
         def purge(cls, ctx):
-            calls.append(ctx.asset_key)
-            if ctx.asset_key == "second" and len(calls) < 3:
+            calls.append(ctx.asset_name)
+            if ctx.asset_name == "second" and len(calls) < 3:
                 raise RuntimeError("crash after first")
 
     class First(Base):
@@ -2015,13 +2015,13 @@ def test_action_config_defaults_and_overrides(executor, style):
     if style == "sync":
 
         def _tune(ctx: rs.ActionContext[TuneConfig]):
-            seen[ctx.asset_key] = (ctx.config.target_size_mb, ctx.config.force)
+            seen[ctx.asset_name] = (ctx.config.target_size_mb, ctx.config.force)
 
     else:
 
         async def _tune(ctx: rs.ActionContext[TuneConfig]):
             await asyncio.sleep(0)
-            seen[ctx.asset_key] = (ctx.config.target_size_mb, ctx.config.force)
+            seen[ctx.asset_name] = (ctx.config.target_size_mb, ctx.config.force)
 
     tune = rs.AssetAction(name="tune", outcome=rs.Outcome.Unchanged)(_tune)
 
@@ -2142,13 +2142,13 @@ def test_action_resource_param_injection(executor, style):
     if style == "sync":
 
         def _tag(ctx, probe: ProbeResource):
-            seen[ctx.asset_key] = probe.prefix
+            seen[ctx.asset_name] = probe.prefix
 
     else:
 
         async def _tag(ctx, probe: ProbeResource):
             await asyncio.sleep(0)
-            seen[ctx.asset_key] = probe.prefix
+            seen[ctx.asset_name] = probe.prefix
 
     tag = rs.AssetAction(name="tag", outcome=rs.Outcome.Unchanged)(_tag)
 

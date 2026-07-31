@@ -17,7 +17,7 @@ use crate::partitions::{PartitionContext, PyPartitionKey};
 pub struct PyActionContext {
     /// The asset the action operates on.
     #[pyo3(get)]
-    pub asset_key: String,
+    pub asset_name: String,
     /// The verb being executed.
     #[pyo3(get)]
     pub action: String,
@@ -43,7 +43,7 @@ pub struct PyActionContext {
 impl PyActionContext {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        asset_key: String,
+        asset_name: String,
         action: String,
         run_id: String,
         asset_metadata: Option<HashMap<String, String>>,
@@ -52,7 +52,7 @@ impl PyActionContext {
         config: Option<Py<PyAny>>,
     ) -> Self {
         Self {
-            asset_key,
+            asset_name,
             action,
             run_id,
             asset_metadata,
@@ -136,12 +136,12 @@ impl PyActionContext {
         }
     }
 
-    /// Python logger named `code-repo.actions.<asset_key>`, lazily initialized.
+    /// Python logger named `code-repo.actions.<asset_name>`, lazily initialized.
     #[getter]
     fn log<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let logger = self._logger.get_or_init(|| {
             let logging = py.import("logging").expect("failed to import logging");
-            let name = format!("code-repo.actions.{}", self.asset_key);
+            let name = format!("code-repo.actions.{}", self.asset_name);
             logging
                 .call_method1("getLogger", (name,))
                 .expect("failed to get logger")
@@ -161,8 +161,8 @@ impl PyActionContext {
 
     fn __repr__(&self) -> String {
         format!(
-            "ActionContext(asset_key='{}', action='{}', run_id='{}')",
-            self.asset_key, self.action, self.run_id
+            "ActionContext(asset_name='{}', action='{}', run_id='{}')",
+            self.asset_name, self.action, self.run_id
         )
     }
 }

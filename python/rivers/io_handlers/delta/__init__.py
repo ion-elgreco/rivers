@@ -177,7 +177,7 @@ class DeltaIOHandler(BaseIOHandler):
         resolves its ``DeltaTable`` from this plus ``storage_options``:
 
         Args:
-            asset_name: The asset key (``ctx.asset_key`` in an action).
+            asset_name: The asset name (``ctx.asset_name`` in an action).
             asset_metadata: Per-asset metadata (``ctx.asset_metadata``); the
                 ``delta/root_name`` entry overrides the leaf name.
         """

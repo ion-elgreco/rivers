@@ -126,6 +126,7 @@ fn execute_with_capture(
             &shared.config_overrides,
             &shared.io_handler_registry,
             input_overrides,
+            &shared.run_id,
             locals,
             &mut resolved_config,
         )

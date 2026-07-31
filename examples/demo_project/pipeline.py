@@ -338,7 +338,7 @@ def active_users(context: AssetExecutionContext, raw_users: dict) -> dict:
 # Decorator-form assets attach actions as AssetAction objects;
 # `profile` shows up as a button on the enriched_orders asset page.
 def _profile_orders(ctx: ActionContext) -> None:
-    ctx.log.info("[profile] sampling join quality for %s", ctx.asset_key)
+    ctx.log.info("[profile] sampling join quality for %s", ctx.asset_name)
 
 
 profile_orders = AssetAction(
@@ -1184,14 +1184,14 @@ class EventLog(Asset):
     )
     @classmethod
     def optimize(cls, ctx: ActionContext) -> None:
-        ctx.log.info("[optimize] compacting %s (run=%s)", ctx.asset_key, ctx.run_id)
+        ctx.log.info("[optimize] compacting %s (run=%s)", ctx.asset_name, ctx.run_id)
         time.sleep(3)
         ctx.log.info("[optimize] done")
 
     @action(outcome=Outcome.Unchanged, description="Drop expired snapshots")
     @classmethod
     def vacuum(cls, ctx: ActionContext) -> None:
-        ctx.log.info("[vacuum] removing expired snapshots for %s", ctx.asset_key)
+        ctx.log.info("[vacuum] removing expired snapshots for %s", ctx.asset_name)
 
     @action(
         outcome=Outcome.MayMaterialize,
@@ -1200,7 +1200,7 @@ class EventLog(Asset):
     @classmethod
     def refresh(cls, ctx: ActionContext) -> ActionResult:
         if int(time.time()) % 2:
-            ctx.log.info("[refresh] no late events for %s", ctx.asset_key)
+            ctx.log.info("[refresh] no late events for %s", ctx.asset_name)
             return ActionResult.unchanged()
         # handle_output replaces the whole value, so append to what is there.
         handler = ctx.io_handler
@@ -1213,7 +1213,7 @@ class EventLog(Asset):
             OutputContext(asset_name="event_log"),
             {"rows": rows, "compacted": current["compacted"]},
         )
-        ctx.log.info("[refresh] appended late events to %s", ctx.asset_key)
+        ctx.log.info("[refresh] appended late events to %s", ctx.asset_name)
         return ActionResult.materialized(metadata={"late_rows": 1})
 
     @action(
@@ -1222,7 +1222,7 @@ class EventLog(Asset):
     )
     @classmethod
     def delete(cls, ctx: ActionContext) -> None:
-        ctx.log.info("[delete] dropping %s — state cleared", ctx.asset_key)
+        ctx.log.info("[delete] dropping %s — state cleared", ctx.asset_name)
 
 
 # =============================================================================

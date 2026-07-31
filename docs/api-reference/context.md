@@ -30,6 +30,7 @@ Context is optional — assets without it continue to work as before.
 | Property | Type | Description |
 |----------|------|-------------|
 | `asset_name` | `str` | Name of the current asset. |
+| `run_id` | `str \| None` | Run this materialization belongs to (`None` only for a directly-constructed context). |
 | `tags` | `list[str] \| None` | Tags from the asset definition. |
 | `kinds` | `list[str]` | Kinds/types from the asset definition. |
 | `group` | `str \| None` | Group from the asset definition. |
@@ -149,14 +150,14 @@ typed config.
 @rs.action(outcome=rs.Outcome.Unchanged)
 @classmethod
 def compact(cls, ctx: rs.ActionContext, warehouse: DuckDB) -> None:
-    warehouse.execute(f"VACUUM {ctx.asset_key}")
+    warehouse.execute(f"VACUUM {ctx.asset_name}")
 ```
 
 ### Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `asset_key` | `str` | Asset the action is running on. |
+| `asset_name` | `str` | Asset the action is running on. |
 | `action` | `str` | The verb being run. |
 | `run_id` | `str` | Run this action belongs to. |
 | `partition` | `PartitionContext \| None` | Partition context (if partitioned). |

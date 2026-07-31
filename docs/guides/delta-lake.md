@@ -309,7 +309,7 @@ class DeltaAsset(rs.Asset):
     def optimize(cls, ctx: rs.ActionContext) -> None:
         h = ctx.io_handler
         dt = DeltaTable(
-            h.asset_table_uri(ctx.asset_key, ctx.asset_metadata),
+            h.asset_table_uri(ctx.asset_name, ctx.asset_metadata),
             storage_options=h.storage_options,
         )
         dt.optimize.compact(writer_properties=h.writer_properties)
@@ -319,7 +319,7 @@ class DeltaAsset(rs.Asset):
     def vacuum(cls, ctx: rs.ActionContext) -> None:
         h = ctx.io_handler
         DeltaTable(
-            h.asset_table_uri(ctx.asset_key, ctx.asset_metadata),
+            h.asset_table_uri(ctx.asset_name, ctx.asset_metadata),
             storage_options=h.storage_options,
         ).vacuum(retention_hours=168, dry_run=False)
 ```
@@ -337,7 +337,7 @@ class Orders(DeltaAsset):
 repo = rs.CodeRepository(assets=[Orders])
 ```
 
-- `asset_table_uri(asset_key, asset_metadata)` — `{table_uri}/{leaf}`, honoring the
+- `asset_table_uri(asset_name, asset_metadata)` — `{table_uri}/{leaf}`, honoring the
   `delta/root_name` override.
 - `partition_predicate(asset_metadata, ctx.partition)` — the SQL predicate for the
   partition(s) being acted on, honoring `delta/partition_expr`.

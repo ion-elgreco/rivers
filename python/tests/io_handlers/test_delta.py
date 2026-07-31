@@ -1540,7 +1540,7 @@ def test_action_body_helpers_through_run_action(tmp_path):
     seen = {}
 
     def _delete(ctx):
-        seen["uri"] = handler.asset_table_uri(ctx.asset_key, ctx.asset_metadata)
+        seen["uri"] = handler.asset_table_uri(ctx.asset_name, ctx.asset_metadata)
         seen["pred"] = handler.partition_predicate(ctx.asset_metadata, ctx.partition)
 
     delete = rs.AssetAction(name="delete", outcome=rs.Outcome.Unmaterialize)(_delete)
