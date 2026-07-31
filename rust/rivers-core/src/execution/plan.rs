@@ -152,6 +152,16 @@ impl ExecutionPlan {
         targets: &[String],
         ordering: ActionOrdering,
     ) -> Self {
+        // Collapse duplicates (first occurrence wins): one step per unique
+        // target, or a repeated name runs the verb once per occurrence. The
+        // materialize path dedups by construction in `from_subgraph`.
+        let mut seen = HashSet::new();
+        let targets: Vec<String> = targets
+            .iter()
+            .filter(|t| seen.insert(t.as_str()))
+            .cloned()
+            .collect();
+
         let name_to_idx: HashMap<&str, petgraph::graph::NodeIndex> = graph
             .node_indices()
             .map(|idx| (graph[idx].name.as_str(), idx))
@@ -859,6 +869,33 @@ mod tests {
         assert_eq!(c.plan_dependencies, vec!["a".to_string()]);
         let a = plan.steps.iter().find(|s| s.name == "a").unwrap();
         assert!(a.plan_dependencies.is_empty());
+    }
+
+    /// Duplicate names in an action selection must collapse to one step — a
+    /// destructive verb must not execute once per occurrence. The materialize
+    /// path dedups by construction; this is its action-side counterpart.
+    #[test]
+    fn test_for_action_dedups_duplicate_targets() {
+        let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"])]);
+        let plan = ExecutionPlan::for_action(
+            &graph,
+            "delete",
+            &["b".into(), "a".into(), "b".into()],
+            ActionOrdering::ReverseTopological,
+        );
+
+        let names: Vec<&str> = plan.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["b", "a"],
+            "duplicates collapse, first-occurrence order kept"
+        );
+        let a = plan.steps.iter().find(|s| s.name == "a").unwrap();
+        assert_eq!(
+            a.plan_dependencies,
+            vec!["b".to_string()],
+            "ordering still holds on the deduped set"
+        );
     }
 
     /// Levels must not depend on the order targets arrive in — the caller
