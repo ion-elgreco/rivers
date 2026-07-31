@@ -1487,6 +1487,25 @@ impl SurrealStorage {
         Ok(())
     }
 
+    /// Which of `ids` belong to action runs. Events don't carry the verb, so
+    /// the materialization consolidation reads it off the run record; a
+    /// missing row reads as materialize (fail-open to the old behavior).
+    async fn action_run_ids(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<std::collections::HashSet<String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let mut result = self
+            .db
+            .query("SELECT VALUE run_id FROM runs WHERE run_id IN $ids AND action IS NOT NONE")
+            .bind(("ids", ids))
+            .await?;
+        let rows: Vec<String> = result.take(0)?;
+        Ok(rows.into_iter().collect())
+    }
+
     async fn upsert_asset_partitions(&self, rows: Vec<DbAssetPartitionWrite>) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
@@ -1711,6 +1730,12 @@ const MATERIALIZE_ASSET_UPDATE: &str = "UPDATE assets SET last_event_id = $event
 /// Stale against every dependency.
 const MATERIALIZE_ASSET_UPDATE_KEEP_IDV: &str = "UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv WHERE code_location_id = $cl AND asset_key = $asset_key";
 
+/// Same, minus provenance and code version. An action run's `materialized()`
+/// executed the verb body, not the asset's materialize function, so the
+/// pending code-version comparison (`code_version_changed()`, the Stale(Code)
+/// badge) must survive it.
+const MATERIALIZE_ASSET_UPDATE_ACTION: &str = "UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version WHERE code_location_id = $cl AND asset_key = $asset_key";
+
 impl StorageBackend for SurrealStorage {
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(cl = %event.code_location_id, asset_key = event.asset_key))]
     async fn store_event(&self, event: &EventRecord) -> Result<String> {
@@ -1743,9 +1768,15 @@ impl StorageBackend for SurrealStorage {
 
                 let data_version = event.event_type.data_version().map(|s| s.to_string());
                 let keep_idv = input_data_versions.is_empty();
+                let from_action = !self
+                    .action_run_ids(vec![event.run_id.clone()])
+                    .await?
+                    .is_empty();
                 let mut query = self
                     .db
-                    .query(if keep_idv {
+                    .query(if from_action {
+                        MATERIALIZE_ASSET_UPDATE_ACTION
+                    } else if keep_idv {
                         MATERIALIZE_ASSET_UPDATE_KEEP_IDV
                     } else {
                         MATERIALIZE_ASSET_UPDATE
@@ -1755,10 +1786,12 @@ impl StorageBackend for SurrealStorage {
                     .bind(("event_id", event_id.clone()))
                     .bind(("run_id", event.run_id.clone()))
                     .bind(("timestamp", event.timestamp))
-                    .bind(("data_version", data_version))
-                    .bind(("mcv", code_version));
-                if !keep_idv {
-                    query = query.bind(("idv", input_data_versions));
+                    .bind(("data_version", data_version));
+                if !from_action {
+                    query = query.bind(("mcv", code_version));
+                    if !keep_idv {
+                        query = query.bind(("idv", input_data_versions));
+                    }
                 }
                 query.await?;
 
@@ -1856,17 +1889,29 @@ impl StorageBackend for SurrealStorage {
         }
 
         // One `assets` row update per materialized asset (latest event wins).
+        let update_run_ids: Vec<String> = latest_mat
+            .values()
+            .map(|&idx| events[idx].run_id.clone())
+            .collect::<std::collections::HashSet<String>>()
+            .into_iter()
+            .collect();
+        let action_ids = self.action_run_ids(update_run_ids).await?;
         for (&(cl, asset_key), &idx) in &latest_mat {
             let event = &events[idx];
             let event_id = &event_ids[idx];
-            let code_version = self.get_code_version(cl, asset_key).await?;
             let data_version = event.event_type.data_version().map(|s| s.to_string());
             let idv = latest_idv
                 .get(&(cl, asset_key))
                 .map(|&i| events[i].input_data_versions.clone());
+            // A co-drained real materialize (the `idv` entry) legitimately
+            // owns provenance and the code-version stamp even when the
+            // action's event is the newer one.
+            let action_only = action_ids.contains(&event.run_id) && idv.is_none();
             let mut query = self
                 .db
-                .query(if idv.is_some() {
+                .query(if action_only {
+                    MATERIALIZE_ASSET_UPDATE_ACTION
+                } else if idv.is_some() {
                     MATERIALIZE_ASSET_UPDATE
                 } else {
                     MATERIALIZE_ASSET_UPDATE_KEEP_IDV
@@ -1876,8 +1921,11 @@ impl StorageBackend for SurrealStorage {
                 .bind(("event_id", event_id.clone()))
                 .bind(("run_id", event.run_id.clone()))
                 .bind(("timestamp", event.timestamp))
-                .bind(("data_version", data_version))
-                .bind(("mcv", code_version));
+                .bind(("data_version", data_version));
+            if !action_only {
+                let code_version = self.get_code_version(cl, asset_key).await?;
+                query = query.bind(("mcv", code_version));
+            }
             if let Some(idv) = idv {
                 query = query.bind(("idv", idv));
             }
@@ -4352,6 +4400,103 @@ mod tests {
         SurrealStorage::new_memory()
             .await
             .expect("failed to create in-memory storage")
+    }
+
+    /// An action's `materialized()` must not advance
+    /// `last_materialization_code_version`: the verb body ran, not the
+    /// asset's materialize function, so a pending code-change rebuild (and
+    /// the Stale(Code) badge) must survive the action. Keyed off the run's
+    /// verb — idv-emptiness also matches every source asset's legitimate
+    /// materializations, which must keep stamping the version.
+    #[tokio::test]
+    async fn action_materialization_preserves_code_version() {
+        let storage = make_storage().await;
+        let cl = "default";
+        let record = |cv: &str| AssetRecord {
+            code_location_id: cl.to_string(),
+            asset_key: "orders".to_string(),
+            tags: vec![],
+            kinds: vec![],
+            asset_group: None,
+            code_version: Some(cv.to_string()),
+            last_event_id: None,
+            last_run_id: None,
+            last_timestamp: None,
+            last_data_version: None,
+            last_materialization_code_version: None,
+            last_input_data_versions: vec![],
+            pool: vec![],
+        };
+        let run = |id: &str, action: Option<&str>, ts: i64| RunRecord {
+            run_id: id.to_string(),
+            code_location_id: cl.to_string(),
+            job_name: None,
+            status: RunStatus::Success,
+            start_time: ts,
+            end_time: Some(ts),
+            tags: vec![],
+            node_names: vec!["orders".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::default(),
+            action: action.map(String::from),
+        };
+        let mat_event = |run_id: &str, ts: i64| EventRecord {
+            code_location_id: cl.to_string(),
+            event_type: EventType::Materialization {
+                data_version: Some(format!("dv_{ts}")),
+            },
+            asset_key: Some("orders".to_string()),
+            run_id: run_id.to_string(),
+            partition_key: None,
+            timestamp: ts,
+            metadata: vec![],
+            input_data_versions: vec![],
+        };
+        let mcv = |records: &[AssetRecord]| {
+            records
+                .iter()
+                .find(|r| r.asset_key == "orders")
+                .and_then(|r| r.last_materialization_code_version.clone())
+        };
+
+        // A real materialize under v1 stamps the version…
+        storage.register_assets(cl, &[record("v1")]).await.unwrap();
+        storage.create_run(&run("r1", None, 1000)).await.unwrap();
+        storage.store_event(&mat_event("r1", 1000)).await.unwrap();
+        let records = storage.get_asset_records(cl).await.unwrap();
+        assert_eq!(mcv(&records).as_deref(), Some("v1"));
+
+        // …the code changes (re-resolve registers v2, leaves mcv at v1)…
+        storage.register_assets(cl, &[record("v2")]).await.unwrap();
+
+        // …then an action run's materialized() lands, via both store paths.
+        storage
+            .create_run(&run("r2", Some("merge"), 2000))
+            .await
+            .unwrap();
+        storage.store_event(&mat_event("r2", 2000)).await.unwrap();
+        let records = storage.get_asset_records(cl).await.unwrap();
+        assert_eq!(
+            mcv(&records).as_deref(),
+            Some("v1"),
+            "store_event: an action's materialized() must not clear the pending rebuild"
+        );
+
+        storage.store_events(&[mat_event("r2", 3000)]).await.unwrap();
+        let records = storage.get_asset_records(cl).await.unwrap();
+        assert_eq!(
+            mcv(&records).as_deref(),
+            Some("v1"),
+            "store_events: an action's materialized() must not clear the pending rebuild"
+        );
+
+        // A later real materialize under v2 re-arms as usual.
+        storage.create_run(&run("r3", None, 4000)).await.unwrap();
+        storage.store_event(&mat_event("r3", 4000)).await.unwrap();
+        let records = storage.get_asset_records(cl).await.unwrap();
+        assert_eq!(mcv(&records).as_deref(), Some("v2"));
     }
 
     /// The run-events page must scan `idx_events_run_ts` (timestamp order), not sort.
