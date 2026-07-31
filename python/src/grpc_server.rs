@@ -564,8 +564,7 @@ impl CodeLocationService for CodeLocationImpl {
             )));
         }
         let asset_selection = if req.selection.is_empty() {
-            // Reads the action table cached at resolve — no GIL, safe from
-            // this tokio worker.
+            // Reads the action table cached at resolve.
             self.handle
                 .assets_supporting_action(&req.action)
                 .map_err(|e| Status::internal(e.to_string()))?

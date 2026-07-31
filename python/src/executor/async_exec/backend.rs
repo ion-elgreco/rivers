@@ -1,9 +1,4 @@
 //! Async executor: runs steps concurrently via tokio JoinSet + spawn_blocking.
-//!
-//! Each step runs in a `spawn_blocking` thread that acquires the GIL via
-//! `Python::try_attach` and calls `execute_step`. Async steps convert their
-//! coroutine via `into_future_with_locals` and block on it with the GIL
-//! released (`py.detach`), so multiple threads overlap their I/O naturally.
 
 use std::collections::HashMap;
 use std::sync::Arc;

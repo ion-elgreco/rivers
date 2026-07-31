@@ -164,8 +164,7 @@ impl<'a> BatchContext<'a> {
         // pool and the claim carries an `AssetScope`, so admission is decided by
         // which partitions each side touches rather than by slot count. A multi
         // materializes all outputs in one step, so it claims each output's pool.
-        // Assets without exclusive actions never touch this. Reads only the
-        // exclusivity cached at resolve — no GIL inside the detached region.
+        // Assets without exclusive actions never touch this.
         match self.scope.plan.verb() {
             Some(verb) => {
                 exclusive = self
