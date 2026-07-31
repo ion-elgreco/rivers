@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use leptos::prelude::*;
 
 use crate::components::partition_picker::PartitionPicker;
-use crate::helpers::JobPartitionPicker;
+use crate::helpers::{JobPartitionPicker, stale_status_kind};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::mutations::{launch_backfill, trigger_action, trigger_materialize};
 use crate::types::{AssetRecord, StaleStatus, SubmitPartitionKey};
@@ -56,11 +56,13 @@ fn launch_summary(n_assets: usize, n_partitions: usize, partitioned: bool) -> St
 
 /// Status dot class + word for an asset's staleness. `None` = the record
 /// hasn't loaded (or the key isn't an asset), which reads as unknown.
+/// Words come from the shared chip vocabulary; only the dot class stays
+/// local (dialogs.css names the up-to-date rule `--ok`).
 fn status_bits(record: Option<&AssetRecord>) -> (&'static str, &'static str) {
     match record.map(|r| &r.stale_status) {
-        Some(StaleStatus::UpToDate) => ("mat-dialog-dot--ok", "up to date"),
-        Some(StaleStatus::Stale) => ("mat-dialog-dot--stale", "stale"),
-        Some(StaleStatus::Missing) => ("mat-dialog-dot--missing", "missing"),
+        Some(s @ StaleStatus::UpToDate) => ("mat-dialog-dot--ok", stale_status_kind(s)),
+        Some(s @ StaleStatus::Stale) => ("mat-dialog-dot--stale", stale_status_kind(s)),
+        Some(s @ StaleStatus::Missing) => ("mat-dialog-dot--missing", stale_status_kind(s)),
         None => ("mat-dialog-dot--missing", ""),
     }
 }
@@ -426,7 +428,9 @@ mod tests {
             stale_status: s,
         };
         let word = |r: Option<&AssetRecord>| status_bits(r).1;
-        assert_eq!(word(Some(&record(StaleStatus::UpToDate))), "up to date");
+        // The words come from the shared chip vocabulary — every other status
+        // surface renders "up-to-date"; a local spelling drifts user-visibly.
+        assert_eq!(word(Some(&record(StaleStatus::UpToDate))), "up-to-date");
         assert_eq!(word(Some(&record(StaleStatus::Stale))), "stale");
         assert_eq!(word(Some(&record(StaleStatus::Missing))), "missing");
         // Unlabeled ≠ missing: an unloaded record shows no status word.
