@@ -176,6 +176,19 @@ impl Executor {
         ctx: &mut dispatch::BatchContext,
         step_indices: &[usize],
     ) -> Vec<(String, PyErr)> {
+        // Action steps run in the orchestrator process regardless of executor:
+        // they carry no dep inputs to ship, and their by-ref transport (action
+        // fn + handler) is neither loky- nor pod-shippable yet. Decided here,
+        // once — before the K8s arm's in-cluster environment detection, and
+        // covering per-asset executor overrides too.
+        if ctx.scope.plan.is_action() {
+            return dispatch::execute_level_batch(
+                &in_process::InProcessBackend,
+                py,
+                ctx,
+                step_indices,
+            );
+        }
         match self {
             Executor::InProcess {} => {
                 dispatch::execute_level_batch(&in_process::InProcessBackend, py, ctx, step_indices)
@@ -200,19 +213,6 @@ impl Executor {
                 worker_cpu,
                 worker_memory,
             } => {
-                // Action steps run in the orchestrator process (like the
-                // parallel executor): they carry no dep inputs to ship and
-                // their by-ref transport is not shippable to step pods yet.
-                // Checked before backend construction — it requires the
-                // in-cluster CodeLocation environment.
-                if ctx.scope.plan.is_action() {
-                    return dispatch::execute_level_batch(
-                        &in_process::InProcessBackend,
-                        py,
-                        ctx,
-                        step_indices,
-                    );
-                }
                 dispatch::execute_level_batch(
                     &kubernetes::KubernetesBackend::new(
                         worker_image

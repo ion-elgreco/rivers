@@ -49,15 +49,6 @@ impl ExecutorBackend for ParallelBackend {
         max_concurrency: Option<usize>,
         failures: &mut Vec<(String, PyErr)>,
     ) {
-        // Action steps run in the orchestrator process: they carry no dep
-        // inputs to ship and their by-ref transport (action fn + handler)
-        // is not loky-serializable yet.
-        if ctx.scope.plan.is_action() {
-            super::super::in_process::InProcessBackend
-                .run_instances(py, ctx, instances, None, failures);
-            return;
-        }
-
         // Order: submit non-pool sync to loky, run async siblings while loky workers
         // execute in their subprocesses, then collect loky results, then claim-gated
         // pool steps. The submit-before-async ordering is what makes loky and async
