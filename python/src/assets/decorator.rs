@@ -1681,6 +1681,17 @@ impl PyAsset {
             .map(|h| h.iter().map(|hook| hook.clone_ref(py)).collect())
     }
 
+    /// Actions declared on this asset; `None` when it declares none.
+    #[getter]
+    fn actions(&self, py: Python) -> Option<Vec<Py<super::action::PyAssetAction>>> {
+        let actions = self.inner.actions();
+        if actions.is_empty() {
+            None
+        } else {
+            Some(actions.iter().map(|a| a.clone_ref(py)).collect())
+        }
+    }
+
     #[getter]
     fn automation_condition(&self) -> Option<PyAutomationCondition> {
         self.inner.automation_condition().cloned()

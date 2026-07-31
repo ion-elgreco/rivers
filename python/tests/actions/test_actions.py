@@ -2440,3 +2440,27 @@ def test_hooks_never_fire_for_action_runs():
     assert repo.run_action("vacuum").success
     assert repo.run_action("delete").success
     assert fired == []
+
+
+def test_asset_actions_attribute_matches_stub():
+    """The stub types ``Asset.actions`` as ``list[AssetAction] | None``; the
+    runtime getter must exist — it was the only declarable of the class-body
+    sweep without one, so ``orders.actions`` raised AttributeError."""
+
+    def _compact(ctx):
+        return None
+
+    compact = rs.AssetAction(name="compact", outcome=rs.Outcome.Unchanged)(_compact)
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler(), actions=[compact])
+    def orders():
+        return 1
+
+    assert [a.name for a in orders.actions] == ["compact"]
+    assert orders.actions[0].outcome == rs.Outcome.Unchanged
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler())
+    def plain():
+        return 1
+
+    assert plain.actions is None
