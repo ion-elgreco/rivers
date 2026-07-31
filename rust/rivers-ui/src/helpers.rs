@@ -574,6 +574,32 @@ pub fn partition_picker_for_assets(
     }
 }
 
+/// Actions an asset offers as generic verb buttons — everything but
+/// `observe`, which external assets surface through their own Observe button.
+pub fn offered_actions(info: &AssetDefinitionInfo) -> Vec<crate::types::AssetActionInfo> {
+    info.actions
+        .iter()
+        .filter(|a| a.name != "observe")
+        .cloned()
+        .collect()
+}
+
+/// Hover title for an action trigger button. `on_selection` switches to the
+/// multi-select wording the bulk surfaces use.
+pub fn action_title(act: &crate::types::AssetActionInfo, on_selection: bool) -> String {
+    act.description.clone().unwrap_or_else(|| {
+        match (act.is_destructive(), on_selection) {
+            (true, true) => format!(
+                "Run '{}' on the selection — clears materialization state",
+                act.name
+            ),
+            (false, true) => format!("Run action '{}' on the selection", act.name),
+            (true, false) => format!("Run '{}' — clears materialization state", act.name),
+            (false, false) => format!("Run action '{}'", act.name),
+        }
+    })
+}
+
 /// Actions every asset in `assets` declares, in the first asset's declaration
 /// order. An action run targets the whole selection, so a verb any member
 /// lacks (or an asset with no info yet) offers nothing. `observe` is excluded
@@ -588,9 +614,9 @@ pub fn common_actions(
     let Some(base) = asset_info_by_key.get(first) else {
         return Vec::new();
     };
-    base.actions
+    let offered = offered_actions(base);
+    offered
         .iter()
-        .filter(|a| a.name != "observe")
         .filter(|a| {
             assets[1..].iter().all(|k| {
                 asset_info_by_key

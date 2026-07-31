@@ -155,13 +155,7 @@ pub fn AssetDetailPage() -> impl IntoView {
         );
         asset_actions.set(
             info.as_ref()
-                .map(|i| {
-                    i.actions
-                        .iter()
-                        .filter(|a| a.name != "observe")
-                        .cloned()
-                        .collect()
-                })
+                .map(|i| crate::helpers::offered_actions(i))
                 .unwrap_or_default(),
         );
         is_observable.set(
@@ -284,13 +278,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                     // state away — it never fires on a bare click, and the
                     // dialog it opens says what it does.
                     let destructive = act.is_destructive();
-                    let title = act.description.clone().unwrap_or_else(|| {
-                        if destructive {
-                            format!("Run '{}' — clears materialization state", act.name)
-                        } else {
-                            format!("Run action '{}'", act.name)
-                        }
-                    });
+                    let title = crate::helpers::action_title(&act, false);
                     view! {
                         <button
                             class=if destructive { "btn btn-danger" } else { "btn" }

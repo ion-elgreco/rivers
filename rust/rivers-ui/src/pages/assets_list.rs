@@ -379,11 +379,7 @@ pub fn AssetsListPage() -> impl IntoView {
                     let destructive = act.is_destructive();
                     let verb = act.name.clone();
                     let label = act.name.clone();
-                    let title = act.description.clone().unwrap_or_else(|| if destructive {
-                        format!("Run '{}' on the selection — clears materialization state", act.name)
-                    } else {
-                        format!("Run action '{}' on the selection", act.name)
-                    });
+                    let title = crate::helpers::action_title(&act, true);
                     view! {
                         <button
                             class=if destructive { "btn btn-danger" } else { "btn" }

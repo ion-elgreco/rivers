@@ -288,29 +288,27 @@ pub fn GraphPage() -> impl IntoView {
         partition_picker_for_assets(&mat_targets.get(), &asset_info_by_key.get())
     });
     let dialog_asset_keys = Signal::derive(move || mat_targets.get());
-    let start_materialize: Callback<Vec<String>> = Callback::new(move |keys: Vec<String>| {
-        let tasks = task_node_names.get_untracked();
-        let keys: Vec<String> = keys.into_iter().filter(|k| !tasks.contains(k)).collect();
-        if keys.is_empty() {
-            return;
-        }
-        dialog_verb.set(None);
-        dialog_destructive.set(false);
-        set_mat_targets.set(keys);
-        show_dialog.set(true);
-    });
-    // Same dialog and partition flow, but the submission carries a verb.
-    let start_action: Callback<(Vec<String>, String, bool)> = Callback::new(
-        move |(keys, verb, destructive): (Vec<String>, String, bool)| {
+    // One opener for both flows — `None` verb materializes. The task-node
+    // filter lives here once: task nodes can be selected for lineage tracing
+    // but never executed.
+    let open_dialog: Callback<(Vec<String>, Option<String>, bool)> = Callback::new(
+        move |(keys, verb, destructive): (Vec<String>, Option<String>, bool)| {
             let tasks = task_node_names.get_untracked();
             let keys: Vec<String> = keys.into_iter().filter(|k| !tasks.contains(k)).collect();
             if keys.is_empty() {
                 return;
             }
-            dialog_verb.set(Some(verb));
+            dialog_verb.set(verb);
             dialog_destructive.set(destructive);
             set_mat_targets.set(keys);
             show_dialog.set(true);
+        },
+    );
+    let start_materialize: Callback<Vec<String>> =
+        Callback::new(move |keys: Vec<String>| open_dialog.run((keys, None, false)));
+    let start_action: Callback<(Vec<String>, String, bool)> = Callback::new(
+        move |(keys, verb, destructive): (Vec<String>, String, bool)| {
+            open_dialog.run((keys, Some(verb), destructive))
         },
     );
 
@@ -848,11 +846,7 @@ pub fn GraphPage() -> impl IntoView {
                                     let verb = act.name.clone();
                                     let label = act.name.clone();
                                     let keys = mat_keys.clone();
-                                    let title = act.description.clone().unwrap_or_else(|| if destructive {
-                                        format!("Run '{}' on the selection — clears materialization state", act.name)
-                                    } else {
-                                        format!("Run action '{}' on the selection", act.name)
-                                    });
+                                    let title = crate::helpers::action_title(&act, true);
                                     view! {
                                         <button
                                             class=if destructive { "btn btn-danger dag-sidebar-action" } else { "btn dag-sidebar-action" }
@@ -998,11 +992,7 @@ pub fn GraphPage() -> impl IntoView {
                                                         let verb = act.name.clone();
                                                         let label = act.name.clone();
                                                         let k = key_for_actions.clone();
-                                                        let title = act.description.clone().unwrap_or_else(|| if destructive {
-                                                            format!("Run '{}' — clears materialization state", act.name)
-                                                        } else {
-                                                            format!("Run action '{}'", act.name)
-                                                        });
+                                                        let title = crate::helpers::action_title(&act, false);
                                                         view! {
                                                             <button
                                                                 class=if destructive { "btn btn-danger dag-sidebar-action" } else { "btn dag-sidebar-action" }
