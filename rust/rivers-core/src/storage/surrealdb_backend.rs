@@ -3705,22 +3705,42 @@ impl PerCodeLocationStorage for SurrealStorage {
         asset_key: &str,
         materialized: &std::collections::HashMap<PartitionKey, i64>,
     ) -> Result<std::collections::HashMap<PartitionKey, i64>> {
+        // One narrow scan serves both consumers below — `$asset_key IN
+        // node_names` defeats every index, so each extra runs query here is a
+        // full table walk per invalidated asset per tick. (An inline subquery
+        // is worse, not better: SurrealDB re-evaluates a non-planner-computable
+        // WHERE per outer row.)
+        let mut result = self
+            .db
+            .query(
+                "SELECT run_id, status, action, partition_key, start_time FROM runs \
+                 WHERE code_location_id = $cl AND $asset_key IN node_names",
+            )
+            .bind(("cl", code_location_id.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .await?;
+
+        #[derive(Debug, SurrealValue)]
+        struct RunScanRow {
+            run_id: String,
+            status: String,
+            action: Option<String>,
+            partition_key: Option<PartitionKey>,
+            start_time: i64,
+        }
+
+        let scan: Vec<RunScanRow> = result.take(0)?;
+
         // A failed action did not fail to *materialize* anything, so it must not
         // floor a partition here: the floor is cleared only by a materialization,
         // which the floor itself then suppresses. Keyed StepFailure events from
         // action runs stay in storage — backfill accounting reads them — so the
         // filtering belongs on this reader, not on the emitter.
-        let mut action_runs = self
-            .db
-            .query(
-                "SELECT VALUE run_id FROM runs \
-                 WHERE code_location_id = $cl AND $asset_key IN node_names \
-                 AND action IS NOT NONE",
-            )
-            .bind(("cl", code_location_id.to_string()))
-            .bind(("asset_key", asset_key.to_string()))
-            .await?;
-        let action_runs: Vec<String> = action_runs.take(0)?;
+        let action_runs: Vec<String> = scan
+            .iter()
+            .filter(|r| r.action.is_some())
+            .map(|r| r.run_id.clone())
+            .collect();
 
         let mut result = self
             .db
@@ -3754,27 +3774,14 @@ impl PerCodeLocationStorage for SurrealStorage {
             }
         }
 
-        let mut result = self
-            .db
-            .query(
-                "SELECT partition_key, start_time FROM runs \
-                 WHERE code_location_id = $cl AND status = 'Failure' \
-                 AND $asset_key IN node_names AND partition_key IS NOT NONE \
-                 AND action IS NONE",
-            )
-            .bind(("cl", code_location_id.to_string()))
-            .bind(("asset_key", asset_key.to_string()))
-            .await?;
-
-        #[derive(Debug, SurrealValue)]
-        struct RunFailRow {
-            partition_key: PartitionKey,
-            start_time: i64,
-        }
-
-        let run_rows: Vec<RunFailRow> = result.take(0)?;
-        for row in run_rows {
-            for member in row.partition_key.members() {
+        for row in &scan {
+            if row.status != "Failure" || row.action.is_some() {
+                continue;
+            }
+            let Some(pk) = &row.partition_key else {
+                continue;
+            };
+            for member in pk.members() {
                 latest_failure
                     .entry(member)
                     .and_modify(|t| *t = (*t).max(row.start_time))
@@ -10266,6 +10273,97 @@ mod tests {
         // Pool should be updated to new config
         assert_eq!(stored.pool, vec![("api".to_string(), 1)]);
         assert_eq!(stored.code_version, Some("v2".to_string()));
+    }
+
+    /// Pins `get_failed_partitions` across every source class in one place:
+    /// keyed failure runs floor, action runs never do (neither their run
+    /// status nor their keyed StepFailure events), and a newer
+    /// materialization or deletion supersedes. Guards the single-scan shape —
+    /// the runs table has no usable index for `$asset_key IN node_names`, so
+    /// each extra scan is a full table walk per invalidated asset per tick.
+    #[tokio::test]
+    async fn failed_partitions_sources_and_supersession() {
+        let storage = make_storage().await;
+        let cl = "default";
+        let single = |k: &str| PartitionKey::Single {
+            keys: vec![k.to_string()],
+        };
+        let run = |id: &str, status: RunStatus, action: Option<&str>, pk: &str, ts: i64| {
+            RunRecord {
+                run_id: id.to_string(),
+                code_location_id: cl.to_string(),
+                job_name: None,
+                status,
+                start_time: ts,
+                end_time: Some(ts),
+                tags: vec![],
+                node_names: vec!["events".to_string()],
+                priority: 0,
+                partition_key: Some(single(pk)),
+                block_reason: None,
+                launched_by: LaunchedBy::default(),
+                action: action.map(String::from),
+            }
+        };
+
+        // p1: a real keyed failure — floors.
+        storage
+            .create_run(&run("rf", RunStatus::Failure, None, "p1", 1000))
+            .await
+            .unwrap();
+        // p2: an action run failed — not a failure to materialize.
+        storage
+            .create_run(&run("ra", RunStatus::Failure, Some("compact"), "p2", 1000))
+            .await
+            .unwrap();
+        // p3: a keyed StepFailure event from an action run — same rule.
+        storage
+            .create_run(&run("rb", RunStatus::Success, Some("compact"), "p3", 1000))
+            .await
+            .unwrap();
+        storage
+            .store_event(&EventRecord {
+                code_location_id: cl.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("events".to_string()),
+                run_id: "rb".to_string(),
+                partition_key: Some(single("p3")),
+                timestamp: 1000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            })
+            .await
+            .unwrap();
+        // p4: failed, then superseded by a newer materialization timestamp.
+        storage
+            .create_run(&run("rs", RunStatus::Failure, None, "p4", 1000))
+            .await
+            .unwrap();
+
+        let materialized: std::collections::HashMap<PartitionKey, i64> =
+            std::iter::once((single("p4"), 2000)).collect();
+        let failed = storage
+            .get_failed_partitions(cl, "events", &materialized)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            failed.get(&single("p1")),
+            Some(&1000),
+            "a keyed failure run must floor its partition"
+        );
+        assert!(
+            !failed.contains_key(&single("p2")),
+            "an action run's failure is not a failure to materialize"
+        );
+        assert!(
+            !failed.contains_key(&single("p3")),
+            "an action run's StepFailure events must not floor"
+        );
+        assert!(
+            !failed.contains_key(&single("p4")),
+            "a newer materialization supersedes the floor"
+        );
     }
 
     /// Asset pools are admitted by partition overlap, not capacity — the
