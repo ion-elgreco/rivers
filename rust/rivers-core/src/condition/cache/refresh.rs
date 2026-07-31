@@ -31,9 +31,14 @@ impl AssetConditionCache {
             .flat_map(|r| r.node_names.iter().cloned())
             .collect();
 
-        // Run ids the tracked-run sweep below observed as terminal this refresh;
+        // Run ids the tracked-run sweeps below observed as terminal this refresh;
         // the new_runs loop must not re-track them from a stale Queued snapshot.
         let mut swept_terminal: HashSet<String> = HashSet::new();
+        let new_runs_terminal: HashSet<&str> = new_runs
+            .iter()
+            .filter(|r| run_status_is_terminal(&r.status))
+            .map(|r| r.run_id.as_str())
+            .collect();
 
         if !self.in_progress_assets.is_empty() {
             let ip_keys: Vec<String> = self.in_progress_assets.keys().cloned().collect();
@@ -79,12 +84,6 @@ impl AssetConditionCache {
             for key in &completed_keys {
                 invalidated_keys.push(key.clone());
             }
-
-            let new_runs_terminal: HashSet<&str> = new_runs
-                .iter()
-                .filter(|r| run_status_is_terminal(&r.status))
-                .map(|r| r.run_id.as_str())
-                .collect();
 
             let mut clearable: Vec<String> = self
                 .in_progress_assets
@@ -167,6 +166,54 @@ impl AssetConditionCache {
             }
         }
 
+        // Watched action runs: once the run cursor passes their start_time this
+        // sweep is the only completion detector, mirroring the tracked-run
+        // sweep above (which covers materialize runs via `in_progress_assets`).
+        if !self.live_action_runs.is_empty() {
+            let ids: Vec<String> = self.live_action_runs.keys().cloned().collect();
+            let watched = storage.get_runs_by_ids(&ids, None).await?;
+            for run in &watched {
+                if !run_status_is_terminal(&run.status) {
+                    continue;
+                }
+                swept_terminal.insert(run.run_id.clone());
+                delta.untrack_action_runs.push(run.run_id.clone());
+                delta
+                    .applied_runs
+                    .push((run.run_id.clone(), run.start_time));
+                if !new_runs_terminal.contains(run.run_id.as_str())
+                    && !self.applied_run_ids.contains_key(&run.run_id)
+                {
+                    invalidated_keys.extend(run.node_names.iter().cloned());
+                    self.apply_run_effects_to_delta(run, &mut delta);
+                }
+            }
+            // A watched id missing from the lookup: the runs row vanished
+            // (deleted after finishing). Same rule as the tracked sweep; the
+            // stored names + key still drive invalidation and row re-checks.
+            if watched.len() < ids.len() {
+                let found: HashSet<&str> = watched.iter().map(|r| r.run_id.as_str()).collect();
+                for (run_id, live) in &self.live_action_runs {
+                    if found.contains(run_id.as_str()) || self.pending_runs.contains_key(run_id) {
+                        continue;
+                    }
+                    delta.untrack_action_runs.push(run_id.clone());
+                    invalidated_keys.extend(live.node_names.iter().cloned());
+                    if let Some(pk) = &live.partition_key {
+                        for asset in &live.node_names {
+                            if self.is_partitioned(asset) {
+                                delta
+                                    .action_partition_checks
+                                    .entry(asset.clone())
+                                    .or_default()
+                                    .extend(pk.members());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if !new_runs.is_empty() {
             // The cursor trails the newest start_time, so already-processed
             // runs re-deliver every tick; only genuinely new work may defeat
@@ -184,10 +231,10 @@ impl AssetConditionCache {
                     !self.applied_run_ids.contains_key(&r.run_id)
                         && !swept_terminal.contains(&r.run_id)
                 } else {
-                    // A live action run is never tracked in-flight (below), so
-                    // `known_in_flight` could never go true for it and every tick
-                    // would read as changed for the verb's whole duration. Its
-                    // completion still arrives through the terminal branch.
+                    // A live action run never enters `in_progress_assets` and no
+                    // condition input reads its watch entry, so it is not new
+                    // work; its completion arrives through the terminal branch
+                    // or the watched-action sweep.
                     r.action.is_none() && !known_in_flight(r)
                 }
             });
@@ -200,11 +247,9 @@ impl AssetConditionCache {
 
                 match run.status {
                     RunStatus::Started | RunStatus::NotStarted | RunStatus::Queued => {
-                        // Action runs are not materialization attempts: tracking a
-                        // live `optimize` makes `eager()`'s `!in_flight()` (and
-                        // dependents' `!any_deps_in_progress()`) suppress the asset
-                        // until the verb finishes. Mirrors initial_load.
-                        if !swept_terminal.contains(&run.run_id) && run.action.is_none() {
+                        if swept_terminal.contains(&run.run_id) {
+                            // Sweep observed the terminal status; this snapshot is stale.
+                        } else if run.action.is_none() {
                             for asset in &run.node_names {
                                 delta.in_progress_changes.push(InProgressChange::Push {
                                     asset_key: asset.clone(),
@@ -212,6 +257,21 @@ impl AssetConditionCache {
                                     partition_key: run.partition_key.clone(),
                                 });
                             }
+                        } else {
+                            // Action runs are not materialization attempts: tracking
+                            // a live `optimize` in `in_progress_assets` makes
+                            // `eager()`'s `!in_flight()` (and dependents'
+                            // `!any_deps_in_progress()`) suppress the asset until the
+                            // verb finishes. Watched separately so the completion is
+                            // still observed once the cursor passes it. Mirrors
+                            // initial_load.
+                            delta.track_action_runs.push((
+                                run.run_id.clone(),
+                                LiveActionRun {
+                                    node_names: run.node_names.clone(),
+                                    partition_key: run.partition_key.clone(),
+                                },
+                            ));
                         }
                     }
                     RunStatus::Success | RunStatus::Failure => {
@@ -575,11 +635,20 @@ impl AssetConditionCache {
             backfill,
             new_last_seen_run_ts,
             new_last_observation_ts,
+            track_action_runs,
+            untrack_action_runs,
             confirmed_pending,
             evicted_pending,
             applied_runs,
             backfill_ended_assets,
         } = delta;
+
+        for (run_id, live) in track_action_runs {
+            self.live_action_runs.insert(run_id, live);
+        }
+        for run_id in untrack_action_runs {
+            self.live_action_runs.remove(&run_id);
+        }
 
         if clear_tick_accumulators {
             self.tick_materialization_tags.clear();

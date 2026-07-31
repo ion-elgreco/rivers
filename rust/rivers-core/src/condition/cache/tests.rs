@@ -488,3 +488,156 @@ async fn deleted_partition_evicted_from_partition_status() {
         "untouched partition must stay cached"
     );
 }
+
+fn mat_events_for(cl: &str, asset: &str, keys: &[&str], ts: i64) -> Vec<crate::storage::EventRecord> {
+    keys.iter()
+        .map(|pk| crate::storage::EventRecord {
+            code_location_id: cl.to_string(),
+            event_type: crate::storage::EventType::Materialization {
+                data_version: Some(format!("dv_{pk}_{ts}")),
+            },
+            asset_key: Some(asset.to_string()),
+            run_id: "r0".to_string(),
+            partition_key: Some(PartitionKey::Single {
+                keys: vec![pk.to_string()],
+            }),
+            timestamp: ts,
+            metadata: vec![],
+            input_data_versions: vec![],
+        })
+        .collect()
+}
+
+fn deletion_event(cl: &str, asset: &str, run_id: &str, pk: &str, ts: i64) -> crate::storage::EventRecord {
+    crate::storage::EventRecord {
+        code_location_id: cl.to_string(),
+        event_type: crate::storage::EventType::Deletion,
+        asset_key: Some(asset.to_string()),
+        run_id: run_id.to_string(),
+        partition_key: Some(PartitionKey::Single {
+            keys: vec![pk.to_string()],
+        }),
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    }
+}
+
+/// The run cursor trails the newest start_time, so an action run that is
+/// still live when any newer run starts falls below the cursor and is never
+/// re-delivered. Its terminal transition — and the deleted-partition
+/// eviction only a completed action run can drive — must not be lost.
+#[tokio::test]
+async fn action_completion_survives_cursor_passing_it() {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+    let single = |k: &str| PartitionKey::Single {
+        keys: vec![k.to_string()],
+    };
+
+    storage
+        .create_run(&mk_run("r0", RunStatus::Success, &["events"], 1000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&mat_events_for(&cl, "events", &["p1", "p2"], 1000))
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(cl.clone());
+    cache.set_partitioned_assets(vec!["events".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    // A delete of p1 starts…
+    let mut del = mk_run("r1", RunStatus::Started, &["events"], 2000);
+    del.end_time = None;
+    del.partition_key = Some(single("p1"));
+    del.action = Some("delete".to_string());
+    storage.create_run(&del).await.unwrap();
+    // …and a newer unrelated run pushes the cursor past its start_time.
+    let mut newer = mk_run("r2", RunStatus::Started, &["other"], 3000);
+    newer.end_time = None;
+    storage.create_run(&newer).await.unwrap();
+    cache.refresh(&storage, 1).await.unwrap();
+
+    // The delete completes only after the cursor moved past it.
+    storage
+        .store_events(&[deletion_event(&cl, "events", "r1", "p1", 3500)])
+        .await
+        .unwrap();
+    storage
+        .update_run_status("r1", RunStatus::Success, Some(3500))
+        .await
+        .unwrap();
+
+    let changed = cache.refresh(&storage, 2).await.unwrap();
+    assert!(changed, "the verb's completion is a meaningful change");
+    let status = cache.partition_status.get("events").unwrap();
+    assert!(
+        !status.timestamps.contains_key(&single("p1")),
+        "deleted partition must be evicted even though the run fell below the cursor"
+    );
+    assert!(
+        status.timestamps.contains_key(&single("p2")),
+        "untouched partition must stay cached"
+    );
+}
+
+/// Same gap across a restart: initial load sets the cursor from the newest
+/// run, so a live action run started earlier is already below it — its
+/// completion must still arrive.
+#[tokio::test]
+async fn action_completion_survives_daemon_restart() {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+    let single = |k: &str| PartitionKey::Single {
+        keys: vec![k.to_string()],
+    };
+
+    storage
+        .create_run(&mk_run("r0", RunStatus::Success, &["events"], 1000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&mat_events_for(&cl, "events", &["p1", "p2"], 1000))
+        .await
+        .unwrap();
+    let mut del = mk_run("r1", RunStatus::Started, &["events"], 2000);
+    del.end_time = None;
+    del.partition_key = Some(single("p1"));
+    del.action = Some("delete".to_string());
+    storage.create_run(&del).await.unwrap();
+    let mut newer = mk_run("r2", RunStatus::Started, &["other"], 3000);
+    newer.end_time = None;
+    storage.create_run(&newer).await.unwrap();
+
+    // Daemon starts while the verb is running.
+    let mut cache = AssetConditionCache::new(cl.clone());
+    cache.set_partitioned_assets(vec!["events".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    storage
+        .store_events(&[deletion_event(&cl, "events", "r1", "p1", 3500)])
+        .await
+        .unwrap();
+    storage
+        .update_run_status("r1", RunStatus::Success, Some(3500))
+        .await
+        .unwrap();
+
+    let changed = cache.refresh(&storage, 1).await.unwrap();
+    assert!(changed, "the verb's completion is a meaningful change");
+    let status = cache.partition_status.get("events").unwrap();
+    assert!(
+        !status.timestamps.contains_key(&single("p1")),
+        "deleted partition must be evicted after a restart mid-verb"
+    );
+    assert!(
+        status.timestamps.contains_key(&single("p2")),
+        "untouched partition must stay cached"
+    );
+}

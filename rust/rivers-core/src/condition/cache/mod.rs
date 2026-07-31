@@ -27,6 +27,8 @@ pub struct AssetConditionCache {
     pub downstream_deps: HashMap<String, Vec<String>>,
     /// In-progress runs per asset: asset_key → (run_id → its partition key).
     pub in_progress_assets: HashMap<String, HashMap<String, Option<PartitionKey>>>,
+    /// Live action runs watched for their terminal transition, keyed by run_id.
+    pub live_action_runs: HashMap<String, LiveActionRun>,
     /// Assets whose latest run failed.
     pub failed_assets: HashSet<String>,
     /// Latest failure timestamp per currently-failed asset.
@@ -96,6 +98,7 @@ impl AssetConditionCache {
             upstream_deps: HashMap::new(),
             downstream_deps: HashMap::new(),
             in_progress_assets: HashMap::new(),
+            live_action_runs: HashMap::new(),
             failed_assets: HashSet::new(),
             failed_asset_timestamps: HashMap::new(),
             last_seen_run_ts: 0,
@@ -327,8 +330,17 @@ impl AssetConditionCache {
                 .await?;
             for run in &live_runs {
                 // An action run is not a materialization attempt, exactly as in
-                // the steady-state push and the failure floors below.
+                // the steady-state push and the failure floors below — but its
+                // start_time is already below the cursor set above, so watch it
+                // or its completion is never observed.
                 if run.action.is_some() {
+                    self.live_action_runs.insert(
+                        run.run_id.clone(),
+                        LiveActionRun {
+                            node_names: run.node_names.clone(),
+                            partition_key: run.partition_key.clone(),
+                        },
+                    );
                     continue;
                 }
                 for asset in &run.node_names {

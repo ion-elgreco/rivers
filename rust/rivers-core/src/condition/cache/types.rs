@@ -72,6 +72,17 @@ pub struct PendingRun {
 /// Default grace period before an unconfirmed dispatched run_id is evicted as a phantom: 60s in nanos.
 pub const DEFAULT_PENDING_GRACE_NANOS: i64 = 60 * 1_000_000_000;
 
+/// A live action run watched for its terminal transition. Action runs never
+/// enter `in_progress_assets` (they are not materialization attempts), so
+/// once the run cursor passes their start_time this watch is the only way
+/// their completion — and the deleted-partition eviction it drives — is
+/// still observed. Node names and key are kept for the vanished-row case.
+#[derive(Clone, Debug)]
+pub struct LiveActionRun {
+    pub node_names: Vec<String>,
+    pub partition_key: Option<PartitionKey>,
+}
+
 /// One mutation to `in_progress_assets`, applied in order.
 pub(super) enum InProgressChange {
     Push {
@@ -139,6 +150,10 @@ pub(super) struct RefreshDelta {
     /// New cursor values; `None` means don't advance.
     pub(super) new_last_seen_run_ts: Option<i64>,
     pub(super) new_last_observation_ts: Option<i64>,
+    /// Live action runs to start watching: `(run_id, details)`.
+    pub(super) track_action_runs: Vec<(String, LiveActionRun)>,
+    /// Watched action runs observed terminal (or deleted) this refresh.
+    pub(super) untrack_action_runs: Vec<String>,
     /// Run_ids confirmed by storage (remove from `pending_runs`).
     pub(super) confirmed_pending: Vec<String>,
     /// Phantom run_ids past grace to evict; `(run_id, asset_keys)`.
