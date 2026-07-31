@@ -550,6 +550,34 @@ def test_run_action_all_assets_fans_out(action_validation_channel):
     assert record is not None and record.action == "purge"
 
 
+def test_launch_backfill_action_rejects_empty_selection(action_validation_channel):
+    """Same opt-in rule as RunAction: an empty selection with a verb must not
+    read as "every asset declaring it" — a caller that computed an empty list
+    would fan a destructive verb across the whole code location, one child run
+    per partition."""
+    channel, pb2, pb2_grpc, _, storage = action_validation_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    before = {r.run_id for r in storage.get_runs(limit=100)}
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.LaunchBackfill(
+            pb2.LaunchBackfillRequest(
+                action="purge",
+                selection=[],
+                partition_keys=[
+                    pb2.ProtoPartitionKey(single=pb2.SinglePartitionKey(keys=["p1"]))
+                ],
+                failure_policy="continue",
+                max_concurrency=1,
+            )
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "selection" in exc.value.details()
+    assert {r.run_id for r in storage.get_runs(limit=100)} == before, (
+        "a rejected action backfill must not leave runs behind"
+    )
+
+
 def test_run_action_rejects_bad_partition_key(action_validation_channel):
     """Same boundary, partition side: a key outside the asset's definition."""
     channel, pb2, pb2_grpc, _, storage = action_validation_channel

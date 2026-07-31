@@ -331,6 +331,17 @@ pub async fn launch_backfill(
 ) -> Result<BackfillRerunResult, ServerFnError> {
     use rivers_api::rivers::LaunchBackfillRequest;
 
+    // Same rule as `trigger_action`: a `#[server]` fn is a public HTTP
+    // endpoint, so an empty selection with a verb must not reach the backend
+    // and read as "every asset declaring it".
+    if let Some(verb) = &action {
+        if job_name.is_none() && selection.as_ref().is_none_or(|s| s.is_empty()) {
+            return Err(ServerFnError::new(format!(
+                "backfill with action '{verb}' needs at least one asset"
+            )));
+        }
+    }
+
     let state = expect_context::<crate::state::AppState>();
     let (_, mut client) = state
         .connect_to(&loc_ns, &loc_name)

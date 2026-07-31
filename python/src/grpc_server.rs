@@ -635,6 +635,16 @@ impl CodeLocationService for CodeLocationImpl {
         request: Request<LaunchBackfillRequest>,
     ) -> Result<Response<LaunchBackfillResponse>, Status> {
         let req = request.into_inner();
+        // Same opt-in rule as `run_action`: `repeated` has no presence, so an
+        // empty selection with a verb is a caller bug, not a request to fan a
+        // destructive action across the code location.
+        if let Some(verb) = &req.action {
+            if req.job_name.is_none() && req.selection.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "backfill with action '{verb}' needs a non-empty selection"
+                )));
+            }
+        }
         let partition_keys = match empty_to_none(req.partition_keys) {
             Some(ks) => Some(
                 ks.into_iter()
