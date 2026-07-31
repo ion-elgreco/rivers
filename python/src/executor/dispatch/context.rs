@@ -117,10 +117,10 @@ pub(crate) fn implicit_asset_pool(asset_key: &str) -> String {
     format!("__asset__:{asset_key}")
 }
 
-/// Capacity of that pool. Exclusion is decided by partition overlap
-/// ([`AssetScope`]), not by counting, so every step takes a single slot and
-/// this only has to be high enough never to bind.
-pub(crate) const EXCLUSIVE_POOL_CAPACITY: u32 = 1_000_000;
+/// Capacity of that pool: unlimited. Exclusion is decided by partition
+/// overlap ([`AssetScope`]), not by counting — a finite sentinel here only
+/// fed the UI a fake "0/1000000" capacity.
+pub(crate) const EXCLUSIVE_POOL_CAPACITY: i32 = -1;
 
 impl<'a> BatchContext<'a> {
     /// What this step touches on the implicit asset pool. `exclusive` marks an

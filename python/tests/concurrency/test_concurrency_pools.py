@@ -170,3 +170,29 @@ def test_asset_decorator_pool_slots_unknown_key():
         @Asset(pool="database", pool_slots={"typo_db": 3})
         def bad():
             pass
+
+
+def test_exclusive_action_pool_registers_unlimited(storage):
+    """The implicit asset pool admits by partition overlap, not capacity —
+    its limit must read as unlimited (-1), not a 1000000 sentinel the UI
+    renders as "0/1000000" while the graph badge says "1/1 full"."""
+    import rivers as rs
+
+    def _opt(ctx):
+        return None
+
+    opt = rs.AssetAction(
+        name="optimize",
+        outcome=rs.Outcome.Unchanged,
+        concurrency=rs.ActionConcurrency.Exclusive,
+    )(_opt)
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler(), actions=[opt])
+    def guarded():
+        return 1
+
+    repo = rs.CodeRepository(assets=[guarded], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+
+    limits = {p.pool_key: p.slot_limit for p in storage.get_pool_limits()}
+    assert limits.get("__asset__:guarded") == -1

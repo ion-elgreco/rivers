@@ -883,9 +883,10 @@ class _ExclusiveTable(rs.Asset):
         return None
 
 
-def test_exclusive_action_registers_multi_slot_pool():
-    """Exclusion is decided by partition overlap, not slot count, so the pool's
-    capacity only has to be high enough never to bind."""
+def test_exclusive_action_registers_unlimited_pool():
+    """Exclusion is decided by partition overlap, not slot count, so the pool
+    registers as unlimited — a finite sentinel only fed the UI a fake
+    capacity."""
     from rivers.testing import memory_storage
 
     storage = memory_storage()
@@ -893,7 +894,7 @@ def test_exclusive_action_registers_multi_slot_pool():
     repo.resolve(storage=storage)
     info = storage.get_pool_info("__asset__:_exclusive_table")
     # EXCLUSIVE_POOL_CAPACITY in python/src/executor/dispatch/context.rs.
-    assert info.slot_limit == 1_000_000
+    assert info.slot_limit == -1
 
 
 def test_exclusive_action_and_materialize_claim_the_pool():
