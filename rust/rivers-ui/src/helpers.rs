@@ -587,8 +587,9 @@ pub fn offered_actions(info: &AssetDefinitionInfo) -> Vec<crate::types::AssetAct
 /// Hover title for an action trigger button. `on_selection` switches to the
 /// multi-select wording the bulk surfaces use.
 pub fn action_title(act: &crate::types::AssetActionInfo, on_selection: bool) -> String {
-    act.description.clone().unwrap_or_else(|| {
-        match (act.is_destructive(), on_selection) {
+    act.description
+        .clone()
+        .unwrap_or_else(|| match (act.is_destructive(), on_selection) {
             (true, true) => format!(
                 "Run '{}' on the selection — clears materialization state",
                 act.name
@@ -596,8 +597,7 @@ pub fn action_title(act: &crate::types::AssetActionInfo, on_selection: bool) -> 
             (false, true) => format!("Run action '{}' on the selection", act.name),
             (true, false) => format!("Run '{}' — clears materialization state", act.name),
             (false, false) => format!("Run action '{}'", act.name),
-        }
-    })
+        })
 }
 
 /// Actions every asset in `assets` declares, in the first asset's declaration

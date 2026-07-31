@@ -191,7 +191,9 @@ def test_exclusive_action_pool_registers_unlimited(storage):
     def guarded():
         return 1
 
-    repo = rs.CodeRepository(assets=[guarded], default_executor=rs.Executor.in_process())
+    repo = rs.CodeRepository(
+        assets=[guarded], default_executor=rs.Executor.in_process()
+    )
     repo.resolve(storage=storage)
 
     limits = {p.pool_key: p.slot_limit for p in storage.get_pool_limits()}

@@ -212,25 +212,23 @@ impl Executor {
                 service_account,
                 worker_cpu,
                 worker_memory,
-            } => {
-                dispatch::execute_level_batch(
-                    &kubernetes::KubernetesBackend::new(
-                        worker_image
-                            .clone()
-                            .or_else(rivers_k8s::env::detect_code_location_image),
-                        *max_concurrent_steps,
-                        namespace
-                            .clone()
-                            .unwrap_or_else(rivers_k8s::env::detect_namespace),
-                        service_account.clone(),
-                        worker_cpu.clone(),
-                        worker_memory.clone(),
-                    ),
-                    py,
-                    ctx,
-                    step_indices,
-                )
-            }
+            } => dispatch::execute_level_batch(
+                &kubernetes::KubernetesBackend::new(
+                    worker_image
+                        .clone()
+                        .or_else(rivers_k8s::env::detect_code_location_image),
+                    *max_concurrent_steps,
+                    namespace
+                        .clone()
+                        .unwrap_or_else(rivers_k8s::env::detect_namespace),
+                    service_account.clone(),
+                    worker_cpu.clone(),
+                    worker_memory.clone(),
+                ),
+                py,
+                ctx,
+                step_indices,
+            ),
         }
     }
 
@@ -270,10 +268,11 @@ impl Executor {
         let needs_bridge = match plan.verb() {
             // The bridge requirement follows the executed verb, not the
             // asset's materialize function.
-            Some(verb) => plan
-                .steps
-                .iter()
-                .any(|s| node_map.get(&s.name).is_some_and(|n| n.action_is_async(verb))),
+            Some(verb) => plan.steps.iter().any(|s| {
+                node_map
+                    .get(&s.name)
+                    .is_some_and(|n| n.action_is_async(verb))
+            }),
             None => plan
                 .steps
                 .iter()

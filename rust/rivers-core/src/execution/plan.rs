@@ -183,9 +183,7 @@ impl ExecutionPlan {
                     ActionOrdering::UpstreamFirst => related_targets(ancestors(graph, target)),
                     // Wait for every related target this one is upstream of
                     // (its dependents).
-                    ActionOrdering::DownstreamFirst => {
-                        related_targets(descendants(graph, target))
-                    }
+                    ActionOrdering::DownstreamFirst => related_targets(descendants(graph, target)),
                 };
                 ExecutionStep {
                     name: target.clone(),
@@ -962,8 +960,12 @@ mod tests {
                 "downstream-first levels for targets {perm:?}"
             );
 
-            let plan =
-                ExecutionPlan::for_action(&graph, "compact", &targets, ActionOrdering::UpstreamFirst);
+            let plan = ExecutionPlan::for_action(
+                &graph,
+                "compact",
+                &targets,
+                ActionOrdering::UpstreamFirst,
+            );
             assert_eq!(
                 level_names(&plan),
                 vec![vec!["a"], vec!["b"], vec!["c"]],
