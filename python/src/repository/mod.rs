@@ -1471,6 +1471,31 @@ impl RepoHandle {
         Ok(assets_supporting_action(&state.node_map, py, action))
     }
 
+    /// Reject any selected asset that doesn't define `action`. Same GIL rule
+    /// as [`Self::assets_supporting_action`]: the caller must already hold it.
+    pub(crate) fn validate_assets_support_action(
+        &self,
+        py: Python,
+        selection: &[String],
+        action: &str,
+    ) -> PyResult<()> {
+        let guard = self.state.read().unwrap();
+        let state = guard.as_ref().ok_or_else(|| {
+            ExecutionError::new_err("CodeRepository not resolved — call resolve() first")
+        })?;
+        for name in selection {
+            let node = state.node_map.get(name).ok_or_else(|| {
+                AssetNotFoundError::new_err(format!("Selection contains unknown asset: '{name}'"))
+            })?;
+            if !node.supports_action(py, action) {
+                return Err(GraphValidationError::new_err(format!(
+                    "Asset '{name}' does not define action '{action}'"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn list_jobs(&self) -> Vec<JobSummary> {
         self.state
             .read()

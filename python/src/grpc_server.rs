@@ -581,6 +581,19 @@ impl CodeLocationService for CodeLocationImpl {
             self.handle
                 .validate_assets_exist(&sel)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            // An asset that exists but doesn't define the verb would otherwise
+            // come back as success plus a run_id for a run that can only fail
+            // at plan build. Same GIL rule as the fan-out branch above.
+            let handle = self.handle.clone();
+            let action = req.action.clone();
+            let names = sel.clone();
+            self.run_on_python(move |py, _repo| {
+                Ok(handle
+                    .validate_assets_support_action(py, &names, &action)
+                    .map_err(|e| e.to_string()))
+            })
+            .await?
+            .map_err(Status::invalid_argument)?;
             sel
         };
         if asset_selection.is_empty() {

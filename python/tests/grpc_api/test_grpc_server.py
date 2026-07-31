@@ -550,6 +550,32 @@ def test_run_action_all_assets_fans_out(action_validation_channel):
     assert record is not None and record.action == "purge"
 
 
+def test_run_action_rejects_unsupported_verb_on_selection(action_validation_channel):
+    """gRPC is the validation boundary: an asset that exists but does not
+    define the verb must be rejected synchronously — otherwise the caller
+    gets success plus a run_id for a run that can only fail at plan build,
+    minutes later, with no synchronous error."""
+    channel, pb2, pb2_grpc, _, storage = action_validation_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    before = {r.run_id for r in storage.get_runs(limit=100)}
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.RunAction(
+            pb2.RunActionRequest(
+                action="purge",
+                selection=["feed"],
+                partition_key=pb2.ProtoPartitionKey(
+                    single=pb2.SinglePartitionKey(keys=["p1"])
+                ),
+            )
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "purge" in exc.value.details() and "feed" in exc.value.details()
+    assert {r.run_id for r in storage.get_runs(limit=100)} == before, (
+        "a rejected action must not leave a run record behind"
+    )
+
+
 def test_launch_backfill_action_rejects_empty_selection(action_validation_channel):
     """Same opt-in rule as RunAction: an empty selection with a verb must not
     read as "every asset declaring it" — a caller that computed an empty list
