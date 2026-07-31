@@ -503,8 +503,8 @@ multiple targets — an action plan has one step per named target.
 | Value | Meaning |
 |-------|---------|
 | `ActionOrdering.Unordered` | No ordering (the default when omitted). |
-| `ActionOrdering.Topological` | Each target waits for the related targets upstream of it. |
-| `ActionOrdering.ReverseTopological` | Each target waits for the related targets it is upstream of — the safe order for a delete. |
+| `ActionOrdering.UpstreamFirst` | Each target waits for the related targets upstream of it. |
+| `ActionOrdering.DownstreamFirst` | Each target waits for the related targets it is upstream of — the safe order for a delete. |
 
 ## `ActionResult`
 

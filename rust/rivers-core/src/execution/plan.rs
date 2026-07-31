@@ -78,10 +78,10 @@ pub enum ActionOrdering {
     #[default]
     Unordered,
     /// Upstream targets first.
-    Topological,
+    UpstreamFirst,
     /// Downstream targets first (delete) — an asset exists only while its
     /// upstream does, the LIFO rule of FK teardown.
-    ReverseTopological,
+    DownstreamFirst,
 }
 
 #[derive(Debug, Clone)]
@@ -163,7 +163,7 @@ impl ExecutionPlan {
             .collect();
 
         // One transitive-closure walk per target, O(T·(V+E)) overall — pairwise
-        // reachability probes made ReverseTopological T·(T−1)² whole-graph
+        // reachability probes made DownstreamFirst T·(T−1)² whole-graph
         // walks: minutes of pure planning at a few hundred targets, re-run per
         // backfill child under the repository's state read lock.
         let related_targets = |closure: HashSet<String>| -> Vec<String> {
@@ -180,10 +180,10 @@ impl ExecutionPlan {
                 let plan_dependencies = match ordering {
                     ActionOrdering::Unordered => Vec::new(),
                     // Wait for every related target upstream of this one.
-                    ActionOrdering::Topological => related_targets(ancestors(graph, target)),
+                    ActionOrdering::UpstreamFirst => related_targets(ancestors(graph, target)),
                     // Wait for every related target this one is upstream of
                     // (its dependents).
-                    ActionOrdering::ReverseTopological => {
+                    ActionOrdering::DownstreamFirst => {
                         related_targets(descendants(graph, target))
                     }
                 };
@@ -818,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn test_for_action_reverse_topological_downstream_first() {
+    fn test_for_action_downstream_first_orders_teardown() {
         // events -> rollups (rollups depends on events); delete must run
         // rollups before events. Unrelated "other" stays parallel.
         let graph = make_graph(vec![
@@ -830,7 +830,7 @@ mod tests {
             &graph,
             "delete",
             &["events".into(), "rollups".into(), "other".into()],
-            ActionOrdering::ReverseTopological,
+            ActionOrdering::DownstreamFirst,
         );
 
         let events = plan.steps.iter().find(|s| s.name == "events").unwrap();
@@ -842,13 +842,13 @@ mod tests {
     }
 
     #[test]
-    fn test_for_action_topological_upstream_first() {
+    fn test_for_action_upstream_first_orders_buildup() {
         let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"]), ("c", vec!["b"])]);
         let plan = ExecutionPlan::for_action(
             &graph,
             "compact",
             &["a".into(), "c".into()],
-            ActionOrdering::Topological,
+            ActionOrdering::UpstreamFirst,
         );
 
         let c = plan.steps.iter().find(|s| s.name == "c").unwrap();
@@ -880,7 +880,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         let plan =
-            ExecutionPlan::for_action(&graph, "delete", &names, ActionOrdering::ReverseTopological);
+            ExecutionPlan::for_action(&graph, "delete", &names, ActionOrdering::DownstreamFirst);
         let elapsed = start.elapsed();
 
         assert_eq!(plan.steps.len(), n);
@@ -889,7 +889,7 @@ mod tests {
         assert_eq!(root.plan_dependencies.len(), n - 1);
         assert!(
             elapsed < std::time::Duration::from_secs(10),
-            "reverse-topological planning took {elapsed:?} for {n} chained targets"
+            "downstream-first planning took {elapsed:?} for {n} chained targets"
         );
     }
 
@@ -903,7 +903,7 @@ mod tests {
             &graph,
             "delete",
             &["b".into(), "a".into(), "b".into()],
-            ActionOrdering::ReverseTopological,
+            ActionOrdering::DownstreamFirst,
         );
 
         let names: Vec<&str> = plan.steps.iter().map(|s| s.name.as_str()).collect();
@@ -923,7 +923,7 @@ mod tests {
     /// Levels must not depend on the order targets arrive in — the caller
     /// derives the target list from a HashMap, so every permutation is
     /// reachable, and a level that puts `a` alongside its downstream `b` is
-    /// exactly the concurrent teardown `ReverseTopological` exists to prevent.
+    /// exactly the concurrent teardown `DownstreamFirst` exists to prevent.
     #[test]
     fn test_for_action_levels_independent_of_target_order() {
         let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"]), ("c", vec!["b"])]);
@@ -954,20 +954,20 @@ mod tests {
                 &graph,
                 "purge",
                 &targets,
-                ActionOrdering::ReverseTopological,
+                ActionOrdering::DownstreamFirst,
             );
             assert_eq!(
                 level_names(&plan),
                 vec![vec!["c"], vec!["b"], vec!["a"]],
-                "reverse-topological levels for targets {perm:?}"
+                "downstream-first levels for targets {perm:?}"
             );
 
             let plan =
-                ExecutionPlan::for_action(&graph, "compact", &targets, ActionOrdering::Topological);
+                ExecutionPlan::for_action(&graph, "compact", &targets, ActionOrdering::UpstreamFirst);
             assert_eq!(
                 level_names(&plan),
                 vec![vec!["a"], vec!["b"], vec!["c"]],
-                "topological levels for targets {perm:?}"
+                "upstream-first levels for targets {perm:?}"
             );
         }
     }

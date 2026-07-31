@@ -189,7 +189,7 @@ class GdprDeletable(rs.Asset):
     @rs.action(
         outcome=rs.Outcome.Unmaterialize,
         concurrency=rs.ActionConcurrency.Exclusive,
-        ordering=rs.ActionOrdering.ReverseTopological,
+        ordering=rs.ActionOrdering.DownstreamFirst,
     )
     @classmethod
     def delete(cls, ctx) -> None:
@@ -203,7 +203,7 @@ class GdprDeletable(rs.Asset):
 repo.run_action("delete", selection=["events", "event_rollups"], partition_key=pk)
 ```
 
-`ReverseTopological` deletes downstream before upstream — a failure midway leaves a
+`DownstreamFirst` deletes downstream before upstream — a failure midway leaves a
 rollup missing rather than a rollup derived from deleted source data. Ordering bounds
 partial failure; it cannot make a multi-asset delete atomic.
 

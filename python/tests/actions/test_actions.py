@@ -307,7 +307,7 @@ def test_reverse_topological_ordering_downstream_first():
     class Purgeable(rs.Asset):
         @rs.action(
             outcome=rs.Outcome.Unchanged,
-            ordering=rs.ActionOrdering.ReverseTopological,
+            ordering=rs.ActionOrdering.DownstreamFirst,
         )
         @classmethod
         def purge(cls, ctx):

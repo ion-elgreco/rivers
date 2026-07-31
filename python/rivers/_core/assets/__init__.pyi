@@ -539,8 +539,8 @@ class ActionOrdering:
     """Asset order when one action run targets several related assets."""
 
     Unordered: "ActionOrdering"
-    Topological: "ActionOrdering"
-    ReverseTopological: "ActionOrdering"
+    UpstreamFirst: "ActionOrdering"
+    DownstreamFirst: "ActionOrdering"
 
 class AssetAction:
     """A named operation on an asset beyond materialize.

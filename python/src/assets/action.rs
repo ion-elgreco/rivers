@@ -114,16 +114,16 @@ pub enum PyActionConcurrency {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PyActionOrdering {
     Unordered,
-    Topological,
-    ReverseTopological,
+    UpstreamFirst,
+    DownstreamFirst,
 }
 
 impl From<PyActionOrdering> for ActionOrdering {
     fn from(o: PyActionOrdering) -> Self {
         match o {
             PyActionOrdering::Unordered => Self::Unordered,
-            PyActionOrdering::Topological => Self::Topological,
-            PyActionOrdering::ReverseTopological => Self::ReverseTopological,
+            PyActionOrdering::UpstreamFirst => Self::UpstreamFirst,
+            PyActionOrdering::DownstreamFirst => Self::DownstreamFirst,
         }
     }
 }
@@ -132,8 +132,8 @@ impl From<ActionOrdering> for PyActionOrdering {
     fn from(o: ActionOrdering) -> Self {
         match o {
             ActionOrdering::Unordered => Self::Unordered,
-            ActionOrdering::Topological => Self::Topological,
-            ActionOrdering::ReverseTopological => Self::ReverseTopological,
+            ActionOrdering::UpstreamFirst => Self::UpstreamFirst,
+            ActionOrdering::DownstreamFirst => Self::DownstreamFirst,
         }
     }
 }
