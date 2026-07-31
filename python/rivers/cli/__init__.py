@@ -325,13 +325,18 @@ def execute(
         )
         raise typer.Exit(1)
     if action is not None and record.action != action:
-        typer.echo(
-            f"Error: run '{run_id}' is recorded as "
+        msg = (
+            f"run '{run_id}' is recorded as "
             f"'{record.action or 'materialize'}' but the pod was launched for "
-            f"'{action}' — refusing to guess",
-            err=True,
+            f"'{action}' — refusing to guess"
         )
-        raise typer.Exit(1)
+        typer.echo(f"Error: {msg}", err=True)
+        # A deliberate refusal, not a crash: exit 1 makes the operator burn its
+        # restart budget re-launching a pod that can never proceed, then blame
+        # "restarts without progress" while this message dies with the deleted
+        # pods. The outcome travels via storage like any completed run.
+        storage.set_run_outcome(run_id, "Failure", 0, 0, message=msg)
+        return
     action = action or record.action
 
     try:

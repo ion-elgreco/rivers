@@ -92,7 +92,12 @@ repo = rs.CodeRepository(assets=[tiny])
 
 def test_execute_action_flag_must_match_the_record(resolved_tmp_path, monkeypatch):
     """The Run CR carries the verb; if it contradicts the record, neither
-    source can be trusted — refuse rather than pick one."""
+    source can be trusted — refuse rather than pick one.
+
+    The refusal is deliberate, so it travels via storage like any completed
+    run: exit 1 reads as "crashed" and burns the operator's restart budget
+    re-launching a pod that can never proceed, then blames "restarts without
+    progress" while the true cause dies with the deleted pods."""
     (resolved_tmp_path / "defs_exec3.py").write_text(REPO_MODULE)
     store = _cloud_env(monkeypatch, resolved_tmp_path / "storage3")
     seed = rs.CodeRepository(assets=[rs.Asset(name="tiny")(lambda: 1)])
@@ -112,8 +117,11 @@ def test_execute_action_flag_must_match_the_record(resolved_tmp_path, monkeypatc
             "compact",
         ],
     )
-    assert result.exit_code == 1, result.output
+    assert result.exit_code == 0, result.output
     assert "materialize" in result.output and "compact" in result.output
+    outcome = store.kv_get("run_outcome:pod-run-2")
+    assert outcome is not None, "the refusal must reach storage as an outcome"
+    assert b"Failure" in outcome and b"compact" in outcome
 
 
 def test_execute_action_flag_routes_the_verb(resolved_tmp_path, monkeypatch):
