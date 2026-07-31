@@ -189,8 +189,8 @@ __all__ = [
 ]
 
 try:
-    from rivers.io_handlers.delta import DeltaIOHandler
+    from rivers.io_handlers.delta import DeltaAsset, DeltaIOHandler
 
-    __all__ = [*__all__, "DeltaIOHandler"]
+    __all__ = [*__all__, "DeltaAsset", "DeltaIOHandler"]
 except ImportError:
     pass

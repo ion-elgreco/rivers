@@ -178,6 +178,21 @@ same `Observation` events it always has. Per-action `retry=` takes an inline
 `RetryPolicy` or the name of one registered in `CodeRepository(retries={...})` — the
 same two spellings asset-level retry accepts.
 
+## Conventional verbs
+
+Verb names are free-form — behavior keys off the declared `outcome`, never the name
+(`materialize`, `observe`, and `compose` are reserved). For the common maintenance
+verbs, use these declarations so a verb behaves the way its name promises:
+
+| Verb | Declaration |
+|------|-------------|
+| `optimize`, `vacuum` | `Outcome.Unchanged` + `ActionConcurrency.Exclusive` — rewrites bytes, never state |
+| `merge`, `refresh` | `Outcome.MayMaterialize` — report an `ActionResult` |
+| `delete`, `purge` | `Outcome.Unmaterialize` + `ActionConcurrency.Exclusive` + `ActionOrdering.DownstreamFirst` |
+
+Delta assets get `optimize`, `vacuum`, and `delete` with exactly these declarations
+built in — subclass [`DeltaAsset`](../api-reference/delta.md#deltaasset).
+
 ## Delete
 
 An `Unmaterialize` action clears materialization state — the run emits `Deletion`

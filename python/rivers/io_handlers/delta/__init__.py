@@ -17,6 +17,7 @@ from pydantic_settings import SettingsConfigDict
 from rivers._core import InputContext, OutputContext
 from rivers._core.partitions import PartitionContext
 from rivers.io_handlers.base import BaseIOHandler
+from rivers.io_handlers.delta.asset import DeltaAsset, OptimizeConfig, VacuumConfig
 from rivers.io_handlers.delta.base import (
     DeltaSchemaMode,
     DeltaTypeHandler,
@@ -38,9 +39,12 @@ from rivers.io_handlers.delta.config import (
 from rivers.io_handlers.delta.predicate import _build_predicate, _resolve_partition_expr
 
 __all__: list[str] = [
+    "DeltaAsset",
     "DeltaIOHandler",
     "DeltaTypeHandler",
     "MergeConfig",
+    "OptimizeConfig",
+    "VacuumConfig",
     "MergeOperationsConfig",
     "PartitionExpr",
     "WhenMatchedDelete",

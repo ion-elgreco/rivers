@@ -296,45 +296,65 @@ def historical(users: pl.DataFrame) -> pl.DataFrame:
 
 ## Maintenance actions
 
-`DeltaIOHandler` exposes the same per-asset resolution the write path uses, so
-[asset actions](../concepts/actions.md) stay symmetric with writes — same URI, same
-credentials, same commit configuration:
+Subclass [`DeltaAsset`](../api-reference/delta.md#deltaasset) and the standard
+maintenance verbs come built in — `optimize`, `vacuum`, and `delete`, resolved
+against the asset's `DeltaIOHandler` (same URI, same credentials, same commit
+configuration the write path uses):
 
 ```python
-class DeltaAsset(rs.Asset):
+from rivers.io_handlers.delta import DeltaAsset  # also exported as rs.DeltaAsset
+
+class Orders(DeltaAsset):
     io_handler = WAREHOUSE
 
-    @rs.action(outcome=rs.Outcome.Unchanged, concurrency=rs.ActionConcurrency.Exclusive)
-    @classmethod
-    def optimize(cls, ctx: rs.ActionContext) -> None:
-        h = ctx.io_handler
-        dt = DeltaTable(
-            h.asset_table_uri(ctx.asset_name, ctx.asset_metadata),
-            storage_options=h.storage_options,
-        )
-        dt.optimize.compact(writer_properties=h.writer_properties)
-
-    @rs.action(outcome=rs.Outcome.Unchanged)
-    @classmethod
-    def vacuum(cls, ctx: rs.ActionContext) -> None:
-        h = ctx.io_handler
-        DeltaTable(
-            h.asset_table_uri(ctx.asset_name, ctx.asset_metadata),
-            storage_options=h.storage_options,
-        ).vacuum(retention_hours=168, dry_run=False)
-```
-
-`DeltaAsset` defines no `materialize()`, so it is a mixin — registering it directly
-raises `AssetDefinitionError`. Subclasses supply the verb and inherit both actions:
-
-```python
-class Orders(DeltaAsset):
     @classmethod
     def materialize(cls) -> pl.DataFrame:
         return pl.DataFrame({"id": [1, 2, 3]})
 
 
 repo = rs.CodeRepository(assets=[Orders])
+repo.run_action("optimize")
+repo.run_action("vacuum", config={"orders": {"retention_hours": 24}})
+repo.run_action("delete", partition_key=pk)
+```
+
+| Verb | Declaration | Behavior |
+|------|-------------|----------|
+| `optimize` | `Unchanged` + `Exclusive` | Compacts small files; z-orders instead when `z_order_by` is configured. Table-wide — run without a partition key. |
+| `vacuum` | `Unchanged` + `Exclusive` | Removes unreferenced files; `retention_hours` and `enforce_retention_duration` via config. Table-wide. |
+| `delete` | `Unmaterialize` + `Exclusive` + `DownstreamFirst` | Deletes the keyed partition's rows via `partition_predicate`, or every row without a key. |
+
+A verb on a table that does not exist yet reports `unchanged` instead of failing,
+so a fleet-wide `repo.run_action("optimize")` skips never-materialized assets.
+`DeltaAsset` sets `kinds = "delta"` and defines no `materialize()`, so it is a
+mixin — subclasses supply it, and a subclass redefining a verb replaces it.
+
+### Custom verbs
+
+For verbs beyond the built-ins, `DeltaIOHandler` exposes the same per-asset
+resolution the write path uses, so custom [asset actions](../concepts/actions.md)
+stay symmetric with writes:
+
+```python
+class Events(DeltaAsset):
+    io_handler = WAREHOUSE
+
+    @classmethod
+    def materialize(cls) -> pl.DataFrame: ...
+
+    @rs.action(outcome=rs.Outcome.MayMaterialize)
+    @classmethod
+    def merge_late(cls, ctx: rs.ActionContext) -> rs.ActionResult:
+        h = ctx.io_handler
+        late = fetch_late_rows(ctx.partition_key)
+        if late.is_empty():
+            return rs.ActionResult.unchanged()
+        merge_into(
+            h.asset_table_uri(ctx.asset_name, ctx.asset_metadata),
+            late,
+            storage_options=h.storage_options,
+        )
+        return rs.ActionResult.materialized(metadata={"rows_merged": len(late)})
 ```
 
 - `asset_table_uri(asset_name, asset_metadata)` — `{table_uri}/{leaf}`, honoring the

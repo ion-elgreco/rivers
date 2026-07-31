@@ -94,6 +94,53 @@ non-partitioned asset, delete the whole table instead of building a predicate.
 
 ---
 
+## `DeltaAsset`
+
+Asset base class with the standard Delta maintenance verbs built in. Subclass it,
+define `materialize`, and `optimize`, `vacuum`, and `delete` appear as
+[actions](../concepts/actions.md), resolved against the asset's `DeltaIOHandler`
+(its own `io_handler` or the repository default). Sets `kinds = "delta"`.
+
+```python
+from rivers.io_handlers.delta import DeltaAsset  # also exported as rs.DeltaAsset
+
+class Orders(DeltaAsset):
+    io_handler = WAREHOUSE
+
+    @classmethod
+    def materialize(cls) -> pl.DataFrame: ...
+```
+
+| Verb | Declaration | Behavior |
+|------|-------------|----------|
+| `optimize` | `Unchanged` + `Exclusive` | `optimize.compact()`, or `z_order` when `z_order_by` is configured. Table-wide — raises if given a partition key. |
+| `vacuum` | `Unchanged` + `Exclusive` | Removes files no longer referenced by the table. Table-wide. |
+| `delete` | `Unmaterialize` + `Exclusive` + `DownstreamFirst` | Deletes the keyed partition's rows via `partition_predicate`, or every row without a key. |
+
+A verb requires the asset to resolve a `DeltaIOHandler` — anything else fails the
+step with a `TypeError` naming the requirement. A verb on a table that does not
+exist yet reports `ActionResult.unchanged()` instead of failing, so a fleet-wide
+`repo.run_action("optimize")` skips never-materialized assets. A subclass
+redefining a verb replaces the built-in.
+
+### `OptimizeConfig`
+
+Per-asset overrides via `run_action("optimize", config={"<asset>": {...}})`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `target_size` | `int \| None` | `None` | Desired file size in bytes (`None` uses the deltalake default). |
+| `z_order_by` | `list[str] \| None` | `None` | Z-order by these columns instead of plain compaction. |
+
+### `VacuumConfig`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `retention_hours` | `int \| None` | `None` | Files older than this are removed (`None` uses the table's retention, 168h by default). |
+| `enforce_retention_duration` | `bool` | `True` | Refuse retention windows shorter than the table's configured minimum. |
+
+---
+
 ## `DeltaTypeHandler`
 
 Parent abstract base for adding type support to `DeltaIOHandler`.
