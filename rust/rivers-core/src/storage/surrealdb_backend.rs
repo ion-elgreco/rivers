@@ -1793,7 +1793,7 @@ impl StorageBackend for SurrealStorage {
                         query = query.bind(("idv", input_data_versions));
                     }
                 }
-                query.await?;
+                query.await?.check()?;
 
                 if let Some(partition_key) = &event.partition_key {
                     self.upsert_asset_partitions(vec![DbAssetPartitionWrite {
@@ -1929,7 +1929,7 @@ impl StorageBackend for SurrealStorage {
             if let Some(idv) = idv {
                 query = query.bind(("idv", idv));
             }
-            query.await?;
+            query.await?.check()?;
         }
 
         // Upsert the affected partition rows in one bulk statement.
@@ -3888,21 +3888,29 @@ impl PerCodeLocationStorage for SurrealStorage {
         limit: i32,
         lease_duration_secs: u32,
     ) -> Result<()> {
-        self.db
-            .query(
-                "UPSERT concurrency_pools SET \
-                     code_location_id = $cl, \
-                     pool_key = $pool_key, \
-                     slot_limit = $slot_limit, \
-                     lease_duration_secs = $lease_duration_secs \
-                 WHERE code_location_id = $cl AND pool_key = $pool_key",
-            )
-            .bind(("cl", code_location_id.to_string()))
-            .bind(("pool_key", pool_key.to_string()))
-            .bind(("slot_limit", limit))
-            .bind(("lease_duration_secs", lease_duration_secs))
-            .await?;
-        Ok(())
+        // These rows are load-bearing: a lost `__asset__:` registration makes
+        // every claim on that asset hard-fail "pool not configured". Bare
+        // `.await?` swallows per-statement errors (conflicts included), and
+        // without them surfacing the retry never fires.
+        super::retry::with_retry(&self.retry_config, || async {
+            self.db
+                .query(
+                    "UPSERT concurrency_pools SET \
+                         code_location_id = $cl, \
+                         pool_key = $pool_key, \
+                         slot_limit = $slot_limit, \
+                         lease_duration_secs = $lease_duration_secs \
+                     WHERE code_location_id = $cl AND pool_key = $pool_key",
+                )
+                .bind(("cl", code_location_id.to_string()))
+                .bind(("pool_key", pool_key.to_string()))
+                .bind(("slot_limit", limit))
+                .bind(("lease_duration_secs", lease_duration_secs))
+                .await?
+                .check()?;
+            Ok(())
+        })
+        .await
     }
 
     async fn get_pool_limits(&self, code_location_id: &str) -> Result<Vec<PoolLimit>> {
@@ -10239,6 +10247,53 @@ mod tests {
         // Pool should be updated to new config
         assert_eq!(stored.pool, vec![("api".to_string(), 1)]);
         assert_eq!(stored.code_version, Some("v2".to_string()));
+    }
+
+    /// `set_pool_limit` rows are load-bearing: a lost `__asset__:` registration
+    /// makes every claim on that asset hard-fail "pool not configured". Under
+    /// same-key contention every call must land or error loudly — with the
+    /// retry + check inside the storage layer, they all land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn set_pool_limit_survives_same_key_contention() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = std::sync::Arc::new(
+            SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+                .await
+                .expect("failed to create rocksdb storage"),
+        );
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(50));
+        let mut handles = Vec::new();
+        for i in 0..50u32 {
+            let storage = storage.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                storage
+                    .set_pool_limit(
+                        crate::storage::DEFAULT_CODE_LOCATION_ID,
+                        "__asset__:orders",
+                        (i % 7) as i32,
+                        300,
+                    )
+                    .await
+            }));
+        }
+        for h in handles {
+            h.await
+                .unwrap()
+                .expect("set_pool_limit must not fail under same-key contention");
+        }
+
+        let pools = storage
+            .get_pool_limits(crate::storage::DEFAULT_CODE_LOCATION_ID)
+            .await
+            .unwrap();
+        let rows: Vec<_> = pools
+            .iter()
+            .filter(|p| p.pool_key == "__asset__:orders")
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one row must survive contention");
     }
 
     // ── Claim/Release protocol tests ──

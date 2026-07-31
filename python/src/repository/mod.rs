@@ -3176,7 +3176,7 @@ impl PyCodeRepository {
         py: Python,
         node_map: &HashMap<String, ResolvedNode>,
         storage_handle: &rivers_core::storage::ScopedStorageHandle<SurrealStorage>,
-    ) {
+    ) -> PyResult<()> {
         const DEFAULT_LEASE_DURATION_SECS: u32 = 300;
 
         let exclusive_pools: Vec<String> = node_map
@@ -3217,14 +3217,23 @@ impl PyCodeRepository {
                     crate::executor::dispatch::EXCLUSIVE_POOL_CAPACITY as i32,
                 );
             }
-            io_rt().block_on(async {
-                let scoped = storage_handle.scoped();
-                futures_util::future::join_all(writes.iter().map(|(pool_key, limit)| {
-                    scoped.set_pool_limit(pool_key, *limit, DEFAULT_LEASE_DURATION_SECS)
-                }))
-                .await;
-            });
-        });
+            // A lost row here makes every later claim on that pool hard-fail
+            // "pool not configured" — fail resolve() loudly instead.
+            io_rt()
+                .block_on(async {
+                    let scoped = storage_handle.scoped();
+                    futures_util::future::join_all(writes.iter().map(|(pool_key, limit)| {
+                        scoped.set_pool_limit(pool_key, *limit, DEFAULT_LEASE_DURATION_SECS)
+                    }))
+                    .await
+                    .into_iter()
+                    .collect::<anyhow::Result<Vec<()>>>()
+                })
+                .map(|_| ())
+                .map_err(|e| {
+                    ExecutionError::new_err(format!("failed to register concurrency pools: {e}"))
+                })
+        })
     }
 
     fn init_run_backend(
@@ -3352,7 +3361,7 @@ impl PyCodeRepository {
 
         if register_catalog {
             register_assets_from_nodes(&storage_handle, &node_map, py);
-            self.register_pools(py, &node_map, &storage_handle);
+            self.register_pools(py, &node_map, &storage_handle)?;
         } else {
             tracing::debug!(
                 target: "rivers::repo",
