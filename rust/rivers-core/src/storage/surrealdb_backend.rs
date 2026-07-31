@@ -1549,15 +1549,22 @@ impl SurrealStorage {
         Ok((pool, claimed.unwrap_or(0)))
     }
 
-    /// SurrealQL fragment that finds a live slot conflicting with `scope` on an
-    /// implicit asset pool. Empty result = free to claim.
+    /// SurrealQL predicate that finds a live slot conflicting with `scope` on
+    /// an implicit asset pool. Empty result = free to claim. Shared verbatim
+    /// by the pre-check probe and the claim transaction — the two enforce the
+    /// same rule and must never drift. `pool_param`/`parts_param` name the
+    /// bind parameters at each site.
     ///
     /// Two non-exclusive holders never conflict, so the cheap `exclusive` test
     /// is first and the set comparison is skipped entirely on the hot path
     /// (concurrent materializes). Beyond that a whole-asset scope (`NONE`)
     /// conflicts with everything, and otherwise the partition sets must
     /// actually intersect.
-    fn asset_conflict_clause(i: usize, scope: Option<&AssetScope>) -> String {
+    fn asset_conflict_predicate(
+        pool_param: &str,
+        parts_param: &str,
+        scope: Option<&AssetScope>,
+    ) -> String {
         let (mine_exclusive, mine_is_whole_asset) = match scope {
             Some(s) => (s.exclusive, s.partitions.is_none()),
             // No scope supplied: treat as whole-asset exclusive, matching how a
@@ -1567,15 +1574,23 @@ impl SurrealStorage {
         let overlap = if mine_is_whole_asset {
             "true".to_string()
         } else {
-            format!("(partitions IS NONE OR partitions CONTAINSANY $parts{i})")
+            format!("(partitions IS NONE OR partitions CONTAINSANY ${parts_param})")
         };
         format!(
-            "LET $conf_{i} = (SELECT VALUE id FROM concurrency_slots \
-                 WHERE code_location_id = $cl AND pool_key = $p{i} \
+            "SELECT VALUE id FROM concurrency_slots \
+                 WHERE code_location_id = $cl AND pool_key = ${pool_param} \
                  AND lease_expires_at > $now \
                  AND (run_id != $run_id OR step_key != $step_key) \
                  AND ({mine_exclusive} OR exclusive) \
-                 AND {overlap} LIMIT 1);\n"
+                 AND {overlap} LIMIT 1"
+        )
+    }
+
+    /// The claim transaction's `LET` wrapper around the shared predicate.
+    fn asset_conflict_clause(i: usize, scope: Option<&AssetScope>) -> String {
+        format!(
+            "LET $conf_{i} = ({});\n",
+            Self::asset_conflict_predicate(&format!("p{i}"), &format!("parts{i}"), scope)
         )
     }
 
@@ -4216,26 +4231,14 @@ impl SurrealStorage {
         now_ns: i64,
         scope: Option<&AssetScope>,
     ) -> Result<bool> {
-        let (mine_exclusive, mine_parts) = match scope {
-            Some(s) => (s.exclusive, s.partitions.clone()),
-            None => (true, None),
-        };
-        let overlap = if mine_parts.is_none() {
-            "true".to_string()
-        } else {
-            "(partitions IS NONE OR partitions CONTAINSANY $parts)".to_string()
-        };
+        let mine_parts = scope.and_then(|s| s.partitions.clone());
         let mut q = self
             .db
             .query(format!(
                 "SELECT VALUE 1 FROM concurrency_pools \
                  WHERE code_location_id = $cl AND pool_key = $pool_key LIMIT 1; \
-                 SELECT VALUE id FROM concurrency_slots \
-                 WHERE code_location_id = $cl AND pool_key = $pool_key \
-                 AND lease_expires_at > $now \
-                 AND (run_id != $run_id OR step_key != $step_key) \
-                 AND ({mine_exclusive} OR exclusive) \
-                 AND {overlap} LIMIT 1"
+                 {}",
+                Self::asset_conflict_predicate("pool_key", "parts", scope)
             ))
             .bind(("cl", code_location_id.to_string()))
             .bind(("pool_key", pool_key.to_string()))
@@ -10363,6 +10366,29 @@ mod tests {
             !failed.contains_key(&single("p4")),
             "a newer materialization supersedes the floor"
         );
+    }
+
+    /// The pre-check probe and the claim transaction enforce the same
+    /// conflict rule — a drift between them turns "wait like any blocked
+    /// claim" into hard PoolContended failures (or vice versa admits a
+    /// conflicting writer). Both must embed the one shared predicate.
+    #[test]
+    fn conflict_predicate_shared_between_precheck_and_transaction() {
+        for scope in [
+            None,
+            Some(AssetScope {
+                exclusive: true,
+                partitions: Some(vec!["p1".to_string()].into_iter().collect()),
+            }),
+        ] {
+            let clause = SurrealStorage::asset_conflict_clause(0, scope.as_ref());
+            let predicate =
+                SurrealStorage::asset_conflict_predicate("p0", "parts0", scope.as_ref());
+            assert!(
+                clause.contains(&predicate),
+                "transaction LET must embed the shared predicate:\n{clause}\nvs\n{predicate}"
+            );
+        }
     }
 
     /// Asset pools are admitted by partition overlap, not capacity — the
