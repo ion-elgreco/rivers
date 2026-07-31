@@ -10,7 +10,6 @@ use leptos::prelude::*;
 use crate::components::partition_picker::PartitionPicker;
 use crate::helpers::JobPartitionPicker;
 use crate::loc::{loc_path, use_current_location};
-use crate::server_fns::assets::get_assets;
 use crate::server_fns::mutations::{launch_backfill, trigger_action, trigger_materialize};
 use crate::types::{AssetRecord, StaleStatus, SubmitPartitionKey};
 
@@ -85,6 +84,11 @@ pub fn MaterializeDialog(
     /// verb from a benign one.
     #[prop(optional, into)]
     destructive: Option<Signal<bool>>,
+    /// Asset records decorating the rows (staleness / group / last
+    /// materialized), from the host page's live resource — the dialog used to
+    /// re-fetch every asset per open.
+    #[prop(into)]
+    records: Signal<HashMap<String, AssetRecord>>,
 ) -> impl IntoView {
     let verb: Signal<Option<String>> = action.unwrap_or_else(|| Signal::derive(|| None));
     let destructive: Signal<bool> = destructive.unwrap_or_else(|| Signal::derive(|| false));
@@ -111,34 +115,6 @@ pub fn MaterializeDialog(
     });
 
     let loc = use_current_location();
-
-    // Staleness / group / last-materialized decorate the rows. Kept in a plain
-    // signal rather than a Resource so a slow (or failed) fetch never withholds
-    // the asset list itself; fetched per open so the staleness is current.
-    let asset_meta = RwSignal::new(HashMap::<String, AssetRecord>::new());
-    // A failed fetch must say so — silently unlabeled rows read as healthy in
-    // a dialog that may be confirming a destructive verb.
-    let meta_failed = RwSignal::new(false);
-    Effect::new(move || {
-        if !show.get() {
-            return;
-        }
-        let (ns, name) = loc.get();
-        leptos::task::spawn_local(async move {
-            match get_assets(ns, name, None, None, None).await {
-                Ok(records) => {
-                    meta_failed.set(false);
-                    asset_meta.set(
-                        records
-                            .into_iter()
-                            .map(|r| (r.asset_key.clone(), r))
-                            .collect(),
-                    );
-                }
-                Err(_) => meta_failed.set(true),
-            }
-        });
-    });
 
     let materialize_action = Action::new(move |_: &()| {
         let sel = selected.get();
@@ -287,15 +263,10 @@ pub fn MaterializeDialog(
                                         >"Clear"</button>
                                     </span>
                                 </div>
-                                <Show when=move || meta_failed.get()>
-                                    <div class="mat-dialog-meta-warning">
-                                        "Couldn't load asset status — staleness not shown."
-                                    </div>
-                                </Show>
                                 <div class="mat-dialog-asset-list">
                                     {
                                         {move || {
-                                            let meta = asset_meta.get();
+                                            let meta = records.get();
                                             asset_keys.get().into_iter().map(|key| {
                                                 let k_checked = key.clone();
                                                 let k_toggle = key.clone();

@@ -134,7 +134,10 @@ pub fn GraphPage() -> impl IntoView {
     let (filter_kind, set_filter_kind) = use_query_param_list("kind");
     let (filter_group, set_filter_group) = use_query_param_list("group");
 
-    let graph_asset_names = Signal::derive(move || {
+    // Memos, not derives: a derive re-walks the whole topology on every read
+    // (each selection change reads these several times); a memo recomputes
+    // only when the topology itself changes.
+    let graph_asset_names = Memo::new(move |_| {
         topology
             .get()
             .and_then(|r| r.ok())
@@ -149,7 +152,7 @@ pub fn GraphPage() -> impl IntoView {
     });
 
     // Task nodes can be selected for lineage tracing but never materialized.
-    let task_node_names = Signal::derive(move || {
+    let task_node_names = Memo::new(move |_| {
         topology
             .get()
             .and_then(|r| r.ok())
@@ -258,7 +261,7 @@ pub fn GraphPage() -> impl IntoView {
 
     // Materialize always routes through the dialog so the user previews the
     // asset list (and partition keys) before anything launches.
-    let asset_info_by_key = Signal::derive(move || {
+    let asset_info_by_key = Memo::new(move |_| {
         assets_info
             .get()
             .and_then(|r| r.ok())
@@ -266,6 +269,16 @@ pub fn GraphPage() -> impl IntoView {
             .into_iter()
             .map(|i| (i.asset_key.clone(), i))
             .collect::<std::collections::HashMap<String, crate::types::AssetDefinitionInfo>>()
+    });
+    // The dialog's row decoration, from the page's own live resource.
+    let records_by_key = Memo::new(move |_| {
+        all_assets
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.asset_key.clone(), r))
+            .collect::<std::collections::HashMap<String, crate::types::AssetRecord>>()
     });
     let (mat_targets, set_mat_targets) = signal(Vec::<String>::new());
     let show_dialog = RwSignal::new(false);
@@ -1019,6 +1032,7 @@ pub fn GraphPage() -> impl IntoView {
             picker=materialize_picker
             action=dialog_verb
             destructive=dialog_destructive
+            records=records_by_key
         />
     }
 }

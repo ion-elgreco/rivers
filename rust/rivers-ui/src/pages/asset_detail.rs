@@ -93,6 +93,16 @@ pub fn AssetDetailPage() -> impl IntoView {
         move || (loc.get(), refresh_tick.get()),
         |((ns, name), _)| get_assets(ns, name, None, None, None),
     );
+    // The materialize dialog's row decoration, from this page's live resource.
+    let records_by_key = Memo::new(move |_| {
+        all_assets
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.asset_key.clone(), r))
+            .collect::<std::collections::HashMap<String, crate::types::AssetRecord>>()
+    });
 
     let (active_tab, set_active_tab) = use_query_param("tab", "overview");
     let (event_filter, set_event_filter) = use_query_param("event_filter", "All");
@@ -807,6 +817,7 @@ pub fn AssetDetailPage() -> impl IntoView {
             picker=materialize_picker
             action=dialog_verb
             destructive=dialog_destructive
+            records=records_by_key
         />
     }
 }

@@ -54,7 +54,7 @@ pub enum StaleStatus {
 /// Asset registration + last-materialization snapshot. Mirrors
 /// `rivers_core::storage::AssetRecord` (sans the per-CL identity field —
 /// scoping happens server-side).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetRecord {
     pub asset_key: String,
     pub tags: Vec<String>,
@@ -507,7 +507,7 @@ pub struct JobRecord {
     pub action: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetDefinitionInfo {
     pub asset_key: String,
     pub description: Option<String>,
@@ -529,7 +529,7 @@ pub struct AssetDefinitionInfo {
 }
 
 /// Mirror of the gRPC `ActionInfo`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetActionInfo {
     pub name: String,
     /// "unchanged" | "may_materialize" | "unmaterialize" | "observe"
@@ -546,7 +546,7 @@ impl AssetActionInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionDefinitionInfo {
     pub kind: String,
     /// Single-dim enumerable keys (Static, TimeWindow). Empty for Multi
@@ -601,7 +601,7 @@ pub enum SubmitPartitionKey {
     Multi(Vec<(String, String)>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookInfo {
     pub hook_type: String,
     pub function_name: String,
