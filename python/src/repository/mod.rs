@@ -117,6 +117,22 @@ pub(crate) fn is_keyless_observe(
     verb == Some("observe") && partition_key.is_none()
 }
 
+/// Resolve every selected name, rejecting unknown ones with the canonical
+/// message. Callers that only validate existence discard the nodes.
+fn resolve_selection<'a>(
+    node_map: &'a HashMap<String, ResolvedNode>,
+    names: impl IntoIterator<Item = &'a String>,
+) -> PyResult<Vec<&'a ResolvedNode>> {
+    names
+        .into_iter()
+        .map(|name| {
+            node_map.get(name).ok_or_else(|| {
+                AssetNotFoundError::new_err(format!("Selection contains unknown asset: '{name}'"))
+            })
+        })
+        .collect()
+}
+
 /// `validate_partition_for_verb` over a borrowed node map, for callers that
 /// hold the map but not the whole `ResolvedState` (the job execution path).
 pub(crate) fn validate_partition_in_map<'a>(
@@ -1471,10 +1487,8 @@ impl RepoHandle {
         let state = guard.as_ref().ok_or_else(|| {
             ExecutionError::new_err("CodeRepository not resolved — call resolve() first")
         })?;
-        for name in selection {
-            let node = state.node_map.get(name).ok_or_else(|| {
-                AssetNotFoundError::new_err(format!("Selection contains unknown asset: '{name}'"))
-            })?;
+        let nodes = resolve_selection(&state.node_map, selection)?;
+        for (name, node) in selection.iter().zip(nodes) {
             if !node.supports_action(action) {
                 return Err(GraphValidationError::new_err(format!(
                     "Asset '{name}' does not define action '{action}'"
@@ -1945,13 +1959,7 @@ impl RepoHandle {
         let state = guard.as_ref().ok_or_else(|| {
             ExecutionError::new_err("Repository not resolved — call resolve() first")
         })?;
-        for name in asset_names {
-            if !state.node_map.contains_key(name) {
-                return Err(AssetNotFoundError::new_err(format!(
-                    "Selection contains unknown asset: '{name}'"
-                )));
-            }
-        }
+        resolve_selection(&state.node_map, asset_names)?;
         Ok(())
     }
 
@@ -2670,13 +2678,7 @@ impl PyCodeRepository {
 
         let selected_names: Vec<String> = match selection {
             Some(sel) => {
-                for name in &sel {
-                    if !state.node_map.contains_key(name) {
-                        return Err(AssetNotFoundError::new_err(format!(
-                            "Selection contains unknown asset: '{name}'"
-                        )));
-                    }
-                }
+                resolve_selection(&state.node_map, &sel)?;
                 sel
             }
             None => assets_supporting_action(&state.node_map, &action),
@@ -4356,12 +4358,8 @@ impl PyCodeRepository {
                     "No assets define action '{verb}'"
                 )));
             }
-            for name in &selection {
-                let node = state.node_map.get(name).ok_or_else(|| {
-                    AssetNotFoundError::new_err(format!(
-                        "Selection contains unknown asset: '{name}'"
-                    ))
-                })?;
+            let nodes = resolve_selection(&state.node_map, &selection)?;
+            for (name, node) in selection.iter().zip(nodes) {
                 if !node.supports_action(verb) {
                     return Err(GraphValidationError::new_err(format!(
                         "Asset '{name}' does not define action '{verb}'"
