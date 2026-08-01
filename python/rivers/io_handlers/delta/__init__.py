@@ -188,6 +188,34 @@ class DeltaIOHandler(BaseIOHandler):
         meta = asset_metadata or {}
         return self._asset_uri(meta.get("delta/root_name", asset_name))
 
+    def resolved_properties(
+        self, asset_metadata: dict[str, str] | None
+    ) -> "tuple[WriterProperties | None, CommitProperties | None]":
+        """Writer/commit properties the write path would use for this asset.
+
+        Per-asset ``delta/writer_properties`` / ``delta/commit_properties``
+        metadata overrides win over the handler defaults — the same resolution
+        ``handle_output`` applies, for action bodies.
+
+        Args:
+            asset_metadata: Per-asset metadata (``ctx.asset_metadata``).
+
+        Returns:
+            The ``(writer_properties, commit_properties)`` pair.
+        """
+        meta = asset_metadata or {}
+        writer_properties = self.writer_properties
+        if "delta/writer_properties" in meta:
+            writer_properties = WriterProperties(
+                **json.loads(meta["delta/writer_properties"])
+            )
+        commit_properties = self.commit_properties
+        if "delta/commit_properties" in meta:
+            commit_properties = CommitProperties(
+                **json.loads(meta["delta/commit_properties"])
+            )
+        return writer_properties, commit_properties
+
     def partition_predicate(
         self,
         asset_metadata: dict[str, str] | None,
@@ -246,16 +274,7 @@ class DeltaIOHandler(BaseIOHandler):
         table_configuration = table_cfg or None
 
         # Resolve writer/commit properties (per-asset override > handler default)
-        writer_properties = self.writer_properties
-        if "delta/writer_properties" in meta:
-            writer_properties = WriterProperties(
-                **json.loads(meta["delta/writer_properties"])
-            )
-        commit_properties = self.commit_properties
-        if "delta/commit_properties" in meta:
-            commit_properties = CommitProperties(
-                **json.loads(meta["delta/commit_properties"])
-            )
+        writer_properties, commit_properties = self.resolved_properties(meta)
 
         return DeltaWriteRequest(
             table_uri=table_uri,

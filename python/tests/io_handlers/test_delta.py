@@ -1657,9 +1657,186 @@ def test_delta_asset_delete_partition_scoped(tmp_path, storage):
     assert len(deletions) == 1
 
 
+def test_partitioned_delta_asset_runs_table_wide_verbs_keyless(tmp_path, storage):
+    """optimize is a whole-asset verb: on a partitioned DeltaAsset it runs
+    without a partition key, and supplying one is rejected up front."""
+    handler, uri = _make_handler(tmp_path, mode="append")
+
+    class Events(rs.DeltaAsset):
+        name = "events"
+        io_handler = handler
+        partitions_def = rs.PartitionsDefinition.static_(["a", "b"])
+        metadata = {"delta/partition_expr": "day"}
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext) -> pa.Table:
+            return pa.table({"day": [context.partition_key], "v": [1]})
+
+    repo = rs.CodeRepository(assets=[Events], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+    repo.materialize(partition_key=rs.PartitionKey.single("a"))
+    repo.materialize(partition_key=rs.PartitionKey.single("a"))
+    repo.materialize(partition_key=rs.PartitionKey.single("b"))
+    assert len(DeltaTable(f"{uri}/events").file_uris()) == 3
+
+    assert repo.run_action("optimize").success
+    # Compaction is per delta partition: day=a's two files become one.
+    assert len(DeltaTable(f"{uri}/events").file_uris()) == 2
+
+    from rivers.exceptions import ExecutionError
+
+    with pytest.raises(ExecutionError, match="whole-asset"):
+        repo.run_action("optimize", partition_key=rs.PartitionKey.single("a"))
+
+
+def test_partitioned_delta_asset_delete_whole_table_keyless(tmp_path, storage):
+    """delete's partition key is optional: keyless on a partitioned DeltaAsset
+    deletes every row and clears materialization state."""
+    handler, uri = _make_handler(tmp_path, mode="append")
+
+    class Events(rs.DeltaAsset):
+        name = "events"
+        io_handler = handler
+        partitions_def = rs.PartitionsDefinition.static_(["a", "b"])
+        metadata = {"delta/partition_expr": "day"}
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext) -> pa.Table:
+            return pa.table({"day": [context.partition_key], "v": [1]})
+
+    repo = rs.CodeRepository(assets=[Events], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+    repo.materialize(partition_key=rs.PartitionKey.single("a"))
+    repo.materialize(partition_key=rs.PartitionKey.single("b"))
+
+    assert repo.run_action("delete").success
+
+    assert pl.read_delta(f"{uri}/events").height == 0
+    record = storage.get_asset_record("events")
+    assert record.last_timestamp is None
+    assert storage.get_materialized_partitions("events") == []
+
+
+def test_delete_missing_table_still_clears_state(tmp_path, storage):
+    """delete on a physically-missing table still applies Unmaterialize —
+    ghost state must be clearable without re-materializing first."""
+    import shutil
+
+    handler, uri = _make_handler(tmp_path)
+
+    class Ghost(rs.DeltaAsset):
+        name = "ghost"
+        io_handler = handler
+
+        @classmethod
+        def materialize(cls) -> pa.Table:
+            return pa.table({"v": [1]})
+
+    repo = rs.CodeRepository(assets=[Ghost], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+    repo.materialize()
+    assert storage.get_asset_record("ghost").last_timestamp is not None
+
+    shutil.rmtree(Path(uri) / "ghost")
+
+    assert repo.run_action("delete").success
+    assert storage.get_asset_record("ghost").last_timestamp is None
+
+
+def test_verbs_forward_writer_and_commit_properties(tmp_path, storage):
+    """optimize rewrites files with the handler's writer_properties and delete
+    commits carry its commit_properties — the same configuration the write
+    path uses."""
+    import pyarrow.parquet as pq
+    from deltalake import CommitProperties, WriterProperties
+
+    # GZIP: neither the write default nor delta-rs's compaction default, so a
+    # dropped writer_properties is unambiguous.
+    handler, uri = _make_handler(
+        tmp_path,
+        mode="append",
+        writer_properties=WriterProperties(compression="GZIP"),
+        commit_properties=CommitProperties(custom_metadata={"committer": "rivers"}),
+    )
+
+    class Events(rs.DeltaAsset):
+        name = "events"
+        io_handler = handler
+
+        @classmethod
+        def materialize(cls) -> pa.Table:
+            return pa.table({"v": [1, 2]})
+
+    repo = rs.CodeRepository(assets=[Events], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+    repo.materialize()
+    repo.materialize()
+
+    assert repo.run_action("optimize").success
+    (compacted,) = DeltaTable(f"{uri}/events").file_uris()
+    compression = pq.ParquetFile(compacted).metadata.row_group(0).column(0).compression
+    assert compression == "GZIP", f"optimize dropped writer_properties ({compression})"
+
+    assert repo.run_action("delete").success
+    history = DeltaTable(f"{uri}/events").history(1)[0]
+    assert "rivers" in json.dumps(history), (
+        f"delete dropped commit_properties ({history})"
+    )
+
+
+def test_keyed_delete_without_partition_expr_names_the_fix(tmp_path, storage):
+    """A keyed delete on an append-mode partitioned asset (valid without
+    delta/partition_expr) must fail naming the metadata key to set."""
+    handler, uri = _make_handler(tmp_path, mode="append")
+
+    class Events(rs.DeltaAsset):
+        name = "events"
+        io_handler = handler
+        partitions_def = rs.PartitionsDefinition.static_(["a", "b"])
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext) -> pa.Table:
+            return pa.table({"day": [context.partition_key], "v": [1]})
+
+    repo = rs.CodeRepository(assets=[Events], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+    repo.materialize(partition_key=rs.PartitionKey.single("a"))
+
+    result = repo.run_action(
+        "delete", partition_key=rs.PartitionKey.single("a"), raise_on_error=False
+    )
+    assert not result.success
+    assert "delta/partition_expr" in result.failed_assets[0][1]
+
+
+def test_verb_config_rejects_unknown_keys(tmp_path, storage):
+    """A typo'd verb-config key fails the run instead of silently using
+    defaults."""
+    handler, uri = _make_handler(tmp_path)
+
+    class Events(rs.DeltaAsset):
+        name = "events"
+        io_handler = handler
+
+        @classmethod
+        def materialize(cls) -> pa.Table:
+            return pa.table({"v": [1]})
+
+    repo = rs.CodeRepository(assets=[Events], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+    repo.materialize()
+
+    result = repo.run_action(
+        "vacuum", config={"events": {"retention_hrs": 1}}, raise_on_error=False
+    )
+    assert not result.success
+    assert "retention_hrs" in result.failed_assets[0][1]
+
+
 def test_delta_asset_delete_whole_table_and_missing_table(tmp_path, storage):
-    """Whole-asset delete clears all rows; a never-materialized asset reports
-    unchanged (no Deletion event) instead of failing."""
+    """Whole-asset delete clears all rows; a missing physical table still
+    applies Unmaterialize (harmless no-op consolidation) so state stays
+    clearable."""
     handler, uri = _make_handler(tmp_path)
 
     class Present(rs.DeltaAsset):
@@ -1705,7 +1882,7 @@ def test_delta_asset_delete_whole_table_and_missing_table(tmp_path, storage):
                 if e.event_type == "Deletion"
             ]
         )
-        == 0
+        == 1
     )
 
 

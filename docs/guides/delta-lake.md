@@ -320,14 +320,16 @@ repo.run_action("delete", partition_key=pk)
 
 | Verb | Declaration | Behavior |
 |------|-------------|----------|
-| `optimize` | `Unchanged` + `Exclusive` | Compacts small files; z-orders instead when `z_order_by` is configured. Table-wide — run without a partition key. |
-| `vacuum` | `Unchanged` + `Exclusive` | Removes unreferenced files; `retention_hours` and `enforce_retention_duration` via config. Table-wide. |
-| `delete` | `Unmaterialize` + `Exclusive` + `DownstreamFirst` | Deletes the keyed partition's rows via `partition_predicate`, or every row without a key. |
+| `optimize` | `Unchanged` + `Exclusive` + `Keyless` | Compacts small files; z-orders instead when `z_order_by` is configured. Table-wide — runs without a partition key, on partitioned assets too. |
+| `vacuum` | `Unchanged` + `Exclusive` + `Keyless` | Removes unreferenced files; `retention_hours` and `enforce_retention_duration` via config. Table-wide, same key rule. |
+| `delete` | `Unmaterialize` + `Exclusive` + `DownstreamFirst` + `Optional` key | Deletes the keyed partition's rows via `partition_predicate`, or every row without a key — both forms valid on partitioned assets. |
 
-A verb on a table that does not exist yet reports `unchanged` instead of failing,
-so a fleet-wide `repo.run_action("optimize")` skips never-materialized assets.
-`DeltaAsset` sets `kinds = "delta"` and defines no `materialize()`, so it is a
-mixin — subclasses supply it, and a subclass redefining a verb replaces it.
+On a table that does not exist yet, `optimize` and `vacuum` report `unchanged`
+instead of failing, so a fleet-wide `repo.run_action("optimize")` skips
+never-materialized assets; `delete` still applies `Unmaterialize`, so dangling
+state clears even when the physical table is already gone. `DeltaAsset` sets
+`kinds = "delta"` and defines no `materialize()`, so it is a mixin — subclasses
+supply it, and a subclass redefining a verb replaces it.
 
 ### Custom verbs
 
