@@ -198,18 +198,18 @@ jobs:
         with:
           install_args: k3d helmfile helm kubectl
 
-      # The external images (MinIO, SurrealDB) come from Docker Hub, whose
-      # unauthenticated per-IP rate limits are a flake source on shared runner
-      # IPs at every-PR cadence. Cache them as a tarball: on a hit the job
-      # never contacts Docker Hub (setup.sh only pulls images missing
-      # locally). The static key doubles as a version pin — bump the -v1
+      # The external images (RustFS, AWS CLI, SurrealDB) come from Docker Hub,
+      # whose unauthenticated per-IP rate limits are a flake source on shared
+      # runner IPs at every-PR cadence. Cache them as a tarball: on a hit the
+      # job never contacts Docker Hub (setup.sh only pulls images missing
+      # locally). The static key doubles as a version pin — bump the -v2
       # suffix to pick up newer upstream tags.
       - name: Restore external image cache
         id: image-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/rivers-ext-images.tar
-          key: rivers-ext-images-arm64-v1
+          key: rivers-ext-images-arm64-v2
 
       - name: Load cached external images
         if: steps.image-cache.outputs.cache-hit == 'true'
@@ -229,7 +229,7 @@ jobs:
         if: steps.image-cache.outputs.cache-hit != 'true'
         run: |
           docker save -o /tmp/rivers-ext-images.tar \
-            minio/mc:latest minio/minio:latest surrealdb/surrealdb:v3
+            rustfs/rustfs:latest amazon/aws-cli:latest surrealdb/surrealdb:v3
 
       - name: Wait for the stack to be ready
         run: just k8s-wait

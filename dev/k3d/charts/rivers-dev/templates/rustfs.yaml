@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustfs
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: rustfs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rustfs
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rustfs
+    spec:
+      # RustFS's image runs as a baked-in non-root uid 10001, but k3d's
+      # local-path-provisioner hands out hostPath-backed PVs whose fsGroup
+      # kubelet won't apply — chown the volume explicitly before the server
+      # starts instead of relying on a pod-level securityContext.
+      initContainers:
+        - name: fix-data-perms
+          image: {{ .Values.rustfs.initImage }}
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "chown -R 10001:10001 /data"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: rustfs
+          image: {{ .Values.rustfs.image }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RUSTFS_VOLUMES
+              value: /data
+            - name: RUSTFS_ADDRESS
+              value: ":9000"
+            - name: RUSTFS_CONSOLE_ENABLE
+              value: "false"
+            - name: RUSTFS_ACCESS_KEY
+              value: {{ .Values.rustfs.accessKey | quote }}
+            - name: RUSTFS_SECRET_KEY
+              value: {{ .Values.rustfs.secretKey | quote }}
+          ports:
+            - containerPort: 9000
+              name: s3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: s3
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+        # Converges the bucket on every pod start (a fresh PVC starts empty);
+        # a helm hook can't do this — the tolerated 15s --wait timeout in the
+        # dev helmfile marks the upgrade failed and skips post-upgrade hooks.
+        # RustFS ships no `mc`-equivalent CLI, so the AWS CLI drives bucket
+        # creation against its S3-compatible API instead.
+        - name: ensure-bucket
+          image: {{ .Values.rustfs.awsCliImage }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: {{ .Values.rustfs.accessKey | quote }}
+            - name: AWS_SECRET_ACCESS_KEY
+              value: {{ .Values.rustfs.secretKey | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ .Values.s3.region | quote }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              until aws --endpoint-url http://127.0.0.1:9000 s3api list-buckets >/dev/null 2>&1; do
+                sleep 2
+              done
+              aws --endpoint-url http://127.0.0.1:9000 s3api head-bucket --bucket {{ .Values.rustfs.bucket }} 2>/dev/null || \
+                aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket --bucket {{ .Values.rustfs.bucket }}
+              sleep infinity
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: rustfs-data
+---
+# A restart used to wipe the volume-less /data (and the bucket with it),
+# failing every run until a manual re-create.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rustfs-data
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: rustfs
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustfs
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: rustfs
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9000
+      targetPort: s3
+      name: s3
+  selector:
+    app.kubernetes.io/name: rustfs

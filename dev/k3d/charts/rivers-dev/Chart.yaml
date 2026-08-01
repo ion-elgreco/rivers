@@ -1,6 +1,6 @@
 apiVersion: v2
 name: rivers-dev
-description: Dev-cluster scaffolding (MinIO + example CodeLocations) for the k3d test setup
+description: Dev-cluster scaffolding (RustFS + example CodeLocations) for the k3d test setup
 type: application
 version: 0.0.0-dev
 appVersion: "0.0.0-dev"
