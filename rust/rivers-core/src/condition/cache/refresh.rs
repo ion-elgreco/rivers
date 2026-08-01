@@ -166,6 +166,11 @@ impl AssetConditionCache {
             }
         }
 
+        // Assets touched by an action run that completed THIS tick — checked
+        // against whole-asset deletion timestamps below so a delete clears
+        // failure floors in steady state, not only at initial_load.
+        let mut action_completed_assets: HashSet<String> = HashSet::new();
+
         // Watched action runs: once the run cursor passes their start_time this
         // sweep is the only completion detector, mirroring the tracked-run
         // sweep above (which covers materialize runs via `in_progress_assets`).
@@ -186,6 +191,7 @@ impl AssetConditionCache {
                 {
                     invalidated_keys.extend(run.node_names.iter().cloned());
                     self.apply_run_effects_to_delta(run, &mut delta);
+                    action_completed_assets.extend(run.node_names.iter().cloned());
                 }
             }
             // A watched id missing from the lookup: the runs row vanished
@@ -278,13 +284,25 @@ impl AssetConditionCache {
                         delta.clear_run(run);
                         if !self.applied_run_ids.contains_key(&run.run_id) {
                             self.apply_run_effects_to_delta(run, &mut delta);
+                            if run.is_action() {
+                                action_completed_assets
+                                    .extend(run.node_names.iter().cloned());
+                            }
                         }
                     }
                     RunStatus::Canceled => {
                         delta.clear_run(run);
-                        delta
-                            .applied_runs
-                            .push((run.run_id.clone(), run.start_time));
+                        if run.is_action() && !self.applied_run_ids.contains_key(&run.run_id) {
+                            // Queues the partition re-checks (and pushes
+                            // applied_runs) — a canceled delete's stored
+                            // deletions still need their rows re-checked.
+                            self.apply_run_effects_to_delta(run, &mut delta);
+                            action_completed_assets.extend(run.node_names.iter().cloned());
+                        } else {
+                            delta
+                                .applied_runs
+                                .push((run.run_id.clone(), run.start_time));
+                        }
                     }
                 }
             }
@@ -295,6 +313,26 @@ impl AssetConditionCache {
             // re-delivered ones.
             if let Some(newest) = new_runs.iter().map(|r| r.start_time).max() {
                 delta.new_last_seen_run_ts = Some(newest.saturating_sub(1));
+            }
+        }
+
+        // Deletion supersedes failure — the steady-state half of the rule
+        // initial_load applies at restart. A whole-asset deletion behaves
+        // like a successful materialize at its timestamp: it clears any
+        // floor it postdates (`failed_removes` already encodes exactly that
+        // comparison). Keyed off completed action runs because Deletion
+        // events never reach the cache otherwise (the event cursor is
+        // observation-only).
+        if !action_completed_assets.is_empty() {
+            let deletion_ts = storage.get_asset_deletion_timestamps(self.ctx.id()).await?;
+            for asset in &action_completed_assets {
+                if let Some(&del) = deletion_ts.get(asset.as_str()) {
+                    delta
+                        .failed_removes
+                        .entry(asset.clone())
+                        .and_modify(|t| *t = (*t).max(del))
+                        .or_insert(del);
+                }
             }
         }
 
@@ -418,12 +456,6 @@ impl AssetConditionCache {
         run: &RunRecord,
         delta: &mut RefreshDelta,
     ) -> bool {
-        if !matches!(run.status, RunStatus::Success | RunStatus::Failure) {
-            return false;
-        }
-        delta
-            .applied_runs
-            .push((run.run_id.clone(), run.start_time));
         // Action runs are not materialization attempts: their effects reach
         // the cache through the record + partition-status refresh of
         // `invalidated_keys` (a delete's cleared record, a merge's new data
@@ -431,8 +463,16 @@ impl AssetConditionCache {
         // semantics only — applying it would make an `optimize` count as a
         // materialization for condition evaluation. The touched partition
         // keys are recorded so the plan phase can detect row deletions the
-        // incremental timestamp fetch can't see.
+        // incremental timestamp fetch can't see — on ANY terminal status:
+        // events flush before the terminal write, so even a Canceled delete
+        // may already have consolidated Deletion events.
         if run.is_action() {
+            if !run_status_is_terminal(&run.status) {
+                return false;
+            }
+            delta
+                .applied_runs
+                .push((run.run_id.clone(), run.start_time));
             if let Some(pk) = &run.partition_key {
                 for asset in &run.node_names {
                     if self.is_partitioned(asset) {
@@ -446,6 +486,12 @@ impl AssetConditionCache {
             }
             return true;
         }
+        if !matches!(run.status, RunStatus::Success | RunStatus::Failure) {
+            return false;
+        }
+        delta
+            .applied_runs
+            .push((run.run_id.clone(), run.start_time));
         let run_asset_names: Arc<[String]> = Arc::from(run.node_names.as_slice());
         let run_tags: Arc<[(String, String)]> = Arc::from(run.tags.as_slice());
         let is_failure = matches!(run.status, RunStatus::Failure);

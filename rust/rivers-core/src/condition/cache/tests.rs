@@ -489,6 +489,68 @@ async fn deleted_partition_evicted_from_partition_status() {
     );
 }
 
+/// A canceled delete still evicts the partitions its stored Deletion events
+/// already removed — events flush before the terminal status write, so
+/// cancel-mid-delete leaves rows gone while the run ends Canceled.
+#[tokio::test]
+async fn canceled_delete_still_evicts_deleted_partitions() {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+    let single = |k: &str| PartitionKey::Single {
+        keys: vec![k.to_string()],
+    };
+
+    storage
+        .create_run(&mk_run("r0", RunStatus::Success, &["events"], 1000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&mat_events_for(&cl, "events", &["p1", "p2"], 1000))
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(cl.clone());
+    cache.set_partitioned_assets(vec!["events".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        cache
+            .partition_status
+            .get("events")
+            .unwrap()
+            .timestamps
+            .contains_key(&single("p1")),
+        "p1 cached after initial load"
+    );
+
+    // Delete p1, then the run is canceled before finishing.
+    let mut del = mk_run("r1", RunStatus::Started, &["events"], 2000);
+    del.end_time = None;
+    del.partition_key = Some(single("p1"));
+    del.action = Some("delete".to_string());
+    storage.create_run(&del).await.unwrap();
+    storage
+        .store_events(&[deletion_event(&cl, "events", "r1", "p1", 2000)])
+        .await
+        .unwrap();
+    storage
+        .update_run_status("r1", RunStatus::Canceled, Some(2000))
+        .await
+        .unwrap();
+
+    cache.refresh(&storage, 1).await.unwrap();
+    let status = cache.partition_status.get("events").unwrap();
+    assert!(
+        !status.timestamps.contains_key(&single("p1")),
+        "canceled delete: partitions its stored deletions removed must be evicted"
+    );
+    assert!(
+        status.timestamps.contains_key(&single("p2")),
+        "untouched partition must stay cached"
+    );
+}
+
 fn mat_events_for(
     cl: &str,
     asset: &str,
@@ -828,4 +890,83 @@ async fn deleted_asset_does_not_resurrect_failure_floor() {
         !cache.failed_assets.contains("report"),
         "deleted asset must not resurrect its failure floor on restart"
     );
+}
+
+/// Deletion supersedes failure in STEADY STATE too: a completed delete action
+/// whose whole-asset Deletion event postdates the floor must clear it without
+/// a daemon restart — and must not clear a floor newer than the deletion.
+#[tokio::test]
+async fn completed_delete_clears_failure_floor_in_steady_state() {
+    use crate::storage::PerCodeLocationStorage;
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+    storage
+        .register_assets(&cl, &[rec_with_run("events", None, 0)])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(cl.clone());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    // Steady state: a failed materialize floors the asset.
+    storage
+        .create_run(&mk_run("f", RunStatus::Failure, &["events"], 1000))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 1).await.unwrap();
+    assert_eq!(
+        cache.failed_asset_timestamps.get("events"),
+        Some(&1000),
+        "failed materialize must floor the asset"
+    );
+
+    // A delete action completes after storing a whole-asset Deletion event.
+    let mut del = mk_run("d", RunStatus::Started, &["events"], 2000);
+    del.end_time = None;
+    del.action = Some("delete".to_string());
+    storage.create_run(&del).await.unwrap();
+    storage
+        .store_events(&[crate::storage::EventRecord {
+            code_location_id: cl.clone(),
+            event_type: crate::storage::EventType::Deletion,
+            asset_key: Some("events".to_string()),
+            run_id: "d".to_string(),
+            partition_key: None,
+            timestamp: 2000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        }])
+        .await
+        .unwrap();
+    storage
+        .update_run_status("d", RunStatus::Success, Some(2000))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 2).await.unwrap();
+    assert!(
+        !cache.failed_assets.contains("events"),
+        "deletion at 2000 must clear the floor from 1000 without a restart"
+    );
+    assert!(!cache.failed_asset_timestamps.contains_key("events"));
+
+    // A floor NEWER than the last deletion survives later action completions.
+    storage
+        .create_run(&mk_run("f2", RunStatus::Failure, &["events"], 3000))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 3).await.unwrap();
+    assert_eq!(cache.failed_asset_timestamps.get("events"), Some(&3000));
+
+    let mut noop = mk_run("d2", RunStatus::Success, &["events"], 3500);
+    noop.action = Some("delete".to_string());
+    storage.create_run(&noop).await.unwrap();
+    cache.refresh(&storage, 4).await.unwrap();
+    assert_eq!(
+        cache.failed_asset_timestamps.get("events"),
+        Some(&3000),
+        "a completed action with only an older deletion must not clear a newer floor"
+    );
+    assert!(cache.failed_assets.contains("events"));
 }
