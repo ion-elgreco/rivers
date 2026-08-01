@@ -39,6 +39,9 @@ struct DbDynamicPartition {
 
 #[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
 struct DbEventWrite {
+    /// Client-generated so a retried closure re-inserts the same record id —
+    /// `INSERT IGNORE` then makes the replay a no-op instead of a duplicate.
+    id: RecordId,
     code_location_id: String,
     event_type: String,
     asset_key: Option<String>,
@@ -318,9 +321,10 @@ impl DbStoredTick {
     }
 }
 
-impl From<&EventRecord> for DbEventWrite {
-    fn from(e: &EventRecord) -> Self {
+impl DbEventWrite {
+    fn from_event(e: &EventRecord, id: RecordId) -> Self {
         Self {
+            id,
             code_location_id: e.code_location_id.clone(),
             event_type: e.event_type.type_name().to_string(),
             asset_key: e.asset_key.clone(),
@@ -1210,6 +1214,12 @@ fn record_id_str(id: &RecordId) -> String {
     format!("{}:{:?}", id.table.as_str(), id.key)
 }
 
+/// Client-generated `events` record id — retried inserts replay the same id
+/// so `INSERT IGNORE` deduplicates instead of appending.
+fn new_event_record_id() -> RecordId {
+    RecordId::new("events", uuid::Uuid::new_v4().simple().to_string())
+}
+
 fn now_nanos() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1242,7 +1252,7 @@ fn run_queued_event(record: &RunRecord) -> EventRecord {
 impl SurrealStorage {
     /// Persist a queued `RunRecord` and emit its `RunQueued` event in one step.
     pub async fn enqueue_run(&self, record: &RunRecord) -> Result<()> {
-        let event = DbEventWrite::from(&run_queued_event(record));
+        let event = DbEventWrite::from_event(&run_queued_event(record), new_event_record_id());
         let result = super::retry::with_retry(&self.retry_config, || async {
             self.db
                 .query(
@@ -1268,7 +1278,7 @@ impl SurrealStorage {
         }
         let events: Vec<DbEventWrite> = records
             .iter()
-            .map(|r| DbEventWrite::from(&run_queued_event(r)))
+            .map(|r| DbEventWrite::from_event(&run_queued_event(r), new_event_record_id()))
             .collect();
         let result = super::retry::with_retry(&self.retry_config, || async {
             self.db
@@ -1305,7 +1315,7 @@ impl SurrealStorage {
         }
         let events: Vec<DbEventWrite> = records
             .iter()
-            .map(|r| DbEventWrite::from(&run_queued_event(r)))
+            .map(|r| DbEventWrite::from_event(&run_queued_event(r), new_event_record_id()))
             .collect();
         let run_ids: Vec<String> = records.iter().map(|r| r.run_id.clone()).collect();
         let result = super::retry::with_retry(&self.retry_config, || async {
@@ -1755,9 +1765,13 @@ const UPSERT_ASSET_PARTITIONS: &str = "INSERT INTO asset_partitions $rows ON DUP
 impl StorageBackend for SurrealStorage {
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(cl = %event.code_location_id, asset_key = event.asset_key))]
     async fn store_event(&self, event: &EventRecord) -> Result<String> {
+        // Generated outside the retry closure: a replayed attempt re-inserts
+        // the same record id, which INSERT IGNORE turns into a no-op.
+        let record_id = new_event_record_id();
+        let event_id = record_id_str(&record_id);
         super::retry::with_retry(&self.retry_config, || async {
         let cl = event.code_location_id.as_str();
-        let mut db_event = DbEventWrite::from(event);
+        let mut db_event = DbEventWrite::from_event(event, record_id.clone());
 
         let mut materialization_code_version: Option<String> = None;
         if let Some(asset_key) = &event.asset_key
@@ -1768,14 +1782,13 @@ impl StorageBackend for SurrealStorage {
                 materialization_code_version = cv;
             }
 
-        let result: Option<DbStoredEvent> = self
-            .db
-            .create("events")
-            .content(db_event)
+        self.db
+            .query("INSERT IGNORE INTO events $rows RETURN NONE")
+            .bind(("rows", vec![db_event]))
             .await
-            .context("failed to store event")?;
-        let stored = result.context("no event returned from create")?;
-        let event_id = record_id_str(&stored.id);
+            .context("failed to store event")?
+            .check()?;
+        let event_id = event_id.clone();
 
         if let Some(asset_key) = &event.asset_key
             && event.event_type.is_materialization() {
@@ -1845,7 +1858,8 @@ impl StorageBackend for SurrealStorage {
                     .bind(("event_id", event_id.clone()))
                     .bind(("timestamp", event.timestamp))
                     .bind(("data_version", data_version))
-                    .await?;
+                    .await?
+                    .check()?;
             }
 
         if let Some(asset_key) = &event.asset_key
@@ -1860,20 +1874,24 @@ impl StorageBackend for SurrealStorage {
 
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = events.len()))]
     async fn store_events(&self, events: &[EventRecord]) -> Result<Vec<String>> {
-        super::retry::with_retry(&self.retry_config, || async {
         if events.is_empty() {
             return Ok(vec![]);
         }
-
-        let db_events: Vec<DbEventWrite> = events.iter().map(DbEventWrite::from).collect();
-        let results: Vec<DbStoredEvent> = self
-            .db
-            .insert("events")
-            .content(db_events)
+        // Ids generated outside the retry closure: one consolidation conflict
+        // replays the whole drained batch, and INSERT IGNORE needs the same
+        // record ids to turn the re-insert into a no-op.
+        let rows: Vec<DbEventWrite> = events
+            .iter()
+            .map(|e| DbEventWrite::from_event(e, new_event_record_id()))
+            .collect();
+        let event_ids: Vec<String> = rows.iter().map(|r| record_id_str(&r.id)).collect();
+        super::retry::with_retry(&self.retry_config, || async {
+        self.db
+            .query("INSERT IGNORE INTO events $rows RETURN NONE")
+            .bind(("rows", rows.clone()))
             .await
-            .context("failed to batch store events")?;
-
-        let event_ids: Vec<String> = results.iter().map(|e| record_id_str(&e.id)).collect();
+            .context("failed to batch store events")?
+            .check()?;
 
         // Group materializations by asset (latest wins), then one bulk upsert.
         let mut latest_mat: std::collections::HashMap<(&str, &str), usize> =
@@ -1998,7 +2016,8 @@ impl StorageBackend for SurrealStorage {
                         .bind(("event_id", event_id.clone()))
                         .bind(("timestamp", event.timestamp))
                         .bind(("data_version", data_version))
-                        .await?;
+                        .await?
+                        .check()?;
                 }
             if let Some(asset_key) = &event.asset_key
                 && event.event_type.is_deletion() {
@@ -2032,7 +2051,7 @@ impl StorageBackend for SurrealStorage {
                 .check()?;
         }
 
-        Ok(event_ids)
+        Ok(event_ids.clone())
         })
         .await
     }
@@ -4573,6 +4592,7 @@ mod tests {
             .unwrap();
         let rows: Vec<DbEventWrite> = (0..2000i64)
             .map(|i| DbEventWrite {
+                id: new_event_record_id(),
                 code_location_id: "default".into(),
                 event_type: if i % 50 == 0 {
                     "StepStart"
@@ -4687,6 +4707,7 @@ mod tests {
             .unwrap();
         let rows: Vec<DbEventWrite> = (0..2000i64)
             .map(|i| DbEventWrite {
+                id: new_event_record_id(),
                 code_location_id: "default".into(),
                 event_type: if i % 3 == 0 {
                     "Observation"
@@ -4924,6 +4945,135 @@ mod tests {
                      (partitions: {parts:?})"
                 ),
             }
+        }
+    }
+
+    /// Concurrent unpartitioned materializations of one asset conflict on the
+    /// `assets` row; the retry re-runs the whole closure, so the event insert
+    /// must be idempotent — every stored materialization appears exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conflict_retry_does_not_duplicate_events() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let retry = super::super::retry::StorageRetryConfig {
+            max_retries: 10,
+            initial_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(5),
+            backoff_multiplier: 1.0,
+        };
+        let storage = std::sync::Arc::new(
+            SurrealStorage::new_embedded_with_retry(
+                temp_dir.as_path_untracked().to_str().unwrap(),
+                retry,
+                Capability::ReadWrite,
+            )
+            .await
+            .expect("failed to create rocksdb storage"),
+        );
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        for i in 0..100 {
+            let key = format!("orders_{i}");
+            storage
+                .register_assets(cl, &[make_asset_record(&key)])
+                .await
+                .unwrap();
+            let racers: Vec<EventRecord> = (0..8)
+                .map(|r| make_event(&key, &format!("mat{r}"), 100 + r as i64))
+                .collect();
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(racers.len()));
+            let tasks: Vec<_> = racers
+                .into_iter()
+                .map(|event| {
+                    let (s, b) = (storage.clone(), barrier.clone());
+                    tokio::spawn(async move {
+                        b.wait().await;
+                        s.store_event(&event).await.unwrap();
+                    })
+                })
+                .collect();
+            for task in tasks {
+                task.await.unwrap();
+            }
+            let events = storage.get_events_for_asset(cl, &key, 1000).await.unwrap();
+            assert_eq!(
+                events.len(),
+                8,
+                "iteration {i}: 8 materializations stored but {} event rows — \
+                 a conflict retry re-inserted an already-committed event",
+                events.len()
+            );
+        }
+    }
+
+    /// Concurrent observations race the same `assets` row. Whatever commits
+    /// last, the row must hold one observation's consistent (timestamp,
+    /// data_version) pair, and — once observation updates surface conflicts
+    /// and retry — the retried closure must not duplicate event rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_observations_stay_consistent() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let retry = super::super::retry::StorageRetryConfig {
+            max_retries: 10,
+            initial_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(5),
+            backoff_multiplier: 1.0,
+        };
+        let storage = std::sync::Arc::new(
+            SurrealStorage::new_embedded_with_retry(
+                temp_dir.as_path_untracked().to_str().unwrap(),
+                retry,
+                Capability::ReadWrite,
+            )
+            .await
+            .expect("failed to create rocksdb storage"),
+        );
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        for i in 0..100 {
+            let key = format!("sensor_{i}");
+            storage
+                .register_assets(cl, &[make_asset_record(&key)])
+                .await
+                .unwrap();
+            let racers: Vec<EventRecord> = (0..8)
+                .map(|r| {
+                    let mut e = make_event(&key, &format!("obs{r}"), 100 + r as i64);
+                    e.event_type = EventType::Observation {
+                        data_version: Some(format!("dv{r}")),
+                    };
+                    e
+                })
+                .collect();
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(racers.len()));
+            let tasks: Vec<_> = racers
+                .into_iter()
+                .map(|event| {
+                    let (s, b) = (storage.clone(), barrier.clone());
+                    tokio::spawn(async move {
+                        b.wait().await;
+                        s.store_event(&event).await.unwrap();
+                    })
+                })
+                .collect();
+            for task in tasks {
+                task.await.unwrap();
+            }
+            let events = storage.get_events_for_asset(cl, &key, 1000).await.unwrap();
+            assert_eq!(
+                events.len(),
+                8,
+                "iteration {i}: 8 observations stored but {} event rows",
+                events.len()
+            );
+            let record = storage.get_asset_record(cl, &key).await.unwrap().unwrap();
+            let ts = record.last_timestamp.expect("an observation committed");
+            let r = ts - 100;
+            assert!((0..8).contains(&r), "iteration {i}: foreign timestamp {ts}");
+            assert_eq!(
+                record.last_data_version.as_deref(),
+                Some(format!("dv{r}").as_str()),
+                "iteration {i}: assets row mixes two observations \
+                 (ts {ts} with {:?})",
+                record.last_data_version
+            );
         }
     }
 
