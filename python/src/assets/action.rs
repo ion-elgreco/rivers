@@ -105,6 +105,16 @@ pub enum PyActionPartitioning {
     Optional,
 }
 
+impl PyActionPartitioning {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Keyless => "keyless",
+            Self::Optional => "optional",
+        }
+    }
+}
+
 #[pymethods]
 impl PyActionPartitioning {
     fn __reduce__<'py>(

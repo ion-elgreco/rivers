@@ -567,9 +567,9 @@ impl ResolvedNode {
         self.find_action(verb).is_some_and(|a| a.is_async)
     }
 
-    /// `(name, outcome, exclusive, description)` for every action this node
-    /// supports — the gRPC `ActionInfo` projection.
-    pub(crate) fn list_actions(&self) -> Vec<(String, String, bool, Option<String>)> {
+    /// `(name, outcome, exclusive, partitioning, description)` for every
+    /// action this node supports — the gRPC `ActionInfo` projection.
+    pub(crate) fn list_actions(&self) -> Vec<(String, String, bool, String, Option<String>)> {
         match self {
             ResolvedNode::Asset(node) => node
                 .actions
@@ -579,6 +579,7 @@ impl ResolvedNode {
                         a.name.clone(),
                         a.outcome.as_str().to_string(),
                         a.exclusive,
+                        a.partitioning.as_str().to_string(),
                         a.description.clone(),
                     )
                 })

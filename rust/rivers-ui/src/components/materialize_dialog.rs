@@ -11,7 +11,7 @@ use crate::components::partition_picker::PartitionPicker;
 use crate::helpers::{JobPartitionPicker, stale_status_kind};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::mutations::{launch_backfill, trigger_action, trigger_materialize};
-use crate::types::{AssetRecord, StaleStatus, SubmitPartitionKey};
+use crate::types::{AssetActionInfo, AssetRecord, StaleStatus, SubmitPartitionKey};
 
 /// Above this many selected partitions, submit one backfill instead of a run each.
 const BACKFILL_THRESHOLD: usize = 2;
@@ -25,7 +25,12 @@ enum DialogOutcome {
 
 /// One-line description of exactly what a submit will launch. Mirrors the
 /// branching in `materialize_action` — if that changes, this must too.
-fn launch_summary(n_assets: usize, n_partitions: usize, partitioned: bool) -> String {
+fn launch_summary(
+    n_assets: usize,
+    n_partitions: usize,
+    partitioned: bool,
+    key_optional: bool,
+) -> String {
     if n_assets == 0 {
         return "Nothing selected".to_string();
     }
@@ -38,6 +43,10 @@ fn launch_summary(n_assets: usize, n_partitions: usize, partitioned: bool) -> St
         return format!("{assets} · 1 run");
     }
     if n_partitions == 0 {
+        // An Optional-key verb without a selection covers the whole asset.
+        if key_optional {
+            return format!("{assets} · whole asset · 1 run");
+        }
         return format!("{assets} · select a partition");
     }
     let parts = if n_partitions == 1 {
@@ -78,9 +87,11 @@ pub fn MaterializeDialog(
     #[prop(optional, into)]
     picker: Option<Signal<JobPartitionPicker>>,
     /// Verb to run instead of materialize. Same partition selection, submitted
-    /// as action runs (or an action backfill above the threshold).
+    /// as action runs (or an action backfill above the threshold). The verb's
+    /// `partitioning` drives the key requirement: Keyless hides the picker,
+    /// Optional allows an empty selection (whole asset).
     #[prop(optional, into)]
-    action: Option<Signal<Option<String>>>,
+    action: Option<Signal<Option<AssetActionInfo>>>,
     /// The verb clears materialization state (`Outcome.Unmaterialize`). Says so
     /// on the dialog — nothing else in the product distinguishes a destructive
     /// verb from a benign one.
@@ -92,7 +103,11 @@ pub fn MaterializeDialog(
     #[prop(into)]
     records: Signal<HashMap<String, AssetRecord>>,
 ) -> impl IntoView {
-    let verb: Signal<Option<String>> = action.unwrap_or_else(|| Signal::derive(|| None));
+    let verb_info: Signal<Option<AssetActionInfo>> =
+        action.unwrap_or_else(|| Signal::derive(|| None));
+    let verb: Signal<Option<String>> = Signal::derive(move || verb_info.get().map(|a| a.name));
+    let keyless_verb = Memo::new(move |_| verb_info.get().is_some_and(|a| a.is_keyless()));
+    let key_optional = Memo::new(move |_| verb_info.get().is_some_and(|a| a.key_optional()));
     let destructive: Signal<bool> = destructive.unwrap_or_else(|| Signal::derive(|| false));
     let (selected, set_selected) = signal(Vec::<String>::new());
     let partition_keys = RwSignal::new(Vec::<SubmitPartitionKey>::new());
@@ -201,13 +216,16 @@ pub fn MaterializeDialog(
 
     // Memo, not Signal::derive — read from six places per render, and the
     // sibling execute_job_dialog already memoizes the same predicate.
-    let is_partitioned =
-        Memo::new(move |_| !matches!(picker_signal.get(), JobPartitionPicker::None));
+    // A Keyless verb reads as unpartitioned: no picker, one whole-asset run.
+    let is_partitioned = Memo::new(move |_| {
+        !keyless_verb.get() && !matches!(picker_signal.get(), JobPartitionPicker::None)
+    });
     let summary = Signal::derive(move || {
         launch_summary(
             selected.get().len(),
             partition_keys.get().len(),
             is_partitioned.get(),
+            key_optional.get(),
         )
     });
     let submit_label = Signal::derive(move || {
@@ -390,7 +408,9 @@ pub fn MaterializeDialog(
                                     if pending.get() || selected.get().is_empty() {
                                         return true;
                                     }
-                                    is_partitioned.get() && partition_keys.get().is_empty()
+                                    is_partitioned.get()
+                                        && partition_keys.get().is_empty()
+                                        && !key_optional.get()
                                 }
                             >
                                 {move || submit_label.get()}
@@ -439,26 +459,33 @@ mod tests {
 
     #[test]
     fn empty_selection_reads_as_nothing() {
-        assert_eq!(launch_summary(0, 0, false), "Nothing selected");
-        assert_eq!(launch_summary(0, 5, true), "Nothing selected");
+        assert_eq!(launch_summary(0, 0, false, false), "Nothing selected");
+        assert_eq!(launch_summary(0, 5, true, false), "Nothing selected");
     }
 
     #[test]
     fn unpartitioned_is_always_one_run() {
-        assert_eq!(launch_summary(1, 0, false), "1 asset · 1 run");
-        assert_eq!(launch_summary(3, 0, false), "3 assets · 1 run");
+        assert_eq!(launch_summary(1, 0, false, false), "1 asset · 1 run");
+        assert_eq!(launch_summary(3, 0, false, false), "3 assets · 1 run");
     }
 
     #[test]
     fn partitioned_without_keys_asks_for_one() {
-        assert_eq!(launch_summary(2, 0, true), "2 assets · select a partition");
+        assert_eq!(launch_summary(2, 0, true, false), "2 assets · select a partition");
+    }
+
+    #[test]
+    fn optional_key_without_keys_covers_the_whole_asset() {
+        assert_eq!(launch_summary(2, 0, true, true), "2 assets · whole asset · 1 run");
+        // A selected key still runs partition-scoped.
+        assert_eq!(launch_summary(1, 1, true, true), "1 asset · 1 partition · 1 run");
     }
 
     #[test]
     fn one_run_per_partition_up_to_the_threshold() {
-        assert_eq!(launch_summary(1, 1, true), "1 asset · 1 partition · 1 run");
+        assert_eq!(launch_summary(1, 1, true, false), "1 asset · 1 partition · 1 run");
         assert_eq!(
-            launch_summary(3, 2, true),
+            launch_summary(3, 2, true, false),
             "3 assets · 2 partitions · 2 runs"
         );
     }
@@ -466,11 +493,11 @@ mod tests {
     #[test]
     fn past_the_threshold_it_is_a_backfill() {
         assert_eq!(
-            launch_summary(3, 3, true),
+            launch_summary(3, 3, true, false),
             "3 assets · 3 partitions · 1 backfill"
         );
         assert_eq!(
-            launch_summary(1, 400, true),
+            launch_summary(1, 400, true, false),
             "1 asset · 400 partitions · 1 backfill"
         );
     }

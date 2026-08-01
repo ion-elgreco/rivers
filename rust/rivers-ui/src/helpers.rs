@@ -1050,6 +1050,7 @@ mod tests {
                 name: name.to_string(),
                 outcome: outcome.to_string(),
                 exclusive: false,
+                partitioning: "required".to_string(),
                 description: None,
             })
             .collect();

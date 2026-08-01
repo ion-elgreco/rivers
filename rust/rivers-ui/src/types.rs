@@ -535,6 +535,9 @@ pub struct AssetActionInfo {
     /// "unchanged" | "may_materialize" | "unmaterialize" | "observe"
     pub outcome: String,
     pub exclusive: bool,
+    /// "required" | "keyless" | "optional" — partition-key rule for the verb.
+    #[serde(default)]
+    pub partitioning: String,
     pub description: Option<String>,
 }
 
@@ -543,6 +546,17 @@ impl AssetActionInfo {
     /// derive its warning styling from here, not a local string compare.
     pub fn is_destructive(&self) -> bool {
         self.outcome == "unmaterialize"
+    }
+
+    /// Whole-asset verb: never takes a partition key (optimize, vacuum).
+    pub fn is_keyless(&self) -> bool {
+        self.partitioning == "keyless"
+    }
+
+    /// A key is accepted but not required (delete, observe): keyless runs
+    /// cover the whole asset.
+    pub fn key_optional(&self) -> bool {
+        self.partitioning == "optional"
     }
 }
 

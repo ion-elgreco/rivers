@@ -161,6 +161,8 @@ message ActionInfo {
   string outcome = 2;
   bool exclusive = 3;
   optional string description = 4;
+  // "required" | "keyless" | "optional" — partition-key rule for the verb
+  string partitioning = 5;
 }
 
 message PartitionDefInfo {

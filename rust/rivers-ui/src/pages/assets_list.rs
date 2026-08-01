@@ -33,7 +33,7 @@ pub fn AssetsListPage() -> impl IntoView {
     let sort_asc = Signal::derive(move || sort_asc_str.get() != "false");
     let (selected, set_selected) = signal(Vec::<String>::new());
     let show_dialog = RwSignal::new(false);
-    let dialog_verb = RwSignal::new(Option::<String>::None);
+    let dialog_verb = RwSignal::new(Option::<crate::types::AssetActionInfo>::None);
     let dialog_destructive = RwSignal::new(false);
     let (attention_collapsed, set_attention_collapsed) = signal(true);
     // Wrap the setter in a Callback so it's Copy and can be freely captured by
@@ -377,7 +377,6 @@ pub fn AssetsListPage() -> impl IntoView {
                 </button>
                 {move || selection_verbs.get().into_iter().map(|act| {
                     let destructive = act.is_destructive();
-                    let verb = act.name.clone();
                     let label = act.name.clone();
                     let title = crate::helpers::action_title(&act, true);
                     view! {
@@ -385,7 +384,7 @@ pub fn AssetsListPage() -> impl IntoView {
                             class=if destructive { "btn btn-danger" } else { "btn" }
                             title=title
                             on:click=move |_| {
-                                dialog_verb.set(Some(verb.clone()));
+                                dialog_verb.set(Some(act.clone()));
                                 dialog_destructive.set(destructive);
                                 show_dialog.set(true);
                             }

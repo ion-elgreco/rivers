@@ -111,6 +111,7 @@ pub async fn get_assets_info(
                     name: act.name,
                     outcome: act.outcome,
                     exclusive: act.exclusive,
+                    partitioning: act.partitioning,
                     description: act.description,
                 })
                 .collect();

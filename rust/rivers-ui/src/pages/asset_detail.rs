@@ -219,7 +219,7 @@ pub fn AssetDetailPage() -> impl IntoView {
         }
     });
     let action_pending = run_asset_action.pending();
-    let dialog_verb = RwSignal::new(Option::<String>::None);
+    let dialog_verb = RwSignal::new(Option::<crate::types::AssetActionInfo>::None);
     let dialog_destructive = RwSignal::new(false);
 
     let (ns_t, name_t) = loc.get();
@@ -289,7 +289,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                                 {
                                     run_asset_action.dispatch(verb.clone());
                                 } else {
-                                    dialog_verb.set(Some(verb.clone()));
+                                    dialog_verb.set(Some(act.clone()));
                                     dialog_destructive.set(destructive);
                                     show_dialog.set(true);
                                 }

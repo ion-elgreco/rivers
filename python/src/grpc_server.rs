@@ -368,12 +368,15 @@ impl CodeLocationService for CodeLocationImpl {
                     let actions = node
                         .list_actions()
                         .into_iter()
-                        .map(|(name, outcome, exclusive, description)| ActionInfo {
-                            name,
-                            outcome,
-                            exclusive,
-                            description,
-                        })
+                        .map(
+                            |(name, outcome, exclusive, partitioning, description)| ActionInfo {
+                                name,
+                                outcome,
+                                exclusive,
+                                partitioning,
+                                description,
+                            },
+                        )
                         .collect();
 
                     assets.push(AssetDefinitionInfo {

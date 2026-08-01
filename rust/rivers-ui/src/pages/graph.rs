@@ -282,7 +282,7 @@ pub fn GraphPage() -> impl IntoView {
     });
     let (mat_targets, set_mat_targets) = signal(Vec::<String>::new());
     let show_dialog = RwSignal::new(false);
-    let dialog_verb = RwSignal::new(Option::<String>::None);
+    let dialog_verb = RwSignal::new(Option::<crate::types::AssetActionInfo>::None);
     let dialog_destructive = RwSignal::new(false);
     let materialize_picker = Signal::derive(move || {
         partition_picker_for_assets(&mat_targets.get(), &asset_info_by_key.get())
@@ -291,8 +291,9 @@ pub fn GraphPage() -> impl IntoView {
     // One opener for both flows — `None` verb materializes. The task-node
     // filter lives here once: task nodes can be selected for lineage tracing
     // but never executed.
-    let open_dialog: Callback<(Vec<String>, Option<String>, bool)> = Callback::new(
-        move |(keys, verb, destructive): (Vec<String>, Option<String>, bool)| {
+    type DialogVerb = Option<crate::types::AssetActionInfo>;
+    let open_dialog: Callback<(Vec<String>, DialogVerb, bool)> = Callback::new(
+        move |(keys, verb, destructive): (Vec<String>, DialogVerb, bool)| {
             let tasks = task_node_names.get_untracked();
             let keys: Vec<String> = keys.into_iter().filter(|k| !tasks.contains(k)).collect();
             if keys.is_empty() {
@@ -306,11 +307,12 @@ pub fn GraphPage() -> impl IntoView {
     );
     let start_materialize: Callback<Vec<String>> =
         Callback::new(move |keys: Vec<String>| open_dialog.run((keys, None, false)));
-    let start_action: Callback<(Vec<String>, String, bool)> = Callback::new(
-        move |(keys, verb, destructive): (Vec<String>, String, bool)| {
-            open_dialog.run((keys, Some(verb), destructive))
-        },
-    );
+    let start_action: Callback<(Vec<String>, crate::types::AssetActionInfo, bool)> =
+        Callback::new(
+            move |(keys, act, destructive): (Vec<String>, crate::types::AssetActionInfo, bool)| {
+                open_dialog.run((keys, Some(act), destructive))
+            },
+        );
 
     let all_kinds = Signal::derive(move || {
         layout
@@ -843,7 +845,6 @@ pub fn GraphPage() -> impl IntoView {
                                 </button>
                                 {common_actions(&mat_keys, &asset_info_by_key.get()).into_iter().map(|act| {
                                     let destructive = act.is_destructive();
-                                    let verb = act.name.clone();
                                     let label = act.name.clone();
                                     let keys = mat_keys.clone();
                                     let title = crate::helpers::action_title(&act, true);
@@ -851,7 +852,7 @@ pub fn GraphPage() -> impl IntoView {
                                         <button
                                             class=if destructive { "btn btn-danger dag-sidebar-action" } else { "btn dag-sidebar-action" }
                                             title=title
-                                            on:click=move |_| { start_action.run((keys.clone(), verb.clone(), destructive)); }
+                                            on:click=move |_| { start_action.run((keys.clone(), act.clone(), destructive)); }
                                         >{label}</button>
                                     }
                                 }).collect::<Vec<_>>()}
@@ -989,7 +990,6 @@ pub fn GraphPage() -> impl IntoView {
                                                     </button>
                                                     {node_verbs.into_iter().map(|act| {
                                                         let destructive = act.is_destructive();
-                                                        let verb = act.name.clone();
                                                         let label = act.name.clone();
                                                         let k = key_for_actions.clone();
                                                         let title = crate::helpers::action_title(&act, false);
@@ -997,7 +997,7 @@ pub fn GraphPage() -> impl IntoView {
                                                             <button
                                                                 class=if destructive { "btn btn-danger dag-sidebar-action" } else { "btn dag-sidebar-action" }
                                                                 title=title
-                                                                on:click=move |_| { start_action.run((vec![k.clone()], verb.clone(), destructive)); }
+                                                                on:click=move |_| { start_action.run((vec![k.clone()], act.clone(), destructive)); }
                                                             >{label}</button>
                                                         }
                                                     }).collect::<Vec<_>>()}
