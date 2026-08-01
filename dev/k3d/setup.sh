@@ -45,7 +45,7 @@ import_images=(rivers-operator:latest)
 k3d image import "${import_images[@]}" -c "${CLUSTER_NAME}"
 
 echo "==> Importing external images"
-for img in minio/mc:latest minio/minio:latest surrealdb/surrealdb:v3; do
+for img in rustfs/rustfs:latest amazon/aws-cli:latest surrealdb/surrealdb:v3; do
     # Skip the Docker Hub round-trip when a correct-arch copy is already
     # local (CI restores these from cache; locally they persist across runs).
     if [ "$(docker image inspect --format '{{.Architecture}}' "$img" 2>/dev/null)" != "arm64" ]; then

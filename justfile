@@ -204,7 +204,7 @@ k8s-test:
 k8s-wait:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Gate operator + SurrealDB + MinIO, then the baseline CodeLocation reaching
+    # Gate operator + SurrealDB + RustFS, then the baseline CodeLocation reaching
     # Ready (operator reconciled its pod, storage reachable). CI runs this before
     # the suite so a broken deploy fails loudly instead of the tests silently
     # skipping. RIVERS_K8S_SKIP_UI=1 drops the UI rollout wait.
@@ -214,7 +214,7 @@ k8s-wait:
     echo "==> Waiting for operator + storage + object store"
     "${kc[@]}" rollout status deploy/rivers-operator --timeout=240s
     "${kc[@]}" wait --for=condition=Ready pod -l app.kubernetes.io/name=surrealdb --timeout=240s
-    "${kc[@]}" wait --for=condition=Ready pod -l app.kubernetes.io/name=minio --timeout=180s
+    "${kc[@]}" wait --for=condition=Ready pod -l app.kubernetes.io/name=rustfs --timeout=180s
     if [ "${RIVERS_K8S_SKIP_UI:-}" != "1" ]; then
         "${kc[@]}" rollout status deploy/rivers-ui --timeout=180s
     fi

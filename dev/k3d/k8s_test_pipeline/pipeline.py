@@ -39,7 +39,7 @@ from rivers import (
     Task,
 )
 
-S3_ENDPOINT = os.environ.get("RIVERS_S3_ENDPOINT", "http://minio.rivers.svc:9000")
+S3_ENDPOINT = os.environ.get("RIVERS_S3_ENDPOINT", "http://rustfs.rivers.svc:9000")
 S3_BUCKET = os.environ.get("RIVERS_S3_BUCKET", "rivers-io")
 
 s3_store = obstore.store.S3Store(
