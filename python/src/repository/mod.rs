@@ -2609,7 +2609,7 @@ impl PyCodeRepository {
         // allow_incomplete_deps keeps the permissive "load missing upstream
         // from io_handler" semantics materialize has always offered (Job's
         // strict completeness check is too strict for ad-hoc selections).
-        let mut synthetic_job = PyJob::new_synthetic(
+        let synthetic_job = PyJob::new_synthetic(
             selected_names.into_iter().collect(),
             self.effective_executor(),
             true,
