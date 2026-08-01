@@ -105,7 +105,8 @@ impl DbStoredRunLog {
     }
 }
 
-/// One `asset_partitions` row, written in bulk via `upsert_asset_partitions`.
+/// One `asset_partitions` row, upserted via [`UPSERT_ASSET_PARTITIONS`] in
+/// the same transaction as its asset's row update.
 #[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
 struct DbAssetPartitionWrite {
     code_location_id: String,
@@ -1465,17 +1466,22 @@ impl SurrealStorage {
                 // it as "this dependency produced something new", so leaving it
                 // to advance would make deleting an asset trigger a
                 // materialization from data that no longer exists. The event id
-                // still points at the deletion so timelines resolve. Both
-                // statements ride one request — a drain full of whole-asset
-                // deletions otherwise pays two round-trips per event.
+                // still points at the deletion so timelines resolve. One
+                // transaction, not two statements: without it each statement
+                // commits on its own, and a concurrent materialization can land
+                // between them — leaving the asset row and its partition rows
+                // disagreeing. A conflict aborts the whole transaction and the
+                // caller's retry re-applies both statements.
                 self.db
                     .query(
-                        "UPDATE assets SET last_event_id = $event_id, last_run_id = NONE, \
+                        "BEGIN TRANSACTION; \
+                         UPDATE assets SET last_event_id = $event_id, last_run_id = NONE, \
                          last_timestamp = NONE, last_data_version = NONE, \
                          last_materialization_code_version = NONE, last_input_data_versions = [] \
                          WHERE code_location_id = $cl AND asset_key = $asset_key; \
                          DELETE FROM asset_partitions WHERE code_location_id = $cl \
-                         AND asset_key = $asset_key",
+                         AND asset_key = $asset_key; \
+                         COMMIT TRANSACTION;",
                     )
                     .bind(("cl", cl.to_string()))
                     .bind(("asset_key", asset_key.to_string()))
@@ -1501,23 +1507,6 @@ impl SurrealStorage {
             .await?;
         let rows: Vec<String> = result.take(0)?;
         Ok(rows.into_iter().collect())
-    }
-
-    async fn upsert_asset_partitions(&self, rows: Vec<DbAssetPartitionWrite>) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        self.db
-            .query(
-                "INSERT INTO asset_partitions $rows ON DUPLICATE KEY UPDATE \
-                 last_event_id = $input.last_event_id, \
-                 last_run_id = $input.last_run_id, \
-                 last_timestamp = $input.last_timestamp",
-            )
-            .bind(("rows", rows))
-            .await?
-            .check()?;
-        Ok(())
     }
 
     async fn query_pool_usage(
@@ -1754,6 +1743,15 @@ const MATERIALIZE_ASSET_UPDATE_KEEP_IDV: &str = "UPDATE assets SET last_event_id
 /// badge) must survive it.
 const MATERIALIZE_ASSET_UPDATE_ACTION: &str = "UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version WHERE code_location_id = $cl AND asset_key = $asset_key";
 
+/// Upsert `asset_partitions` rows on the UNIQUE index — one row per
+/// partition, latest event wins. Always rides one transaction with the
+/// asset-row update above so the two never disagree under a concurrent
+/// whole-asset deletion.
+const UPSERT_ASSET_PARTITIONS: &str = "INSERT INTO asset_partitions $rows ON DUPLICATE KEY UPDATE \
+     last_event_id = $input.last_event_id, \
+     last_run_id = $input.last_run_id, \
+     last_timestamp = $input.last_timestamp";
+
 impl StorageBackend for SurrealStorage {
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(cl = %event.code_location_id, asset_key = event.asset_key))]
     async fn store_event(&self, event: &EventRecord) -> Result<String> {
@@ -1790,15 +1788,25 @@ impl StorageBackend for SurrealStorage {
                     .action_run_ids(vec![event.run_id.clone()])
                     .await?
                     .is_empty();
+                let update_sql = if from_action {
+                    MATERIALIZE_ASSET_UPDATE_ACTION
+                } else if keep_idv {
+                    MATERIALIZE_ASSET_UPDATE_KEEP_IDV
+                } else {
+                    MATERIALIZE_ASSET_UPDATE
+                };
+                // The asset row and its partition row commit together — a
+                // concurrent whole-asset deletion lands wholly before or
+                // wholly after this materialization, never between the two.
+                let sql = match &event.partition_key {
+                    Some(_) => format!(
+                        "BEGIN TRANSACTION; {update_sql}; {UPSERT_ASSET_PARTITIONS}; COMMIT TRANSACTION;"
+                    ),
+                    None => update_sql.to_string(),
+                };
                 let mut query = self
                     .db
-                    .query(if from_action {
-                        MATERIALIZE_ASSET_UPDATE_ACTION
-                    } else if keep_idv {
-                        MATERIALIZE_ASSET_UPDATE_KEEP_IDV
-                    } else {
-                        MATERIALIZE_ASSET_UPDATE
-                    })
+                    .query(sql)
                     .bind(("cl", cl.to_string()))
                     .bind(("asset_key", asset_key.clone()))
                     .bind(("event_id", event_id.clone()))
@@ -1811,19 +1819,20 @@ impl StorageBackend for SurrealStorage {
                         query = query.bind(("idv", input_data_versions));
                     }
                 }
-                query.await?.check()?;
-
                 if let Some(partition_key) = &event.partition_key {
-                    self.upsert_asset_partitions(vec![DbAssetPartitionWrite {
-                        code_location_id: cl.to_string(),
-                        asset_key: asset_key.clone(),
-                        partition_key: partition_key.clone(),
-                        last_event_id: event_id.clone(),
-                        last_run_id: event.run_id.clone(),
-                        last_timestamp: event.timestamp,
-                    }])
-                    .await?;
+                    query = query.bind((
+                        "rows",
+                        vec![DbAssetPartitionWrite {
+                            code_location_id: cl.to_string(),
+                            asset_key: asset_key.clone(),
+                            partition_key: partition_key.clone(),
+                            last_event_id: event_id.clone(),
+                            last_run_id: event.run_id.clone(),
+                            last_timestamp: event.timestamp,
+                        }],
+                    ));
                 }
+                query.await?.check()?;
             }
 
         if let Some(asset_key) = &event.asset_key
@@ -1914,6 +1923,16 @@ impl StorageBackend for SurrealStorage {
             .into_iter()
             .collect();
         let action_ids = self.action_run_ids(update_run_ids).await?;
+        // Each asset's partition rows commit in one transaction with its
+        // `assets` row update — a concurrent whole-asset deletion lands
+        // wholly before or wholly after, never between the two. Every
+        // partition row comes from a materialization event, so its asset is
+        // always in `latest_mat`.
+        let mut parts_by_asset: std::collections::HashMap<(&str, &str), Vec<DbAssetPartitionWrite>> =
+            std::collections::HashMap::new();
+        for ((cl, ak, _), row) in part_rows {
+            parts_by_asset.entry((cl, ak)).or_default().push(row);
+        }
         for (&(cl, asset_key), &idx) in &latest_mat {
             let event = &events[idx];
             let event_id = &event_ids[idx];
@@ -1925,15 +1944,25 @@ impl StorageBackend for SurrealStorage {
             // owns provenance and the code-version stamp even when the
             // action's event is the newer one.
             let action_only = action_ids.contains(&event.run_id) && idv.is_none();
+            let update_sql = if action_only {
+                MATERIALIZE_ASSET_UPDATE_ACTION
+            } else if idv.is_some() {
+                MATERIALIZE_ASSET_UPDATE
+            } else {
+                MATERIALIZE_ASSET_UPDATE_KEEP_IDV
+            };
+            let parts = parts_by_asset.remove(&(cl, asset_key)).unwrap_or_default();
+            let has_parts = !parts.is_empty();
+            let sql = if has_parts {
+                format!(
+                    "BEGIN TRANSACTION; {update_sql}; {UPSERT_ASSET_PARTITIONS}; COMMIT TRANSACTION;"
+                )
+            } else {
+                update_sql.to_string()
+            };
             let mut query = self
                 .db
-                .query(if action_only {
-                    MATERIALIZE_ASSET_UPDATE_ACTION
-                } else if idv.is_some() {
-                    MATERIALIZE_ASSET_UPDATE
-                } else {
-                    MATERIALIZE_ASSET_UPDATE_KEEP_IDV
-                })
+                .query(sql)
                 .bind(("cl", cl.to_string()))
                 .bind(("asset_key", asset_key.to_string()))
                 .bind(("event_id", event_id.clone()))
@@ -1947,12 +1976,11 @@ impl StorageBackend for SurrealStorage {
             if let Some(idv) = idv {
                 query = query.bind(("idv", idv));
             }
+            if has_parts {
+                query = query.bind(("rows", parts));
+            }
             query.await?.check()?;
         }
-
-        // Upsert the affected partition rows in one bulk statement.
-        self.upsert_asset_partitions(part_rows.into_values().collect())
-            .await?;
 
         // Partition-scoped deletions collapse to one DELETE per asset — a
         // purge over a date range lands thousands of them in one drain.
@@ -4719,25 +4747,15 @@ mod tests {
                 .map(|(d, v)| (d.to_string(), vec![v.to_string()]))
                 .collect(),
         };
-        let row = |pk: PartitionKey, event_id: &str, ts: i64| super::DbAssetPartitionWrite {
-            code_location_id: cl.to_string(),
-            asset_key: "inventory".to_string(),
-            partition_key: pk,
-            last_event_id: event_id.to_string(),
-            last_run_id: "r".to_string(),
-            last_timestamp: ts,
-        };
 
         let date_first = mk(vec![("date", "2024-01-01"), ("region", "eu")]);
         let region_first = mk(vec![("region", "eu"), ("date", "2024-01-01")]);
-        storage
-            .upsert_asset_partitions(vec![row(date_first.clone(), "ev1", 1)])
-            .await
-            .unwrap();
-        storage
-            .upsert_asset_partitions(vec![row(region_first, "ev2", 2)])
-            .await
-            .unwrap();
+        let mut first = make_event("inventory", "r", 1);
+        first.partition_key = Some(date_first.clone());
+        storage.store_event(&first).await.unwrap();
+        let mut second = make_event("inventory", "r", 2);
+        second.partition_key = Some(region_first);
+        storage.store_event(&second).await.unwrap();
 
         let parts = storage
             .get_materialized_partitions(cl, "inventory")
@@ -4760,7 +4778,7 @@ mod tests {
 
     /// `store_events`/`store_event` upsert `asset_partitions` on the UNIQUE index to replace rather than duplicate.
     #[tokio::test]
-    async fn test_upsert_asset_partitions_replaces_on_unique_index() {
+    async fn test_partition_row_replaces_on_unique_index() {
         let temp_dir = test_temp_dir::test_temp_dir!();
         let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
             .await
@@ -4769,23 +4787,13 @@ mod tests {
         let pk = PartitionKey::Single {
             keys: vec!["p1".to_string()],
         };
-        let row = |event_id: &str, ts: i64| super::DbAssetPartitionWrite {
-            code_location_id: cl.to_string(),
-            asset_key: "inventory".to_string(),
-            partition_key: pk.clone(),
-            last_event_id: event_id.to_string(),
-            last_run_id: "r".to_string(),
-            last_timestamp: ts,
-        };
 
-        storage
-            .upsert_asset_partitions(vec![row("ev1", 1)])
-            .await
-            .unwrap();
-        storage
-            .upsert_asset_partitions(vec![row("ev2", 2)])
-            .await
-            .unwrap();
+        let mut first = make_event("inventory", "r", 1);
+        first.partition_key = Some(pk.clone());
+        storage.store_event(&first).await.unwrap();
+        let mut second = make_event("inventory", "r", 2);
+        second.partition_key = Some(pk.clone());
+        storage.store_event(&second).await.unwrap();
 
         // Upsert on the unique index updates in place: one row, latest values.
         let parts = storage
@@ -4806,6 +4814,117 @@ mod tests {
             vec![(pk.clone(), 2)],
             "must update the existing row in place"
         );
+    }
+
+    /// Race partitioned materializations against whole-asset deletions per
+    /// iteration on the RocksDB backend (kv-mem misses write-write conflicts)
+    /// and return each iteration's final asset row + partition set. Retries
+    /// keep their full budget but near-zero backoff so contended iterations
+    /// stay fast. `mat{r}` writes partition `p{r}`; the seed writes `pseed`.
+    async fn race_deletion_against_partitioned_mat(
+        iters: usize,
+    ) -> Vec<(AssetRecord, Vec<PartitionKey>)> {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let retry = super::super::retry::StorageRetryConfig {
+            max_retries: 10,
+            initial_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(5),
+            backoff_multiplier: 1.0,
+        };
+        let storage = std::sync::Arc::new(
+            SurrealStorage::new_embedded_with_retry(
+                temp_dir.as_path_untracked().to_str().unwrap(),
+                retry,
+                Capability::ReadWrite,
+            )
+            .await
+            .expect("failed to create rocksdb storage"),
+        );
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let single = |name: &str| PartitionKey::Single {
+            keys: vec![name.to_string()],
+        };
+        let mut finals = Vec::with_capacity(iters);
+        for i in 0..iters {
+            let key = format!("orders_{i}");
+            storage
+                .register_assets(cl, &[make_asset_record(&key)])
+                .await
+                .unwrap();
+            let mut seed = make_event(&key, "seed", 1);
+            seed.partition_key = Some(single("pseed"));
+            storage.store_event(&seed).await.unwrap();
+
+            let mut racers = Vec::new();
+            for r in 0..8 {
+                let mut mat = make_event(&key, &format!("mat{r}"), 100 + r as i64);
+                mat.partition_key = Some(single(&format!("p{r}")));
+                racers.push(mat);
+                let mut del = make_event(&key, &format!("del{r}"), 200 + r as i64);
+                del.event_type = EventType::Deletion;
+                racers.push(del);
+            }
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(racers.len()));
+            let tasks: Vec<_> = racers
+                .into_iter()
+                .map(|event| {
+                    let (s, b) = (storage.clone(), barrier.clone());
+                    tokio::spawn(async move {
+                        b.wait().await;
+                        // Contention exhausting the retry budget is a loud,
+                        // clean failure for the caller — only committed state
+                        // is under test here.
+                        let _ = s.store_event(&event).await;
+                    })
+                })
+                .collect();
+            for task in tasks {
+                task.await.unwrap();
+            }
+
+            let record = storage.get_asset_record(cl, &key).await.unwrap().unwrap();
+            let parts = storage.get_materialized_partitions(cl, &key).await.unwrap();
+            finals.push((record, parts));
+        }
+        finals
+    }
+
+    /// A whole-asset deletion and a partitioned materialization racing on the
+    /// same asset must serialize: afterwards the asset row and the partition
+    /// rows agree, whichever won. A torn state means one side's writes split
+    /// around the other's — the deletion's clear+delete or the materialize's
+    /// update+upsert landed as two independently-committed pieces.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deletion_and_materialization_consolidate_atomically() {
+        for (i, (record, parts)) in race_deletion_against_partitioned_mat(300)
+            .await
+            .iter()
+            .enumerate()
+        {
+            match record.last_run_id.as_deref() {
+                Some(run) => {
+                    let own = PartitionKey::Single {
+                        keys: vec![if run == "seed" {
+                            "pseed".to_string()
+                        } else {
+                            format!("p{}", run.trim_start_matches("mat"))
+                        }],
+                    };
+                    assert!(
+                        parts.contains(&own),
+                        "iteration {i}: asset row holds {run} but its partition \
+                         row is gone — a deletion split around that materialization \
+                         (partitions: {parts:?})"
+                    );
+                }
+                None => assert!(
+                    parts.is_empty(),
+                    "iteration {i}: asset row is cleared but partition rows \
+                     survived — a materialization split around a deletion \
+                     (partitions: {parts:?})"
+                ),
+            }
+        }
     }
 
     /// Per-partition lookups receive the display string and must still match a persisted Multi key.
