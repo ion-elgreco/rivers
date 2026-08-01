@@ -545,6 +545,20 @@ class ActionOrdering:
     UpstreamFirst: "ActionOrdering"
     DownstreamFirst: "ActionOrdering"
 
+class ActionPartitioning:
+    """Where a verb runs relative to the asset's partitions.
+
+    ``Required`` (the default) matches materialize: partitioned assets need a
+    partition key. ``Keyless`` marks a whole-asset verb — valid without a key
+    even on partitioned assets, and a supplied key is rejected (optimize,
+    vacuum, the built-in observe). ``Optional`` accepts both: keyed runs are
+    partition-scoped, keyless runs cover the whole asset (delete).
+    """
+
+    Required: "ActionPartitioning"
+    Keyless: "ActionPartitioning"
+    Optional: "ActionPartitioning"
+
 class AssetAction:
     """A named operation on an asset beyond materialize.
 
@@ -562,6 +576,7 @@ class AssetAction:
     name: str
     outcome: Outcome
     exclusive: bool
+    partitioning: ActionPartitioning
     description: str | None
 
     def __init__(
@@ -572,6 +587,7 @@ class AssetAction:
         ordering: ActionOrdering | None = ...,
         retry: "RetryPolicy | str | None" = ...,
         description: str | None = ...,
+        partitioning: ActionPartitioning | None = ...,
     ) -> None: ...
     def __call__(self, func: Callable[..., Any]) -> "AssetAction": ...
 
@@ -656,6 +672,7 @@ def action(
     retry: "RetryPolicy | str | None" = ...,
     description: str | None = ...,
     name: str | None = ...,
+    partitioning: "ActionPartitioning | None" = ...,
 ) -> Callable[[_F], _F]:
     """Mark a classmethod in an asset class body as an action."""
 

@@ -576,12 +576,10 @@ impl PyJob {
         raise_on_error: bool,
     ) -> PyResult<PyRunResult> {
         let (plan, node_map, executor) = self.validated_parts()?;
-        // A verb reaching a partitioned asset without a key is not a no-op: an
-        // `Unmaterialize` action emits a whole-asset Deletion and clears every
-        // partition. `run_action` gates this; the job path has to as well.
-        if let Some(action) = self.action.as_deref()
-            && !crate::repository::is_keyless_observe(Some(action), partition_key.as_ref())
-        {
+        // Key rules are per-action (`partitioning=`): a `Required` verb on a
+        // partitioned asset needs a key, a `Keyless` one rejects it. The job
+        // path enforces the same gate as `run_action`.
+        if let Some(action) = self.action.as_deref() {
             crate::repository::validate_partition_in_map(
                 node_map,
                 plan.all_asset_names().iter().map(String::as_str),

@@ -257,7 +257,7 @@ fn asset_name(cls: &Bound<'_, PyType>) -> PyResult<String> {
 ///     @classmethod
 ///     def optimize(cls, ctx) -> None: ...
 #[pyfunction]
-#[pyo3(signature = (*, outcome, concurrency=None, ordering=None, retry=None, description=None, name=None))]
+#[pyo3(signature = (*, outcome, concurrency=None, ordering=None, retry=None, description=None, name=None, partitioning=None))]
 pub(crate) fn action(
     py: Python<'_>,
     outcome: Py<PyAny>,
@@ -266,6 +266,7 @@ pub(crate) fn action(
     retry: Option<Py<PyAny>>,
     description: Option<Py<PyAny>>,
     name: Option<Py<PyAny>>,
+    partitioning: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     let meta = PyDict::new(py);
     meta.set_item("name", name)?;
@@ -274,6 +275,7 @@ pub(crate) fn action(
     meta.set_item("ordering", ordering)?;
     meta.set_item("retry", retry)?;
     meta.set_item("description", description)?;
+    meta.set_item("partitioning", partitioning)?;
     let meta: Py<PyDict> = meta.unbind();
 
     let deco = PyCFunction::new_closure(py, None, None, move |args, _kwargs| {
@@ -398,7 +400,14 @@ fn collect_actions<'py>(cls: &Bound<'py, PyType>) -> PyResult<Vec<Bound<'py, PyA
                     continue;
                 }
                 kwargs.set_item("name", &name)?;
-                for key in ["outcome", "concurrency", "ordering", "retry", "description"] {
+                for key in [
+                    "outcome",
+                    "concurrency",
+                    "ordering",
+                    "retry",
+                    "description",
+                    "partitioning",
+                ] {
                     kwargs.set_item(key, meta.get_item(key)?)?;
                 }
                 let act = py.get_type::<PyAssetAction>().call((), Some(&kwargs))?;

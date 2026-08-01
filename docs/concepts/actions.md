@@ -15,20 +15,23 @@ In a class-based asset, mark classmethods with `@rs.action`; shared verbs live i
 mixins and are inherited:
 
 ```python
-class DeltaAsset(rs.Asset):
+class TableMaintenance(rs.Asset):
     io_handler = WAREHOUSE
 
     @rs.action(outcome=rs.Outcome.Unchanged, concurrency=rs.ActionConcurrency.Exclusive)
     @classmethod
-    def optimize(cls, ctx: rs.ActionContext) -> None:
+    def compact(cls, ctx: rs.ActionContext) -> None:
         h = ctx.io_handler
-        DeltaTable(...).optimize.compact()
+        compact_small_files(h.asset_uri(ctx.asset_name))
 
 
-class Orders(DeltaAsset):
+class Orders(TableMaintenance):
     @classmethod
     def materialize(cls, ctx) -> pl.DataFrame: ...
 ```
+
+For Delta tables the standard maintenance verbs ship built in — subclass
+[`DeltaAsset`](../api-reference/delta.md#deltaasset) instead of hand-writing them.
 
 The decorator form attaches reusable `AssetAction` objects, mirroring `hooks=[...]`:
 
@@ -59,6 +62,12 @@ repo.run_action("compact", partition_key=rs.PartitionKey.single("2026-07-25"))
 
 With no `selection`, the action runs over every asset that defines it. Every targeted
 asset must define the verb — anything else is a validation error.
+
+Partition-key rules are per-verb, declared with `partitioning=`. The default,
+`ActionPartitioning.Required`, matches materialize: partitioned assets need a key.
+`ActionPartitioning.Keyless` marks a whole-asset verb — it runs without a key even
+on partitioned assets, and a supplied key is rejected up front. `Optional` accepts
+both: keyed runs are partition-scoped, keyless runs cover the whole asset.
 
 Multi-partition actions are ordinary backfills; child runs inherit the verb, and
 `rerun_backfill` preserves it:
@@ -186,9 +195,9 @@ verbs, use these declarations so a verb behaves the way its name promises:
 
 | Verb | Declaration |
 |------|-------------|
-| `optimize`, `vacuum` | `Outcome.Unchanged` + `ActionConcurrency.Exclusive` — rewrites bytes, never state |
+| `optimize`, `vacuum` | `Outcome.Unchanged` + `ActionConcurrency.Exclusive` + `ActionPartitioning.Keyless` — rewrites bytes table-wide, never state |
 | `merge`, `refresh` | `Outcome.MayMaterialize` — report an `ActionResult` |
-| `delete`, `purge` | `Outcome.Unmaterialize` + `ActionConcurrency.Exclusive` + `ActionOrdering.DownstreamFirst` |
+| `delete`, `purge` | `Outcome.Unmaterialize` + `ActionConcurrency.Exclusive` + `ActionOrdering.DownstreamFirst` + `ActionPartitioning.Optional` |
 
 Delta assets get `optimize`, `vacuum`, and `delete` with exactly these declarations
 built in — subclass [`DeltaAsset`](../api-reference/delta.md#deltaasset).

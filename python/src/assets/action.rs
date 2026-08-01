@@ -83,6 +83,38 @@ impl PyActionOrdering {
     }
 }
 
+/// Where a verb runs relative to the asset's partitions.
+#[pyclass(
+    name = "ActionPartitioning",
+    module = "rivers._core",
+    frozen,
+    eq,
+    hash,
+    from_py_object
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PyActionPartitioning {
+    /// Partitioned assets require a partition key, exactly like materialize.
+    #[default]
+    Required,
+    /// Whole-asset verb: never takes a key — valid keyless even on
+    /// partitioned assets (optimize, vacuum, the built-in observe).
+    Keyless,
+    /// Key optional: keyed runs are partition-scoped, keyless runs cover
+    /// the whole asset (delete).
+    Optional,
+}
+
+#[pymethods]
+impl PyActionPartitioning {
+    fn __reduce__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyAny>, String))> {
+        reduce_enum_variant::<Self>(py, format!("{self:?}"))
+    }
+}
+
 /// Whether an action can overlap other work on the same asset.
 #[pyclass(
     name = "ActionConcurrency",
@@ -146,6 +178,7 @@ pub struct PyAssetAction {
     pub outcome: ActionOutcome,
     pub exclusive: bool,
     pub ordering: ActionOrdering,
+    pub partitioning: PyActionPartitioning,
     pub retry: Option<rivers_core::execution::retry::RetryRef>,
     pub description: Option<String>,
     pub func: Option<Py<PyAny>>,
@@ -159,6 +192,7 @@ impl PyAssetAction {
             outcome: self.outcome,
             exclusive: self.exclusive,
             ordering: self.ordering,
+            partitioning: self.partitioning,
             retry: self.retry.clone(),
             description: self.description.clone(),
             func: Some(func),
@@ -181,14 +215,46 @@ pub(crate) struct ResolvedAction {
     pub exclusive: bool,
     pub ordering: ActionOrdering,
     pub outcome: ActionOutcome,
+    pub partitioning: PyActionPartitioning,
     pub retry: Option<rivers_core::execution::retry::RetryRef>,
     pub description: Option<String>,
+}
+
+impl ResolvedAction {
+    /// Snapshot a declared `PyAssetAction` (bound body included) at resolve.
+    pub(crate) fn from_asset_action(py: Python, a: &PyAssetAction) -> Self {
+        Self {
+            name: a.name.clone(),
+            func: a.func.as_ref().map(|f| f.clone_ref(py)),
+            is_async: a.is_async,
+            exclusive: a.exclusive,
+            ordering: a.ordering,
+            outcome: a.outcome,
+            partitioning: a.partitioning,
+            retry: a.retry.clone(),
+            description: a.description.clone(),
+        }
+    }
+
+    pub(crate) fn clone_ref(&self, py: Python) -> Self {
+        Self {
+            name: self.name.clone(),
+            func: self.func.as_ref().map(|f| f.clone_ref(py)),
+            is_async: self.is_async,
+            exclusive: self.exclusive,
+            ordering: self.ordering,
+            outcome: self.outcome,
+            partitioning: self.partitioning,
+            retry: self.retry.clone(),
+            description: self.description.clone(),
+        }
+    }
 }
 
 #[pymethods]
 impl PyAssetAction {
     #[new]
-    #[pyo3(signature = (name, outcome, concurrency=None, ordering=None, retry=None, description=None))]
+    #[pyo3(signature = (name, outcome, concurrency=None, ordering=None, retry=None, description=None, partitioning=None))]
     fn new(
         name: String,
         outcome: ActionOutcome,
@@ -196,6 +262,7 @@ impl PyAssetAction {
         ordering: Option<PyActionOrdering>,
         retry: Option<Bound<'_, PyAny>>,
         description: Option<String>,
+        partitioning: Option<PyActionPartitioning>,
     ) -> PyResult<Self> {
         if outcome == ActionOutcome::Observe {
             return Err(AssetDefinitionError::new_err(
@@ -212,6 +279,7 @@ impl PyAssetAction {
             outcome,
             exclusive: matches!(concurrency, Some(PyActionConcurrency::Exclusive)),
             ordering: ordering.unwrap_or(PyActionOrdering::Unordered).into(),
+            partitioning: partitioning.unwrap_or_default(),
             retry: crate::retry::extract_retry_ref(retry)?,
             description,
             func: None,
@@ -244,6 +312,11 @@ impl PyAssetAction {
     #[getter]
     fn exclusive(&self) -> bool {
         self.exclusive
+    }
+
+    #[getter(partitioning)]
+    fn partitioning_py(&self) -> PyActionPartitioning {
+        self.partitioning
     }
 
     #[getter]
@@ -286,6 +359,7 @@ impl PyAssetAction {
                 self.outcome,
                 self.exclusive,
                 self.ordering.into(),
+                self.partitioning,
                 retry,
                 self.description.clone(),
                 self.func.as_ref().map(|f| f.clone_ref(py)),
@@ -301,6 +375,7 @@ type ActionParts = (
     ActionOutcome,
     bool,
     PyActionOrdering,
+    PyActionPartitioning,
     Option<String>,
     Option<String>,
     Option<Py<PyAny>>,
@@ -316,6 +391,7 @@ pub fn _reconstruct_asset_action(
     outcome: ActionOutcome,
     exclusive: bool,
     ordering: PyActionOrdering,
+    partitioning: PyActionPartitioning,
     retry: Option<String>,
     description: Option<String>,
     func: Option<Py<PyAny>>,
@@ -333,6 +409,7 @@ pub fn _reconstruct_asset_action(
         outcome,
         exclusive,
         ordering: ordering.into(),
+        partitioning,
         retry,
         description,
         func,

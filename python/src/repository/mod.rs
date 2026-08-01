@@ -108,13 +108,17 @@ fn validate_partition_for_verb<'a>(
     validate_partition_in_map(&state.node_map, asset_names, partition_key, verb)
 }
 
-/// An unkeyed `observe` is a whole-asset observation — the observe fn takes no
-/// partition — so a partitioned observable must not be made to supply a key.
-pub(crate) fn is_keyless_observe(
+/// Partitioning declared for `verb` on `name`'s resolved action.
+/// Materialize (`verb` None) and unknown verbs read as `Required` — the
+/// verb-support check rejects unknown verbs elsewhere.
+fn action_partitioning(
+    node_map: &HashMap<String, ResolvedNode>,
+    name: &str,
     verb: Option<&str>,
-    partition_key: Option<&PyPartitionKey>,
-) -> bool {
-    verb == Some("observe") && partition_key.is_none()
+) -> crate::assets::action::PyActionPartitioning {
+    verb.and_then(|v| node_map.get(name)?.find_action(v))
+        .map(|a| a.partitioning)
+        .unwrap_or_default()
 }
 
 /// Resolve every selected name, rejecting unknown ones with the canonical
@@ -141,22 +145,40 @@ pub(crate) fn validate_partition_in_map<'a>(
     partition_key: Option<&PyPartitionKey>,
     verb: Option<&str>,
 ) -> PyResult<()> {
+    use crate::assets::action::PyActionPartitioning;
     let partitioned = iter_partitioned_assets(node_map, asset_names);
 
     let Some(pk) = partition_key else {
-        if partitioned.is_empty() {
+        // Keyless is only an error where the verb actually requires a key:
+        // a `Keyless` verb (optimize, vacuum, observe) is whole-asset by
+        // declaration, an `Optional` one (delete) covers the whole asset
+        // when unkeyed.
+        let requiring: Vec<&str> = partitioned
+            .iter()
+            .filter(|(n, _)| {
+                action_partitioning(node_map, n, verb) == PyActionPartitioning::Required
+            })
+            .map(|(n, _)| *n)
+            .collect();
+        if requiring.is_empty() {
             return Ok(());
         }
-        let names: Vec<&str> = partitioned.iter().map(|(n, _)| *n).collect();
         return Err(ExecutionError::new_err(format!(
             "Cannot run '{}' without partition_key: assets {:?} have partition \
              definitions. Provide a partition_key or exclude them from selection.",
             verb.unwrap_or("materialize"),
-            names
+            requiring
         )));
     };
 
     for (name, pd) in &partitioned {
+        if action_partitioning(node_map, name, verb) == PyActionPartitioning::Keyless {
+            return Err(ExecutionError::new_err(format!(
+                "Action '{}' is whole-asset on '{}': run it without a partition_key.",
+                verb.unwrap_or("materialize"),
+                name
+            )));
+        }
         if !pd.validate_partition_key(pk)? {
             return Err(ExecutionError::new_err(format!(
                 "Invalid partition_key '{}' for asset '{}': not a member of its \
@@ -1770,14 +1792,12 @@ impl RepoHandle {
             let asset_names = summary.asset_names.clone();
             let action = summary.action.clone();
 
-            if !is_keyless_observe(action.as_deref(), partition_key) {
-                validate_partition_for_verb(
-                    state,
-                    asset_names.iter().map(String::as_str),
-                    partition_key,
-                    action.as_deref(),
-                )?;
-            }
+            validate_partition_for_verb(
+                state,
+                asset_names.iter().map(String::as_str),
+                partition_key,
+                action.as_deref(),
+            )?;
             let dyn_checks = dynamic_partition_checks(
                 state,
                 asset_names.iter().map(String::as_str),
@@ -1922,9 +1942,6 @@ impl RepoHandle {
         partition_key: Option<&PyPartitionKey>,
         verb: Option<&str>,
     ) -> PyResult<()> {
-        if is_keyless_observe(verb, partition_key) {
-            return Ok(());
-        }
         let (dyn_checks, storage, code_location_id) = {
             let guard = self.state.read().unwrap();
             let state = guard.as_ref().ok_or_else(|| {
@@ -2727,26 +2744,23 @@ impl PyCodeRepository {
             )));
         }
 
-        let keyless_observe = is_keyless_observe(Some(&action), partition_key.as_ref());
-        if !keyless_observe {
-            validate_partition_for_verb(
-                state,
-                selected_names.iter().map(String::as_str),
-                partition_key.as_ref(),
-                Some(&action),
-            )?;
-            let dyn_checks = dynamic_partition_checks(
-                state,
-                selected_names.iter().map(String::as_str),
-                partition_key.as_ref(),
-            );
-            if !dyn_checks.is_empty() {
-                rt().block_on(verify_dynamic_partition_keys(
-                    &state.storage,
-                    &state.code_location_id,
-                    &dyn_checks,
-                ))?;
-            }
+        validate_partition_for_verb(
+            state,
+            selected_names.iter().map(String::as_str),
+            partition_key.as_ref(),
+            Some(&action),
+        )?;
+        let dyn_checks = dynamic_partition_checks(
+            state,
+            selected_names.iter().map(String::as_str),
+            partition_key.as_ref(),
+        );
+        if !dyn_checks.is_empty() {
+            rt().block_on(verify_dynamic_partition_keys(
+                &state.storage,
+                &state.code_location_id,
+                &dyn_checks,
+            ))?;
         }
 
         let mut synthetic_job =

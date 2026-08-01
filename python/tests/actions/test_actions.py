@@ -301,7 +301,35 @@ def test_action_failure_does_not_inherit_asset_retry():
     assert "StepFailure" in types
 
 
-def test_reverse_topological_ordering_downstream_first():
+def test_action_partitioning_declaration():
+    """partitioning= rides AssetAction and @rs.action; Required is the default."""
+    act = rs.AssetAction(
+        name="compact_all",
+        outcome=rs.Outcome.Unchanged,
+        partitioning=rs.ActionPartitioning.Keyless,
+    )
+    assert act.partitioning == rs.ActionPartitioning.Keyless
+    default = rs.AssetAction(name="touch", outcome=rs.Outcome.Unchanged)
+    assert default.partitioning == rs.ActionPartitioning.Required
+
+    class Purgeable(rs.Asset):
+        @rs.action(
+            outcome=rs.Outcome.Unmaterialize,
+            partitioning=rs.ActionPartitioning.Optional,
+        )
+        @classmethod
+        def purge(cls, ctx) -> None: ...
+
+        @classmethod
+        def materialize(cls) -> int:
+            return 1
+
+    desugared = rs._core.assets.desugar(Purgeable)
+    (purge,) = [a for a in desugared.actions if a.name == "purge"]
+    assert purge.partitioning == rs.ActionPartitioning.Optional
+
+
+def test_downstream_first_ordering():
     order = []
 
     class Purgeable(rs.Asset):

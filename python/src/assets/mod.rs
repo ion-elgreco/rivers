@@ -11,7 +11,10 @@ pub mod multi_asset;
 pub mod self_dependency;
 pub mod single_asset;
 
-use action::{ActionOutcome, PyActionConcurrency, PyActionOrdering, PyActionResult, PyAssetAction};
+use action::{
+    ActionOutcome, PyActionConcurrency, PyActionOrdering, PyActionPartitioning, PyActionResult,
+    PyAssetAction,
+};
 use decorator::{AssetDef, PyAsset};
 use dep_def::DepDef;
 use external_asset::PyExternalAsset;
@@ -40,6 +43,7 @@ pub fn register_asset_module(parent_module: &Bound<'_, PyModule>) -> PyResult<()
         ActionOutcome as "Outcome",
         PyActionConcurrency as "ActionConcurrency",
         PyActionOrdering as "ActionOrdering",
+        PyActionPartitioning as "ActionPartitioning",
         PyActionContext as "ActionContext",
         PyActionResult as "ActionResult",
     ], fns [

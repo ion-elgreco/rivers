@@ -282,6 +282,9 @@ impl ResolvedAsset {
                     exclusive: false,
                     ordering: rivers_core::execution::plan::ActionOrdering::Unordered,
                     outcome: crate::assets::action::ActionOutcome::Observe,
+                    // Keyless observes the whole asset; keyed observes one
+                    // partition — both are supported, so the key is optional.
+                    partitioning: crate::assets::action::PyActionPartitioning::Optional,
                     retry: None,
                     description: Some("Record an observation of external data".to_string()),
                 }],
@@ -293,17 +296,7 @@ impl ResolvedAsset {
                     .output_actions(lookup)
                     .iter()
                     .map(|a| {
-                        let a = a.borrow(py);
-                        crate::assets::action::ResolvedAction {
-                            name: a.name.clone(),
-                            func: a.func.as_ref().map(|f| f.clone_ref(py)),
-                            is_async: a.is_async,
-                            exclusive: a.exclusive,
-                            ordering: a.ordering,
-                            outcome: a.outcome,
-                            retry: a.retry.clone(),
-                            description: a.description.clone(),
-                        }
+                        crate::assets::action::ResolvedAction::from_asset_action(py, &a.borrow(py))
                     })
                     .collect()
             }
@@ -370,20 +363,7 @@ impl ResolvedAsset {
             graph_invocation_order: self.graph_invocation_order.clone(),
             observe_fn: self.observe_fn.as_ref().map(|f| f.clone_ref(py)),
             automation_condition: self.automation_condition.clone(),
-            actions: self
-                .actions
-                .iter()
-                .map(|a| crate::assets::action::ResolvedAction {
-                    name: a.name.clone(),
-                    func: a.func.as_ref().map(|f| f.clone_ref(py)),
-                    is_async: a.is_async,
-                    exclusive: a.exclusive,
-                    ordering: a.ordering,
-                    outcome: a.outcome,
-                    retry: a.retry.clone(),
-                    description: a.description.clone(),
-                })
-                .collect(),
+            actions: self.actions.iter().map(|a| a.clone_ref(py)).collect(),
         }
     }
 }
