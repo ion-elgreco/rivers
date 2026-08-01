@@ -157,22 +157,27 @@ through base classes like everything else, and a subclass override replaces the
 inherited action:
 
 ```python
-class DeltaAsset(rs.Asset):
+class TableMaintenance(rs.Asset):
     io_handler = WAREHOUSE
 
     @rs.action(outcome=rs.Outcome.Unchanged, concurrency=rs.ActionConcurrency.Exclusive)
     @classmethod
     def optimize(cls, ctx: rs.ActionContext) -> None: ...
 
-    @rs.action(outcome=rs.Outcome.Unchanged)
+    @rs.action(outcome=rs.Outcome.Unchanged, concurrency=rs.ActionConcurrency.Exclusive)
     @classmethod
     def vacuum(cls, ctx: rs.ActionContext) -> None: ...
 
 
-class Orders(DeltaAsset):        # inherits optimize + vacuum
+class Orders(TableMaintenance):  # inherits optimize + vacuum
     @classmethod
     def materialize(cls, ctx) -> pl.DataFrame: ...
 ```
+
+Delta tables don't need hand-written maintenance verbs:
+[`DeltaAsset`](../api-reference/delta.md#deltaasset) ships `optimize`, `vacuum`,
+and `delete` built in, declared per the
+[conventional verbs](../concepts/actions.md#conventional-verbs) table.
 
 Reusable `AssetAction` objects can also be assigned as class attributes
 (`optimize = delta_optimize`). Shadowing an inherited action with a non-action
