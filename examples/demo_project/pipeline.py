@@ -16,9 +16,10 @@ import time
 from datetime import datetime
 
 import obstore.store
+import pyarrow as pa
+from deltalake import write_deltalake
 from pydantic import BaseModel
 from rivers import (
-    ActionConcurrency,
     ActionContext,
     ActionResult,
     Asset,
@@ -30,10 +31,11 @@ from rivers import (
     BackfillStrategy,
     BashTask,
     CodeRepository,
+    DeltaAsset,
+    DeltaIOHandler,
     Executor,
     Hook,
     HookContext,
-    InputContext,
     Job,
     MetadataValue,
     Observation,
@@ -107,6 +109,19 @@ if _deployment == "cloud":
     raw_io = VersionedPickleIOHandler(store=_s3_store, prefix="raw")
     processed_io = VersionedPickleIOHandler(store=_s3_store, prefix="processed")
     output_io = VersionedPickleIOHandler(store=_s3_store, prefix="output")
+    delta_io = DeltaIOHandler(
+        table_uri=f"s3://{os.environ.get('RIVERS_S3_BUCKET', 'rivers-io')}/delta",
+        mode="append",
+        storage_options={
+            "AWS_ENDPOINT_URL": os.environ.get(
+                "RIVERS_S3_ENDPOINT", "http://minio.rivers.svc:9000"
+            ),
+            "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", ""),
+            "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+            "AWS_REGION": os.environ.get("AWS_REGION", "us-east-1"),
+            "AWS_ALLOW_HTTP": "true",
+        },
+    )
 else:
     _io_root = os.path.join(os.getcwd(), ".rivers", "demo-io")
     os.makedirs(_io_root, exist_ok=True)
@@ -114,6 +129,9 @@ else:
     raw_io = VersionedPickleIOHandler(store=_local_store, prefix="raw")
     processed_io = VersionedPickleIOHandler(store=_local_store, prefix="processed")
     output_io = VersionedPickleIOHandler(store=_local_store, prefix="output")
+    delta_io = DeltaIOHandler(
+        table_uri=os.path.join(_io_root, "delta"), mode="append"
+    )
 
 
 # =============================================================================
@@ -1154,44 +1172,31 @@ def metadata_showcase(context: AssetExecutionContext) -> dict:
 
 
 # =============================================================================
-# Asset Actions — class-form asset with maintenance verbs
+# Asset Actions — native DeltaAsset with built-in maintenance verbs
 # =============================================================================
-# Every verb below is a button on the event_log asset page. `optimize` is
-# exclusive: it serializes against materialize and other exclusive verbs via
-# the implicit __asset__:event_log pool (watch the run Gantt while one runs).
+# `event_log` is a real Delta table. `optimize`, `vacuum`, and `delete` come
+# from the DeltaAsset base — each a button on the asset page doing the real
+# Delta operation (compaction, file cleanup, row deletion + state clear).
+# `optimize` is exclusive: it serializes against materialize and other
+# exclusive verbs via the implicit __asset__:event_log pool (watch the run
+# Gantt while one runs). `refresh` shows a custom verb on top of the base.
 
 
-class EventLog(Asset):
-    """Append-only event log with maintenance actions."""
+class EventLog(DeltaAsset):
+    """Append-only event log stored as a Delta table."""
 
     name = "event_log"
-    io_handler = output_io
+    io_handler = delta_io
     tags = ["maintenance", "actions-demo"]
-    kinds = "table"
     group = "maintenance_demo"
-    metadata = {"format": "pickle"}
 
     @classmethod
-    def materialize(cls, context: AssetExecutionContext) -> dict:
-        rows = [{"id": i, "event": f"evt-{i:03d}"} for i in range(100)]
-        context.add_output_metadata({"rows": MetadataValue.int(len(rows))})
-        return {"rows": rows, "compacted": False}
-
-    @action(
-        outcome=Outcome.Unchanged,
-        concurrency=ActionConcurrency.Exclusive,
-        description="Compact the log in place; runs exclusively with materialize",
-    )
-    @classmethod
-    def optimize(cls, ctx: ActionContext) -> None:
-        ctx.log.info("[optimize] compacting %s (run=%s)", ctx.asset_name, ctx.run_id)
-        time.sleep(3)
-        ctx.log.info("[optimize] done")
-
-    @action(outcome=Outcome.Unchanged, description="Drop expired snapshots")
-    @classmethod
-    def vacuum(cls, ctx: ActionContext) -> None:
-        ctx.log.info("[vacuum] removing expired snapshots for %s", ctx.asset_name)
+    def materialize(cls, context: AssetExecutionContext) -> pa.Table:
+        events = pa.table(
+            {"id": list(range(100)), "event": [f"evt-{i:03d}" for i in range(100)]}
+        )
+        context.add_output_metadata({"rows": MetadataValue.int(events.num_rows)})
+        return events
 
     @action(
         outcome=Outcome.MayMaterialize,
@@ -1202,27 +1207,16 @@ class EventLog(Asset):
         if int(time.time()) % 2:
             ctx.log.info("[refresh] no late events for %s", ctx.asset_name)
             return ActionResult.unchanged()
-        # handle_output replaces the whole value, so append to what is there.
         handler = ctx.io_handler
-        current = handler.load_input(
-            InputContext(asset_name="event_log", downstream_asset="event_log")
-        )
-        rows = list(current["rows"])
-        rows.append({"id": f"late-{len(rows)}", "event": "evt-late"})
-        handler.handle_output(
-            OutputContext(asset_name="event_log"),
-            {"rows": rows, "compacted": current["compacted"]},
+        late = pa.table({"id": [int(time.time())], "event": ["evt-late"]})
+        write_deltalake(
+            handler.asset_table_uri(ctx.asset_name, ctx.asset_metadata),
+            late,
+            mode="append",
+            storage_options=handler.storage_options,
         )
         ctx.log.info("[refresh] appended late events to %s", ctx.asset_name)
         return ActionResult.materialized(metadata={"late_rows": 1})
-
-    @action(
-        outcome=Outcome.Unmaterialize,
-        description="Drop the log and clear materialization state",
-    )
-    @classmethod
-    def delete(cls, ctx: ActionContext) -> None:
-        ctx.log.info("[delete] dropping %s — state cleared", ctx.asset_name)
 
 
 # =============================================================================
