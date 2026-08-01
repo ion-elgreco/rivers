@@ -1178,8 +1178,10 @@ def metadata_showcase(context: AssetExecutionContext) -> dict:
 # from the DeltaAsset base — each a button on the asset page doing the real
 # Delta operation (compaction, file cleanup, row deletion + state clear).
 # `optimize` is exclusive: it serializes against materialize and other
-# exclusive verbs via the implicit __asset__:event_log pool (watch the run
-# Gantt while one runs). `refresh` shows a custom verb on top of the base.
+# exclusive verbs via the implicit __asset__:event_log pool. On this tiny
+# table the verbs finish in milliseconds, so the serialization won't be
+# visible on the Gantt — the pool page shows the exclusive claim instead.
+# `refresh` shows a custom verb on top of the base.
 
 
 class EventLog(DeltaAsset):
