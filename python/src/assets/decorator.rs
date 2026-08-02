@@ -615,6 +615,13 @@ impl AssetDef {
         self.deps.iter().map(|d| d.clone_ref(py)).collect()
     }
 
+    /// Per-output actions (the `actions=` argument) — the introspection route
+    /// for a multi-asset's verbs, which live on its outputs.
+    #[getter]
+    fn actions(&self, py: Python) -> Vec<Py<super::action::PyAssetAction>> {
+        self.actions.iter().map(|a| a.clone_ref(py)).collect()
+    }
+
     /// The definition object, or the `partition_defs` registry name string.
     #[getter]
     fn partitions_def(&self, py: Python) -> Option<Py<PyAny>> {

@@ -352,6 +352,8 @@ class AssetDef:
     partitions_def: PartitionsDefinition | str | None
     partition_mapping: dict[str | AssetDef, PartitionMapping] | None
     pool: list[tuple[str, int]]
+    actions: list["AssetAction"]
+    """Per-output actions — a multi-asset's verbs live here, on its outputs."""
 
     def __init__(
         self,

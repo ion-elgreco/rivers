@@ -129,6 +129,25 @@ def test_multi_asset_output_keeps_assetdef_metadata():
     assert by_name["events"].metadata is None
 
 
+def test_multi_asset_verbs_introspectable_via_output_defs():
+    """A multi-asset's verbs live on its outputs: ``output_defs[i].actions``
+    is the introspection route (``.actions`` on the multi itself is None)."""
+    compact = rs.AssetAction(name="compact", outcome=rs.Outcome.Unchanged)(
+        lambda ctx: None
+    )
+
+    @rs.Asset.from_multi(
+        output_defs=[rs.AssetDef("a"), rs.AssetDef("b")],
+        actions=[compact],
+    )
+    def multi():
+        return {"a": 1, "b": 2}
+
+    assert multi.actions is None
+    for d in multi.output_defs:
+        assert [a.name for a in d.actions] == ["compact"]
+
+
 def test_multi_asset_per_output_fields_survive_resolve(storage):
     """Per-output tags/group/pool/metadata from ``from_multi`` reach the
     RESOLVED node — the assets row, pool registration, and the io context —
