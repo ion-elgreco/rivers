@@ -133,6 +133,10 @@ pub(super) struct RefreshDelta {
     pub(super) failed_adds: HashMap<String, FailedRun>,
     /// Asset keys whose success clears `failed_assets`, with the success run's timestamp.
     pub(super) failed_removes: HashMap<String, i64>,
+    /// Whole-asset deletion timestamps from completed action runs: last-run
+    /// map slots at or before the deletion are dropped at apply (the floors
+    /// ride `failed_removes`).
+    pub(super) deletion_supersessions: Vec<(String, i64)>,
     /// `asset → run_ids` where the asset's step succeeded but its record write lags.
     pub(super) materialized_overrides: HashMap<String, HashSet<String>>,
     /// Latest-run tag/asset-name updates, gated on materialization at apply.

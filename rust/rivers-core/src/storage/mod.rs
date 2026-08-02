@@ -1621,6 +1621,14 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         code_location_id: &str,
     ) -> impl Future<Output = Result<HashMap<String, i64>>> + Send;
 
+    /// Newest non-action `Success` run containing the asset — the last-run-map
+    /// adoption fallback when `assets.last_run_id` points at an action run.
+    fn get_latest_materialize_run(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+    ) -> impl Future<Output = Result<Option<RunRecord>>> + Send;
+
     fn get_backfills(
         &self,
         code_location_id: &str,
@@ -2026,6 +2034,12 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
     pub async fn get_asset_deletion_timestamps(&self) -> Result<HashMap<String, i64>> {
         self.backend
             .get_asset_deletion_timestamps(self.code_location_id)
+            .await
+    }
+
+    pub async fn get_latest_materialize_run(&self, asset_key: &str) -> Result<Option<RunRecord>> {
+        self.backend
+            .get_latest_materialize_run(self.code_location_id, asset_key)
             .await
     }
 

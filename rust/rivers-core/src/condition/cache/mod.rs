@@ -421,6 +421,10 @@ impl AssetConditionCache {
             let runs_by_id: HashMap<&str, &crate::storage::RunRecord> =
                 last_runs.iter().map(|r| (r.run_id.as_str(), r)).collect();
             type AssetRunRow = (String, Option<PartitionKey>, i64, RunTags, Arc<[String]>);
+            // Assets whose newest consolidated run is an action: adopt the
+            // newest real materialize below instead — steady state keeps that
+            // run's entry when the verb completes, so a restart must too.
+            let mut action_masked: Vec<String> = Vec::new();
             let asset_runs: Vec<AssetRunRow> = self
                 .records
                 .values()
@@ -430,6 +434,7 @@ impl AssetConditionCache {
                     // action runs into the last-run maps, so a restart must not
                     // adopt one either.
                     if run.is_action() {
+                        action_masked.push(record.asset_key.clone());
                         return None;
                     }
                     let run_ts = run.end_time.unwrap_or(run.start_time);
@@ -453,6 +458,17 @@ impl AssetConditionCache {
                 .collect();
             for (asset_key, partition_key, run_ts, tags, asset_names) in &asset_runs {
                 self.update_last_run_maps(asset_key, partition_key, *run_ts, tags, asset_names);
+            }
+            for asset_key in action_masked {
+                let Some(run) = scoped.get_latest_materialize_run(&asset_key).await? else {
+                    continue;
+                };
+                let run_ts = run.end_time.unwrap_or(run.start_time);
+                let tags: RunTags = Arc::from(run.tags.as_slice());
+                let names: Arc<[String]> = Arc::from(run.node_names.as_slice());
+                for pk in run_partition_slots(self.is_partitioned(&asset_key), &run) {
+                    self.update_last_run_maps(&asset_key, &pk, run_ts, &tags, &names);
+                }
             }
         }
 

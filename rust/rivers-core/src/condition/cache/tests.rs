@@ -783,6 +783,157 @@ async fn initial_load_skips_action_runs_in_last_run_maps() {
     );
 }
 
+/// When the newest consolidated run is an action, restart adopts the newest
+/// non-action run instead: steady state keeps the previous materialize's
+/// entry, so a restart must not flip `LastExecutedWithTags` or `eager()`'s
+/// last-run suppression.
+#[tokio::test]
+async fn initial_load_adopts_newest_non_action_run_behind_an_action() {
+    use crate::storage::PerCodeLocationStorage;
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+    storage
+        .register_assets(&cl, &[rec_with_run("events", None, 0)])
+        .await
+        .unwrap();
+
+    let mat_event = |run: &str, ts: i64| crate::storage::EventRecord {
+        code_location_id: cl.clone(),
+        event_type: crate::storage::EventType::Materialization {
+            data_version: Some(format!("dv_{ts}")),
+        },
+        asset_key: Some("events".to_string()),
+        run_id: run.to_string(),
+        partition_key: None,
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+
+    // R1: a real materialize, tagged, co-materializing a sibling.
+    let mut mat = mk_run("r1", RunStatus::Success, &["events", "rollup"], 1000);
+    mat.tags = vec![("team".to_string(), "data".to_string())];
+    storage.create_run(&mat).await.unwrap();
+    storage.store_events(&[mat_event("r1", 1000)]).await.unwrap();
+
+    // R2: a MayMaterialize verb reports materialized() → last_run_id = r2.
+    let mut act = mk_run("r2", RunStatus::Success, &["events"], 2000);
+    act.action = Some("refresh".to_string());
+    storage.create_run(&act).await.unwrap();
+    storage.store_events(&[mat_event("r2", 2000)]).await.unwrap();
+
+    let mut cache = AssetConditionCache::new(cl.clone());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let tags = cache
+        .last_run_tags
+        .get("events")
+        .and_then(|slots| slots.get(&None))
+        .expect("restart must adopt r1 (newest non-action) into the tag map");
+    assert_eq!(
+        tags.as_ref(),
+        &[("team".to_string(), "data".to_string())],
+        "adopted tags must be r1's, not the action run's"
+    );
+    let names = cache
+        .last_run_asset_names
+        .get("events")
+        .and_then(|slots| slots.get(&None))
+        .expect("restart must adopt r1 into the asset-names map");
+    assert!(names.contains(&"rollup".to_string()));
+}
+
+/// A completed whole-asset delete clears the last-run maps in steady state —
+/// the record is gone and a restart would adopt nothing, so keeping the
+/// entries makes `LastExecutedWithTags` flip on the next restart.
+#[tokio::test]
+async fn completed_delete_clears_last_run_maps_in_steady_state() {
+    use crate::storage::PerCodeLocationStorage;
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+    storage
+        .register_assets(&cl, &[rec_with_run("events", None, 0)])
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(cl.clone());
+    cache.refresh(&storage, 0).await.unwrap();
+
+    // Steady state: a tagged materialize seeds the last-run maps.
+    let mut mat = mk_run("r1", RunStatus::Success, &["events"], 1000);
+    mat.tags = vec![("team".to_string(), "data".to_string())];
+    storage.create_run(&mat).await.unwrap();
+    storage
+        .store_events(&[crate::storage::EventRecord {
+            code_location_id: cl.clone(),
+            event_type: crate::storage::EventType::Materialization {
+                data_version: Some("dv_1".to_string()),
+            },
+            asset_key: Some("events".to_string()),
+            run_id: "r1".to_string(),
+            partition_key: None,
+            timestamp: 1000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        }])
+        .await
+        .unwrap();
+    cache.refresh(&storage, 1).await.unwrap();
+    assert!(
+        cache
+            .last_run_tags
+            .get("events")
+            .and_then(|s| s.get(&None))
+            .is_some(),
+        "sanity: the materialize seeded the tag map"
+    );
+
+    // A whole-asset delete completes.
+    let mut del = mk_run("d", RunStatus::Started, &["events"], 2000);
+    del.end_time = None;
+    del.action = Some("delete".to_string());
+    storage.create_run(&del).await.unwrap();
+    storage
+        .store_events(&[crate::storage::EventRecord {
+            code_location_id: cl.clone(),
+            event_type: crate::storage::EventType::Deletion,
+            asset_key: Some("events".to_string()),
+            run_id: "d".to_string(),
+            partition_key: None,
+            timestamp: 2000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        }])
+        .await
+        .unwrap();
+    storage
+        .update_run_status("d", RunStatus::Success, Some(2000))
+        .await
+        .unwrap();
+    cache.refresh(&storage, 2).await.unwrap();
+
+    assert!(
+        cache
+            .last_run_tags
+            .get("events")
+            .and_then(|s| s.get(&None))
+            .is_none(),
+        "whole-asset delete must clear the last-run tag entry"
+    );
+    assert!(
+        cache
+            .last_run_asset_names
+            .get("events")
+            .and_then(|s| s.get(&None))
+            .is_none(),
+        "whole-asset delete must clear the last-run asset-names entry"
+    );
+}
+
 /// Deleting a partition wipes the timestamp row that superseded its old
 /// failures, so a daemon restart would resurrect it as failed — and
 /// `eager()`'s `!ExecutionFailed` gate then keeps it from ever being

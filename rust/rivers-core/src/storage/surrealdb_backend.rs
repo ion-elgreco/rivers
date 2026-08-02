@@ -1250,6 +1250,31 @@ fn run_queued_event(record: &RunRecord) -> EventRecord {
 }
 
 impl SurrealStorage {
+    /// Conditional `update_run_status`: mark `Failure` only while the run is
+    /// still non-terminal. Returns whether a row matched — `false` means the
+    /// run already reached a terminal status and was left alone (a late
+    /// launch-error must not stomp a concurrent Canceled/Success write).
+    pub async fn fail_run_if_active(&self, run_id: &str, end_time: i64) -> Result<bool> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut response = self
+                .db
+                .query(
+                    "UPDATE runs SET status = 'Failure', end_time = $end_time \
+                     WHERE run_id = $run_id \
+                     AND status IN ['NotStarted', 'Queued', 'Started'] \
+                     RETURN AFTER",
+                )
+                .bind(("run_id", run_id.to_string()))
+                .bind(("end_time", end_time))
+                .await
+                .context("failed to fail-out run")?
+                .check()?;
+            let rows: Vec<RunRecord> = response.take(0)?;
+            Ok(!rows.is_empty())
+        })
+        .await
+    }
+
     /// Persist a queued `RunRecord` and emit its `RunQueued` event in one step.
     pub async fn enqueue_run(&self, record: &RunRecord) -> Result<()> {
         let event = DbEventWrite::from_event(&run_queued_event(record), new_event_record_id());
@@ -3768,12 +3793,16 @@ impl PerCodeLocationStorage for SurrealStorage {
         // node_names` defeats every index, so each extra runs query here is a
         // full table walk per invalidated asset per tick. (An inline subquery
         // is worse, not better: SurrealDB re-evaluates a non-planner-computable
-        // WHERE per outer row.)
+        // WHERE per outer row.) The predicate keeps only the rows the two
+        // consumers read — action runs and failures — so a hot asset's
+        // thousands of clean materializes never leave the database.
         let mut result = self
             .db
             .query(
-                "SELECT run_id, status, action, partition_key, start_time FROM runs \
-                 WHERE code_location_id = $cl AND $asset_key IN node_names",
+                "SELECT run_id, status, action, partition_key, start_time, end_time \
+                 FROM runs \
+                 WHERE code_location_id = $cl AND $asset_key IN node_names \
+                 AND (action IS NOT NONE OR status = 'Failure')",
             )
             .bind(("cl", code_location_id.to_string()))
             .bind(("asset_key", asset_key.to_string()))
@@ -3786,6 +3815,7 @@ impl PerCodeLocationStorage for SurrealStorage {
             action: Option<String>,
             partition_key: Option<PartitionKey>,
             start_time: i64,
+            end_time: Option<i64>,
         }
 
         let scan: Vec<RunScanRow> = result.take(0)?;
@@ -3840,11 +3870,15 @@ impl PerCodeLocationStorage for SurrealStorage {
             let Some(pk) = &row.partition_key else {
                 continue;
             };
+            // End-time basis, like every other reader of the supersession
+            // rule: the failure happens when the run ends, so a deletion
+            // during the run must not outrank it.
+            let ts = row.end_time.unwrap_or(row.start_time);
             for member in pk.members() {
                 latest_failure
                     .entry(member)
-                    .and_modify(|t| *t = (*t).max(row.start_time))
-                    .or_insert(row.start_time);
+                    .and_modify(|t| *t = (*t).max(ts))
+                    .or_insert(ts);
             }
         }
 
@@ -3922,6 +3956,30 @@ impl PerCodeLocationStorage for SurrealStorage {
 
         let rows: Vec<DelTsRow> = result.take(0)?;
         Ok(rows.into_iter().map(|r| (r.asset_key, r.ts)).collect())
+    }
+
+    async fn get_latest_materialize_run(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+    ) -> Result<Option<RunRecord>> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut response = self
+                .db
+                .query(
+                    "SELECT * FROM runs WHERE code_location_id = $cl \
+                     AND $asset IN node_names AND action IS NONE \
+                     AND status = 'Success' \
+                     ORDER BY start_time DESC LIMIT 1",
+                )
+                .bind(("cl", code_location_id.to_string()))
+                .bind(("asset", asset_key.to_string()))
+                .await
+                .context("failed to fetch latest materialize run")?;
+            let runs: Vec<RunRecord> = response.take(0)?;
+            Ok(runs.into_iter().next())
+        })
+        .await
     }
 
     async fn get_backfills(
@@ -9241,6 +9299,96 @@ mod tests {
             .await
             .unwrap();
         assert!(empty.is_empty());
+    }
+
+    /// A late launch-error must not stomp a terminal status written by a
+    /// concurrent canceller — the fail-out only lands on active runs.
+    #[tokio::test]
+    async fn fail_run_if_active_leaves_terminal_runs_alone() {
+        let storage = make_storage().await;
+
+        let mut canceled = RunRecord {
+            run_id: "gone".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Canceled,
+            start_time: 100,
+            end_time: Some(150),
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+        };
+        storage.create_run(&canceled).await.unwrap();
+        assert!(
+            !storage.fail_run_if_active("gone", 200).await.unwrap(),
+            "terminal run must be left alone"
+        );
+        let rec = storage.get_run("gone").await.unwrap().unwrap();
+        assert_eq!(rec.status, RunStatus::Canceled, "status stomped");
+        assert_eq!(rec.end_time, Some(150));
+
+        canceled.run_id = "fresh".to_string();
+        canceled.status = RunStatus::NotStarted;
+        canceled.end_time = None;
+        storage.create_run(&canceled).await.unwrap();
+        assert!(
+            storage.fail_run_if_active("fresh", 200).await.unwrap(),
+            "active run must fail out"
+        );
+        let rec = storage.get_run("fresh").await.unwrap().unwrap();
+        assert_eq!(rec.status, RunStatus::Failure);
+        assert_eq!(rec.end_time, Some(200));
+    }
+
+    /// Status-only keyed failures floor at run END: a whole-asset deletion
+    /// landing mid-run (start < deletion < end) must not outrank the failure —
+    /// every other reader of the supersession rule uses the end-time basis.
+    #[tokio::test]
+    async fn deletion_during_a_run_does_not_outrank_its_failure() {
+        let storage = make_storage().await;
+        register(&storage, &["orders"]).await;
+
+        let run = RunRecord {
+            run_id: "late_fail".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Failure,
+            start_time: 90,
+            end_time: Some(110),
+            tags: vec![],
+            node_names: vec!["orders".to_string()],
+            priority: 0,
+            partition_key: Some(PartitionKey::Single {
+                keys: vec!["p1".to_string()],
+            }),
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+        };
+        storage.create_run(&run).await.unwrap();
+
+        let mut deletion = make_event("orders", "cleanup", 100);
+        deletion.event_type = EventType::Deletion;
+        storage.store_event(&deletion).await.unwrap();
+
+        let failed = storage
+            .get_failed_partitions(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                "orders",
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            failed.contains_key(&PartitionKey::Single {
+                keys: vec!["p1".to_string()]
+            }),
+            "a deletion at 100 must not clear a failure that ended at 110"
+        );
     }
 
     #[tokio::test]

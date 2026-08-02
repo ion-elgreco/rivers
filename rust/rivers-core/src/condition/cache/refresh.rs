@@ -332,6 +332,7 @@ impl AssetConditionCache {
                         .entry(asset.clone())
                         .and_modify(|t| *t = (*t).max(del))
                         .or_insert(del);
+                    delta.deletion_supersessions.push((asset.clone(), del));
                 }
             }
         }
@@ -672,6 +673,7 @@ impl AssetConditionCache {
             in_progress_changes,
             failed_adds,
             failed_removes,
+            deletion_supersessions,
             materialized_overrides,
             last_run_updates,
             tick_tag_updates,
@@ -756,6 +758,26 @@ impl AssetConditionCache {
             // that MATERIALIZED the asset — mirror the failure-floor gate.
             if self.run_materialized_asset(&asset, &run_id, &materialized_overrides) {
                 self.update_last_run_maps(&asset, &pk, run_ts, &tags, &names);
+            }
+        }
+        // A whole-asset deletion outdates every last-run slot it postdates —
+        // the record is gone, and a restart would adopt nothing. Runs after
+        // the deletion (applied above with a newer entry ts) survive.
+        for (asset, del_ts) in deletion_supersessions {
+            let stale: Vec<Option<PartitionKey>> = self
+                .last_run_entry_ts
+                .iter()
+                .filter(|((a, _), ts)| *a == asset && **ts <= del_ts)
+                .map(|((_, pk), _)| pk.clone())
+                .collect();
+            for pk in stale {
+                self.last_run_entry_ts.remove(&(asset.clone(), pk.clone()));
+                if let Some(slots) = self.last_run_tags.get_mut(&asset) {
+                    slots.remove(&pk);
+                }
+                if let Some(slots) = self.last_run_asset_names.get_mut(&asset) {
+                    slots.remove(&pk);
+                }
             }
         }
         for (asset, pk, run_id, run_failed, tags) in tick_tag_updates {

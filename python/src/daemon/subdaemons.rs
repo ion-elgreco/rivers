@@ -295,17 +295,25 @@ pub(crate) async fn fail_unlaunched_run(
     run_id: &str,
     error: &str,
 ) {
-    if let Err(e) = storage
-        .update_run_status(run_id, RunStatus::Failure, Some(now_ts()))
-        .await
-    {
-        tracing::error!(
-            target: "rivers::coordinator",
-            run_id = %run_id,
-            error = %e,
-            "failed to fail-out an unlaunched run; it will read as in-flight until the next sweep"
-        );
-        return;
+    match storage.fail_run_if_active(run_id, now_ts()).await {
+        Err(e) => {
+            tracing::error!(
+                target: "rivers::coordinator",
+                run_id = %run_id,
+                error = %e,
+                "failed to fail-out an unlaunched run; it will read as in-flight until the next sweep"
+            );
+            return;
+        }
+        Ok(false) => {
+            tracing::info!(
+                target: "rivers::coordinator",
+                run_id = %run_id,
+                "launch error for an already-terminal run — leaving its status"
+            );
+            return;
+        }
+        Ok(true) => {}
     }
     if let Err(e) = storage
         .store_event(&EventRecord {
