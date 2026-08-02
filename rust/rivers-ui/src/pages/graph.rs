@@ -271,15 +271,7 @@ pub fn GraphPage() -> impl IntoView {
             .collect::<std::collections::HashMap<String, crate::types::AssetDefinitionInfo>>()
     });
     // The dialog's row decoration, from the page's own live resource.
-    let records_by_key = Memo::new(move |_| {
-        all_assets
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| (r.asset_key.clone(), r))
-            .collect::<std::collections::HashMap<String, crate::types::AssetRecord>>()
-    });
+    let (records_by_key, records_failed) = crate::helpers::records_by_key(all_assets);
     let (mat_targets, set_mat_targets) = signal(Vec::<String>::new());
     let show_dialog = RwSignal::new(false);
     let dialog_verb = RwSignal::new(Option::<crate::types::AssetActionInfo>::None);
@@ -1023,6 +1015,7 @@ pub fn GraphPage() -> impl IntoView {
             action=dialog_verb
             destructive=dialog_destructive
             records=records_by_key
+            records_failed=records_failed
         />
     }
 }

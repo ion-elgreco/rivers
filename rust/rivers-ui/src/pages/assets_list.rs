@@ -51,15 +51,7 @@ pub fn AssetsListPage() -> impl IntoView {
         |((ns, name), _)| get_assets(ns, name, None, None, None),
     );
     // The materialize dialog's row decoration, from this page's live resource.
-    let records_by_key = Memo::new(move |_| {
-        all_assets
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| (r.asset_key.clone(), r))
-            .collect::<std::collections::HashMap<String, AssetRecord>>()
-    });
+    let (records_by_key, records_failed) = crate::helpers::records_by_key(all_assets);
     let assets_info = Resource::new(
         move || (refresh_tick.get(), loc.get()),
         |(_tick, (ns, name))| async move { get_assets_info(ns, name).await },
@@ -734,6 +726,7 @@ pub fn AssetsListPage() -> impl IntoView {
             action=dialog_verb
             destructive=dialog_destructive
             records=records_by_key
+            records_failed=records_failed
         />
     }
 }

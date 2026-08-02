@@ -102,7 +102,14 @@ pub fn MaterializeDialog(
     /// re-fetch every asset per open.
     #[prop(into)]
     records: Signal<HashMap<String, AssetRecord>>,
+    /// The host's records fetch failed: rows keep the last good data, and the
+    /// dialog says so — silently unlabeled rows read as healthy in a dialog
+    /// that may be confirming a destructive verb.
+    #[prop(optional, into)]
+    records_failed: Option<Signal<bool>>,
 ) -> impl IntoView {
+    let records_failed: Signal<bool> =
+        records_failed.unwrap_or_else(|| Signal::derive(|| false));
     let verb_info: Signal<Option<AssetActionInfo>> =
         action.unwrap_or_else(|| Signal::derive(|| None));
     let verb: Signal<Option<String>> = Signal::derive(move || verb_info.get().map(|a| a.name));
@@ -259,6 +266,12 @@ pub fn MaterializeDialog(
                     <Show when=move || destructive.get()>
                         <p class="text-error mat-dialog-warning">
                             "Clears materialization state for the selected assets."
+                        </p>
+                    </Show>
+
+                    <Show when=move || records_failed.get()>
+                        <p class="mat-dialog-meta-warning">
+                            "Couldn't load asset status — staleness not shown."
                         </p>
                     </Show>
 

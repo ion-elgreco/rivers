@@ -574,6 +574,29 @@ pub fn partition_picker_for_assets(
     }
 }
 
+/// Asset records keyed by asset_key from a page's `get_assets` resource,
+/// plus whether the latest fetch failed. Keeps the last good map on `Err`
+/// so a transient failure doesn't blank every consumer — the flag is what
+/// surfaces the failure (the materialize dialog's staleness warning).
+pub fn records_by_key(
+    all_assets: Resource<Result<Vec<crate::types::AssetRecord>, ServerFnError>>,
+) -> (
+    Memo<std::collections::HashMap<String, crate::types::AssetRecord>>,
+    Memo<bool>,
+) {
+    let records = Memo::new(move |prev: Option<&std::collections::HashMap<_, _>>| {
+        match all_assets.get() {
+            Some(Ok(assets)) => assets
+                .into_iter()
+                .map(|a| (a.asset_key.clone(), a))
+                .collect(),
+            _ => prev.cloned().unwrap_or_default(),
+        }
+    });
+    let failed = Memo::new(move |_| matches!(all_assets.get(), Some(Err(_))));
+    (records, failed)
+}
+
 /// Actions an asset offers as generic verb buttons — everything but
 /// `observe`, which external assets surface through their own Observe button.
 pub fn offered_actions(info: &AssetDefinitionInfo) -> Vec<crate::types::AssetActionInfo> {

@@ -94,15 +94,7 @@ pub fn AssetDetailPage() -> impl IntoView {
         |((ns, name), _)| get_assets(ns, name, None, None, None),
     );
     // The materialize dialog's row decoration, from this page's live resource.
-    let records_by_key = Memo::new(move |_| {
-        all_assets
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| (r.asset_key.clone(), r))
-            .collect::<std::collections::HashMap<String, crate::types::AssetRecord>>()
-    });
+    let (records_by_key, records_failed) = crate::helpers::records_by_key(all_assets);
 
     let (active_tab, set_active_tab) = use_query_param("tab", "overview");
     let (event_filter, set_event_filter) = use_query_param("event_filter", "All");
@@ -732,13 +724,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                 {move || {
                     let current_key = key();
                     let topo = graph.get().and_then(|r| r.ok());
-                    let records_by_key: std::collections::HashMap<String, crate::types::AssetRecord> = all_assets
-                        .get()
-                        .and_then(|r| r.ok())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|r| (r.asset_key.clone(), r))
-                        .collect();
+                    let records_by_key = records_by_key.get();
 
                     let (upstream, downstream): (Vec<String>, Vec<String>) = topo
                         .map(|t| (t.direct_upstream(&current_key), t.direct_downstream(&current_key)))
@@ -806,6 +792,7 @@ pub fn AssetDetailPage() -> impl IntoView {
             action=dialog_verb
             destructive=dialog_destructive
             records=records_by_key
+            records_failed=records_failed
         />
     }
 }
