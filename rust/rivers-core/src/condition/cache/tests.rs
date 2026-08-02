@@ -425,20 +425,8 @@ async fn deleted_partition_evicted_from_partition_status() {
         .create_run(&mk_run("r0", RunStatus::Success, &["events"], 1000))
         .await
         .unwrap();
-    let mat_event = |pk: &str, ts: i64| crate::storage::EventRecord {
-        code_location_id: cl.clone(),
-        event_type: crate::storage::EventType::Materialization {
-            data_version: Some(format!("dv_{pk}_{ts}")),
-        },
-        asset_key: Some("events".to_string()),
-        run_id: "r0".to_string(),
-        partition_key: Some(single(pk)),
-        timestamp: ts,
-        metadata: vec![],
-        input_data_versions: vec![],
-    };
     storage
-        .store_events(&[mat_event("p1", 1000), mat_event("p2", 1000)])
+        .store_events(&mat_events_for(&cl, "events", &["p1", "p2"], 1000))
         .await
         .unwrap();
 
@@ -459,16 +447,7 @@ async fn deleted_partition_evicted_from_partition_status() {
     del.action = Some("delete".to_string());
     storage.create_run(&del).await.unwrap();
     storage
-        .store_events(&[crate::storage::EventRecord {
-            code_location_id: cl.clone(),
-            event_type: crate::storage::EventType::Deletion,
-            asset_key: Some("events".to_string()),
-            run_id: "r1".to_string(),
-            partition_key: Some(single("p1")),
-            timestamp: 2000,
-            metadata: vec![],
-            input_data_versions: vec![],
-        }])
+        .store_events(&[deletion_event(&cl, "events", "r1", "p1", 2000)])
         .await
         .unwrap();
     storage

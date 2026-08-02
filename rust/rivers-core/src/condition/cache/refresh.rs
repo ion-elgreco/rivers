@@ -195,27 +195,29 @@ impl AssetConditionCache {
                 }
             }
             // A watched id missing from the lookup: the runs row vanished
-            // (deleted after finishing). Same rule as the tracked sweep; the
-            // stored names + key still drive invalidation and row re-checks.
+            // (deleted after finishing). The stored names + key still drive
+            // invalidation and row re-checks. (Action runs are never in
+            // `pending_runs` — only the condition daemon's materialize
+            // dispatch registers there — so no pending grace applies.)
             if watched.len() < ids.len() {
                 let found: HashSet<&str> = watched.iter().map(|r| r.run_id.as_str()).collect();
                 for (run_id, live) in &self.live_action_runs {
-                    if found.contains(run_id.as_str()) || self.pending_runs.contains_key(run_id) {
+                    if found.contains(run_id.as_str()) {
                         continue;
                     }
+                    tracing::info!(
+                        target: "rivers::conditions",
+                        run_id = %run_id,
+                        "watched action run vanished (deleted after finishing); \
+                         re-checking its partitions"
+                    );
                     delta.untrack_action_runs.push(run_id.clone());
                     invalidated_keys.extend(live.node_names.iter().cloned());
-                    if let Some(pk) = &live.partition_key {
-                        for asset in &live.node_names {
-                            if self.is_partitioned(asset) {
-                                delta
-                                    .action_partition_checks
-                                    .entry(asset.clone())
-                                    .or_default()
-                                    .extend(pk.members());
-                            }
-                        }
-                    }
+                    self.queue_action_partition_checks(
+                        &live.node_names,
+                        live.partition_key.as_ref(),
+                        &mut delta,
+                    );
                 }
             }
         }
@@ -474,17 +476,11 @@ impl AssetConditionCache {
             delta
                 .applied_runs
                 .push((run.run_id.clone(), run.start_time));
-            if let Some(pk) = &run.partition_key {
-                for asset in &run.node_names {
-                    if self.is_partitioned(asset) {
-                        delta
-                            .action_partition_checks
-                            .entry(asset.clone())
-                            .or_default()
-                            .extend(pk.members());
-                    }
-                }
-            }
+            self.queue_action_partition_checks(
+                &run.node_names,
+                run.partition_key.as_ref(),
+                delta,
+            );
             return true;
         }
         if !matches!(run.status, RunStatus::Success | RunStatus::Failure) {
@@ -645,6 +641,28 @@ impl AssetConditionCache {
             );
         }
         Ok(out)
+    }
+
+    /// Queue an action run's touched partition keys for the existence
+    /// re-check — the incremental timestamp fetch can't see row deletions.
+    fn queue_action_partition_checks(
+        &self,
+        node_names: &[String],
+        partition_key: Option<&PartitionKey>,
+        delta: &mut RefreshDelta,
+    ) {
+        let Some(pk) = partition_key else {
+            return;
+        };
+        for asset in node_names {
+            if self.is_partitioned(asset) {
+                delta
+                    .action_partition_checks
+                    .entry(asset.clone())
+                    .or_default()
+                    .extend(pk.members());
+            }
+        }
     }
 
     /// Whether `run_id` is the run that materialized `asset` this refresh: the
