@@ -637,28 +637,34 @@ pub fn common_actions(
     let Some(base) = asset_info_by_key.get(first) else {
         return Vec::new();
     };
-    let offered = offered_actions(base);
-    offered
+    base.actions
         .iter()
-        .filter(|a| {
-            assets[1..].iter().all(|k| {
-                asset_info_by_key
-                    .get(k)
-                    .is_some_and(|i| i.actions.iter().any(|b| b.name == a.name))
-            })
-        })
-        .map(|a| {
+        .filter(|a| a.name != "observe")
+        .filter_map(|a| {
+            // One pass over the selection per verb: bail if any member lacks
+            // the verb, collecting each member's variant on the way.
             // Outcomes may diverge per asset for one verb name, and this row
             // only drives the confirmation styling (execution re-resolves per
             // target) — so a destructive variant on ANY member wins over the
             // first asset's.
-            assets
+            let variants: Option<Vec<&crate::types::AssetActionInfo>> = assets
                 .iter()
-                .filter_map(|k| asset_info_by_key.get(k))
-                .filter_map(|i| i.actions.iter().find(|b| b.name == a.name))
-                .find(|b| b.is_destructive())
-                .unwrap_or(a)
-                .clone()
+                .map(|k| {
+                    asset_info_by_key
+                        .get(k)?
+                        .actions
+                        .iter()
+                        .find(|b| b.name == a.name)
+                })
+                .collect();
+            let variants = variants?;
+            Some(
+                (*variants
+                    .iter()
+                    .find(|b| b.is_destructive())
+                    .unwrap_or(&variants[0]))
+                .clone(),
+            )
         })
         .collect()
 }

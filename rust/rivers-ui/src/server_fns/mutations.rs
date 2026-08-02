@@ -164,8 +164,9 @@ pub async fn trigger_action(
 ) -> Result<String, ServerFnError> {
     use rivers_api::rivers::RunActionRequest;
 
-    // A `#[server]` fn is a public HTTP endpoint, so an empty selection must not
-    // reach the backend and read as "every asset declaring the verb".
+    // The backend rejects an empty selection too (all_assets is always false
+    // here) — this copy just fails fast with a clean message instead of a
+    // gRPC status string, and without the round trip.
     if selection.is_empty() {
         return Err(ServerFnError::new(format!(
             "action '{action}' needs at least one asset"
