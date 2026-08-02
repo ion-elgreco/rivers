@@ -258,6 +258,8 @@ class Asset:
 
     Declaration-time input: a class body may list actions built elsewhere
     (e.g. a mixin's verb); ``@rs.action`` bodies register themselves.
+    ``None`` for multi-assets — their verbs live per output on the
+    ``output_defs`` entries (``AssetDef.actions``).
     """
 
     @property

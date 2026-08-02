@@ -460,6 +460,21 @@ class Storage:
         """(Internal) sweep expired leases; return the number of slots freed."""
         ...
 
+    def _create_run(
+        self,
+        run_id: str,
+        job_name: str,
+        status: str,
+        start_time: int,
+        priority: int = 0,
+        tags: list[tuple[str, str]] = ...,
+        block_reason: str | None = None,
+        node_names: list[str] = ...,
+        action: str | None = None,
+    ) -> None:
+        """(Internal) create a run record directly — test helper."""
+        ...
+
     def get_queued_runs(self) -> list[RunRecord]:
         """Return every run currently in the ``Queued`` state."""
         ...
