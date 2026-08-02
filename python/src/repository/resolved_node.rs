@@ -184,22 +184,47 @@ impl ResolvedAsset {
             Asset::External(ext) if ext.observe_fn.is_some()
         );
 
-        let tags = asset.tags().cloned();
-        let kinds = asset.kinds().0.clone();
-        let group = asset.group().cloned();
-        let code_version = asset.code_version().cloned();
-        let pool = asset.pool().clone();
+        // Multi outputs read their per-output SingleAsset — `from_multi`
+        // already merged the top-level values into each one, so the whole-
+        // asset accessors (None/empty for Multi) would drop them all.
+        let single_for_output = match (asset, &output_name) {
+            (Asset::Multi(multi), Some(out)) => multi
+                .assets
+                .iter()
+                .find(|sa| sa.name.as_deref() == Some(out.as_str())),
+            _ => None,
+        };
+        let tags = match single_for_output {
+            Some(sa) => sa.tags.clone(),
+            None => asset.tags().cloned(),
+        };
+        let kinds = match single_for_output {
+            Some(sa) => sa.kinds.0.clone(),
+            None => asset.kinds().0.clone(),
+        };
+        let group = match single_for_output {
+            Some(sa) => sa.group.clone(),
+            None => asset.group().cloned(),
+        };
+        let code_version = match single_for_output {
+            Some(sa) => sa.code_version.clone(),
+            None => asset.code_version().cloned(),
+        };
+        let pool = match single_for_output {
+            Some(sa) => sa.pool.clone(),
+            None => asset.pool().clone(),
+        };
         let compute = asset.compute_for_output(output_name.as_deref()).cloned();
-        let metadata = asset.metadata().cloned();
+        let metadata = match single_for_output {
+            Some(sa) => sa.metadata.clone(),
+            None => asset.metadata().cloned(),
+        };
         let backfill_strategy = asset.backfill_strategy().cloned();
 
         // For Multi outputs, prefer the per-output partitions_def, falling back
         // to the multi-level value. For other shapes, use the asset-level value.
-        let partitions_def_ref = if let (Asset::Multi(multi), Some(out)) = (asset, &output_name) {
-            multi
-                .assets
-                .iter()
-                .find(|sa| sa.name.as_deref() == Some(out.as_str()))
+        let partitions_def_ref = if let Asset::Multi(multi) = asset {
+            single_for_output
                 .and_then(|sa| sa.partitions_def.as_ref())
                 .or(multi.partitions_def.as_ref())
         } else {

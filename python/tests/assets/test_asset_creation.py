@@ -129,6 +129,54 @@ def test_multi_asset_output_keeps_assetdef_metadata():
     assert by_name["events"].metadata is None
 
 
+def test_multi_asset_per_output_fields_survive_resolve(storage):
+    """Per-output tags/group/pool/metadata from ``from_multi`` reach the
+    RESOLVED node — the assets row, pool registration, and the io context —
+    not just ``output_defs``."""
+    seen = {}
+
+    class Recorder(rs.BaseIOHandler):
+        def handle_output(self, context, obj):
+            seen[context.asset_name] = context.asset_metadata
+
+        def load_input(self, context):
+            return None
+
+    @rs.Asset.from_multi(
+        output_defs=[
+            rs.AssetDef(
+                "orders",
+                metadata={"delta/root_name": "orders_v2"},
+                tags=["gold"],
+                group="sales",
+                pool="database",
+                pool_slots=2,
+            ),
+            rs.AssetDef("events"),
+        ],
+        io_handler=Recorder(),
+    )
+    def multi():
+        return {"orders": 1, "events": 2}
+
+    repo = rs.CodeRepository(assets=[multi], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+
+    record = storage.get_asset_record("orders")
+    assert record.tags == ["gold"], "per-output tags must reach the assets row"
+    assert record.group == "sales"
+    assert record.pool == [("database", 2)], "per-output pool must be claimed"
+    assert "database" in {p.pool_key for p in storage.get_pool_limits()}, (
+        "the declared pool must be auto-registered"
+    )
+
+    repo.materialize()
+    assert seen["orders"] == {"delta/root_name": "orders_v2"}, (
+        "the io context must see per-output metadata"
+    )
+    assert seen["events"] is None
+
+
 def test_multi_asset_name_derived():
     defs = [rs.AssetDef("foo"), rs.AssetDef("bar")]
 
