@@ -55,19 +55,6 @@ pub(crate) fn get_annotations<'py>(
     Ok(annotations.cast_bound::<PyDict>(py)?.clone())
 }
 
-/// Enumerate `(name, optional annotation)` for every *injectable* parameter on
-/// `func` via `inspect.signature` in declaration order. Includes unannotated
-/// params (`def downstream(upstream)`) — `__annotations__` alone would silently
-/// drop them, breaking dep inference and arg injection.
-///
-/// **Skipped:**
-/// - Params with a default value (`def leaf(root, _i=i)`) — Python supplies
-///   the default; we'd misread the param as an unresolved dep otherwise.
-/// - Variadic `*args` / `**kwargs` — never injectable, only collect leftovers.
-///
-/// Callers fall back to the param NAME when annotation is `None` (e.g.
-/// matching against asset / resource names) and skip annotation-typed checks
-/// like `is_context_annotation`.
 /// One resource argument: config-instantiated when per-run overrides exist,
 /// else the shared instance.
 fn resource_arg(
@@ -82,6 +69,19 @@ fn resource_arg(
     }
 }
 
+/// Enumerate `(name, optional annotation)` for every *injectable* parameter on
+/// `func` via `inspect.signature` in declaration order. Includes unannotated
+/// params (`def downstream(upstream)`) — `__annotations__` alone would silently
+/// drop them, breaking dep inference and arg injection.
+///
+/// **Skipped:**
+/// - Params with a default value (`def leaf(root, _i=i)`) — Python supplies
+///   the default; we'd misread the param as an unresolved dep otherwise.
+/// - Variadic `*args` / `**kwargs` — never injectable, only collect leftovers.
+///
+/// Callers fall back to the param NAME when annotation is `None` (e.g.
+/// matching against asset / resource names) and skip annotation-typed checks
+/// like `is_context_annotation`.
 pub(crate) fn enumerate_params<'py>(
     py: Python<'py>,
     func: &Py<PyAny>,
