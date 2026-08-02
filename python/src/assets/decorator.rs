@@ -433,6 +433,14 @@ pub fn normalize_pool(
                 "pool key must be a non-empty string",
             ));
         }
+        // The implicit per-asset pools: a user pool with the prefix would
+        // acquire exclusive whole-asset semantics on another asset's pool.
+        if key.starts_with(rivers_core::storage::ASSET_POOL_PREFIX) {
+            return Err(AssetDefinitionError::new_err(format!(
+                "pool '{key}': the '__asset__:' prefix is reserved for the \
+                 implicit per-asset pools"
+            )));
+        }
     }
 
     let slots_map: HashMap<String, u32> = match pool_slots {

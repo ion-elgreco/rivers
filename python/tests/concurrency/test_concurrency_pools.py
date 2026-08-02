@@ -136,6 +136,20 @@ def test_asset_def_no_pool():
     assert defn.pool == []
 
 
+def test_reserved_asset_pool_prefix_rejected():
+    """`__asset__:` names the implicit per-asset pools — a user pool with the
+    prefix would silently impose exclusive whole-asset semantics on another
+    asset, so it is rejected at declaration."""
+    with pytest.raises(Exception, match="__asset__"):
+
+        @Asset(pool="__asset__:orders")
+        def bad():
+            return 1
+
+    with pytest.raises(Exception, match="__asset__"):
+        AssetDef("out", pool="__asset__:orders")
+
+
 def test_asset_decorator_pool_invalid_type():
     """pool must be str or list[str]."""
     with pytest.raises(Exception, match="pool must be"):
