@@ -1787,6 +1787,68 @@ const UPSERT_ASSET_PARTITIONS: &str = "INSERT INTO asset_partitions $rows ON DUP
      last_run_id = $input.last_run_id, \
      last_timestamp = $input.last_timestamp";
 
+impl SurrealStorage {
+    /// Roll the `assets` row (and any partition rows, in one transaction)
+    /// forward to a materialization event — the single consolidation shared
+    /// by `store_event` and `store_events`. `from_action`: the event's run
+    /// is an action run AND no co-drained event supplied real provenance
+    /// (`idv`) — the ACTION variant then preserves the code-version stamp
+    /// and provenance so a pending Stale(Code) badge survives the verb.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_materialization(
+        &self,
+        cl: &str,
+        asset_key: &str,
+        event_id: &str,
+        run_id: &str,
+        timestamp: i64,
+        data_version: Option<String>,
+        code_version: Option<String>,
+        idv: Option<Vec<(String, String)>>,
+        from_action: bool,
+        parts: Vec<DbAssetPartitionWrite>,
+    ) -> Result<()> {
+        let update_sql = if from_action {
+            MATERIALIZE_ASSET_UPDATE_ACTION
+        } else if idv.is_some() {
+            MATERIALIZE_ASSET_UPDATE
+        } else {
+            MATERIALIZE_ASSET_UPDATE_KEEP_IDV
+        };
+        // The asset row and its partition rows commit together — a concurrent
+        // whole-asset deletion lands wholly before or wholly after this
+        // materialization, never between the two.
+        let has_parts = !parts.is_empty();
+        let sql = if has_parts {
+            format!(
+                "BEGIN TRANSACTION; {update_sql}; {UPSERT_ASSET_PARTITIONS}; COMMIT TRANSACTION;"
+            )
+        } else {
+            update_sql.to_string()
+        };
+        let mut query = self
+            .db
+            .query(sql)
+            .bind(("cl", cl.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .bind(("event_id", event_id.to_string()))
+            .bind(("run_id", run_id.to_string()))
+            .bind(("timestamp", timestamp))
+            .bind(("data_version", data_version));
+        if !from_action {
+            query = query.bind(("mcv", code_version));
+            if let Some(idv) = idv {
+                query = query.bind(("idv", idv));
+            }
+        }
+        if has_parts {
+            query = query.bind(("rows", parts));
+        }
+        query.await?.check()?;
+        Ok(())
+    }
+}
+
 impl StorageBackend for SurrealStorage {
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(cl = %event.code_location_id, asset_key = event.asset_key))]
     async fn store_event(&self, event: &EventRecord) -> Result<String> {
@@ -1817,49 +1879,16 @@ impl StorageBackend for SurrealStorage {
 
         if let Some(asset_key) = &event.asset_key
             && event.event_type.is_materialization() {
-                let code_version = materialization_code_version;
                 let input_data_versions = event.input_data_versions.clone();
-
-                let data_version = event.event_type.data_version().map(|s| s.to_string());
-                let keep_idv = input_data_versions.is_empty();
-                let from_action = !self
+                let is_action = !self
                     .action_run_ids(vec![event.run_id.clone()])
                     .await?
                     .is_empty();
-                let update_sql = if from_action {
-                    MATERIALIZE_ASSET_UPDATE_ACTION
-                } else if keep_idv {
-                    MATERIALIZE_ASSET_UPDATE_KEEP_IDV
-                } else {
-                    MATERIALIZE_ASSET_UPDATE
-                };
-                // The asset row and its partition row commit together — a
-                // concurrent whole-asset deletion lands wholly before or
-                // wholly after this materialization, never between the two.
-                let sql = match &event.partition_key {
-                    Some(_) => format!(
-                        "BEGIN TRANSACTION; {update_sql}; {UPSERT_ASSET_PARTITIONS}; COMMIT TRANSACTION;"
-                    ),
-                    None => update_sql.to_string(),
-                };
-                let mut query = self
-                    .db
-                    .query(sql)
-                    .bind(("cl", cl.to_string()))
-                    .bind(("asset_key", asset_key.clone()))
-                    .bind(("event_id", event_id.clone()))
-                    .bind(("run_id", event.run_id.clone()))
-                    .bind(("timestamp", event.timestamp))
-                    .bind(("data_version", data_version));
-                if !from_action {
-                    query = query.bind(("mcv", code_version));
-                    if !keep_idv {
-                        query = query.bind(("idv", input_data_versions));
-                    }
-                }
-                if let Some(partition_key) = &event.partition_key {
-                    query = query.bind((
-                        "rows",
+                let idv = (!input_data_versions.is_empty()).then_some(input_data_versions);
+                let parts = event
+                    .partition_key
+                    .as_ref()
+                    .map(|partition_key| {
                         vec![DbAssetPartitionWrite {
                             code_location_id: cl.to_string(),
                             asset_key: asset_key.clone(),
@@ -1867,10 +1896,22 @@ impl StorageBackend for SurrealStorage {
                             last_event_id: event_id.clone(),
                             last_run_id: event.run_id.clone(),
                             last_timestamp: event.timestamp,
-                        }],
-                    ));
-                }
-                query.await?.check()?;
+                        }]
+                    })
+                    .unwrap_or_default();
+                self.apply_materialization(
+                    cl,
+                    asset_key,
+                    &event_id,
+                    &event.run_id,
+                    event.timestamp,
+                    event.event_type.data_version().map(|s| s.to_string()),
+                    materialization_code_version,
+                    idv,
+                    is_action,
+                    parts,
+                )
+                .await?;
             }
 
         if let Some(asset_key) = &event.asset_key
@@ -1979,7 +2020,6 @@ impl StorageBackend for SurrealStorage {
         for (&(cl, asset_key), &idx) in &latest_mat {
             let event = &events[idx];
             let event_id = &event_ids[idx];
-            let data_version = event.event_type.data_version().map(|s| s.to_string());
             let idv = latest_idv
                 .get(&(cl, asset_key))
                 .map(|&i| events[i].input_data_versions.clone());
@@ -1987,42 +2027,25 @@ impl StorageBackend for SurrealStorage {
             // owns provenance and the code-version stamp even when the
             // action's event is the newer one.
             let action_only = action_ids.contains(&event.run_id) && idv.is_none();
-            let update_sql = if action_only {
-                MATERIALIZE_ASSET_UPDATE_ACTION
-            } else if idv.is_some() {
-                MATERIALIZE_ASSET_UPDATE
+            let code_version = if action_only {
+                None
             } else {
-                MATERIALIZE_ASSET_UPDATE_KEEP_IDV
+                self.get_code_version(cl, asset_key).await?
             };
             let parts = parts_by_asset.remove(&(cl, asset_key)).unwrap_or_default();
-            let has_parts = !parts.is_empty();
-            let sql = if has_parts {
-                format!(
-                    "BEGIN TRANSACTION; {update_sql}; {UPSERT_ASSET_PARTITIONS}; COMMIT TRANSACTION;"
-                )
-            } else {
-                update_sql.to_string()
-            };
-            let mut query = self
-                .db
-                .query(sql)
-                .bind(("cl", cl.to_string()))
-                .bind(("asset_key", asset_key.to_string()))
-                .bind(("event_id", event_id.clone()))
-                .bind(("run_id", event.run_id.clone()))
-                .bind(("timestamp", event.timestamp))
-                .bind(("data_version", data_version));
-            if !action_only {
-                let code_version = self.get_code_version(cl, asset_key).await?;
-                query = query.bind(("mcv", code_version));
-            }
-            if let Some(idv) = idv {
-                query = query.bind(("idv", idv));
-            }
-            if has_parts {
-                query = query.bind(("rows", parts));
-            }
-            query.await?.check()?;
+            self.apply_materialization(
+                cl,
+                asset_key,
+                event_id,
+                &event.run_id,
+                event.timestamp,
+                event.event_type.data_version().map(|s| s.to_string()),
+                code_version,
+                idv,
+                action_only,
+                parts,
+            )
+            .await?;
         }
 
         // Partition-scoped deletions collapse to one DELETE per asset — a
@@ -11020,6 +11043,44 @@ mod tests {
                 count,
                 Some(n as u32),
                 "pools={n}: expected {n} slots at statement index {idx}"
+            );
+        }
+
+        // Mixed counted + asset pools: asset pools emit one LET (the overlap
+        // predicate) instead of two ($lim/$used), so the formula's asset term
+        // is only exercised when both kinds ride one transaction.
+        for n_counted in 1..=2 {
+            let mut pools: Vec<(String, u32)> = pool_names[..n_counted]
+                .iter()
+                .map(|k| (k.to_string(), 1))
+                .collect();
+            // Distinct per iteration — the exclusive overlap claim from one
+            // iteration would contend the next on a shared asset pool.
+            pools.push((format!("__asset__:orders_{n_counted}"), 1));
+            let asset_idx = [pools.len() - 1];
+            let query = SurrealStorage::build_claim_transaction(&pools, &asset_idx, None);
+            let now_ns = now_nanos();
+            let lease_exp = now_ns + 300_000_000_000i64;
+
+            let mut q = storage.db.query(&query);
+            for (i, (pk, _)) in pools.iter().enumerate() {
+                q = q.bind((format!("p{i}"), pk.clone()));
+            }
+            q = q
+                .bind(("cl", crate::storage::DEFAULT_CODE_LOCATION_ID.to_string()))
+                .bind(("run_id", format!("mixed_run_{n_counted}")))
+                .bind(("step_key", format!("mixed_step_{n_counted}")))
+                .bind(("now", now_ns))
+                .bind(("lease_exp", lease_exp));
+
+            let mut response = q.await.unwrap().check().unwrap();
+            let idx = SurrealStorage::claim_check_statement_index(pools.len(), 1);
+            let count: Option<u32> = response.take((idx, "total")).unwrap();
+            assert_eq!(
+                count,
+                Some(pools.len() as u32),
+                "mixed pools={} + 1 asset: expected slots at statement index {idx}",
+                n_counted
             );
         }
     }
