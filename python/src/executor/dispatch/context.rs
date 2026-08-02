@@ -192,8 +192,9 @@ impl<'a> BatchContext<'a> {
                 }
                 // A graph asset's own step is composition-only and never
                 // executes — its inner tasks do the writing, so they carry
-                // the claim. Inner tasks of one such graph therefore also
-                // serialize against each other.
+                // the claim. These claims are non-exclusive: inner tasks
+                // run alongside each other and only an Exclusive action on
+                // the parent excludes them.
                 if let Some((parent, _)) = step.name.split_once('/')
                     && has_exclusive(parent)
                 {

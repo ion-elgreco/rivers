@@ -573,12 +573,10 @@ impl CodeLocationService for CodeLocationImpl {
                 .map_err(|e| Status::internal(e.to_string()))?
         } else {
             let sel = req.selection;
-            self.handle
-                .validate_assets_exist(&sel)
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            // An asset that exists but doesn't define the verb would otherwise
-            // come back as success plus a run_id for a run that can only fail
-            // at plan build.
+            // Resolves the selection too — unknown assets fail here with the
+            // same message a bare existence check produced. Without the verb
+            // check an existing asset came back as success plus a run_id for
+            // a run that can only fail at plan build.
             self.handle
                 .validate_assets_support_action(&sel, &req.action)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;

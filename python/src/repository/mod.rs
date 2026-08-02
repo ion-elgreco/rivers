@@ -137,6 +137,25 @@ fn resolve_selection<'a>(
         .collect()
 }
 
+/// Every selected asset must exist and define `verb` — the shared boundary
+/// check (gRPC RunAction, backfill verbs). A free function over the node map
+/// so callers already holding the state lock don't re-enter it.
+fn ensure_assets_support_action(
+    node_map: &HashMap<String, ResolvedNode>,
+    selection: &[String],
+    verb: &str,
+) -> PyResult<()> {
+    let nodes = resolve_selection(node_map, selection)?;
+    for (name, node) in selection.iter().zip(nodes) {
+        if !node.supports_action(verb) {
+            return Err(GraphValidationError::new_err(format!(
+                "Asset '{name}' does not define action '{verb}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `validate_partition_for_verb` over a borrowed node map, for callers that
 /// hold the map but not the whole `ResolvedState` (the job execution path).
 pub(crate) fn validate_partition_in_map<'a>(
@@ -1489,8 +1508,7 @@ impl RepoHandle {
             .and_then(|s| s.jobs_info.get(name).map(|j| j.asset_names.clone()))
     }
 
-    /// Assets defining `action`, sorted. Reads the action table cached at
-    /// resolve — no GIL involved.
+    /// Assets defining `action`, sorted.
     pub(crate) fn assets_supporting_action(&self, action: &str) -> PyResult<Vec<String>> {
         let guard = self.state.read().unwrap();
         let state = guard.as_ref().ok_or_else(|| {
@@ -1509,15 +1527,7 @@ impl RepoHandle {
         let state = guard.as_ref().ok_or_else(|| {
             ExecutionError::new_err("CodeRepository not resolved — call resolve() first")
         })?;
-        let nodes = resolve_selection(&state.node_map, selection)?;
-        for (name, node) in selection.iter().zip(nodes) {
-            if !node.supports_action(action) {
-                return Err(GraphValidationError::new_err(format!(
-                    "Asset '{name}' does not define action '{action}'"
-                )));
-            }
-        }
-        Ok(())
+        ensure_assets_support_action(&state.node_map, selection, action)
     }
 
     pub(crate) fn list_jobs(&self) -> Vec<JobSummary> {
@@ -2500,7 +2510,6 @@ impl PyCodeRepository {
         tags: Option<Vec<(String, String)>>,
         config: Option<HashMap<String, Py<PyAny>>>,
         launched_by: LaunchedBy,
-        action: Option<String>,
         resume: bool,
         raise_on_error: bool,
     ) -> PyResult<PyRunResult> {
@@ -2523,7 +2532,7 @@ impl PyCodeRepository {
                 tags_vec.clone(),
                 launched_by,
                 run_id.clone(),
-                action,
+                synthetic_job.action.clone(),
             ))?;
         }
 
@@ -2642,7 +2651,6 @@ impl PyCodeRepository {
             tags,
             config,
             launched_by,
-            None,
             resume,
             raise_on_error,
         )
@@ -2664,7 +2672,6 @@ impl PyCodeRepository {
         tags: Option<Vec<(String, String)>>,
         config: Option<HashMap<String, Py<PyAny>>>,
         launched_by: LaunchedBy,
-        action: Option<String>,
         resume: bool,
         raise_on_error: bool,
     ) -> PyResult<PyRunResult> {
@@ -2699,7 +2706,6 @@ impl PyCodeRepository {
             tags,
             config,
             launched_by,
-            action,
             resume,
             raise_on_error,
         )
@@ -2765,7 +2771,9 @@ impl PyCodeRepository {
 
         let mut synthetic_job =
             PyJob::new_synthetic(selected_names, self.effective_executor(), true, None);
-        synthetic_job.action = Some(action.clone());
+        // The job is the single carrier of the verb: the run record reads it
+        // in launch_prepared_job, so record and plan can never disagree.
+        synthetic_job.action = Some(action);
         self.launch_synthetic_job(
             state,
             graph,
@@ -2776,7 +2784,6 @@ impl PyCodeRepository {
             tags,
             config,
             launched_by,
-            Some(action),
             resume,
             raise_on_error,
         )
@@ -3230,7 +3237,7 @@ impl PyCodeRepository {
             for pool_key in &exclusive_pools {
                 writes.insert(
                     pool_key.clone(),
-                    crate::executor::dispatch::EXCLUSIVE_POOL_CAPACITY as i32,
+                    crate::executor::dispatch::EXCLUSIVE_POOL_CAPACITY,
                 );
             }
             // A lost row here makes every later claim on that pool hard-fail
@@ -4393,14 +4400,7 @@ impl PyCodeRepository {
                     "No assets define action '{verb}'"
                 )));
             }
-            let nodes = resolve_selection(&state.node_map, &selection)?;
-            for (name, node) in selection.iter().zip(nodes) {
-                if !node.supports_action(verb) {
-                    return Err(GraphValidationError::new_err(format!(
-                        "Asset '{name}' does not define action '{verb}'"
-                    )));
-                }
-            }
+            ensure_assets_support_action(&state.node_map, &selection, verb)?;
         }
 
         // Keys/ranges against an unpartitioned selection would bypass every
