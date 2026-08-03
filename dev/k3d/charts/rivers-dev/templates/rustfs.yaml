@@ -82,16 +82,29 @@ spec:
               until aws --endpoint-url http://127.0.0.1:9000 s3api list-buckets >/dev/null 2>&1; do
                 sleep 2
               done
-              aws --endpoint-url http://127.0.0.1:9000 s3api head-bucket --bucket {{ .Values.rustfs.bucket }} 2>/dev/null || \
-                aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket --bucket {{ .Values.rustfs.bucket }}
+              if ! aws --endpoint-url http://127.0.0.1:9000 s3api head-bucket --bucket {{ .Values.rustfs.bucket }} 2>/dev/null; then
+                aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket --bucket {{ .Values.rustfs.bucket }} || exit 1
+              fi
+              touch /tmp/bucket-ready
               sleep infinity
+          # Without this the pod reports Ready as soon as the sidecar process
+          # starts — i.e. before the bucket exists — so `just k8s-wait` goes
+          # green and the S3-backed tests then fail on a missing bucket.
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "test -f /tmp/bucket-ready"]
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          # The AWS CLI v2 bundles a Python interpreter — it OOM-kills below
+          # ~64Mi and takes ~20s per invocation when throttled to 50m CPU.
+          # (MinIO's `mc`, a small static Go binary, ran fine on 32Mi/50m.)
           resources:
             requests:
-              cpu: 5m
-              memory: 16Mi
+              cpu: 10m
+              memory: 64Mi
             limits:
-              cpu: 50m
-              memory: 32Mi
+              cpu: 500m
+              memory: 256Mi
       volumes:
         - name: data
           persistentVolumeClaim:
