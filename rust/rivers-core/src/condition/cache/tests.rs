@@ -795,13 +795,19 @@ async fn initial_load_adopts_newest_non_action_run_behind_an_action() {
     let mut mat = mk_run("r1", RunStatus::Success, &["events", "rollup"], 1000);
     mat.tags = vec![("team".to_string(), "data".to_string())];
     storage.create_run(&mat).await.unwrap();
-    storage.store_events(&[mat_event("r1", 1000)]).await.unwrap();
+    storage
+        .store_events(&[mat_event("r1", 1000)])
+        .await
+        .unwrap();
 
     // R2: a MayMaterialize verb reports materialized() → last_run_id = r2.
     let mut act = mk_run("r2", RunStatus::Success, &["events"], 2000);
     act.action = Some("refresh".to_string());
     storage.create_run(&act).await.unwrap();
-    storage.store_events(&[mat_event("r2", 2000)]).await.unwrap();
+    storage
+        .store_events(&[mat_event("r2", 2000)])
+        .await
+        .unwrap();
 
     let mut cache = AssetConditionCache::new(cl.clone());
     cache.refresh(&storage, 0).await.unwrap();

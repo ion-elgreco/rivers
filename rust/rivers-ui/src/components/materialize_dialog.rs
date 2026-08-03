@@ -108,8 +108,7 @@ pub fn MaterializeDialog(
     #[prop(optional, into)]
     records_failed: Option<Signal<bool>>,
 ) -> impl IntoView {
-    let records_failed: Signal<bool> =
-        records_failed.unwrap_or_else(|| Signal::derive(|| false));
+    let records_failed: Signal<bool> = records_failed.unwrap_or_else(|| Signal::derive(|| false));
     let verb_info: Signal<Option<AssetActionInfo>> =
         action.unwrap_or_else(|| Signal::derive(|| None));
     let verb: Signal<Option<String>> = Signal::derive(move || verb_info.get().map(|a| a.name));
@@ -484,19 +483,31 @@ mod tests {
 
     #[test]
     fn partitioned_without_keys_asks_for_one() {
-        assert_eq!(launch_summary(2, 0, true, false), "2 assets · select a partition");
+        assert_eq!(
+            launch_summary(2, 0, true, false),
+            "2 assets · select a partition"
+        );
     }
 
     #[test]
     fn optional_key_without_keys_covers_the_whole_asset() {
-        assert_eq!(launch_summary(2, 0, true, true), "2 assets · whole asset · 1 run");
+        assert_eq!(
+            launch_summary(2, 0, true, true),
+            "2 assets · whole asset · 1 run"
+        );
         // A selected key still runs partition-scoped.
-        assert_eq!(launch_summary(1, 1, true, true), "1 asset · 1 partition · 1 run");
+        assert_eq!(
+            launch_summary(1, 1, true, true),
+            "1 asset · 1 partition · 1 run"
+        );
     }
 
     #[test]
     fn one_run_per_partition_up_to_the_threshold() {
-        assert_eq!(launch_summary(1, 1, true, false), "1 asset · 1 partition · 1 run");
+        assert_eq!(
+            launch_summary(1, 1, true, false),
+            "1 asset · 1 partition · 1 run"
+        );
         assert_eq!(
             launch_summary(3, 2, true, false),
             "3 assets · 2 partitions · 2 runs"

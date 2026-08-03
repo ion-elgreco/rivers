@@ -584,15 +584,15 @@ pub fn records_by_key(
     Memo<std::collections::HashMap<String, crate::types::AssetRecord>>,
     Memo<bool>,
 ) {
-    let records = Memo::new(move |prev: Option<&std::collections::HashMap<_, _>>| {
-        match all_assets.get() {
+    let records = Memo::new(
+        move |prev: Option<&std::collections::HashMap<_, _>>| match all_assets.get() {
             Some(Ok(assets)) => assets
                 .into_iter()
                 .map(|a| (a.asset_key.clone(), a))
                 .collect(),
             _ => prev.cloned().unwrap_or_default(),
-        }
-    });
+        },
+    );
     let failed = Memo::new(move |_| matches!(all_assets.get(), Some(Err(_))));
     (records, failed)
 }

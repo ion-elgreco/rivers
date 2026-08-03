@@ -287,8 +287,7 @@ impl AssetConditionCache {
                         if !self.applied_run_ids.contains_key(&run.run_id) {
                             self.apply_run_effects_to_delta(run, &mut delta);
                             if run.is_action() {
-                                action_completed_assets
-                                    .extend(run.node_names.iter().cloned());
+                                action_completed_assets.extend(run.node_names.iter().cloned());
                             }
                         }
                     }
@@ -476,11 +475,7 @@ impl AssetConditionCache {
             delta
                 .applied_runs
                 .push((run.run_id.clone(), run.start_time));
-            self.queue_action_partition_checks(
-                &run.node_names,
-                run.partition_key.as_ref(),
-                delta,
-            );
+            self.queue_action_partition_checks(&run.node_names, run.partition_key.as_ref(), delta);
             return true;
         }
         if !matches!(run.status, RunStatus::Success | RunStatus::Failure) {

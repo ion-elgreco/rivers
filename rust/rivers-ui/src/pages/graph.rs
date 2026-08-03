@@ -299,12 +299,11 @@ pub fn GraphPage() -> impl IntoView {
     );
     let start_materialize: Callback<Vec<String>> =
         Callback::new(move |keys: Vec<String>| open_dialog.run((keys, None, false)));
-    let start_action: Callback<(Vec<String>, crate::types::AssetActionInfo, bool)> =
-        Callback::new(
-            move |(keys, act, destructive): (Vec<String>, crate::types::AssetActionInfo, bool)| {
-                open_dialog.run((keys, Some(act), destructive))
-            },
-        );
+    let start_action: Callback<(Vec<String>, crate::types::AssetActionInfo, bool)> = Callback::new(
+        move |(keys, act, destructive): (Vec<String>, crate::types::AssetActionInfo, bool)| {
+            open_dialog.run((keys, Some(act), destructive))
+        },
+    );
 
     let all_kinds = Signal::derive(move || {
         layout
