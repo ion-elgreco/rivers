@@ -22,7 +22,7 @@ pyo3 = { version = "0.28.2", features = ["extension-module", "abi3-py310", "chro
 pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
 pyo3-arrow = { version = "0.17", default-features = false }
 arrow-schema = "58"
-arrow-ipc = "58"
+arrow-ipc = "59"
 chrono.workspace = true
 croner.workspace = true
 url.workspace = true
