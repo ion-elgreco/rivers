@@ -49,7 +49,7 @@ axum-server.workspace = true
 # pinned alongside that feature. `jsonptr` provides the `PointerBuf` paths
 # json-patch operations are built from.
 json-patch = "4"
-jsonptr = "0.7"
+jsonptr = "0.8"
 mimalloc = "0.1"
 
 [dev-dependencies]
