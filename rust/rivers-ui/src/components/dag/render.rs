@@ -447,6 +447,7 @@ fn render_node_full(
                 if let Some(ref cb) = on_node_click {
                     ev.prevent_default();
                     let additive = ev.shift_key() || ev.ctrl_key() || ev.meta_key();
+                    ev.stop_propagation();
                     cb.run((node_id.clone(), additive));
                 }
             }
