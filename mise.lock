@@ -262,8 +262,11 @@ checksum = "sha256:d1cede9e308cc3eb072392af1c02ccae4bdd3d2f374ec2970dbd8cdfdaa91
 url = "https://github.com/protocolbuffers/protobuf/releases/download/v35.0/protoc-35.0-win64.zip"
 
 [[tools.rust]]
-version = "stable"
+version = "1.97.1"
 backend = "core:rust"
+
+[tools.rust.options]
+targets = "wasm32-unknown-unknown"
 
 [[tools.uv]]
 version = "0.11.16"

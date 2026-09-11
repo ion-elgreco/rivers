@@ -16,7 +16,7 @@ mise install --locked
 
 If you prefer to manage tools yourself, the individual prerequisites are listed below.
 
-- **Rust** (stable) — install via [rustup](https://rustup.rs)
+- **Rust** — install via [rustup](https://rustup.rs); it picks up the version pinned in `rust-toolchain.toml`
 - **Python** ≥ 3.10
 - **[uv](https://docs.astral.sh/uv/)** — package manager for the Python side
 - **[just](https://github.com/casey/just)** — task runner; all dev commands go through the `justfile` at the repo root
