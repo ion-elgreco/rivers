@@ -2,6 +2,7 @@
 name = "rivers"
 version.workspace = true
 edition = "2024"
+license.workspace = true
 readme = "README.md"
 
 [lib]

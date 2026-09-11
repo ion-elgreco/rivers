@@ -3,7 +3,8 @@ name = "rivers"
 version = "0.0.0.dev0"
 description = "Orchestration platform for tasks and assets, fully backed by Rust."
 readme = "README.md"
-license = "LICENSE"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
 dependencies = [
     "loky>=3.5",

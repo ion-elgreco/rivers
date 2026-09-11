@@ -81,3 +81,7 @@ See the [Getting Started guide](https://ion-elgreco.github.io/rivers/latest/gett
 ## Contributing
 
 Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup (`just develop`, `just test`, `just pre-commit`), code conventions, and the test matrix. The [`docs/`](docs/) directory hosts both the user-facing guides and architectural notes for contributors.
+
+## License
+
+rivers is licensed under the [Apache License, Version 2.0](LICENSE).
