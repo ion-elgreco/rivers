@@ -8,9 +8,9 @@ inputs:
     default: "3.13"
 
   rust-toolchain:
-    description: "The Rust toolchain to set up"
+    description: "The Rust toolchain to set up. Empty (the default) installs the version pinned in rust-toolchain.toml."
     required: false
-    default: "stable"
+    default: ""
 
   cache:
     description: "Enable Swatinem rust-cache via setup-rust-toolchain. Release workflows should set this to 'false'"
