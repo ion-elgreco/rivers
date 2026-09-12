@@ -118,13 +118,61 @@ mike_pkg := "git+https://github.com/squidfunk/mike.git@2d4ad799442f4592db8ad53b1
 
 # branch without pushing it. Example: `just docs-deploy 0.1.0 ""`.
 docs-deploy version push="--push":
-    uvx --from "{{ mike_pkg }}" --with zensical mike deploy {{ push }} --update-aliases {{ version }} latest
+    uvx --from "{{ mike_pkg }}" --with zensical mike deploy --deploy-prefix docs {{ push }} --update-aliases {{ version }} latest
 
 # Set the `latest` alias as the default — installs the root redirect
 
-# from `/` to `/latest/`. Idempotent; runs once per release.
+# from `/docs/` to `/docs/latest/`. Idempotent; runs once per release.
 docs-set-default push="--push":
-    uvx --from "{{ mike_pkg }}" --with zensical mike set-default {{ push }} latest
+    uvx --from "{{ mike_pkg }}" --with zensical mike set-default --deploy-prefix docs {{ push }} latest
+
+# Preview the whole site locally in the exact layout it deploys to:
+# landing page at `/`, versioned docs at `/docs/latest/`. Use this to check
+# the links between the two. For live-reload docs editing, use `docs-serve`.
+site-serve port="8090":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    preview="site-preview"
+    uvx zensical build
+    rm -rf "$preview"
+    mkdir -p "$preview/docs"
+    cp -R www/. "$preview/"
+    cp -R site/. "$preview/docs/latest/"
+    # Stands in for the redirect that `mike set-default` installs in production.
+    printf '<!doctype html><meta http-equiv="refresh" content="0; url=./latest/">\n' > "$preview/docs/index.html"
+    echo ""
+    echo "  landing page   http://localhost:{{ port }}/"
+    echo "  docs           http://localhost:{{ port }}/docs/latest/"
+    echo ""
+    python3 -m http.server {{ port }} -d "$preview"
+
+# Publish the landing page (www/) to the ROOT of the gh-pages branch.
+# mike owns `docs/<version>/`; this recipe owns only the root files it
+# copies. Pass push="" for a local dry-run that builds the commit without
+# pushing it. Example: `just site-deploy ""`.
+site-deploy push="--push":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    work=$(mktemp -d)
+    trap 'git worktree remove --force "$work" 2>/dev/null || true' EXIT
+    git fetch origin gh-pages
+    git worktree add --detach "$work" origin/gh-pages
+    # Mirror www/ onto the root and leave docs/ alone — mike owns that subtree.
+    # Naming the files explicitly meant a new one (like _headers) was copied but
+    # never staged, so clear and stage by pathspec instead.
+    find "$work" -mindepth 1 -maxdepth 1 \
+        ! -name docs ! -name .git ! -name .nojekyll -exec rm -rf {} +
+    cp -R www/. "$work/"
+    touch "$work/.nojekyll"
+    git -C "$work" add -A -- . ':!docs'
+    if git -C "$work" diff --cached --quiet; then
+        echo "landing page unchanged — nothing to publish"
+        exit 0
+    fi
+    git -C "$work" commit -m "site: publish landing page"
+    if [ -n "{{ push }}" ]; then
+        git -C "$work" push origin HEAD:gh-pages
+    fi
 
 # === K8s Integration Testing ===
 

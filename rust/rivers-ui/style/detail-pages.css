@@ -50,7 +50,8 @@
 .health-card-header {
     display: flex;
     justify-content: space-between;
-    align-items: center;
+    align-items: baseline;
+    gap: 0.5rem;
     margin-bottom: 0.5rem;
 }
 .health-group-name {
@@ -58,12 +59,18 @@
     font-weight: 500;
     font-size: 13px;
     color: var(--text);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 .health-count {
     font-family: var(--font-mono);
     font-size: 11.5px;
     letter-spacing: -0.005em;
     color: var(--text-muted);
+    white-space: nowrap;
+    flex-shrink: 0;
 }
 .health-bar {
     height: 6px;
