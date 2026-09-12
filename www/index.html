@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rivers — Orchestration platform for tasks and assets, fully backed by Rust</title>
+<meta name="description" content="rivers is a Rust-powered orchestration platform built around data assets. Define pipelines in Python; rivers resolves the graph and plans execution in compiled Rust.">
+<link rel="icon" href="/assets/logo.svg" type="image/svg+xml">
+<link rel="canonical" href="https://orchestrator.rs/">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://orchestrator.rs/">
+<meta property="og:title" content="rivers — orchestration, fully backed by Rust">
+<meta property="og:description" content="Define pipelines in Python. rivers resolves the graph and plans execution in compiled Rust — no Python interpreter on the control plane.">
+<meta property="og:image" content="https://orchestrator.rs/assets/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<!-- Decorative background: glow orbs + grid. Purely visual. -->
+<div class="bg" aria-hidden="true">
+  <div class="orb orb-a"></div>
+  <div class="orb orb-b"></div>
+  <div class="orb orb-c"></div>
+  <div class="grid-lines"></div>
+</div>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="/">
+      <img src="/assets/logo.svg" alt="" width="28" height="28">
+      <span>rivers</span>
+    </a>
+    <nav class="nav-links" aria-label="Main">
+      <a href="/docs/latest/">Docs</a>
+      <a href="/docs/latest/concepts/assets/">Concepts</a>
+      <a href="/docs/latest/comparisons/">Comparisons</a>
+      <a href="/docs/latest/installation/kubernetes/">Kubernetes</a>
+      <a class="ghost" href="https://github.com/ion-elgreco/rivers">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- Hero -->
+  <section class="hero">
+    <div class="wrap hero-inner">
+      <div class="hero-copy">
+        <a class="pill" href="https://github.com/ion-elgreco/rivers">
+          <span class="pip"></span> Open source · Apache 2.0 <span class="pill-arrow" aria-hidden="true">→</span>
+        </a>
+        <h1>Orchestration that runs at <span class="grad">Rust speed</span>.</h1>
+        <p class="lede">
+          Define pipelines in Python. rivers resolves the graph, plans execution, and
+          runs the scheduler in compiled Rust — with no Python interpreter on the control plane.
+        </p>
+        <div class="cta">
+          <a class="btn primary" href="/docs/latest/getting-started/">Get started</a>
+          <a class="btn glass" href="https://github.com/ion-elgreco/rivers">View on GitHub</a>
+        </div>
+        <div class="install">
+          <span class="prompt" aria-hidden="true">$</span>
+          <code>pip install rivers</code>
+          <button class="copy" type="button" data-copy="pip install rivers" aria-label="Copy install command">Copy</button>
+        </div>
+      </div>
+
+      <div class="hero-code">
+        <div class="code-card glow">
+          <div class="code-head"><span class="dot red"></span><span class="dot amber"></span><span class="dot green"></span><span class="fname">pipeline.py</span></div>
+<pre><code><span class="k">import</span> rivers <span class="k">as</span> rs
+
+<span class="d">@rs.Asset</span>
+<span class="k">def</span> <span class="f">raw_data</span>():
+    <span class="k">return</span> {<span class="s">"users"</span>: <span class="n">100</span>, <span class="s">"events"</span>: <span class="n">5000</span>}
+
+<span class="d">@rs.Asset</span>
+<span class="k">def</span> <span class="f">summary</span>(raw_data: <span class="t">dict</span>):
+    <span class="k">return</span> <span class="s">f"{raw_data['users']} users"</span>
+
+repo = rs.<span class="t">CodeRepository</span>(assets=[raw_data, summary])
+repo.materialize()</code></pre>
+        </div>
+        <p class="code-note">rivers reads the type-annotated parameters and builds the dependency graph. No wiring step.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Capability marquee -->
+  <section class="marquee-wrap" aria-label="Capabilities">
+    <div class="marquee">
+      <ul class="marquee-track">
+        <li>Assets</li><li>Partitions</li><li>Backfills</li><li>Schedules</li><li>Sensors</li>
+        <li>Automation conditions</li><li>Retries</li><li>Concurrency pools</li><li>Kubernetes</li>
+        <li>Delta Lake</li><li>Polars</li><li>PyArrow</li><li>SurrealDB</li><li>Lineage</li>
+        <li aria-hidden="true">Assets</li><li aria-hidden="true">Partitions</li><li aria-hidden="true">Backfills</li>
+        <li aria-hidden="true">Schedules</li><li aria-hidden="true">Sensors</li>
+        <li aria-hidden="true">Automation conditions</li><li aria-hidden="true">Retries</li>
+        <li aria-hidden="true">Concurrency pools</li><li aria-hidden="true">Kubernetes</li>
+        <li aria-hidden="true">Delta Lake</li><li aria-hidden="true">Polars</li><li aria-hidden="true">PyArrow</li>
+        <li aria-hidden="true">SurrealDB</li><li aria-hidden="true">Lineage</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Animated lineage diagram -->
+  <section class="lineage reveal">
+    <div class="wrap">
+      <h2 class="center">Assets, not tasks</h2>
+      <p class="center sub">rivers tracks what your pipeline <em>produces</em>. Dependencies come from the function signature, and lineage comes for free.</p>
+      <div class="lineage-frame">
+        <svg viewBox="0 0 880 260" class="dag" role="img" aria-label="Diagram: two source assets flow into a joined asset, then into two downstream assets">
+          <defs>
+            <linearGradient id="edge" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0%" stop-color="#ff8f78"/>
+              <stop offset="100%" stop-color="#50e1f9"/>
+            </linearGradient>
+          </defs>
+          <g class="edges" fill="none" stroke="url(#edge)" stroke-width="2">
+            <path d="M190 70 C 270 70, 280 130, 360 130"/>
+            <path d="M190 190 C 270 190, 280 130, 360 130"/>
+            <path d="M520 130 C 600 130, 610 70, 690 70"/>
+            <path d="M520 130 C 600 130, 610 190, 690 190"/>
+          </g>
+          <g class="nodes">
+            <g class="node" style="--i:0"><rect x="40" y="44" width="150" height="52" rx="10"/><text x="115" y="75">events</text></g>
+            <g class="node" style="--i:1"><rect x="40" y="164" width="150" height="52" rx="10"/><text x="115" y="195">users</text></g>
+            <g class="node hot" style="--i:2"><rect x="360" y="104" width="160" height="52" rx="10"/><text x="440" y="135">sessions</text></g>
+            <g class="node" style="--i:3"><rect x="690" y="44" width="150" height="52" rx="10"/><text x="765" y="75">daily_report</text></g>
+            <g class="node" style="--i:4"><rect x="690" y="164" width="150" height="52" rx="10"/><text x="765" y="195">ml_features</text></g>
+          </g>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- Product screenshot slot -->
+  <section class="shot reveal">
+    <div class="wrap">
+      <h2 class="center">Watch every run, asset, and partition</h2>
+      <p class="center sub">The web UI is Rust too — Leptos server-side rendering with WebAssembly hydration, served by axum.</p>
+      <!--
+        SCREENSHOT SLOT.
+        Run `just demo`, open http://localhost:3000, and capture the lineage view at 2560x1440.
+        Save it as www/assets/ui-lineage.png, then delete this placeholder div and
+        uncomment the <img> below.
+      -->
+      <div class="shot-placeholder">
+        <p><strong>Screenshot goes here</strong></p>
+        <p>Run <code>just demo</code>, capture the lineage view, and save it to <code>www/assets/ui-lineage.png</code>.</p>
+      </div>
+      <!-- <img class="shot-img" src="/assets/ui-lineage.png" alt="The rivers web UI showing an asset lineage graph with run status" width="2560" height="1440" loading="lazy"> -->
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section class="features reveal">
+    <div class="wrap">
+      <h2 class="center">Everything a data platform needs</h2>
+      <p class="center sub">Built in, not bolted on.</p>
+      <div class="grid">
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">◆</span> Asset-based orchestration</h3>
+          <p>Declare data assets as Python functions. rivers resolves the dependency graph from the signatures, and supports single, multi-output, graph, and external assets.</p>
+          <a href="/docs/latest/concepts/assets/">Assets<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">▦</span> Partitions that scale</h3>
+          <p>Static, time-window, multi-dimensional, and dynamic partitions. Partition mapping and key validation run in Rust, so large partition sets stay responsive.</p>
+          <a href="/docs/latest/concepts/partitions/">Partitions<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">⚙</span> Executors for any scale</h3>
+          <p>Run in process while you develop. Switch to concurrent subprocess workers, or give every step its own Kubernetes pod, without changing your asset code.</p>
+          <a href="/docs/latest/concepts/jobs/">Executors<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">◷</span> Schedules, sensors, automation</h3>
+          <p>Declarative triggers — cron, event-driven, and dependency-aware automation conditions — evaluated by the rivers daemon.</p>
+          <a href="/docs/latest/concepts/scheduling/">Automation<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">↻</span> Backfills and retries</h3>
+          <p>Run partition ranges with multi-run, single-run, and per-dimension strategies. Declarative retries match on exception type and classify infrastructure failures.</p>
+          <a href="/docs/latest/concepts/backfills/">Backfills<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">▤</span> Persistent storage built in</h3>
+          <p>Embedded SurrealDB with RocksDB for local development. A SurrealDB server for production. Run history, lineage, and logs are durable from the first run.</p>
+          <a href="/docs/latest/api-reference/storage/">Storage<span aria-hidden="true"> →</span></a>
+        </article>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- Rust core -->
+  <section class="split reveal">
+    <div class="wrap split-inner">
+      <div>
+        <h2>Python is the API.<br><span class="grad">Rust does the work.</span></h2>
+        <p>Graph resolution, partition mapping, execution planning, and the scheduler are all compiled Rust. Python is the surface you write against, and nothing more.</p>
+        <p>Plan times stay below a millisecond on graphs with thousands of nodes.</p>
+        <a class="btn glass" href="/docs/latest/architecture/concurrency-flow/">Read the architecture</a>
+      </div>
+      <ul class="ticks">
+        <li>Graph resolution in <code>petgraph</code>, not Python objects</li>
+        <li>One binary starts the database, scheduler, and UI</li>
+        <li>Server-sent events push run state to the browser</li>
+        <li>No control-plane Python interpreter to keep warm</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Kubernetes -->
+  <section class="split alt reveal">
+    <div class="wrap split-inner">
+      <div>
+        <h2>Kubernetes-native</h2>
+        <p>rivers ships an operator and custom resource definitions. Declare a repository as a <code>CodeLocation</code> and the operator reconciles it.</p>
+        <a class="btn glass" href="/docs/latest/installation/kubernetes/">Install on Kubernetes</a>
+      </div>
+      <div class="code-card glow">
+        <div class="code-head"><span class="dot red"></span><span class="dot amber"></span><span class="dot green"></span><span class="fname">codelocation.yaml</span></div>
+<pre><code><span class="y">apiVersion</span>: rivers.io/v1alpha1
+<span class="y">kind</span>: CodeLocation
+<span class="y">metadata</span>:
+  <span class="y">name</span>: analytics
+<span class="y">spec</span>:
+  <span class="y">image</span>: ghcr.io/acme/pipelines
+  <span class="y">tag</span>: v0.2.0
+  <span class="y">module</span>: pipelines.analytics</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- Final CTA -->
+  <section class="final reveal">
+    <div class="wrap">
+      <div class="final-card">
+        <h2>Your first asset, in minutes</h2>
+        <p class="sub">Install the package, decorate a function, and materialize it.</p>
+        <div class="cta center-cta">
+          <a class="btn primary" href="/docs/latest/getting-started/">Get started</a>
+          <a class="btn glass" href="/docs/latest/guides/migrating/">Migrating from Dagster or Prefect</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div class="wrap footer-inner">
+    <div class="footer-brand">
+      <img src="/assets/logo.svg" alt="" width="24" height="24">
+      <span>rivers</span>
+    </div>
+    <nav class="footer-links" aria-label="Footer">
+      <a href="/docs/latest/">Documentation</a>
+      <a href="/docs/latest/api-reference/repository/">API reference</a>
+      <a href="https://github.com/ion-elgreco/rivers">GitHub</a>
+      <a href="https://github.com/ion-elgreco/rivers/issues">Issues</a>
+      <a href="https://github.com/ion-elgreco/rivers/discussions">Discussions</a>
+    </nav>
+    <p class="license">Apache 2.0 licensed.</p>
+  </div>
+</footer>
+
+<script>
+  // Copy-to-clipboard on the install command.
+  document.querySelectorAll(".copy").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      navigator.clipboard.writeText(btn.dataset.copy).then(function () {
+        var prev = btn.textContent;
+        btn.textContent = "Copied";
+        setTimeout(function () { btn.textContent = prev; }, 1500);
+      });
+    });
+  });
+
+  // Scroll reveal. Sections start hidden only when this script runs, so the
+  // page stays readable with JavaScript disabled.
+  var motionOK = !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var targets = document.querySelectorAll(".reveal");
+  if (motionOK && "IntersectionObserver" in window) {
+    targets.forEach(function (el) { el.classList.add("reveal-armed"); });
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) {
+          entry.target.classList.add("reveal-in");
+          io.unobserve(entry.target);
+        }
+      });
+    }, { rootMargin: "0px 0px -12% 0px" });
+    targets.forEach(function (el) { io.observe(el); });
+  }
+</script>
+</body>
+</html>

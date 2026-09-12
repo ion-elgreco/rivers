@@ -1,6 +1,6 @@
 site_name: rivers
 site_description: Orchestration platform for tasks and assets fully backed by Rust
-site_url: https://ion-elgreco.github.io/rivers/
+site_url: https://orchestrator.rs/docs/
 repo_url: https://github.com/ion-elgreco/rivers
 repo_name: rivers
 
