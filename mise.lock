@@ -230,36 +230,36 @@ checksum = "sha256:c31bd80c43b7784b461853c5c78d70b5e6ac57f612e17ead9f083aaf89ad7
 url = "https://dl.k8s.io/v1.33.13/bin/windows/amd64/kubectl.exe"
 
 [[tools.protobuf]]
-version = "35.0"
+version = "36.1"
 backend = "aqua:protocolbuffers/protobuf/protoc"
 
 [tools.protobuf."platforms.linux-arm64"]
-checksum = "sha256:36b518ac14d90351cc6598228ed2bbe5afe4e357b1af470b07e0ec1609875de2"
-url = "https://github.com/protocolbuffers/protobuf/releases/download/v35.0/protoc-35.0-linux-aarch_64.zip"
+checksum = "sha256:237a68856edf1bd28b6204bddd0596c1cf46d298bc29c620012540b2e44c73e7"
+url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.1/protoc-36.1-linux-aarch_64.zip"
 
 [tools.protobuf."platforms.linux-arm64-musl"]
-checksum = "sha256:36b518ac14d90351cc6598228ed2bbe5afe4e357b1af470b07e0ec1609875de2"
-url = "https://github.com/protocolbuffers/protobuf/releases/download/v35.0/protoc-35.0-linux-aarch_64.zip"
+checksum = "sha256:237a68856edf1bd28b6204bddd0596c1cf46d298bc29c620012540b2e44c73e7"
+url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.1/protoc-36.1-linux-aarch_64.zip"
 
 [tools.protobuf."platforms.linux-x64"]
-checksum = "sha256:a45cda0989c17dd950db55f6fbe1e5814c50fda08e87aa422980ac1f89dddbbc"
-url = "https://github.com/protocolbuffers/protobuf/releases/download/v35.0/protoc-35.0-linux-x86_64.zip"
+checksum = "sha256:c4bc672d9d49214dc8cafdceadf4df92182d6ca8e3ec65a56b2d7de5602669b4"
+url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.1/protoc-36.1-linux-x86_64.zip"
 
 [tools.protobuf."platforms.linux-x64-musl"]
-checksum = "sha256:a45cda0989c17dd950db55f6fbe1e5814c50fda08e87aa422980ac1f89dddbbc"
-url = "https://github.com/protocolbuffers/protobuf/releases/download/v35.0/protoc-35.0-linux-x86_64.zip"
+checksum = "sha256:c4bc672d9d49214dc8cafdceadf4df92182d6ca8e3ec65a56b2d7de5602669b4"
+url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.1/protoc-36.1-linux-x86_64.zip"
 
 [tools.protobuf."platforms.macos-arm64"]
-checksum = "sha256:45444963204757fd3e2fbe304bc1fdadfb488d8556ff099c4cc06575eab88976"
-url = "https://github.com/protocolbuffers/protobuf/releases/download/v35.0/protoc-35.0-osx-aarch_64.zip"
+checksum = "sha256:de56d57afe30c5d191b11d24ff93dd4025728d7fb43b773886b2d3613e0bdbb2"
+url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.1/protoc-36.1-osx-aarch_64.zip"
 
 [tools.protobuf."platforms.macos-x64"]
-checksum = "sha256:3580c2d115fccb5b0239960c8f70f8da14787b1973a46b2f39c315ad71c11e01"
-url = "https://github.com/protocolbuffers/protobuf/releases/download/v35.0/protoc-35.0-osx-x86_64.zip"
+checksum = "sha256:ee2c5496e4af0aa6a224894bc0f7025145260e004d890487d510725ce8b473eb"
+url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.1/protoc-36.1-osx-x86_64.zip"
 
 [tools.protobuf."platforms.windows-x64"]
-checksum = "sha256:d1cede9e308cc3eb072392af1c02ccae4bdd3d2f374ec2970dbd8cdfdaa91363"
-url = "https://github.com/protocolbuffers/protobuf/releases/download/v35.0/protoc-35.0-win64.zip"
+checksum = "sha256:390e515cb456e6a978553bdb57baf087b054885077fd6da7f7ff0160279c07d6"
+url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.1/protoc-36.1-win64.zip"
 
 [[tools.rust]]
 version = "1.97.1"
