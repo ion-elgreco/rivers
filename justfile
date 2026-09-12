@@ -157,10 +157,14 @@ site-deploy push="--push":
     trap 'git worktree remove --force "$work" 2>/dev/null || true' EXIT
     git fetch origin gh-pages
     git worktree add --detach "$work" origin/gh-pages
-    rm -rf "$work/index.html" "$work/styles.css" "$work/CNAME" "$work/assets"
+    # Mirror www/ onto the root and leave docs/ alone — mike owns that subtree.
+    # Naming the files explicitly meant a new one (like _headers) was copied but
+    # never staged, so clear and stage by pathspec instead.
+    find "$work" -mindepth 1 -maxdepth 1 \
+        ! -name docs ! -name .git ! -name .nojekyll -exec rm -rf {} +
     cp -R www/. "$work/"
     touch "$work/.nojekyll"
-    git -C "$work" add -A index.html styles.css CNAME assets .nojekyll
+    git -C "$work" add -A -- . ':!docs'
     if git -C "$work" diff --cached --quiet; then
         echo "landing page unchanged — nothing to publish"
         exit 0
