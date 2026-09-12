@@ -214,7 +214,7 @@ jobs:
       # rivers-api's prost-build invokes protoc at build time. `3.36.1` is
       # upstream v36.1 — install-action keeps protoc's legacy `3.` prefix.
       - name: Install protoc
-        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: protoc@3.36.1
 
@@ -289,7 +289,7 @@ jobs:
       # rivers-api's prost-build invokes protoc at build time. `3.36.1` is
       # upstream v36.1 — install-action keeps protoc's legacy `3.` prefix.
       - name: Install protoc
-        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: protoc@3.36.1
 
