@@ -14,6 +14,9 @@
   --accent-hover: #ff775d;
   --secondary: #50e1f9;
   --radius: 16px;
+  --flow-dash: 7px;
+  --flow-gap: 9px;
+  --flow-speed: 1.6s;
   --wrap: 1140px;
   --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
@@ -75,6 +78,32 @@ code { font-family: var(--mono); font-size: 0.9em; }
   mask-image: radial-gradient(ellipse 75% 55% at 50% 0%, #000 35%, transparent 100%);
 }
 
+/* ---- Signature motif: the flowing dashed edge ---- */
+@keyframes flow { to { stroke-dashoffset: -32px; } }
+@keyframes flowbg { to { background-position: 16px 0; } }
+
+.flow-edge {
+  stroke-dasharray: var(--flow-dash) var(--flow-gap);
+  animation: flow var(--flow-speed) linear infinite;
+}
+.flow-rule {
+  height: 1px; border: 0; margin: 0;
+  background: repeating-linear-gradient(90deg,
+    var(--accent) 0 var(--flow-dash), transparent var(--flow-dash) 16px);
+  background-size: 16px 1px;
+  animation: flowbg var(--flow-speed) linear infinite;
+  opacity: 0.4;
+}
+.flow-link {
+  color: var(--accent); text-decoration: none; padding-bottom: 3px;
+  background-image: repeating-linear-gradient(90deg,
+    currentColor 0 var(--flow-dash), transparent var(--flow-dash) 16px);
+  background-size: 16px 1px; background-repeat: repeat-x; background-position: 0 100%;
+}
+.flow-link:hover { animation: flowbg var(--flow-speed) linear infinite; }
+
+.wrap-rule { max-width: var(--wrap); margin: 0 auto; }
+
 /* ---- Nav ---- */
 .nav {
   position: sticky; top: 0; z-index: 50;
@@ -101,19 +130,40 @@ code { font-family: var(--mono); font-size: 0.9em; }
 .hero-inner { display: grid; grid-template-columns: 1.05fr 1fr; gap: 56px; align-items: center; }
 .hero-copy, .hero-code, .split-inner > * { min-width: 0; }
 
-.pill {
-  display: inline-flex; align-items: center; gap: 9px;
-  padding: 7px 15px; margin-bottom: 26px; border-radius: 999px;
+/* ---- Hero proof strip ---- */
+.proof {
+  /* Direct child of the two-column .hero-inner grid — span it. */
+  grid-column: 1 / -1; justify-self: center;
+  display: flex; flex-wrap: wrap; align-items: stretch; justify-content: center;
+  width: fit-content; max-width: 100%; margin: 30px auto 0;
   background: var(--glass); border: 1px solid var(--border);
-  color: var(--muted); font-size: 13.5px; font-weight: 550;
+  border-radius: 999px; padding: 6px 8px;
   backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
-  transition: border-color 0.18s, color 0.18s;
 }
-.pill:hover { border-color: var(--border-strong); color: var(--text); }
-.pill-arrow { transition: transform 0.18s; }
-.pill:hover .pill-arrow { transform: translateX(3px); }
+.stat {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 20px; border-radius: 999px;
+  color: inherit; transition: background 0.2s;
+}
+.stat:hover { background: rgba(255, 255, 255, 0.04); color: inherit; }
+.stat b { font-family: var(--mono); font-size: 15.5px; font-weight: 600; letter-spacing: -0.01em; color: var(--text); }
+.stat span { font-size: 13.5px; color: var(--muted); font-weight: 550; }
+.stat .mark { color: var(--accent); font-size: 15px; line-height: 1; }
+/* `display: flex` on .stat would beat the hidden attribute, so restate it. */
+.stat[hidden] { display: none; }
+/* Dashed separator — the motif again, at hairline scale. Generated between
+   visible stats, so hiding one takes its separator with it. */
+.stat { position: relative; }
+/* `~` not `+`: adjacency counts hidden stats and leaves a dangling separator. */
+.stat:not([hidden]) ~ .stat:not([hidden])::before {
+  content: ""; position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+  width: 1px; height: 24px;
+  background: repeating-linear-gradient(180deg,
+    var(--border-strong) 0 var(--flow-dash), transparent var(--flow-dash) 16px);
+  background-size: 1px 16px;
+}
 .pip {
-  width: 7px; height: 7px; border-radius: 50%; background: var(--secondary);
+  width: 7px; height: 7px; border-radius: 50%; background: var(--secondary); flex: none;
   box-shadow: 0 0 0 0 rgba(80, 225, 249, 0.6); animation: pulse 2.4s ease-out infinite;
 }
 @keyframes pulse {
@@ -159,21 +209,30 @@ h1 {
 }
 .btn.glass:hover { border-color: var(--border-strong); color: var(--text); box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4); }
 
+/* The command line is the real call to action, so it is sized like one. */
 .install {
-  display: inline-flex; align-items: center; gap: 12px;
-  background: var(--glass); border: 1px solid var(--border);
-  border-radius: 11px; padding: 10px 10px 10px 16px;
+  display: flex; align-items: center; gap: 14px;
+  max-width: 420px; padding: 0 6px 0 22px;
+  background: rgba(11, 13, 19, 0.82); border: 1px solid var(--border);
+  border-radius: 11px; font-family: var(--mono);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
   backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
 }
-.install .prompt { color: var(--accent); font-family: var(--mono); font-weight: 700; }
-.install code { color: var(--text); font-size: 15px; }
-.copy {
-  font: inherit; font-size: 13px; font-weight: 600;
-  background: transparent; color: var(--muted);
-  border: 1px solid var(--border); border-radius: 7px;
-  padding: 5px 11px; cursor: pointer; transition: color 0.15s, border-color 0.15s;
+.install .prompt { color: var(--accent); user-select: none; font-weight: 700; }
+.install .cmd {
+  flex: 1; padding: 18px 0; font-size: 18px; letter-spacing: -0.01em;
+  color: var(--text); white-space: nowrap; overflow: auto; scrollbar-width: none;
 }
-.copy:hover { color: var(--text); border-color: var(--border-strong); }
+.install .cmd::-webkit-scrollbar { display: none; }
+.copy {
+  flex: none; margin: 6px 0; padding: 9px 14px;
+  font-family: var(--mono); font-size: 12.5px; font-weight: 600;
+  background: var(--glass); color: var(--muted);
+  border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+  transition: color 0.18s, border-color 0.18s, background 0.18s;
+}
+.copy:hover { color: var(--text); border-color: var(--border-strong); background: rgba(255, 255, 255, 0.06); }
+.copy.done { color: var(--secondary); border-color: rgba(80, 225, 249, 0.4); }
 
 /* ---- Code cards ---- */
 .code-card {
@@ -222,30 +281,68 @@ section { position: relative; }
 h2 { font-size: clamp(28px, 3.4vw, 42px); letter-spacing: -0.028em; margin: 0 0 14px; font-weight: 700; line-height: 1.1; }
 .sub { color: var(--muted); margin: 0 auto 44px; max-width: 46em; }
 
-/* ---- Lineage diagram ---- */
+/* ---- Code-to-DAG sequence ---- */
+/* One 10s loop: code lines land, edges flow, nodes light up downstream. */
 .lineage { padding: 78px 0; }
-.lineage-frame {
+.seq {
+  display: grid; grid-template-columns: minmax(280px, 1fr) minmax(300px, 1.15fr);
+  gap: 28px; align-items: center;
   background: var(--glass); border: 1px solid var(--border);
-  border-radius: 22px; padding: 26px;
+  border-radius: 22px; padding: 30px;
   backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
 }
+.seq > * { min-width: 0; }
+@media (max-width: 820px) {
+  .seq { grid-template-columns: 1fr; gap: 22px; padding: 22px; }
+  .seq-steps { flex-direction: column; gap: 0; }
+}
+
+.ln { display: block; opacity: 0; animation: 10s linear infinite; }
+.ln:nth-child(1) { animation-name: t1; }
+.ln:nth-child(2) { animation-name: t2; }
+.ln:nth-child(3) { animation-name: t3; }
+.ln:nth-child(4) { animation-name: t4; }
+.ln:nth-child(5) { animation-name: t5; }
+@keyframes t1 { 0%,2%  { opacity:0; transform:translateY(3px); } 6%,94%  { opacity:1; transform:none; } 100% { opacity:0; } }
+@keyframes t2 { 0%,4%  { opacity:0; transform:translateY(3px); } 8%,94%  { opacity:1; transform:none; } 100% { opacity:0; } }
+@keyframes t3 { 0%,6%  { opacity:0; transform:translateY(3px); } 10%,94% { opacity:1; transform:none; } 100% { opacity:0; } }
+@keyframes t4 { 0%,8%  { opacity:0; transform:translateY(3px); } 12%,94% { opacity:1; transform:none; } 100% { opacity:0; } }
+@keyframes t5 { 0%,10% { opacity:0; transform:translateY(3px); } 14%,94% { opacity:1; transform:none; } 100% { opacity:0; } }
+
+.run {
+  display: flex; align-items: center; gap: 9px;
+  padding: 12px 16px; border-top: 1px solid var(--border);
+  font-family: var(--mono); font-size: 12.5px; color: var(--muted);
+  opacity: 0; animation: runIn 10s linear infinite;
+}
+.run b { color: var(--secondary); font-weight: 600; }
+@keyframes runIn { 0%,26% { opacity:0; } 30%,94% { opacity:1; } 100% { opacity:0; } }
+
 .dag { width: 100%; height: auto; display: block; }
-.dag .edges path {
-  stroke-dasharray: 7 9; opacity: 0.85;
-  animation: flow 1.6s linear infinite;
+.dag .node rect { fill: rgba(255,255,255,.05); stroke: var(--border-strong); stroke-width: 1.5; }
+.dag .node text { fill: var(--text); font-family: var(--mono); font-size: 15px; text-anchor: middle; }
+.dag .node.src rect { animation: litSrc 10s linear infinite; }
+.dag .node.mid rect { animation: hotMid 10s linear infinite; }
+.dag .node.out rect { animation: litOut 10s linear infinite; }
+@keyframes litSrc { 0%,32% { fill:rgba(255,255,255,.05); stroke:rgba(255,255,255,.16); } 36%,94% { fill:rgba(80,225,249,.10); stroke:rgba(80,225,249,.55); } 100% { fill:rgba(255,255,255,.05); stroke:rgba(255,255,255,.16); } }
+@keyframes hotMid { 0%,44% { fill:rgba(255,255,255,.05); stroke:rgba(255,255,255,.16); } 48%,94% { fill:rgba(255,143,120,.16); stroke:#ff8f78; } 100% { fill:rgba(255,255,255,.05); stroke:rgba(255,255,255,.16); } }
+@keyframes litOut { 0%,62% { fill:rgba(255,255,255,.05); stroke:rgba(255,255,255,.16); } 66%,94% { fill:rgba(80,225,249,.10); stroke:rgba(80,225,249,.55); } 100% { fill:rgba(255,255,255,.05); stroke:rgba(255,255,255,.16); } }
+.dag .e1 { opacity: 0; animation: edge1 10s linear infinite; }
+.dag .e2 { opacity: 0; animation: edge2 10s linear infinite; }
+@keyframes edge1 { 0%,36% { opacity:0; } 40%,94% { opacity:.9; } 100% { opacity:0; } }
+@keyframes edge2 { 0%,56% { opacity:0; } 60%,94% { opacity:.9; } 100% { opacity:0; } }
+
+.seq-steps { display: flex; gap: 0; margin-top: 26px; }
+.step {
+  flex: 1; padding: 14px 18px; font-size: 13.5px; color: var(--muted);
+  border-top: 1px solid var(--border);
 }
-@keyframes flow { to { stroke-dashoffset: -32; } }
-.dag .node rect {
-  fill: rgba(255, 255, 255, 0.05); stroke: var(--border-strong); stroke-width: 1.5;
-  animation: node-in 0.6s ease-out both; animation-delay: calc(var(--i) * 0.12s);
+.step b {
+  display: block; font-family: var(--mono); font-size: 11.5px;
+  letter-spacing: .08em; text-transform: uppercase; color: var(--accent); margin-bottom: 5px;
 }
-.dag .node text {
-  fill: var(--text); font-family: var(--mono); font-size: 15px; text-anchor: middle;
-  animation: node-in 0.6s ease-out both; animation-delay: calc(var(--i) * 0.12s);
-}
-.dag .node.hot rect { stroke: var(--accent); fill: rgba(255, 143, 120, 0.10); }
-@keyframes node-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+.step code { color: var(--secondary); }
 
 /* ---- Screenshot ---- */
 .shot { padding: 78px 0; }
@@ -403,7 +500,15 @@ h2 { font-size: clamp(28px, 3.4vw, 42px); letter-spacing: -0.028em; margin: 0 0 
 /* ---- Code showcase ---- */
 .showcase { padding: 82px 0; }
 .snips { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; }
-.snip .code-card { margin-bottom: 20px; }
+.snip { display: flex; flex-direction: column; }
+.snip .code-card { flex: 1; margin-bottom: 20px; }
+/* Subgrid aligns the cards and the captions across all three columns, so the
+   headings sit on one line even when the code blocks differ in height. */
+@supports (grid-template-rows: subgrid) {
+  .snips { grid-template-rows: auto auto; row-gap: 20px; }
+  .snip { display: grid; grid-template-rows: subgrid; grid-row: span 2; }
+  .snip .code-card { margin-bottom: 0; }
+}
 .snip .code-head { padding: 11px 15px; }
 .snip .code-card pre { padding: 18px; }
 .snip .code-card code { font-size: 13px; line-height: 1.6; }
@@ -418,6 +523,10 @@ h2 { font-size: clamp(28px, 3.4vw, 42px); letter-spacing: -0.028em; margin: 0 0 
   .orb { filter: blur(80px); }
 }
 @media (max-width: 640px) {
+  .proof { border-radius: var(--radius); padding: 4px; }
+  .stat:not([hidden]) ~ .stat:not([hidden])::before { display: none; }
+  .stat { padding: 9px 14px; }
+
   .grid, .snips { grid-template-columns: 1fr; }
   .table-frame { overflow-x: auto; }
   .cmp { min-width: 620px; }
@@ -436,7 +545,15 @@ h2 { font-size: clamp(28px, 3.4vw, 42px); letter-spacing: -0.028em; margin: 0 0 
     transition-duration: 0.001ms !important;
   }
   .marquee-track { animation: none; }
-  .dag .edges path { animation: none; stroke-dasharray: none; }
+  /* The sequence loops end at opacity:0, so pin it to its finished state
+     instead of letting the global rule snap it to the last keyframe. */
+  .ln, .run, .dag .e1, .dag .e2 { animation: none !important; opacity: 1 !important; }
+  .ln { transform: none !important; }
+  .flow-edge, .flow-rule, .flow-link:hover { animation: none !important; }
+  .flow-edge { stroke-dasharray: none; }
+  .dag .node rect { animation: none !important; }
+  .dag .node.src rect, .dag .node.out rect { fill: rgba(80, 225, 249, .10); stroke: rgba(80, 225, 249, .55); }
+  .dag .node.mid rect { fill: rgba(255, 143, 120, .16); stroke: #ff8f78; }
   .btn:hover, .card:hover { transform: none; }
   .reveal-armed { opacity: 1; transform: none; }
 }

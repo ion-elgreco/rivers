@@ -48,9 +48,6 @@
   <section class="hero">
     <div class="wrap hero-inner">
       <div class="hero-copy">
-        <a class="pill" href="https://github.com/ion-elgreco/rivers">
-          <span class="pip"></span> Open source · Apache 2.0 <span class="pill-arrow" aria-hidden="true">→</span>
-        </a>
         <h1>Orchestration that runs at <span class="grad">Rust speed</span>.</h1>
         <p class="lede">
           Write assets in Python. rivers resolves the graph, plans execution, and runs
@@ -63,7 +60,7 @@
         </div>
         <div class="install">
           <span class="prompt" aria-hidden="true">$</span>
-          <code>pip install rivers</code>
+          <code class="cmd">pip install rivers</code>
           <button class="copy" type="button" data-copy="pip install rivers" aria-label="Copy install command">Copy</button>
         </div>
       </div>
@@ -86,17 +83,36 @@ repo.materialize()</code></pre>
         </div>
         <p class="code-note">rivers reads the type-annotated parameters and builds the dependency graph. No wiring step.</p>
       </div>
+
+      <!-- The two API-backed stats stay hidden until the script fills them, so the
+           page never shows a number it cannot vouch for. Separators are generated. -->
+      <div class="proof">
+        <a class="stat" hidden href="https://github.com/ion-elgreco/rivers/stargazers">
+          <span class="mark" aria-hidden="true">★</span><b data-stat="stars"></b><span>stars</span>
+        </a>
+        <a class="stat" hidden href="https://github.com/ion-elgreco/rivers/releases/latest">
+          <b data-stat="release"></b><span data-stat="released"></span>
+        </a>
+        <a class="stat" href="https://github.com/ion-elgreco/rivers/blob/main/LICENSE">
+          <b>Apache&nbsp;2.0</b><span>license</span>
+        </a>
+        <a class="stat" href="https://github.com/ion-elgreco/rivers/discussions">
+          <span class="pip" aria-hidden="true"></span><b>Discussions</b><span>ask anything</span>
+        </a>
+      </div>
     </div>
   </section>
+
+  <hr class="flow-rule wrap-rule" aria-hidden="true">
 
   <!-- Capability marquee -->
   <section class="marquee-wrap" aria-label="Capabilities">
     <div class="marquee">
       <ul class="marquee-track">
-        <li>Assets</li><li>Partitions</li><li>Backfills</li><li>Schedules</li><li>Sensors</li>
+        <li>Assets</li><li>Tasks</li><li>Graph assets</li><li>Partitions</li><li>Backfills</li><li>Schedules</li><li>Sensors</li>
         <li>Automation conditions</li><li>Retries</li><li>Concurrency pools</li><li>Kubernetes</li>
         <li>Delta Lake</li><li>Polars</li><li>PyArrow</li><li>SurrealDB</li><li>Lineage</li>
-        <li aria-hidden="true">Assets</li><li aria-hidden="true">Partitions</li><li aria-hidden="true">Backfills</li>
+        <li aria-hidden="true">Assets</li><li aria-hidden="true">Tasks</li><li aria-hidden="true">Graph assets</li><li aria-hidden="true">Partitions</li><li aria-hidden="true">Backfills</li>
         <li aria-hidden="true">Schedules</li><li aria-hidden="true">Sensors</li>
         <li aria-hidden="true">Automation conditions</li><li aria-hidden="true">Retries</li>
         <li aria-hidden="true">Concurrency pools</li><li aria-hidden="true">Kubernetes</li>
@@ -127,37 +143,52 @@ repo.materialize()</code></pre>
           </tbody>
         </table>
       </div>
-      <p class="center micro">Plan times stay below a millisecond on graphs with thousands of nodes. <a href="/docs/latest/comparisons/dagster/">See the full comparison</a></p>
+      <p class="center micro">Plan times stay below a millisecond on graphs with thousands of nodes. <a class="flow-link" href="/docs/latest/comparisons/dagster/">See the full comparison</a></p>
     </div>
   </section>
 
-  <!-- Animated lineage diagram -->
+  <!-- Code to DAG sequence -->
   <section class="lineage reveal">
     <div class="wrap">
-      <h2 class="center">Assets, not tasks</h2>
-      <p class="center sub">rivers tracks what your pipeline <em>produces</em>. Dependencies come from the function signature, and lineage comes for free.</p>
-      <div class="lineage-frame">
-        <svg viewBox="0 0 880 260" class="dag" role="img" aria-label="Diagram: two source assets flow into a joined asset, then into two downstream assets">
+      <h2 class="center">The graph is inferred, not declared</h2>
+      <p class="center sub">An asset is what your pipeline <em>produces</em>. A task is a step inside one. You wire neither — rivers reads the function parameters, builds the edges, and lineage comes for free.</p>
+
+      <div class="seq">
+        <div class="code-card">
+          <div class="code-head"><span class="dot red"></span><span class="dot amber"></span><span class="dot green"></span><span class="fname">analytics.py</span></div>
+<pre><code><span class="ln"><span class="k">import</span> rivers <span class="k">as</span> rs</span><span class="ln"> </span><span class="ln"><span class="d">@rs.Asset</span></span><span class="ln"><span class="k">def</span> <span class="f">sessions</span>(events, users):</span><span class="ln">    <span class="k">return</span> join(events, users)</span></code></pre>
+          <div class="run"><span>$ rivers materialize pipelines.analytics</span><b>&#10003; materialized</b></div>
+        </div>
+
+        <svg viewBox="0 0 560 260" class="dag" role="img" aria-label="Diagram: the assets events and users flow into sessions, which flows into report and features">
           <defs>
             <linearGradient id="edge" x1="0" y1="0" x2="1" y2="0">
               <stop offset="0%" stop-color="#ff8f78"/>
               <stop offset="100%" stop-color="#50e1f9"/>
             </linearGradient>
           </defs>
-          <g class="edges" fill="none" stroke="url(#edge)" stroke-width="2">
-            <path d="M190 70 C 270 70, 280 130, 360 130"/>
-            <path d="M190 190 C 270 190, 280 130, 360 130"/>
-            <path d="M520 130 C 600 130, 610 70, 690 70"/>
-            <path d="M520 130 C 600 130, 610 190, 690 190"/>
+          <g fill="none" stroke="url(#edge)" stroke-width="2">
+            <g class="e1 flow-edge">
+              <path d="M130 62 C 190 62, 195 130, 250 130"/>
+              <path d="M130 198 C 190 198, 195 130, 250 130"/>
+            </g>
+            <g class="e2 flow-edge">
+              <path d="M370 130 C 400 130, 405 62, 440 62"/>
+              <path d="M370 130 C 400 130, 405 198, 440 198"/>
+            </g>
           </g>
-          <g class="nodes">
-            <g class="node" style="--i:0"><rect x="40" y="44" width="150" height="52" rx="10"/><text x="115" y="75">events</text></g>
-            <g class="node" style="--i:1"><rect x="40" y="164" width="150" height="52" rx="10"/><text x="115" y="195">users</text></g>
-            <g class="node hot" style="--i:2"><rect x="360" y="104" width="160" height="52" rx="10"/><text x="440" y="135">sessions</text></g>
-            <g class="node" style="--i:3"><rect x="690" y="44" width="150" height="52" rx="10"/><text x="765" y="75">daily_report</text></g>
-            <g class="node" style="--i:4"><rect x="690" y="164" width="150" height="52" rx="10"/><text x="765" y="195">ml_features</text></g>
-          </g>
+          <g class="node src"><rect x="10" y="38" width="120" height="48" rx="10"/><text x="70" y="67">events</text></g>
+          <g class="node src"><rect x="10" y="174" width="120" height="48" rx="10"/><text x="70" y="203">users</text></g>
+          <g class="node mid"><rect x="250" y="106" width="120" height="48" rx="10"/><text x="310" y="135">sessions</text></g>
+          <g class="node out"><rect x="440" y="38" width="110" height="48" rx="10"/><text x="495" y="67">report</text></g>
+          <g class="node out"><rect x="440" y="174" width="110" height="48" rx="10"/><text x="495" y="203">features</text></g>
         </svg>
+      </div>
+
+      <div class="seq-steps">
+        <div class="step"><b>0&ndash;3s</b> Five lines of Python appear. A decorator and a return — no YAML and no registry call.</div>
+        <div class="step"><b>3&ndash;5s</b> The upstreams resolve and the edges start flowing. The graph was never declared; it was inferred.</div>
+        <div class="step"><b>5&ndash;9s</b> <code>sessions</code> goes hot and the downstream assets light up.</div>
       </div>
     </div>
   </section>
@@ -251,24 +282,28 @@ repo.materialize()</code></pre>
     prev = self.get_inner()
     <span class="k">return</span> (prev <span class="k">or</span> <span class="n">0</span>) + len(events)</code></pre>
           </div>
-          <h3>Read your own last value</h3>
-          <p>An incremental asset loads its previous output through a typed parameter. There is no graph cycle, and no workaround.</p>
+          <div class="snip-text">
+            <h3>Read your own last value</h3>
+            <p>An incremental asset loads its previous output through a typed parameter. There is no graph cycle, and no workaround.</p>
+          </div>
         </article>
 
         <article class="snip">
           <div class="code-card">
             <div class="code-head"><span class="fname">fanout.py</span></div>
-<pre><code><span class="d">@rs.Asset.from_graph</span>()
+<pre><code><span class="d">@rs.Task</span>
+<span class="k">def</span> <span class="f">double</span>(x: <span class="t">int</span>) -> <span class="t">int</span>:
+    <span class="k">return</span> x * <span class="n">2</span>
+
+<span class="d">@rs.Asset.from_graph</span>()
 <span class="k">def</span> <span class="f">doubled</span>():
-    mapped = numbers().map(
-        double, max_concurrency=<span class="n">4</span>
-    )
-    <span class="k">return</span> sum_all(
-        mapped.collect_stream()
-    )</code></pre>
+    m = numbers().map(double)
+    <span class="k">return</span> total(m.collect_stream())</code></pre>
           </div>
-          <h3>Fan out, collect as it lands</h3>
-          <p>Downstream work starts on the first mapped result. A streaming collect means no barrier waiting for the slowest branch.</p>
+          <div class="snip-text">
+            <h3>Compose tasks into one asset</h3>
+            <p>A graph asset is a sub-DAG of tasks, and each task is its own step. Fan out with <code>.map()</code>; a streaming collect starts downstream work on the first result instead of waiting for the slowest branch.</p>
+          </div>
         </article>
 
         <article class="snip">
@@ -282,8 +317,10 @@ repo.materialize()</code></pre>
 <span class="k">def</span> <span class="f">report</span>(prices, inventory):
     <span class="k">return</span> {**prices, **inventory}</code></pre>
           </div>
-          <h3>Mix async and sync freely</h3>
-          <p>Async assets run as event-loop tasks while sync assets run in subprocess workers, inside the same run.</p>
+          <div class="snip-text">
+            <h3>Mix async and sync freely</h3>
+            <p>Async assets run as event-loop tasks while sync assets run in subprocess workers, inside the same run.</p>
+          </div>
         </article>
 
       </div>
@@ -374,7 +411,7 @@ repo.materialize()</code></pre>
     <div class="wrap split-inner">
       <div>
         <h2>Kubernetes is the control plane</h2>
-        <p>Registering a pipeline is one <code>kubectl apply</code>. The operator resolves the tag to an immutable digest, reconciles a Deployment and Service, and registers the endpoint for the UI to discover.</p>
+        <p>Registering a code location is one <code>kubectl apply</code>. The operator resolves the tag to an immutable digest, reconciles a Deployment and Service, and registers the endpoint for the UI to discover.</p>
         <p>There is no workspace file to maintain, no "add code location" flow in the UI, and no agent process to register against. Delete the resource to remove it.</p>
         <a class="btn glass" href="/docs/latest/installation/kubernetes/">Install on Kubernetes</a>
       </div>
@@ -391,6 +428,8 @@ repo.materialize()</code></pre>
       </div>
     </div>
   </section>
+
+  <hr class="flow-rule wrap-rule" aria-hidden="true">
 
   <!-- Final CTA -->
   <section class="final reveal">
@@ -432,12 +471,58 @@ repo.materialize()</code></pre>
   document.querySelectorAll(".copy").forEach(function (btn) {
     btn.addEventListener("click", function () {
       navigator.clipboard.writeText(btn.dataset.copy).then(function () {
-        var prev = btn.textContent;
-        btn.textContent = "Copied";
-        setTimeout(function () { btn.textContent = prev; }, 1500);
+        btn.textContent = "\u2713 Copied";
+        btn.classList.add("done");
+        clearTimeout(btn._revert);
+        btn._revert = setTimeout(function () {
+          btn.textContent = "Copy";
+          btn.classList.remove("done");
+        }, 1600);
       });
     });
   });
+
+  // Proof strip. Stars and the latest release are fetched live and stay hidden
+  // until they arrive. GitHub allows 60 unauthenticated calls an hour per IP, so a
+  // failure is ordinary — the stat simply stays hidden rather than showing an error.
+  (function () {
+    var api = "https://api.github.com/repos/ion-elgreco/rivers";
+
+    function set(key, value) {
+      var el = document.querySelector('[data-stat="' + key + '"]');
+      if (el && value) el.textContent = value;
+    }
+
+    function shipped(iso) {
+      var days = Math.floor((Date.now() - Date.parse(iso)) / 86400000);
+      if (days <= 0) return "shipped today";
+      if (days === 1) return "shipped yesterday";
+      if (days < 30) return "shipped " + days + "d ago";
+      return "shipped " + new Date(iso).toLocaleDateString("en", { month: "short", year: "numeric" });
+    }
+
+    function get(path, fn) {
+      fetch(api + path)
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { if (d) fn(d); })
+        .catch(function () {});
+    }
+
+    function reveal(key) {
+      var el = document.querySelector('[data-stat="' + key + '"]');
+      if (el) el.closest(".stat").hidden = false;
+    }
+
+    get("", function (d) {
+      set("stars", String(d.stargazers_count));
+      reveal("stars");
+    });
+    get("/releases/latest", function (d) {
+      set("release", d.tag_name);
+      set("released", shipped(d.published_at));
+      reveal("release");
+    });
+  })();
 
   // Screenshot carousel. Fades between slides and advances on its own, unless
   // the visitor prefers reduced motion or is interacting with it.
