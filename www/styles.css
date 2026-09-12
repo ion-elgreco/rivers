@@ -253,12 +253,6 @@ h2 { font-size: clamp(28px, 3.4vw, 42px); letter-spacing: -0.028em; margin: 0 0 
   width: 100%; height: auto; border: 1px solid var(--border); border-radius: 20px;
   box-shadow: 0 40px 100px rgba(0, 0, 0, 0.6), 0 0 70px rgba(80, 225, 249, 0.10);
 }
-.shot-placeholder {
-  border: 2px dashed var(--border-strong); border-radius: 20px;
-  padding: 82px 24px; text-align: center; color: var(--muted); background: var(--glass);
-}
-.shot-placeholder p { margin: 6px 0; }
-.shot-placeholder code { color: var(--secondary); }
 
 /* ---- Features ---- */
 .features { padding: 78px 0; }
