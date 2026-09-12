@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rivers — Orchestration platform for tasks and assets, fully backed by Rust</title>
-<meta name="description" content="rivers is a Rust-powered orchestration platform built around data assets. Define pipelines in Python; rivers resolves the graph and plans execution in compiled Rust.">
+<meta name="description" content="rivers is a Rust-powered orchestration platform built around data assets. Define pipelines in Python; rivers resolves the graph, plans execution, and runs the scheduler in compiled Rust.">
 <link rel="icon" href="/assets/logo.svg" type="image/svg+xml">
 <link rel="canonical" href="https://orchestrator.rs/">
 <meta property="og:type" content="website">
@@ -53,8 +53,9 @@
         </a>
         <h1>Orchestration that runs at <span class="grad">Rust speed</span>.</h1>
         <p class="lede">
-          Define pipelines in Python. rivers resolves the graph, plans execution, and
-          runs the scheduler in compiled Rust — with no Python interpreter on the control plane.
+          Write assets in Python. rivers resolves the graph, plans execution, and runs
+          the scheduler as compiled Rust — so nothing in the control plane waits on a
+          Python interpreter.
         </p>
         <div class="cta">
           <a class="btn primary" href="/docs/latest/getting-started/">Get started</a>
@@ -105,6 +106,31 @@ repo.materialize()</code></pre>
     </div>
   </section>
 
+  <!-- Control plane comparison -->
+  <section class="compare reveal">
+    <div class="wrap">
+      <h2 class="center">The control plane is compiled</h2>
+      <p class="center sub">Most orchestrators run their scheduler, planner, and daemon as Python processes. rivers compiles all of them into one binary. Python only runs inside your own asset code.</p>
+      <div class="table-frame">
+        <table class="cmp">
+          <thead>
+            <tr><th scope="col">Component</th><th scope="col">Python orchestrators</th><th scope="col">rivers</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Graph resolution</td><td class="was">Python</td><td class="now">Compiled Rust (<code>petgraph</code>)</td></tr>
+            <tr><td>Execution planner</td><td class="was">Python</td><td class="now">Compiled Rust</td></tr>
+            <tr><td>Partition mapping</td><td class="was">Python</td><td class="now">Compiled Rust</td></tr>
+            <tr><td>Daemon: schedules, sensors, automation</td><td class="was">Python</td><td class="now">Compiled Rust, no GIL held</td></tr>
+            <tr><td>Web UI server</td><td class="was">Python plus a JavaScript bundle</td><td class="now">Rust: axum, Leptos, WebAssembly</td></tr>
+            <tr><td>Kubernetes integration</td><td class="was">Python launcher</td><td class="now">Rust operator with CRDs</td></tr>
+            <tr class="punch"><td>Python interpreter on the control plane</td><td class="was">Yes, everywhere</td><td class="now">None</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="center micro">Plan times stay below a millisecond on graphs with thousands of nodes. <a href="/docs/latest/comparisons/dagster/">See the full comparison</a></p>
+    </div>
+  </section>
+
   <!-- Animated lineage diagram -->
   <section class="lineage reveal">
     <div class="wrap">
@@ -136,11 +162,139 @@ repo.materialize()</code></pre>
     </div>
   </section>
 
+  <!-- rivers dev -->
+  <section class="split reveal">
+    <div class="wrap split-inner">
+      <div>
+        <h2>One command starts <span class="grad">the whole stack</span>.</h2>
+        <p>No separate webserver and daemon to babysit. No Postgres to provision. No <code>workspace.yaml</code>, and no docker-compose file.</p>
+        <p>The binary you run on your laptop is the same one that ships to production through the Helm chart.</p>
+        <a class="btn glass" href="/docs/latest/getting-started/">Getting started</a>
+      </div>
+      <div>
+        <div class="code-card glow">
+          <div class="code-head"><span class="dot red"></span><span class="dot amber"></span><span class="dot green"></span><span class="fname">terminal</span></div>
+<pre><code><span class="d">$</span> rivers dev pipelines.analytics</code></pre>
+        </div>
+        <ul class="ticks starts">
+          <li>Embedded SurrealDB on RocksDB — no external database</li>
+          <li>The scheduler daemon, evaluating your automation</li>
+          <li>The gRPC code-location backend on port 3001</li>
+          <li>The web UI on port 3000, in the same process</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section class="features reveal">
+    <div class="wrap">
+      <h2 class="center">Built for the parts that usually hurt</h2>
+      <p class="center sub">Not a feature list. These are the differences you feel in week three.</p>
+      <div class="grid">
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">◆</span> A daemon per code location</h3>
+          <p>Most orchestrators run one global daemon for every team. One slow sensor stalls everyone's triggers. rivers runs a daemon inside each code location, so a bad tick in one team's repo cannot touch another's.</p>
+          <a href="/docs/latest/comparisons/dagster/">How isolation works<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">▦</span> Pools that survive a crash</h3>
+          <p>Concurrency pool slots are leases. When a pod is killed mid-step, the lease expires and the slot returns. A dead worker cannot hold your warehouse capacity hostage. One asset can hold several pools at once.</p>
+          <a href="/docs/latest/concepts/concurrency/">Concurrency<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">⚡</span> Async assets, for real</h3>
+          <p>Write <code>async def</code> on an asset and rivers awaits it on the tokio event loop. No wrapper and no separate decorator. The parallel executor caps async fan-out separately from its subprocess workers.</p>
+          <a href="/docs/latest/concepts/jobs/">Executors<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">◷</span> Partitions that mix kinds</h3>
+          <p>Put time-window, static, and dynamic dimensions in the same partition definition, with no cap on dimension count. Cron accepts a seconds field, so partitions and schedules can tick below a minute.</p>
+          <a href="/docs/latest/concepts/partitions/">Partitions<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">◱</span> Config is just Pydantic</h3>
+          <p>Annotate the context with your model — <code>AssetExecutionContext[MyConfig]</code> — and the type is read from the annotation. No config DSL, no run-config dictionary, and real autocomplete on <code>context.config</code>.</p>
+          <a href="/docs/latest/concepts/configuration/">Configuration<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">◎</span> Tracing without an add-on</h3>
+          <p>Set <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> and spans flow to your collector. Python <code>logging</code> and <code>context.log</code> bridge into the same subscriber, so per-step log capture needs no setup.</p>
+          <a href="/docs/latest/api-reference/environment-variables/">Environment variables<span aria-hidden="true"> →</span></a>
+        </article>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- Code showcase -->
+  <section class="showcase reveal">
+    <div class="wrap">
+      <h2 class="center">Three things that are usually awkward</h2>
+      <p class="center sub">Each of these is one annotation in rivers.</p>
+      <div class="snips">
+
+        <article class="snip">
+          <div class="code-card">
+            <div class="code-head"><span class="fname">incremental.py</span></div>
+<pre><code><span class="d">@rs.Asset</span>
+<span class="k">def</span> <span class="f">running_total</span>(
+    self: rs.<span class="t">SelfDependency</span>[<span class="t">int</span>],
+    events: <span class="t">list</span>,
+) -> <span class="t">int</span>:
+    prev = self.get_inner()
+    <span class="k">return</span> (prev <span class="k">or</span> <span class="n">0</span>) + len(events)</code></pre>
+          </div>
+          <h3>Read your own last value</h3>
+          <p>An incremental asset loads its previous output through a typed parameter. There is no graph cycle, and no workaround.</p>
+        </article>
+
+        <article class="snip">
+          <div class="code-card">
+            <div class="code-head"><span class="fname">fanout.py</span></div>
+<pre><code><span class="d">@rs.Asset.from_graph</span>()
+<span class="k">def</span> <span class="f">doubled</span>():
+    mapped = numbers().map(
+        double, max_concurrency=<span class="n">4</span>
+    )
+    <span class="k">return</span> sum_all(
+        mapped.collect_stream()
+    )</code></pre>
+          </div>
+          <h3>Fan out, collect as it lands</h3>
+          <p>Downstream work starts on the first mapped result. A streaming collect means no barrier waiting for the slowest branch.</p>
+        </article>
+
+        <article class="snip">
+          <div class="code-card">
+            <div class="code-head"><span class="fname">async.py</span></div>
+<pre><code><span class="d">@rs.Asset</span>
+<span class="k">async def</span> <span class="f">prices</span>():
+    <span class="k">return await</span> client.fetch(<span class="s">"/prices"</span>)
+
+<span class="d">@rs.Asset</span>
+<span class="k">def</span> <span class="f">report</span>(prices, inventory):
+    <span class="k">return</span> {**prices, **inventory}</code></pre>
+          </div>
+          <h3>Mix async and sync freely</h3>
+          <p>Async assets run as event-loop tasks while sync assets run in subprocess workers, inside the same run.</p>
+        </article>
+
+      </div>
+    </div>
+  </section>
+
   <!-- Product screenshot slot -->
   <section class="shot reveal">
     <div class="wrap">
       <h2 class="center">Watch every run, asset, and partition</h2>
-      <p class="center sub">The web UI is Rust too — Leptos server-side rendering with WebAssembly hydration, served by axum.</p>
+      <p class="center sub">The UI is Rust too. Run state, materializations, and automation ticks stream to the browser over server-sent events, with a live indicator instead of a refresh button.</p>
       <!--
         SCREENSHOT SLOT.
         Run `just demo`, open http://localhost:3000, and capture the lineage view at 2560x1440.
@@ -155,77 +309,13 @@ repo.materialize()</code></pre>
     </div>
   </section>
 
-  <!-- Features -->
-  <section class="features reveal">
-    <div class="wrap">
-      <h2 class="center">Everything a data platform needs</h2>
-      <p class="center sub">Built in, not bolted on.</p>
-      <div class="grid">
-
-        <article class="card">
-          <h3><span class="ico" aria-hidden="true">◆</span> Asset-based orchestration</h3>
-          <p>Declare data assets as Python functions. rivers resolves the dependency graph from the signatures, and supports single, multi-output, graph, and external assets.</p>
-          <a href="/docs/latest/concepts/assets/">Assets<span aria-hidden="true"> →</span></a>
-        </article>
-
-        <article class="card">
-          <h3><span class="ico" aria-hidden="true">▦</span> Partitions that scale</h3>
-          <p>Static, time-window, multi-dimensional, and dynamic partitions. Partition mapping and key validation run in Rust, so large partition sets stay responsive.</p>
-          <a href="/docs/latest/concepts/partitions/">Partitions<span aria-hidden="true"> →</span></a>
-        </article>
-
-        <article class="card">
-          <h3><span class="ico" aria-hidden="true">⚙</span> Executors for any scale</h3>
-          <p>Run in process while you develop. Switch to concurrent subprocess workers, or give every step its own Kubernetes pod, without changing your asset code.</p>
-          <a href="/docs/latest/concepts/jobs/">Executors<span aria-hidden="true"> →</span></a>
-        </article>
-
-        <article class="card">
-          <h3><span class="ico" aria-hidden="true">◷</span> Schedules, sensors, automation</h3>
-          <p>Declarative triggers — cron, event-driven, and dependency-aware automation conditions — evaluated by the rivers daemon.</p>
-          <a href="/docs/latest/concepts/scheduling/">Automation<span aria-hidden="true"> →</span></a>
-        </article>
-
-        <article class="card">
-          <h3><span class="ico" aria-hidden="true">↻</span> Backfills and retries</h3>
-          <p>Run partition ranges with multi-run, single-run, and per-dimension strategies. Declarative retries match on exception type and classify infrastructure failures.</p>
-          <a href="/docs/latest/concepts/backfills/">Backfills<span aria-hidden="true"> →</span></a>
-        </article>
-
-        <article class="card">
-          <h3><span class="ico" aria-hidden="true">▤</span> Persistent storage built in</h3>
-          <p>Embedded SurrealDB with RocksDB for local development. A SurrealDB server for production. Run history, lineage, and logs are durable from the first run.</p>
-          <a href="/docs/latest/api-reference/storage/">Storage<span aria-hidden="true"> →</span></a>
-        </article>
-
-      </div>
-    </div>
-  </section>
-
-  <!-- Rust core -->
-  <section class="split reveal">
-    <div class="wrap split-inner">
-      <div>
-        <h2>Python is the API.<br><span class="grad">Rust does the work.</span></h2>
-        <p>Graph resolution, partition mapping, execution planning, and the scheduler are all compiled Rust. Python is the surface you write against, and nothing more.</p>
-        <p>Plan times stay below a millisecond on graphs with thousands of nodes.</p>
-        <a class="btn glass" href="/docs/latest/architecture/concurrency-flow/">Read the architecture</a>
-      </div>
-      <ul class="ticks">
-        <li>Graph resolution in <code>petgraph</code>, not Python objects</li>
-        <li>One binary starts the database, scheduler, and UI</li>
-        <li>Server-sent events push run state to the browser</li>
-        <li>No control-plane Python interpreter to keep warm</li>
-      </ul>
-    </div>
-  </section>
-
   <!-- Kubernetes -->
   <section class="split alt reveal">
     <div class="wrap split-inner">
       <div>
-        <h2>Kubernetes-native</h2>
-        <p>rivers ships an operator and custom resource definitions. Declare a repository as a <code>CodeLocation</code> and the operator reconciles it.</p>
+        <h2>Kubernetes is the control plane</h2>
+        <p>Registering a pipeline is one <code>kubectl apply</code>. The operator resolves the tag to an immutable digest, reconciles a Deployment and Service, and registers the endpoint for the UI to discover.</p>
+        <p>There is no workspace file to maintain, no "add code location" flow in the UI, and no agent process to register against. Delete the resource to remove it.</p>
         <a class="btn glass" href="/docs/latest/installation/kubernetes/">Install on Kubernetes</a>
       </div>
       <div class="code-card glow">
