@@ -87,10 +87,14 @@ runs:
     # `3.` prefix here: `3.36.1` is upstream v36.1. Keep the version in sync
     # with `protobuf` in mise.toml and PROTOC_VERSION in release-python.yaml.
     #
+    # install-action resolves the version against a manifest baked into the
+    # release we pin, so the pin has to be at least as new as the protoc
+    # release. Too old and it fails with "protoc@<version> is not supported".
+    #
     # wasm-bindgen-cli is used by `just wasm` / `just wasm-dev` (driven directly
     # so we can pass a custom cargo profile — wasm-pack can't)
     - name: Install protoc + wasm tooling
-      uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+      uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
       with:
         tool: protoc@3.36.1,wasm-bindgen-cli@0.2.121,wasm-pack@0.14.0
 
