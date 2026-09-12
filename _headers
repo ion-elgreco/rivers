@@ -1,0 +1,5 @@
+# Cloudflare Pages header rules. GitHub Pages ignores this file.
+# Screenshot filenames are stable, so `immutable` would pin a recapture out of
+# every cache for its lifetime. A day, revalidated, is the honest trade.
+/assets/*
+  Cache-Control: public, max-age=86400, stale-while-revalidate=604800
