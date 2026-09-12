@@ -170,35 +170,6 @@ site-deploy push="--push":
         git -C "$work" push origin HEAD:gh-pages
     fi
 
-# ONE-TIME migration. Moves the versioned docs already published at the
-# gh-pages root into `docs/`, to match `--deploy-prefix docs`. Run it once
-# with push="--push", then run `just docs-set-default`. Delete this recipe
-# afterwards.
-docs-migrate-prefix push="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    work=$(mktemp -d)
-    trap 'git worktree remove --force "$work" 2>/dev/null || true' EXIT
-    git fetch origin gh-pages
-    git worktree add --detach "$work" origin/gh-pages
-    mkdir -p "$work/docs"
-    for entry in "$work"/*/; do
-        name=$(basename "$entry")
-        if [ "$name" = "docs" ] || [ "$name" = "assets" ]; then
-            continue
-        fi
-        echo "moving $name -> docs/$name"
-        git -C "$work" mv "$name" "docs/$name"
-    done
-    if [ -f "$work/versions.json" ]; then
-        git -C "$work" mv versions.json docs/versions.json
-    fi
-    git -C "$work" rm -f --ignore-unmatch index.html
-    git -C "$work" commit -m "docs: move versioned docs under /docs"
-    if [ -n "{{ push }}" ]; then
-        git -C "$work" push origin HEAD:gh-pages
-    fi
-
 # === K8s Integration Testing ===
 
 linux_target := "aarch64-unknown-linux-gnu"
