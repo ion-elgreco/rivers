@@ -249,10 +249,54 @@ h2 { font-size: clamp(28px, 3.4vw, 42px); letter-spacing: -0.028em; margin: 0 0 
 
 /* ---- Screenshot ---- */
 .shot { padding: 78px 0; }
-.shot-img {
-  width: 100%; height: auto; border: 1px solid var(--border); border-radius: 20px;
-  box-shadow: 0 40px 100px rgba(0, 0, 0, 0.6), 0 0 70px rgba(80, 225, 249, 0.10);
+.carousel { position: relative; }
+.carousel-viewport { position: relative; }
+.carousel-track { list-style: none; margin: 0; padding: 0; position: relative; }
+
+/* Only the active slide is in flow, so the frame takes its height. */
+.carousel-slide {
+  position: absolute; inset: 0;
+  opacity: 0; visibility: hidden;
+  transition: opacity 0.55s ease;
 }
+.carousel-slide.is-active { position: relative; opacity: 1; visibility: visible; }
+.carousel-slide img {
+  display: block; width: 100%; height: auto;
+  border: 1px solid var(--border); border-radius: 18px;
+  box-shadow: 0 40px 100px rgba(0, 0, 0, 0.6), 0 0 70px rgba(80, 225, 249, 0.08);
+}
+
+.carousel-arrow {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  z-index: 3; width: 46px; height: 46px; padding: 0;
+  display: grid; place-items: center;
+  font: inherit; font-size: 26px; line-height: 1; cursor: pointer;
+  color: var(--text); background: rgba(11, 13, 19, 0.85);
+  border: 1px solid var(--border); border-radius: 50%;
+  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+  opacity: 0; transition: opacity 0.2s, border-color 0.2s, background 0.2s;
+}
+.carousel:hover .carousel-arrow { opacity: 1; }
+.carousel-arrow:focus-visible { opacity: 1; }
+.carousel-arrow:hover { border-color: var(--accent); background: rgba(11, 13, 19, 0.95); }
+.carousel-prev { left: 16px; }
+.carousel-next { right: 16px; }
+
+.carousel-caption {
+  margin: 22px auto 0; max-width: 64ch; min-height: 3em;
+  text-align: center; color: var(--muted); font-size: 15px;
+}
+.carousel-caption b { color: var(--text); font-weight: 650; }
+.carousel-caption code { color: var(--secondary); }
+
+.carousel-dots { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-top: 4px; }
+.carousel-dots button {
+  width: 8px; height: 8px; padding: 0; border: 0; border-radius: 50%;
+  background: var(--border-strong); cursor: pointer;
+  transition: background 0.2s, transform 0.2s;
+}
+.carousel-dots button:hover { background: var(--muted); }
+.carousel-dots button[aria-selected="true"] { background: var(--accent); transform: scale(1.45); }
 
 /* ---- Features ---- */
 .features { padding: 78px 0; }

@@ -293,11 +293,79 @@ repo.materialize()</code></pre>
   <!-- Product screenshot slot -->
   <section class="shot reveal">
     <div class="wrap">
-      <h2 class="center">Watch every run, asset, and partition</h2>
-      <p class="center sub">The UI is Rust too. Run state, materializations, and automation ticks stream to the browser over server-sent events, with a live indicator instead of a refresh button.</p>
-      <img class="shot-img" src="/assets/ui-runs.png"
-           alt="The rivers web UI run list: eighteen runs with their launch source, status, assets, partition keys, and duration"
-           width="2880" height="1800" loading="lazy">
+      <h2 class="center">The whole platform, in one UI</h2>
+      <p class="center sub">Every screen below is Rust — Leptos server-side rendering with WebAssembly hydration, on axum. Run state, materializations, and automation ticks stream over server-sent events, so there is a live indicator instead of a refresh button.</p>
+      <div class="carousel" data-carousel>
+        <div class="carousel-viewport">
+          <ul class="carousel-track">
+            <li class="carousel-slide is-active" data-caption="<b>Overview</b> &mdash; Run health, success rate, and every asset group in one screen.">
+              <img src="/assets/ui/overview.png" width="2160" height="1350"
+                   alt="The rivers web UI, Overview page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Runs</b> &mdash; What launched each run — a schedule, a condition, or a backfill — with its assets and partition keys.">
+              <img src="/assets/ui/runs.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Runs page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Run detail</b> &mdash; A step timeline over the full event stream: pool slots, materializations, and step results.">
+              <img src="/assets/ui/run-detail.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Run detail page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Logs</b> &mdash; Per-step logs with a level filter. Anything you write with <code>context.log</code> lands here.">
+              <img src="/assets/ui/run-logs.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Logs page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Lineage</b> &mdash; The asset graph, marked up with materialized, running, stale, and external state.">
+              <img src="/assets/ui/lineage.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Lineage page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Assets</b> &mdash; Kind, type, group, tags, and freshness for every asset in the repository.">
+              <img src="/assets/ui/assets.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Assets page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Automation</b> &mdash; Schedules, sensors, and declarative conditions, with the next tick for each.">
+              <img src="/assets/ui/automation.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Automation page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Backfills</b> &mdash; Partition ranges in flight, and how far each one has progressed.">
+              <img src="/assets/ui/backfills.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Backfills page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Jobs</b> &mdash; Every job the repository defines.">
+              <img src="/assets/ui/jobs.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Jobs page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Pools</b> &mdash; Concurrency slots across the cluster, with the lease that reclaims them after a crash.">
+              <img src="/assets/ui/pools.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Pools page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Queue</b> &mdash; What is waiting to run, and exactly what is blocking it.">
+              <img src="/assets/ui/queue.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Queue page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Deployment</b> &mdash; The daemon, the code locations, and the storage backend.">
+              <img src="/assets/ui/deployment.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Deployment page">
+            </li>
+          </ul>
+          <button class="carousel-arrow carousel-prev" type="button" aria-label="Previous screenshot" data-step="-1">&#8249;</button>
+          <button class="carousel-arrow carousel-next" type="button" aria-label="Next screenshot" data-step="1">&#8250;</button>
+        </div>
+        <p class="carousel-caption" data-caption-out aria-live="polite"><b>Overview</b> &mdash; Run health, success rate, and every asset group in one screen.</p>
+        <div class="carousel-dots" role="tablist" aria-label="Choose a screenshot">
+          <button type="button" role="tab" aria-selected="true" aria-label="Overview" data-go="0"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Runs" data-go="1"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Run detail" data-go="2"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Logs" data-go="3"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Lineage" data-go="4"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Assets" data-go="5"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Automation" data-go="6"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Backfills" data-go="7"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Jobs" data-go="8"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Pools" data-go="9"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Queue" data-go="10"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Deployment" data-go="11"></button>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -358,6 +426,8 @@ repo.materialize()</code></pre>
 </footer>
 
 <script>
+  var motionOK = !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
   // Copy-to-clipboard on the install command.
   document.querySelectorAll(".copy").forEach(function (btn) {
     btn.addEventListener("click", function () {
@@ -369,9 +439,49 @@ repo.materialize()</code></pre>
     });
   });
 
+  // Screenshot carousel. Fades between slides and advances on its own, unless
+  // the visitor prefers reduced motion or is interacting with it.
+  (function () {
+    var root = document.querySelector("[data-carousel]");
+    if (!root) return;
+    var slides = Array.prototype.slice.call(root.querySelectorAll(".carousel-slide"));
+    var dots = Array.prototype.slice.call(root.querySelectorAll("[data-go]"));
+    var caption = root.querySelector("[data-caption-out]");
+    var idx = 0, timer = null;
+
+    function show(n) {
+      idx = (n + slides.length) % slides.length;
+      slides.forEach(function (s, k) { s.classList.toggle("is-active", k === idx); });
+      dots.forEach(function (d, k) { d.setAttribute("aria-selected", k === idx ? "true" : "false"); });
+      caption.innerHTML = slides[idx].dataset.caption;
+      var img = slides[idx].querySelector("img");
+      if (img) img.removeAttribute("loading");
+    }
+    function stop() { if (timer) { clearInterval(timer); timer = null; } }
+    function start() {
+      stop();
+      if (motionOK) timer = setInterval(function () { show(idx + 1); }, 5200);
+    }
+
+    root.querySelectorAll("[data-step]").forEach(function (b) {
+      b.addEventListener("click", function () { show(idx + Number(b.dataset.step)); start(); });
+    });
+    dots.forEach(function (d) {
+      d.addEventListener("click", function () { show(Number(d.dataset.go)); start(); });
+    });
+    root.addEventListener("mouseenter", stop);
+    root.addEventListener("mouseleave", start);
+    root.addEventListener("focusin", stop);
+    root.addEventListener("focusout", start);
+    root.addEventListener("keydown", function (e) {
+      if (e.key === "ArrowLeft") { show(idx - 1); start(); }
+      if (e.key === "ArrowRight") { show(idx + 1); start(); }
+    });
+    start();
+  })();
+
   // Scroll reveal. Sections start hidden only when this script runs, so the
   // page stays readable with JavaScript disabled.
-  var motionOK = !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   var targets = document.querySelectorAll(".reveal");
   if (motionOK && "IntersectionObserver" in window) {
     targets.forEach(function (el) { el.classList.add("reveal-armed"); });
