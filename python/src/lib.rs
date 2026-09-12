@@ -75,6 +75,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Optional OTel layer — activates when OTEL_EXPORTER_OTLP_ENDPOINT is set
     let mut otel_build_err = None;
     let otel_layer = if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
+        let _runtime_guard = runtime::rt().enter();
         match opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
             .build()
