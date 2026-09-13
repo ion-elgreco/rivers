@@ -6060,6 +6060,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rivers-bench-storage"
+version = "0.0.0-dev"
+dependencies = [
+ "anyhow",
+ "clap 4.6.5",
+ "rivers-core",
+ "tokio",
+]
+
+[[package]]
 name = "rivers-core"
 version = "0.0.0-dev"
 dependencies = [
