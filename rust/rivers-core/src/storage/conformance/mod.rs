@@ -7,6 +7,46 @@
 
 mod cases;
 
+/// A live PostgreSQL to run the suite against, or `None` to skip that row.
+///
+/// The skip prints, because the harness reports a skipped test as `ok` and a
+/// PostgreSQL row that never ran would otherwise look green.
+fn postgres_url() -> Option<String> {
+    let url = std::env::var("RIVERS_TEST_POSTGRES_URL")
+        .ok()
+        .filter(|u| !u.is_empty());
+    if url.is_none() {
+        eprintln!("SKIPPED: RIVERS_TEST_POSTGRES_URL is unset, no PostgreSQL to test against");
+    }
+    url
+}
+
+/// Storage over a schema of this case's own, migrated and empty.
+///
+/// A schema per case, because the cases assume they own the database. The
+/// search_path comes from connect options rather than a `SET`: that would bind
+/// only one connection, and the next query from the pool would land in `public`.
+async fn postgres_fixture(url: &str, case: &str) -> crate::storage::any::AnyStorage {
+    use sqlx::{AssertSqlSafe, PgPool};
+    let schema = format!("rivers_conf_{case}");
+    let admin = PgPool::connect(url).await.expect("connect");
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema};"
+    )))
+    .execute(&admin)
+    .await
+    .expect("fresh schema");
+    admin.close().await;
+
+    let scoped = format!("{url}?options=-c%20search_path%3D{schema}");
+    crate::storage::any::AnyStorage::postgres_connect(
+        &scoped,
+        crate::storage::migration::Capability::Migrate,
+    )
+    .await
+    .expect("migrate the test schema")
+}
+
 /// Generate one real test per (case, backend) pair.
 ///
 /// `test_temp_dir!` keys off the calling function, so the embedded row expands
@@ -23,6 +63,21 @@ macro_rules! conformance_suite {
                 async fn $case() {
                     let storage = Arc::new(
                         AnyStorage::surreal_memory().await.expect("in-memory storage"),
+                    );
+                    cases::$case(&storage).await;
+                }
+            )*
+        }
+
+        mod postgres {
+            use super::cases;
+            use std::sync::Arc;
+            $(
+                #[tokio::test]
+                async fn $case() {
+                    let Some(url) = super::postgres_url() else { return };
+                    let storage = Arc::new(
+                        super::postgres_fixture(&url, stringify!($case)).await,
                     );
                     cases::$case(&storage).await;
                 }

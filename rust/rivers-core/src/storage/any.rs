@@ -13,6 +13,7 @@ use std::future::Future;
 
 use anyhow::Result;
 
+use super::postgres_backend::PostgresStorage;
 use super::surrealdb_backend::{Capability, SurrealConnectConfig, SurrealStorage};
 use super::url::StorageUrl;
 use super::*;
@@ -20,6 +21,7 @@ use super::*;
 /// A storage backend, chosen at connect time.
 pub enum AnyStorage {
     Surreal(SurrealStorage),
+    Postgres(PostgresStorage),
 }
 
 impl std::fmt::Debug for AnyStorage {
@@ -34,6 +36,12 @@ impl From<SurrealStorage> for AnyStorage {
     }
 }
 
+impl From<PostgresStorage> for AnyStorage {
+    fn from(inner: PostgresStorage) -> Self {
+        Self::Postgres(inner)
+    }
+}
+
 /// Delegate async trait methods to the active backend.
 ///
 /// Adding a backend means adding one arm here, not one arm in every method.
@@ -45,6 +53,7 @@ macro_rules! delegate_trait {
                 async move {
                     match self {
                         Self::Surreal(inner) => inner.$name($($arg),*).await,
+                        Self::Postgres(inner) => inner.$name($($arg),*).await,
                     }
                 }
             }
@@ -60,6 +69,7 @@ macro_rules! delegate_inherent {
             pub async fn $name(&self, $($arg: $ty),*) -> $ret {
                 match self {
                     Self::Surreal(inner) => inner.$name($($arg),*).await,
+                    Self::Postgres(inner) => inner.$name($($arg),*).await,
                 }
             }
         )*
@@ -119,18 +129,20 @@ impl AnyStorage {
             StorageUrl::SurrealRemote(config) => {
                 Self::surreal_connect_with_capability(config, cap).await
             }
-            StorageUrl::Postgres { url } => {
-                anyhow::bail!(
-                    "PostgreSQL storage ({url}) is not implemented yet;                      the schema and migrations exist but the backend does not"
-                )
-            }
+            StorageUrl::Postgres { url } => Self::postgres_connect(&url, cap).await,
         }
+    }
+
+    /// Remote PostgreSQL server.
+    pub async fn postgres_connect(url: &str, cap: Capability) -> Result<Self> {
+        Ok(Self::Postgres(PostgresStorage::connect(url, cap).await?))
     }
 
     /// Human-readable backend label for logs.
     pub fn label(&self) -> String {
         match self {
             Self::Surreal(inner) => inner.backend_kind().label(),
+            Self::Postgres(inner) => inner.label(),
         }
     }
 

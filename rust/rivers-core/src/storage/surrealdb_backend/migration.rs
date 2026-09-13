@@ -11,8 +11,8 @@ use surrealdb::types::SurrealValue;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::now_nanos;
 use crate::storage::migration::{Capability, SchemaStamps, check_compatibility};
+use crate::storage::now_nanos;
 
 /// refinery's history table — one checksummed row per applied migration.
 const REFINERY_HISTORY_TABLE: &str = "refinery_schema_history";

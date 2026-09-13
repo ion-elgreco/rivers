@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::assets::graph::GraphTopology;
 use crate::storage::any::AnyStorage;
-use crate::storage::surrealdb_backend::now_nanos;
+use crate::storage::now_nanos;
 use crate::storage::*;
 
 fn make_event(asset_key: &str, run_id: &str, ts: i64) -> EventRecord {

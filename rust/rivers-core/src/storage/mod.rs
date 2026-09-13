@@ -586,34 +586,47 @@ pub enum RunStatus {
     Canceled,
 }
 
-impl SurrealValue for RunStatus {
-    fn kind_of() -> Kind {
-        String::kind_of()
-    }
-
-    fn into_value(self) -> Value {
-        let s = match self {
+impl RunStatus {
+    /// The stored text form. Both backends persist this exact string, so the
+    /// mapping lives here rather than in either backend's serialization.
+    pub fn as_str(&self) -> &'static str {
+        match self {
             Self::Queued => "Queued",
             Self::NotStarted => "NotStarted",
             Self::Started => "Started",
             Self::Success => "Success",
             Self::Failure => "Failure",
             Self::Canceled => "Canceled",
-        };
-        s.to_string().into_value()
+        }
+    }
+
+    /// Inverse of [`Self::as_str`].
+    pub fn from_stored(s: &str) -> Option<Self> {
+        Some(match s {
+            "Queued" => Self::Queued,
+            "NotStarted" => Self::NotStarted,
+            "Started" => Self::Started,
+            "Success" => Self::Success,
+            "Failure" => Self::Failure,
+            "Canceled" => Self::Canceled,
+            _ => return None,
+        })
+    }
+}
+
+impl SurrealValue for RunStatus {
+    fn kind_of() -> Kind {
+        String::kind_of()
+    }
+
+    fn into_value(self) -> Value {
+        self.as_str().to_string().into_value()
     }
 
     fn from_value(value: Value) -> std::result::Result<Self, SurrealError> {
         let s = String::from_value(value)?;
-        match s.as_str() {
-            "Queued" => Ok(Self::Queued),
-            "NotStarted" => Ok(Self::NotStarted),
-            "Started" => Ok(Self::Started),
-            "Success" => Ok(Self::Success),
-            "Failure" => Ok(Self::Failure),
-            "Canceled" => Ok(Self::Canceled),
-            _ => Err(SurrealError::internal(format!("unknown RunStatus: {s}"))),
-        }
+        Self::from_stored(&s)
+            .ok_or_else(|| SurrealError::internal(format!("unknown RunStatus: {s}")))
     }
 }
 
@@ -840,6 +853,28 @@ pub struct RunsSummary {
     pub failure: u64,
     pub success: u64,
     pub last_24h: u64,
+}
+
+/// Wall-clock nanoseconds since the Unix epoch.
+pub(crate) fn now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64
+}
+
+/// The `RunQueued` event every backend writes beside a newly enqueued run.
+pub(crate) fn run_queued_event(record: &RunRecord) -> EventRecord {
+    EventRecord {
+        code_location_id: record.code_location_id.clone(),
+        event_type: EventType::RunQueued,
+        asset_key: None,
+        run_id: record.run_id.clone(),
+        partition_key: record.partition_key.clone(),
+        timestamp: record.start_time,
+        metadata: vec![(tag_keys::PRIORITY.to_string(), record.priority.to_string())],
+        input_data_versions: vec![],
+    }
 }
 
 // ── Backfill records ──

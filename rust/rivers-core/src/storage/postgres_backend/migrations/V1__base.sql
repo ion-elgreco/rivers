@@ -104,6 +104,20 @@ CREATE INDEX IF NOT EXISTS idx_runs_loc_status ON runs (code_location_id, status
 -- Scoped get_runs / get_runs_since walk one CL's runs in start_time order.
 CREATE INDEX IF NOT EXISTS idx_runs_loc_time ON runs (code_location_id, start_time);
 
+-- One row per step execution; log streams are optional columns. Keeps log
+-- payloads off the events indexes and out of every structured-events scan.
+CREATE TABLE IF NOT EXISTS run_logs (
+    id                text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    code_location_id  text NOT NULL DEFAULT 'default',
+    run_id            text NOT NULL,
+    step_key          text NOT NULL,
+    timestamp         bigint NOT NULL,
+    stdout            text,
+    stderr            text,
+    logs              text
+);
+CREATE INDEX IF NOT EXISTS idx_run_logs_run ON run_logs (run_id);
+
 -- General-purpose key/value store (graph topology, etc.)
 CREATE TABLE IF NOT EXISTS kv (
     key    text PRIMARY KEY,
@@ -170,6 +184,7 @@ CREATE TABLE IF NOT EXISTS backfills (
     backfill_id           text PRIMARY KEY,
     code_location_id      text NOT NULL DEFAULT 'default',
     status                text NOT NULL,
+    job_name              text,
     strategy              jsonb NOT NULL,
     failure_policy        text NOT NULL,
     asset_selection       text[] NOT NULL DEFAULT '{}',
@@ -182,7 +197,8 @@ CREATE TABLE IF NOT EXISTS backfills (
     tags                  jsonb NOT NULL DEFAULT '[]'::jsonb,
     create_time           bigint NOT NULL,
     end_time              bigint,
-    error                 text
+    error                 text,
+    launched_by           jsonb NOT NULL DEFAULT '{"kind": "manual"}'::jsonb
 );
 CREATE INDEX IF NOT EXISTS idx_backfills_loc_status ON backfills (code_location_id, status);
 
@@ -222,6 +238,43 @@ CREATE TABLE IF NOT EXISTS pending_steps (
     PRIMARY KEY (run_id, step_key)
 );
 CREATE INDEX IF NOT EXISTS idx_pending_pool ON pending_steps (code_location_id, pool_key);
+
+-- ── change notifications ──
+-- Backs `subscribe_table`, the UI's live-update feed. Statement-level, not
+-- row-level: a 10k-row event batch sends one notification, not 10k. The
+-- payload carries the schema so two rivers schemas in one database do not
+-- wake each other's listeners.
+CREATE OR REPLACE FUNCTION rivers_notify() RETURNS trigger AS $rivers$
+BEGIN
+    PERFORM pg_notify('rivers_' || TG_TABLE_NAME, TG_TABLE_SCHEMA);
+    RETURN NULL;
+END;
+$rivers$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER runs_notify AFTER INSERT OR UPDATE OR DELETE ON runs
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify();
+CREATE OR REPLACE TRIGGER assets_notify AFTER INSERT OR UPDATE OR DELETE ON assets
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify();
+CREATE OR REPLACE TRIGGER asset_partitions_notify AFTER INSERT OR UPDATE OR DELETE ON asset_partitions
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify();
+CREATE OR REPLACE TRIGGER events_notify AFTER INSERT OR UPDATE OR DELETE ON events
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify();
+CREATE OR REPLACE TRIGGER run_logs_notify AFTER INSERT OR UPDATE OR DELETE ON run_logs
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify();
+CREATE OR REPLACE TRIGGER backfills_notify AFTER INSERT OR UPDATE OR DELETE ON backfills
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify();
+CREATE OR REPLACE TRIGGER ticks_notify AFTER INSERT OR UPDATE OR DELETE ON ticks
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify();
+CREATE OR REPLACE TRIGGER condition_ticks_notify AFTER INSERT OR UPDATE OR DELETE ON condition_ticks
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify();
+CREATE OR REPLACE TRIGGER condition_evals_notify AFTER INSERT OR UPDATE OR DELETE ON condition_evals
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify();
+CREATE OR REPLACE TRIGGER concurrency_pools_notify AFTER INSERT OR UPDATE OR DELETE ON concurrency_pools
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify();
+CREATE OR REPLACE TRIGGER concurrency_slots_notify AFTER INSERT OR UPDATE OR DELETE ON concurrency_slots
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify();
+CREATE OR REPLACE TRIGGER pending_steps_notify AFTER INSERT OR UPDATE OR DELETE ON pending_steps
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify();
 
 -- ── migration metadata ──
 -- One row per applied migration: its compatibility class and the floors it set.

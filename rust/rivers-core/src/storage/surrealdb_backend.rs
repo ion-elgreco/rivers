@@ -17,6 +17,7 @@ use super::{
     RunsPage, RunsSummary, SlotHolder, StorageBackend, StoredConditionEval, StoredConditionTick,
     StoredEvent, StoredLog, StoredTick, TickRecord,
 };
+use super::{now_nanos, run_queued_event};
 
 mod migration;
 pub use crate::storage::migration::{Capability, SchemaMigrationNeeded};
@@ -1205,33 +1206,9 @@ fn record_id_str(id: &RecordId) -> String {
     format!("{}:{:?}", id.table.as_str(), id.key)
 }
 
-pub(crate) fn now_nanos() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as i64
-}
-
 #[derive(Debug, SurrealValue, serde::Deserialize)]
 struct OptStringField {
     value: Option<String>,
-}
-
-/// Build the `RunQueued` event row that pairs with a freshly-written queued `RunRecord`.
-fn run_queued_event(record: &RunRecord) -> EventRecord {
-    EventRecord {
-        code_location_id: record.code_location_id.clone(),
-        event_type: EventType::RunQueued,
-        asset_key: None,
-        run_id: record.run_id.clone(),
-        partition_key: record.partition_key.clone(),
-        timestamp: record.start_time,
-        metadata: vec![(
-            super::tag_keys::PRIORITY.to_string(),
-            record.priority.to_string(),
-        )],
-        input_data_versions: vec![],
-    }
 }
 
 impl SurrealStorage {
@@ -4292,15 +4269,6 @@ mod tests {
         }
     }
 
-    /// Register assets before store_event.
-    async fn register(storage: &SurrealStorage, keys: &[&str]) {
-        let records: Vec<AssetRecord> = keys.iter().map(|k| make_asset_record(k)).collect();
-        storage
-            .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &records)
-            .await
-            .unwrap();
-    }
-
     #[tokio::test]
     async fn test_create_run_swallows_duplicate_id_after_retry() {
         use super::super::retry;
@@ -4827,29 +4795,6 @@ mod tests {
         );
     }
 
-    fn make_backfill(id: &str, status: BackfillStatus, create_time: i64) -> BackfillRecord {
-        BackfillRecord {
-            code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
-            backfill_id: id.to_string(),
-            status,
-            strategy: BackfillStrategy::MultiRun,
-            failure_policy: BackfillFailurePolicy::Continue,
-            asset_selection: vec!["a".to_string()],
-            job_name: None,
-            partition_keys: vec![],
-            run_ids: vec![],
-            completed_partitions: vec![],
-            failed_partitions: vec![],
-            canceled_partitions: vec![],
-            max_concurrency: 1,
-            tags: vec![],
-            create_time,
-            end_time: None,
-            error: None,
-            launched_by: LaunchedBy::default(),
-        }
-    }
-
     // ── Run queue tests ──
 
     // ── Concurrency pool tests ──
@@ -5318,32 +5263,4 @@ mod tests {
     // ── backfill launch recovery ──
 
     // ── Run progress, outcome, cancellation, step events ──
-
-    fn mk_isolation_backfill(
-        id: &str,
-        cl: &str,
-        status: BackfillStatus,
-        create_time: i64,
-    ) -> BackfillRecord {
-        BackfillRecord {
-            backfill_id: id.to_string(),
-            code_location_id: cl.to_string(),
-            status,
-            strategy: BackfillStrategy::MultiRun,
-            failure_policy: BackfillFailurePolicy::Continue,
-            asset_selection: vec!["a".to_string()],
-            job_name: None,
-            partition_keys: vec![],
-            run_ids: vec![],
-            completed_partitions: vec![],
-            failed_partitions: vec![],
-            canceled_partitions: vec![],
-            max_concurrency: 1,
-            tags: vec![],
-            create_time,
-            end_time: None,
-            error: None,
-            launched_by: LaunchedBy::default(),
-        }
-    }
 }
