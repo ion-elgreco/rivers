@@ -225,7 +225,7 @@ pub fn make_context(client: kube_client::Client, storage: Arc<AnyStorage>) -> Co
         namespace: "default".to_string(),
         storage,
         directory: Arc::new(DirectoryState::new()),
-        surreal_pod_cfg: rivers_k8s::env::SurrealPodConfig::default(),
+        storage_pod_cfg: rivers_k8s::env::StoragePodConfig::default(),
     }
 }
 

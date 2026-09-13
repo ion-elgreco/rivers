@@ -41,6 +41,30 @@ impl StorageUrl {
     pub fn is_remote(&self) -> bool {
         matches!(self, Self::SurrealRemote(_) | Self::Postgres { .. })
     }
+
+    /// The location as text, with any password replaced by `***`. Safe to log.
+    pub fn redacted(&self) -> String {
+        match self {
+            Self::SurrealEmbedded { path } => format!("rocksdb://{path}"),
+            Self::SurrealMemory => "mem://".to_string(),
+            Self::SurrealRemote(cfg) => redact_password(&cfg.endpoint),
+            Self::Postgres { url } => redact_password(url),
+        }
+    }
+}
+
+/// Strip the password from a connection url so it is safe to log.
+pub fn redact_password(url: &str) -> String {
+    match (url.find("://"), url.find('@')) {
+        (Some(scheme_end), Some(at)) if at > scheme_end + 3 => {
+            let userinfo = &url[scheme_end + 3..at];
+            match userinfo.split_once(':') {
+                Some((user, _)) => format!("{}{}:***{}", &url[..scheme_end + 3], user, &url[at..]),
+                None => url.to_string(),
+            }
+        }
+        _ => url.to_string(),
+    }
 }
 
 impl FromStr for StorageUrl {

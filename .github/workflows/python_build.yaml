@@ -71,6 +71,26 @@ jobs:
     permissions:
       contents: read
 
+    # The storage conformance suite runs every case against three backends.
+    # Without this service the PostgreSQL row skips (and says so) instead of
+    # failing, so a broken service shows up as a drop in the test count.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: rivers
+          POSTGRES_DB: rivers
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      RIVERS_TEST_POSTGRES_URL: postgres://postgres:rivers@localhost:5432/rivers
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -32,7 +32,7 @@ spec:
           type: RuntimeDefault
       {{- if .Values.surrealdb.enabled }}
       initContainers:
-        {{- include "rivers.surrealReadinessInitContainer" . | nindent 8 }}
+        {{- include "rivers.storageReadinessInitContainer" . | nindent 8 }}
       {{- end }}
       containers:
         - name: operator
@@ -57,7 +57,7 @@ spec:
                   fieldPath: metadata.name
             - name: RIVERS_NAMESPACE
               value: {{ include "rivers.namespace" . }}
-            {{- include "rivers.surrealEnv" . | nindent 12 }}
+            {{- include "rivers.storageEnv" . | nindent 12 }}
             - name: RIVERS_CODE_LOCATION_SERVICE_ACCOUNT
               value: {{ .Values.executor.serviceAccountName | quote }}
             - name: RIVERS_METRICS_ADDR

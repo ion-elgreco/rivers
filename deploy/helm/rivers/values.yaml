@@ -1,6 +1,26 @@
 global:
   namespace: rivers
 
+# Which storage backend rivers uses: "surrealdb" or "postgresql".
+#
+# PostgreSQL is remote-only — the chart connects to a server you run, it does
+# not bundle one. Selecting it also requires `surrealdb.enabled: false`, so an
+# unused SurrealDB is never installed beside it. Any other value fails the
+# install rather than falling back.
+storage:
+  backend: surrealdb
+
+# Used only when `storage.backend` is "postgresql".
+postgresql:
+  # Connection URL: postgres://user:password@host:5432/dbname
+  # The chart copies this into a Secret so the password never lands in a pod
+  # spec. Prefer `existingSecret` in production.
+  url: ""
+  # Existing Secret holding the URL. When set, `url` is ignored.
+  existingSecret: ""
+  secretKeys:
+    url: url
+
 surrealdb:
   # Install the bundled SurrealDB subchart
   # (https://github.com/surrealdb/helm-charts). Set to false to point rivers

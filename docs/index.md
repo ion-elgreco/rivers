@@ -50,6 +50,6 @@ print(repo.load_node("summary"))  # "100 users, 5000 events"
 - **Parallel & distributed execution** — `Executor.parallel()` for concurrent subprocess workers, `Executor.kubernetes()` for one-pod-per-step on K8s.
 - **Schedules, sensors, and automation conditions** — declarative triggers (cron, event-driven, dep-aware) executed by the rivers daemon.
 - **Backfills** — partition-range execution with multi-run, single-run, and per-dimension strategies.
-- **Persistent storage** — embedded SurrealDB + RocksDB for local dev, SurrealDB server for production.
+- **Persistent storage** — embedded SurrealDB + RocksDB for local dev; a SurrealDB or PostgreSQL server for production.
 - **Concurrency control** — run-queue limits, tag concurrency, and step-level concurrency pools.
 - **Single-binary dev experience** — `rivers dev <module>` boots SurrealDB (embedded RocksDB), the scheduler, and the web UI on `:3000` in one process.

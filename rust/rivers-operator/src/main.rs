@@ -18,6 +18,7 @@ use kube_client::{Api, Client};
 use kube_runtime::Controller;
 use kube_runtime::watcher::Config as WatcherConfig;
 use rivers_core::storage::any::AnyStorage;
+use rivers_core::storage::migration::Capability;
 use rivers_k8s::crd::code_location::CodeLocation;
 use rivers_k8s::crd::run::Run;
 use tracing_subscriber::EnvFilter;
@@ -58,17 +59,14 @@ async fn main() -> anyhow::Result<()> {
 
     let client = Client::try_default().await?;
     let namespace = rivers_k8s::env::detect_namespace();
-    let surreal_config = rivers_k8s::env::detect_surreal_connect_config();
+    let storage_url = rivers_k8s::env::detect_storage_url()?;
 
     tracing::info!(
         %namespace,
-        endpoint = %surreal_config.endpoint,
-        surreal_ns = %surreal_config.namespace,
-        surreal_db = %surreal_config.database,
-        authenticated = surreal_config.credentials.is_some(),
-        "connecting to SurrealDB"
+        backend = storage_url.backend_name(),
+        "connecting to storage"
     );
-    let storage = Arc::new(AnyStorage::surreal_connect(surreal_config).await?);
+    let storage = Arc::new(AnyStorage::open(storage_url, Capability::ReadWrite).await?);
 
     let runs: Api<Run> = Api::namespaced(client.clone(), &namespace);
     let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
@@ -76,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), &namespace);
     let services: Api<Service> = Api::namespaced(client.clone(), &namespace);
 
-    let surreal_pod_cfg = rivers_k8s::env::SurrealPodConfig::from_env();
+    let storage_pod_cfg = rivers_k8s::env::StoragePodConfig::from_env();
 
     // Built up front so the run reconciler's Context can reference it; the
     // watcher + gRPC tasks are spawned later via `spawn_registry_service`.
@@ -87,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
         namespace: namespace.clone(),
         storage,
         directory: directory_state.clone(),
-        surreal_pod_cfg: surreal_pod_cfg.clone(),
+        storage_pod_cfg: storage_pod_cfg.clone(),
     });
 
     let pod_identity = pod_identity();
@@ -117,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
         leader: leader.clone(),
         code_location_service_account: std::env::var(CODE_LOCATION_SA_ENV)
             .unwrap_or_else(|_| DEFAULT_CODE_LOCATION_SA.to_string()),
-        surreal_pod_cfg: surreal_pod_cfg.clone(),
+        storage_pod_cfg: storage_pod_cfg.clone(),
     });
 
     let metrics_addr =

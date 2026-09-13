@@ -119,7 +119,7 @@ pub async fn handle_executor_failure(
     }
 
     let cl_env = fetch_cl_env(ctx, run).await?;
-    let pod = build_executor_pod(run, &pod_name, run_id, true, &cl_env, &ctx.surreal_pod_cfg);
+    let pod = build_executor_pod(run, &pod_name, run_id, true, &cl_env, &ctx.storage_pod_cfg);
     match pods_api.create(&PostParams::default(), &pod).await {
         Ok(_) => {}
         Err(kube_client::Error::Api(ref e)) if e.code == 409 => {

@@ -75,7 +75,7 @@ pub fn build_deployment(
     cl: &CodeLocation,
     resolved_image: &str,
     code_location_service_account: &str,
-    surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
+    storage_pod_cfg: &rivers_k8s::env::StoragePodConfig,
 ) -> Deployment {
     let name = deployment_name(&cl.name_any());
     let ns = cl.namespace();
@@ -136,7 +136,7 @@ pub fn build_deployment(
                             ..Default::default()
                         }]),
                         resources: Some(spec.resources.clone()),
-                        env: Some(build_env(cl, resolved_image, surreal_pod_cfg)),
+                        env: Some(build_env(cl, resolved_image, storage_pod_cfg)),
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -151,7 +151,7 @@ pub fn build_deployment(
 fn build_env(
     cl: &CodeLocation,
     resolved_image: &str,
-    surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
+    storage_pod_cfg: &rivers_k8s::env::StoragePodConfig,
 ) -> Vec<EnvVar> {
     let mut env = vec![
         EnvVar {
@@ -175,7 +175,7 @@ fn build_env(
             ..Default::default()
         },
     ];
-    env.extend(rivers_k8s::env::build_surreal_pod_env(surreal_pod_cfg));
+    env.extend(rivers_k8s::env::build_storage_pod_env(storage_pod_cfg));
     env.extend(cl.spec.env.iter().cloned());
     env
 }
@@ -285,7 +285,7 @@ mod tests {
             &cl,
             "ghcr.io/acme/pipeline@sha256:abc",
             "rivers-code-location",
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
         );
 
         let expected = json!({
@@ -325,6 +325,7 @@ mod tests {
                                 { "name": "RIVERS_CODE_LOCATION_ID", "value": "" },
                                 { "name": "RIVERS_CODE_LOCATION_IMAGE", "value": "ghcr.io/acme/pipeline@sha256:abc" },
                                 { "name": "RIVERS_MODULE", "value": "acme.pipeline" },
+                                { "name": "RIVERS_STORAGE_URL", "value": "ws://surrealdb.rivers.svc:8000" },
                                 { "name": "RIVERS_SURREAL_ENDPOINT", "value": "ws://surrealdb.rivers.svc:8000" },
                                 { "name": "RIVERS_SURREAL_NAMESPACE", "value": "rivers" },
                                 { "name": "RIVERS_SURREAL_DATABASE", "value": "main" },
@@ -386,7 +387,7 @@ mod tests {
             &cl,
             "ghcr.io/acme/pipeline@sha256:deadbeef",
             "rivers-code-location",
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
         );
 
         let expected = json!({
@@ -433,6 +434,7 @@ mod tests {
                                 { "name": "RIVERS_CODE_LOCATION_ID", "value": "550e8400-e29b-41d4-a716-446655440000" },
                                 { "name": "RIVERS_CODE_LOCATION_IMAGE", "value": "ghcr.io/acme/pipeline@sha256:deadbeef" },
                                 { "name": "RIVERS_MODULE", "value": "acme.pipeline" },
+                                { "name": "RIVERS_STORAGE_URL", "value": "ws://surrealdb.rivers.svc:8000" },
                                 { "name": "RIVERS_SURREAL_ENDPOINT", "value": "ws://surrealdb.rivers.svc:8000" },
                                 { "name": "RIVERS_SURREAL_NAMESPACE", "value": "rivers" },
                                 { "name": "RIVERS_SURREAL_DATABASE", "value": "main" },
@@ -473,7 +475,7 @@ mod tests {
             &cl,
             "img@sha256:a",
             "rivers-code-location",
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
         );
 
         let expected_resources = json!({

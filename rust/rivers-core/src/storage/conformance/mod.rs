@@ -9,13 +9,20 @@ mod cases;
 
 /// A live PostgreSQL to run the suite against, or `None` to skip that row.
 ///
-/// The skip prints, because the harness reports a skipped test as `ok` and a
-/// PostgreSQL row that never ran would otherwise look green.
+/// Skipping is for laptops without a server. Under CI it panics instead: the
+/// harness reports a skipped test as `ok`, so a PostgreSQL service that failed
+/// to start would take the whole backend out of the run and still look green.
 fn postgres_url() -> Option<String> {
     let url = std::env::var("RIVERS_TEST_POSTGRES_URL")
         .ok()
         .filter(|u| !u.is_empty());
     if url.is_none() {
+        assert!(
+            std::env::var("CI").is_err(),
+            "RIVERS_TEST_POSTGRES_URL is unset under CI — the PostgreSQL service \
+             did not start, and skipping it would report a green run that never \
+             tested the backend"
+        );
         eprintln!("SKIPPED: RIVERS_TEST_POSTGRES_URL is unset, no PostgreSQL to test against");
     }
     url

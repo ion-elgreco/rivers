@@ -1,0 +1,111 @@
+suite: postgresql storage backend
+templates:
+  - templates/operator-deployment.yaml
+  - templates/ui-deployment.yaml
+  - templates/postgresql-url-secret.yaml
+release:
+  name: rivers
+  namespace: rivers
+tests:
+  - it: inline url lands in a chart-managed Secret, never in a pod spec
+    set:
+      storage.backend: postgresql
+      surrealdb.enabled: false
+      postgresql.url: postgres://rivers:s3cret@pg:5432/rivers
+    asserts:
+      - template: templates/postgresql-url-secret.yaml
+        equal:
+          path: stringData.url
+          value: postgres://rivers:s3cret@pg:5432/rivers
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_STORAGE_URL
+            valueFrom:
+              secretKeyRef:
+                name: rivers-postgresql-url
+                key: url
+      # The two coordinates a run pod re-emits onto its step pods.
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_STORAGE_URL_SECRET_NAME
+            value: rivers-postgresql-url
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_STORAGE_URL_SECRET_KEY
+            value: url
+
+  - it: drops the SurrealDB env and the wait-for-surreal init container
+    set:
+      storage.backend: postgresql
+      surrealdb.enabled: false
+      postgresql.url: postgres://rivers:s3cret@pg:5432/rivers
+    asserts:
+      - template: templates/operator-deployment.yaml
+        notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_ENDPOINT
+            value: ws://surrealdb.rivers.svc:8000
+      # No bundled server means no image to borrow for a readiness probe; a
+      # failed connect restarts the pod instead.
+      - template: templates/operator-deployment.yaml
+        isNull:
+          path: spec.template.spec.initContainers
+
+  - it: existingSecret suppresses the chart-managed Secret
+    set:
+      storage.backend: postgresql
+      surrealdb.enabled: false
+      postgresql.existingSecret: my-pg-secret
+      postgresql.secretKeys.url: dsn
+    asserts:
+      - template: templates/postgresql-url-secret.yaml
+        hasDocuments:
+          count: 0
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_STORAGE_URL
+            valueFrom:
+              secretKeyRef:
+                name: my-pg-secret
+                key: dsn
+
+  # Helm renders every template and reports the first failure, so each guard
+  # test disables the UI and asserts against the template helm actually
+  # blames — the Secret, which reads the backend selector first.
+  - it: fails rather than installing an unused SurrealDB beside PostgreSQL
+    set:
+      ui.enabled: false
+      storage.backend: postgresql
+      postgresql.url: postgres://rivers:s3cret@pg:5432/rivers
+    asserts:
+      - template: templates/postgresql-url-secret.yaml
+        failedTemplate:
+          errorPattern: "set surrealdb.enabled=false"
+
+  - it: fails when PostgreSQL is selected with no connection details
+    set:
+      ui.enabled: false
+      storage.backend: postgresql
+      surrealdb.enabled: false
+    asserts:
+      - template: templates/postgresql-url-secret.yaml
+        failedTemplate:
+          errorPattern: "set postgresql.url or postgresql.existingSecret"
+
+  - it: fails on an unknown backend rather than defaulting to SurrealDB
+    set:
+      ui.enabled: false
+      storage.backend: mysql
+    asserts:
+      - template: templates/postgresql-url-secret.yaml
+        failedTemplate:
+          errorPattern: 'storage.backend must be "surrealdb" or "postgresql"'

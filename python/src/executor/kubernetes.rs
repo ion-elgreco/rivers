@@ -60,7 +60,7 @@ pub(crate) struct KubernetesBackend {
     /// every step pod. Read once from the run pod's own env (set by the
     /// operator) so step pods get the same `secretKeyRef` without
     /// round-tripping the password value through this process.
-    pub surreal_pod_cfg: rivers_k8s::env::SurrealPodConfig,
+    pub storage_pod_cfg: rivers_k8s::env::StoragePodConfig,
     pub run_cr_name: String,
     pub run_cr_uid: String,
     /// Resolved once via [`rivers_k8s::env::current_code_location_id`]
@@ -130,7 +130,7 @@ impl KubernetesBackend {
         worker_memory: String,
     ) -> Self {
         let module = std::env::var("RIVERS_MODULE").unwrap_or_default();
-        let surreal_pod_cfg = rivers_k8s::env::SurrealPodConfig::from_env();
+        let storage_pod_cfg = rivers_k8s::env::StoragePodConfig::from_env();
         let run_cr_name = std::env::var("RIVERS_RUN_CR_NAME").unwrap_or_default();
         let run_cr_uid = std::env::var("RIVERS_RUN_CR_UID").unwrap_or_default();
         let code_location_id = rivers_k8s::env::current_code_location_id();
@@ -145,7 +145,7 @@ impl KubernetesBackend {
             worker_cpu,
             worker_memory,
             module,
-            surreal_pod_cfg,
+            storage_pod_cfg,
             run_cr_name,
             run_cr_uid,
             code_location_id,
@@ -173,7 +173,7 @@ impl KubernetesBackend {
             worker_cpu: self.worker_cpu.clone(),
             worker_memory: self.worker_memory.clone(),
             module: self.module.clone(),
-            surreal_pod_cfg: self.surreal_pod_cfg.clone(),
+            storage_pod_cfg: self.storage_pod_cfg.clone(),
             run_id: run_id.to_string(),
             run_cr_name: self.run_cr_name.clone(),
             run_cr_uid: self.run_cr_uid.clone(),

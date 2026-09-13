@@ -14,11 +14,15 @@ tests:
           content:
             name: RIVERS_SURREAL_ENDPOINT
             value: ws://surrealdb.rivers.svc:8000
+      # The UI reads the location from env, not argv: on the PostgreSQL path
+      # the URL is a secret and must not appear in a pod spec's args.
       - template: templates/ui-deployment.yaml
         documentIndex: 0
         contains:
-          path: spec.template.spec.containers[0].args
-          content: ws://surrealdb.rivers.svc:8000
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_STORAGE_URL
+            value: ws://surrealdb.rivers.svc:8000
 
   - it: routes to an external endpoint when the bundled subchart is disabled
     set:
@@ -34,8 +38,10 @@ tests:
       - template: templates/ui-deployment.yaml
         documentIndex: 0
         contains:
-          path: spec.template.spec.containers[0].args
-          content: wss://surreal.example.com:443
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_STORAGE_URL
+            value: wss://surreal.example.com:443
 
   - it: fails the install when surrealdb is disabled and no endpoint is set
     set:

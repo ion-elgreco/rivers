@@ -18,7 +18,9 @@ class ModuleConfig(BaseModel):
 
 class StorageConfig(BaseModel):
     path: str = ".rivers/storage/"
-    endpoint: str | None = None
+    # Whole location as one URL; the scheme picks the backend. Overrides
+    # ``path`` when set.
+    url: str | None = None
 
 
 class ServerConfig(BaseModel):
@@ -69,7 +71,7 @@ class RiversConfig(BaseSettings):
         port: int | None = None,
         grpc_port: int | None = None,
         storage_path: str | None = None,
-        surreal_endpoint: str | None = None,
+        storage_url: str | None = None,
         no_daemon: bool | None = None,
         synthetic: str | None = None,
     ) -> "RiversConfig":
@@ -86,7 +88,7 @@ class RiversConfig(BaseSettings):
         groups: dict[str, dict] = {
             "module": {"path": module, "repo_var": repo_var},
             "server": {"host": host, "port": port, "grpc_port": grpc_port},
-            "storage": {"path": storage_path, "endpoint": surreal_endpoint},
+            "storage": {"path": storage_path, "url": storage_url},
             "daemon": {"no_daemon": no_daemon},
             "synthetic": {"size": synthetic},
         }

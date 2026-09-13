@@ -10,6 +10,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
 use super::migration::Capability;
+use super::url::redact_password as redact;
 use super::*;
 
 /// Storage over a PostgreSQL server.
@@ -266,20 +267,6 @@ fn event_from_row(row: &sqlx::postgres::PgRow) -> Result<StoredEvent> {
         code_version: row.try_get("code_version")?,
         input_data_versions: from_json(row, "input_data_versions")?,
     })
-}
-
-/// Strip the password from a connection url so it is safe to log.
-fn redact(url: &str) -> String {
-    match (url.find("://"), url.find('@')) {
-        (Some(scheme_end), Some(at)) if at > scheme_end + 3 => {
-            let userinfo = &url[scheme_end + 3..at];
-            match userinfo.split_once(':') {
-                Some((user, _)) => format!("{}{}:***{}", &url[..scheme_end + 3], user, &url[at..]),
-                None => url.to_string(),
-            }
-        }
-        _ => url.to_string(),
-    }
 }
 
 impl PostgresStorage {

@@ -16,6 +16,37 @@ ghcr.io/ion-elgreco/rivers-operator:{{ .Chart.AppVersion }}
 ghcr.io/ion-elgreco/rivers-ui:{{ .Chart.AppVersion }}
 {{- end -}}
 
+{{/*
+Selected storage backend, validated once so every caller sees the same answer.
+Each failure below is a configuration that would otherwise install something
+that cannot work: an unknown backend name, a PostgreSQL install still carrying
+the SurrealDB subchart, or a PostgreSQL install with no connection details.
+*/}}
+{{- define "rivers.storageBackend" -}}
+{{- $b := .Values.storage.backend | default "surrealdb" -}}
+{{- if not (has $b (list "surrealdb" "postgresql")) -}}
+{{ fail (printf "storage.backend must be \"surrealdb\" or \"postgresql\", got %q" $b) }}
+{{- end -}}
+{{- if eq $b "postgresql" -}}
+{{- if .Values.surrealdb.enabled -}}
+{{ fail "storage.backend is postgresql but surrealdb.enabled is true; set surrealdb.enabled=false so the unused SurrealDB subchart is not installed" }}
+{{- end -}}
+{{- if and (not .Values.postgresql.url) (not .Values.postgresql.existingSecret) -}}
+{{ fail "storage.backend is postgresql; set postgresql.url or postgresql.existingSecret" }}
+{{- end -}}
+{{- end -}}
+{{ $b }}
+{{- end -}}
+
+{{/* Non-empty when PostgreSQL is the selected backend. */}}
+{{- define "rivers.usePostgres" -}}
+{{- if eq (include "rivers.storageBackend" . | trim) "postgresql" -}}true{{- end -}}
+{{- end -}}
+
+{{- define "rivers.postgresSecretName" -}}
+{{- .Values.postgresql.existingSecret | default "rivers-postgresql-url" -}}
+{{- end -}}
+
 {{- define "rivers.surrealEndpoint" -}}
 {{- if .Values.surrealdb.enabled -}}
 ws://surrealdb.{{ include "rivers.namespace" . }}.svc:{{ .Values.surrealdb.service.port }}
@@ -188,6 +219,47 @@ downstream are only added when auth is requested.
 - name: RIVERS_SURREAL_AUTH_PASSWORD_KEY
   value: {{ .Values.surrealdb.auth.secretKeys.password | quote }}
 {{- end }}
+{{- end -}}
+
+{{/*
+Storage connection env stamped on every rivers pod. One `RIVERS_STORAGE_URL`
+picks the backend by scheme, so pods need no separate "which engine" flag.
+
+On PostgreSQL the URL embeds its password and therefore arrives by
+`secretKeyRef`; the two coordinates beside it let a run pod re-emit the same
+ref onto its step pods without holding the password in memory.
+
+On SurrealDB the `ws://` URL is not secret, but it carries no namespace,
+database, or credentials — `rivers.surrealEnv` still supplies those.
+*/}}
+{{- define "rivers.storageEnv" -}}
+{{- if include "rivers.usePostgres" . -}}
+- name: RIVERS_STORAGE_URL
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "rivers.postgresSecretName" . }}
+      key: {{ .Values.postgresql.secretKeys.url | quote }}
+- name: RIVERS_STORAGE_URL_SECRET_NAME
+  value: {{ include "rivers.postgresSecretName" . | quote }}
+- name: RIVERS_STORAGE_URL_SECRET_KEY
+  value: {{ .Values.postgresql.secretKeys.url | quote }}
+{{- else -}}
+- name: RIVERS_STORAGE_URL
+  value: {{ include "rivers.surrealEndpoint" . | quote }}
+{{ include "rivers.surrealEnv" . }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Wait for storage before the main container starts. SurrealDB gets an init
+container built from its own image (`/surreal isready`). PostgreSQL gets
+none: the chart does not bundle a server, so there is no image to borrow, and
+a failed connect restarts the pod — which is the same wait, one layer up.
+*/}}
+{{- define "rivers.storageReadinessInitContainer" -}}
+{{- if not (include "rivers.usePostgres" .) -}}
+{{ include "rivers.surrealReadinessInitContainer" . }}
+{{- end -}}
 {{- end -}}
 
 {{- define "rivers.uiAuthCookieSecretName" -}}

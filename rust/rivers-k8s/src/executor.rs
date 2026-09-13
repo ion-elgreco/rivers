@@ -22,7 +22,7 @@ pub struct K8sStepExecutorConfig {
     /// step Job's `valueFrom.secretKeyRef` references the same Secret the
     /// rest of the rivers pods use — the run pod never holds the password
     /// in memory.
-    pub surreal_pod_cfg: crate::env::SurrealPodConfig,
+    pub storage_pod_cfg: crate::env::StoragePodConfig,
     pub run_id: String,
     pub run_cr_name: String,
     pub run_cr_uid: String,
@@ -287,7 +287,7 @@ fn build_job_inner(
                                     ..Default::default()
                                 },
                             ];
-                            env.extend(crate::env::build_surreal_pod_env(&config.surreal_pod_cfg));
+                            env.extend(crate::env::build_storage_pod_env(&config.storage_pod_cfg));
                             env.extend(config.extra_env.iter().cloned());
                             env
                         }),
@@ -314,7 +314,7 @@ mod tests {
             worker_cpu: "1".to_string(),
             worker_memory: "2Gi".to_string(),
             module: "my_project.definitions".to_string(),
-            surreal_pod_cfg: crate::env::SurrealPodConfig::default()
+            storage_pod_cfg: crate::env::StoragePodConfig::default()
                 .with_endpoint("ws://surrealdb:8000"),
             run_id: "abc-123".to_string(),
             run_cr_name: "rivers-run-abc-123".to_string(),

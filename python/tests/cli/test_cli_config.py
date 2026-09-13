@@ -94,7 +94,7 @@ class TestDefaultConfigValues:
         assert cfg.module.repo_var == "repo"
         assert cfg.storage == StorageConfig()
         assert cfg.storage.path == ".rivers/storage/"
-        assert cfg.storage.endpoint is None
+        assert cfg.storage.url is None
         assert cfg.server == ServerConfig()
         assert cfg.server.host == "127.0.0.1"
         assert cfg.server.port == 3000
@@ -163,12 +163,12 @@ class TestEnvSettings:
         cfg = RiversConfig()
         assert cfg.module.path == "my.module"
 
-    def test_nested_env_var_sets_storage_endpoint(self, tmp_path, monkeypatch):
-        """``RIVERS_STORAGE_ENDPOINT`` is mapped to ``cfg.storage.endpoint``."""
+    def test_nested_env_var_sets_storage_url(self, tmp_path, monkeypatch):
+        """``RIVERS_STORAGE_URL`` is mapped to ``cfg.storage.url``."""
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv("RIVERS_STORAGE_ENDPOINT", "http://localhost:8000")
+        monkeypatch.setenv("RIVERS_STORAGE_URL", "ws://localhost:8000")
         cfg = RiversConfig()
-        assert cfg.storage.endpoint == "http://localhost:8000"
+        assert cfg.storage.url == "ws://localhost:8000"
 
     def test_top_level_collision_env_var_is_ignored(self, tmp_path, monkeypatch):
         """Bare top-level names like ``RIVERS_MODULE`` are filtered out."""
@@ -237,11 +237,11 @@ class TestRiversToml:
         """Storage path and remote endpoint are loaded from ``[storage]``."""
         _make_rivers_toml(
             resolved_tmp_path,
-            storage={"path": "/data/storage", "endpoint": "http://db:8000"},
+            storage={"path": "/data/storage", "url": "ws://db:8000"},
         )
         cfg = RiversConfig()
         assert cfg.storage.path == "/data/storage"
-        assert cfg.storage.endpoint == "http://db:8000"
+        assert cfg.storage.url == "ws://db:8000"
 
     def test_reads_daemon_no_daemon(self, resolved_tmp_path):
         """The ``no_daemon`` boolean flag is loaded from ``[daemon]``."""
@@ -349,7 +349,7 @@ class TestFromCli:
             port=4000,
             grpc_port=4001,
             storage_path="/tmp/store",
-            surreal_endpoint="ws://db:8000",
+            storage_url="ws://db:8000",
             no_daemon=True,
             synthetic="1k",
         )
@@ -359,7 +359,7 @@ class TestFromCli:
         assert cfg.server.port == 4000
         assert cfg.server.grpc_port == 4001
         assert cfg.storage.path == "/tmp/store"
-        assert cfg.storage.endpoint == "ws://db:8000"
+        assert cfg.storage.url == "ws://db:8000"
         assert cfg.daemon.no_daemon is True
         assert cfg.synthetic.size == "1k"
 

@@ -12,6 +12,7 @@ use pyo3::prelude::*;
 
 use crate::errors::StorageError;
 use rivers_core::storage::any::AnyStorage;
+use rivers_core::storage::migration::Capability;
 use rivers_core::storage::{
     AssetRecord, CodeLocationContext, LaunchedBy, RunRecord, RunStatus, ScopedStorage,
     ScopedStorageHandle, StaleCauseCategory, StaleStatus, StorageBackend, StoredEvent, StoredLog,
@@ -462,6 +463,29 @@ fn to_py_err(e: anyhow::Error) -> PyErr {
 }
 
 /// Resolve a remote connect config from kwargs → `RIVERS_SURREAL_*` env → default,
+/// Parse a storage URL and say which `StorageType` it opens.
+///
+/// A SurrealDB URL carries neither scope nor credentials, so it picks those up
+/// from the env the same way [`resolve_remote_config`] does with no kwargs.
+/// Pure (no Python, no I/O), so callers run it inside `py.detach`.
+fn parse_storage_url(
+    url: &str,
+) -> PyResult<(rivers_core::storage::url::StorageUrl, PyStorageType)> {
+    use rivers_core::storage::url::StorageUrl;
+    let parsed: StorageUrl = url
+        .parse()
+        .map_err(|e| StorageError::new_err(format!("{e}")))?;
+    Ok(match parsed {
+        StorageUrl::SurrealEmbedded { .. } => (parsed, PyStorageType::Embedded),
+        StorageUrl::SurrealMemory => (parsed, PyStorageType::Memory),
+        StorageUrl::SurrealRemote(cfg) => {
+            let (cfg, _) = resolve_remote_config(cfg.endpoint, None, None, None, None);
+            (StorageUrl::SurrealRemote(cfg), PyStorageType::Remote)
+        }
+        StorageUrl::Postgres { .. } => (parsed, PyStorageType::Postgres),
+    })
+}
+
 /// returning the config and whether it carries credentials. Pure (no Python, no
 /// I/O), so callers run it inside `py.detach`. Shared by `connect` / `migrate_remote`.
 fn resolve_remote_config(
@@ -538,6 +562,7 @@ pub enum PyStorageType {
     Memory,
     Embedded,
     Remote,
+    Postgres,
 }
 
 #[pyclass(
@@ -907,6 +932,47 @@ impl PyStorage {
             "storage ready"
         );
         Ok(Self::from_storage(storage, PyStorageType::Remote))
+    }
+
+    /// Open storage from a URL, letting the scheme pick the backend.
+    ///
+    /// `rocksdb://<path>` and `mem://` are embedded SurrealDB; `ws://` and
+    /// `wss://` a SurrealDB server; `postgres://` a PostgreSQL server. A
+    /// SurrealDB URL carries no scope or credentials, so those still come from
+    /// the `RIVERS_SURREAL_*` env vars — use :meth:`connect` to pass them
+    /// explicitly.
+    #[staticmethod]
+    fn open(py: Python<'_>, url: &str) -> PyResult<Self> {
+        let url_owned = url.to_string();
+        let (storage, kind, backend, endpoint) = py.detach(|| -> PyResult<_> {
+            let (parsed, kind) = parse_storage_url(&url_owned)?;
+            let backend = parsed.backend_name();
+            let endpoint = parsed.redacted();
+            let storage = io_rt()
+                .block_on(AnyStorage::open(parsed, Capability::ReadWrite))
+                .map_err(to_py_err)?;
+            Ok((storage, kind, backend, endpoint))
+        })?;
+        tracing::info!(target: "rivers::storage", backend, endpoint = %endpoint, "storage ready");
+        Ok(Self::from_storage(storage, kind))
+    }
+
+    /// Apply pending schema migrations to whatever [`open`](Self::open) names.
+    /// Idempotent; the migrating connection is opened and dropped immediately.
+    #[staticmethod]
+    fn migrate(py: Python<'_>, url: &str) -> PyResult<()> {
+        let url_owned = url.to_string();
+        let (backend, endpoint) = py.detach(|| -> PyResult<_> {
+            let (parsed, _) = parse_storage_url(&url_owned)?;
+            let backend = parsed.backend_name();
+            let endpoint = parsed.redacted();
+            io_rt()
+                .block_on(AnyStorage::open(parsed, Capability::Migrate))
+                .map_err(to_py_err)?;
+            Ok((backend, endpoint))
+        })?;
+        tracing::info!(target: "rivers::storage", backend, endpoint = %endpoint, "storage schema migrated");
+        Ok(())
     }
 
     /// Apply pending storage schema migrations to an embedded database, bringing

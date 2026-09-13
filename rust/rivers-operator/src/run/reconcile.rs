@@ -35,7 +35,7 @@ pub struct Context {
     pub directory: Arc<DirectoryState>,
     /// SurrealDB connection bundle stamped onto every Run pod the operator
     /// creates.
-    pub surreal_pod_cfg: rivers_k8s::env::SurrealPodConfig,
+    pub storage_pod_cfg: rivers_k8s::env::StoragePodConfig,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -139,7 +139,7 @@ async fn reconcile_pending(
     let pod_name = executor_pod_name(name);
 
     let cl_env = fetch_cl_env(ctx, run).await?;
-    let pod = build_executor_pod(run, &pod_name, run_id, false, &cl_env, &ctx.surreal_pod_cfg);
+    let pod = build_executor_pod(run, &pod_name, run_id, false, &cl_env, &ctx.storage_pod_cfg);
     match pods_api.create(&PostParams::default(), &pod).await {
         Ok(_) => {
             tracing::info!(run = %name, pod = %pod_name, "created executor pod");
