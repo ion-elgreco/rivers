@@ -508,17 +508,23 @@ impl PostgresStorage {
             return Ok(Vec::new());
         }
         self.retry(|| async {
-            // One `DISTINCT ON` pass beats the SurrealDB backend's
-            // one-statement-per-job fan-out.
-            let mut q = sqlx::QueryBuilder::new(
-                "SELECT DISTINCT ON (job_name) * FROM runs WHERE job_name = ANY(",
-            );
+            // One index lookup per job, not a scan of every run belonging to
+            // any of them. `DISTINCT ON (job_name) ... ORDER BY job_name,
+            // start_time DESC` reads the opposite way round from
+            // `idx_runs_job_time`, so it cannot use the index at all: measured
+            // on 18k rows it fell back to a sequential scan plus an external
+            // merge sort that spilled to disk, 21.7ms against 0.15ms here.
+            let mut q = sqlx::QueryBuilder::new("SELECT r.* FROM unnest(");
             q.push_bind(job_names);
-            q.push(")");
+            q.push(
+                "::text[]) AS j(job_name) CROSS JOIN LATERAL ( \
+                 SELECT * FROM runs WHERE runs.job_name = j.job_name",
+            );
             if let Some(cl) = code_location_id {
-                q.push(" AND code_location_id = ").push_bind(cl.to_string());
+                q.push(" AND runs.code_location_id = ")
+                    .push_bind(cl.to_string());
             }
-            q.push(" ORDER BY job_name, start_time DESC");
+            q.push(" ORDER BY runs.start_time DESC LIMIT 1) r");
             let rows = q.build().fetch_all(&self.pool).await?;
 
             let mut by_job: HashMap<String, RunRecord> = HashMap::new();
