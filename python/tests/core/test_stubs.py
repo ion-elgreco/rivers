@@ -4,7 +4,11 @@ from pathlib import Path
 
 from pyright import run as pyright_run
 
-STUBS_FILE = str(Path(__file__).parent / "stubs.py")
+# Pyright runs against this directory as its own project. Without that, it
+# resolves config from the *caller's* cwd: from the repo root it finds none and
+# works, but from `python/` it finds `pyproject.toml`'s `exclude = ["**/tests"]`,
+# skips the fixture, and emits no reveal_type output at all.
+PROJECT_DIR = str(Path(__file__).parent)
 
 EXPECTED_TYPES = {
     "ext": "ExternalAsset",
@@ -22,6 +26,8 @@ EXPECTED_TYPES = {
     "load_any": "Any",
     "load_typed": "int",
     "load_typed_str": "str",
+    "storage": "Storage",
+    "storage_kind": "StorageType",
 }
 
 
@@ -39,11 +45,21 @@ def _parse_reveal_types(output: str) -> dict[str, str]:
 
 
 def test_stub_types():
-    result = pyright_run(STUBS_FILE, capture_output=True, text=True, timeout=60)
+    result = pyright_run(
+        "--project", PROJECT_DIR, capture_output=True, text=True, timeout=120
+    )
 
     revealed = _parse_reveal_types(result.stdout)  # type: ignore
 
     assert result.returncode == 0, f"pyright reported errors:\n{result.stdout}"
+
+    # A skipped fixture yields no diagnostics at all, which would otherwise read
+    # as "every type is None" — a confusing failure that hides the real cause.
+    assert revealed, (
+        "pyright checked nothing. The fixture was excluded from analysis; "
+        "check tests/core/pyrightconfig.json still exists.\n"
+        f"{result.stdout}"
+    )
 
     for var_name, expected_type in EXPECTED_TYPES.items():
         actual = revealed.get(var_name)
