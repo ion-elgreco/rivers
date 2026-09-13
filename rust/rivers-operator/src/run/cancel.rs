@@ -4,7 +4,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube_client::Api;
 use kube_runtime::controller::Action;
 use rivers_core::storage::StorageBackend;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_k8s::crd::run::{CANCEL_ANNOTATION, CONDITION_CANCELLING, Run, RunPhase};
 
 use super::cleanup;
@@ -23,7 +23,7 @@ pub fn is_cancel_requested(run: &Run) -> bool {
         .is_some_and(|v| v == "true")
 }
 
-/// Begin cooperative cancellation: signal the executor through SurrealDB,
+/// Begin cooperative cancellation: signal the executor through storage,
 /// kill any in-flight step jobs, then transition the Run to `Cancelling` so
 /// the next reconcile pass enforces the grace period.
 pub async fn start_cancelling(
@@ -129,7 +129,7 @@ pub async fn reconcile_cancelling(
 
 async fn finalize_cancelled(
     runs_api: &Api<Run>,
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     run: &Run,
     name: &str,
     message: Option<&str>,
@@ -202,7 +202,7 @@ mod tests {
         assert!(!is_cancel_requested(&run));
     }
 
-    async fn seed_step_events(storage: &SurrealStorage, run_id: &str, completed: u32, total: u32) {
+    async fn seed_step_events(storage: &AnyStorage, run_id: &str, completed: u32, total: u32) {
         let ts = chrono::Utc::now().timestamp();
         for i in 0..total {
             storage

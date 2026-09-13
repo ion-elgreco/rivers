@@ -8,7 +8,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::Parser;
 use rivers_core::assets::graph::GraphTopology;
-use rivers_core::storage::surrealdb_backend::{Capability, SurrealStorage};
+use rivers_core::storage::any::AnyStorage;
+use rivers_core::storage::surrealdb_backend::Capability;
 use rivers_ui::code_location_registry::Registry;
 use rivers_ui::synthetic::{generate_synthetic_graph, parse_node_count};
 use std::sync::Arc;
@@ -21,10 +22,11 @@ struct Args {
     #[arg(long, default_value = ".rivers/storage/")]
     storage_path: String,
 
-    /// Connect to a remote SurrealDB instead of embedded storage.
+    /// Connect to a storage server instead of embedded storage; the scheme
+    /// picks the backend (`ws://`, `wss://`, `postgres://`).
     /// When set, --storage-path is ignored.
     #[arg(long)]
-    surreal_endpoint: Option<String>,
+    storage_url: Option<String>,
 
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
@@ -68,31 +70,40 @@ async fn main() {
         .compact()
         .init();
 
-    let storage = Arc::new(if let Some(ref endpoint) = args.surreal_endpoint {
-        // Build the connect config from the same env vars the operator stamps
-        // on every rivers pod. CLI flag wins for the endpoint (so a developer
-        // can `cargo run` against a local SurrealDB without setting envs);
-        // namespace/database/credentials always come from env.
-        let mut config = rivers_k8s::env::detect_surreal_connect_config();
-        config.endpoint = endpoint.clone();
-        let authenticated = config.credentials.is_some();
+    // The flag wins over the environment, so a developer can `cargo run`
+    // against a local server without setting envs. Falling back to
+    // `RIVERS_STORAGE_URL` (and not the `RIVERS_SURREAL_*` vars) keeps the
+    // in-cluster path working while a developer who sets neither still gets
+    // embedded storage.
+    let storage_url = args
+        .storage_url
+        .clone()
+        .or_else(|| {
+            std::env::var(rivers_k8s::env::ENV_STORAGE_URL)
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .map(|raw| rivers_k8s::env::storage_url_from_arg(&raw).expect("invalid storage url"));
+
+    let storage = Arc::new(if let Some(url) = storage_url {
+        let backend = url.backend_name();
+        let endpoint = url.redacted();
         // The production UI is a read-only storage consumer; writes go through
         // gRPC to code locations. Open `Read` so a write-breaking migration for
         // newer writers does not lock the UI out.
-        let storage = SurrealStorage::connect_with_capability(config, Capability::Read)
+        let storage = AnyStorage::open(url, Capability::Read)
             .await
-            .expect("Failed to connect to remote SurrealDB");
+            .expect("Failed to connect to remote storage");
         tracing::info!(
             target: "rivers::storage",
-            backend = "remote",
+            backend,
             endpoint = %endpoint,
-            authenticated,
             "storage ready"
         );
         storage
     } else {
         let storage =
-            SurrealStorage::new_embedded_with_capability(&args.storage_path, Capability::Read)
+            AnyStorage::surreal_embedded_with_capability(&args.storage_path, Capability::Read)
                 .await
                 .expect("Failed to open embedded storage");
         tracing::info!(

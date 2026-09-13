@@ -2,14 +2,14 @@
 //!
 //! `EventWriter` sends `EventRecord`s / `LogRecord`s over an unbounded mpsc
 //! channel to a background Tokio task. The task accumulates them and flushes
-//! to SurrealDB in batches (by count or timer), decoupling storage write
+//! to storage in batches (by count or timer), decoupling storage write
 //! latency from step execution throughput. The channel is unbounded so events
 //! arent lossed and we dont block the thread; if storage falls behind, depth grows and a warning is logged once it crosses the
 //! high-water mark.
 use std::sync::Arc;
 use std::time::Duration;
 
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{EventRecord, LogRecord, ScopedStorageHandle, StorageBackend};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -60,7 +60,7 @@ pub(crate) struct EventWriter {
 }
 
 impl EventWriter {
-    pub(crate) fn new(storage: ScopedStorageHandle<SurrealStorage>) -> Self {
+    pub(crate) fn new(storage: ScopedStorageHandle<AnyStorage>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let code_location_id = storage.code_location_id().to_string();
         let backend = Arc::clone(storage.backend());
@@ -106,7 +106,7 @@ impl EventWriter {
     }
 }
 
-async fn flush_batch(storage: &SurrealStorage, batch: &mut Vec<EventRecord>) {
+async fn flush_batch(storage: &AnyStorage, batch: &mut Vec<EventRecord>) {
     if batch.is_empty() {
         return;
     }
@@ -116,7 +116,7 @@ async fn flush_batch(storage: &SurrealStorage, batch: &mut Vec<EventRecord>) {
     batch.clear();
 }
 
-async fn flush_logs(storage: &SurrealStorage, batch: &mut Vec<LogRecord>) {
+async fn flush_logs(storage: &AnyStorage, batch: &mut Vec<LogRecord>) {
     if batch.is_empty() {
         return;
     }
@@ -126,7 +126,7 @@ async fn flush_logs(storage: &SurrealStorage, batch: &mut Vec<LogRecord>) {
     batch.clear();
 }
 
-async fn batch_writer_loop(mut rx: mpsc::UnboundedReceiver<WriterMsg>, storage: &SurrealStorage) {
+async fn batch_writer_loop(mut rx: mpsc::UnboundedReceiver<WriterMsg>, storage: &AnyStorage) {
     let mut events = Vec::with_capacity(BATCH_SIZE);
     let mut logs: Vec<LogRecord> = Vec::new();
     let mut interval = tokio::time::interval(Duration::from_millis(FLUSH_INTERVAL_MS));

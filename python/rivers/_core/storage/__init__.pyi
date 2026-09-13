@@ -15,6 +15,8 @@ class StorageType(enum.IntEnum):
     """SurrealDB+RocksDB embedded in the process — single-process access only."""
     Remote = ...
     """SurrealDB server / TiKV — supports multi-process access."""
+    Postgres = ...
+    """PostgreSQL server — supports multi-process access. Remote only."""
 
 class StoredEvent:
     """One persisted run-event record (materialization, observation, error, ...)."""
@@ -234,9 +236,10 @@ class ConcurrencyClaimStatus:
 class Storage:
     """Persistent storage backend — events, runs, assets, ticks, KV, pools, queue.
 
-    Construct via the static factories (:meth:`memory`, :meth:`embedded`,
-    :meth:`connect`); the underlying SurrealDB connection is shared across
-    rivers components.
+    Construct via the static factories. :meth:`open` takes one URL and picks
+    the backend from its scheme; :meth:`memory`, :meth:`embedded`, and
+    :meth:`connect` name a SurrealDB backend directly. The underlying
+    connection is shared across rivers components.
     """
 
     @property
@@ -274,6 +277,40 @@ class Storage:
         ``database`` — matching a ``DEFINE USER ... ON DATABASE`` definition.
         Omit both for an ``--unauthenticated`` SurrealDB. ``namespace``
         defaults to ``"rivers"`` and ``database`` to ``"main"``.
+        """
+        ...
+
+    @staticmethod
+    def open(url: str) -> Storage:
+        """Open storage from a URL, letting the scheme pick the backend.
+
+        ================== ====================================
+        Scheme             Backend
+        ================== ====================================
+        ``rocksdb://``     embedded SurrealDB at that path
+        ``mem://``         in-memory SurrealDB
+        ``ws://``          SurrealDB server
+        ``wss://``         SurrealDB server over TLS
+        ``postgres://``    PostgreSQL server
+        ================== ====================================
+
+        A SurrealDB URL carries no namespace, database, or credentials, so
+        those still resolve from the ``RIVERS_SURREAL_*`` env vars. Use
+        :meth:`connect` to pass them explicitly.
+
+        :param url: the storage location.
+        :raises StorageError: if the scheme is unknown or the connection fails.
+        """
+        ...
+
+    @staticmethod
+    def migrate(url: str) -> None:
+        """Apply pending schema migrations to whatever :meth:`open` names.
+
+        Idempotent — a no-op when already current. Runs any data-heal steps
+        under a cross-process lease. Backs ``rivers db migrate``.
+
+        :param url: the storage location.
         """
         ...
 

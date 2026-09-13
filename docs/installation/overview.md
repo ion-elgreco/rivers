@@ -7,10 +7,14 @@ How rivers' components fit together on a Kubernetes cluster.
 | Component | Image | Purpose |
 | --- | --- | --- |
 | `rivers-operator` | `ghcr.io/ion-elgreco/rivers-operator` | Reconciles `CodeLocation` CRs into Deployments; runs admission webhooks |
-| `rivers-ui` | `ghcr.io/ion-elgreco/rivers-ui` | Web UI (Leptos SSR + WASM hydration), reads run state from SurrealDB |
+| `rivers-ui` | `ghcr.io/ion-elgreco/rivers-ui` | Web UI (Leptos SSR + WASM hydration), reads run state from storage |
 | SurrealDB | `surrealdb/surrealdb:v3` (subchart) | Shared state — runs, events, asset materializations |
 
 The `rivers` Helm chart wires all three together; the `rivers-crds` Helm chart ships the cluster-scoped `CustomResourceDefinitions` (`CodeLocation`, `Run`) that the operator watches.
+
+The diagrams below show the bundled SurrealDB, which is the default. rivers
+also runs on a PostgreSQL server you provide — the shape is identical, only the
+database changes. See [Use PostgreSQL instead of SurrealDB](kubernetes.md#use-postgresql-instead-of-surrealdb).
 
 ## How it fits together
 

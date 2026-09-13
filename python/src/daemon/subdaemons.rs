@@ -5,7 +5,7 @@ use std::time::Duration;
 use chrono::Utc;
 use pyo3::prelude::*;
 use rivers_core::run_backend::RunHealthStatus;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{
     EventRecord, EventType, RunStatus, ScopedStorageHandle, StorageBackend,
 };
@@ -22,11 +22,11 @@ use crate::gil_threads::GilThreads;
 use crate::repository::PyCodeRepository;
 
 /// Backfill pickup loop — polls for Requested backfills owned by this CL every
-/// 5s and executes them. Scoped per CL so two daemons sharing a SurrealDB
+/// 5s and executes them. Scoped per CL so two daemons sharing a database
 /// don't race on each other's backfills.
 pub(crate) fn spawn_backfill_pickup_loop(
     repo: Arc<Py<PyCodeRepository>>,
-    handle: ScopedStorageHandle<SurrealStorage>,
+    handle: ScopedStorageHandle<AnyStorage>,
     cancel: CancellationToken,
     run_queue_enabled: bool,
     gil_threads: GilThreads,
@@ -98,7 +98,7 @@ pub(crate) fn spawn_backfill_pickup_loop(
 /// Run queue coordinator — dequeues runs and launches them, with periodic health checks.
 pub(crate) fn spawn_run_queue_coordinator(
     rq_config: rivers_core::concurrency::RunQueueConfig,
-    handle: ScopedStorageHandle<SurrealStorage>,
+    handle: ScopedStorageHandle<AnyStorage>,
     run_backend: Arc<RunBackendKind>,
     repo: Arc<Py<PyCodeRepository>>,
     cancel: CancellationToken,
@@ -174,7 +174,7 @@ pub(crate) fn spawn_run_queue_coordinator(
 }
 
 async fn health_check_active_runs(
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     run_backend: &Arc<RunBackendKind>,
     active_runs: &mut HashSet<String>,
 ) {
@@ -236,7 +236,7 @@ async fn health_check_active_runs(
 /// the tick query can never re-select — it silently holds a concurrency slot
 /// until failed here.
 async fn sweep_stalled_not_started(
-    handle: &ScopedStorageHandle<SurrealStorage>,
+    handle: &ScopedStorageHandle<AnyStorage>,
     run_backend: &Arc<RunBackendKind>,
     active_runs: &HashSet<String>,
     start_timeout: Duration,
@@ -290,7 +290,7 @@ async fn sweep_stalled_not_started(
 /// a `RunLaunchFailed` event. Shared by the queue coordinator's start-timeout
 /// sweep and the direct dispatcher's launch-error path.
 pub(crate) async fn fail_unlaunched_run(
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     code_location_id: &str,
     run_id: &str,
     error: &str,
@@ -338,7 +338,7 @@ const BACKFILL_RESUME_GRACE_NS: i64 = 180 * 1_000_000_000;
 /// 5s and finalizes them when all their runs reach a terminal state; flips
 /// zero-run stragglers back to Requested so the pickup loop re-executes them.
 pub(crate) fn spawn_backfill_monitor(
-    handle: ScopedStorageHandle<SurrealStorage>,
+    handle: ScopedStorageHandle<AnyStorage>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -434,7 +434,7 @@ pub(crate) fn spawn_backfill_monitor(
 pub(crate) fn spawn_schedule_sensor_loop(
     mut automations: Vec<AutomationEntry>,
     tick_tx: tokio::sync::mpsc::UnboundedSender<TickWriteMsg>,
-    handle: ScopedStorageHandle<SurrealStorage>,
+    handle: ScopedStorageHandle<AnyStorage>,
     run_dispatcher: Arc<RunDispatcherKind>,
     backfill_dispatcher: Arc<BackfillDispatcherKind>,
     eval_dispatcher: Arc<EvalDispatcher>,

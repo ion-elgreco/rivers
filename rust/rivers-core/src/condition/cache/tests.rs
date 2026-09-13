@@ -153,9 +153,9 @@ async fn initial_load_run_completing_mid_load_is_not_lost() {
     // applied off that late terminal read: that skipped its effects forever,
     // leaving last_run_asset_names[source] at r0's joint names, which kept
     // LastRunIncludesTarget true and permanently suppressed eager() downstream.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::surreal_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     let ctx = crate::storage::CodeLocationContext::new(cl.clone());
 
@@ -317,9 +317,9 @@ fn partition_keyed_success_clears_unpartitioned_asset_floor() {
 /// vanished; the pending grace-period eviction owns that case.
 #[tokio::test]
 async fn deleted_tracked_run_clears_in_progress_guard() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::surreal_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     let mut cache = AssetConditionCache::new(cl.clone());
 

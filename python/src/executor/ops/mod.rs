@@ -9,16 +9,16 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 use rivers_core::storage::ScopedStorageHandle;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 
 use crate::metadata::MetadataValue;
 use crate::repository::resolved_node::ResolvedNode;
 use crate::result_types::ResultKind;
 
 /// Shorthand type for the per-CL storage handle passed through executor
-/// chains. Bundles `Arc<SurrealStorage>` with the owning code-location
+/// chains. Bundles `Arc<AnyStorage>` with the owning code-location
 /// identity so per-CL methods can be reached without re-passing the id.
-pub(crate) type StorageHandle<'a> = &'a ScopedStorageHandle<SurrealStorage>;
+pub(crate) type StorageHandle<'a> = &'a ScopedStorageHandle<AnyStorage>;
 
 /// Generator multi-asset state attached to a `StepResult`. `Sync` uses
 /// `__next__`; `Async` uses `__anext__` driven through the async bridge.

@@ -145,6 +145,41 @@ where
     }
 }
 
+/// True if `e` is a PostgreSQL error worth retrying.
+///
+/// Matched on SQLSTATE rather than message text: `40001` is a serialization
+/// failure under `SERIALIZABLE`, `40P01` a detected deadlock, and `57014` a
+/// cancelled statement. All three mean "try again", not "this is wrong".
+pub fn is_transient_postgres_error(e: &sqlx::Error) -> bool {
+    matches!(
+        e.as_database_error().and_then(|d| d.code()).as_deref(),
+        Some("40001" | "40P01" | "57014")
+    )
+}
+
+/// [`with_retry`]'s predicate for the PostgreSQL backend. Walks the anyhow
+/// chain so context wrappers don't hide the underlying `sqlx::Error`.
+pub fn postgres_should_retry(e: &anyhow::Error) -> bool {
+    e.chain()
+        .find_map(|x| x.downcast_ref::<sqlx::Error>())
+        .map(is_transient_postgres_error)
+        .unwrap_or(false)
+}
+
+/// True if the error is PostgreSQL's unique-violation (`23505`). Callers using
+/// client-supplied ids treat this as a phantom-commit success after a retry,
+/// mirroring [`is_unique_index_violation`] on the SurrealDB side.
+pub fn is_postgres_unique_violation(e: &anyhow::Error) -> bool {
+    e.chain()
+        .find_map(|x| x.downcast_ref::<sqlx::Error>())
+        .and_then(|s| {
+            s.as_database_error()
+                .and_then(|d| d.code())
+                .map(|c| c == "23505")
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

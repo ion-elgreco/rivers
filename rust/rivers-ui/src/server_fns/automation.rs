@@ -315,7 +315,7 @@ pub async fn get_condition_evals(
 
         let mut tick_work: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
         for t in ticks {
-            let tid = format!("{}:{:?}", t.id.table.as_str(), t.id.key);
+            let tid = t.id.clone();
             if fired_tick_ids.contains(&tid) {
                 tick_work.insert(tid, (t.run_ids, t.backfill_ids));
             }
@@ -475,7 +475,7 @@ pub async fn get_condition_tick_detail(
             .and_then(|ticks| {
                 ticks
                     .into_iter()
-                    .find(|t| format!("{}:{:?}", t.id.table.as_str(), t.id.key) == tick_id)
+                    .find(|t| t.id.clone() == tick_id)
                     .map(|t| (t.run_ids, t.backfill_ids))
             })
             .unwrap_or_default();

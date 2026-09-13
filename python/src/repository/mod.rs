@@ -19,7 +19,7 @@ use crate::errors::{
 };
 use rivers_core::assets::graph::{GraphTopology, NodeRef, TopologyNode, to_topology};
 use rivers_core::repo::CodeRepository;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{
     BackfillFailurePolicy, BackfillRecord, BackfillStatus, EventRecord, EventType, LaunchedBy,
     PartitionKey, RunRecord, RunStatus, StorageBackend,
@@ -222,7 +222,7 @@ fn validate_backfill_strategy(
 /// that are NOT registered. Storage failures propagate — an unreachable
 /// store says nothing about whether a key is retired.
 async fn unregistered_dynamic_keys(
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     code_location_id: &str,
     checks: &[DynamicKeyCheck],
 ) -> PyResult<Vec<(String, String, String)>> {
@@ -243,7 +243,7 @@ async fn unregistered_dynamic_keys(
 }
 
 async fn verify_dynamic_partition_keys(
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     code_location_id: &str,
     checks: &[DynamicKeyCheck],
 ) -> PyResult<()> {
@@ -348,7 +348,7 @@ impl PyRunResult {
 pub struct PyRunHandle {
     #[pyo3(get)]
     pub(crate) run_id: String,
-    storage: Arc<SurrealStorage>,
+    storage: Arc<AnyStorage>,
 }
 
 #[pymethods]
@@ -1312,7 +1312,7 @@ pub(crate) struct ResolvedState {
     pub(crate) jobs_info: HashMap<String, JobSummary>,
     pub(crate) sensors_info: HashMap<String, SensorSummary>,
     pub(crate) schedules_info: HashMap<String, ScheduleSummary>,
-    pub(crate) storage: Arc<SurrealStorage>,
+    pub(crate) storage: Arc<AnyStorage>,
     pub(crate) storage_type: PyStorageType,
     pub(crate) resources: HashMap<String, ResourceVariant>,
     pub(crate) io_handler_registry: crate::assets::io_handler_registry::IOHandlerRegistry,
@@ -2821,7 +2821,7 @@ impl PyCodeRepository {
         py: Python,
         node_map: &HashMap<String, ResolvedNode>,
         resolved_graph: &rivers_core::assets::graph::AssetGraph,
-        storage_handle: &rivers_core::storage::ScopedStorageHandle<SurrealStorage>,
+        storage_handle: &rivers_core::storage::ScopedStorageHandle<AnyStorage>,
     ) -> PyResult<()> {
         py.detach(|| {
             let mut topology = to_topology(resolved_graph);
@@ -2867,7 +2867,7 @@ impl PyCodeRepository {
         &self,
         py: Python,
         node_map: &HashMap<String, ResolvedNode>,
-        storage_handle: &rivers_core::storage::ScopedStorageHandle<SurrealStorage>,
+        storage_handle: &rivers_core::storage::ScopedStorageHandle<AnyStorage>,
     ) {
         const DEFAULT_LEASE_DURATION_SECS: u32 = 300;
 
@@ -2960,7 +2960,7 @@ impl PyCodeRepository {
         } else {
             let storage = py.detach(|| {
                 io_rt()
-                    .block_on(SurrealStorage::new_memory())
+                    .block_on(AnyStorage::surreal_memory())
                     .map(Arc::new)
                     .map_err(|e| {
                         ConfigurationError::new_err(format!("Failed to init storage: {e}"))

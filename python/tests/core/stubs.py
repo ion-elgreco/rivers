@@ -116,3 +116,11 @@ reveal_type(load_typed)
 
 load_typed_str = repo.load_node("bare", type_hint=str)
 reveal_type(load_typed_str)
+
+
+# Storage.open returns Storage whatever the URL scheme picks
+storage = rs.Storage.open("mem://")
+reveal_type(storage)
+
+storage_kind = storage.type
+reveal_type(storage_kind)

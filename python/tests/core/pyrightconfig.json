@@ -1,0 +1,5 @@
+{
+  "//": "Scopes the stub check to its fixture. Without its own project, pyright picks up python/pyproject.toml, whose `exclude = [\"**/tests\"]` skips the fixture and silently emits no reveal_type output.",
+  "include": ["stubs.py"],
+  "reportMissingImports": "error"
+}

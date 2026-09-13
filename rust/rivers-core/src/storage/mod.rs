@@ -1,7 +1,13 @@
 //! Storage trait and types for persisting orchestration state.
 
+pub mod any;
+#[cfg(test)]
+mod conformance;
+pub mod migration;
+pub mod postgres_backend;
 pub mod retry;
 pub mod surrealdb_backend;
+pub mod url;
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -580,34 +586,47 @@ pub enum RunStatus {
     Canceled,
 }
 
-impl SurrealValue for RunStatus {
-    fn kind_of() -> Kind {
-        String::kind_of()
-    }
-
-    fn into_value(self) -> Value {
-        let s = match self {
+impl RunStatus {
+    /// The stored text form. Both backends persist this exact string, so the
+    /// mapping lives here rather than in either backend's serialization.
+    pub fn as_str(&self) -> &'static str {
+        match self {
             Self::Queued => "Queued",
             Self::NotStarted => "NotStarted",
             Self::Started => "Started",
             Self::Success => "Success",
             Self::Failure => "Failure",
             Self::Canceled => "Canceled",
-        };
-        s.to_string().into_value()
+        }
+    }
+
+    /// Inverse of [`Self::as_str`].
+    pub fn from_stored(s: &str) -> Option<Self> {
+        Some(match s {
+            "Queued" => Self::Queued,
+            "NotStarted" => Self::NotStarted,
+            "Started" => Self::Started,
+            "Success" => Self::Success,
+            "Failure" => Self::Failure,
+            "Canceled" => Self::Canceled,
+            _ => return None,
+        })
+    }
+}
+
+impl SurrealValue for RunStatus {
+    fn kind_of() -> Kind {
+        String::kind_of()
+    }
+
+    fn into_value(self) -> Value {
+        self.as_str().to_string().into_value()
     }
 
     fn from_value(value: Value) -> std::result::Result<Self, SurrealError> {
         let s = String::from_value(value)?;
-        match s.as_str() {
-            "Queued" => Ok(Self::Queued),
-            "NotStarted" => Ok(Self::NotStarted),
-            "Started" => Ok(Self::Started),
-            "Success" => Ok(Self::Success),
-            "Failure" => Ok(Self::Failure),
-            "Canceled" => Ok(Self::Canceled),
-            _ => Err(SurrealError::internal(format!("unknown RunStatus: {s}"))),
-        }
+        Self::from_stored(&s)
+            .ok_or_else(|| SurrealError::internal(format!("unknown RunStatus: {s}")))
     }
 }
 
@@ -834,6 +853,28 @@ pub struct RunsSummary {
     pub failure: u64,
     pub success: u64,
     pub last_24h: u64,
+}
+
+/// Wall-clock nanoseconds since the Unix epoch.
+pub(crate) fn now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64
+}
+
+/// The `RunQueued` event every backend writes beside a newly enqueued run.
+pub(crate) fn run_queued_event(record: &RunRecord) -> EventRecord {
+    EventRecord {
+        code_location_id: record.code_location_id.clone(),
+        event_type: EventType::RunQueued,
+        asset_key: None,
+        run_id: record.run_id.clone(),
+        partition_key: record.partition_key.clone(),
+        timestamp: record.start_time,
+        metadata: vec![(tag_keys::PRIORITY.to_string(), record.priority.to_string())],
+        input_data_versions: vec![],
+    }
 }
 
 // ── Backfill records ──
@@ -1149,7 +1190,9 @@ pub struct TickRecord {
 /// Stored tick with its database-assigned ID.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredTick {
-    pub id: surrealdb::types::RecordId,
+    /// Opaque row id, unique within its table. Backends choose the format;
+    /// treat it as a string, never parse it.
+    pub id: String,
     #[serde(default = "default_code_location_id")]
     pub code_location_id: String,
     pub automation_name: String,
@@ -1183,7 +1226,9 @@ pub struct ConditionTickRecord {
 /// Stored global condition tick with database-assigned ID.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredConditionTick {
-    pub id: surrealdb::types::RecordId,
+    /// Opaque row id, unique within its table. Backends choose the format;
+    /// treat it as a string, never parse it.
+    pub id: String,
     #[serde(default = "default_code_location_id")]
     pub code_location_id: String,
     pub timestamp: i64,
@@ -1217,7 +1262,9 @@ pub struct ConditionEvalRecord {
 /// Stored condition evaluation with database-assigned ID.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredConditionEval {
-    pub id: surrealdb::types::RecordId,
+    /// Opaque row id, unique within its table. Backends choose the format;
+    /// treat it as a string, never parse it.
+    pub id: String,
     #[serde(default = "default_code_location_id")]
     pub code_location_id: String,
     pub asset_key: String,
@@ -1283,7 +1330,9 @@ impl LogRecord {
 /// Stored step log with its database-assigned ID.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredLog {
-    pub id: surrealdb::types::RecordId,
+    /// Opaque row id, unique within its table. Backends choose the format;
+    /// treat it as a string, never parse it.
+    pub id: String,
     #[serde(default = "default_code_location_id")]
     pub code_location_id: String,
     pub run_id: String,
@@ -1297,7 +1346,9 @@ pub struct StoredLog {
 /// Stored event with its database-assigned ID.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredEvent {
-    pub id: surrealdb::types::RecordId,
+    /// Opaque row id, unique within its table. Backends choose the format;
+    /// treat it as a string, never parse it.
+    pub id: String,
     pub event_type: EventType,
     pub asset_key: Option<String>,
     pub run_id: String,

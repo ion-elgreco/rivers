@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionStep;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{ScopedStorageHandle, StorageBackend};
 use tokio::sync::{Semaphore, mpsc};
 
@@ -186,7 +186,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
 /// preserves long-standing per-backend behavior.)
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
-    storage: ScopedStorageHandle<SurrealStorage>,
+    storage: ScopedStorageHandle<AnyStorage>,
     pools: Vec<(String, u32)>,
     run_id: String,
     pool_step_name: String,

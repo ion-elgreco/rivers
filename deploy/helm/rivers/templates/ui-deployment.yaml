@@ -31,7 +31,7 @@ spec:
           type: RuntimeDefault
       {{- if .Values.surrealdb.enabled }}
       initContainers:
-        {{- include "rivers.surrealReadinessInitContainer" . | nindent 8 }}
+        {{- include "rivers.storageReadinessInitContainer" . | nindent 8 }}
       {{- end }}
       containers:
         - name: ui
@@ -47,8 +47,6 @@ spec:
             - "0.0.0.0"
             - "--port"
             - "{{ .Values.ui.port }}"
-            - "--surreal-endpoint"
-            - {{ include "rivers.surrealEndpoint" . | quote }}
             - "--registry-url"
             - "http://rivers-operator-registry.{{ include "rivers.namespace" . }}.svc:{{ .Values.operator.registry.port }}"
           env:
@@ -57,7 +55,7 @@ spec:
                 secretKeyRef:
                   name: rivers-registry-token
                   key: token
-            {{- include "rivers.surrealEnv" . | nindent 12 }}
+            {{- include "rivers.storageEnv" . | nindent 12 }}
             {{- include "rivers.uiAuthEnv" . | nindent 12 }}
           ports:
             - containerPort: {{ .Values.ui.port }}

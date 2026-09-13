@@ -1,5 +1,5 @@
 [workspace]
-members = ["python", "rust/rivers-core", "rust/rivers-api", "rust/rivers-ui", "rust/rivers-k8s", "rust/rivers-operator"]
+members = ["python", "rust/rivers-core", "rust/rivers-api", "rust/rivers-ui", "rust/rivers-k8s", "rust/rivers-operator", "rust/rivers-bench-storage"]
 exclude = []
 resolver = "2"
 

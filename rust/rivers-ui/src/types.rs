@@ -1168,7 +1168,7 @@ mod conversions {
             Self {
                 // Must match the format used by record_id_str() in the daemon,
                 // since that's what's stored in condition_evals.tick_id.
-                id: format!("{}:{:?}", t.id.table.as_str(), t.id.key),
+                id: t.id.clone(),
                 timestamp: t.timestamp,
                 total_evaluated: t.total_evaluated,
                 total_fired: t.total_fired,
@@ -1403,7 +1403,7 @@ mod conversions {
         #[test]
         fn stored_event_partition_key_uses_canonical_display() {
             let core = rivers_core::storage::StoredEvent {
-                id: rivers_core::surrealdb::types::RecordId::new("events", "e1"),
+                id: "events:e1".to_string(),
                 event_type: rivers_core::storage::EventType::Materialization { data_version: None },
                 asset_key: Some("orders".into()),
                 run_id: "r1".into(),

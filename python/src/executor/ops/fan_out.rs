@@ -9,7 +9,7 @@ use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
 use rivers_core::storage::PartitionKey as CorePartitionKey;
 use rivers_core::storage::ScopedStorageHandle;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 
 use crate::assets::io_handler_registry::IOHandlerRegistry;
 use crate::context::io::PyInputContext;
@@ -39,7 +39,7 @@ pub(crate) fn extract_mapping_key(
 /// the downstream fan-out resolver falls back to synthetic indices when KV
 /// returns absent.
 pub(crate) fn persist_dynamic_keys(
-    storage: &ScopedStorageHandle<SurrealStorage>,
+    storage: &ScopedStorageHandle<AnyStorage>,
     asset_name: &str,
     partition_key: &Option<PyPartitionKey>,
     data_version: &str,
@@ -89,7 +89,7 @@ pub(crate) fn resolve_predefined_keys(
     partition_key: &Option<PyPartitionKey>,
     step_dynamic_keys: &HashMap<String, Vec<String>>,
     data_versions: &HashMap<String, String>,
-    storage: &ScopedStorageHandle<SurrealStorage>,
+    storage: &ScopedStorageHandle<AnyStorage>,
 ) -> Option<Vec<String>> {
     if let Some(keys) = step_dynamic_keys.get(fan_out_source) {
         return if keys.is_empty() {

@@ -10,7 +10,7 @@ use rivers_k8s::crd::run::Run;
 /// (skip already-completed steps); `cl_env` is the parent
 /// `CodeLocation.spec.env` forwarded onto the pod so `secretKeyRef` /
 /// `configMapKeyRef` / `fieldRef` semantics are preserved.
-/// `surreal_pod_cfg` carries the SurrealDB scope + auth-secret coordinates
+/// `storage_pod_cfg` carries the SurrealDB scope + auth-secret coordinates
 /// stamped on every rivers pod — sourced from the operator's own env, so the
 /// auth-secret coordinates the run pod re-emits onto step pods stay
 /// consistent with the operator's view. The pod is owned by the Run CR so
@@ -21,7 +21,7 @@ pub fn build_executor_pod(
     run_id: &str,
     resume: bool,
     cl_env: &[EnvVar],
-    surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
+    storage_pod_cfg: &rivers_k8s::env::StoragePodConfig,
 ) -> Pod {
     let spec = &run.spec;
     let run_uid = run.metadata.uid.as_deref().unwrap_or_default();
@@ -119,8 +119,8 @@ pub fn build_executor_pod(
                         },
                     ];
                     // Endpoint comes from RunSpec; scope + auth coords from operator state.
-                    env.extend(rivers_k8s::env::build_surreal_pod_env(
-                        &surreal_pod_cfg
+                    env.extend(rivers_k8s::env::build_storage_pod_env(
+                        &storage_pod_cfg
                             .clone()
                             .with_endpoint(spec.surreal_endpoint.clone()),
                     ));
@@ -140,13 +140,13 @@ fn build_execute_args(
     run_id: &str,
     resume: bool,
 ) -> Vec<String> {
+    // The location reaches the pod as `RIVERS_STORAGE_URL` env, never argv: a
+    // PostgreSQL URL embeds its password, and argv is world-readable in a pod.
     let mut args = vec![
         "execute".to_string(),
         spec.module.clone(),
         "--run-id".to_string(),
         run_id.to_string(),
-        "--surreal-endpoint".to_string(),
-        spec.surreal_endpoint.clone(),
     ];
 
     args.extend(["--target".to_string(), spec.target.clone()]);
@@ -211,7 +211,7 @@ mod tests {
             run_id,
             resume,
             cl_env,
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
         )
     }
 
@@ -255,7 +255,10 @@ mod tests {
         assert!(args.contains(&"my_project.definitions".to_string()));
         assert!(args.contains(&"--run-id".to_string()));
         assert!(args.contains(&"test-run-id".to_string()));
-        assert!(args.contains(&"--surreal-endpoint".to_string()));
+        // The location is env-only: a PostgreSQL URL embeds its password and
+        // argv is world-readable inside a pod.
+        assert!(!args.iter().any(|a| a.starts_with("--storage-url")));
+        assert!(!args.iter().any(|a| a.starts_with("--surreal-endpoint")));
         assert!(args.contains(&"--target".to_string()));
         assert!(args.contains(&"my_job".to_string()));
 
@@ -265,6 +268,10 @@ mod tests {
             .map(|e| (e.name.as_str(), e.value.as_deref().unwrap_or("")))
             .collect();
         assert_eq!(env_map["RIVERS_RUN_ID"], "test-run-id");
+        assert_eq!(
+            env_map["RIVERS_STORAGE_URL"],
+            "ws://surrealdb.rivers.svc:8000"
+        );
         assert_eq!(
             env_map["RIVERS_SURREAL_ENDPOINT"],
             "ws://surrealdb.rivers.svc:8000"

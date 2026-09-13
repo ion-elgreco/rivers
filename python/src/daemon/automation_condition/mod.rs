@@ -7,7 +7,7 @@ use rivers_core::condition::{
     AssetConditionCache, AssetConditionInfo, ConditionEvalState, ConditionPass, DimensionKind,
     DimensionUniverse, PartitionInfo, PartitionMappingKind, PartitionUniverse,
 };
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{PartitionKey as CorePartitionKey, ScopedStorageHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -285,7 +285,7 @@ fn extract_partition_mappings(
 pub(super) struct ConditionEvalLoopConfig {
     pub conditions: Vec<AssetConditionInfo>,
     /// Storage scoped to the owning code location.
-    pub storage: ScopedStorageHandle<SurrealStorage>,
+    pub storage: ScopedStorageHandle<AnyStorage>,
     /// Shared with the schedule/sensor loop.
     pub run_dispatcher: Arc<crate::daemon::dispatchers::RunDispatcherKind>,
     pub backfill_dispatcher: Arc<crate::daemon::dispatchers::BackfillDispatcherKind>,

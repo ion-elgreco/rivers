@@ -1,24 +1,24 @@
-//! Server-side plumbing for live updates: one SurrealDB LIVE query per
+//! Server-side plumbing for live updates: one change subscription per
 //! table, fanned out into a single broadcast channel tagged by channel
 //! name, exposed as a single `/api/events?channels=…` SSE endpoint.
 //!
 //! - A **channel** is a named group of tables whose notifications are
 //!   treated as equivalent triggers by the UI (see [`LIVE_CHANNELS`]).
-//! - One background task per `(channel, table)` pair holds the LIVE query
+//! - One background task per `(channel, table)` pair holds the subscription
 //!   open, reconnecting with exponential backoff (250 ms → 30 s).
 //! - All tasks share one [`broadcast::Sender<&'static str>`]; the SSE
 //!   handler subscribes, filters by client-requested channels, and emits
 //!   `event: {channel}-changed\ndata: 1` events.
 //!
 //! **Python-write guarantee.** All backend writes flow through the same
-//! `Arc<SurrealStorage>` (Python daemon via PyO3 in `rivers dev`, or a
-//! shared remote SurrealDB in K8s), so the live queries here see every
+//! `Arc<AnyStorage>` (Python daemon via PyO3 in `rivers dev`, or a
+//! shared remote database in K8s), so the subscriptions here see every
 //! mutation regardless of which process wrote it.
 
 use axum::extract::Query;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,7 +38,7 @@ pub struct LiveChannel {
 
 /// Every channel a page can subscribe to. The `name` is what clients pass
 /// in `?channels=…`; `event_name` is `"{name}-changed"` pre-computed once;
-/// `tables` are the SurrealDB tables whose LIVE queries feed this channel.
+/// `tables` are the tables whose change subscriptions feed this channel.
 pub const LIVE_CHANNELS: &[LiveChannel] = &[
     LiveChannel {
         name: "runs",
@@ -151,7 +151,7 @@ pub struct ChannelSnapshot {
 /// channel name. Returns the shared sender plus a [`LiveMetrics`] handle
 /// the diagnostic endpoint reads from.
 pub fn spawn_live_broadcasters(
-    storage: Arc<SurrealStorage>,
+    storage: Arc<AnyStorage>,
     shutdown: CancellationToken,
 ) -> (broadcast::Sender<&'static str>, LiveMetrics) {
     let (tx, _rx) = broadcast::channel::<&'static str>(256);
@@ -172,7 +172,7 @@ pub fn spawn_live_broadcasters(
 }
 
 fn spawn_one(
-    storage: Arc<SurrealStorage>,
+    storage: Arc<AnyStorage>,
     shutdown: CancellationToken,
     tx: broadcast::Sender<&'static str>,
     channel_name: &'static str,
@@ -201,7 +201,7 @@ fn spawn_one(
 /// failure or stream end, and emits one synthetic tick on every reconnect
 /// after the first so clients catch up on anything missed during the gap.
 ///
-/// Decoupled from [`SurrealStorage`] (subscribe is a closure) so tests can
+/// Decoupled from [`AnyStorage`] (subscribe is a closure) so tests can
 /// drive it with a deterministic mock stream.
 ///
 /// - `table`: optional diagnostic tag for tracing; `None` is used by tests
@@ -661,7 +661,7 @@ mod tests {
         use tokio::net::{TcpListener, TcpStream};
 
         let storage = Arc::new(
-            rivers_core::storage::surrealdb_backend::SurrealStorage::new_memory()
+            rivers_core::storage::any::AnyStorage::surreal_memory()
                 .await
                 .unwrap(),
         );
@@ -756,7 +756,7 @@ mod tests {
 
     /// Full-path integration test over HTTP: verifies that a write to any
     /// channel's table is **perceived as an SSE event** by a subscribed
-    /// client — `SurrealStorage` (in-memory) → `spawn_live_broadcasters` →
+    /// client — `AnyStorage` (in-memory) → `spawn_live_broadcasters` →
     /// `/api/events` Axum route → raw TCP SSE client → `event: {X}-changed`
     /// + `data: 1` on the wire.
     ///
@@ -789,9 +789,9 @@ mod tests {
 
         // 1. In-memory storage + broadcaster + minimal Axum router.
         let storage = Arc::new(
-            rivers_core::storage::surrealdb_backend::SurrealStorage::new_memory()
+            rivers_core::storage::any::AnyStorage::surreal_memory()
                 .await
-                .expect("build in-memory SurrealStorage"),
+                .expect("build in-memory AnyStorage"),
         );
         let shutdown = CancellationToken::new();
         let (tx, _metrics) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
@@ -1079,9 +1079,9 @@ mod tests {
         use rivers_core::storage::{LaunchedBy, RunRecord, RunStatus, StorageBackend};
 
         let storage = Arc::new(
-            rivers_core::storage::surrealdb_backend::SurrealStorage::new_memory()
+            rivers_core::storage::any::AnyStorage::surreal_memory()
                 .await
-                .expect("build in-memory SurrealStorage"),
+                .expect("build in-memory AnyStorage"),
         );
         let shutdown = CancellationToken::new();
         let (_tx, metrics) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
@@ -1172,7 +1172,7 @@ mod tests {
         use tokio::net::{TcpListener, TcpStream};
 
         let storage = Arc::new(
-            rivers_core::storage::surrealdb_backend::SurrealStorage::new_memory()
+            rivers_core::storage::any::AnyStorage::surreal_memory()
                 .await
                 .unwrap(),
         );
@@ -1283,7 +1283,7 @@ mod tests {
         use tokio::net::{TcpListener, TcpStream};
 
         let storage = Arc::new(
-            rivers_core::storage::surrealdb_backend::SurrealStorage::new_memory()
+            rivers_core::storage::any::AnyStorage::surreal_memory()
                 .await
                 .unwrap(),
         );
@@ -1429,7 +1429,7 @@ mod tests {
         use tokio::net::{TcpListener, TcpStream};
 
         let storage = Arc::new(
-            rivers_core::storage::surrealdb_backend::SurrealStorage::new_memory()
+            rivers_core::storage::any::AnyStorage::surreal_memory()
                 .await
                 .unwrap(),
         );

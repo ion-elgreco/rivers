@@ -260,8 +260,13 @@ k8s-wait:
     # Pin the context like the tests do, so this never waits on the wrong cluster.
     kc=(kubectl --context "k3d-${RIVERS_K3D_CLUSTER:-rivers-test}" -n "$ns")
     echo "==> Waiting for operator + storage + object store"
+    if [ "${RIVERS_K8S_STORAGE_BACKEND:-surrealdb}" = "postgresql" ]; then
+        storage_label=postgres
+    else
+        storage_label=surrealdb
+    fi
+    "${kc[@]}" wait --for=condition=Ready pod -l "app.kubernetes.io/name=${storage_label}" --timeout=240s
     "${kc[@]}" rollout status deploy/rivers-operator --timeout=240s
-    "${kc[@]}" wait --for=condition=Ready pod -l app.kubernetes.io/name=surrealdb --timeout=240s
     "${kc[@]}" wait --for=condition=Ready pod -l app.kubernetes.io/name=rustfs --timeout=180s
     if [ "${RIVERS_K8S_SKIP_UI:-}" != "1" ]; then
         "${kc[@]}" rollout status deploy/rivers-ui --timeout=180s

@@ -85,8 +85,10 @@ def dev(
     port: int | None = typer.Option(None, help="Port to bind to"),
     grpc_port: int | None = typer.Option(None, help="Port for gRPC backend server"),
     storage_path: str | None = typer.Option(None, help="Path for embedded storage"),
-    surreal_endpoint: str | None = typer.Option(
-        None, help="Remote SurrealDB endpoint (overrides --storage-path)"
+    storage_url: str | None = typer.Option(
+        None,
+        help="Storage server URL; the scheme picks the backend "
+        "(ws://, wss://, postgres://). Overrides --storage-path.",
     ),
     no_daemon: bool | None = typer.Option(
         None, help="Disable schedule/sensor automation daemon"
@@ -107,7 +109,7 @@ def dev(
         port=port,
         grpc_port=grpc_port,
         storage_path=storage_path,
-        surreal_endpoint=surreal_endpoint,
+        storage_url=storage_url,
         no_daemon=no_daemon,
         synthetic=synthetic,
     )
@@ -115,8 +117,8 @@ def dev(
     os.environ["RIVERS_DEPLOYMENT"] = "dev"
     if cfg.module.path:
         os.environ["RIVERS_MODULE"] = cfg.module.path
-    if cfg.storage.endpoint:
-        os.environ["RIVERS_SURREAL_ENDPOINT"] = cfg.storage.endpoint
+    if cfg.storage.url:
+        os.environ["RIVERS_STORAGE_URL"] = cfg.storage.url
 
     if cfg.module.path is None:
         typer.echo(
@@ -150,12 +152,12 @@ def dev(
         typer.echo(f"Error: '{cfg.module.repo_var}' is not a CodeRepository", err=True)
         raise typer.Exit(1)
 
-    storage_endpoint = cfg.storage.endpoint
+    storage_url = cfg.storage.url
 
-    if storage_endpoint is not None:
+    if storage_url is not None:
         storage = _open_or_prompt_migrate(
-            lambda: Storage.connect(storage_endpoint),
-            lambda: Storage.migrate_remote(storage_endpoint),
+            lambda: Storage.open(storage_url),
+            lambda: Storage.migrate(storage_url),
         )
     else:
         storage = _open_or_prompt_migrate(
@@ -205,8 +207,10 @@ def serve(
     ),
     host: str = typer.Option("0.0.0.0", help="Host to bind to"),
     grpc_port: int = typer.Option(3001, help="Port for gRPC backend server"),
-    surreal_endpoint: str = typer.Option(
-        ..., envvar="RIVERS_SURREAL_ENDPOINT", help="Remote SurrealDB endpoint"
+    storage_url: str = typer.Option(
+        ...,
+        envvar="RIVERS_STORAGE_URL",
+        help="Storage server URL; the scheme picks the backend",
     ),
     no_daemon: bool = typer.Option(
         False, help="Disable schedule/sensor automation daemon"
@@ -214,14 +218,14 @@ def serve(
 ) -> None:
     """Start rivers code location server for Kubernetes deployment.
 
-    Connects to a remote SurrealDB instance, starts the gRPC backend and web UI,
+    Connects to a remote storage server, starts the gRPC backend and web UI,
     and runs the automation daemon. Designed to run inside a K8s code-location pod.
     """
     os.environ["RIVERS_MODULE"] = module
     os.environ["RIVERS_DEPLOYMENT"] = "cloud"
-    os.environ["RIVERS_SURREAL_ENDPOINT"] = surreal_endpoint
+    os.environ["RIVERS_STORAGE_URL"] = storage_url
 
-    storage = Storage.connect(surreal_endpoint)
+    storage = Storage.open(storage_url)
 
     sys.path.insert(0, ".")
     try:
@@ -260,8 +264,10 @@ def serve(
 def execute(
     module: str = typer.Argument(help="Python module path containing CodeRepository"),
     run_id: str = typer.Option(..., help="Pre-assigned run ID"),
-    surreal_endpoint: str = typer.Option(
-        ..., help="Remote SurrealDB endpoint (e.g. ws://host:8000)"
+    storage_url: str = typer.Option(
+        ...,
+        envvar="RIVERS_STORAGE_URL",
+        help="Storage server URL (e.g. ws://host:8000, postgres://host/db)",
     ),
     repo_var: str = typer.Option(
         "repo", help="Variable name of CodeRepository in module"
@@ -279,10 +285,10 @@ def execute(
         False, help="Resume a crashed run, skipping completed steps"
     ),
 ) -> None:
-    """Execute a run against a remote SurrealDB. Designed for K8s executor pods."""
+    """Execute a run against a remote storage server. Designed for K8s executor pods."""
     os.environ["RIVERS_DEPLOYMENT"] = "cloud"
     os.environ["RIVERS_RUN_ID"] = run_id
-    storage = Storage.connect(surreal_endpoint)
+    storage = Storage.open(storage_url)
 
     sys.path.insert(0, ".")
     try:
@@ -373,11 +379,11 @@ def execute_step(
     """Execute a single step within a run. Designed for K8s step pods."""
     os.environ["RIVERS_DEPLOYMENT"] = "cloud"
     os.environ["RIVERS_RUN_ID"] = run_id
-    surreal_endpoint = os.environ.get("RIVERS_SURREAL_ENDPOINT")
-    if not surreal_endpoint:
-        typer.echo("Error: RIVERS_SURREAL_ENDPOINT env var is required", err=True)
+    storage_url = os.environ.get("RIVERS_STORAGE_URL")
+    if not storage_url:
+        typer.echo("Error: RIVERS_STORAGE_URL env var is required", err=True)
         raise typer.Exit(1)
-    storage = Storage.connect(surreal_endpoint)
+    storage = Storage.open(storage_url)
 
     sys.path.insert(0, ".")
     try:
@@ -783,10 +789,11 @@ def db_migrate(
     storage_path: str = typer.Option(
         ".rivers/storage/", help="Path for embedded storage"
     ),
-    surreal_endpoint: str | None = typer.Option(
+    storage_url: str | None = typer.Option(
         None,
-        envvar="RIVERS_SURREAL_ENDPOINT",
-        help="Remote SurrealDB endpoint (overrides --storage-path)",
+        envvar="RIVERS_STORAGE_URL",
+        help="Storage server URL; the scheme picks the backend. "
+        "Overrides --storage-path.",
     ),
 ) -> None:
     """Apply pending storage schema migrations.
@@ -796,9 +803,9 @@ def db_migrate(
     database is already current. Run this after upgrading rivers when a code
     location or the UI reports that the database needs migration.
     """
-    target = surreal_endpoint or storage_path
-    if surreal_endpoint:
-        Storage.migrate_remote(surreal_endpoint)
+    target = storage_url or storage_path
+    if storage_url:
+        Storage.migrate(storage_url)
     else:
         Storage.migrate_embedded(storage_path)
     typer.echo(f"Storage schema is up to date ({target}).")

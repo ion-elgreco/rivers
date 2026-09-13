@@ -39,7 +39,7 @@ Every flag (and the module argument) can also come from configuration, with CLI 
 | `--port` | `3000` | Web UI port. |
 | `--grpc-port` | `3001` | gRPC backend port. |
 | `--storage-path` | `.rivers/storage/` | Embedded SurrealDB+RocksDB path. |
-| `--surreal-endpoint` | unset | Connect to a remote SurrealDB instead of using embedded storage. |
+| `--storage-url` | unset | Connect to a storage server instead of using embedded storage. The scheme picks the backend: `ws://`, `wss://`, `postgres://`. |
 | `--no-daemon` | `False` | Disable the automation daemon. |
 | `--synthetic` | unset | Override the graph with a synthetic DAG (`100`, `1k`, `10k`, `50k`) for benchmarking. |
 
@@ -51,12 +51,12 @@ Every flag (and the module argument) can also come from configuration, with CLI 
 rivers serve my_pipeline \
   --host 0.0.0.0 \
   --grpc-port 3001 \
-  --surreal-endpoint $RIVERS_SURREAL_ENDPOINT
+  --storage-url $RIVERS_STORAGE_URL
 ```
 
-Connects to a remote SurrealDB instance, starts the gRPC backend and web UI, and runs the automation daemon. Designed to run inside a code-location pod.
+Connects to a remote storage server, starts the gRPC backend and web UI, and runs the automation daemon. Designed to run inside a code-location pod.
 
-`--surreal-endpoint` may also be set via the `RIVERS_SURREAL_ENDPOINT` env var.
+`--storage-url` may also be set via the `RIVERS_STORAGE_URL` env var, which is what the Helm chart sets on every rivers pod.
 
 ---
 
@@ -113,11 +113,13 @@ rivers backfill-cancel BACKFILL_ID my_pipeline
 ## `execute` / `execute-step` (Kubernetes-internal)
 
 ```bash
-rivers execute my_pipeline --run-id RID --surreal-endpoint ws://surreal:8000
+RIVERS_STORAGE_URL=ws://surreal:8000 rivers execute my_pipeline --run-id RID
 rivers execute-step my_pipeline --run-id RID --step-key my_asset
 ```
 
 Designed for K8s execution pods. `execute` runs an entire run with a pre-assigned `run-id`; `execute-step` runs one step (used by step worker pods).
+
+Both read the location from `RIVERS_STORAGE_URL` rather than a flag: a PostgreSQL URL embeds its password, and a pod's argv is world-readable.
 
 ---
 
@@ -146,9 +148,10 @@ rivers queue why RUN_ID          # explain why a queued run is blocked
 Brings a database up to the running rivers build's schema version, applying any pending migrations under a cross-process lease. Idempotent. Run it after upgrading rivers when a code location or the UI reports that the database needs migration; see [Storage › Schema versioning & migration](storage.md#schema-versioning-migration).
 
 ```bash
-rivers db migrate                                          # embedded (default .rivers/storage/)
-rivers db migrate --storage-path /data/rivers              # embedded, explicit path
-rivers db migrate --surreal-endpoint ws://surrealdb:8000   # remote (or RIVERS_SURREAL_ENDPOINT)
+rivers db migrate                                             # embedded (default .rivers/storage/)
+rivers db migrate --storage-path /data/rivers                 # embedded, explicit path
+rivers db migrate --storage-url ws://surrealdb:8000           # SurrealDB server
+rivers db migrate --storage-url postgres://user:pw@db/rivers  # PostgreSQL server
 ```
 
 In Kubernetes, run this as an init/job step before rolling out upgraded code locations. `rivers dev` offers to run it interactively when it finds the database behind the build.

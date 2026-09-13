@@ -6,15 +6,15 @@ use http::{Request, Response};
 use http_body_util::BodyExt;
 use k8s_openapi::api::core::v1::{Pod, PodStatus};
 use rivers_core::storage::StorageBackend;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationSpec};
 use rivers_k8s::crd::run::{Run, RunCrdStatus, RunSpec};
 
 use super::reconcile::Context;
 use crate::codelocation::DirectoryState;
 
-pub async fn memory_storage() -> Arc<SurrealStorage> {
-    Arc::new(SurrealStorage::new_memory().await.unwrap())
+pub async fn memory_storage() -> Arc<AnyStorage> {
+    Arc::new(AnyStorage::surreal_memory().await.unwrap())
 }
 
 #[derive(Debug, Clone)]
@@ -219,18 +219,18 @@ pub fn test_pod(name: &str, phase: &str) -> Pod {
     }
 }
 
-pub fn make_context(client: kube_client::Client, storage: Arc<SurrealStorage>) -> Context {
+pub fn make_context(client: kube_client::Client, storage: Arc<AnyStorage>) -> Context {
     Context {
         client,
         namespace: "default".to_string(),
         storage,
         directory: Arc::new(DirectoryState::new()),
-        surreal_pod_cfg: rivers_k8s::env::SurrealPodConfig::default(),
+        storage_pod_cfg: rivers_k8s::env::StoragePodConfig::default(),
     }
 }
 
 /// Create a run record in storage so update_run_status has something to update.
-pub async fn seed_run_record(storage: &SurrealStorage, run_id: &str) {
+pub async fn seed_run_record(storage: &AnyStorage, run_id: &str) {
     use rivers_core::storage::{DEFAULT_CODE_LOCATION_ID, LaunchedBy, RunRecord, RunStatus};
     storage
         .create_run(&RunRecord {

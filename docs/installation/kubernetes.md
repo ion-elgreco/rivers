@@ -289,9 +289,69 @@ removes the footgun by always requiring auth for the bundled path.
 
 `rivers dev` reads the same env vars (`RIVERS_SURREAL_USERNAME` /
 `RIVERS_SURREAL_PASSWORD` / `RIVERS_SURREAL_NAMESPACE` /
-`RIVERS_SURREAL_DATABASE`) for `--surreal-endpoint` connections, or none
+`RIVERS_SURREAL_DATABASE`) for `--storage-url ws://...` connections, or none
 of them when using embedded storage. Set them in your shell when pointing
 `rivers dev` at an authenticated remote SurrealDB.
+
+## Use PostgreSQL instead of SurrealDB
+
+rivers runs on PostgreSQL as well as SurrealDB. Both backends implement the
+same storage API, and every storage test runs against both, so behaviour does
+not drift between them.
+
+PostgreSQL is **remote-only** — the chart connects to a server you run, it does
+not bundle one. Point the chart at it and turn the SurrealDB subchart off:
+
+```yaml
+storage:
+  backend: postgresql
+
+surrealdb:
+  enabled: false
+
+postgresql:
+  url: postgres://rivers:CHANGEME@postgres.db.svc:5432/rivers
+```
+
+The chart copies `postgresql.url` into a Secret named `rivers-postgresql-url`,
+and every rivers pod reads it through `valueFrom.secretKeyRef`. The password
+never lands in a pod spec, a CR, or a pod's argv.
+
+For production, manage the Secret yourself and reference it instead:
+
+```yaml
+postgresql:
+  existingSecret: my-postgres-dsn
+  secretKeys:
+    url: dsn
+```
+
+Run the schema migration before the first install, and again after each rivers
+upgrade:
+
+```bash
+rivers db migrate --storage-url postgres://rivers:CHANGEME@postgres.db.svc:5432/rivers
+```
+
+### What the chart refuses to install
+
+Each of these fails the install with a message naming the value to fix, rather
+than installing something that cannot work:
+
+| Configuration | Why it fails |
+|---------------|--------------|
+| `storage.backend` is neither `surrealdb` nor `postgresql` | A typo would otherwise fall back to SurrealDB silently. |
+| `backend: postgresql` with `surrealdb.enabled: true` | You would pay for a SurrealDB StatefulSet that nothing reads. |
+| `backend: postgresql` with no `url` and no `existingSecret` | The pods would have nothing to connect to. |
+
+### Choosing a backend
+
+Pick PostgreSQL when you already run PostgreSQL and want one database to
+operate, back up, and monitor. Pick the bundled SurrealDB when you want the
+chart to manage storage for you.
+
+Local development uses embedded SurrealDB either way: there is no embedded
+PostgreSQL, so `rivers dev` with no `--storage-url` opens RocksDB on disk.
 
 ## UI authentication
 

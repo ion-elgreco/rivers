@@ -64,7 +64,7 @@ fn replace_handle(svc: Service, handle: ServiceHandle, cancel: Option<Cancellati
     };
     if let Some(token) = cancel {
         // Cooperative shutdown: the task observes the cancel token and
-        // drains itself gracefully (subdaemons join, Arc<SurrealStorage>
+        // drains itself gracefully (subdaemons join, Arc<AnyStorage>
         // clones drop)
         token.cancel();
         drop(handle);

@@ -3,7 +3,7 @@
 use anyhow::Result;
 
 use crate::concurrency::{RunQueueConfig, TagConcurrencyCounter};
-use crate::storage::surrealdb_backend::SurrealStorage;
+use crate::storage::any::AnyStorage;
 use crate::storage::{
     CoordinatorRunInfo, EventRecord, EventType, RunStatus, ScopedStorageHandle, StorageBackend,
 };
@@ -11,12 +11,12 @@ use crate::util::now_ts;
 
 pub struct RunQueueCoordinator {
     config: RunQueueConfig,
-    /// Scoped so daemons sharing a SurrealDB only dequeue and block their own runs.
-    storage: ScopedStorageHandle<SurrealStorage>,
+    /// Scoped so daemons sharing a database only dequeue and block their own runs.
+    storage: ScopedStorageHandle<AnyStorage>,
 }
 
 impl RunQueueCoordinator {
-    pub fn new(config: RunQueueConfig, storage: ScopedStorageHandle<SurrealStorage>) -> Self {
+    pub fn new(config: RunQueueConfig, storage: ScopedStorageHandle<AnyStorage>) -> Self {
         Self { config, storage }
     }
 
@@ -142,18 +142,15 @@ mod tests {
         CodeLocationContext, DEFAULT_CODE_LOCATION_ID, LaunchedBy, RunRecord, RunStatus,
     };
 
-    async fn make_storage() -> Arc<SurrealStorage> {
+    async fn make_storage() -> Arc<AnyStorage> {
         Arc::new(
-            SurrealStorage::new_memory()
+            AnyStorage::surreal_memory()
                 .await
                 .expect("failed to create in-memory storage"),
         )
     }
 
-    fn make_coordinator(
-        config: RunQueueConfig,
-        storage: Arc<SurrealStorage>,
-    ) -> RunQueueCoordinator {
+    fn make_coordinator(config: RunQueueConfig, storage: Arc<AnyStorage>) -> RunQueueCoordinator {
         RunQueueCoordinator::new(
             config,
             ScopedStorageHandle::new(storage, CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID)),
@@ -438,7 +435,7 @@ mod tests {
         );
     }
 
-    /// Regression: two daemons sharing one SurrealDB must only dequeue runs
+    /// Regression: two daemons sharing one database must only dequeue runs
     /// belonging to their own code location. Before the fix, daemon B's
     /// `coordinator_tick_query` would return daemon A's queued runs, then
     /// `K8sRunBackend::launch` would stamp them with B's image+module, and

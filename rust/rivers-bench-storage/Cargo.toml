@@ -1,0 +1,12 @@
+[package]
+name = "rivers-bench-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+rivers-core = { path = "../rivers-core" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

@@ -1,7 +1,9 @@
+use anyhow::Result;
 use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, SecretKeySelector};
 use rivers_core::storage::surrealdb_backend::{
     DEFAULT_DATABASE, DEFAULT_NAMESPACE, SurrealConnectConfig,
 };
+use rivers_core::storage::url::StorageUrl;
 
 use crate::defaults;
 
@@ -11,6 +13,17 @@ const K8S_NAMESPACE_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/
 /// Stamped onto run pods by the operator (see `pod_builder.rs`) and onto
 /// CodeLocation daemon pods by the CodeLocation reconciler.
 pub const ENV_CODE_LOCATION_NAME: &str = "RIVERS_CODE_LOCATION_NAME";
+
+/// The whole storage location as one URL; its scheme picks the backend.
+/// Set by the Helm chart's PostgreSQL path. When unset, the `RIVERS_SURREAL_*`
+/// vars below describe the location instead.
+pub const ENV_STORAGE_URL: &str = "RIVERS_STORAGE_URL";
+
+/// Coordinates of the Secret holding [`ENV_STORAGE_URL`]. A PostgreSQL URL
+/// embeds its password, so pods read it through `valueFrom.secretKeyRef`
+/// rather than a plain pod-spec value.
+pub const ENV_STORAGE_URL_SECRET_NAME: &str = "RIVERS_STORAGE_URL_SECRET_NAME";
+pub const ENV_STORAGE_URL_SECRET_KEY: &str = "RIVERS_STORAGE_URL_SECRET_KEY";
 
 /// SurrealDB connection envs stamped on every rivers pod.
 pub const ENV_SURREAL_ENDPOINT: &str = "RIVERS_SURREAL_ENDPOINT";
@@ -127,6 +140,35 @@ pub fn detect_surreal_connect_config() -> SurrealConnectConfig {
     cfg
 }
 
+/// Resolve the storage location this pod should open.
+///
+/// [`ENV_STORAGE_URL`] wins when set. A SurrealDB URL there still takes its
+/// namespace, database, and credentials from the `RIVERS_SURREAL_*` vars,
+/// because a `ws://` URL carries none of the three.
+///
+/// With no URL set, the SurrealDB vars alone describe the location — what
+/// every chart emitted before the PostgreSQL backend existed.
+pub fn detect_storage_url() -> Result<StorageUrl> {
+    match env_nonempty(ENV_STORAGE_URL) {
+        Some(raw) => storage_url_from_arg(&raw),
+        None => Ok(StorageUrl::SurrealRemote(detect_surreal_connect_config())),
+    }
+}
+
+/// Parse a storage URL given on a command line, with the same SurrealDB
+/// overlay [`detect_storage_url`] applies. Lets a `--storage-url` flag beat
+/// the environment without losing the scope and credentials the URL omits.
+pub fn storage_url_from_arg(raw: &str) -> Result<StorageUrl> {
+    match raw.parse::<StorageUrl>()? {
+        StorageUrl::SurrealRemote(_) => {
+            let mut cfg = detect_surreal_connect_config();
+            cfg.endpoint = raw.to_string();
+            Ok(StorageUrl::SurrealRemote(cfg))
+        }
+        other => Ok(other),
+    }
+}
+
 /// Coordinates of the K8s Secret holding rivers' SurrealDB credentials.
 /// Used by pods that re-emit `valueFrom.secretKeyRef` on child pods (e.g.
 /// the run pod launching step pods) without round-tripping the password
@@ -157,18 +199,45 @@ impl SurrealAuthSecretRef {
     }
 }
 
+/// Coordinates of the Secret holding the storage URL. Populated only on the
+/// PostgreSQL path; empty means the SurrealDB env triple describes the
+/// location instead.
+#[derive(Debug, Clone, Default)]
+pub struct StorageUrlSecretRef {
+    pub secret_name: String,
+    pub key: String,
+}
+
+impl StorageUrlSecretRef {
+    pub fn from_env() -> Self {
+        Self {
+            secret_name: std::env::var(ENV_STORAGE_URL_SECRET_NAME).unwrap_or_default(),
+            key: std::env::var(ENV_STORAGE_URL_SECRET_KEY).unwrap_or_default(),
+        }
+    }
+
+    /// True when both coordinates are populated, the only state where it is
+    /// safe to emit a `valueFrom.secretKeyRef` for the URL.
+    pub fn is_set(&self) -> bool {
+        !self.secret_name.is_empty() && !self.key.is_empty()
+    }
+}
+
 /// SurrealDB connection bundle stamped on rivers pods. The endpoint can be
 /// overridden per-Run via [`with_endpoint`](Self::with_endpoint) while
 /// keeping the operator-level scope and auth-secret coordinates.
 #[derive(Debug, Clone)]
-pub struct SurrealPodConfig {
+pub struct StoragePodConfig {
     pub endpoint: String,
     pub namespace: String,
     pub database: String,
     pub auth_secret: SurrealAuthSecretRef,
+    /// When set, pods get the whole location from this Secret key and the
+    /// SurrealDB fields above are not emitted.
+    pub storage_url_secret: StorageUrlSecretRef,
 }
 
-impl SurrealPodConfig {
+impl StoragePodConfig {
     pub fn from_env() -> Self {
         Self {
             endpoint: env_nonempty(ENV_SURREAL_ENDPOINT)
@@ -180,6 +249,7 @@ impl SurrealPodConfig {
                 rivers_core::storage::surrealdb_backend::DEFAULT_DATABASE.to_string()
             }),
             auth_secret: SurrealAuthSecretRef::from_env(),
+            storage_url_secret: StorageUrlSecretRef::from_env(),
         }
     }
 
@@ -189,29 +259,71 @@ impl SurrealPodConfig {
     }
 }
 
-impl Default for SurrealPodConfig {
+impl Default for StoragePodConfig {
     fn default() -> Self {
         Self {
             endpoint: defaults::SURREAL_ENDPOINT.to_string(),
             namespace: rivers_core::storage::surrealdb_backend::DEFAULT_NAMESPACE.to_string(),
             database: rivers_core::storage::surrealdb_backend::DEFAULT_DATABASE.to_string(),
             auth_secret: SurrealAuthSecretRef::default(),
+            storage_url_secret: StorageUrlSecretRef::default(),
         }
     }
 }
 
-/// Build the standard SurrealDB env-var block stamped on rivers pods
-/// (operator, UI, CodeLocation daemon, run, step). Always emits the
-/// endpoint, namespace, and database (plain values). When the bundle's
-/// `auth_secret` is set, also emits:
+/// Build the storage env-var block stamped on rivers pods (operator, UI,
+/// CodeLocation daemon, run, step).
+///
+/// On the PostgreSQL path (`storage_url_secret` set) this is one
+/// `RIVERS_STORAGE_URL` from a `secretKeyRef`, plus the two coordinates a run
+/// pod needs to re-emit the same ref on its step pods. The URL embeds the
+/// password, so it never becomes a plain pod-spec value, and the SurrealDB
+/// fields are left off entirely — they describe nothing on this path.
+///
+/// Otherwise it is the SurrealDB triple (endpoint, namespace, database) as
+/// plain values. When `auth_secret` is set it also emits:
 ///
 /// - `RIVERS_SURREAL_USERNAME` / `RIVERS_SURREAL_PASSWORD` via
 ///   `valueFrom.secretKeyRef` so the secret material never lands in pod specs
 /// - `RIVERS_SURREAL_AUTH_SECRET_NAME` / `_USERNAME_KEY` / `_PASSWORD_KEY` as
 ///   plain values so the run pod can re-emit the same secretKeyRef on step
 ///   pods without holding the password in memory
-pub fn build_surreal_pod_env(cfg: &SurrealPodConfig) -> Vec<EnvVar> {
+pub fn build_storage_pod_env(cfg: &StoragePodConfig) -> Vec<EnvVar> {
+    if cfg.storage_url_secret.is_set() {
+        return vec![
+            EnvVar {
+                name: ENV_STORAGE_URL.to_string(),
+                value_from: Some(EnvVarSource {
+                    secret_key_ref: Some(SecretKeySelector {
+                        name: cfg.storage_url_secret.secret_name.clone(),
+                        key: cfg.storage_url_secret.key.clone(),
+                        optional: None,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            EnvVar {
+                name: ENV_STORAGE_URL_SECRET_NAME.to_string(),
+                value: Some(cfg.storage_url_secret.secret_name.clone()),
+                ..Default::default()
+            },
+            EnvVar {
+                name: ENV_STORAGE_URL_SECRET_KEY.to_string(),
+                value: Some(cfg.storage_url_secret.key.clone()),
+                ..Default::default()
+            },
+        ];
+    }
     let mut env = vec![
+        // Every rivers pod gets the location as a URL, whichever backend is in
+        // play, so `rivers execute` and the UI read one env var and not two
+        // shapes. `ws://` carries no scope, hence the triple below it.
+        EnvVar {
+            name: ENV_STORAGE_URL.to_string(),
+            value: Some(cfg.endpoint.clone()),
+            ..Default::default()
+        },
         EnvVar {
             name: ENV_SURREAL_ENDPOINT.to_string(),
             value: Some(cfg.endpoint.clone()),
@@ -364,15 +476,111 @@ mod tests {
             .map(|sk| (sk.name.clone(), sk.key.clone()))
     }
 
+    /// Set `RIVERS_STORAGE_URL` for the duration of `f`. Shares the same
+    /// serialization concern as [`with_env`]: env vars are process-global.
+    fn with_storage_url<R>(url: Option<&str>, f: impl FnOnce() -> R) -> R {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(ENV_STORAGE_URL).ok();
+        match url {
+            Some(v) => unsafe { std::env::set_var(ENV_STORAGE_URL, v) },
+            None => unsafe { std::env::remove_var(ENV_STORAGE_URL) },
+        }
+        let out = f();
+        match prev {
+            Some(v) => unsafe { std::env::set_var(ENV_STORAGE_URL, v) },
+            None => unsafe { std::env::remove_var(ENV_STORAGE_URL) },
+        }
+        out
+    }
+
     #[test]
-    fn build_surreal_pod_env_unauthenticated_omits_credentials() {
-        let cfg = SurrealPodConfig {
+    fn storage_url_defaults_to_surreal_when_unset() {
+        let url = with_storage_url(None, || detect_storage_url().unwrap());
+        assert!(
+            matches!(url, StorageUrl::SurrealRemote(_)),
+            "no URL set means the SurrealDB env vars describe the location"
+        );
+    }
+
+    #[test]
+    fn storage_url_selects_postgres_by_scheme() {
+        let url = with_storage_url(Some("postgres://u:p@db:5432/rivers"), || {
+            detect_storage_url().unwrap()
+        });
+        assert_eq!(url.backend_name(), "PostgreSQL");
+        assert_eq!(
+            url.redacted(),
+            "postgres://u:***@db:5432/rivers",
+            "the password must never reach a log line"
+        );
+    }
+
+    #[test]
+    fn a_surreal_url_still_takes_its_scope_from_the_env() {
+        // `ws://` carries no namespace or database, so dropping the env
+        // overlay would silently point every pod at the defaults.
+        let url = storage_url_from_arg("ws://elsewhere:8000").unwrap();
+        match url {
+            StorageUrl::SurrealRemote(cfg) => {
+                assert_eq!(cfg.endpoint, "ws://elsewhere:8000");
+                assert!(!cfg.namespace.is_empty());
+                assert!(!cfg.database.is_empty());
+            }
+            other => panic!("expected a SurrealDB location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_scheme_is_an_error_not_a_guess() {
+        assert!(storage_url_from_arg("mysql://db/rivers").is_err());
+    }
+
+    #[test]
+    fn storage_pod_env_on_the_postgres_path_hides_the_url() {
+        let cfg = StoragePodConfig {
+            storage_url_secret: StorageUrlSecretRef {
+                secret_name: "rivers-storage-url".to_string(),
+                key: "url".to_string(),
+            },
+            ..StoragePodConfig::default()
+        };
+        let env = build_storage_pod_env(&cfg);
+        assert_eq!(
+            env_secret_ref(&env, ENV_STORAGE_URL),
+            Some(("rivers-storage-url".to_string(), "url".to_string())),
+            "the URL embeds a password and must come from a secretKeyRef"
+        );
+        assert!(
+            env_value_of(&env, ENV_STORAGE_URL).is_none(),
+            "the URL must never be a plain pod-spec value"
+        );
+        assert!(
+            env.iter().all(|e| e.name != ENV_SURREAL_ENDPOINT),
+            "the SurrealDB triple describes nothing on the PostgreSQL path"
+        );
+        // The run pod re-emits the same ref onto its step pods.
+        assert_eq!(
+            env_value_of(&env, ENV_STORAGE_URL_SECRET_NAME).as_deref(),
+            Some("rivers-storage-url")
+        );
+        assert_eq!(
+            env_value_of(&env, ENV_STORAGE_URL_SECRET_KEY).as_deref(),
+            Some("url")
+        );
+    }
+
+    #[test]
+    fn build_storage_pod_env_unauthenticated_omits_credentials() {
+        let cfg = StoragePodConfig {
             endpoint: "ws://surrealdb:8000".to_string(),
             namespace: "rivers".to_string(),
             database: "main".to_string(),
             auth_secret: SurrealAuthSecretRef::default(),
+            storage_url_secret: StorageUrlSecretRef::default(),
         };
-        let env = build_surreal_pod_env(&cfg);
+        let env = build_storage_pod_env(&cfg);
         assert_eq!(
             env_value_of(&env, ENV_SURREAL_ENDPOINT).as_deref(),
             Some("ws://surrealdb:8000")
@@ -400,8 +608,8 @@ mod tests {
     }
 
     #[test]
-    fn build_surreal_pod_env_with_auth_emits_secret_key_refs() {
-        let cfg = SurrealPodConfig {
+    fn build_storage_pod_env_with_auth_emits_secret_key_refs() {
+        let cfg = StoragePodConfig {
             endpoint: "wss://prod:443".to_string(),
             namespace: "rivers".to_string(),
             database: "main".to_string(),
@@ -410,8 +618,9 @@ mod tests {
                 username_key: "username".to_string(),
                 password_key: "password".to_string(),
             },
+            storage_url_secret: StorageUrlSecretRef::default(),
         };
-        let env = build_surreal_pod_env(&cfg);
+        let env = build_storage_pod_env(&cfg);
         // Plain values still present.
         assert_eq!(
             env_value_of(&env, ENV_SURREAL_ENDPOINT).as_deref(),

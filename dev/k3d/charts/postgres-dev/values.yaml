@@ -1,0 +1,9 @@
+namespace: rivers
+
+# Dev-cluster scaffolding only. Production deployments bring their own
+# PostgreSQL and point `postgresql.url` (or `postgresql.existingSecret`) at it.
+image: postgres:18-alpine
+database: rivers
+username: rivers
+password: riverstest
+storageSize: 2Gi

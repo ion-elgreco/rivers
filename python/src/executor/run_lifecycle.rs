@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionPlan;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{LaunchedBy, RunRecord, RunStatus, ScopedStorageHandle, StorageBackend};
 
 use super::Executor;
@@ -40,7 +40,7 @@ pub(crate) struct RunPlanArgs<'a> {
     pub plan: &'a ExecutionPlan,
     pub node_map: &'a HashMap<String, ResolvedNode>,
     pub executor: &'a Executor,
-    pub storage: &'a ScopedStorageHandle<SurrealStorage>,
+    pub storage: &'a ScopedStorageHandle<AnyStorage>,
     pub resources: &'a HashMap<String, ResourceVariant>,
     pub io_handler_registry: &'a IOHandlerRegistry,
 
@@ -134,7 +134,7 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
 
 fn finalize_status(
     py: Python,
-    storage: &ScopedStorageHandle<SurrealStorage>,
+    storage: &ScopedStorageHandle<AnyStorage>,
     run_id: &str,
     success: bool,
 ) -> PyResult<RunStatus> {

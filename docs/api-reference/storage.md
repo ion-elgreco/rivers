@@ -2,7 +2,37 @@
 
 ## `Storage`
 
-SurrealDB-backed storage for events, runs, asset records, and key-value data.
+Storage for events, runs, asset records, and key-value data.
+
+rivers has two backends. **SurrealDB** runs embedded (RocksDB on local disk) or
+as a server. **PostgreSQL** runs as a server only — there is no embedded
+PostgreSQL, so local development uses embedded SurrealDB.
+
+Both backends implement the same API. Every storage test in the conformance
+suite runs against both, so behaviour does not drift between them.
+
+### `Storage.open(url)`
+
+Open storage from a URL. The scheme picks the backend.
+
+```python
+storage = rs.Storage.open("rocksdb://.rivers/storage")   # embedded SurrealDB
+storage = rs.Storage.open("ws://surrealdb:8000")         # SurrealDB server
+storage = rs.Storage.open("postgres://user:pw@db/rivers")  # PostgreSQL server
+```
+
+| Scheme | Backend |
+|--------|---------|
+| `rocksdb://<path>` | Embedded SurrealDB at that path |
+| `mem://` | In-memory SurrealDB (tests; data lost on shutdown) |
+| `ws://`, `wss://` | SurrealDB server |
+| `postgres://`, `postgresql://` | PostgreSQL server |
+
+A SurrealDB URL carries no namespace, database, or credentials, so those still
+resolve from the `RIVERS_SURREAL_*` env vars. Use `Storage.connect` below to
+pass them explicitly.
+
+An unknown scheme raises `StorageError` rather than falling back to a default.
 
 ### `Storage.memory()`
 
@@ -40,6 +70,9 @@ Each parameter resolves via: explicit kwarg → `RIVERS_SURREAL_*` env var → d
 
 When `username` and `password` both resolve to non-empty values, they authenticate as a database-scoped user against `namespace` / `database` — matching a `DEFINE USER ... ON DATABASE` definition.
 
+PostgreSQL carries its credentials in the URL, so it has no equivalent of this
+method — use `Storage.open("postgres://user:password@host/dbname")`.
+
 ## Schema versioning & migration
 
 Each persistent database carries a **schema stamp** — the schema version it was last migrated to, plus a `min_reader` and `min_writer` floor (the oldest rivers build allowed to read, and to write, that version). Opening a store checks this stamp against the build's schema version and **refuses an incompatible open instead of silently migrating**.
@@ -62,15 +95,28 @@ An **uninitialized** store (no stamp) is bootstrapped by whichever process opens
 Applies pending schema migrations, bringing the database to the running build's schema version. Idempotent (a no-op when already current), and serialized across processes by a short-lived lease so two openers can't migrate the same store at once. Run it after upgrading rivers when a code location or the UI reports that the database needs migration.
 
 ```bash
-rivers db migrate                              # embedded (--storage-path, default .rivers/storage/)
-rivers db migrate --surreal-endpoint ws://surrealdb:8000   # remote
+rivers db migrate                                            # embedded (--storage-path, default .rivers/storage/)
+rivers db migrate --storage-url ws://surrealdb:8000          # SurrealDB server
+rivers db migrate --storage-url postgres://user:pw@db/rivers  # PostgreSQL server
 ```
+
+`--storage-url` also reads the `RIVERS_STORAGE_URL` env var, which is what the
+Helm chart sets on every rivers pod.
 
 In K8s, run it as an explicit init/job step before rolling out upgraded code locations. `rivers dev` instead offers to migrate interactively when it finds the database behind the build.
 
+### `Storage.migrate(url)`
+
+The programmatic form of `rivers db migrate` — open, migrate, close. Takes the
+same URL as `Storage.open`, so it covers every backend.
+
+```python
+rs.Storage.migrate("postgres://user:pw@db/rivers")
+```
+
 ### `Storage.migrate_embedded(path)` / `Storage.migrate_remote(endpoint, ...)`
 
-The programmatic form of `rivers db migrate` — open-migrate-close. `migrate_remote` takes the same `username` / `password` / `namespace` / `database` resolution as `Storage.connect`.
+SurrealDB-specific forms. `migrate_remote` takes the same `username` / `password` / `namespace` / `database` resolution as `Storage.connect`.
 
 ```python
 rs.Storage.migrate_embedded(".rivers/storage")
@@ -79,7 +125,8 @@ rs.Storage.migrate_remote("ws://surrealdb.rivers.svc.cluster.local:8000")
 
 ### `storage.type`
 
-Returns a `StorageType` enum (`StorageType.Memory`, `StorageType.Embedded`, or `StorageType.Remote`).
+Returns a `StorageType` enum: `StorageType.Memory`, `StorageType.Embedded`,
+`StorageType.Remote` (a SurrealDB server), or `StorageType.Postgres`.
 
 ## Sync Methods
 
