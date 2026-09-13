@@ -30,6 +30,11 @@ WHERE e.event_type = 'LogOutput';
 
 DELETE FROM events WHERE event_type = 'LogOutput';
 
+-- The change-notification trigger follows its table: `rivers_notify()` is
+-- defined in v1, but nothing can trigger on `run_logs` until it exists.
+CREATE OR REPLACE TRIGGER run_logs_notify AFTER INSERT OR UPDATE OR DELETE ON run_logs
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify();
+
 -- v2 restructures where logs live: v1 builds would read logs from events
 -- (silently empty) and write logs nothing reads — both floors rise.
 INSERT INTO migration_meta (version, class, min_reader, min_writer)

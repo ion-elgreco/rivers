@@ -121,8 +121,8 @@ pub fn build_deployment(
                         command: Some(vec!["rivers".to_string()]),
                         // `module` is a positional argument to `rivers serve`;
                         // `--grpc-port` is the flag name (not `--port`).
-                        // `--surreal-endpoint` is read from the env we inject
-                        // below via Typer's `envvar="RIVERS_SURREAL_ENDPOINT"`.
+                        // `--storage-url` is read from the env we inject below
+                        // via Typer's `envvar="RIVERS_STORAGE_URL"`.
                         args: Some(vec![
                             "serve".to_string(),
                             spec.module.clone(),
