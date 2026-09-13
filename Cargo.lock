@@ -6082,6 +6082,7 @@ dependencies = [
  "ordermap",
  "petgraph",
  "refinery-core",
+ "rstest",
  "serde",
  "serde_json",
  "siphasher",

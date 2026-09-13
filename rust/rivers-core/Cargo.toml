@@ -36,4 +36,5 @@ siphasher = "1"
 tracing.workspace = true
 
 [dev-dependencies]
+rstest = { version = "0.26", default-features = false }
 test-temp-dir = "0.8"
