@@ -1,8 +1,13 @@
 //! Storage trait and types for persisting orchestration state.
 
 pub mod any;
+#[cfg(test)]
+mod conformance;
+pub mod migration;
+pub mod postgres_backend;
 pub mod retry;
 pub mod surrealdb_backend;
+pub mod url;
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;

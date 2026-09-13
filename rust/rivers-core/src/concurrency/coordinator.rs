@@ -150,10 +150,7 @@ mod tests {
         )
     }
 
-    fn make_coordinator(
-        config: RunQueueConfig,
-        storage: Arc<AnyStorage>,
-    ) -> RunQueueCoordinator {
+    fn make_coordinator(config: RunQueueConfig, storage: Arc<AnyStorage>) -> RunQueueCoordinator {
         RunQueueCoordinator::new(
             config,
             ScopedStorageHandle::new(storage, CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID)),

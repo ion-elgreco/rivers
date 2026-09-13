@@ -111,11 +111,7 @@ struct AutomationDaemon {
 }
 
 impl AutomationDaemon {
-    fn new(
-        repo: Py<PyCodeRepository>,
-        storage: Arc<AnyStorage>,
-        is_memory_storage: bool,
-    ) -> Self {
+    fn new(repo: Py<PyCodeRepository>, storage: Arc<AnyStorage>, is_memory_storage: bool) -> Self {
         Self {
             repo,
             storage,

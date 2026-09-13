@@ -15068,10 +15068,7 @@ fn test_update_dep_baselines_prevents_newly_updated_false_positive() {
 // ── Phantom run eviction: dispatch inserts run_ids; refresh confirms from storage or evicts after grace ─
 
 /// Helper: memory-backed storage with asset `a` registered and an initialized cache.
-async fn pending_test_setup() -> (
-    crate::storage::any::AnyStorage,
-    AssetConditionCache,
-) {
+async fn pending_test_setup() -> (crate::storage::any::AnyStorage, AssetConditionCache) {
     use crate::storage::any::AnyStorage;
     let storage = AnyStorage::surreal_memory().await.unwrap();
     storage
