@@ -46,7 +46,7 @@ impl From<StoredEvent> for PyStoredEvent {
     fn from(e: StoredEvent) -> Self {
         let data_version = e.event_type.data_version().map(|s| s.to_string());
         Self {
-            id: format!("{}:{:?}", e.id.table.as_str(), e.id.key),
+            id: e.id.clone(),
             event_type: e.event_type.type_name().to_string(),
             asset_key: e.asset_key,
             run_id: e.run_id,
@@ -81,7 +81,7 @@ pub struct PyStoredLog {
 impl From<StoredLog> for PyStoredLog {
     fn from(l: StoredLog) -> Self {
         Self {
-            id: format!("{}:{:?}", l.id.table.as_str(), l.id.key),
+            id: l.id.clone(),
             run_id: l.run_id,
             step_key: l.step_key,
             timestamp: l.timestamp,
@@ -435,7 +435,7 @@ pub struct PyStoredTick {
 impl From<StoredTick> for PyStoredTick {
     fn from(t: StoredTick) -> Self {
         Self {
-            id: format!("{}:{:?}", t.id.table.as_str(), t.id.key),
+            id: t.id.clone(),
             automation_name: t.automation_name,
             automation_type: t.automation_type,
             status: t.status,

@@ -1155,7 +1155,9 @@ pub struct TickRecord {
 /// Stored tick with its database-assigned ID.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredTick {
-    pub id: surrealdb::types::RecordId,
+    /// Opaque row id, unique within its table. Backends choose the format;
+    /// treat it as a string, never parse it.
+    pub id: String,
     #[serde(default = "default_code_location_id")]
     pub code_location_id: String,
     pub automation_name: String,
@@ -1189,7 +1191,9 @@ pub struct ConditionTickRecord {
 /// Stored global condition tick with database-assigned ID.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredConditionTick {
-    pub id: surrealdb::types::RecordId,
+    /// Opaque row id, unique within its table. Backends choose the format;
+    /// treat it as a string, never parse it.
+    pub id: String,
     #[serde(default = "default_code_location_id")]
     pub code_location_id: String,
     pub timestamp: i64,
@@ -1223,7 +1227,9 @@ pub struct ConditionEvalRecord {
 /// Stored condition evaluation with database-assigned ID.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredConditionEval {
-    pub id: surrealdb::types::RecordId,
+    /// Opaque row id, unique within its table. Backends choose the format;
+    /// treat it as a string, never parse it.
+    pub id: String,
     #[serde(default = "default_code_location_id")]
     pub code_location_id: String,
     pub asset_key: String,
@@ -1289,7 +1295,9 @@ impl LogRecord {
 /// Stored step log with its database-assigned ID.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredLog {
-    pub id: surrealdb::types::RecordId,
+    /// Opaque row id, unique within its table. Backends choose the format;
+    /// treat it as a string, never parse it.
+    pub id: String,
     #[serde(default = "default_code_location_id")]
     pub code_location_id: String,
     pub run_id: String,
@@ -1303,7 +1311,9 @@ pub struct StoredLog {
 /// Stored event with its database-assigned ID.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredEvent {
-    pub id: surrealdb::types::RecordId,
+    /// Opaque row id, unique within its table. Backends choose the format;
+    /// treat it as a string, never parse it.
+    pub id: String,
     pub event_type: EventType,
     pub asset_key: Option<String>,
     pub run_id: String,

@@ -91,7 +91,7 @@ struct DbStoredRunLog {
 impl DbStoredRunLog {
     fn into_stored_log(self) -> StoredLog {
         StoredLog {
-            id: self.id,
+            id: record_id_str(&self.id),
             code_location_id: self.code_location_id,
             run_id: self.run_id,
             step_key: self.step_key,
@@ -235,7 +235,7 @@ impl From<&ConditionTickRecord> for DbConditionTickWrite {
 impl DbStoredConditionTick {
     fn into_stored(self) -> StoredConditionTick {
         StoredConditionTick {
-            id: self.id,
+            id: record_id_str(&self.id),
             code_location_id: self.code_location_id,
             timestamp: self.timestamp,
             total_evaluated: self.total_evaluated as u32,
@@ -266,7 +266,7 @@ impl From<&ConditionEvalRecord> for DbConditionEvalWrite {
 impl DbStoredConditionEval {
     fn into_stored(self) -> StoredConditionEval {
         StoredConditionEval {
-            id: self.id,
+            id: record_id_str(&self.id),
             code_location_id: self.code_location_id,
             asset_key: self.asset_key,
             tick_id: self.tick_id,
@@ -300,7 +300,7 @@ impl From<&TickRecord> for DbTickWrite {
 impl DbStoredTick {
     fn into_stored_tick(self) -> StoredTick {
         StoredTick {
-            id: self.id,
+            id: record_id_str(&self.id),
             code_location_id: self.code_location_id,
             automation_name: self.automation_name,
             automation_type: self.automation_type,
@@ -338,7 +338,7 @@ impl DbStoredEvent {
         let event_type = EventType::from_type_name(&self.event_type, self.data_version)
             .unwrap_or(EventType::StepFailure);
         StoredEvent {
-            id: self.id,
+            id: record_id_str(&self.id),
             event_type,
             asset_key: self.asset_key,
             run_id: self.run_id,
@@ -1195,6 +1195,12 @@ impl SurrealStorage {
     }
 }
 
+/// Render a record id as the opaque string the storage API hands out.
+///
+/// The `{:?}` is load-bearing: this exact text is persisted in
+/// `condition_evals.tick_id` and in the `last_event_id` columns, so changing
+/// the format orphans every row written by an older build. It needs a
+/// migration, not a tidy-up.
 fn record_id_str(id: &RecordId) -> String {
     format!("{}:{:?}", id.table.as_str(), id.key)
 }
