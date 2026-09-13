@@ -153,7 +153,7 @@ mod tests {
     use crate::run::test_helpers::*;
 
     async fn seed_step_events(
-        storage: &rivers_core::storage::surrealdb_backend::SurrealStorage,
+        storage: &rivers_core::storage::any::AnyStorage,
         run_id: &str,
         completed: u32,
         total: u32,

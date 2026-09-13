@@ -4,7 +4,7 @@
 //! state, and forwards a `TickRecord` to the background tick writer.
 use std::sync::Arc;
 
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{ScopedStorageHandle, TickRecord};
 
 use super::automation_entry::AutomationEntry;
@@ -17,7 +17,7 @@ use crate::executor::ops::now_ts;
 pub(crate) async fn process_tick_result(
     automations: &mut [AutomationEntry],
     tick_tx: &tokio::sync::mpsc::UnboundedSender<TickWriteMsg>,
-    handle: &ScopedStorageHandle<SurrealStorage>,
+    handle: &ScopedStorageHandle<AnyStorage>,
     run_dispatcher: &Arc<RunDispatcherKind>,
     backfill_dispatcher: &Arc<BackfillDispatcherKind>,
     tick_result: TickResult,

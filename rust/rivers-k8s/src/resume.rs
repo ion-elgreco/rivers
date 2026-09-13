@@ -33,12 +33,12 @@ pub async fn build_resume_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rivers_core::storage::surrealdb_backend::SurrealStorage;
+    use rivers_core::storage::any::AnyStorage;
     use rivers_core::storage::{EventRecord, EventType, StorageBackend};
 
     #[tokio::test]
     async fn test_build_resume_state_empty_run() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::surreal_memory().await.unwrap();
         let state = build_resume_state(&storage, "no-such-run").await.unwrap();
         assert_eq!(
             state,
@@ -51,7 +51,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_resume_state_with_completed_steps() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::surreal_memory().await.unwrap();
         let run_id = "resume-test-1";
 
         storage

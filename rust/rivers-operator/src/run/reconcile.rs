@@ -5,7 +5,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube_client::api::{DeleteParams, Patch, PatchParams, PostParams};
 use kube_client::{Api, ResourceExt};
 use kube_runtime::controller::Action;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{RunOutcome, RunStatus, StorageBackend};
 use rivers_k8s::crd::code_location::CodeLocation;
 use rivers_k8s::crd::run::{CONDITION_EXECUTOR_READY, Run, RunCondition, RunCrdStatus, RunPhase};
@@ -27,7 +27,7 @@ const MAX_CONDITIONS: usize = 20;
 pub struct Context {
     pub client: kube_client::Client,
     pub namespace: String,
-    pub storage: Arc<SurrealStorage>,
+    pub storage: Arc<AnyStorage>,
     /// Shared CodeLocation cache fed by `codelocation::run_watcher`. The
     /// run reconciler reads `spec.env` from here on every Pending → Running
     /// transition; on cache miss (startup window before the watcher syncs)
@@ -399,7 +399,7 @@ async fn handle_deletion(
 /// Called when the operator transitions a run to a terminal phase and the
 /// executor didn't get a chance to write the status itself.
 pub(crate) async fn sync_run_status_to_storage(
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     run_id: &str,
     phase: &RunPhase,
 ) {

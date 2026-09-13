@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{ConditionEvalRecord, ScopedStorageHandle, StorageBackend, TickRecord};
 use tokio_util::sync::CancellationToken;
 
@@ -82,7 +82,7 @@ pub(crate) fn spawn_batch_writer<W: BatchWriter>(
 /// 500ms or when the batch hits `max_batch` (default 256, or 32 for memory
 /// storage; overridable via `RIVERS_TICK_BATCH_SIZE`).
 pub(crate) struct TickWriter {
-    handle: ScopedStorageHandle<SurrealStorage>,
+    handle: ScopedStorageHandle<AnyStorage>,
     flush_interval: Duration,
     max_batch: usize,
     batch: Vec<TickRecord>,
@@ -90,7 +90,7 @@ pub(crate) struct TickWriter {
 }
 
 impl TickWriter {
-    fn new(handle: ScopedStorageHandle<SurrealStorage>, is_memory_storage: bool) -> Self {
+    fn new(handle: ScopedStorageHandle<AnyStorage>, is_memory_storage: bool) -> Self {
         let default_batch: usize = if is_memory_storage { 32 } else { 256 };
         let max_batch: usize = std::env::var("RIVERS_TICK_BATCH_SIZE")
             .ok()
@@ -203,7 +203,7 @@ fn trim_backlog<T>(batch: &mut Vec<T>, max_batch: usize, what: &str) {
 }
 
 pub(crate) fn spawn_tick_writer(
-    handle: ScopedStorageHandle<SurrealStorage>,
+    handle: ScopedStorageHandle<AnyStorage>,
     cancel: CancellationToken,
     is_memory_storage: bool,
 ) -> (
@@ -219,7 +219,7 @@ pub(crate) fn spawn_tick_writer(
 /// prunes the global `condition_ticks` table when `max_evals_retained` is
 /// `Some`.
 pub(crate) struct ConditionEvalWriter {
-    handle: ScopedStorageHandle<SurrealStorage>,
+    handle: ScopedStorageHandle<AnyStorage>,
     flush_interval: Duration,
     max_batch: usize,
     max_evals_retained: Option<usize>,
@@ -228,7 +228,7 @@ pub(crate) struct ConditionEvalWriter {
 }
 
 impl ConditionEvalWriter {
-    fn new(handle: ScopedStorageHandle<SurrealStorage>, max_evals_retained: Option<usize>) -> Self {
+    fn new(handle: ScopedStorageHandle<AnyStorage>, max_evals_retained: Option<usize>) -> Self {
         let max_batch: usize = std::env::var("RIVERS_CONDITION_EVAL_BATCH_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -312,7 +312,7 @@ impl BatchWriter for ConditionEvalWriter {
 }
 
 pub(crate) fn spawn_condition_eval_writer(
-    handle: ScopedStorageHandle<SurrealStorage>,
+    handle: ScopedStorageHandle<AnyStorage>,
     cancel: CancellationToken,
     max_evals_retained: Option<usize>,
 ) -> (

@@ -1,6 +1,6 @@
 use kube_client::Api;
 use rivers_core::storage::StorageBackend;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_k8s::crd::run::Run;
 
 use super::reconcile::{Error, patch_status};
@@ -11,7 +11,7 @@ use super::reconcile::{Error, patch_status};
 /// swallowed so a flaky storage hop doesn't kill the reconcile pass).
 pub async fn update_progress(
     runs_api: &Api<Run>,
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     run: &Run,
     name: &str,
 ) -> Result<bool, Error> {
@@ -62,7 +62,7 @@ mod tests {
 
     use crate::run::test_helpers::*;
 
-    async fn seed_step_events(storage: &SurrealStorage, run_id: &str, completed: u32, total: u32) {
+    async fn seed_step_events(storage: &AnyStorage, run_id: &str, completed: u32, total: u32) {
         let ts = chrono::Utc::now().timestamp();
         for i in 0..total {
             storage

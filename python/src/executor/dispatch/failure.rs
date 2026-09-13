@@ -6,7 +6,7 @@ use std::time::Duration;
 use pyo3::exceptions::{PyKeyboardInterrupt, PyMemoryError, PyTimeoutError};
 use pyo3::prelude::*;
 use rivers_core::execution::retry::{FailureReason, RetryPolicy, compute_delay, should_retry};
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{EventType, StorageBackend};
 
 use crate::runtime::io_rt;
@@ -77,7 +77,7 @@ pub(crate) fn admit_retry(
 /// Sleep out a backoff `delay` in 1s slices, polling run cancellation between
 /// slices. Returns true if the run was cancelled before the delay elapsed.
 pub(crate) async fn backoff_sleep_cancellable(
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     run_id: &str,
     delay: Duration,
 ) -> bool {
@@ -101,7 +101,7 @@ pub(crate) async fn backoff_sleep_cancellable(
 /// Blocking flavor for the sync lifecycle (GIL released for the wait).
 pub(crate) fn backoff_sleep_cancellable_blocking(
     py: Python,
-    storage: &Arc<SurrealStorage>,
+    storage: &Arc<AnyStorage>,
     run_id: &str,
     delay: Duration,
 ) -> bool {
@@ -114,7 +114,7 @@ pub(crate) fn backoff_sleep_cancellable_blocking(
 /// no sleep to interrupt, so each iteration checks explicitly.
 pub(crate) fn run_cancelled_blocking(
     py: Python,
-    storage: &Arc<SurrealStorage>,
+    storage: &Arc<AnyStorage>,
     run_id: &str,
 ) -> bool {
     let storage = Arc::clone(storage);
@@ -127,7 +127,7 @@ pub(crate) fn run_cancelled_blocking(
 /// StepRetry events a prior (crashed) run already recorded for this step —
 /// a resumed ladder continues the budget from there instead of restarting it.
 pub(crate) async fn prior_step_retries(
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     run_id: &str,
     step_key: &str,
 ) -> u32 {
@@ -144,7 +144,7 @@ pub(crate) async fn prior_step_retries(
 
 pub(crate) fn prior_step_retries_blocking(
     py: Python,
-    storage: &Arc<SurrealStorage>,
+    storage: &Arc<AnyStorage>,
     run_id: &str,
     step_key: &str,
 ) -> u32 {

@@ -18,7 +18,7 @@ use crate::repository::resolved_node::ResolvedNode;
 use crate::runtime::io_rt;
 
 use crate::context::hook::PyHookContext;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 
 fn emit_step_event(
     writer: &EventWriter,
@@ -364,7 +364,7 @@ pub(crate) fn emit_observation(
 }
 
 pub(crate) fn register_assets_from_nodes(
-    storage: &ScopedStorageHandle<SurrealStorage>,
+    storage: &ScopedStorageHandle<AnyStorage>,
     node_map: &HashMap<String, ResolvedNode>,
     py: Python,
 ) {

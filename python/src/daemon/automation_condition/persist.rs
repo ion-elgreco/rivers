@@ -1,6 +1,6 @@
 //! Single-write persistence for the global condition tick.
 use rivers_core::condition::EvalResultRow;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{ConditionTickRecord, ScopedStorageHandle, StorageBackend};
 
 /// Per-asset dispatch outcome, feeding the asset's tick-history row.
@@ -120,7 +120,7 @@ impl ConditionTickHandle {
     /// reference, and a fabricated id would orphan them.
     pub(super) async fn finalize(
         self,
-        storage: &ScopedStorageHandle<SurrealStorage>,
+        storage: &ScopedStorageHandle<AnyStorage>,
     ) -> Option<String> {
         let record = self.build_record();
         match storage.backend().store_condition_tick(&record).await {

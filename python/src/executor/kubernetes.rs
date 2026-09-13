@@ -304,7 +304,7 @@ async fn classify_failed_pod(
 async fn poll_step_attempt(
     client: &kube_client::Client,
     namespace: &str,
-    storage: &Arc<rivers_core::storage::surrealdb_backend::SurrealStorage>,
+    storage: &Arc<rivers_core::storage::any::AnyStorage>,
     run_id: &str,
     poll_key: &str,
     job_name: &str,
@@ -438,7 +438,7 @@ struct StepJobSpec {
 async fn run_step_with_retries(
     client: kube_client::Client,
     namespace: String,
-    storage: Arc<rivers_core::storage::surrealdb_backend::SurrealStorage>,
+    storage: Arc<rivers_core::storage::any::AnyStorage>,
     run_id: String,
     code_location_id: String,
     config: Arc<rivers_k8s::executor::K8sStepExecutorConfig>,
@@ -603,7 +603,7 @@ async fn run_step_with_retries(
 async fn run_jobs_to_completion(
     client: kube_client::Client,
     namespace: String,
-    storage: Arc<rivers_core::storage::surrealdb_backend::SurrealStorage>,
+    storage: Arc<rivers_core::storage::any::AnyStorage>,
     run_id: String,
     code_location_id: String,
     config: Arc<rivers_k8s::executor::K8sStepExecutorConfig>,

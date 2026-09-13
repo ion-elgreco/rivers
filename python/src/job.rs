@@ -10,7 +10,7 @@ use petgraph::Direction;
 use pyo3::prelude::*;
 use rivers_core::assets::graph::AssetGraph;
 use rivers_core::execution::plan::{ExecutionPlan, StepKind};
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{LaunchedBy, ScopedStorageHandle};
 
 use rivers_core::execution::retry::{RetryPolicy, RetryRef};
@@ -45,7 +45,7 @@ pub struct PyJob {
     /// Storage scoped to the owning code location, set by `CodeRepository`
     /// during resolve. `None` for unresolved jobs. Used by `run_record` (which
     /// short-circuits when this is None) and `execute_run` for materialization.
-    storage: Option<ScopedStorageHandle<SurrealStorage>>,
+    storage: Option<ScopedStorageHandle<AnyStorage>>,
     pub(crate) resources: HashMap<String, ResourceVariant>,
     io_handler_registry: Option<IOHandlerRegistry>,
 }
@@ -71,7 +71,7 @@ impl PyJob {
         }
     }
 
-    pub(crate) fn set_storage(&mut self, storage: ScopedStorageHandle<SurrealStorage>) {
+    pub(crate) fn set_storage(&mut self, storage: ScopedStorageHandle<AnyStorage>) {
         self.storage = Some(storage);
     }
 
@@ -96,7 +96,7 @@ impl PyJob {
     pub(crate) fn configure_for_repo(
         &mut self,
         py: Python,
-        storage: &Arc<SurrealStorage>,
+        storage: &Arc<AnyStorage>,
         code_location_id: &str,
         resources: &HashMap<String, ResourceVariant>,
         io_handler_registry: &IOHandlerRegistry,

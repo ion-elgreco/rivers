@@ -11,7 +11,7 @@ use chrono::Utc;
 use pyo3::PyTypeInfo;
 use pyo3::prelude::*;
 use rivers_core::run_backend::{RunBackend, RunHealthStatus};
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use tokio_util::sync::CancellationToken;
 
 use crate::automation::PyEvalMode;
@@ -93,7 +93,7 @@ impl RunBackendKind {
 
 struct AutomationDaemon {
     repo: Py<PyCodeRepository>,
-    storage: Arc<SurrealStorage>,
+    storage: Arc<AnyStorage>,
     cancel: CancellationToken,
     /// Cancelled when the spawned `daemon_main_loop` task fully exits
     /// (after every subdaemon has joined and in-flight runs are drained).
@@ -113,7 +113,7 @@ struct AutomationDaemon {
 impl AutomationDaemon {
     fn new(
         repo: Py<PyCodeRepository>,
-        storage: Arc<SurrealStorage>,
+        storage: Arc<AnyStorage>,
         is_memory_storage: bool,
     ) -> Self {
         Self {
@@ -346,7 +346,7 @@ struct DaemonLoopConfig {
         ),
     >,
     repo: Arc<Py<PyCodeRepository>>,
-    storage: Arc<SurrealStorage>,
+    storage: Arc<AnyStorage>,
     cancel: CancellationToken,
     loky_executor: Option<Arc<Py<PyAny>>>,
     /// Registered resources, threaded to the eval dispatcher for subprocess

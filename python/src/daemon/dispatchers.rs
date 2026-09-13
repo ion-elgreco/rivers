@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use pyo3::prelude::*;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{RunRecord, RunStatus};
 
 use super::types::{BackfillRequestData, MaterializationRequestData, RunRequestData};
@@ -73,8 +73,8 @@ pub(crate) struct DirectRunDispatcher {
 
 pub(crate) struct QueuedRunDispatcher {
     handle: RepoHandle,
-    /// Used by `dispatch_materialization` to write Queued `RunRecord`s directly via `SurrealStorage::enqueue_run`.
-    storage: Arc<SurrealStorage>,
+    /// Used by `dispatch_materialization` to write Queued `RunRecord`s directly via `AnyStorage::enqueue_run`.
+    storage: Arc<AnyStorage>,
     code_location_id: String,
 }
 
@@ -87,7 +87,7 @@ impl RunDispatcherKind {
     pub(crate) fn new(
         repo: Arc<Py<PyCodeRepository>>,
         handle: RepoHandle,
-        storage: Arc<SurrealStorage>,
+        storage: Arc<AnyStorage>,
         code_location_id: String,
         run_queue_enabled: bool,
         gil_threads: GilThreads,
@@ -268,7 +268,7 @@ impl DirectRunDispatcher {
 }
 
 impl QueuedRunDispatcher {
-    /// Materialization variant: write a Queued `RunRecord` for each request via `SurrealStorage::enqueue_run`.
+    /// Materialization variant: write a Queued `RunRecord` for each request via `AnyStorage::enqueue_run`.
     async fn dispatch_materialization(
         &self,
         requests: &[MaterializationRequestData],

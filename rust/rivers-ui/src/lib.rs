@@ -65,7 +65,7 @@ mod server {
     use leptos::config::LeptosOptions;
     use leptos_axum::{LeptosRoutes, generate_route_list};
     use rivers_core::assets::graph::GraphTopology;
-    use rivers_core::storage::surrealdb_backend::SurrealStorage;
+    use rivers_core::storage::any::AnyStorage;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
     use tower_http::compression::CompressionLayer;
@@ -173,7 +173,7 @@ mod server {
     /// live-broadcaster, the auth gate (when a mode is enabled), and the
     /// Leptos route table. Returns when `shutdown` fires.
     pub async fn start_server(
-        storage: Arc<SurrealStorage>,
+        storage: Arc<AnyStorage>,
         graph: Option<Arc<GraphTopology>>,
         host: String,
         port: u16,

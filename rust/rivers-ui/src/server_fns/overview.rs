@@ -472,7 +472,7 @@ pub async fn get_deployment_info(
 
     Ok(DeploymentInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        storage_type: state.storage.backend_kind().label(),
+        storage_type: state.storage.label(),
         grpc_url,
         grpc_connected,
         code_location_mode,

@@ -17,7 +17,7 @@ use k8s_openapi::api::core::v1::{Pod, Service};
 use kube_client::{Api, Client};
 use kube_runtime::Controller;
 use kube_runtime::watcher::Config as WatcherConfig;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_k8s::crd::code_location::CodeLocation;
 use rivers_k8s::crd::run::Run;
 use tracing_subscriber::EnvFilter;
@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
         authenticated = surreal_config.credentials.is_some(),
         "connecting to SurrealDB"
     );
-    let storage = Arc::new(SurrealStorage::connect(surreal_config).await?);
+    let storage = Arc::new(AnyStorage::surreal_connect(surreal_config).await?);
 
     let runs: Api<Run> = Api::namespaced(client.clone(), &namespace);
     let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);

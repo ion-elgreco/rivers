@@ -151,12 +151,12 @@ mod async_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    use rivers_core::storage::surrealdb_backend::SurrealStorage;
+    use rivers_core::storage::any::AnyStorage;
     use rivers_core::storage::{EventRecord, EventType, StorageBackend};
 
     use crate::run::test_helpers::*;
 
-    async fn seed_step_events(storage: &SurrealStorage, run_id: &str, completed: u32, total: u32) {
+    async fn seed_step_events(storage: &AnyStorage, run_id: &str, completed: u32, total: u32) {
         let ts = chrono::Utc::now().timestamp();
         for i in 0..total {
             storage
