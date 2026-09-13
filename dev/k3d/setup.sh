@@ -14,8 +14,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # get pushed here so the operator can resolve a real manifest digest from
 # them (executor pod pulls require `image@sha256:...`). Operator/UI/external
 # images stay on the `k3d image import` path — pulled by tag, no digest.
-REGISTRY_NAME="k3d-rivers-registry"
-REGISTRY_HOST_PORT="5111"
+# Overridable so a second cluster (e.g. a PostgreSQL one beside the default
+# SurrealDB one) gets its own registry instead of colliding on the name/port.
+REGISTRY_NAME="${RIVERS_K3D_REGISTRY:-k3d-rivers-registry}"
+REGISTRY_HOST_PORT="${RIVERS_K3D_REGISTRY_PORT:-5111}"
 REGISTRY_HOST="localhost:${REGISTRY_HOST_PORT}"
 
 echo "==> Creating k3d cluster: ${CLUSTER_NAME}"
@@ -45,7 +47,15 @@ import_images=(rivers-operator:latest)
 k3d image import "${import_images[@]}" -c "${CLUSTER_NAME}"
 
 echo "==> Importing external images"
-for img in rustfs/rustfs:latest amazon/aws-cli:latest surrealdb/surrealdb:v3; do
+# Only the selected storage backend's image is imported; the other would be a
+# few hundred MB of pull and import for a pod that never starts.
+external_images=(rustfs/rustfs:latest amazon/aws-cli:latest)
+if [ "${RIVERS_K8S_STORAGE_BACKEND:-surrealdb}" = "postgresql" ]; then
+    external_images+=(postgres:18-alpine)
+else
+    external_images+=(surrealdb/surrealdb:v3)
+fi
+for img in "${external_images[@]}"; do
     # Skip the Docker Hub round-trip when a correct-arch copy is already
     # local (CI restores these from cache; locally they persist across runs).
     if [ "$(docker image inspect --format '{{.Architecture}}' "$img" 2>/dev/null)" != "arm64" ]; then

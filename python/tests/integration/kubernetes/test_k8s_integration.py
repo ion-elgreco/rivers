@@ -19,7 +19,9 @@ to point at.
 """
 
 import base64
+import json
 import os
+import subprocess
 import time
 
 import grpc
@@ -204,12 +206,68 @@ def _dump_debug_info(run_name: str) -> str:
     return "\n".join(lines)
 
 
-def _query_run_events(run_id: str, fields: str = "event_type, asset_key") -> list[dict]:
-    """Query SurrealDB via its HTTP /sql endpoint over a kr8s port-forward.
+def _query_run_events_postgres(run_id: str, fields: str) -> list[dict]:
+    """PostgreSQL counterpart of `_query_run_events`.
 
-    kr8s exec doesn't support stdin on the v4 channel protocol that k3s
-    speaks, and `surreal sql` only reads queries from stdin — so we go
-    through the HTTP API instead.
+    `psql -c` takes the query as an argument, sidestepping the stdin
+    limitation that pushed the SurrealDB path onto its HTTP API.
+    """
+    pods = list(
+        Pod.list(
+            namespace=NAMESPACE,
+            label_selector="app.kubernetes.io/name=postgres",
+            api=kube_api(),
+        )
+    )
+    assert pods, "no storage pod found: neither surrealdb nor postgres is deployed"
+    columns = [f.strip() for f in fields.split(",")]
+    out = subprocess.run(
+        [
+            "kubectl", "--context", KUBECTL_CONTEXT, "-n", NAMESPACE,
+            "exec", pods[0].name, "--",
+            "psql", "-U", "rivers", "-d", "rivers", "-t", "-A", "-F", "\x1f",
+            "-c", f"SELECT {fields} FROM events WHERE run_id = '{run_id}'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if out.returncode != 0:
+        return []
+    rows = []
+    for line in out.stdout.splitlines():
+        if not line.strip():
+            continue
+        rows.append(
+            {c: _decode_psql_value(v) for c, v in zip(columns, line.split("\x1f"))}
+        )
+    return rows
+
+
+def _decode_psql_value(raw: str):
+    """Match what the SurrealDB path hands back for the same column.
+
+    psql prints SQL NULL as an empty field and jsonb as its JSON text, so
+    `metadata` would arrive as a string where SurrealDB gives a list of pairs.
+    Only bracketed values are parsed, to leave a text column that happens to
+    look numeric alone.
+    """
+    if raw == "":
+        return None
+    if raw[0] in "[{":
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return raw
+    return raw
+
+
+def _query_run_events(run_id: str, fields: str = "event_type, asset_key") -> list[dict]:
+    """Read a run's events straight from whichever database the cluster runs.
+
+    Dispatches on which storage pod exists, so the same assertions hold on
+    either backend. Returning `[]` for "no database found" would turn a
+    missing backend into an empty result set and pass the wrong test.
     """
     pods = list(
         Pod.list(
@@ -219,7 +277,7 @@ def _query_run_events(run_id: str, fields: str = "event_type, asset_key") -> lis
         )
     )
     if not pods:
-        return []
+        return _query_run_events_postgres(run_id, fields)
     pod = pods[0]
     secret = Secret.get(
         name="rivers-surrealdb-auth", namespace=NAMESPACE, api=kube_api()
