@@ -527,6 +527,15 @@ pub struct EventRecord {
     pub input_data_versions: Vec<(String, String)>,
 }
 
+/// One asset's step reaching a terminal state inside one run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepOutcome {
+    pub asset_key: String,
+    pub run_id: String,
+    /// `true` for `StepSuccess`, `false` for `StepFailure`.
+    pub succeeded: bool,
+}
+
 // ── Asset / Run / Tick records ──
 
 #[derive(Debug, Clone, PartialEq, SurrealValue, serde::Serialize, serde::Deserialize)]
@@ -1469,7 +1478,9 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<StoredConditionTick>>> + Send;
 
-    fn prune_condition_ticks(
+    /// Drop condition ticks past `max_ticks` along with their evaluations.
+    /// Returns the number of ticks dropped.
+    fn prune_condition_history(
         &self,
         code_location_id: &str,
         max_ticks: usize,
@@ -1487,13 +1498,6 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         code_location_id: &str,
         tick_id: &str,
     ) -> impl Future<Output = Result<Vec<StoredConditionEval>>> + Send;
-
-    fn prune_condition_evals(
-        &self,
-        code_location_id: &str,
-        asset_key: &str,
-        max_evals: usize,
-    ) -> impl Future<Output = Result<usize>> + Send;
 
     fn get_partition_events(
         &self,
@@ -1844,9 +1848,9 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
             .await
     }
 
-    pub async fn prune_condition_ticks(&self, max_ticks: usize) -> Result<usize> {
+    pub async fn prune_condition_history(&self, max_ticks: usize) -> Result<usize> {
         self.backend
-            .prune_condition_ticks(self.code_location_id, max_ticks)
+            .prune_condition_history(self.code_location_id, max_ticks)
             .await
     }
 
@@ -1866,12 +1870,6 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
     ) -> Result<Vec<StoredConditionEval>> {
         self.backend
             .get_condition_evals_for_tick(self.code_location_id, tick_id)
-            .await
-    }
-
-    pub async fn prune_condition_evals(&self, asset_key: &str, max_evals: usize) -> Result<usize> {
-        self.backend
-            .prune_condition_evals(self.code_location_id, asset_key, max_evals)
             .await
     }
 
@@ -2171,12 +2169,15 @@ pub trait StorageBackend: PerCodeLocationStorage {
     fn store_run_logs(&self, logs: &[LogRecord]) -> impl Future<Output = Result<()>> + Send;
     fn get_run_logs(&self, run_id: &str) -> impl Future<Output = Result<Vec<StoredLog>>> + Send;
 
-    /// Scan the given runs' step events for `asset_key` in one pass.
-    fn step_completion(
+    /// Every terminal step among `asset_keys` inside `run_ids`, in one query.
+    ///
+    /// Takes both as sets because the caller asks about many assets at once. A
+    /// per-asset call would read each run's whole log once per asset.
+    fn step_outcomes(
         &self,
-        asset_key: &str,
+        asset_keys: &[String],
         run_ids: &[String],
-    ) -> impl Future<Output = Result<(bool, Vec<String>)>> + Send;
+    ) -> impl Future<Output = Result<Vec<StepOutcome>>> + Send;
 
     // Runs
     fn create_run(&self, run: &RunRecord) -> impl Future<Output = Result<()>> + Send;

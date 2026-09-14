@@ -14,19 +14,21 @@ theme:
   favicon: assets/logo.svg
   icon:
     repo: fontawesome/brands/github
+  # Dark first. With no `media` key Material takes the first palette as the
+  # default, and each palette carries the toggle that leaves it.
   palette:
-    - scheme: default
-      primary: deep purple
-      accent: amber
-      toggle:
-        icon: material/brightness-7
-        name: Switch to dark mode
     - scheme: slate
       primary: deep purple
       accent: amber
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
+    - scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
   features:
     - content.code.copy
     - content.code.annotate

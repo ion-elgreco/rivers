@@ -133,17 +133,81 @@ repo.materialize()</code></pre>
             <tr><th scope="col">Component</th><th scope="col">Python orchestrators</th><th scope="col">rivers</th></tr>
           </thead>
           <tbody>
-            <tr><td>Graph resolution</td><td class="was">Python</td><td class="now">Compiled Rust (<code>petgraph</code>)</td></tr>
-            <tr><td>Execution planner</td><td class="was">Python</td><td class="now">Compiled Rust</td></tr>
-            <tr><td>Partition mapping</td><td class="was">Python</td><td class="now">Compiled Rust</td></tr>
-            <tr><td>Daemon: schedules, sensors, automation</td><td class="was">Python</td><td class="now">Compiled Rust, no GIL held</td></tr>
-            <tr><td>Web UI server</td><td class="was">Python plus a JavaScript bundle</td><td class="now">Rust: axum, Leptos, WebAssembly</td></tr>
+            <tr><td>Graph resolution</td><td class="was">Python</td><td class="now">Rust (<code>petgraph</code>)</td></tr>
+            <tr><td>Execution planner</td><td class="was">Python</td><td class="now">Rust</td></tr>
+            <tr><td>Partition mapping</td><td class="was">Python</td><td class="now">Rust</td></tr>
+            <tr><td>Daemon: schedules, sensors, automation</td><td class="was">Python</td><td class="now">Rust, no GIL held</td></tr>
+            <tr><td>Web UI server</td><td class="was">Python plus a JavaScript bundle</td><td class="now">Rust: axum, Leptos, WASM</td></tr>
             <tr><td>Kubernetes integration</td><td class="was">Python launcher</td><td class="now">Rust operator with CRDs</td></tr>
             <tr class="punch"><td>Python interpreter on the control plane</td><td class="was">Yes, everywhere</td><td class="now">None</td></tr>
           </tbody>
         </table>
       </div>
       <p class="center micro">Plan times stay below a millisecond on graphs with thousands of nodes. <a class="flow-link" href="/docs/latest/comparisons/dagster/">See the full comparison</a></p>
+    </div>
+  </section>
+
+  <!-- rivers-benchmark:generated - do not hand-edit, rerun bench/run.sh -->
+  <section class="compare reveal">
+    <div class="wrap">
+      <h2 class="center">Measured against the others</h2>
+      <p class="center sub">Wins and losses alike, on one machine, with the same Python and the same storage class. Each framework runs in its best configuration, and the highlighted figure wins the row.</p>
+      <div class="table-frame" data-bench-table>
+        <table class="cmp bench">
+          <thead>
+            <tr><th scope="col">Measurement</th><th scope="col">Dagster</th><th scope="col">Prefect</th><th scope="col">rivers</th></tr>
+          </thead>
+          <tbody>
+            <tr class="group"><th colspan="4" scope="rowgroup">Kubernetes control plane</th></tr>
+            <tr><td>install to ready for work</td><td class="rival win">25 s</td><td class="rival">43 s</td><td class="rivers">45 s</td></tr>
+            <tr><td>memory at idle</td><td class="rival">366 MB</td><td class="rival">389 MB</td><td class="rivers win">159 MB</td></tr>
+            <tr><td>images on disk</td><td class="rival">399 MB</td><td class="rival">374 MB</td><td class="rivers win">244 MB</td></tr>
+          </tbody>
+          <tbody>
+            <tr class="group"><th colspan="4" scope="rowgroup">Graph engine</th></tr>
+            <tr><td>build a 100,000-asset graph</td><td class="rival">35.06 s</td><td class="rival">6.29 s</td><td class="rivers win">718 ms</td></tr>
+            <tr><td>build a 50,000-asset graph with dependencies</td><td class="rival">32.81 s</td><td class="rival">3.89 s</td><td class="rivers win">370 ms</td></tr>
+            <tr><td>resolve a selection over 10,000 assets</td><td class="rival">960 ms</td><td class="rival none">not supported</td><td class="rivers win">8 ms</td></tr>
+          </tbody>
+          <tbody>
+            <tr class="group"><th colspan="4" scope="rowgroup">Run execution</th></tr>
+            <tr><td>one no-op asset, end to end</td><td class="rival">95 ms</td><td class="rival">1.09 s</td><td class="rivers win">3 ms</td></tr>
+            <tr><td>no-op runs per second</td><td class="rival">10/s</td><td class="rival">1/s</td><td class="rivers win">365/s</td></tr>
+            <tr><td>per step in one run of 5,000</td><td class="rival">25.5 ms</td><td class="rival none">timed out</td><td class="rivers win">0.5 ms</td></tr>
+            <tr><td>parallel efficiency, 512 sleeping assets</td><td class="rival">4%</td><td class="rival">23%</td><td class="rivers win">76%</td></tr>
+            <tr><td>cancel a running run</td><td class="rival">582 ms</td><td class="rival none">not supported</td><td class="rivers win">1 ms</td></tr>
+          </tbody>
+          <tbody>
+            <tr class="group"><th colspan="4" scope="rowgroup">Partitions</th></tr>
+            <tr><td>define and load 1,000,000</td><td class="rival">532 ms</td><td class="rival none">not supported</td><td class="rivers win">80 ms</td></tr>
+            <tr><td>materialize, count and list over 1,000,000 keys</td><td class="rival">415 ms</td><td class="rival none">not supported</td><td class="rivers win">93 ms</td></tr>
+          </tbody>
+          <tbody>
+            <tr class="group"><th colspan="4" scope="rowgroup">Automation daemon</th></tr>
+            <tr><td>sensors held at a 1-second interval</td><td class="rival">50</td><td class="rival none">not supported</td><td class="rivers win">2,000+</td></tr>
+            <tr><td>conditions held at a 1-second interval</td><td class="rival">10,000</td><td class="rival none">not supported</td><td class="rivers win">20,000+</td></tr>
+            <tr><td>evaluate 500 schedules once</td><td class="rival">2.2 ms</td><td class="rival none">not supported</td><td class="rivers win">0.38 ms</td></tr>
+          </tbody>
+          <tbody>
+            <tr class="group"><th colspan="4" scope="rowgroup">Backfill</th></tr>
+            <tr><td>partitions per second, 1,000 partitions</td><td class="rival">1.5/s</td><td class="rival none">not supported</td><td class="rivers win">104.7/s</td></tr>
+          </tbody>
+          <tbody>
+            <tr class="group"><th colspan="4" scope="rowgroup">Concurrency</th></tr>
+            <tr><td>claims per second, 10,000 against four slots</td><td class="rival">101/s</td><td class="rival none">timed out</td><td class="rivers win">753/s</td></tr>
+          </tbody>
+          <tbody>
+            <tr class="group"><th colspan="4" scope="rowgroup">Read path</th></tr>
+            <tr><td>answer a UI page over 10,000 runs</td><td class="rival">21.1 ms</td><td class="rival">48.3 ms</td><td class="rivers win">2.0 ms</td></tr>
+          </tbody>
+          <tbody>
+            <tr class="group"><th colspan="4" scope="rowgroup">Logs</th></tr>
+            <tr><td>write and read 100,000 lines</td><td class="rival">1.15 s</td><td class="rival">75.53 s</td><td class="rivers win">291 ms</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <button class="btn glass bench-more" type="button" data-bench-toggle hidden>Show all measurements</button>
+      <p class="center micro">Measured on Apple Silicon. <a class="flow-link" href="https://github.com/ion-elgreco/rivers/blob/main/bench/RESULTS.md">Full results and method</a></p>
     </div>
   </section>
 
@@ -198,8 +262,8 @@ repo.materialize()</code></pre>
     <div class="wrap split-inner">
       <div>
         <h2>One command starts <span class="grad">the whole stack</span>.</h2>
-        <p>No separate webserver and daemon to babysit. No Postgres to provision. No <code>workspace.yaml</code>, and no docker-compose file.</p>
-        <p>The binary you run on your laptop is the same one that ships to production through the Helm chart.</p>
+        <p>On your laptop, one process runs the scheduler, your code, the database and the UI. There is no daemon to babysit, no <code>workspace.yaml</code>, and no docker-compose file.</p>
+        <p>Nothing changes when you go to production. The Helm chart runs the same components, split into their own pods.</p>
         <a class="btn glass" href="/docs/latest/getting-started/">Getting started</a>
       </div>
       <div>
@@ -208,7 +272,7 @@ repo.materialize()</code></pre>
 <pre><code><span class="d">$</span> rivers dev pipelines.analytics</code></pre>
         </div>
         <ul class="ticks starts">
-          <li>Embedded SurrealDB on RocksDB — no external database</li>
+          <li>SurrealDB, embedded on RocksDB — it also runs in memory or on a remote server</li>
           <li>The scheduler daemon, evaluating your automation</li>
           <li>The gRPC code-location backend on port 3001</li>
           <li>The web UI on port 3000, in the same process</li>
@@ -231,12 +295,6 @@ repo.materialize()</code></pre>
         </article>
 
         <article class="card">
-          <h3><span class="ico" aria-hidden="true">▦</span> Pools that survive a crash</h3>
-          <p>Concurrency pool slots are leases. When a pod is killed mid-step, the lease expires and the slot returns. A dead worker cannot hold your warehouse capacity hostage. One asset can hold several pools at once.</p>
-          <a href="/docs/latest/concepts/concurrency/">Concurrency<span aria-hidden="true"> →</span></a>
-        </article>
-
-        <article class="card">
           <h3><span class="ico" aria-hidden="true">⚡</span> Async assets, for real</h3>
           <p>Write <code>async def</code> on an asset and rivers awaits it on the tokio event loop. No wrapper and no separate decorator. The parallel executor caps async fan-out separately from its subprocess workers.</p>
           <a href="/docs/latest/concepts/jobs/">Executors<span aria-hidden="true"> →</span></a>
@@ -252,6 +310,30 @@ repo.materialize()</code></pre>
           <h3><span class="ico" aria-hidden="true">◱</span> Config is just Pydantic</h3>
           <p>Annotate the context with your model — <code>AssetExecutionContext[MyConfig]</code> — and the type is read from the annotation. No config DSL, no run-config dictionary, and real autocomplete on <code>context.config</code>.</p>
           <a href="/docs/latest/concepts/configuration/">Configuration<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">⊞</span> One symbol per concept</h3>
+          <p>Every concept is a single class with named constructors. Type <code>rs.Executor.</code> and the IDE lists every executor; <code>rs.PartitionsDefinition.</code> lists every partition kind. One import, nothing to memorise.</p>
+          <a href="/docs/latest/comparisons/dagster/#api-ergonomics-one-class-one-entry-point">The API surface<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">⧉</span> Backfills that split by dimension</h3>
+          <p>Give one dimension a run each and batch another inside it. <code>per_dimension(multi_run=["date"], single_run=["region"])</code> is one run per date, with every region in it. No custom backfill code.</p>
+          <a href="/docs/latest/concepts/backfills/">Backfills<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">▣</span> Size the step, not the run</h3>
+          <p>A cheap parse step and a 30&nbsp;Gi join should not share one pod size. <code>compute=rs.Compute(memory="32Gi")</code> sizes that asset alone. Axes you leave unset inherit the executor default.</p>
+          <a href="/docs/latest/concepts/compute/">Per-asset compute<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">▲</span> An OOM retry gets more memory</h3>
+          <p>When the kernel kills a step, rivers reads the pod status, tells a real OOM from an eviction, and relaunches with more memory. 8&nbsp;Gi, then 16, then 32, up to your ceiling.</p>
+          <a href="/docs/latest/concepts/retries/">Retries<span aria-hidden="true"> →</span></a>
         </article>
 
         <article class="card">
@@ -331,7 +413,7 @@ repo.materialize()</code></pre>
   <section class="shot reveal">
     <div class="wrap">
       <h2 class="center">The whole platform, in one UI</h2>
-      <p class="center sub">Every screen below is Rust — Leptos server-side rendering with WebAssembly hydration, on axum. Run state, materializations, and automation ticks stream over server-sent events, so there is a live indicator instead of a refresh button.</p>
+      <p class="center sub">Every page updates itself. Run state, materializations, and automation ticks arrive as they happen, so you get a live indicator instead of a refresh button.</p>
       <div class="carousel" data-carousel>
         <div class="carousel-viewport">
           <ul class="carousel-track">
@@ -412,7 +494,7 @@ repo.materialize()</code></pre>
       <div>
         <h2>Kubernetes is the control plane</h2>
         <p>Registering a code location is one <code>kubectl apply</code>. The operator resolves the tag to an immutable digest, reconciles a Deployment and Service, and registers the endpoint for the UI to discover.</p>
-        <p>There is no workspace file to maintain, no "add code location" flow in the UI, and no agent process to register against. Delete the resource to remove it.</p>
+        <p>There is no workspace file to maintain, no "add code location" flow in the UI, and no extra process polling a hosted service for work. Delete the resource to remove it.</p>
         <a class="btn glass" href="/docs/latest/installation/kubernetes/">Install on Kubernetes</a>
       </div>
       <div class="code-card glow">
@@ -521,6 +603,34 @@ repo.materialize()</code></pre>
       set("release", d.tag_name);
       set("released", shipped(d.published_at));
       reveal("release");
+    });
+  })();
+
+  // Benchmark table. It opens as a preview and the button shows the rest. The
+  // clamp is added here, so the whole table is readable without script.
+  (function () {
+    var frame = document.querySelector("[data-bench-table]");
+    var btn = document.querySelector("[data-bench-toggle]");
+    if (!frame || !btn) return;
+    var rows = frame.querySelectorAll("tbody tr:not(.group)").length;
+
+    function label(open) {
+      btn.textContent = open ? "Show fewer" : "Show all " + rows + " measurements";
+      btn.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+
+    frame.classList.add("is-clamped");
+    btn.hidden = false;
+    label(false);
+
+    btn.addEventListener("click", function () {
+      var open = !frame.classList.toggle("is-clamped");
+      label(open);
+      // Collapsing from the bottom of a long table would otherwise strand the
+      // visitor below the section.
+      if (!open) {
+        frame.scrollIntoView({ behavior: motionOK ? "smooth" : "auto", block: "start" });
+      }
     });
   })();
 

@@ -1,0 +1,20 @@
+# Dagster's published images are amd64 only. This rebuilds the same version
+# natively so the Kubernetes comparison is not distorted by CPU emulation.
+#
+# DAGSTER_VERSION must match bench/envs/pyproject.toml — the local and
+# in-cluster measurements have to run the same Dagster. The integration
+# libraries still use the 0.x line: 1.13.22 pairs with 0.29.22.
+FROM python:3.11-slim
+
+ARG DAGSTER_VERSION=1.13.22
+ARG DAGSTER_LIB_VERSION=0.29.22
+RUN pip install --no-cache-dir \
+    "dagster==${DAGSTER_VERSION}" \
+    "dagster-graphql==${DAGSTER_VERSION}" \
+    "dagster-webserver==${DAGSTER_VERSION}" \
+    "dagster-k8s==${DAGSTER_LIB_VERSION}" \
+    "dagster-postgres==${DAGSTER_LIB_VERSION}"
+
+ENV DAGSTER_HOME=/opt/dagster/dagster_home
+RUN mkdir -p "$DAGSTER_HOME" /opt/dagster/app
+WORKDIR /opt/dagster/app

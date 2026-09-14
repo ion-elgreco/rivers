@@ -216,15 +216,13 @@ pub(crate) fn spawn_tick_writer(
 /// Buffers per-asset `ConditionEvalRecord`s and per-key prune requests,
 /// flushing every 2s or when the batch hits `max_batch` (default 256;
 /// overridable via `RIVERS_CONDITION_EVAL_BATCH_SIZE`). Each flush also
-/// prunes the global `condition_ticks` table when `max_evals_retained` is
-/// `Some`.
+/// prunes condition history when `max_evals_retained` is `Some`.
 pub(crate) struct ConditionEvalWriter {
     handle: ScopedStorageHandle<SurrealStorage>,
     flush_interval: Duration,
     max_batch: usize,
     max_evals_retained: Option<usize>,
     batch: Vec<ConditionEvalRecord>,
-    prune_keys: HashMap<String, usize>,
 }
 
 impl ConditionEvalWriter {
@@ -239,7 +237,6 @@ impl ConditionEvalWriter {
             max_batch,
             max_evals_retained,
             batch: Vec::with_capacity(max_batch),
-            prune_keys: HashMap::new(),
         }
     }
 }
@@ -252,11 +249,6 @@ impl BatchWriter for ConditionEvalWriter {
     }
 
     fn ingest(&mut self, msg: ConditionEvalWriteMsg) -> bool {
-        if let Some(max) = msg.max_evals_retained {
-            for e in &msg.evals {
-                self.prune_keys.insert(e.asset_key.clone(), max);
-            }
-        }
         self.batch.extend(msg.evals);
         self.batch.len() >= self.max_batch
     }
@@ -286,26 +278,16 @@ impl BatchWriter for ConditionEvalWriter {
                 }
             }
         }
-        for (key, max) in self.prune_keys.drain() {
-            if let Err(e) = self.handle.scoped().prune_condition_evals(&key, max).await {
-                tracing::warn!(
-                    target: "rivers::daemon",
-                    asset = %key,
-                    error = %e,
-                    "failed to prune condition evals"
-                );
-            }
-        }
-        // Ticks only grow when evals do — an idle daemon must not run the
+        // History only grows when evals do — an idle daemon must not run the
         // prune query every 2s forever.
         if flushed_evals
             && let Some(max) = self.max_evals_retained
-            && let Err(e) = self.handle.scoped().prune_condition_ticks(max).await
+            && let Err(e) = self.handle.scoped().prune_condition_history(max).await
         {
             tracing::warn!(
                 target: "rivers::daemon",
                 error = %e,
-                "failed to prune condition ticks"
+                "failed to prune condition history"
             );
         }
     }

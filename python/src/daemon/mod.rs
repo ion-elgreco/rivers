@@ -489,7 +489,6 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
             tick_tx: tick_tx.clone(),
             max_ticks_retained,
             eval_tx,
-            max_evals_retained,
             upstream_partition_keys,
         })
         .await;

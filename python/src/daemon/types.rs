@@ -235,7 +235,6 @@ pub(crate) struct TickWriteMsg {
 
 pub(crate) struct ConditionEvalWriteMsg {
     pub(crate) evals: Vec<ConditionEvalRecord>,
-    pub(crate) max_evals_retained: Option<usize>,
 }
 
 pub(crate) type BoxedPyFuture = Pin<Box<dyn Future<Output = PyResult<Py<PyAny>>> + Send>>;
