@@ -9500,6 +9500,29 @@ async fn test_cache_tick_materialization_tags_includes_empty_tags() {
     assert_eq!(tick_tags.unwrap(), &vec![Arc::from(vec![])]);
 }
 
+/// The question the old per-asset `step_completion` answered, rebuilt from a
+/// batch result: did this asset finish in any of these runs, and which of them
+/// did its step succeed in?
+async fn completion(
+    storage: &crate::storage::surrealdb_backend::SurrealStorage,
+    asset: &str,
+    runs: &[String],
+) -> (bool, Vec<String>) {
+    use crate::storage::StorageBackend;
+    let outcomes = storage
+        .step_outcomes(std::slice::from_ref(&asset.to_string()), runs)
+        .await
+        .unwrap();
+    let mut succeeded: Vec<String> = outcomes
+        .iter()
+        .filter(|o| o.succeeded)
+        .map(|o| o.run_id.clone())
+        .collect();
+    succeeded.sort();
+    succeeded.dedup();
+    (!outcomes.is_empty(), succeeded)
+}
+
 #[tokio::test]
 async fn test_step_completion_sql_query() {
     // Direct test of the step_completion event scan against SurrealDB.
@@ -9583,72 +9606,82 @@ async fn test_step_completion_sql_query() {
 
     // Test 1: asset "a" in run-query-test → true
     assert!(
-        storage
-            .step_completion("a", std::slice::from_ref(&run_id))
+        completion(&storage, "a", std::slice::from_ref(&run_id))
             .await
-            .unwrap()
             .0,
         "should find StepSuccess for 'a' in run-query-test"
     );
 
     // Test 2: asset "b" in run-query-test → true
     assert!(
-        storage
-            .step_completion("b", std::slice::from_ref(&run_id))
+        completion(&storage, "b", std::slice::from_ref(&run_id))
             .await
-            .unwrap()
             .0,
         "should find StepSuccess for 'b' in run-query-test"
     );
 
     // Test 3: asset "a" in other-run → true
     assert!(
-        storage
-            .step_completion("a", std::slice::from_ref(&other_run))
+        completion(&storage, "a", std::slice::from_ref(&other_run))
             .await
-            .unwrap()
             .0,
         "should find StepSuccess for 'a' in run-other"
     );
 
     // Test 4: asset "c" (doesn't exist) → false
     assert!(
-        !storage
-            .step_completion("c", std::slice::from_ref(&run_id))
+        !completion(&storage, "c", std::slice::from_ref(&run_id))
             .await
-            .unwrap()
             .0,
         "should NOT find StepSuccess for 'c'"
     );
 
     // Test 5: asset "a" in non-existent run → false
     assert!(
-        !storage
-            .step_completion("a", &["run-nonexistent".to_string()])
+        !completion(&storage, "a", &["run-nonexistent".to_string()])
             .await
-            .unwrap()
             .0,
         "should NOT find StepSuccess in non-existent run"
     );
 
     // Test 6: asset "a" in multiple run_ids → true (matches first)
     assert!(
-        storage
-            .step_completion("a", &[run_id.clone(), other_run.clone()])
+        completion(&storage, "a", &[run_id.clone(), other_run.clone()])
             .await
-            .unwrap()
             .0,
         "should find StepSuccess for 'a' across multiple run_ids"
     );
 
     // Test 7: asset "b" in other_run only → false (b only has events in run_id)
     assert!(
-        !storage
-            .step_completion("b", std::slice::from_ref(&other_run))
+        !completion(&storage, "b", std::slice::from_ref(&other_run))
             .await
-            .unwrap()
             .0,
         "should NOT find StepSuccess for 'b' in run-other"
+    );
+
+    // Test 8: both assets in one call, each answered from its own runs.
+    let outcomes = storage
+        .step_outcomes(
+            &["a".to_string(), "b".to_string()],
+            &[run_id.clone(), other_run.clone()],
+        )
+        .await
+        .unwrap();
+    let mut pairs: Vec<(String, String)> = outcomes
+        .iter()
+        .map(|o| (o.asset_key.clone(), o.run_id.clone()))
+        .collect();
+    pairs.sort();
+    pairs.dedup();
+    assert_eq!(
+        pairs,
+        vec![
+            ("a".to_string(), other_run.clone()),
+            ("a".to_string(), run_id.clone()),
+            ("b".to_string(), run_id.clone()),
+        ],
+        "one call must answer for every asset without inventing a 'b' in run-other"
     );
 }
 
@@ -9680,7 +9713,7 @@ async fn test_step_completion_single_pass() {
         .unwrap();
 
     let runs = vec!["run-fail".to_string(), "run-ok".to_string()];
-    let (completed, succeeded) = storage.step_completion("a", &runs).await.unwrap();
+    let (completed, succeeded) = completion(&storage, "a", &runs).await;
     assert!(completed, "a completed a step in the given runs");
     assert_eq!(
         succeeded,
@@ -9688,16 +9721,37 @@ async fn test_step_completion_single_pass() {
         "every succeeding run must be identified"
     );
 
-    let (completed, succeeded) = storage.step_completion("b", &runs).await.unwrap();
+    let (completed, succeeded) = completion(&storage, "b", &runs).await;
     assert!(completed, "a failure is still a completion");
     assert!(
         succeeded.is_empty(),
         "no success run for a failed-only asset"
     );
 
-    let (completed, succeeded) = storage.step_completion("c", &runs).await.unwrap();
+    let (completed, succeeded) = completion(&storage, "c", &runs).await;
     assert!(!completed, "no events for 'c' in the given runs");
     assert!(succeeded.is_empty());
+
+    // The point of the batch: three assets, one round trip, each still keyed
+    // to the run its own step finished in.
+    let outcomes = storage
+        .step_outcomes(&["a".to_string(), "b".to_string(), "c".to_string()], &runs)
+        .await
+        .unwrap();
+    let mut seen: Vec<(String, String, bool)> = outcomes
+        .iter()
+        .map(|o| (o.asset_key.clone(), o.run_id.clone(), o.succeeded))
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("a".to_string(), "run-fail".to_string(), false),
+            ("a".to_string(), "run-ok".to_string(), true),
+            ("b".to_string(), "run-ok".to_string(), false),
+        ],
+        "one call must carry each asset's own outcome per run"
+    );
 }
 
 // ── Partition-aware tests ───────────────────────────────────────────────

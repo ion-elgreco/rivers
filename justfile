@@ -341,6 +341,24 @@ k8s-deploy project="test": (k8s-code-location project)
 # Full cycle: create cluster, deploy, test, tear down
 k8s-integration: k8s-up k8s-test
 
+# === Orchestrator comparison benchmark ===
+
+# One-time setup: create the Dagster and Prefect virtualenvs (see bench/README.md)
+bench-setup:
+    bench/setup.sh
+
+# Quick smoke pass over the comparison benchmark — about 15 minutes
+bench-quick:
+    bench/run.sh --quick
+
+# Full local comparison sweep — about two hours
+bench:
+    bench/run.sh
+
+# Full sweep plus Kubernetes startup — about three hours, needs docker/k3d/helm
+bench-k8s:
+    bench/run.sh --with-k8s
+
 # Remove environment and caches
 [confirm("Are you sure?")]
 clean:

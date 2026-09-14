@@ -11,6 +11,8 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+# Release wheel built for the Kubernetes comparison benchmark.
+dist-release/
 downloads/
 eggs/
 .eggs/
@@ -151,6 +153,7 @@ activemq-data/
 .env
 .envrc
 .venv
+.venv-bench
 env/
 venv/
 ENV/

@@ -1,0 +1,31 @@
+# Pinned Dagster and Prefect environment for the comparison benchmark.
+#
+# Both frameworks share one environment. They resolve together cleanly, and
+# measuring each one in a shared environment against a separate one moves no
+# benchmark outside run-to-run noise, so the extra environment bought nothing.
+#
+# rivers is not here. It is the project under test, maturin builds it, and it
+# lives in the repository's own `.venv`.
+#
+# `uv.lock` beside this file pins the whole resolved tree, which is what makes
+# a rerun months from now install what produced the published numbers. Because
+# one lock covers both frameworks, bumping either one can move a shared pin
+# under the other — rerun the whole sweep after any bump, never half of it.
+#
+# To refresh: bump the versions here, run `uv lock --project bench/envs`, and
+# commit the new lock.
+[project]
+name = "rivers-bench-envs"
+version = "0"
+description = "Pinned Dagster and Prefect environment for the rivers comparison benchmark"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "dagster==1.13.22",
+    "dagster-webserver==1.13.22",
+    "prefect==3.8.5",
+    "psutil>=7.0",
+]
+
+[tool.uv]
+# Nothing here is importable; this project exists only to pin an environment.
+package = false

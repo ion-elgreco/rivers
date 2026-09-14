@@ -12,7 +12,6 @@ import sys
 
 _capture = contextvars.ContextVar("_step_capture", default=None)
 _get = _capture.get
-_MAX = 4 * 1024 * 1024
 
 
 class _Writer:
@@ -77,8 +76,9 @@ class StepCapture:
         """Stop capturing and return ``(stdout, stderr)``.
 
         Returns:
-            A two-tuple of strings. Each string is truncated from the front to
-            ``_MAX`` bytes so a runaway logger cannot exhaust memory.
+            A two-tuple of strings holding everything the step wrote. Output is
+            never dropped: a step that logs more than expected is a thing to
+            see in the log, not a thing to hide by discarding the evidence.
         """
         if self._done:
             return ("", "")
@@ -89,10 +89,10 @@ class StepCapture:
         return (out, err)
 
     def _join(self, idx):
-        """Concatenate buffer ``idx`` and clear it, truncating to ``_MAX`` bytes."""
+        """Concatenate buffer ``idx`` and clear it."""
         r = "".join(self._bufs[idx])
         self._bufs[idx].clear()
-        return r[-_MAX:] if len(r) > _MAX else r
+        return r
 
 
 _installed = False
