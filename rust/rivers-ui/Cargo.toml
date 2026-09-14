@@ -128,7 +128,7 @@ mimalloc = "0.1"
 # `build.rs` precompresses once on the host and `lib.rs` `include_bytes!`s
 # the result.
 [build-dependencies]
-brotli = "8"
+brotli = "9"
 
 # Native (non-wasm) dev-deps. Tokio's `test-util` (for `start_paused = true`
 # + `tokio::time::advance`) and `tokio-stream` are only needed by the
