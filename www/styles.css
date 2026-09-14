@@ -23,7 +23,7 @@
 }
 
 * { box-sizing: border-box; }
-html { scroll-behavior: smooth; }
+html { scroll-behavior: smooth; scroll-padding-top: 84px; }
 
 body {
   margin: 0;
@@ -477,6 +477,7 @@ h2 { font-size: clamp(28px, 3.4vw, 42px); letter-spacing: -0.028em; margin: 0 0 
   backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
 }
+.table-scroll { overflow: hidden; }
 .cmp { width: 100%; border-collapse: collapse; font-size: 15.5px; }
 .cmp th {
   text-align: left; padding: 17px 22px;
@@ -511,13 +512,14 @@ h2 { font-size: clamp(28px, 3.4vw, 42px); letter-spacing: -0.028em; margin: 0 0 
 .cmp.bench tbody tr:last-child td { border-bottom: 1px solid var(--border); }
 .cmp.bench tbody:last-child tr:last-child td { border-bottom: 0; }
 /* The table is twenty rows, so it opens as a preview. Script adds the clamp,
-   which keeps the whole table visible when script does not run. Masking the
-   fade rather than overlaying it keeps it on the bottom edge while the mobile
-   frame scrolls sideways. */
-.table-frame.is-clamped {
-  max-height: 440px; overflow-y: hidden;
-  -webkit-mask-image: linear-gradient(to bottom, #000 78%, transparent 100%);
-  mask-image: linear-gradient(to bottom, #000 78%, transparent 100%);
+   which keeps the whole table visible when script does not run. The clamp sits
+   on the scroller, so the frame keeps its border and its rounded bottom edge.
+   Masking the fade rather than overlaying it keeps it on the bottom edge while
+   the mobile scroller moves sideways. */
+.table-frame.is-clamped .table-scroll {
+  max-height: 540px; overflow-y: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 88%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 88%, transparent 100%);
 }
 .bench-more {
   display: block; margin: 20px auto 0;
@@ -561,7 +563,7 @@ h2 { font-size: clamp(28px, 3.4vw, 42px); letter-spacing: -0.028em; margin: 0 0 
   .stat { padding: 9px 14px; }
 
   .grid, .snips { grid-template-columns: 1fr; }
-  .table-frame { overflow-x: auto; }
+  .table-scroll { overflow-x: auto; }
   .cmp { min-width: 620px; }
   .nav-links { gap: 14px; }
   .nav-links a:not(.ghost) { display: none; }

@@ -48,12 +48,14 @@ SECTION = """  {marker}
       <h2 class="center">Measured against the others</h2>
       <p class="center sub">{subtitle}</p>
       <div class="table-frame" data-bench-table>
-        <table class="cmp bench">
-          <thead>
-            <tr><th scope="col">Measurement</th>{headers}</tr>
-          </thead>
+        <div class="table-scroll">
+          <table class="cmp bench">
+            <thead>
+              <tr><th scope="col">Measurement</th>{headers}</tr>
+            </thead>
 {groups}
-        </table>
+          </table>
+        </div>
       </div>
       <button class="btn glass bench-more" type="button" data-bench-toggle hidden>Show all measurements</button>
       <p class="center micro">{footnote} <a class="flow-link" href="https://github.com/ion-elgreco/rivers/blob/main/bench/RESULTS.md">Full results and method</a></p>
@@ -100,14 +102,14 @@ def cell(row: Row, framework: str) -> str:
 def group(topic: str, measured: list[Row]) -> str:
     """One topic: a heading row, then its measurements."""
     lines = [
-        "          <tbody>",
-        f'            <tr class="group"><th colspan="{len(COLUMNS) + 1}" '
+        "            <tbody>",
+        f'              <tr class="group"><th colspan="{len(COLUMNS) + 1}" '
         f'scope="rowgroup">{html.escape(topic)}</th></tr>',
     ]
     for row in measured:
         cells = "".join(cell(row, framework) for framework in COLUMNS)
-        lines.append(f"            <tr><td>{html.escape(row.label)}</td>{cells}</tr>")
-    lines.append("          </tbody>")
+        lines.append(f"              <tr><td>{html.escape(row.label)}</td>{cells}</tr>")
+    lines.append("            </tbody>")
     return "\n".join(lines)
 
 
