@@ -16,7 +16,7 @@ use crate::condition::state::{
     update_condition_state, update_dep_baselines,
 };
 use crate::storage::{BackfillStrategy, PartitionKey, StorageBackend};
-use chrono::{NaiveDateTime, TimeZone};
+use jiff::civil;
 
 mod universe;
 mod window;
@@ -242,7 +242,7 @@ impl ConditionPass {
     /// Advance every tracked partition universe to `now`. Returns whether any universe changed.
     pub fn refresh_partition_universes(
         &mut self,
-        now: NaiveDateTime,
+        now: civil::DateTime,
         dynamic_keys: &HashMap<String, HashSet<String>>,
     ) -> bool {
         let mut changed = false;
@@ -505,7 +505,7 @@ impl ConditionPass {
     }
 
     fn evaluate(&self, now: i64, selective: bool) -> Vec<EvalResultRow> {
-        let now_local = chrono::Local.timestamp_nanos(now).naive_local();
+        let now_local = crate::util::local_datetime(now);
         let time_windows = TimeWindowResolver::new(&self.time_window_sources, now_local);
         let in_progress_keys: HashSet<String> =
             self.cache.in_progress_assets.keys().cloned().collect();

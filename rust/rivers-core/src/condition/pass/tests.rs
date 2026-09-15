@@ -13,8 +13,8 @@ fn make_daily_keys(keys: &[&str]) -> HashSet<PartitionKey> {
 }
 
 /// Helper: parse "YYYY-MM-DD HH:MM" as a wall-clock naive datetime.
-fn to_wall(dt_str: &str) -> NaiveDateTime {
-    chrono::NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%d %H:%M").unwrap()
+fn to_wall(dt_str: &str) -> jiff::civil::DateTime {
+    jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M", dt_str).unwrap()
 }
 
 fn test_record(key: &str) -> crate::storage::AssetRecord {
@@ -97,7 +97,7 @@ fn handled_after_fired_selection(selection: PartitionSelection) -> Option<i64> {
 #[test]
 fn grid_derivation_matches_the_scan_sub_daily_lookback() {
     let fmt = "%Y-%m-%dT%H:%M:%S";
-    let parse = |s: &str| chrono::NaiveDateTime::parse_from_str(s, fmt).unwrap();
+    let parse = |s: &str| jiff::civil::DateTime::strptime(fmt, s).unwrap();
     let keys = make_daily_keys(&[
         "2024-01-01T07:00:00",
         "2024-01-01T08:00:00",
@@ -635,8 +635,8 @@ fn classify_skips_asset_when_no_mapped_key_survives() {
     assert!(plan.is_empty());
 }
 
-fn naive(s: &str) -> NaiveDateTime {
-    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+fn naive(s: &str) -> jiff::civil::DateTime {
+    jiff::civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", s).unwrap()
 }
 
 fn hourly_grid() -> TimeGrid {

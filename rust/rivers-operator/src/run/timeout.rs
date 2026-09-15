@@ -21,12 +21,11 @@ pub fn is_timed_out(run: &Run) -> bool {
         .status
         .as_ref()
         .and_then(|s| s.started_at.as_deref())
-        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .map(|t| t.with_timezone(&chrono::Utc));
+        .and_then(|t| t.parse::<jiff::Timestamp>().ok());
 
     match started_at {
         Some(t) => {
-            let elapsed = (chrono::Utc::now() - t).num_seconds().max(0) as u64;
+            let elapsed = jiff::Timestamp::now().duration_since(t).as_secs().max(0) as u64;
             elapsed >= timeout_seconds
         }
         None => false,
@@ -62,21 +61,21 @@ mod tests {
 
     #[test]
     fn not_timed_out_when_no_timeout_configured() {
-        let run = test_run_with_timeout(None, Some(chrono::Utc::now().to_rfc3339()));
+        let run = test_run_with_timeout(None, Some(jiff::Timestamp::now().to_string()));
         assert!(!is_timed_out(&run));
     }
 
     #[test]
     fn not_timed_out_within_limit() {
-        let started = chrono::Utc::now();
-        let run = test_run_with_timeout(Some(3600), Some(started.to_rfc3339()));
+        let started = jiff::Timestamp::now();
+        let run = test_run_with_timeout(Some(3600), Some(started.to_string()));
         assert!(!is_timed_out(&run));
     }
 
     #[test]
     fn timed_out_when_exceeded() {
-        let started = chrono::Utc::now() - chrono::Duration::seconds(120);
-        let run = test_run_with_timeout(Some(60), Some(started.to_rfc3339()));
+        let started = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(120);
+        let run = test_run_with_timeout(Some(60), Some(started.to_string()));
         assert!(is_timed_out(&run));
     }
 
@@ -88,8 +87,8 @@ mod tests {
 
     #[test]
     fn timed_out_at_exact_boundary() {
-        let started = chrono::Utc::now() - chrono::Duration::seconds(60);
-        let run = test_run_with_timeout(Some(60), Some(started.to_rfc3339()));
+        let started = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(60);
+        let run = test_run_with_timeout(Some(60), Some(started.to_string()));
         assert!(is_timed_out(&run));
     }
 
@@ -132,7 +131,7 @@ pub async fn transition_to_timed_out(
 
     let mut new_status = status.clone();
     new_status.phase = Some(RunPhase::TimedOut);
-    new_status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+    new_status.completed_at = Some(jiff::Timestamp::now().to_string());
     new_status.message = Some(format!("Run exceeded {timeout}s timeout"));
 
     if let Ok(progress) = ctx.storage.get_run_progress(run_id).await {
@@ -157,7 +156,7 @@ mod async_tests {
     use crate::run::test_helpers::*;
 
     async fn seed_step_events(storage: &SurrealStorage, run_id: &str, completed: u32, total: u32) {
-        let ts = chrono::Utc::now().timestamp();
+        let ts = jiff::Timestamp::now().as_second();
         for i in 0..total {
             storage
                 .store_event(&EventRecord {

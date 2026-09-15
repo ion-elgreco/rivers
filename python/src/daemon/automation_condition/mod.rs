@@ -1,4 +1,5 @@
 //! Automation condition daemon loop — evaluates condition trees and triggers materializations.
+use jiff::civil;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use engine::ConditionTickEngine;
 fn def_keys_and_universe(
     def: &PartitionsDefinition,
 ) -> (HashSet<CorePartitionKey>, PartitionUniverse) {
-    let now = chrono::Local::now().naive_local();
+    let now = jiff::Zoned::now().datetime();
     let universe = partition_universe_for(def, now);
     let keys = def
         .get_partition_keys_capped(now)
@@ -62,8 +63,8 @@ fn partition_info_from_node(
 /// Watermark the per-tick refresh resumes from.
 fn seeded_watermark(
     def: &PartitionsDefinition,
-    now: chrono::NaiveDateTime,
-) -> chrono::NaiveDateTime {
+    now: civil::DateTime,
+) -> civil::DateTime {
     match def {
         PartitionsDefinition::TimeWindow { end: Some(e), .. } => (*e).min(now),
         _ => now,
@@ -73,7 +74,7 @@ fn seeded_watermark(
 /// How `def`'s key universe evolves after extraction.
 fn partition_universe_for(
     def: &PartitionsDefinition,
-    now: chrono::NaiveDateTime,
+    now: civil::DateTime,
 ) -> PartitionUniverse {
     match def {
         PartitionsDefinition::Static { .. } => PartitionUniverse::Frozen,

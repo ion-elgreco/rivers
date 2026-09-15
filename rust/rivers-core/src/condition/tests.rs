@@ -13,6 +13,15 @@ use crate::storage::{
     StorageBackend,
 };
 
+/// A UTC instant, for schedules and tick windows.
+fn utc(y: i16, mo: i8, d: i8, h: i8, mi: i8, sec: i8) -> jiff::Timestamp {
+    jiff::civil::date(y, mo, d)
+        .at(h, mi, sec, 0)
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .unwrap()
+        .timestamp()
+}
+
 fn make_record(key: &str) -> AssetRecord {
     AssetRecord {
         code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
@@ -3011,15 +3020,9 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
     let grid = crate::timegrid::TimeGrid {
         cron_schedule: None,
         interval_seconds: Some(86400.0),
-        start: chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap(),
+        start: jiff::civil::date(2024, 1, 1).at(0, 0, 0, 0),
         end: Some(
-            chrono::NaiveDate::from_ymd_opt(2024, 2, 1)
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap(),
+            jiff::civil::date(2024, 2, 1).at(0, 0, 0, 0),
         ),
         fmt: "%Y-%m-%d".to_string(),
     };
@@ -9922,8 +9925,8 @@ fn test_time_window_mapping_shifts_selections_by_offset() {
     let grid = TimeGrid {
         cron_schedule: Some("0 0 * * *".into()),
         interval_seconds: None,
-        start: chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap().into(),
-        end: Some(chrono::NaiveDate::from_ymd_opt(2024, 2, 1).unwrap().into()),
+        start: jiff::civil::date(2024, 1, 1).at(0, 0, 0, 0),
+        end: Some(jiff::civil::date(2024, 2, 1).at(0, 0, 0, 0)),
         fmt: "%Y-%m-%d".into(),
     };
     let m = PartitionMappingKind::TimeWindow {
@@ -10033,10 +10036,7 @@ fn test_partitioned_in_latest_time_window_selects_recent_keys() {
             grid: None,
         },
     )]);
-    let now_local = chrono::NaiveDate::from_ymd_opt(2020, 1, 5)
-        .unwrap()
-        .and_hms_opt(12, 0, 0)
-        .unwrap();
+    let now_local = jiff::civil::date(2020, 1, 5).at(12, 0, 0, 0);
     let tw = TimeWindowResolver::new(&fmts, now_local);
     let pctx = PartitionEvalContext {
         all_keys: &pdata.all_keys,
@@ -10075,10 +10075,7 @@ fn test_partitioned_in_latest_time_window_empty_when_no_recent() {
             grid: None,
         },
     )]);
-    let now_local = chrono::NaiveDate::from_ymd_opt(2020, 1, 1)
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap();
+    let now_local = jiff::civil::date(2020, 1, 1).at(0, 0, 0, 0);
     let tw = TimeWindowResolver::new(&fmts, now_local);
     let pctx = PartitionEvalContext {
         all_keys: &pdata.all_keys,
@@ -10108,10 +10105,7 @@ fn test_partitioned_in_latest_time_window_static_partitions_selects_none() {
     let deps = HashMap::new();
     let pdata = OwnedPartitionData::new(&["us", "eu", "ap"], &["us"], &[("us", 100)]);
     let fmts: HashMap<String, TimeWindowSource> = HashMap::new(); // "a" is not time-partitioned
-    let now_local = chrono::NaiveDate::from_ymd_opt(2020, 1, 1)
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap();
+    let now_local = jiff::civil::date(2020, 1, 1).at(0, 0, 0, 0);
     let tw = TimeWindowResolver::new(&fmts, now_local);
     let empty_partition_statuses = HashMap::new();
     let pctx = PartitionEvalContext {
@@ -10159,10 +10153,7 @@ fn test_partitioned_in_latest_time_window_combined_with_missing() {
             grid: None,
         },
     )]);
-    let now_local = chrono::NaiveDate::from_ymd_opt(2020, 1, 5)
-        .unwrap()
-        .and_hms_opt(12, 0, 0)
-        .unwrap();
+    let now_local = jiff::civil::date(2020, 1, 5).at(12, 0, 0, 0);
     let tw = TimeWindowResolver::new(&fmts, now_local);
     let pctx = PartitionEvalContext {
         all_keys: &pdata.all_keys,
@@ -13973,7 +13964,6 @@ fn test_partitioned_on_cron_no_deps_fires_all_partitions() {
 
 #[test]
 fn test_cron_tick_respects_timezone() {
-    use chrono::{TimeZone, Utc};
     // "0 9 * * *" in America/New_York must fire when the NY wall clock crosses 09:00
     // (= 13:00 UTC in EDT), not 09:00 UTC.
     let record = make_materialized_record("a", 100);
@@ -13985,16 +13975,8 @@ fn test_cron_tick_respects_timezone() {
     };
 
     // Window 12:30→13:30 UTC (08:30→09:30 EDT); the 09:00 EDT tick (13:00 UTC) lies inside.
-    let prev_tick = Utc
-        .with_ymd_and_hms(2026, 6, 16, 12, 30, 0)
-        .unwrap()
-        .timestamp_nanos_opt()
-        .unwrap();
-    let now = Utc
-        .with_ymd_and_hms(2026, 6, 16, 13, 30, 0)
-        .unwrap()
-        .timestamp_nanos_opt()
-        .unwrap();
+    let prev_tick = utc(2026, 6, 16, 12, 30, 0).as_nanosecond() as i64;
+    let now = utc(2026, 6, 16, 13, 30, 0).as_nanosecond() as i64;
     let prev = AssetConditionState {
         last_tick_timestamp: Some(prev_tick),
         ..Default::default()
@@ -14023,7 +14005,6 @@ fn test_cron_tick_respects_timezone() {
 
 #[test]
 fn test_cron_tick_across_dst_fallback_terminates_and_fires() {
-    use chrono::{TimeZone, Utc};
     // On the DST fall-back day (2025-11-02), a noon schedule must still fire and the call
     // must terminate (the naive-as-UTC croner path can't spin on the fall-back).
     let record = make_materialized_record("a", 100);
@@ -14034,16 +14015,8 @@ fn test_cron_tick_across_dst_fallback_terminates_and_fires() {
         timezone: Some("America/New_York".to_string()),
     };
     // 16:00 UTC (11:00 EST) → 17:30 UTC (12:30 EST); noon EST = 17:00 UTC.
-    let prev_tick = Utc
-        .with_ymd_and_hms(2025, 11, 2, 16, 0, 0)
-        .unwrap()
-        .timestamp_nanos_opt()
-        .unwrap();
-    let now = Utc
-        .with_ymd_and_hms(2025, 11, 2, 17, 30, 0)
-        .unwrap()
-        .timestamp_nanos_opt()
-        .unwrap();
+    let prev_tick = utc(2025, 11, 2, 16, 0, 0).as_nanosecond() as i64;
+    let now = utc(2025, 11, 2, 17, 30, 0).as_nanosecond() as i64;
     let prev = AssetConditionState {
         last_tick_timestamp: Some(prev_tick),
         ..Default::default()
@@ -16740,7 +16713,6 @@ fn test_or_short_circuit_preserves_stateful_child_latch() {
 /// fire at the declared wall time, and the UTC instant shifts across DST while the wall time stays fixed.
 #[test]
 fn test_next_cron_occurrence_utc_respects_timezone_and_dst() {
-    use chrono::{TimeZone, Utc};
     let cron = croner::parser::CronParser::builder()
         .seconds(croner::parser::Seconds::Optional)
         .build()
@@ -16748,24 +16720,24 @@ fn test_next_cron_occurrence_utc_respects_timezone_and_dst() {
         .unwrap();
 
     // No timezone → evaluated in UTC: next 09:00 UTC.
-    let after = Utc.with_ymd_and_hms(2024, 1, 15, 0, 0, 0).unwrap();
+    let after = utc(2024, 1, 15, 0, 0, 0);
     assert_eq!(
         next_cron_occurrence_utc(&cron, after, None),
-        Some(Utc.with_ymd_and_hms(2024, 1, 15, 9, 0, 0).unwrap()),
+        Some(utc(2024, 1, 15, 9, 0, 0)),
     );
 
     // America/New_York, winter (EST = UTC-5): 09:00 local → 14:00 UTC.
     assert_eq!(
         next_cron_occurrence_utc(&cron, after, Some("America/New_York")),
-        Some(Utc.with_ymd_and_hms(2024, 1, 15, 14, 0, 0).unwrap()),
+        Some(utc(2024, 1, 15, 14, 0, 0)),
         "09:00 EST must be 14:00 UTC, not 09:00 UTC"
     );
 
     // Same schedule, summer (EDT = UTC-4): 09:00 local → 13:00 UTC (shifts an hour across DST, wall time fixed).
-    let summer = Utc.with_ymd_and_hms(2024, 7, 15, 0, 0, 0).unwrap();
+    let summer = utc(2024, 7, 15, 0, 0, 0);
     assert_eq!(
         next_cron_occurrence_utc(&cron, summer, Some("America/New_York")),
-        Some(Utc.with_ymd_and_hms(2024, 7, 15, 13, 0, 0).unwrap()),
+        Some(utc(2024, 7, 15, 13, 0, 0)),
         "09:00 EDT must be 13:00 UTC"
     );
 }
@@ -16774,7 +16746,6 @@ fn test_next_cron_occurrence_utc_respects_timezone_and_dst() {
 /// first valid instant after the gap (03:00 EDT = 07:00 UTC), not the skipped wall time misread as UTC.
 #[test]
 fn test_next_cron_occurrence_utc_spring_forward_gap_advances_to_gap_end() {
-    use chrono::{TimeZone, Utc};
     let cron = croner::parser::CronParser::builder()
         .seconds(croner::parser::Seconds::Optional)
         .build()
@@ -16782,10 +16753,10 @@ fn test_next_cron_occurrence_utc_spring_forward_gap_advances_to_gap_end() {
         .unwrap();
 
     // 2026-03-08 01:00 EST = 06:00 UTC, one wall-clock hour before the gap.
-    let after = Utc.with_ymd_and_hms(2026, 3, 8, 6, 0, 0).unwrap();
+    let after = utc(2026, 3, 8, 6, 0, 0);
     assert_eq!(
         next_cron_occurrence_utc(&cron, after, Some("America/New_York")),
-        Some(Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0).unwrap()),
+        Some(utc(2026, 3, 8, 7, 0, 0)),
         "gap occurrence must fire at the first valid wall time after the gap (03:00 EDT)"
     );
 }
@@ -16795,7 +16766,6 @@ fn test_next_cron_occurrence_utc_spring_forward_gap_advances_to_gap_end() {
 /// the next occurrence must be strictly after `after`.
 #[test]
 fn test_next_cron_occurrence_utc_fall_back_never_returns_past_instant() {
-    use chrono::{TimeZone, Utc};
     let cron = croner::parser::CronParser::builder()
         .seconds(croner::parser::Seconds::Optional)
         .build()
@@ -16804,7 +16774,7 @@ fn test_next_cron_occurrence_utc_fall_back_never_returns_past_instant() {
 
     // 06:05 UTC = 01:05 EST (second pass of the repeated 01:00-02:00 hour); next 01:30 is
     // ambiguous: 01:30 EDT = 05:30 UTC (past) vs 01:30 EST = 06:30 UTC.
-    let after = Utc.with_ymd_and_hms(2025, 11, 2, 6, 5, 0).unwrap();
+    let after = utc(2025, 11, 2, 6, 5, 0);
     let next = next_cron_occurrence_utc(&cron, after, Some("America/New_York"))
         .expect("occurrence must exist");
     assert!(
@@ -16814,7 +16784,7 @@ fn test_next_cron_occurrence_utc_fall_back_never_returns_past_instant() {
     );
     assert_eq!(
         next,
-        Utc.with_ymd_and_hms(2025, 11, 2, 6, 30, 0).unwrap(),
+        utc(2025, 11, 2, 6, 30, 0),
         "the first 01:30 wall time after 01:05 EST is 01:30 EST"
     );
 }

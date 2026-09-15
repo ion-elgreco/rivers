@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 use tracing::Instrument;
@@ -65,7 +65,7 @@ impl EvalDispatcher {
         &self,
         due: Vec<DueEval>,
         join_set: &mut tokio::task::JoinSet<TickResult>,
-        dispatched_at: DateTime<Utc>,
+        dispatched_at: Timestamp,
     ) {
         let mut subprocess_items: Vec<DueEval> = Vec::new();
 
@@ -87,7 +87,7 @@ impl EvalDispatcher {
         &self,
         due: DueEval,
         join_set: &mut tokio::task::JoinSet<TickResult>,
-        dispatched_at: DateTime<Utc>,
+        dispatched_at: Timestamp,
     ) {
         let DueEval {
             index,
@@ -118,7 +118,7 @@ impl EvalDispatcher {
         &self,
         items: Vec<DueEval>,
         join_set: &mut tokio::task::JoinSet<TickResult>,
-        dispatched_at: DateTime<Utc>,
+        dispatched_at: Timestamp,
     ) {
         let loky = self
             .loky_executor

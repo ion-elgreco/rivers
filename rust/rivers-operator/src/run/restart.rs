@@ -34,7 +34,7 @@ pub async fn handle_executor_failure(
     // would replay the whole run.
     if let Ok(Some(outcome)) = storage.get_run_outcome(run_id).await {
         let mut new_status = status.clone();
-        new_status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        new_status.completed_at = Some(jiff::Timestamp::now().to_string());
         apply_outcome_to_status(&mut new_status, outcome);
         patch_status(runs_api, name, &new_status).await?;
         if let Some(ref phase) = new_status.phase {
@@ -58,7 +58,7 @@ pub async fn handle_executor_failure(
 
     if progress_made {
         new_status.restarts_without_progress = 0;
-        new_status.last_progress_at = Some(chrono::Utc::now().to_rfc3339());
+        new_status.last_progress_at = Some(jiff::Timestamp::now().to_string());
         tracing::info!(
             run = %name,
             completed = current_completed,
@@ -81,7 +81,7 @@ pub async fn handle_executor_failure(
             "exceeded max restarts without progress"
         );
 
-        new_status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        new_status.completed_at = Some(jiff::Timestamp::now().to_string());
 
         match storage.get_run_outcome(run_id).await {
             Ok(Some(outcome)) => apply_outcome_to_status(&mut new_status, outcome),
@@ -158,7 +158,7 @@ mod tests {
         completed: u32,
         total: u32,
     ) {
-        let ts = chrono::Utc::now().timestamp();
+        let ts = jiff::Timestamp::now().as_second();
         for i in 0..total {
             storage
                 .store_event(&EventRecord {

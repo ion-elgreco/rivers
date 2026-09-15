@@ -13,8 +13,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 async-trait = "0.1"
 ordermap = "1"
-chrono.workspace = true
-chrono-tz.workspace = true
+jiff.workspace = true
 croner.workspace = true
 futures-util = { workspace = true }
 petgraph.workspace = true

@@ -70,7 +70,7 @@ impl ConditionTickEngine {
         }
         let universe_changed = self
             .pass
-            .refresh_partition_universes(chrono::Local::now().naive_local(), &dynamic_keys);
+            .refresh_partition_universes(jiff::Zoned::now().datetime(), &dynamic_keys);
         let has_changes = has_changes || universe_changed;
 
         tracing::trace!(

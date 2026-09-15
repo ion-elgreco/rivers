@@ -326,7 +326,7 @@ pub fn RunDetailPage() -> impl IntoView {
                                 }</div>
                                 <div class="run-trigger-meta">
                                     <StatusChip kind=status_kind.to_string()/>
-                                    <span class="run-trigger-meta-item" title=format_relative_time(record.start_time, chrono::Utc::now().timestamp())>{format_timestamp(Some(record.start_time))}</span>
+                                    <span class="run-trigger-meta-item" title=format_relative_time(record.start_time, jiff::Timestamp::now().as_second())>{format_timestamp(Some(record.start_time))}</span>
                                     <span class="run-trigger-meta-sep">"·"</span>
                                     <span class="run-trigger-meta-item">"elapsed "<span class="run-trigger-meta-value">{elapsed_label}</span></span>
                                     <span class="run-trigger-meta-sep">"·"</span>
@@ -1049,7 +1049,7 @@ fn RunGanttBody(
 }
 fn format_log_timestamp(ts: i64) -> String {
     nanos_to_datetime(ts)
-        .map(|d| d.format("%H:%M:%S%.3f").to_string())
+        .map(|d| d.strftime("%H:%M:%S%.3f").to_string())
         .unwrap_or_else(|| "-".to_string())
 }
 

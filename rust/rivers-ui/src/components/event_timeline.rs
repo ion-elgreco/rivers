@@ -8,7 +8,7 @@ use leptos::prelude::*;
 fn format_timestamp(ts: i64) -> String {
     let dt = crate::helpers::nanos_to_datetime(ts);
     match dt {
-        Some(d) => d.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+        Some(d) => d.strftime("%Y-%m-%d %H:%M:%S%.3f").to_string(),
         None => ts.to_string(),
     }
 }
@@ -26,7 +26,7 @@ pub fn EventTimeline(events: Vec<StoredEvent>) -> impl IntoView {
                 .map(|event| {
                     let time_abs = format_timestamp(event.timestamp);
                     // Tooltip text only — no reactive tick needed.
-                    let time_rel = format_relative_time(event.timestamp, chrono::Utc::now().timestamp());
+                    let time_rel = format_relative_time(event.timestamp, jiff::Timestamp::now().as_second());
                     let label = event_type_label(&event);
                     let badge_class = format!("badge badge-{}", event_badge_class(&label));
                     let asset = event.asset_key.clone().unwrap_or_default();

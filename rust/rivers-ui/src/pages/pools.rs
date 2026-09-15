@@ -338,7 +338,7 @@ fn HoldersTable(detail: PoolDetail) -> impl IntoView {
         .into_any();
     }
 
-    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let now = jiff::Timestamp::now().as_nanosecond() as i64;
     const GRID: &str = "grid-template-columns: 100px 2fr 60px 140px 140px";
 
     view! {

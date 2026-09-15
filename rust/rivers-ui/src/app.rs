@@ -40,7 +40,7 @@ pub fn shell() -> impl IntoView {
     // Stamp server-now so `App` uses the same value SSR rendered with, and
     // so the WASM hydrate path can read it back from the body before the
     // first reactive render. See `crate::now` for the full handshake.
-    let server_now = chrono::Utc::now().timestamp();
+    let server_now = jiff::Timestamp::now().as_second();
     provide_context(crate::now::SsrInitialNow(server_now));
     let favicon_href = crate::favicon::data_uri();
     view! {

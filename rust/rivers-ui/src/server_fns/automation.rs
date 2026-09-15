@@ -20,20 +20,23 @@ use crate::types::{
 /// emits a network-call shim instead of the body), so this helper is unused
 /// in wasm builds.
 #[cfg(feature = "ssr")]
-fn next_occurrence_from(expr: &str, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+fn next_occurrence_from(expr: &str, now: jiff::Timestamp) -> Option<String> {
     croner::parser::CronParser::builder()
         .seconds(croner::parser::Seconds::Optional)
         .build()
         .parse(expr)
         .ok()
-        .and_then(|c| c.find_next_occurrence(&now, false).ok())
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .and_then(|c| {
+            c.find_next_occurrence(&now.to_zoned(jiff::tz::TimeZone::UTC).datetime(), false)
+                .ok()
+        })
+        .map(|dt: jiff::civil::DateTime| dt.strftime("%Y-%m-%d %H:%M:%S UTC").to_string())
 }
 
 /// Compute next tick time for a cron expression. Returns formatted string.
 #[server]
 pub async fn get_next_tick(cron_expression: String) -> Result<Option<String>, ServerFnError> {
-    Ok(next_occurrence_from(&cron_expression, chrono::Utc::now()))
+    Ok(next_occurrence_from(&cron_expression, jiff::Timestamp::now()))
 }
 
 /// Compute next tick times for multiple cron expressions in a single request.
@@ -41,7 +44,7 @@ pub async fn get_next_tick(cron_expression: String) -> Result<Option<String>, Se
 pub async fn get_next_ticks(
     cron_expressions: Vec<(String, String)>,
 ) -> Result<Vec<(String, Option<String>)>, ServerFnError> {
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     Ok(cron_expressions
         .into_iter()
         .map(|(name, expr)| (name, next_occurrence_from(&expr, now)))
@@ -522,11 +525,14 @@ pub async fn get_condition_tick_detail(
 #[cfg(all(test, feature = "ssr"))]
 mod tests {
     use super::next_occurrence_from;
-    use chrono::TimeZone;
 
     #[test]
     fn five_field_cron_parses() {
-        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let now = jiff::civil::date(2026, 1, 1)
+            .at(0, 0, 0, 0)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp();
         // Every 5 minutes — next firing after midnight is 00:05.
         let next = next_occurrence_from("*/5 * * * *", now).expect("should parse");
         assert_eq!(next, "2026-01-01 00:05:00 UTC");
@@ -537,7 +543,11 @@ mod tests {
         // Regression: parser used to drop 6-field expressions, leaving the
         // UI's "next tick" preview empty for schedules the daemon happily
         // ticks (e.g. sub-minute or seconds-precise crons).
-        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let now = jiff::civil::date(2026, 1, 1)
+            .at(0, 0, 0, 0)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp();
         // Every 30 seconds at midnight — next firing is 00:00:30.
         let next = next_occurrence_from("*/30 0 0 * * *", now).expect("should parse");
         assert_eq!(next, "2026-01-01 00:00:30 UTC");
@@ -545,7 +555,11 @@ mod tests {
 
     #[test]
     fn invalid_cron_returns_none() {
-        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let now = jiff::civil::date(2026, 1, 1)
+            .at(0, 0, 0, 0)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp();
         assert!(next_occurrence_from("not a cron", now).is_none());
     }
 }

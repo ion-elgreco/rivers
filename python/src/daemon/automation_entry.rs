@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use chrono::Utc;
+use jiff::{SignedDuration, Timestamp};
 use croner::Cron;
 use rivers_core::storage::LaunchedBy;
 
@@ -13,13 +13,13 @@ pub(crate) enum AutomationEntry {
     Schedule {
         info: ScheduleInfo,
         cron: Box<Cron>,
-        next_occurrence: Option<chrono::DateTime<Utc>>,
+        next_occurrence: Option<Timestamp>,
     },
     Sensor {
         info: SensorInfo,
         cursor: Option<String>,
         last_tick_time: Option<f64>,
-        last_eval: Option<chrono::DateTime<Utc>>,
+        last_eval: Option<Timestamp>,
         in_flight: bool,
     },
 }
@@ -69,7 +69,7 @@ impl AutomationEntry {
         )
     }
 
-    pub(crate) fn is_due(&self, now: chrono::DateTime<Utc>) -> bool {
+    pub(crate) fn is_due(&self, now: Timestamp) -> bool {
         match self {
             AutomationEntry::Schedule {
                 next_occurrence, ..
@@ -85,7 +85,7 @@ impl AutomationEntry {
                 }
                 let interval_secs = info.minimum_interval.as_secs() as i64;
                 last_eval
-                    .map(|last| (now - last).num_seconds() >= interval_secs)
+                    .map(|last| now.duration_since(last).as_secs() >= interval_secs)
                     .unwrap_or(true)
             }
         }
@@ -98,13 +98,13 @@ impl AutomationEntry {
         }
     }
 
-    pub(crate) fn next_due_in(&self, now: chrono::DateTime<Utc>) -> Option<Duration> {
+    pub(crate) fn next_due_in(&self, now: Timestamp) -> Option<Duration> {
         match self {
             AutomationEntry::Schedule {
                 next_occurrence, ..
             } => next_occurrence
                 .filter(|next| *next > now)
-                .and_then(|next| (next - now).to_std().ok()),
+                .and_then(|next| Duration::try_from(next.duration_since(now)).ok()),
             AutomationEntry::Sensor {
                 info,
                 last_eval,
@@ -114,17 +114,17 @@ impl AutomationEntry {
                 if *in_flight {
                     return None;
                 }
-                let interval = chrono::Duration::seconds(info.minimum_interval.as_secs() as i64);
+                let interval = SignedDuration::from_secs(info.minimum_interval.as_secs() as i64);
                 last_eval
                     .map(|last| last + interval)
                     .filter(|next| *next > now)
-                    .and_then(|next| (next - now).to_std().ok())
+                    .and_then(|next| Duration::try_from(next.duration_since(now)).ok())
             }
         }
     }
 
     /// Called at dispatch time: sets last_eval and marks sensor as in-flight.
-    pub(crate) fn mark_dispatched(&mut self, now: chrono::DateTime<Utc>) {
+    pub(crate) fn mark_dispatched(&mut self, now: Timestamp) {
         match self {
             AutomationEntry::Sensor {
                 last_eval,
@@ -186,7 +186,7 @@ impl AutomationEntry {
                 eval_mode: info.eval_mode.clone(),
                 timeout: info.eval_timeout,
                 kind: AutomationKind::Schedule {
-                    exec_time: next_occurrence.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                    exec_time: next_occurrence.map(|t| t.to_string()).unwrap_or_default(),
                 },
                 eval_fn: info.eval_fn.clone(),
                 default_job_name: Some(info.job_name.clone()),

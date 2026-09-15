@@ -651,7 +651,7 @@ pub fn ConditionReplay(
                 {move || {
                     let records = evals.get().and_then(|r| r.ok()).unwrap_or_default();
 
-                    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                    let now_ns = jiff::Timestamp::now().as_nanosecond() as i64;
                     let window_ns = minutes as i64 * 60 * 1_000_000_000;
                     let mut recent: Vec<_> = records
                         .into_iter()

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::Utc;
+use jiff::Timestamp;
 use pyo3::prelude::*;
 use rivers_core::run_backend::RunHealthStatus;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
@@ -462,7 +462,7 @@ pub(crate) fn spawn_schedule_sensor_loop(
                 .await;
             }
 
-            let now = Utc::now();
+            let now = Timestamp::now();
             let due: Vec<DueEval> = collect_and_mark_due(&mut automations, now);
             eval_dispatcher.spawn_due(due, &mut join_set, now).await;
 
@@ -482,7 +482,7 @@ pub(crate) fn spawn_schedule_sensor_loop(
                     Some(Ok(tick_result)) = join_set.join_next(), if !join_set.is_empty() => {
                         let completed_idx = tick_result.index;
                         process_tick_result(&mut automations, &tick_tx, &handle, &run_dispatcher, &backfill_dispatcher, tick_result, max_ticks_retained).await;
-                        let now_inner = Utc::now();
+                        let now_inner = Timestamp::now();
                         if automations[completed_idx].is_due(now_inner) {
                             break;
                         }
@@ -512,7 +512,7 @@ pub(crate) fn spawn_schedule_sensor_loop(
 /// per-entry state machine driven by a single side-effect site.
 fn collect_and_mark_due(
     automations: &mut [AutomationEntry],
-    now: chrono::DateTime<Utc>,
+    now: Timestamp,
 ) -> Vec<DueEval> {
     let due_indices: Vec<usize> = automations
         .iter()
