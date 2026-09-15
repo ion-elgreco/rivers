@@ -865,6 +865,15 @@ enum StoredMetadataValue {
     },
 }
 
+/// Nanoseconds for a stored `DateRange` bound. The bounds are serialized
+/// wall-clock datetimes with no zone, so they are read as UTC.
+fn wall_nanos(wall: &str) -> i64 {
+    jiff::civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", wall)
+        .and_then(|d| d.to_zoned(jiff::tz::TimeZone::UTC))
+        .map(|z| z.timestamp().as_nanosecond() as i64)
+        .unwrap_or(0)
+}
+
 impl From<StoredMetadataValue> for MetadataDisplay {
     fn from(v: StoredMetadataValue) -> Self {
         match v {
@@ -896,12 +905,8 @@ impl From<StoredMetadataValue> for MetadataDisplay {
                 Self::Text(format!("[{text}]"))
             }
             StoredMetadataValue::DateRange { start, end } => {
-                let s = chrono::NaiveDateTime::parse_from_str(&start, "%Y-%m-%dT%H:%M:%S")
-                    .map(|d| d.and_utc().timestamp_nanos_opt().unwrap_or(0))
-                    .unwrap_or(0);
-                let e = chrono::NaiveDateTime::parse_from_str(&end, "%Y-%m-%dT%H:%M:%S")
-                    .map(|d| d.and_utc().timestamp_nanos_opt().unwrap_or(0))
-                    .unwrap_or(0);
+                let s = wall_nanos(&start);
+                let e = wall_nanos(&end);
                 Self::DateRange { start: s, end: e }
             }
             StoredMetadataValue::Schema { ipc_bytes: _ } => {

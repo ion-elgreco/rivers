@@ -118,7 +118,7 @@ async fn reconcile_init(runs_api: &Api<Run>, run: &Run, name: &str) -> Result<Ac
     let status = RunCrdStatus {
         phase: Some(RunPhase::Pending),
         run_id: Some(run_id.clone()),
-        started_at: Some(chrono::Utc::now().to_rfc3339()),
+        started_at: Some(jiff::Timestamp::now().to_string()),
         ..Default::default()
     };
     patch_status(runs_api, name, &status).await?;
@@ -187,7 +187,7 @@ async fn reconcile_running(
         Some(pod) => match pod_phase(&pod) {
             PodState::Succeeded => {
                 let mut new_status = status.clone();
-                new_status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                new_status.completed_at = Some(jiff::Timestamp::now().to_string());
 
                 let executor_wrote_status = match ctx.storage.get_run_outcome(run_id).await {
                     Ok(Some(outcome)) => {
@@ -304,7 +304,7 @@ pub(crate) fn make_condition(type_: &str, reason: &str) -> RunCondition {
     RunCondition {
         r#type: type_.to_string(),
         status: "True".to_string(),
-        last_transition_time: Some(chrono::Utc::now().to_rfc3339()),
+        last_transition_time: Some(jiff::Timestamp::now().to_string()),
         reason: Some(reason.to_string()),
         message: None,
     }
@@ -409,7 +409,7 @@ pub(crate) async fn sync_run_status_to_storage(
         RunPhase::Cancelled => RunStatus::Canceled,
         _ => return,
     };
-    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let now = jiff::Timestamp::now().as_nanosecond() as i64;
     if let Err(e) = storage.update_run_status(run_id, status, Some(now)).await {
         tracing::warn!(
             run_id = %run_id,

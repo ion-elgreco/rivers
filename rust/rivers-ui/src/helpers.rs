@@ -130,24 +130,22 @@ pub fn use_query_param_usize(
     (value, set_value)
 }
 
-/// Convert a nanosecond timestamp to a chrono DateTime.
-pub fn nanos_to_datetime(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
-    let secs = ts / 1_000_000_000;
-    let nanos = (ts % 1_000_000_000) as u32;
-    chrono::DateTime::from_timestamp(secs, nanos)
+/// Convert a nanosecond timestamp to a UTC instant.
+pub fn nanos_to_datetime(ts: i64) -> Option<jiff::Timestamp> {
+    jiff::Timestamp::from_nanosecond(ts as i128).ok()
 }
 
 /// Format an optional nanosecond timestamp as "YYYY-MM-DD HH:MM:SS" or "-".
 pub fn format_timestamp(ts: Option<i64>) -> String {
     ts.and_then(nanos_to_datetime)
-        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+        .map(|d| d.strftime("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_else(|| "-".to_string())
 }
 
 /// Format a nanosecond timestamp (non-optional) as "YYYY-MM-DD HH:MM:SS" or "-".
 pub fn format_timestamp_nanos(ts: i64) -> String {
     nanos_to_datetime(ts)
-        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+        .map(|d| d.strftime("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_else(|| "-".to_string())
 }
 
@@ -279,7 +277,7 @@ pub fn tick_status_class(status: &str) -> &'static str {
 ///
 /// `now` is unix seconds; pass [`crate::now::use_now`]`().get()` from a
 /// reactive scope so the label re-renders on each clock tick. Tests/non-
-/// reactive callers can pass `chrono::Utc::now().timestamp()` directly.
+/// reactive callers can pass `jiff::Timestamp::now().as_second()` directly.
 pub fn format_relative_time(ts: i64, now: i64) -> String {
     let secs = ts / 1_000_000_000;
     let diff = now - secs;
@@ -299,7 +297,7 @@ pub fn format_relative_time(ts: i64, now: i64) -> String {
         return format!("{}d ago", diff / 86400);
     }
     nanos_to_datetime(ts)
-        .map(|d| d.format("%Y-%m-%d").to_string())
+        .map(|d| d.strftime("%Y-%m-%d").to_string())
         .unwrap_or_else(|| "-".to_string())
 }
 

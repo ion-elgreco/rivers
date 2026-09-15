@@ -75,11 +75,10 @@ pub async fn reconcile_cancelling(
         .iter()
         .find(|c| c.r#type == CONDITION_CANCELLING)
         .and_then(|c| c.last_transition_time.as_deref())
-        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .map(|t| t.with_timezone(&chrono::Utc));
+        .and_then(|t| t.parse::<jiff::Timestamp>().ok());
 
     let elapsed = cancelling_since
-        .map(|t| (chrono::Utc::now() - t).num_seconds().max(0) as u64)
+        .map(|t| jiff::Timestamp::now().duration_since(t).as_secs().max(0) as u64)
         .unwrap_or(0);
 
     let pod_exited = match status.executor_pod.as_deref() {
@@ -139,7 +138,7 @@ async fn finalize_cancelled(
 
     let mut new_status = status.clone();
     new_status.phase = Some(RunPhase::Cancelled);
-    new_status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+    new_status.completed_at = Some(jiff::Timestamp::now().to_string());
 
     if let Ok(progress) = storage.get_run_progress(run_id).await {
         new_status.completed_steps = Some(progress.completed_steps);
@@ -203,7 +202,7 @@ mod tests {
     }
 
     async fn seed_step_events(storage: &SurrealStorage, run_id: &str, completed: u32, total: u32) {
-        let ts = chrono::Utc::now().timestamp();
+        let ts = jiff::Timestamp::now().as_second();
         for i in 0..total {
             storage
                 .store_event(&EventRecord {
@@ -278,7 +277,7 @@ mod tests {
         seed_step_events(&storage, "run-1", 3, 5).await;
         let ctx = make_context(client, storage);
 
-        let cancelling_since = chrono::Utc::now().to_rfc3339();
+        let cancelling_since = jiff::Timestamp::now().to_string();
         let run = test_run_cancelling("run-1", &cancelling_since);
 
         reconcile_cancelling(&runs_api, &pods_api, &run, "test-run", &ctx)
@@ -304,7 +303,7 @@ mod tests {
         let storage = memory_storage().await;
         let ctx = make_context(client, storage);
 
-        let cancelling_since = chrono::Utc::now().to_rfc3339();
+        let cancelling_since = jiff::Timestamp::now().to_string();
         let run = test_run_cancelling("run-1", &cancelling_since);
 
         reconcile_cancelling(&runs_api, &pods_api, &run, "test-run", &ctx)
@@ -333,7 +332,7 @@ mod tests {
         let storage = memory_storage().await;
         let ctx = make_context(client, storage);
 
-        let cancelling_since = chrono::Utc::now().to_rfc3339();
+        let cancelling_since = jiff::Timestamp::now().to_string();
         let run = test_run_cancelling("run-1", &cancelling_since);
 
         reconcile_cancelling(&runs_api, &pods_api, &run, "test-run", &ctx)
@@ -363,8 +362,8 @@ mod tests {
         let storage = memory_storage().await;
         let ctx = make_context(client, storage);
 
-        let past = chrono::Utc::now() - chrono::Duration::seconds(600);
-        let mut run = test_run_cancelling("run-1", &past.to_rfc3339());
+        let past = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(600);
+        let mut run = test_run_cancelling("run-1", &past.to_string());
         run.spec.cancel_grace_period_seconds = 300;
 
         reconcile_cancelling(&runs_api, &pods_api, &run, "test-run", &ctx)
@@ -404,7 +403,7 @@ mod tests {
         seed_run_record(&storage, "run-1").await;
         let ctx = make_context(client, storage.clone());
 
-        let cancelling_since = chrono::Utc::now().to_rfc3339();
+        let cancelling_since = jiff::Timestamp::now().to_string();
         let run = test_run_cancelling("run-1", &cancelling_since);
 
         reconcile_cancelling(&runs_api, &pods_api, &run, "test-run", &ctx)

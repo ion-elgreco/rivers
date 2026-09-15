@@ -160,9 +160,7 @@ pub async fn get_runs_page(
 #[server]
 pub async fn get_runs_summary() -> Result<RunsSummary, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let cutoff = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or(0)
+    let cutoff = (jiff::Timestamp::now().as_nanosecond() as i64)
         .saturating_sub(86_400_000_000_000);
     state
         .storage
