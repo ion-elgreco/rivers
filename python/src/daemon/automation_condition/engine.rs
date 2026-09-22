@@ -23,7 +23,6 @@ pub(in crate::daemon) struct ConditionTickEngine {
     pub(super) tick_tx: tokio::sync::mpsc::UnboundedSender<TickWriteMsg>,
     pub(super) eval_tx: tokio::sync::mpsc::UnboundedSender<ConditionEvalWriteMsg>,
     pub(super) max_ticks_retained: Option<usize>,
-    pub(super) max_evals_retained: Option<usize>,
     /// When eval state last persisted (throttles passive-tick flushes).
     pub(super) last_state_persist: i64,
     /// Carries the priming load's `changed` into the first tick — without it
@@ -71,7 +70,7 @@ impl ConditionTickEngine {
         }
         let universe_changed = self
             .pass
-            .refresh_partition_universes(chrono::Local::now().naive_local(), &dynamic_keys);
+            .refresh_partition_universes(jiff::Zoned::now().datetime(), &dynamic_keys);
         let has_changes = has_changes || universe_changed;
 
         tracing::trace!(
@@ -311,7 +310,6 @@ impl ConditionTickEngine {
         if !eval_records.is_empty() {
             let _ = self.eval_tx.send(ConditionEvalWriteMsg {
                 evals: eval_records,
-                max_evals_retained: self.max_evals_retained,
             });
         }
     }

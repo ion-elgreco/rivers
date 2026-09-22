@@ -1,19 +1,25 @@
 namespace: rivers
 
-# MinIO is dev-cluster scaffolding for the example pipelines; production
+# RustFS is dev-cluster scaffolding for the example pipelines; production
 # deployments bring their own S3-compatible store and wire creds via
 # CodeLocation.spec.env.
-minio:
-  image: minio/minio:latest
-  mcImage: minio/mc:latest
-  rootUser: rivers
-  rootPassword: riverstest
+rustfs:
+  image: rustfs/rustfs:latest
+  # Root image for the chown-to-10001 init container (RustFS's data dir must
+  # be owned by its non-root uid; k3d's local-path-provisioner doesn't honor
+  # fsGroup on its hostPath-backed PVs, so this can't be done via securityContext).
+  initImage: busybox:stable
+  # No `mc`-equivalent ships with RustFS; the AWS CLI talks to any
+  # S3-compatible endpoint via --endpoint-url.
+  awsCliImage: amazon/aws-cli:latest
+  accessKey: rivers
+  secretKey: riverstest
   bucket: rivers-io
 
 # S3-compatible env vars stamped onto every CodeLocation's executor and
-# step pods. Defaults point at the in-cluster MinIO above.
+# step pods. Defaults point at the in-cluster RustFS above.
 s3:
-  endpoint: http://minio.rivers.svc:9000
+  endpoint: http://rustfs.rivers.svc:9000
   bucket: rivers-io
   accessKey: rivers
   secretKey: riverstest

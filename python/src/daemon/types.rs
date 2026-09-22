@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use chrono::Utc;
+use jiff::Timestamp;
 use pyo3::prelude::*;
 use rivers_core::storage::{ConditionEvalRecord, TickRecord};
 
@@ -230,7 +230,7 @@ pub(crate) struct TickResult {
     pub(crate) result: Result<EvalOutcome, String>,
     pub(crate) prev_cursor: Option<String>,
     #[allow(dead_code)]
-    pub(crate) dispatched_at: chrono::DateTime<Utc>,
+    pub(crate) dispatched_at: Timestamp,
 }
 
 pub(crate) struct TickWriteMsg {
@@ -240,7 +240,6 @@ pub(crate) struct TickWriteMsg {
 
 pub(crate) struct ConditionEvalWriteMsg {
     pub(crate) evals: Vec<ConditionEvalRecord>,
-    pub(crate) max_evals_retained: Option<usize>,
 }
 
 pub(crate) type BoxedPyFuture = Pin<Box<dyn Future<Output = PyResult<Py<PyAny>>> + Send>>;

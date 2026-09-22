@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::storage::PartitionKey;
 use crate::util::parse_key_datetime;
-use chrono::NaiveDateTime;
+use jiff::civil;
 
 /// How an asset's latest time window is resolved: its key format, plus the
 /// grid when the universe is grid-enumerated (enabling O(window) derivation
@@ -20,13 +20,13 @@ pub struct TimeWindowSource {
 /// everything.
 pub struct TimeWindowResolver<'a> {
     sources: &'a HashMap<String, TimeWindowSource>,
-    now_local: NaiveDateTime,
+    now_local: civil::DateTime,
     #[allow(clippy::type_complexity)]
     memo: std::cell::RefCell<HashMap<(String, u64), std::sync::Arc<HashSet<PartitionKey>>>>,
 }
 
 impl<'a> TimeWindowResolver<'a> {
-    pub fn new(sources: &'a HashMap<String, TimeWindowSource>, now_local: NaiveDateTime) -> Self {
+    pub fn new(sources: &'a HashMap<String, TimeWindowSource>, now_local: civil::DateTime) -> Self {
         Self {
             sources,
             now_local,
@@ -77,7 +77,7 @@ impl<'a> TimeWindowResolver<'a> {
 pub(crate) fn derive_window_keys_from_grid(
     grid: &crate::timegrid::TimeGrid,
     all_keys: &HashSet<PartitionKey>,
-    now_local: NaiveDateTime,
+    now_local: civil::DateTime,
     lookback_delta: Option<f64>,
 ) -> Option<HashSet<PartitionKey>> {
     let (latest, _) = grid.nearest_keys(now_local);
@@ -93,9 +93,11 @@ pub(crate) fn derive_window_keys_from_grid(
     match lookback_delta {
         None => insert_if_known(latest),
         Some(delta_secs) => {
-            let cutoff = latest_dt.checked_sub_signed(chrono::Duration::nanoseconds(
-                (delta_secs * 1_000_000_000.0) as i64,
-            ))?;
+            let cutoff = latest_dt
+                .checked_sub(jiff::SignedDuration::from_nanos(
+                    (delta_secs * 1_000_000_000.0) as i64,
+                ))
+                .ok()?;
             for key in grid.keys_in_range(cutoff, latest_dt).ok()? {
                 // keys_in_range brackets the window straddling `cutoff`; the
                 // scan keeps only keys whose window START is at/after it.
@@ -114,10 +116,10 @@ pub(crate) fn derive_window_keys_from_grid(
 pub fn compute_latest_time_window_keys(
     all_keys: &HashSet<PartitionKey>,
     fmt: &str,
-    now_local: NaiveDateTime,
+    now_local: civil::DateTime,
     lookback_delta: Option<f64>,
 ) -> HashSet<PartitionKey> {
-    let mut parsed: Vec<(&PartitionKey, NaiveDateTime)> = all_keys
+    let mut parsed: Vec<(&PartitionKey, civil::DateTime)> = all_keys
         .iter()
         .filter_map(|pk| {
             let key_str = match pk {
@@ -143,8 +145,9 @@ pub fn compute_latest_time_window_keys(
         Some(delta_secs) => {
             let latest_start = parsed[0].1;
             let lookback_nanos = (delta_secs * 1_000_000_000.0) as i64;
-            let cutoff =
-                latest_start.checked_sub_signed(chrono::Duration::nanoseconds(lookback_nanos));
+            let cutoff = latest_start
+                .checked_sub(jiff::SignedDuration::from_nanos(lookback_nanos))
+                .ok();
             parsed
                 .into_iter()
                 .filter(|(_, dt)| cutoff.is_none_or(|c| *dt >= c))

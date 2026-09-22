@@ -40,7 +40,7 @@ pub(crate) fn format_duration_secs(secs: f64) -> String {
 
 pub(crate) fn format_ts(ts: i64) -> String {
     crate::helpers::nanos_to_datetime(ts)
-        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+        .map(|d| d.strftime("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_else(|| ts.to_string())
 }
 

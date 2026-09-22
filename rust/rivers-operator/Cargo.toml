@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-license-file.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "rivers-operator"
@@ -29,7 +29,7 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
-chrono.workspace = true
+jiff.workspace = true
 uuid.workspace = true
 futures-util = { workspace = true }
 thiserror.workspace = true

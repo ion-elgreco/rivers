@@ -501,7 +501,7 @@ pub fn AssetsListPage() -> impl IntoView {
                         .unwrap_or_else(|| "never".into());
                     let last_ts_abs = record.last_timestamp
                         .and_then(crate::helpers::nanos_to_datetime)
-                        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                        .map(|d| d.strftime("%Y-%m-%d %H:%M").to_string())
                         .unwrap_or_else(|| "—".to_string());
                     let seed: u32 = record.asset_key.bytes().map(|b| b as u32).sum::<u32>().max(1);
                     let (dim_value, dim_color) = match dim {

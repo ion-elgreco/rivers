@@ -3,14 +3,15 @@ name = "rivers"
 version = "0.0.0.dev0"
 description = "Orchestration platform for tasks and assets, fully backed by Rust."
 readme = "README.md"
-license = "LICENSE"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
 dependencies = [
     "loky>=3.5",
     "obstore>=0.11.0",
     "pydantic>=2.11.9",
     "pydantic-settings>=2.14.2",
-    "typer>=0.26.8",
+    "typer>=0.27.0",
 ]
 
 [project.optional-dependencies]

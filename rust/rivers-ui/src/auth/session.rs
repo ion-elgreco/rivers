@@ -63,7 +63,7 @@ fn removal_header(name: &str, secure: bool) -> (HeaderName, String) {
 }
 
 pub fn now_ts() -> i64 {
-    chrono::Utc::now().timestamp()
+    jiff::Timestamp::now().as_second()
 }
 
 /// Read + decrypt a JSON payload from a private cookie.

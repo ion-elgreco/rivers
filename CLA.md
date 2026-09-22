@@ -10,7 +10,7 @@ By submitting a Contribution to the Project, You accept and agree to the followi
 
 - **"You"** (or **"Your"**) means the copyright owner or the legal entity authorized by the copyright owner that is entering into this Agreement. For legal entities, the entity making a Contribution and all other entities that control, are controlled by, or are under common control with that entity are considered to be a single Contributor.
 - **"Contribution"** means any original work of authorship, including any modifications or additions to an existing work, that is intentionally submitted by You to the Project for inclusion in, or documentation of, the Project. "Submitted" means any form of electronic, verbal, or written communication sent to the Project or the Project Owner, including but not limited to communication on source-code repositories, issue trackers, mailing lists, and other communication channels managed by, or on behalf of, the Project Owner, for the purpose of discussing and improving the Project. This excludes communication that You conspicuously mark or otherwise designate in writing as "Not a Contribution."
-- **"Current Project License"** means the GNU Affero General Public License v3.0 (AGPL-3.0), under which the Project is currently distributed.
+- **"Current Project License"** means the Apache License, Version 2.0 (Apache-2.0), under which the Project is currently distributed.
 
 ## 2. Grant of Copyright License
 

@@ -98,7 +98,7 @@ if _deployment == "cloud":
         bucket=os.environ.get("RIVERS_S3_BUCKET", "rivers-io"),
         config={
             "endpoint": os.environ.get(
-                "RIVERS_S3_ENDPOINT", "http://minio.rivers.svc:9000"
+                "RIVERS_S3_ENDPOINT", "http://rustfs.rivers.svc:9000"
             ),
             "access_key_id": os.environ.get("AWS_ACCESS_KEY_ID", ""),
             "secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
@@ -114,7 +114,7 @@ if _deployment == "cloud":
         mode="append",
         storage_options={
             "AWS_ENDPOINT_URL": os.environ.get(
-                "RIVERS_S3_ENDPOINT", "http://minio.rivers.svc:9000"
+                "RIVERS_S3_ENDPOINT", "http://rustfs.rivers.svc:9000"
             ),
             "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", ""),
             "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),

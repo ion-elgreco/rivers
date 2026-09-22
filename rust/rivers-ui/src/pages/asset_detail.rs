@@ -374,7 +374,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                     };
                     // Tooltip text (hover only — no reactive tick needed).
                     let last_ts_rel = record.last_timestamp
-                        .map(|t| format_relative_time(t, chrono::Utc::now().timestamp()))
+                        .map(|t| format_relative_time(t, jiff::Timestamp::now().as_second()))
                         .unwrap_or_default();
                     let last_label = if is_external.get() { "LAST OBSERVED" } else { "LAST MATERIALIZED" };
                     let partitioned_val = info
@@ -585,7 +585,7 @@ pub fn AssetDetailPage() -> impl IntoView {
             <Transition>
                 {move || {
                     events.get().and_then(|r| r.ok()).map(|evts| {
-                        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                        let now_ns = jiff::Timestamp::now().as_nanosecond() as i64;
                         let glyph_events: Vec<GlyphEvent> = evts
                             .iter()
                             .filter_map(|e| {
@@ -650,7 +650,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                                         {rows.into_iter().map(|evt| {
                                             let evt_ts = evt.timestamp;
                                             let time_abs = crate::helpers::nanos_to_datetime(evt.timestamp)
-                                                .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+                                                .map(|d| d.strftime("%Y-%m-%d %H:%M:%S").to_string())
                                                 .unwrap_or_default();
                                             let type_label = format!("{:?}", evt.event_type);
                                             let type_cls = event_type_class(&evt.event_type);
@@ -972,7 +972,7 @@ fn AutomationTicksTab(asset_key: String, #[prop(into)] refresh_tick: Signal<u32>
                         if records.is_empty() {
                             return view! { <div class="empty-state">"No evaluations yet. The daemon stores evaluations every tick."</div> }.into_any();
                         }
-                        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                        let now = jiff::Timestamp::now().as_nanosecond() as i64;
                         let window_ns: i64 = 60 * 60 * 1_000_000_000;
                         let bucket_ns = window_ns / 60;
                         let mut buckets: Vec<(u32, bool)> = vec![(0, false); 60];

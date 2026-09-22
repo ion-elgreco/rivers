@@ -20,7 +20,7 @@ pub struct NowContext(pub Signal<i64>);
 
 /// SSR-only handoff: shell stamps the value before `<App/>` so `App` sees
 /// the *same* value shell wrote into `<body data-ssr-now>`. Without this,
-/// shell and App would each call `chrono::Utc::now()` separately and could
+/// shell and App would each call `jiff::Timestamp::now()` separately and could
 /// disagree by a second across the SSR/hydrate boundary.
 #[cfg(feature = "ssr")]
 #[derive(Clone, Copy)]
@@ -32,7 +32,7 @@ pub struct SsrInitialNow(pub i64);
 pub fn use_now() -> Signal<i64> {
     use_context::<NowContext>()
         .map(|c| c.0)
-        .unwrap_or_else(|| Signal::derive(|| chrono::Utc::now().timestamp()))
+        .unwrap_or_else(|| Signal::derive(|| jiff::Timestamp::now().as_second()))
 }
 
 fn read_initial_now() -> i64 {
@@ -53,7 +53,7 @@ fn read_initial_now() -> i64 {
             return val;
         }
     }
-    chrono::Utc::now().timestamp()
+    jiff::Timestamp::now().as_second()
 }
 
 /// Install the global clock. Call once near the top of `App`.
@@ -70,7 +70,7 @@ pub fn provide_now_context() {
         Effect::new(move |_| {
             use core::time::Duration;
             if let Ok(handle) = set_interval_with_handle(
-                move || now_signal.set(chrono::Utc::now().timestamp()),
+                move || now_signal.set(jiff::Timestamp::now().as_second()),
                 Duration::from_secs(1),
             ) {
                 on_cleanup(move || handle.clear());

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
-use chrono::Utc;
+use jiff::Timestamp;
 use pyo3::PyTypeInfo;
 use pyo3::prelude::*;
 use rivers_core::run_backend::{RunBackend, RunHealthStatus};
@@ -404,7 +404,7 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
                 let cron = Box::new(cron);
                 let next = rivers_core::condition::next_cron_occurrence_utc(
                     &cron,
-                    Utc::now(),
+                    Timestamp::now(),
                     info.timezone.as_deref(),
                 );
                 automations.push(AutomationEntry::Schedule {
@@ -489,7 +489,6 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
             tick_tx: tick_tx.clone(),
             max_ticks_retained,
             eval_tx,
-            max_evals_retained,
             upstream_partition_keys,
         })
         .await;

@@ -47,7 +47,7 @@ releases:
           enabled: {{ if eq (env "RIVERS_K8S_SKIP_UI") "1" }}false{{ else }}true{{ end }}
           image: rivers-ui:latest
 
-  # Dev-cluster scaffolding: MinIO + example CodeLocation CRs.
+  # Dev-cluster scaffolding: RustFS + example CodeLocation CRs.
   - name: rivers-dev
     namespace: rivers
     chart: ./charts/rivers-dev

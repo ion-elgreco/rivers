@@ -136,13 +136,16 @@ pub fn RunDetailPage() -> impl IntoView {
         },
         |(id, _)| get_run_step_events(id),
     );
-    let run_logs = Resource::new(
-        move || {
-            params.track();
-            (run_id(), refresh_tick.get())
-        },
-        |(id, _)| get_run_logs(id),
-    );
+    // Client-only on purpose. RunLogPanel is mounted outside the resource
+    // Transition, so if the server resolved this the SSR markup would carry log
+    // rows and tab badges that the freshly-hydrated (still empty) client tree
+    // does not have — an unrecoverable hydration mismatch.
+    let run_logs = LocalResource::new(move || {
+        params.track();
+        let id = run_id();
+        refresh_tick.get();
+        async move { get_run_logs(id).await }
+    });
     let topology = Resource::new(
         move || loc.get(),
         |(ns, name)| async move { crate::server_fns::graph::get_graph_topology(ns, name).await },
@@ -329,7 +332,7 @@ pub fn RunDetailPage() -> impl IntoView {
                                             "action "<span class="run-trigger-meta-value">{verb}</span>
                                         </span>
                                     })}
-                                    <span class="run-trigger-meta-item" title=format_relative_time(record.start_time, chrono::Utc::now().timestamp())>{format_timestamp(Some(record.start_time))}</span>
+                                    <span class="run-trigger-meta-item" title=format_relative_time(record.start_time, jiff::Timestamp::now().as_second())>{format_timestamp(Some(record.start_time))}</span>
                                     <span class="run-trigger-meta-sep">"·"</span>
                                     <span class="run-trigger-meta-item">"elapsed "<span class="run-trigger-meta-value">{elapsed_label}</span></span>
                                     <span class="run-trigger-meta-sep">"·"</span>
@@ -1109,7 +1112,7 @@ fn RunGanttBody(
 }
 fn format_log_timestamp(ts: i64) -> String {
     nanos_to_datetime(ts)
-        .map(|d| d.format("%H:%M:%S%.3f").to_string())
+        .map(|d| d.strftime("%H:%M:%S%.3f").to_string())
         .unwrap_or_else(|| "-".to_string())
 }
 

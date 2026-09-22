@@ -176,7 +176,7 @@ pub fn test_run_running(run_id: &str, completed_steps: Option<u32>) -> Run {
         phase: Some(rivers_k8s::crd::run::RunPhase::Running),
         run_id: Some(run_id.to_string()),
         executor_pod: Some("test-run-executor".to_string()),
-        started_at: Some(chrono::Utc::now().to_rfc3339()),
+        started_at: Some(jiff::Timestamp::now().to_string()),
         completed_steps,
         ..Default::default()
     });
@@ -191,7 +191,7 @@ pub fn test_run_cancelling(run_id: &str, cancelling_since: &str) -> Run {
         phase: Some(rivers_k8s::crd::run::RunPhase::Cancelling),
         run_id: Some(run_id.to_string()),
         executor_pod: Some("test-run-executor".to_string()),
-        started_at: Some(chrono::Utc::now().to_rfc3339()),
+        started_at: Some(jiff::Timestamp::now().to_string()),
         conditions: vec![rivers_k8s::crd::run::RunCondition {
             r#type: rivers_k8s::crd::run::CONDITION_CANCELLING.to_string(),
             status: "True".to_string(),
@@ -238,7 +238,7 @@ pub async fn seed_run_record(storage: &SurrealStorage, run_id: &str) {
             code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
             job_name: Some("test-job".to_string()),
             status: RunStatus::Started,
-            start_time: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            start_time: jiff::Timestamp::now().as_nanosecond() as i64,
             end_time: None,
             tags: vec![],
             node_names: vec![],

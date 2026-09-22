@@ -1,23 +1,28 @@
 //! Wall-clock time-window grid for time-partition keys.
 
 use anyhow::{Result, bail};
-use chrono::{Local, NaiveDateTime, TimeZone, Utc};
+use jiff::{SignedDuration, civil};
 use serde::{Deserialize, Serialize};
+
+/// Nanoseconds from `start` to `dt`, or `None` when the span exceeds `i64`.
+fn nanos_between(start: civil::DateTime, dt: civil::DateTime) -> Option<i64> {
+    i64::try_from(dt.duration_since(start).as_nanos()).ok()
+}
 
 /// The time parameters of a TimeWindow partition definition.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TimeGrid {
     pub cron_schedule: Option<String>,
     pub interval_seconds: Option<f64>,
-    pub start: NaiveDateTime,
-    pub end: Option<NaiveDateTime>,
+    pub start: civil::DateTime,
+    pub end: Option<civil::DateTime>,
     pub fmt: String,
 }
 
 impl TimeGrid {
     /// Effective end bound: the explicit `end`, else now.
-    fn end_bound(&self) -> NaiveDateTime {
-        self.end.unwrap_or_else(|| Local::now().naive_local())
+    fn end_bound(&self) -> civil::DateTime {
+        self.end.unwrap_or_else(|| jiff::Zoned::now().datetime())
     }
 
     /// Shift `key` by `offset` windows (negative = earlier).
@@ -43,11 +48,11 @@ impl TimeGrid {
             let total = interval_ns.checked_mul(offset).ok_or_else(|| {
                 anyhow::anyhow!("time_window offset {offset} overflows for interval {secs}s")
             })?;
-            dt.checked_add_signed(chrono::Duration::nanoseconds(total))
+            dt.checked_add(SignedDuration::from_nanos(total))
+                .ok()
                 .ok_or_else(out_of_range)?
         } else if let Some(expr) = &self.cron_schedule {
             let cron = parse_cron(expr)?;
-            let anchor = Utc.from_utc_datetime(&dt);
             let direction = if offset > 0 {
                 croner::Direction::Forward
             } else {
@@ -55,13 +60,13 @@ impl TimeGrid {
             };
             let mut remaining = offset.unsigned_abs();
             let mut shifted = None;
-            for tick in cron.iter_from(anchor, direction) {
-                if tick == anchor {
+            for tick in cron.iter_from(dt, direction) {
+                if tick == dt {
                     continue;
                 }
                 remaining -= 1;
                 if remaining == 0 {
-                    shifted = Some(tick.naive_utc());
+                    shifted = Some(tick);
                     break;
                 }
             }
@@ -72,11 +77,15 @@ impl TimeGrid {
         if shifted < self.start || shifted >= end_dt {
             return Err(out_of_range());
         }
-        Ok(shifted.format(&self.fmt).to_string())
+        Ok(shifted.strftime(&self.fmt).to_string())
     }
 
     /// Enumerate the grid keys in `[from, to]` (inclusive).
-    pub fn keys_in_range(&self, from: NaiveDateTime, to: NaiveDateTime) -> Result<Vec<String>> {
+    pub fn keys_in_range(
+        &self,
+        from: civil::DateTime,
+        to: civil::DateTime,
+    ) -> Result<Vec<String>> {
         let mut out = Vec::new();
         if to < from {
             return Ok(out);
@@ -86,47 +95,48 @@ impl TimeGrid {
             if interval_ns <= 0 {
                 bail!("TimeWindow interval must be positive");
             }
-            let step = chrono::Duration::nanoseconds(interval_ns);
+            let step = SignedDuration::from_nanos(interval_ns);
             // Grid ticks are start + n*step; snap `from` up to the next tick
             // so a raw endpoint can't shift the whole walk off-grid (the cron
             // branch snaps inherently).
             let mut t = if from <= self.start {
                 self.start
             } else {
-                let offset_ns = (from - self.start).num_nanoseconds().unwrap_or(0);
+                let offset_ns = nanos_between(self.start, from).unwrap_or(0);
                 let rem = offset_ns.rem_euclid(interval_ns);
                 if rem == 0 {
                     from
                 } else {
-                    match self.start.checked_add_signed(chrono::Duration::nanoseconds(
-                        offset_ns - rem + interval_ns,
-                    )) {
-                        Some(next) => next,
-                        None => return Ok(out),
+                    match self
+                        .start
+                        .checked_add(SignedDuration::from_nanos(offset_ns - rem + interval_ns))
+                    {
+                        Ok(next) => next,
+                        Err(_) => return Ok(out),
                     }
                 }
             };
             while t <= to {
-                out.push(t.format(&self.fmt).to_string());
-                match t.checked_add_signed(step) {
-                    Some(next) => t = next,
-                    None => break,
+                out.push(t.strftime(&self.fmt).to_string());
+                match t.checked_add(step) {
+                    Ok(next) => t = next,
+                    Err(_) => break,
                 }
             }
         } else if let Some(expr) = &self.cron_schedule {
             let cron = parse_cron(expr)?;
             let anchor = from
-                .checked_sub_signed(chrono::Duration::seconds(1))
+                .checked_sub(SignedDuration::from_secs(1))
                 .unwrap_or(from);
-            for tick in cron.iter_from(Utc.from_utc_datetime(&anchor), croner::Direction::Forward) {
-                let t = cron_tick_naive(tick);
+            for tick in cron.iter_from(anchor, croner::Direction::Forward) {
+                let t = cron_tick_civil(tick);
                 if t < from {
                     continue;
                 }
                 if t > to {
                     break;
                 }
-                out.push(t.format(&self.fmt).to_string());
+                out.push(t.strftime(&self.fmt).to_string());
             }
         } else {
             bail!("TimeWindow requires either cron_schedule or interval_seconds");
@@ -135,7 +145,11 @@ impl TimeGrid {
     }
 
     /// Window starts in the half-open `[from, to)` for arbitrary endpoints.
-    pub fn window_starts_in(&self, from: NaiveDateTime, to: NaiveDateTime) -> Result<Vec<String>> {
+    pub fn window_starts_in(
+        &self,
+        from: civil::DateTime,
+        to: civil::DateTime,
+    ) -> Result<Vec<String>> {
         let from = from.max(self.start);
         let to = to.min(self.end_bound());
         let mut out = Vec::new();
@@ -147,7 +161,7 @@ impl TimeGrid {
             if interval_ns <= 0 {
                 bail!("TimeWindow interval must be positive");
             }
-            let Some(offset_ns) = (from - self.start).num_nanoseconds() else {
+            let Some(offset_ns) = nanos_between(self.start, from) else {
                 return Ok(out);
             };
             let first_idx = offset_ns.div_euclid(interval_ns)
@@ -156,35 +170,35 @@ impl TimeGrid {
                 } else {
                     1
                 };
-            let step = chrono::Duration::nanoseconds(interval_ns);
-            let mut t = match first_idx.checked_mul(interval_ns).and_then(|ns| {
-                self.start
-                    .checked_add_signed(chrono::Duration::nanoseconds(ns))
-            }) {
+            let step = SignedDuration::from_nanos(interval_ns);
+            let mut t = match first_idx
+                .checked_mul(interval_ns)
+                .and_then(|ns| self.start.checked_add(SignedDuration::from_nanos(ns)).ok())
+            {
                 Some(t) => t,
                 None => return Ok(out),
             };
             while t < to {
-                out.push(t.format(&self.fmt).to_string());
-                match t.checked_add_signed(step) {
-                    Some(next) => t = next,
-                    None => break,
+                out.push(t.strftime(&self.fmt).to_string());
+                match t.checked_add(step) {
+                    Ok(next) => t = next,
+                    Err(_) => break,
                 }
             }
         } else if let Some(expr) = &self.cron_schedule {
             let cron = parse_cron(expr)?;
             let anchor = from
-                .checked_sub_signed(chrono::Duration::seconds(1))
+                .checked_sub(SignedDuration::from_secs(1))
                 .unwrap_or(from);
-            for tick in cron.iter_from(Utc.from_utc_datetime(&anchor), croner::Direction::Forward) {
-                let t = cron_tick_naive(tick);
+            for tick in cron.iter_from(anchor, croner::Direction::Forward) {
+                let t = cron_tick_civil(tick);
                 if t < from {
                     continue;
                 }
                 if t >= to {
                     break;
                 }
-                out.push(t.format(&self.fmt).to_string());
+                out.push(t.strftime(&self.fmt).to_string());
             }
         } else {
             bail!("TimeWindow requires either cron_schedule or interval_seconds");
@@ -193,32 +207,30 @@ impl TimeGrid {
     }
 
     /// Nearest valid keys around `dt` — the latest tick `<= dt` and earliest `> dt`.
-    pub fn nearest_keys(&self, dt: NaiveDateTime) -> (Option<String>, Option<String>) {
+    pub fn nearest_keys(&self, dt: civil::DateTime) -> (Option<String>, Option<String>) {
         let end_dt = self.end_bound();
-        let key = |t: NaiveDateTime| t.format(&self.fmt).to_string();
+        let key = |t: civil::DateTime| t.strftime(&self.fmt).to_string();
         if let Some(secs) = self.interval_seconds {
             let interval_ns = (secs * 1_000_000_000.0) as i64;
             if interval_ns <= 0 {
                 return (None, None);
             }
             let tick = |idx: i64| {
-                idx.checked_mul(interval_ns).and_then(|ns| {
-                    self.start
-                        .checked_add_signed(chrono::Duration::nanoseconds(ns))
-                })
+                idx.checked_mul(interval_ns)
+                    .and_then(|ns| self.start.checked_add(SignedDuration::from_nanos(ns)).ok())
             };
             let prev = end_dt
-                .checked_sub_signed(chrono::Duration::nanoseconds(1))
+                .checked_sub(SignedDuration::from_nanos(1))
+                .ok()
                 .map(|last| std::cmp::min(dt, last))
                 .filter(|cap| *cap >= self.start)
-                .and_then(|cap| (cap - self.start).num_nanoseconds())
+                .and_then(|cap| nanos_between(self.start, cap))
                 .map(|ns| ns.div_euclid(interval_ns))
                 .and_then(tick);
             let next = if dt < self.start {
                 Some(self.start)
             } else {
-                (dt - self.start)
-                    .num_nanoseconds()
+                nanos_between(self.start, dt)
                     .and_then(|ns| ns.div_euclid(interval_ns).checked_add(1))
                     .and_then(tick)
             }
@@ -229,16 +241,16 @@ impl TimeGrid {
                 return (None, None);
             };
             let prev = {
-                let anchor = Utc.from_utc_datetime(&std::cmp::min(dt, end_dt));
+                let anchor = std::cmp::min(dt, end_dt);
                 cron.iter_from(anchor, croner::Direction::Backward)
-                    .map(cron_tick_naive)
+                    .map(cron_tick_civil)
                     .find(|t| *t <= dt && *t < end_dt)
                     .filter(|t| *t >= self.start)
             };
             let next = {
-                let anchor = Utc.from_utc_datetime(&std::cmp::max(dt, self.start));
+                let anchor = std::cmp::max(dt, self.start);
                 cron.iter_from(anchor, croner::Direction::Forward)
-                    .map(cron_tick_naive)
+                    .map(cron_tick_civil)
                     .find(|t| *t > dt)
                     .filter(|t| *t < end_dt)
             };
@@ -250,10 +262,8 @@ impl TimeGrid {
 }
 
 /// Normalize a cron tick to whole seconds (croner yields sub-second fractions).
-fn cron_tick_naive(tick: chrono::DateTime<Utc>) -> NaiveDateTime {
-    use chrono::Timelike;
-    let naive = tick.naive_utc();
-    naive.with_nanosecond(0).unwrap_or(naive)
+fn cron_tick_civil(tick: civil::DateTime) -> civil::DateTime {
+    tick.with().subsec_nanosecond(0).build().unwrap_or(tick)
 }
 
 /// Parse a cron expression in the ONE dialect rivers accepts (5 or 6 fields,
@@ -270,14 +280,14 @@ pub fn parse_cron(expr: &str) -> Result<croner::Cron> {
 #[cfg(test)]
 mod tests {
     use super::TimeGrid;
-    use chrono::NaiveDate;
+    use jiff::civil::{self, date};
 
     fn daily_jan() -> TimeGrid {
         TimeGrid {
             cron_schedule: Some("0 0 * * *".into()),
             interval_seconds: None,
-            start: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap().into(),
-            end: Some(NaiveDate::from_ymd_opt(2024, 2, 1).unwrap().into()),
+            start: date(2024, 1, 1).at(0, 0, 0, 0),
+            end: Some(date(2024, 2, 1).at(0, 0, 0, 0)),
             fmt: "%Y-%m-%d".into(),
         }
     }
@@ -302,11 +312,11 @@ mod tests {
         let g = TimeGrid {
             cron_schedule: None,
             interval_seconds: Some(3600.0),
-            start: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap().into(),
+            start: date(2024, 1, 1).at(0, 0, 0, 0),
             end: None,
             fmt: "%Y-%m-%dT%H:%M:%S".into(),
         };
-        assert!(g.shift_key("-262143-01-01T00:00:00", -1).is_err());
+        assert!(g.shift_key("-009999-01-01T00:00:00", -1).is_err());
     }
 
     #[test]
@@ -314,8 +324,8 @@ mod tests {
         let g = TimeGrid {
             cron_schedule: None,
             interval_seconds: Some(1e-12),
-            start: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap().into(),
-            end: Some(NaiveDate::from_ymd_opt(2024, 12, 31).unwrap().into()),
+            start: date(2024, 1, 1).at(0, 0, 0, 0),
+            end: Some(date(2024, 12, 31).at(0, 0, 0, 0)),
             fmt: "%Y-%m-%dT%H:%M:%S".into(),
         };
         assert!(g.shift_key("2024-06-01T00:00:00", 1).is_err());
@@ -336,8 +346,8 @@ mod tests {
         let g = TimeGrid {
             cron_schedule: None,
             interval_seconds: Some(21600.0),
-            start: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap().into(),
-            end: Some(NaiveDate::from_ymd_opt(2024, 1, 3).unwrap().into()),
+            start: date(2024, 1, 1).at(0, 0, 0, 0),
+            end: Some(date(2024, 1, 3).at(0, 0, 0, 0)),
             fmt: "%Y-%m-%dT%H:%M:%S".into(),
         };
         assert_eq!(
@@ -350,14 +360,14 @@ mod tests {
         TimeGrid {
             cron_schedule: None,
             interval_seconds: Some(3600.0),
-            start: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap().into(),
-            end: Some(NaiveDate::from_ymd_opt(2024, 1, 2).unwrap().into()),
+            start: date(2024, 1, 1).at(0, 0, 0, 0),
+            end: Some(date(2024, 1, 2).at(0, 0, 0, 0)),
             fmt: "%Y-%m-%dT%H:%M:%S".into(),
         }
     }
 
-    fn dt(s: &str) -> chrono::NaiveDateTime {
-        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+    fn dt(s: &str) -> civil::DateTime {
+        s.parse().unwrap()
     }
 
     #[test]

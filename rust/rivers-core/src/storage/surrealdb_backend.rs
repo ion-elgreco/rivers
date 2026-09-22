@@ -14,8 +14,9 @@ use super::{
     BackfillsPage, BackfillsSummary, BlockReason, ConcurrencyClaimStatus, ConditionEvalRecord,
     ConditionTickRecord, CoordinatorRunInfo, EventRecord, EventType, LogRecord, PartitionKey,
     PerCodeLocationStorage, PoolBlockDetail, PoolInfo, PoolLimit, RunFilter, RunOutcome,
-    RunProgress, RunRecord, RunStatus, RunsPage, RunsSummary, SlotHolder, StorageBackend,
-    StoredConditionEval, StoredConditionTick, StoredEvent, StoredLog, StoredTick, TickRecord,
+    RunProgress, RunRecord, RunStatus, RunsPage, RunsSummary, SlotHolder, StepOutcome,
+    StorageBackend, StoredConditionEval, StoredConditionTick, StoredEvent, StoredLog, StoredTick,
+    TickRecord,
 };
 #[cfg(test)]
 use crate::assets::graph::GraphTopology;
@@ -137,6 +138,16 @@ struct DbStoredEvent {
     code_version: Option<String>,
     #[serde(default)]
     input_data_versions: Vec<(String, String)>,
+}
+
+/// Projection behind `SurrealStorage::step_outcomes`. A step event always
+/// carries an `asset_key`, but the column is optional on the table, so a row
+/// without one is dropped rather than guessed at.
+#[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
+struct DbStepOutcome {
+    asset_key: Option<String>,
+    run_id: String,
+    event_type: String,
 }
 
 #[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
@@ -381,6 +392,13 @@ impl SurrealBackendKind {
 }
 
 /// Default SurrealDB namespace used by every rivers connection.
+/// How many asset rows go into one `INSERT` when registering a code location.
+///
+/// Batching is what makes registration fast — the previous implementation ran
+/// two queries per asset, so a 100 000-asset location cost 200 000 round trips.
+/// Chunking keeps any single statement from growing unbounded.
+const REGISTER_ASSETS_CHUNK: usize = 2_000;
+
 pub const DEFAULT_NAMESPACE: &str = "rivers";
 
 /// Default SurrealDB database used by every rivers connection.
@@ -2149,32 +2167,45 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
-    async fn step_completion(
+    /// `run_id IN $run_ids` becomes a union of index scans over
+    /// `idx_events_run`, one branch per run. `asset_key` is deliberately not in
+    /// the query: SurrealDB cannot index an `IN` against a long list, so it
+    /// would test every scanned row against the whole list — which is the
+    /// quadratic this method exists to remove. Matching here is a hash lookup.
+    async fn step_outcomes(
         &self,
-        asset_key: &str,
+        asset_keys: &[String],
         run_ids: &[String],
-    ) -> Result<(bool, Vec<String>)> {
+    ) -> Result<Vec<StepOutcome>> {
+        if asset_keys.is_empty() || run_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: HashSet<&str> = asset_keys.iter().map(String::as_str).collect();
         super::retry::with_retry(&self.retry_config, || async {
-            let mut completed = false;
-            let mut succeeded: Vec<String> = Vec::new();
-            for run_id in run_ids {
-                let events = self.get_events_for_run(run_id).await?;
-                for e in &events {
-                    if e.asset_key.as_deref() != Some(asset_key) {
-                        continue;
+            let mut result = self
+                .db
+                .query(
+                    "SELECT asset_key, run_id, event_type FROM events \
+                     WHERE run_id IN $run_ids \
+                     AND event_type IN ['StepSuccess', 'StepFailure']",
+                )
+                .bind(("run_ids", run_ids.to_vec()))
+                .await?;
+            let rows: Vec<DbStepOutcome> = result.take(0)?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|row| {
+                    let asset_key = row.asset_key?;
+                    if !wanted.contains(asset_key.as_str()) {
+                        return None;
                     }
-                    match e.event_type {
-                        EventType::StepSuccess => {
-                            completed = true;
-                            succeeded.push(run_id.clone());
-                            break;
-                        }
-                        EventType::StepFailure => completed = true,
-                        _ => {}
-                    }
-                }
-            }
-            Ok((completed, succeeded))
+                    Some(StepOutcome {
+                        asset_key,
+                        run_id: row.run_id,
+                        succeeded: row.event_type == EventType::StepSuccess.type_name(),
+                    })
+                })
+                .collect())
         })
         .await
     }
@@ -3194,6 +3225,10 @@ impl PerCodeLocationStorage for SurrealStorage {
         Ok(assets)
     }
 
+    /// The plan for this is `IndexScan idx_assets_loc` either way — the code
+    /// location's whole asset set — so an `asset_key IN $keys` clause saves no
+    /// reads and costs one list comparison per scanned row. At 3,200 keys that
+    /// clause was 473 ms against 9 ms for the same scan filtered here.
     async fn get_asset_records_by_keys(
         &self,
         code_location_id: &str,
@@ -3202,44 +3237,51 @@ impl PerCodeLocationStorage for SurrealStorage {
         if keys.is_empty() {
             return Ok(vec![]);
         }
-        let keys_vec: Vec<String> = keys.to_vec();
+        let wanted: HashSet<&str> = keys.iter().map(String::as_str).collect();
         let mut result = self
             .db
-            .query("SELECT * FROM assets WHERE code_location_id = $cl AND asset_key IN $keys")
+            .query("SELECT * FROM assets WHERE code_location_id = $cl")
             .bind(("cl", code_location_id.to_string()))
-            .bind(("keys", keys_vec))
             .await?;
         let assets: Vec<AssetRecord> = result.take(0)?;
-        Ok(assets)
+        Ok(assets
+            .into_iter()
+            .filter(|record| wanted.contains(record.asset_key.as_str()))
+            .collect())
     }
 
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(%code_location_id, count = records.len()))]
+    /// Bulk upsert `assets` rows, matched on the table's UNIQUE
+    /// (code_location_id, asset_key) index.
+    ///
+    /// The update clause lists only the fields that describe the asset's
+    /// *definition*. Everything else on an existing row — last event, last run,
+    /// data versions — is materialization history, and re-resolving a code
+    /// location must not wipe it.
     async fn register_assets(&self, code_location_id: &str, records: &[AssetRecord]) -> Result<()> {
-        for record in records {
-            let mut existing = self
-                .db
-                .query("SELECT * FROM assets WHERE code_location_id = $cl AND asset_key = $asset_key LIMIT 1")
-                .bind(("cl", code_location_id.to_string()))
-                .bind(("asset_key", record.asset_key.clone()))
-                .await?;
-            let found: Vec<AssetRecord> = existing.take(0)?;
-
-            if found.is_empty() {
-                let mut to_insert = record.clone();
-                to_insert.code_location_id = code_location_id.to_string();
-                let _: Option<AssetRecord> = self.db.create("assets").content(to_insert).await?;
-            } else {
-                self.db
-                    .query("UPDATE assets SET tags = $tags, kinds = $kinds, asset_group = $asset_group, code_version = $code_version, pool = $pool WHERE code_location_id = $cl AND asset_key = $asset_key")
-                    .bind(("cl", code_location_id.to_string()))
-                    .bind(("asset_key", record.asset_key.clone()))
-                    .bind(("tags", record.tags.clone()))
-                    .bind(("kinds", record.kinds.clone()))
-                    .bind(("asset_group", record.asset_group.clone()))
-                    .bind(("code_version", record.code_version.clone()))
-                    .bind(("pool", record.pool.clone()))
-                    .await?;
-            }
+        if records.is_empty() {
+            return Ok(());
+        }
+        for chunk in records.chunks(REGISTER_ASSETS_CHUNK) {
+            let rows: Vec<AssetRecord> = chunk
+                .iter()
+                .map(|record| AssetRecord {
+                    code_location_id: code_location_id.to_string(),
+                    ..record.clone()
+                })
+                .collect();
+            self.db
+                .query(
+                    "INSERT INTO assets $rows ON DUPLICATE KEY UPDATE \
+                     tags = $input.tags, \
+                     kinds = $input.kinds, \
+                     asset_group = $input.asset_group, \
+                     code_version = $input.code_version, \
+                     pool = $input.pool",
+                )
+                .bind(("rows", rows))
+                .await?
+                .check()?;
         }
 
         Ok(())
@@ -3532,7 +3574,17 @@ impl PerCodeLocationStorage for SurrealStorage {
         Ok(ticks.into_iter().map(|t| t.into_stored()).collect())
     }
 
-    async fn prune_condition_ticks(
+    /// Drop condition ticks past `max_ticks`, and the per-asset evaluations
+    /// that belong to them.
+    ///
+    /// An evaluation is written once per asset per tick and carries that
+    /// tick's id, so how long it lives is a property of the tick. Pruning it
+    /// per asset instead cost one query per asset on every flush: at 10,000
+    /// assets that was 5 s of pruning to remove what one tick had added, and
+    /// the writer never caught up. Evaluations go first, because a crash
+    /// between the two leaves ticks the next pass drops again, where the
+    /// reverse strands evaluations nothing will ever collect.
+    async fn prune_condition_history(
         &self,
         code_location_id: &str,
         max_ticks: usize,
@@ -3541,13 +3593,33 @@ impl PerCodeLocationStorage for SurrealStorage {
             .db
             .query(
                 "LET $keep = (SELECT * FROM condition_ticks WHERE code_location_id = $cl ORDER BY timestamp DESC LIMIT $max);\
-                 DELETE FROM condition_ticks WHERE code_location_id = $cl AND id NOT IN $keep.id RETURN BEFORE;",
+                 SELECT * FROM condition_ticks WHERE code_location_id = $cl AND id NOT IN $keep.id;",
             )
             .bind(("cl", code_location_id.to_string()))
             .bind(("max", max_ticks))
             .await?;
-        let deleted: Vec<DbStoredConditionTick> = result.take(1)?;
-        Ok(deleted.len())
+        let dropped: Vec<DbStoredConditionTick> = result.take(1)?;
+        if dropped.is_empty() {
+            return Ok(0);
+        }
+
+        for tick in &dropped {
+            self.db
+                .query("DELETE FROM condition_evals WHERE tick_id = $tick_id")
+                .bind(("tick_id", record_id_str(&tick.id)))
+                .await?
+                .check()?;
+        }
+
+        // By id, not by re-running the window: a tick written since the SELECT
+        // would shift it and drop a tick whose evaluations are still here.
+        let ids: Vec<RecordId> = dropped.iter().map(|t| t.id.clone()).collect();
+        self.db
+            .query("DELETE FROM condition_ticks WHERE id IN $ids")
+            .bind(("ids", ids))
+            .await?
+            .check()?;
+        Ok(dropped.len())
     }
 
     async fn get_condition_evals(
@@ -3580,26 +3652,6 @@ impl PerCodeLocationStorage for SurrealStorage {
             .await?;
         let evals: Vec<DbStoredConditionEval> = result.take(0)?;
         Ok(evals.into_iter().map(|e| e.into_stored()).collect())
-    }
-
-    async fn prune_condition_evals(
-        &self,
-        code_location_id: &str,
-        asset_key: &str,
-        max_evals: usize,
-    ) -> Result<usize> {
-        let mut result = self
-            .db
-            .query(
-                "LET $keep = (SELECT * FROM condition_evals WHERE code_location_id = $cl AND asset_key = $key ORDER BY timestamp DESC LIMIT $max);\
-                 DELETE FROM condition_evals WHERE code_location_id = $cl AND asset_key = $key AND id NOT IN $keep.id RETURN BEFORE;"
-            )
-            .bind(("cl", code_location_id.to_string()))
-            .bind(("key", asset_key.to_string()))
-            .bind(("max", max_evals))
-            .await?;
-        let deleted: Vec<DbStoredConditionEval> = result.take(1)?;
-        Ok(deleted.len())
     }
 
     async fn get_partition_events(
@@ -4169,7 +4221,11 @@ impl PerCodeLocationStorage for SurrealStorage {
         let predicate =
             |e: &anyhow::Error| super::retry::default_should_retry(e) || e.is::<PoolContended>();
 
-        let result = super::retry::with_retry_if(&self.retry_config, predicate, || async {
+        // Both retryable outcomes here are lost races, not a sick backend: the
+        // write-write conflict on `claim_version` and `PoolContended` alike
+        // clear as soon as the winning claim commits.
+        let retry_config = self.retry_config.contended();
+        let result = super::retry::with_retry_if(&retry_config, predicate, || async {
             self.try_claim_concurrency_slots_once(
                 code_location_id,
                 pools,
@@ -4878,6 +4934,89 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_register_assets_upserts_definition_and_keeps_history() {
+        // register_assets bulk-upserts on the UNIQUE (code_location_id,
+        // asset_key) index. Re-resolving a code location must refresh the
+        // asset's definition without wiping what it has materialized.
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+
+        let materialized = AssetRecord {
+            code_location_id: cl.to_string(),
+            asset_key: "orders".to_string(),
+            tags: vec!["old".to_string()],
+            kinds: vec!["table".to_string()],
+            asset_group: Some("raw".to_string()),
+            code_version: Some("v1".to_string()),
+            last_event_id: Some("event-1".to_string()),
+            last_run_id: Some("run-1".to_string()),
+            last_timestamp: Some(1_700_000_000),
+            last_data_version: Some("data-1".to_string()),
+            last_materialization_code_version: Some("v1".to_string()),
+            last_input_data_versions: vec![("upstream".to_string(), "data-0".to_string())],
+            pool: vec![("cpu".to_string(), 1)],
+        };
+        storage
+            .register_assets(cl, std::slice::from_ref(&materialized))
+            .await
+            .expect("first registration failed");
+
+        // A re-resolve carries the new definition and no materialization state.
+        let redefined = AssetRecord {
+            tags: vec!["new".to_string()],
+            kinds: vec!["view".to_string()],
+            asset_group: Some("curated".to_string()),
+            code_version: Some("v2".to_string()),
+            last_event_id: None,
+            last_run_id: None,
+            last_timestamp: None,
+            last_data_version: None,
+            last_materialization_code_version: None,
+            last_input_data_versions: Vec::new(),
+            pool: vec![("cpu".to_string(), 4)],
+            ..materialized.clone()
+        };
+        storage
+            .register_assets(cl, std::slice::from_ref(&redefined))
+            .await
+            .expect("re-registration failed");
+
+        let stored = storage
+            .get_asset_record(cl, "orders")
+            .await
+            .expect("lookup failed")
+            .expect("asset missing after re-registration");
+
+        // Definition fields take the new values.
+        assert_eq!(stored.tags, vec!["new".to_string()]);
+        assert_eq!(stored.kinds, vec!["view".to_string()]);
+        assert_eq!(stored.asset_group, Some("curated".to_string()));
+        assert_eq!(stored.code_version, Some("v2".to_string()));
+        assert_eq!(stored.pool, vec![("cpu".to_string(), 4)]);
+
+        // Materialization history survives.
+        assert_eq!(stored.last_event_id, Some("event-1".to_string()));
+        assert_eq!(stored.last_run_id, Some("run-1".to_string()));
+        assert_eq!(stored.last_timestamp, Some(1_700_000_000));
+        assert_eq!(stored.last_data_version, Some("data-1".to_string()));
+        assert_eq!(
+            stored.last_materialization_code_version,
+            Some("v1".to_string())
+        );
+        assert_eq!(
+            stored.last_input_data_versions,
+            vec![("upstream".to_string(), "data-0".to_string())]
+        );
+
+        // Still one row, not two.
+        let all = storage.get_asset_records(cl).await.expect("list failed");
+        assert_eq!(all.len(), 1, "upsert created a duplicate row");
+    }
+
     /// `store_events`/`store_event` upsert `asset_partitions` on the UNIQUE index to replace rather than duplicate.
     #[tokio::test]
     async fn test_partition_row_replaces_on_unique_index() {
@@ -4932,6 +5071,7 @@ mod tests {
             initial_backoff: std::time::Duration::from_millis(1),
             max_backoff: std::time::Duration::from_millis(5),
             backoff_multiplier: 1.0,
+            max_elapsed: None,
         };
         let storage = std::sync::Arc::new(
             SurrealStorage::new_embedded_with_retry(
@@ -5040,6 +5180,7 @@ mod tests {
             initial_backoff: std::time::Duration::from_millis(1),
             max_backoff: std::time::Duration::from_millis(5),
             backoff_multiplier: 1.0,
+            max_elapsed: None,
         };
         let storage = std::sync::Arc::new(
             SurrealStorage::new_embedded_with_retry(
@@ -5097,6 +5238,7 @@ mod tests {
             initial_backoff: std::time::Duration::from_millis(1),
             max_backoff: std::time::Duration::from_millis(5),
             backoff_multiplier: 1.0,
+            max_elapsed: None,
         };
         let storage = std::sync::Arc::new(
             SurrealStorage::new_embedded_with_retry(
@@ -8235,25 +8377,12 @@ mod tests {
             .await
             .unwrap();
         assert!(other.is_empty());
-
-        // Prune keeps newest 2
-        let pruned = storage
-            .prune_condition_evals(crate::storage::DEFAULT_CODE_LOCATION_ID, "my_asset", 2)
-            .await
-            .unwrap();
-        assert_eq!(pruned, 3);
-        let after_prune = storage
-            .get_condition_evals(crate::storage::DEFAULT_CODE_LOCATION_ID, "my_asset", 100)
-            .await
-            .unwrap();
-        assert_eq!(after_prune.len(), 2);
-        assert_eq!(after_prune[0].timestamp, 1120);
     }
 
     // ── Zero-coverage function tests ──
 
     #[tokio::test]
-    async fn test_step_completion_completed_flag() {
+    async fn test_step_outcomes_terminal_steps_only() {
         let storage = make_storage().await;
         register(&storage, &["asset_a", "asset_b"]).await;
 
@@ -8302,47 +8431,51 @@ mod tests {
             .await
             .unwrap();
 
+        // A returned row is a terminal step, so "completed" is "any row".
+        let completed = async |asset: &str, runs: &[String]| {
+            !storage
+                .step_outcomes(std::slice::from_ref(&asset.to_string()), runs)
+                .await
+                .unwrap()
+                .is_empty()
+        };
+
         // Only StepStart — not completed
-        assert!(
-            !storage
-                .step_completion("asset_a", &["run_1".to_string()])
-                .await
-                .unwrap()
-                .0
-        );
+        assert!(!completed("asset_a", &["run_1".to_string()]).await);
         // StepSuccess — completed
-        assert!(
-            storage
-                .step_completion("asset_a", &["run_2".to_string()])
-                .await
-                .unwrap()
-                .0
-        );
+        assert!(completed("asset_a", &["run_2".to_string()]).await);
         // StepFailure — completed
-        assert!(
-            storage
-                .step_completion("asset_b", &["run_3".to_string()])
-                .await
-                .unwrap()
-                .0
-        );
+        assert!(completed("asset_b", &["run_3".to_string()]).await);
         // Unknown run
-        assert!(
-            !storage
-                .step_completion("asset_a", &["run_99".to_string()])
-                .await
-                .unwrap()
-                .0
-        );
+        assert!(!completed("asset_a", &["run_99".to_string()]).await);
         // Empty slice
-        assert!(!storage.step_completion("asset_a", &[]).await.unwrap().0);
+        assert!(!completed("asset_a", &[]).await);
         // Multiple runs — finds it in run_2
-        assert!(
-            storage
-                .step_completion("asset_a", &["run_1".to_string(), "run_2".to_string()])
-                .await
-                .unwrap()
-                .0
+        assert!(completed("asset_a", &["run_1".to_string(), "run_2".to_string()]).await);
+
+        // Asking about both assets at once must not credit asset_a with
+        // asset_b's failure, nor either with the other's run.
+        let mut rows: Vec<(String, String, bool)> = storage
+            .step_outcomes(
+                &["asset_a".to_string(), "asset_b".to_string()],
+                &[
+                    "run_1".to_string(),
+                    "run_2".to_string(),
+                    "run_3".to_string(),
+                ],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|o| (o.asset_key, o.run_id, o.succeeded))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("asset_a".to_string(), "run_2".to_string(), true),
+                ("asset_b".to_string(), "run_3".to_string(), false),
+            ]
         );
     }
 
@@ -8760,16 +8893,21 @@ mod tests {
         }
     }
 
+    /// Pruning keeps the newest ticks and takes each dropped tick's
+    /// evaluations with it. An evaluation the UI cannot join back to a tick
+    /// shows no runs, so outliving the tick buys nothing.
     #[tokio::test]
-    async fn test_prune_condition_ticks() {
+    async fn test_prune_condition_history_drops_evals_with_their_tick() {
         let storage = make_storage().await;
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
 
+        let mut tick_ids = Vec::new();
         for i in 0..10 {
-            storage
+            let tick_id = storage
                 .store_condition_tick(&ConditionTickRecord {
-                    code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+                    code_location_id: cl.to_string(),
                     timestamp: 1000 + i * 100,
-                    total_evaluated: 1,
+                    total_evaluated: 2,
                     total_fired: 0,
                     eval_duration_us: 10,
                     run_ids: vec![],
@@ -8777,22 +8915,53 @@ mod tests {
                 })
                 .await
                 .unwrap();
+            let evals: Vec<ConditionEvalRecord> = ["asset_a", "asset_b"]
+                .iter()
+                .map(|key| ConditionEvalRecord {
+                    code_location_id: cl.to_string(),
+                    asset_key: (*key).to_string(),
+                    tick_id: tick_id.clone(),
+                    timestamp: 1000 + i * 100,
+                    fired: false,
+                    eval_duration_us: 5,
+                    run_ids: vec![],
+                    tree_json: b"{}".to_vec(),
+                    selection_json: None,
+                })
+                .collect();
+            storage.store_condition_evals_batch(&evals).await.unwrap();
+            tick_ids.push(tick_id);
         }
 
-        let deleted = storage
-            .prune_condition_ticks(crate::storage::DEFAULT_CODE_LOCATION_ID, 3)
-            .await
-            .unwrap();
+        let deleted = storage.prune_condition_history(cl, 3).await.unwrap();
         assert_eq!(deleted, 7);
 
-        let remaining = storage
-            .get_condition_ticks(crate::storage::DEFAULT_CODE_LOCATION_ID, 100)
-            .await
-            .unwrap();
+        let remaining = storage.get_condition_ticks(cl, 100).await.unwrap();
         assert_eq!(remaining.len(), 3);
         assert_eq!(remaining[0].timestamp, 1900);
         assert_eq!(remaining[1].timestamp, 1800);
         assert_eq!(remaining[2].timestamp, 1700);
+
+        for asset in ["asset_a", "asset_b"] {
+            let evals = storage.get_condition_evals(cl, asset, 100).await.unwrap();
+            assert_eq!(
+                evals.len(),
+                3,
+                "{asset} must keep exactly the evals of the retained ticks"
+            );
+            let kept: Vec<i64> = evals.iter().map(|e| e.timestamp).collect();
+            assert_eq!(kept, vec![1900, 1800, 1700]);
+        }
+        for dropped in &tick_ids[..7] {
+            assert!(
+                storage
+                    .get_condition_evals_for_tick(cl, dropped)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a dropped tick must leave no evals behind"
+            );
+        }
     }
 
     #[tokio::test]

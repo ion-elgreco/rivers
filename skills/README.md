@@ -22,7 +22,7 @@ git clone --depth 1 https://github.com/ion-elgreco/rivers /tmp/rivers
 mkdir -p .claude/skills && cp -r /tmp/rivers/skills/migrate-to-rivers .claude/skills/
 ```
 
-See the [migration guide](https://ion-elgreco.github.io/rivers/guides/migrating/) for details.
+See the [migration guide](https://orchestrator.rs/docs/latest/guides/migrating/) for details.
 
 ## Accuracy
 

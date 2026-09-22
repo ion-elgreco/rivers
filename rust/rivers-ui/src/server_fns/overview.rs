@@ -457,7 +457,7 @@ pub async fn get_deployment_info(
                 .unwrap_or(0);
         }
 
-        let now = chrono::Utc::now().timestamp();
+        let now = jiff::Timestamp::now().as_second();
         if let Ok(resp) = client.get_schedules(GetSchedulesRequest {}).await {
             let schedules = resp.into_inner().schedules;
             daemon_schedules = schedules.len();

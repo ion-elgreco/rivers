@@ -134,7 +134,7 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         evaluate_deployment_phase(&cl, dep_status.as_ref());
 
     let endpoint = grpc_endpoint(&name, &namespace, cl.spec.grpc_port);
-    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+    let now_rfc3339 = jiff::Timestamp::now().to_string();
 
     let prior_status = cl.status.as_ref();
     let mut status = CodeLocationStatus {
@@ -516,7 +516,7 @@ async fn patch_waiting_status(
     generation: Option<i64>,
     cl: &CodeLocation,
 ) -> Result<(), kube_client::Error> {
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = jiff::Timestamp::now().to_string();
     let prior = cl.status.as_ref();
     let mut status = CodeLocationStatus {
         phase: Some(CodeLocationPhase::Pending),
@@ -550,7 +550,7 @@ async fn patch_error_status(
     cl: &CodeLocation,
     err: &ImageError,
 ) -> Result<(), kube_client::Error> {
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = jiff::Timestamp::now().to_string();
     let prior = cl.status.as_ref();
     let mut status = CodeLocationStatus {
         phase: Some(CodeLocationPhase::Failed),

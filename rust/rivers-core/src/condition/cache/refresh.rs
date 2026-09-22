@@ -45,6 +45,8 @@ impl AssetConditionCache {
             let fresh_records = scoped.get_asset_records_by_keys(&ip_keys).await?;
             let mut completed_keys: Vec<String> = Vec::new();
             let mut completed_run_ids: HashSet<String> = HashSet::new();
+            // In-progress assets whose record timestamp has not moved.
+            let mut unmoved: Vec<String> = Vec::new();
             for record in fresh_records {
                 let old = self.records.get(&record.asset_key);
                 let ts_changed = old
@@ -64,20 +66,59 @@ impl AssetConditionCache {
                     }
                     completed_keys.push(record.asset_key.clone());
                     delta.record_updates.push(record);
-                } else if let Some(runs) = self.in_progress_assets.get(&record.asset_key) {
-                    let run_ids: Vec<String> = runs.keys().cloned().collect();
-                    let (completed, succeeded_runs) =
-                        storage.step_completion(&record.asset_key, &run_ids).await?;
-                    if completed {
-                        completed_keys.push(record.asset_key.clone());
-                        if !succeeded_runs.is_empty() {
-                            delta
-                                .materialized_overrides
-                                .entry(record.asset_key.clone())
-                                .or_default()
-                                .extend(succeeded_runs);
-                        }
-                        completed_run_ids.extend(run_ids);
+                } else if self.in_progress_assets.contains_key(&record.asset_key) {
+                    unmoved.push(record.asset_key);
+                }
+            }
+
+            // An unmoved record does not mean the step is still running — the
+            // run may have failed, which writes no materialization. Storage
+            // has to answer for these, but once for all of them: asking per
+            // asset read the run's whole log once per asset it covered.
+            if !unmoved.is_empty() {
+                let mut probe_runs: Vec<String> = unmoved
+                    .iter()
+                    .filter_map(|key| self.in_progress_assets.get(key))
+                    .flat_map(|runs| runs.keys().cloned())
+                    .collect();
+                probe_runs.sort_unstable();
+                probe_runs.dedup();
+
+                let outcomes = storage.step_outcomes(&unmoved, &probe_runs).await?;
+                let mut succeeded_runs: HashMap<&str, HashSet<String>> = HashMap::new();
+                for outcome in &outcomes {
+                    // `probe_runs` is the union over every unmoved asset, so an
+                    // outcome can name a run this asset was never tracked
+                    // against. Only its own runs make it complete.
+                    let tracked = self
+                        .in_progress_assets
+                        .get(&outcome.asset_key)
+                        .is_some_and(|runs| runs.contains_key(&outcome.run_id));
+                    if !tracked {
+                        continue;
+                    }
+                    let entry = succeeded_runs
+                        .entry(outcome.asset_key.as_str())
+                        .or_default();
+                    if outcome.succeeded {
+                        entry.insert(outcome.run_id.clone());
+                    }
+                }
+
+                for key in &unmoved {
+                    let Some(succeeded) = succeeded_runs.get(key.as_str()) else {
+                        continue;
+                    };
+                    completed_keys.push(key.clone());
+                    if !succeeded.is_empty() {
+                        delta
+                            .materialized_overrides
+                            .entry(key.clone())
+                            .or_default()
+                            .extend(succeeded.iter().cloned());
+                    }
+                    if let Some(runs) = self.in_progress_assets.get(key) {
+                        completed_run_ids.extend(runs.keys().cloned());
                     }
                 }
             }

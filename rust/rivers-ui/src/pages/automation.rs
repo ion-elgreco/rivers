@@ -599,7 +599,7 @@ fn render_conditions_tab(
     const GRID: &str = "grid-template-columns: 24px 1.8fr 2fr 0.9fr 0.9fr 0.8fr";
 
     let timeline_view = (!ticks.is_empty()).then(|| {
-        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let now = jiff::Timestamp::now().as_nanosecond() as i64;
         let window_ns: i64 = 60 * 60 * 1_000_000_000;
         let bucket_ns = window_ns / 60;
         let mut buckets: Vec<(u32, bool)> = vec![(0, false); 60];

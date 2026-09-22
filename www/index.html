@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rivers — Orchestration platform for tasks and assets, fully backed by Rust</title>
+<meta name="description" content="rivers is a Rust-powered orchestration platform built around data assets. Define pipelines in Python; rivers resolves the graph, plans execution, and runs the scheduler in compiled Rust.">
+<link rel="icon" href="/assets/logo.svg" type="image/svg+xml">
+<link rel="canonical" href="https://orchestrator.rs/">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://orchestrator.rs/">
+<meta property="og:title" content="rivers — orchestration, fully backed by Rust">
+<meta property="og:description" content="Define pipelines in Python. rivers resolves the graph and plans execution in compiled Rust — no Python interpreter on the control plane.">
+<meta property="og:image" content="https://orchestrator.rs/assets/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<!-- Decorative background: glow orbs + grid. Purely visual. -->
+<div class="bg" aria-hidden="true">
+  <div class="orb orb-a"></div>
+  <div class="orb orb-b"></div>
+  <div class="orb orb-c"></div>
+  <div class="grid-lines"></div>
+</div>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="/">
+      <img src="/assets/logo.svg" alt="" width="28" height="28">
+      <span>rivers</span>
+    </a>
+    <nav class="nav-links" aria-label="Main">
+      <a href="/docs/latest/">Docs</a>
+      <a href="/docs/latest/concepts/assets/">Concepts</a>
+      <a href="/docs/latest/comparisons/">Comparisons</a>
+      <a href="/docs/latest/installation/kubernetes/">Kubernetes</a>
+      <a class="ghost" href="https://github.com/ion-elgreco/rivers">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- Hero -->
+  <section class="hero">
+    <div class="wrap hero-inner">
+      <div class="hero-copy">
+        <h1>Orchestration that runs at <span class="grad">Rust speed</span>.</h1>
+        <p class="lede">
+          Write assets in Python. rivers resolves the graph, plans execution, and runs
+          the scheduler as compiled Rust — so nothing in the control plane waits on a
+          Python interpreter.
+        </p>
+        <div class="cta">
+          <a class="btn primary" href="/docs/latest/getting-started/">Get started</a>
+          <a class="btn glass" href="https://github.com/ion-elgreco/rivers">View on GitHub</a>
+        </div>
+        <div class="install">
+          <span class="prompt" aria-hidden="true">$</span>
+          <code class="cmd">pip install rivers</code>
+          <button class="copy" type="button" data-copy="pip install rivers" aria-label="Copy install command">Copy</button>
+        </div>
+      </div>
+
+      <div class="hero-code">
+        <div class="code-card glow">
+          <div class="code-head"><span class="dot red"></span><span class="dot amber"></span><span class="dot green"></span><span class="fname">pipeline.py</span></div>
+<pre><code><span class="k">import</span> rivers <span class="k">as</span> rs
+
+<span class="d">@rs.Asset</span>
+<span class="k">def</span> <span class="f">raw_data</span>():
+    <span class="k">return</span> {<span class="s">"users"</span>: <span class="n">100</span>, <span class="s">"events"</span>: <span class="n">5000</span>}
+
+<span class="d">@rs.Asset</span>
+<span class="k">def</span> <span class="f">summary</span>(raw_data: <span class="t">dict</span>):
+    <span class="k">return</span> <span class="s">f"{raw_data['users']} users"</span>
+
+repo = rs.<span class="t">CodeRepository</span>(assets=[raw_data, summary])
+repo.materialize()</code></pre>
+        </div>
+        <p class="code-note">rivers reads the type-annotated parameters and builds the dependency graph. No wiring step.</p>
+      </div>
+
+      <!-- The two API-backed stats stay hidden until the script fills them, so the
+           page never shows a number it cannot vouch for. Separators are generated. -->
+      <div class="proof">
+        <a class="stat" hidden href="https://github.com/ion-elgreco/rivers/stargazers">
+          <span class="mark" aria-hidden="true">★</span><b data-stat="stars"></b><span>stars</span>
+        </a>
+        <a class="stat" hidden href="https://github.com/ion-elgreco/rivers/releases/latest">
+          <b data-stat="release"></b><span data-stat="released"></span>
+        </a>
+        <a class="stat" href="https://github.com/ion-elgreco/rivers/blob/main/LICENSE">
+          <b>Apache&nbsp;2.0</b><span>license</span>
+        </a>
+        <a class="stat" href="https://github.com/ion-elgreco/rivers/discussions">
+          <span class="pip" aria-hidden="true"></span><b>Discussions</b><span>ask anything</span>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <hr class="flow-rule wrap-rule" aria-hidden="true">
+
+  <!-- Capability marquee -->
+  <section class="marquee-wrap" aria-label="Capabilities">
+    <div class="marquee">
+      <ul class="marquee-track">
+        <li>Assets</li><li>Tasks</li><li>Graph assets</li><li>Partitions</li><li>Backfills</li><li>Schedules</li><li>Sensors</li>
+        <li>Automation conditions</li><li>Retries</li><li>Concurrency pools</li><li>Kubernetes</li>
+        <li>Delta Lake</li><li>Polars</li><li>PyArrow</li><li>SurrealDB</li><li>Lineage</li>
+        <li aria-hidden="true">Assets</li><li aria-hidden="true">Tasks</li><li aria-hidden="true">Graph assets</li><li aria-hidden="true">Partitions</li><li aria-hidden="true">Backfills</li>
+        <li aria-hidden="true">Schedules</li><li aria-hidden="true">Sensors</li>
+        <li aria-hidden="true">Automation conditions</li><li aria-hidden="true">Retries</li>
+        <li aria-hidden="true">Concurrency pools</li><li aria-hidden="true">Kubernetes</li>
+        <li aria-hidden="true">Delta Lake</li><li aria-hidden="true">Polars</li><li aria-hidden="true">PyArrow</li>
+        <li aria-hidden="true">SurrealDB</li><li aria-hidden="true">Lineage</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Control plane comparison -->
+  <section class="compare reveal">
+    <div class="wrap">
+      <h2 class="center">The control plane is compiled</h2>
+      <p class="center sub">Most orchestrators run their scheduler, planner, and daemon as Python processes. rivers compiles all of them into one binary. Python only runs inside your own asset code.</p>
+      <div class="table-frame">
+        <div class="table-scroll">
+          <table class="cmp">
+            <thead>
+              <tr><th scope="col">Component</th><th scope="col">Python orchestrators</th><th scope="col">rivers</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Graph resolution</td><td class="was">Python</td><td class="now">Rust (<code>petgraph</code>)</td></tr>
+              <tr><td>Execution planner</td><td class="was">Python</td><td class="now">Rust</td></tr>
+              <tr><td>Partition mapping</td><td class="was">Python</td><td class="now">Rust</td></tr>
+              <tr><td>Daemon: schedules, sensors, automation</td><td class="was">Python</td><td class="now">Rust, no GIL held</td></tr>
+              <tr><td>Web UI server</td><td class="was">Python plus a JavaScript bundle</td><td class="now">Rust: axum, Leptos, WASM</td></tr>
+              <tr><td>Kubernetes integration</td><td class="was">Python launcher</td><td class="now">Rust operator with CRDs</td></tr>
+              <tr class="punch"><td>Python interpreter on the control plane</td><td class="was">Yes, everywhere</td><td class="now">None</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <p class="center micro">Plan times stay below a millisecond on graphs with thousands of nodes. <a class="flow-link" href="/docs/latest/comparisons/dagster/">See the full comparison</a></p>
+    </div>
+  </section>
+
+  <!-- rivers-benchmark:generated - do not hand-edit, rerun bench/run.sh -->
+  <section class="compare reveal">
+    <div class="wrap">
+      <h2 class="center">Measured against the others</h2>
+      <p class="center sub">Wins and losses alike, on one machine, with the same Python and the same storage class. Each framework runs in its best configuration, and the highlighted figure wins the row.</p>
+      <div class="table-frame" data-bench-table>
+        <div class="table-scroll">
+          <table class="cmp bench">
+            <thead>
+              <tr><th scope="col">Measurement</th><th scope="col">Dagster</th><th scope="col">Prefect</th><th scope="col">rivers</th></tr>
+            </thead>
+            <tbody>
+              <tr class="group"><th colspan="4" scope="rowgroup">Kubernetes control plane</th></tr>
+              <tr><td>install to ready for work</td><td class="rival win">25 s</td><td class="rival">43 s</td><td class="rivers">45 s</td></tr>
+              <tr><td>memory at idle</td><td class="rival">366 MB</td><td class="rival">389 MB</td><td class="rivers win">159 MB</td></tr>
+              <tr><td>images on disk</td><td class="rival">399 MB</td><td class="rival">374 MB</td><td class="rivers win">244 MB</td></tr>
+            </tbody>
+            <tbody>
+              <tr class="group"><th colspan="4" scope="rowgroup">Graph engine</th></tr>
+              <tr><td>build a 100,000-asset graph</td><td class="rival">35.06 s</td><td class="rival">6.29 s</td><td class="rivers win">718 ms</td></tr>
+              <tr><td>build a 50,000-asset graph with dependencies</td><td class="rival">32.81 s</td><td class="rival">3.89 s</td><td class="rivers win">370 ms</td></tr>
+              <tr><td>resolve a selection over 10,000 assets</td><td class="rival">960 ms</td><td class="rival none">not supported</td><td class="rivers win">8 ms</td></tr>
+            </tbody>
+            <tbody>
+              <tr class="group"><th colspan="4" scope="rowgroup">Run execution</th></tr>
+              <tr><td>one no-op asset, end to end</td><td class="rival">95 ms</td><td class="rival">1.09 s</td><td class="rivers win">3 ms</td></tr>
+              <tr><td>no-op runs per second</td><td class="rival">10/s</td><td class="rival">1/s</td><td class="rivers win">365/s</td></tr>
+              <tr><td>per step in one run of 5,000</td><td class="rival">25.5 ms</td><td class="rival none">timed out</td><td class="rivers win">0.5 ms</td></tr>
+              <tr><td>parallel efficiency, 512 sleeping assets</td><td class="rival">4%</td><td class="rival">23%</td><td class="rivers win">76%</td></tr>
+              <tr><td>cancel a running run</td><td class="rival">582 ms</td><td class="rival none">not supported</td><td class="rivers win">1 ms</td></tr>
+            </tbody>
+            <tbody>
+              <tr class="group"><th colspan="4" scope="rowgroup">Partitions</th></tr>
+              <tr><td>define and load 1,000,000</td><td class="rival">532 ms</td><td class="rival none">not supported</td><td class="rivers win">80 ms</td></tr>
+              <tr><td>materialize, count and list over 1,000,000 keys</td><td class="rival">415 ms</td><td class="rival none">not supported</td><td class="rivers win">93 ms</td></tr>
+            </tbody>
+            <tbody>
+              <tr class="group"><th colspan="4" scope="rowgroup">Automation daemon</th></tr>
+              <tr><td>sensors held at a 1-second interval</td><td class="rival">50</td><td class="rival none">not supported</td><td class="rivers win">2,000+</td></tr>
+              <tr><td>conditions held at a 1-second interval</td><td class="rival">10,000</td><td class="rival none">not supported</td><td class="rivers win">20,000+</td></tr>
+              <tr><td>evaluate 500 schedules once</td><td class="rival">2.2 ms</td><td class="rival none">not supported</td><td class="rivers win">0.38 ms</td></tr>
+            </tbody>
+            <tbody>
+              <tr class="group"><th colspan="4" scope="rowgroup">Backfill</th></tr>
+              <tr><td>partitions per second, 1,000 partitions</td><td class="rival">1.5/s</td><td class="rival none">not supported</td><td class="rivers win">104.7/s</td></tr>
+            </tbody>
+            <tbody>
+              <tr class="group"><th colspan="4" scope="rowgroup">Concurrency</th></tr>
+              <tr><td>claims per second, 10,000 against four slots</td><td class="rival">101/s</td><td class="rival none">timed out</td><td class="rivers win">753/s</td></tr>
+            </tbody>
+            <tbody>
+              <tr class="group"><th colspan="4" scope="rowgroup">Read path</th></tr>
+              <tr><td>answer a UI page over 10,000 runs</td><td class="rival">21.1 ms</td><td class="rival">48.3 ms</td><td class="rivers win">2.0 ms</td></tr>
+            </tbody>
+            <tbody>
+              <tr class="group"><th colspan="4" scope="rowgroup">Logs</th></tr>
+              <tr><td>write and read 100,000 lines</td><td class="rival">1.15 s</td><td class="rival">75.53 s</td><td class="rivers win">291 ms</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <button class="btn glass bench-more" type="button" data-bench-toggle hidden>Show all measurements</button>
+      <p class="center micro">Measured on Apple Silicon. <a class="flow-link" href="https://github.com/ion-elgreco/rivers/blob/main/bench/RESULTS.md">Full results and method</a></p>
+    </div>
+  </section>
+
+  <!-- Code to DAG sequence -->
+  <section class="lineage reveal">
+    <div class="wrap">
+      <h2 class="center">The graph is inferred, not declared</h2>
+      <p class="center sub">An asset is what your pipeline <em>produces</em>. A task is a step inside one. You wire neither — rivers reads the function parameters, builds the edges, and lineage comes for free.</p>
+
+      <div class="seq">
+        <div class="code-card">
+          <div class="code-head"><span class="dot red"></span><span class="dot amber"></span><span class="dot green"></span><span class="fname">analytics.py</span></div>
+<pre><code><span class="ln"><span class="k">import</span> rivers <span class="k">as</span> rs</span><span class="ln"> </span><span class="ln"><span class="d">@rs.Asset</span></span><span class="ln"><span class="k">def</span> <span class="f">sessions</span>(events, users):</span><span class="ln">    <span class="k">return</span> join(events, users)</span></code></pre>
+          <div class="run"><span>$ rivers materialize pipelines.analytics</span><b>&#10003; materialized</b></div>
+        </div>
+
+        <svg viewBox="0 0 560 260" class="dag" role="img" aria-label="Diagram: the assets events and users flow into sessions, which flows into report and features">
+          <defs>
+            <linearGradient id="edge" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0%" stop-color="#ff8f78"/>
+              <stop offset="100%" stop-color="#50e1f9"/>
+            </linearGradient>
+          </defs>
+          <g fill="none" stroke="url(#edge)" stroke-width="2">
+            <g class="e1 flow-edge">
+              <path d="M130 62 C 190 62, 195 130, 250 130"/>
+              <path d="M130 198 C 190 198, 195 130, 250 130"/>
+            </g>
+            <g class="e2 flow-edge">
+              <path d="M370 130 C 400 130, 405 62, 440 62"/>
+              <path d="M370 130 C 400 130, 405 198, 440 198"/>
+            </g>
+          </g>
+          <g class="node src"><rect x="10" y="38" width="120" height="48" rx="10"/><text x="70" y="67">events</text></g>
+          <g class="node src"><rect x="10" y="174" width="120" height="48" rx="10"/><text x="70" y="203">users</text></g>
+          <g class="node mid"><rect x="250" y="106" width="120" height="48" rx="10"/><text x="310" y="135">sessions</text></g>
+          <g class="node out"><rect x="440" y="38" width="110" height="48" rx="10"/><text x="495" y="67">report</text></g>
+          <g class="node out"><rect x="440" y="174" width="110" height="48" rx="10"/><text x="495" y="203">features</text></g>
+        </svg>
+      </div>
+
+      <div class="seq-steps">
+        <div class="step"><b>0&ndash;3s</b> Five lines of Python appear. A decorator and a return — no YAML and no registry call.</div>
+        <div class="step"><b>3&ndash;5s</b> The upstreams resolve and the edges start flowing. The graph was never declared; it was inferred.</div>
+        <div class="step"><b>5&ndash;9s</b> <code>sessions</code> goes hot and the downstream assets light up.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- rivers dev -->
+  <section class="split reveal">
+    <div class="wrap split-inner">
+      <div>
+        <h2>One command starts <span class="grad">the whole stack</span>.</h2>
+        <p>On your laptop, one process runs the scheduler, your code, the database and the UI. There is no daemon to babysit, no <code>workspace.yaml</code>, and no docker-compose file.</p>
+        <p>Nothing changes when you go to production. The Helm chart runs the same components, split into their own pods.</p>
+        <a class="btn glass" href="/docs/latest/getting-started/">Getting started</a>
+      </div>
+      <div>
+        <div class="code-card glow">
+          <div class="code-head"><span class="dot red"></span><span class="dot amber"></span><span class="dot green"></span><span class="fname">terminal</span></div>
+<pre><code><span class="d">$</span> rivers dev pipelines.analytics</code></pre>
+        </div>
+        <ul class="ticks starts">
+          <li>SurrealDB, embedded on RocksDB — it also runs in memory or on a remote server</li>
+          <li>The scheduler daemon, evaluating your automation</li>
+          <li>The gRPC code-location backend on port 3001</li>
+          <li>The web UI on port 3000, in the same process</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section class="features reveal">
+    <div class="wrap">
+      <h2 class="center">Built for the parts that usually hurt</h2>
+      <p class="center sub">Not a feature list. These are the differences you feel in week three.</p>
+      <div class="grid">
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">◆</span> A daemon per code location</h3>
+          <p>Most orchestrators run one global daemon for every team. One slow sensor stalls everyone's triggers. rivers runs a daemon inside each code location, so a bad tick in one team's repo cannot touch another's.</p>
+          <a href="/docs/latest/comparisons/dagster/">How isolation works<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">⚡</span> Async assets, for real</h3>
+          <p>Write <code>async def</code> on an asset and rivers awaits it on the tokio event loop. No wrapper and no separate decorator. The parallel executor caps async fan-out separately from its subprocess workers.</p>
+          <a href="/docs/latest/concepts/jobs/">Executors<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">◷</span> Partitions that mix kinds</h3>
+          <p>Put time-window, static, and dynamic dimensions in the same partition definition, with no cap on dimension count. Cron accepts a seconds field, so partitions and schedules can tick below a minute.</p>
+          <a href="/docs/latest/concepts/partitions/">Partitions<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">◱</span> Config is just Pydantic</h3>
+          <p>Annotate the context with your model — <code>AssetExecutionContext[MyConfig]</code> — and the type is read from the annotation. No config DSL, no run-config dictionary, and real autocomplete on <code>context.config</code>.</p>
+          <a href="/docs/latest/concepts/configuration/">Configuration<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">⊞</span> One symbol per concept</h3>
+          <p>Every concept is a single class with named constructors. Type <code>rs.Executor.</code> and the IDE lists every executor; <code>rs.PartitionsDefinition.</code> lists every partition kind. One import, nothing to memorise.</p>
+          <a href="/docs/latest/comparisons/dagster/#api-ergonomics-one-class-one-entry-point">The API surface<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">⧉</span> Backfills that split by dimension</h3>
+          <p>Give one dimension a run each and batch another inside it. <code>per_dimension(multi_run=["date"], single_run=["region"])</code> is one run per date, with every region in it. No custom backfill code.</p>
+          <a href="/docs/latest/concepts/backfills/">Backfills<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">▣</span> Size the step, not the run</h3>
+          <p>A cheap parse step and a 30&nbsp;Gi join should not share one pod size. <code>compute=rs.Compute(memory="32Gi")</code> sizes that asset alone. Axes you leave unset inherit the executor default.</p>
+          <a href="/docs/latest/concepts/compute/">Per-asset compute<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">▲</span> An OOM retry gets more memory</h3>
+          <p>When the kernel kills a step, rivers reads the pod status, tells a real OOM from an eviction, and relaunches with more memory. 8&nbsp;Gi, then 16, then 32, up to your ceiling.</p>
+          <a href="/docs/latest/concepts/retries/">Retries<span aria-hidden="true"> →</span></a>
+        </article>
+
+        <article class="card">
+          <h3><span class="ico" aria-hidden="true">◎</span> Tracing without an add-on</h3>
+          <p>Set <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> and spans flow to your collector. Python <code>logging</code> and <code>context.log</code> bridge into the same subscriber, so per-step log capture needs no setup.</p>
+          <a href="/docs/latest/api-reference/environment-variables/">Environment variables<span aria-hidden="true"> →</span></a>
+        </article>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- Code showcase -->
+  <section class="showcase reveal">
+    <div class="wrap">
+      <h2 class="center">Three things that are usually awkward</h2>
+      <p class="center sub">Each of these is one annotation in rivers.</p>
+      <div class="snips">
+
+        <article class="snip">
+          <div class="code-card">
+            <div class="code-head"><span class="fname">incremental.py</span></div>
+<pre><code><span class="d">@rs.Asset</span>
+<span class="k">def</span> <span class="f">running_total</span>(
+    self: rs.<span class="t">SelfDependency</span>[<span class="t">int</span>],
+    events: <span class="t">list</span>,
+) -> <span class="t">int</span>:
+    prev = self.get_inner()
+    <span class="k">return</span> (prev <span class="k">or</span> <span class="n">0</span>) + len(events)</code></pre>
+          </div>
+          <div class="snip-text">
+            <h3>Read your own last value</h3>
+            <p>An incremental asset loads its previous output through a typed parameter. There is no graph cycle, and no workaround.</p>
+          </div>
+        </article>
+
+        <article class="snip">
+          <div class="code-card">
+            <div class="code-head"><span class="fname">fanout.py</span></div>
+<pre><code><span class="d">@rs.Task</span>
+<span class="k">def</span> <span class="f">double</span>(x: <span class="t">int</span>) -> <span class="t">int</span>:
+    <span class="k">return</span> x * <span class="n">2</span>
+
+<span class="d">@rs.Asset.from_graph</span>()
+<span class="k">def</span> <span class="f">doubled</span>():
+    m = numbers().map(double)
+    <span class="k">return</span> total(m.collect_stream())</code></pre>
+          </div>
+          <div class="snip-text">
+            <h3>Compose tasks into one asset</h3>
+            <p>A graph asset is a sub-DAG of tasks, and each task is its own step. Fan out with <code>.map()</code>; a streaming collect starts downstream work on the first result instead of waiting for the slowest branch.</p>
+          </div>
+        </article>
+
+        <article class="snip">
+          <div class="code-card">
+            <div class="code-head"><span class="fname">async.py</span></div>
+<pre><code><span class="d">@rs.Asset</span>
+<span class="k">async def</span> <span class="f">prices</span>():
+    <span class="k">return await</span> client.fetch(<span class="s">"/prices"</span>)
+
+<span class="d">@rs.Asset</span>
+<span class="k">def</span> <span class="f">report</span>(prices, inventory):
+    <span class="k">return</span> {**prices, **inventory}</code></pre>
+          </div>
+          <div class="snip-text">
+            <h3>Mix async and sync freely</h3>
+            <p>Async assets run as event-loop tasks while sync assets run in subprocess workers, inside the same run.</p>
+          </div>
+        </article>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- Product screenshot slot -->
+  <section class="shot reveal">
+    <div class="wrap">
+      <h2 class="center">The whole platform, in one UI</h2>
+      <p class="center sub">Every page updates itself. Run state, materializations, and automation ticks arrive as they happen, so you get a live indicator instead of a refresh button.</p>
+      <div class="carousel" data-carousel>
+        <div class="carousel-viewport">
+          <ul class="carousel-track">
+            <li class="carousel-slide is-active" data-caption="<b>Overview</b> &mdash; Run health, success rate, and every asset group in one screen.">
+              <img src="/assets/ui/overview.png" width="2160" height="1350"
+                   alt="The rivers web UI, Overview page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Runs</b> &mdash; What launched each run — a schedule, a condition, or a backfill — with its assets and partition keys.">
+              <img src="/assets/ui/runs.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Runs page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Run detail</b> &mdash; A step timeline over the full event stream: pool slots, materializations, and step results.">
+              <img src="/assets/ui/run-detail.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Run detail page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Logs</b> &mdash; Per-step logs with a level filter. Anything you write with <code>context.log</code> lands here.">
+              <img src="/assets/ui/run-logs.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Logs page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Lineage</b> &mdash; The asset graph, marked up with materialized, running, stale, and external state.">
+              <img src="/assets/ui/lineage.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Lineage page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Assets</b> &mdash; Kind, type, group, tags, and freshness for every asset in the repository.">
+              <img src="/assets/ui/assets.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Assets page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Automation</b> &mdash; Schedules, sensors, and declarative conditions, with the next tick for each.">
+              <img src="/assets/ui/automation.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Automation page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Backfills</b> &mdash; Partition ranges in flight, and how far each one has progressed.">
+              <img src="/assets/ui/backfills.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Backfills page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Jobs</b> &mdash; Every job the repository defines.">
+              <img src="/assets/ui/jobs.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Jobs page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Pools</b> &mdash; Concurrency slots across the cluster, with the lease that reclaims them after a crash.">
+              <img src="/assets/ui/pools.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Pools page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Queue</b> &mdash; What is waiting to run, and exactly what is blocking it.">
+              <img src="/assets/ui/queue.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Queue page">
+            </li>
+            <li class="carousel-slide" data-caption="<b>Deployment</b> &mdash; The daemon, the code locations, and the storage backend.">
+              <img src="/assets/ui/deployment.png" width="2160" height="1350" loading="lazy"
+                   alt="The rivers web UI, Deployment page">
+            </li>
+          </ul>
+          <button class="carousel-arrow carousel-prev" type="button" aria-label="Previous screenshot" data-step="-1">&#8249;</button>
+          <button class="carousel-arrow carousel-next" type="button" aria-label="Next screenshot" data-step="1">&#8250;</button>
+        </div>
+        <p class="carousel-caption" data-caption-out aria-live="polite"><b>Overview</b> &mdash; Run health, success rate, and every asset group in one screen.</p>
+        <div class="carousel-dots" role="tablist" aria-label="Choose a screenshot">
+          <button type="button" role="tab" aria-selected="true" aria-label="Overview" data-go="0"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Runs" data-go="1"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Run detail" data-go="2"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Logs" data-go="3"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Lineage" data-go="4"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Assets" data-go="5"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Automation" data-go="6"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Backfills" data-go="7"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Jobs" data-go="8"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Pools" data-go="9"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Queue" data-go="10"></button>
+          <button type="button" role="tab" aria-selected="false" aria-label="Deployment" data-go="11"></button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Kubernetes -->
+  <section class="split alt reveal">
+    <div class="wrap split-inner">
+      <div>
+        <h2>Kubernetes is the control plane</h2>
+        <p>Registering a code location is one <code>kubectl apply</code>. The operator resolves the tag to an immutable digest, reconciles a Deployment and Service, and registers the endpoint for the UI to discover.</p>
+        <p>There is no workspace file to maintain, no "add code location" flow in the UI, and no extra process polling a hosted service for work. Delete the resource to remove it.</p>
+        <a class="btn glass" href="/docs/latest/installation/kubernetes/">Install on Kubernetes</a>
+      </div>
+      <div class="code-card glow">
+        <div class="code-head"><span class="dot red"></span><span class="dot amber"></span><span class="dot green"></span><span class="fname">codelocation.yaml</span></div>
+<pre><code><span class="y">apiVersion</span>: rivers.io/v1alpha1
+<span class="y">kind</span>: CodeLocation
+<span class="y">metadata</span>:
+  <span class="y">name</span>: analytics
+<span class="y">spec</span>:
+  <span class="y">image</span>: ghcr.io/acme/pipelines
+  <span class="y">tag</span>: v0.2.0
+  <span class="y">module</span>: pipelines.analytics</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <hr class="flow-rule wrap-rule" aria-hidden="true">
+
+  <!-- Final CTA -->
+  <section class="final reveal">
+    <div class="wrap">
+      <div class="final-card">
+        <h2>Your first asset, in minutes</h2>
+        <p class="sub">Install the package, decorate a function, and materialize it.</p>
+        <div class="cta center-cta">
+          <a class="btn primary" href="/docs/latest/getting-started/">Get started</a>
+          <a class="btn glass" href="/docs/latest/guides/migrating/">Migrating from Dagster or Prefect</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div class="wrap footer-inner">
+    <div class="footer-brand">
+      <img src="/assets/logo.svg" alt="" width="24" height="24">
+      <span>rivers</span>
+    </div>
+    <nav class="footer-links" aria-label="Footer">
+      <a href="/docs/latest/">Documentation</a>
+      <a href="/docs/latest/api-reference/repository/">API reference</a>
+      <a href="https://github.com/ion-elgreco/rivers">GitHub</a>
+      <a href="https://github.com/ion-elgreco/rivers/issues">Issues</a>
+      <a href="https://github.com/ion-elgreco/rivers/discussions">Discussions</a>
+    </nav>
+    <p class="license">Apache 2.0 licensed.</p>
+  </div>
+</footer>
+
+<script>
+  var motionOK = !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // Copy-to-clipboard on the install command.
+  document.querySelectorAll(".copy").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      navigator.clipboard.writeText(btn.dataset.copy).then(function () {
+        btn.textContent = "\u2713 Copied";
+        btn.classList.add("done");
+        clearTimeout(btn._revert);
+        btn._revert = setTimeout(function () {
+          btn.textContent = "Copy";
+          btn.classList.remove("done");
+        }, 1600);
+      });
+    });
+  });
+
+  // Proof strip. Stars and the latest release are fetched live and stay hidden
+  // until they arrive. GitHub allows 60 unauthenticated calls an hour per IP, so a
+  // failure is ordinary — the stat simply stays hidden rather than showing an error.
+  (function () {
+    var api = "https://api.github.com/repos/ion-elgreco/rivers";
+
+    function set(key, value) {
+      var el = document.querySelector('[data-stat="' + key + '"]');
+      if (el && value) el.textContent = value;
+    }
+
+    function shipped(iso) {
+      var days = Math.floor((Date.now() - Date.parse(iso)) / 86400000);
+      if (days <= 0) return "shipped today";
+      if (days === 1) return "shipped yesterday";
+      if (days < 30) return "shipped " + days + "d ago";
+      return "shipped " + new Date(iso).toLocaleDateString("en", { month: "short", year: "numeric" });
+    }
+
+    function get(path, fn) {
+      fetch(api + path)
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { if (d) fn(d); })
+        .catch(function () {});
+    }
+
+    function reveal(key) {
+      var el = document.querySelector('[data-stat="' + key + '"]');
+      if (el) el.closest(".stat").hidden = false;
+    }
+
+    get("", function (d) {
+      set("stars", String(d.stargazers_count));
+      reveal("stars");
+    });
+    get("/releases/latest", function (d) {
+      set("release", d.tag_name);
+      set("released", shipped(d.published_at));
+      reveal("release");
+    });
+  })();
+
+  // Benchmark table. It opens as a preview and the button shows the rest. The
+  // clamp is added here, so the whole table is readable without script.
+  (function () {
+    var frame = document.querySelector("[data-bench-table]");
+    var btn = document.querySelector("[data-bench-toggle]");
+    if (!frame || !btn) return;
+    var rows = frame.querySelectorAll("tbody tr:not(.group)").length;
+
+    function label(open) {
+      btn.textContent = open ? "Show fewer" : "Show all " + rows + " measurements";
+      btn.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+
+    frame.classList.add("is-clamped");
+    btn.hidden = false;
+    label(false);
+
+    btn.addEventListener("click", function () {
+      var open = !frame.classList.toggle("is-clamped");
+      label(open);
+      // Collapsing from the bottom of a long table would otherwise strand the
+      // visitor below the section.
+      if (!open) {
+        frame.scrollIntoView({ behavior: motionOK ? "smooth" : "auto", block: "start" });
+      }
+    });
+  })();
+
+  // Screenshot carousel. Fades between slides and advances on its own, unless
+  // the visitor prefers reduced motion or is interacting with it.
+  (function () {
+    var root = document.querySelector("[data-carousel]");
+    if (!root) return;
+    var slides = Array.prototype.slice.call(root.querySelectorAll(".carousel-slide"));
+    var dots = Array.prototype.slice.call(root.querySelectorAll("[data-go]"));
+    var caption = root.querySelector("[data-caption-out]");
+    var idx = 0, timer = null;
+
+    function show(n) {
+      idx = (n + slides.length) % slides.length;
+      slides.forEach(function (s, k) { s.classList.toggle("is-active", k === idx); });
+      dots.forEach(function (d, k) { d.setAttribute("aria-selected", k === idx ? "true" : "false"); });
+      caption.innerHTML = slides[idx].dataset.caption;
+      var img = slides[idx].querySelector("img");
+      if (img) img.removeAttribute("loading");
+    }
+    function stop() { if (timer) { clearInterval(timer); timer = null; } }
+    function start() {
+      stop();
+      if (motionOK) timer = setInterval(function () { show(idx + 1); }, 5200);
+    }
+
+    root.querySelectorAll("[data-step]").forEach(function (b) {
+      b.addEventListener("click", function () { show(idx + Number(b.dataset.step)); start(); });
+    });
+    dots.forEach(function (d) {
+      d.addEventListener("click", function () { show(Number(d.dataset.go)); start(); });
+    });
+    root.addEventListener("mouseenter", stop);
+    root.addEventListener("mouseleave", start);
+    root.addEventListener("focusin", stop);
+    root.addEventListener("focusout", start);
+    root.addEventListener("keydown", function (e) {
+      if (e.key === "ArrowLeft") { show(idx - 1); start(); }
+      if (e.key === "ArrowRight") { show(idx + 1); start(); }
+    });
+    start();
+  })();
+
+  // Scroll reveal. Sections start hidden only when this script runs, so the
+  // page stays readable with JavaScript disabled.
+  var targets = document.querySelectorAll(".reveal");
+  if (motionOK && "IntersectionObserver" in window) {
+    targets.forEach(function (el) { el.classList.add("reveal-armed"); });
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) {
+          entry.target.classList.add("reveal-in");
+          io.unobserve(entry.target);
+        }
+      });
+    }, { rootMargin: "0px 0px -12% 0px" });
+    targets.forEach(function (el) { io.observe(el); });
+  }
+</script>
+</body>
+</html>
