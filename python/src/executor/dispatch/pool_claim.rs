@@ -194,7 +194,7 @@ async fn claim_async_poll(
     let poll_interval = *CLAIM_POLL_INTERVAL;
     let max_jitter = *CLAIM_POLL_JITTER;
     let timeout = *CLAIM_TIMEOUT;
-    let deadline = tokio::time::Instant::now() + timeout;
+    let mut deadline = tokio::time::Instant::now() + timeout;
     let code_location_id = storage.code_location_id();
 
     let mut attempt: u32 = 0;
@@ -224,7 +224,11 @@ async fn claim_async_poll(
                 return Ok(());
             }
             ConcurrencyClaimStatus::Pending { position, reason } => {
-                if tokio::time::Instant::now() >= deadline {
+                // The timeout counts only time blocked on user pools: an
+                // asset pool's holder is a live step, so the wait ends with it.
+                if reason.only_asset_pools() {
+                    deadline = tokio::time::Instant::now() + timeout;
+                } else if tokio::time::Instant::now() >= deadline {
                     anyhow::bail!(
                         "step '{step_key}' timed out waiting for pool slots after {timeout:?}"
                     );

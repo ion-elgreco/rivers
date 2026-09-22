@@ -1151,6 +1151,19 @@ pub enum BlockReason {
     PoolsFull { pools: Vec<PoolBlockDetail> },
 }
 
+impl BlockReason {
+    /// Every blocking pool is an asset's implicit pool — held by a live step
+    /// that renews its lease, so the wait ends when that step does.
+    pub fn only_asset_pools(&self) -> bool {
+        match self {
+            BlockReason::PoolFull { pool_key, .. } => pool_key.starts_with(ASSET_POOL_PREFIX),
+            BlockReason::PoolsFull { pools } => pools
+                .iter()
+                .all(|p| p.pool_key.starts_with(ASSET_POOL_PREFIX)),
+        }
+    }
+}
+
 impl std::fmt::Display for BlockReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

@@ -6,6 +6,10 @@ timeline, and retry policies never leak over from materialize.
 """
 
 import asyncio
+import os
+import subprocess
+import sys
+import textwrap
 
 import pytest
 from pydantic import BaseModel
@@ -1305,6 +1309,82 @@ def test_exclusive_action_serializes_with_materialize():
         e.event_type for e in repo.storage.get_events_for_run(result["r"].run_id)
     ]
     assert "StepSlotWaiting" in waiting
+
+
+def test_asset_pool_wait_outlives_the_claim_timeout():
+    """A materialize waiting on its asset's exclusive-action pool must wait for
+    the action, not fail at the claim timeout: the failure set a floor that
+    stopped eager for good. A user pool still times out. Subprocess because
+    the timeout is read once per process."""
+    script = textwrap.dedent(
+        """
+        import threading, time
+        import rivers as rs
+        from rivers.testing import memory_storage
+
+        started = threading.Event()
+
+        class Table(rs.Asset):
+            io_handler = rs.InMemoryIOHandler()
+
+            @classmethod
+            def materialize(cls):
+                return 1
+
+            @rs.action(
+                outcome=rs.Outcome.Unchanged,
+                concurrency=rs.ActionConcurrency.Exclusive,
+            )
+            @classmethod
+            def optimize(cls, ctx):
+                started.set()
+                time.sleep(3)
+
+        @rs.Asset(pool="db", io_handler=rs.InMemoryIOHandler())
+        def pooled():
+            return 1
+
+        storage = memory_storage()
+        repo = rs.CodeRepository(
+            assets=[Table, pooled], default_executor=rs.Executor.in_process()
+        )
+        repo.resolve(storage=storage)
+        repo.materialize(selection=["table"])
+
+        out = {}
+        t = threading.Thread(
+            target=lambda: out.update(r=repo.run_action("optimize", raise_on_error=False))
+        )
+        t.start()
+        assert started.wait(30), "optimize never started"
+        repo.materialize(selection=["table"])
+        t.join(60)
+        assert out["r"].success, "optimize failed"
+
+        storage.set_pool_limit("db", 1)
+        storage._claim_concurrency_slots([("db", 1)], "other-run", "other-step")
+        try:
+            repo.materialize(selection=["pooled"])
+        except Exception as e:
+            assert "timed out waiting for pool slots" in str(e), e
+        else:
+            raise SystemExit("a user-pool wait must still time out")
+        """
+    )
+    env = dict(
+        os.environ,
+        RIVERS_CLAIM_TIMEOUT="1s",
+        RIVERS_CLAIM_POLL_INTERVAL="100ms",
+        RIVERS_CLAIM_POLL_JITTER="0s",
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr[-3000:]}"
 
 
 def _slow_partitioned_exclusive(started, release, windows):

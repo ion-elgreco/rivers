@@ -25,7 +25,7 @@ Tunes how step workers wait for available slots in a concurrency pool. Durations
 |----------|---------|-------------|
 | `RIVERS_CLAIM_POLL_INTERVAL` | `1s` | How often to re-check storage for an available slot. Shorter = faster pickup, more storage load. |
 | `RIVERS_CLAIM_POLL_JITTER` | `500ms` | Maximum random jitter added to the poll interval to break up correlated retries. |
-| `RIVERS_CLAIM_TIMEOUT` | `600s` (~10 min) | Total time a step waits for a slot before failing with a claim timeout. |
+| `RIVERS_CLAIM_TIMEOUT` | `600s` (~10 min) | Total time a step waits for a slot before failing with a claim timeout. Time spent waiting on an asset's own pool (behind an exclusive [action](../concepts/actions.md)) does not count. |
 
 ## Operator
 
