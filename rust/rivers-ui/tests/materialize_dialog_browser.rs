@@ -11,12 +11,14 @@
 mod common;
 
 use common::{click, flush_effects, fresh_mount_target, nav_to, query_all, query_one};
+use std::collections::HashMap;
+
 use leptos::mount::mount_to;
 use leptos::prelude::*;
 use leptos_router::components::Router;
 use rivers_ui::components::materialize_dialog::MaterializeDialog;
 use rivers_ui::helpers::JobPartitionPicker;
-use rivers_ui::types::PartitionDimensionInfo;
+use rivers_ui::types::{AssetActionInfo, PartitionDimensionInfo};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::HtmlInputElement;
@@ -32,6 +34,7 @@ fn mount_no_picker(show: RwSignal<bool>, asset_keys: Vec<String>) -> web_sys::Ht
                 <MaterializeDialog
                     show=show
                     asset_keys=Signal::derive(move || asset_keys.clone())
+                    records=Signal::derive(HashMap::new)
                 />
             </Router>
         }
@@ -57,6 +60,7 @@ fn mount_with_picker(
                 <MaterializeDialog
                     show=show
                     asset_keys=Signal::derive(move || asset_keys.clone())
+                    records=Signal::derive(HashMap::new)
                     picker=picker_signal
                 />
             </Router>
@@ -420,6 +424,7 @@ async fn reopening_unpartitioned_drops_the_previous_partition_keys() {
                 <MaterializeDialog
                     show=show
                     asset_keys=Signal::derive(|| vec!["a".to_string()])
+                    records=Signal::derive(HashMap::new)
                     picker=Signal::derive(move || picker.get())
                 />
             </Router>
@@ -468,7 +473,16 @@ async fn destructive_verb_is_named_and_flagged() {
                 <MaterializeDialog
                     show=show
                     asset_keys=Signal::derive(|| vec!["a".to_string()])
-                    action=Signal::derive(|| Some("purge".to_string()))
+                    records=Signal::derive(HashMap::new)
+                    action=Signal::derive(|| {
+                        Some(AssetActionInfo {
+                            name: "purge".to_string(),
+                            outcome: "unmaterialize".to_string(),
+                            exclusive: true,
+                            partitioning: "optional".to_string(),
+                            description: None,
+                        })
+                    })
                     destructive=Signal::derive(|| true)
                 />
             </Router>

@@ -12,6 +12,7 @@
 mod common;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use common::{
@@ -193,6 +194,7 @@ async fn materialize_success_redirects_to_run_detail() {
                 <MaterializeDialog
                     show=show
                     asset_keys=Signal::derive(move || assets.clone())
+                    records=Signal::derive(HashMap::new)
                 />
             </Router>
         }
