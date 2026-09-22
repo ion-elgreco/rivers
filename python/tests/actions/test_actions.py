@@ -770,6 +770,102 @@ def test_keyless_observe_job_on_partitioned_observable_is_allowed():
     assert repo.storage.get_run(result.run_id).action == "observe"
 
 
+def _queued_vacuum_repo(storage, calls, **repo_kwargs):
+    """Partitioned table with a whole-asset `vacuum` and an Optional `purge`,
+    each behind a Job, in run-queue mode."""
+
+    class Events(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext):
+            return context.partition_key
+
+        @rs.action(
+            outcome=rs.Outcome.Unchanged,
+            partitioning=rs.ActionPartitioning.Keyless,
+        )
+        @classmethod
+        def vacuum(cls, ctx):
+            calls.append(("vacuum", ctx.has_partition_key))
+
+        @rs.action(
+            outcome=rs.Outcome.Unmaterialize,
+            partitioning=rs.ActionPartitioning.Optional,
+        )
+        @classmethod
+        def purge(cls, ctx):
+            calls.append(("purge", ctx.has_partition_key))
+
+    repo = rs.CodeRepository(
+        assets=[Events],
+        jobs=[
+            rs.Job(name="nightly_vacuum", assets=[Events], action="vacuum"),
+            rs.Job(name="purge_job", assets=[Events], action="purge"),
+        ],
+        default_executor=IP,
+        run_queue=rs.RunQueueConfig(max_concurrent_runs=2, dequeue_interval="50ms"),
+        **repo_kwargs,
+    )
+    repo.resolve(storage=storage)
+    return repo
+
+
+def test_queued_action_job_validates_partitions_for_its_verb(storage):
+    """The run queue must apply the job's verb to the partition check — it
+    checked materialize rules, so a whole-asset verb could never be queued
+    without a key, and a key it must refuse was accepted and failed at launch."""
+    repo = _queued_vacuum_repo(storage, [])
+
+    handle = repo._submit_run(job_name="nightly_vacuum")
+    run = repo.storage.get_run(handle.run_id)
+    assert (run.status, run.action, run.partition_key) == ("Queued", "vacuum", None)
+
+    with pytest.raises(Exception, match="Action 'vacuum' is whole-asset"):
+        repo._submit_run(
+            job_name="nightly_vacuum", partition_key=rs.PartitionKey.single("p1")
+        )
+
+    # An Optional verb takes either form.
+    keyless = repo.storage.get_run(repo._submit_run(job_name="purge_job").run_id)
+    assert (keyless.action, keyless.partition_key) == ("purge", None)
+    keyed = repo._submit_run(
+        job_name="purge_job", partition_key=rs.PartitionKey.single("p2")
+    )
+    assert repo.storage.get_run(keyed.run_id).action == "purge"
+
+
+def test_scheduled_whole_asset_action_job_runs_through_the_queue(storage):
+    """The documented nightly-maintenance pattern — a Schedule over an action
+    Job — on a partitioned asset in run-queue mode. Every tick failed with
+    "Cannot run 'materialize' without partition_key" before."""
+    calls = []
+
+    @rs.Schedule(
+        cron_schedule="* * * * * *",
+        job_name="nightly_vacuum",
+        name="vacuum_schedule",
+        default_status=rs.ScheduleStatus.Running,
+    )
+    def vacuum_schedule(context: rs.ScheduleEvaluationContext):
+        return rs.RunRequest()
+
+    repo = _queued_vacuum_repo(storage, calls, schedules=[vacuum_schedule])
+    daemon = AutomationDaemon(repo=repo, storage=storage, condition_eval_interval="1m")
+    daemon.start()
+    try:
+        assert wait_until(lambda: ("vacuum", False) in calls, timeout=20), (
+            f"no vacuum ran; runs: {[(r.status, r.action) for r in storage.get_runs(limit=20)]}"
+        )
+    finally:
+        daemon.stop()
+
+    ran = [r for r in storage.get_runs(limit=20) if r.action == "vacuum"]
+    assert ran and all(r.partition_key is None for r in ran)
+    assert any(r.status == "Success" for r in ran)
+
+
 def test_keyed_observe_sees_its_partition_key():
     """A keyed observe records its result against that partition, so the body
     has to be able to see which one it is."""

@@ -221,6 +221,7 @@ class CodeRepository:
         self,
         selection: list[str] | None = None,
         partition_key: PartitionKey | None = None,
+        job_name: str | None = None,
     ) -> "RunHandle":
         """(Internal) submit a run to the queue and return a handle."""
         ...

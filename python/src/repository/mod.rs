@@ -1604,10 +1604,13 @@ impl RepoHandle {
                     .collect()
             };
 
-            validate_partition_for_selection(
+            // The record carries the job's verb, so the key must satisfy it.
+            let action = job_action(&state.jobs_info, job_name.as_deref());
+            validate_partition_for_verb(
                 state,
                 asset_names.iter().map(String::as_str),
                 partition_key,
+                action.as_deref(),
             )?;
             let dyn_checks = dynamic_partition_checks(
                 state,
@@ -1620,7 +1623,6 @@ impl RepoHandle {
             let run_tags = tags.unwrap_or_default();
             let core_pk = partition_key.map(|pk| pk.into());
             let priority = priority_from_tags(&run_tags);
-            let action = job_action(&state.jobs_info, job_name.as_deref());
 
             let record = RunRecord {
                 run_id,
@@ -1687,10 +1689,17 @@ impl RepoHandle {
 
             for sub in &runs {
                 let asset_names = sub.selection.clone().unwrap_or_else(|| all_names.clone());
-                validate_partition_for_selection(
+                // A job target carries its own verb; `sub.action` is the
+                // selection-target verb from `backfill(action=...)`.
+                let action = sub
+                    .action
+                    .clone()
+                    .or_else(|| job_action(&state.jobs_info, sub.job_name.as_deref()));
+                validate_partition_for_verb(
                     state,
                     asset_names.iter().map(String::as_str),
                     sub.partition_key.as_ref(),
+                    action.as_deref(),
                 )?;
                 dyn_checks.extend(dynamic_partition_checks(
                     state,
@@ -1701,12 +1710,6 @@ impl RepoHandle {
                 let run_tags = sub.tags.clone().unwrap_or_default();
                 let priority = priority_from_tags(&run_tags);
                 let core_pk = sub.partition_key.as_ref().map(|pk| pk.into());
-                // A job target carries its own verb; `sub.action` is the
-                // selection-target verb from `backfill(action=...)`.
-                let action = sub
-                    .action
-                    .clone()
-                    .or_else(|| job_action(&state.jobs_info, sub.job_name.as_deref()));
 
                 records.push(RunRecord {
                     run_id,
@@ -4190,13 +4193,15 @@ impl PyCodeRepository {
         self.teardown_resources(py);
     }
 
-    /// Test helper. Only works when run_queue is configured.
-    #[pyo3(signature = (selection=None, partition_key=None))]
+    /// Test helper. Only works when run_queue is configured. `job_name`
+    /// submits the way the queued dispatcher does: the job's assets and verb.
+    #[pyo3(signature = (selection=None, partition_key=None, job_name=None))]
     fn _submit_run(
         &self,
         py: Python,
         selection: Option<Vec<String>>,
         partition_key: Option<PyPartitionKey>,
+        job_name: Option<String>,
     ) -> PyResult<PyRunHandle> {
         if !self.has_run_queue() {
             return Err(ExecutionError::new_err(
@@ -4208,13 +4213,17 @@ impl PyCodeRepository {
         // resolve and bypass this helper.
         let _guard = self.ensure_resolved()?;
         drop(_guard);
+        let selection = match &job_name {
+            Some(job) if selection.is_none() => self.handle().job_asset_names(job),
+            _ => selection,
+        };
         py.detach(|| {
             io_rt().block_on(self.submit_run(
                 selection,
                 partition_key.as_ref(),
                 None,
                 LaunchedBy::Manual { user: None },
-                None,
+                job_name,
             ))
         })
     }
