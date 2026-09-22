@@ -530,6 +530,111 @@ async fn canceled_delete_still_evicts_deleted_partitions() {
     );
 }
 
+/// A keyless delete of a partitioned asset (an `Optional` verb run without a
+/// key) drops every partition row at once. The run names no keys, so the
+/// touched-key re-check has nothing to probe — the cache must still evict
+/// them all, while a partition materialized after the deletion stays.
+#[tokio::test]
+async fn keyless_delete_evicts_every_cached_partition() {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+    let single = |k: &str| PartitionKey::Single {
+        keys: vec![k.to_string()],
+    };
+
+    storage
+        .create_run(&mk_run("r0", RunStatus::Success, &["events"], 1000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&mat_events_for(&cl, "events", &["p1", "p2", "p3"], 1000))
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(cl.clone());
+    cache.set_partitioned_assets(vec!["events".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+    assert_eq!(
+        cache.partition_status.get("events").unwrap().timestamps.len(),
+        3,
+        "all three partitions cached after initial load"
+    );
+
+    let mut del = mk_run("r1", RunStatus::Started, &["events"], 2000);
+    del.end_time = None;
+    del.action = Some("delete".to_string());
+    storage.create_run(&del).await.unwrap();
+    let mut whole = deletion_event(&cl, "events", "r1", "p1", 2000);
+    whole.partition_key = None;
+    storage.store_events(&[whole]).await.unwrap();
+    storage
+        .update_run_status("r1", RunStatus::Success, Some(2000))
+        .await
+        .unwrap();
+
+    cache.refresh(&storage, 1).await.unwrap();
+    let cached: Vec<&PartitionKey> = cache
+        .partition_status
+        .get("events")
+        .unwrap()
+        .timestamps
+        .keys()
+        .collect();
+    assert!(
+        cached.is_empty(),
+        "a keyless delete must evict every cached partition, still cached: {cached:?}"
+    );
+
+    // A later materialization of p2 comes back through the normal fetch.
+    storage
+        .create_run(&mk_run("r2", RunStatus::Success, &["events"], 3000))
+        .await
+        .unwrap();
+    let mut rebuilt = mat_events_for(&cl, "events", &["p2"], 3000);
+    rebuilt[0].run_id = "r2".to_string();
+    storage.store_events(&rebuilt).await.unwrap();
+    cache.refresh(&storage, 2).await.unwrap();
+    let status = cache.partition_status.get("events").unwrap();
+    assert!(status.timestamps.contains_key(&single("p2")));
+    assert_eq!(status.timestamps.len(), 1);
+}
+
+/// A keyless action that deletes nothing (optimize, vacuum) must leave the
+/// cached partitions alone — only a whole-asset deletion triggers the reload.
+#[tokio::test]
+async fn keyless_action_without_deletion_keeps_cached_partitions() {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+
+    storage
+        .create_run(&mk_run("r0", RunStatus::Success, &["events"], 1000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&mat_events_for(&cl, "events", &["p1", "p2"], 1000))
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(cl.clone());
+    cache.set_partitioned_assets(vec!["events".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let mut opt = mk_run("r1", RunStatus::Success, &["events"], 2000);
+    opt.action = Some("optimize".to_string());
+    storage.create_run(&opt).await.unwrap();
+
+    cache.refresh(&storage, 1).await.unwrap();
+    assert_eq!(
+        cache.partition_status.get("events").unwrap().timestamps.len(),
+        2,
+        "a keyless action without a deletion must not evict partitions"
+    );
+}
+
 fn mat_events_for(
     cl: &str,
     asset: &str,

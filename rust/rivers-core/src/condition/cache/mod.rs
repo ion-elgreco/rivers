@@ -33,6 +33,9 @@ pub struct AssetConditionCache {
     pub failed_assets: HashSet<String>,
     /// Latest failure timestamp per currently-failed asset.
     pub failed_asset_timestamps: HashMap<String, i64>,
+    /// Newest whole-asset deletion seen per asset. A newer one means every
+    /// partition row was dropped, so the asset's partitions are reloaded.
+    pub asset_deletion_ts: HashMap<String, i64>,
     /// Timestamp of the most recent run seen (for cursor-based queries).
     pub last_seen_run_ts: i64,
     /// Timestamp of the most recent observation event seen (cursor for external assets).
@@ -101,6 +104,7 @@ impl AssetConditionCache {
             live_action_runs: HashMap::new(),
             failed_assets: HashSet::new(),
             failed_asset_timestamps: HashMap::new(),
+            asset_deletion_ts: HashMap::new(),
             last_seen_run_ts: 0,
             last_observation_ts: 0,
             initialized: false,
@@ -410,6 +414,7 @@ impl AssetConditionCache {
         let floors = &self.failed_asset_timestamps;
         self.failed_assets
             .retain(|asset| floors.contains_key(asset));
+        self.asset_deletion_ts = deletion_ts;
 
         let last_run_ids: Vec<String> = self
             .records

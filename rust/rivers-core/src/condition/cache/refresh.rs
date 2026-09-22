@@ -254,6 +254,7 @@ impl AssetConditionCache {
                     );
                     delta.untrack_action_runs.push(run_id.clone());
                     invalidated_keys.extend(live.node_names.iter().cloned());
+                    action_completed_assets.extend(live.node_names.iter().cloned());
                     self.queue_action_partition_checks(
                         &live.node_names,
                         live.partition_key.as_ref(),
@@ -375,6 +376,15 @@ impl AssetConditionCache {
                         .and_modify(|t| *t = (*t).max(del))
                         .or_insert(del);
                     delta.deletion_supersessions.push((asset.clone(), del));
+                    // A new whole-asset deletion dropped every partition row,
+                    // and the run names no keys to re-check — reload them all.
+                    let new_deletion = self
+                        .asset_deletion_ts
+                        .get(asset.as_str())
+                        .is_none_or(|&seen| del > seen);
+                    if new_deletion && self.is_partitioned(asset) {
+                        delta.partition_reloads.insert(asset.clone());
+                    }
                 }
             }
         }
@@ -391,6 +401,7 @@ impl AssetConditionCache {
                     storage,
                     &invalidated_keys,
                     &delta.action_partition_checks,
+                    &delta.partition_reloads,
                 )
                 .await?;
             delta.partition_status = partition_status;
@@ -611,11 +622,15 @@ impl AssetConditionCache {
     /// `action_checks` holds partition keys touched by completed action runs:
     /// their rows are re-fetched by key, and keys with no row (deleted) are
     /// marked for eviction — the incremental fetch can't observe deletions.
+    /// `reloads` are assets whose rows were all dropped by a whole-asset
+    /// deletion: they are fetched in full and every cached key without a row
+    /// is evicted.
     pub(super) async fn fetch_partition_status_for_invalidated<S: StorageBackend>(
         &self,
         storage: &S,
         invalidated_keys: &[String],
         action_checks: &HashMap<String, HashSet<PartitionKey>>,
+        reloads: &HashSet<String>,
     ) -> anyhow::Result<HashMap<String, PartitionStatusPatch>> {
         let scoped = storage.for_code_location(&self.ctx);
         let mut out: HashMap<String, PartitionStatusPatch> = HashMap::new();
@@ -629,13 +644,18 @@ impl AssetConditionCache {
             // the dominant per-tick cost at large partition counts. The cursor
             // trails the max by 1 (like the run cursor): equal stamps from one
             // batched `now` can land in a later refresh.
-            let since = current
-                .timestamps
-                .values()
-                .copied()
-                .max()
-                .map(|m| m - 1)
-                .unwrap_or(-1);
+            let reload = reloads.contains(asset_key.as_str());
+            let since = if reload {
+                -1
+            } else {
+                current
+                    .timestamps
+                    .values()
+                    .copied()
+                    .max()
+                    .map(|m| m - 1)
+                    .unwrap_or(-1)
+            };
             let fresh_timestamps = scoped
                 .get_partition_timestamps_since(asset_key, since)
                 .await?;
@@ -650,7 +670,7 @@ impl AssetConditionCache {
             let failed = scoped
                 .get_failed_partitions(asset_key, &current.timestamps)
                 .await?;
-            let deleted = match action_checks.get(asset_key.as_str()) {
+            let mut deleted = match action_checks.get(asset_key.as_str()) {
                 Some(touched) if !touched.is_empty() => {
                     let touched: Vec<PartitionKey> = touched.iter().cloned().collect();
                     let existing: HashSet<PartitionKey> = scoped
@@ -666,6 +686,17 @@ impl AssetConditionCache {
                 }
                 _ => HashSet::new(),
             };
+            if reload {
+                let live: HashSet<&PartitionKey> =
+                    fresh_timestamps.iter().map(|(pk, _)| pk).collect();
+                deleted.extend(
+                    current
+                        .timestamps
+                        .keys()
+                        .filter(|pk| !live.contains(pk))
+                        .cloned(),
+                );
+            }
             out.insert(
                 asset_key.clone(),
                 PartitionStatusPatch {
@@ -734,6 +765,7 @@ impl AssetConditionCache {
             partition_status,
             // Consumed by the plan-phase invalidated fetch, not the apply.
             action_partition_checks: _,
+            partition_reloads: _,
             backfill,
             new_last_seen_run_ts,
             new_last_observation_ts,
@@ -818,6 +850,10 @@ impl AssetConditionCache {
         // the record is gone, and a restart would adopt nothing. Runs after
         // the deletion (applied above with a newer entry ts) survive.
         for (asset, del_ts) in deletion_supersessions {
+            self.asset_deletion_ts
+                .entry(asset.clone())
+                .and_modify(|t| *t = (*t).max(del_ts))
+                .or_insert(del_ts);
             let stale: Vec<Option<PartitionKey>> = self
                 .last_run_entry_ts
                 .iter()

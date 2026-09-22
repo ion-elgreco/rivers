@@ -149,6 +149,9 @@ pub(super) struct RefreshDelta {
     /// incremental timestamp fetch can't see row deletions, so these keys
     /// are re-checked for existence and evicted when gone.
     pub(super) action_partition_checks: HashMap<String, HashSet<PartitionKey>>,
+    /// Partitioned assets with a new whole-asset deletion: every row was
+    /// dropped, so their partition status is re-fetched in full.
+    pub(super) partition_reloads: HashSet<String>,
     /// Replacement `BackfillState`, if any backfill query happened.
     pub(super) backfill: Option<BackfillState>,
     /// New cursor values; `None` means don't advance.
