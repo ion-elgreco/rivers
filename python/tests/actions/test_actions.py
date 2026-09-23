@@ -2785,6 +2785,50 @@ def test_backfill_request_carries_the_action(storage):
     assert calls == ["p1"]
 
 
+def test_backfill_of_a_whole_asset_verb_is_rejected_up_front():
+    """A backfill always runs keyed, and a whole-asset verb refuses keys — so
+    such a backfill can never succeed. It was accepted (a dry run even
+    reported the runs) and every child failed at launch."""
+    calls = []
+
+    class Events(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext):
+            return context.partition_key
+
+        @rs.action(outcome=rs.Outcome.Unchanged, partitioning=rs.ActionPartitioning.Keyless)
+        @classmethod
+        def optimize(cls, ctx):
+            calls.append(ctx.asset_name)
+
+    repo = rs.CodeRepository(
+        assets=[Events],
+        jobs=[rs.Job(name="nightly_optimize", assets=[Events], action="optimize")],
+        default_executor=IP,
+    )
+    keys = [rs.PartitionKey.single("p1"), rs.PartitionKey.single("p2")]
+    for k in keys:
+        repo.materialize(partition_key=k)
+    runs_before = len(repo.storage.get_runs(limit=50))
+
+    for dry_run in (True, False):
+        with pytest.raises(Exception, match="Action 'optimize' is whole-asset"):
+            repo.backfill(
+                selection=["events"], partition_keys=keys, action="optimize", dry_run=dry_run
+            )
+    with pytest.raises(Exception, match="Action 'optimize' is whole-asset"):
+        repo.backfill(
+            selection=["events"],
+            partition_range=rs.PartitionKeyRange.single("p1", "p2"),
+            action="optimize",
+        )
+    assert calls == []
+    assert len(repo.storage.get_runs(limit=50)) == runs_before
+
+
 def test_empty_action_backfill_selection_is_rejected(storage):
     """An empty selection with a verb ran the verb on every asset declaring
     it — a sensor that filtered its candidates down to [] fanned a delete

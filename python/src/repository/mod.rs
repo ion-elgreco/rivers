@@ -4126,13 +4126,18 @@ impl PyCodeRepository {
                         })?,
                     None => record.asset_selection.clone(),
                 };
+                let verb = record
+                    .action
+                    .clone()
+                    .or_else(|| job_action(&state.jobs_info, record.job_name.as_deref()));
                 let candidates: Vec<(PyPartitionKey, Vec<DynamicKeyCheck>)> = partition_keys
                     .into_iter()
                     .filter(|key| {
-                        validate_partition_for_selection(
+                        validate_partition_for_verb(
                             state,
                             selection_names.iter().map(String::as_str),
                             Some(key),
+                            verb.as_deref(),
                         )
                         .is_ok()
                     })
@@ -4468,18 +4473,24 @@ impl PyCodeRepository {
             ));
         }
 
+        // What the children execute: the selection's verb, or the job's own.
+        let child_verb = action
+            .clone()
+            .or_else(|| job_action(&state.jobs_info, job_name.as_deref()));
         let resolved_keys: Vec<PyPartitionKey> = if let Some(keys) = partition_keys {
             if keys.is_empty() {
                 return Err(ExecutionError::new_err("partition_keys must not be empty"));
             }
             // repo.backfill() and gRPC LaunchBackfill are boundaries — reject
             // invalid keys here like `materialize` does, instead of persisting
-            // a BackfillRecord that counts them and fails per-run later.
+            // a BackfillRecord that counts them and fails per-run later. The
+            // children run the verb, so the key must satisfy it.
             for key in &keys {
-                validate_partition_for_selection(
+                validate_partition_for_verb(
                     state,
                     selection.iter().map(String::as_str),
                     Some(key),
+                    child_verb.as_deref(),
                 )?;
             }
             keys
@@ -4506,10 +4517,11 @@ impl PyCodeRepository {
             // partitioned assets must accept each key too, same boundary
             // contract as the explicit-keys branch.
             for key in &resolved {
-                validate_partition_for_selection(
+                validate_partition_for_verb(
                     state,
                     selection.iter().map(String::as_str),
                     Some(key),
+                    child_verb.as_deref(),
                 )?;
             }
             resolved
