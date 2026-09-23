@@ -305,6 +305,14 @@ def _connect_to(monkeypatch, path):
     return store, endpoints
 
 
+def _use_endpoint(monkeypatch, via):
+    """Name ENDPOINT by flag, or by env var as the operator sets it on a pod."""
+    if via == "env":
+        monkeypatch.setenv("RIVERS_SURREAL_ENDPOINT", ENDPOINT)
+        return []
+    return ["--surreal-endpoint", ENDPOINT]
+
+
 @pytest.mark.parametrize("command", ["run-action", "backfill"])
 def test_a_storage_path_the_user_passes_keeps_the_verbs_state(
     resolved_tmp_path, command
@@ -326,70 +334,55 @@ def test_a_storage_path_the_user_passes_keeps_the_verbs_state(
     _assert_events_p1_purged(embedded_storage(str(path)))
 
 
+@pytest.mark.parametrize("via", ["flag", "env"])
 @pytest.mark.parametrize("command", ["run-action", "backfill"])
 def test_surreal_endpoint_records_the_verb_in_the_shared_store(
-    resolved_tmp_path, monkeypatch, command
+    resolved_tmp_path, monkeypatch, command, via
 ):
     """A delete from the CLI must land in the store the code location reads,
-    not in a scratch store that no other process sees."""
-    module = f"defs_remote_{command.replace('-', '_')}"
+    not in a scratch store that no other process sees. A cron pod names that
+    store only by `RIVERS_SURREAL_ENDPOINT`."""
+    module = f"defs_remote_{command.replace('-', '_')}_{via}"
     _write_module(resolved_tmp_path, module, PURGE_MODULE)
     store, endpoints = _connect_to(monkeypatch, resolved_tmp_path / "shared_db")
+    endpoint_args = _use_endpoint(monkeypatch, via)
 
     for args in (
         ["materialize", module, "--partition-key", "p1"],
         _purge_events_p1(command, module),
     ):
-        done = runner.invoke(app, [*args, "--surreal-endpoint", ENDPOINT])
-        assert done.exit_code == 0, done.output
+        done = runner.invoke(app, [*args, *endpoint_args])
+        assert done.exit_code == 0, done.output or done.exception
 
     assert endpoints == [ENDPOINT, ENDPOINT]
     assert not (resolved_tmp_path / ".rivers").exists()
     _assert_events_p1_purged(store)
 
 
+@pytest.mark.parametrize("via", ["flag", "env"])
 def test_backfill_status_and_cancel_read_the_shared_store(
-    resolved_tmp_path, monkeypatch
+    resolved_tmp_path, monkeypatch, via
 ):
-    _write_module(resolved_tmp_path, "defs_remote_status", PURGE_MODULE)
+    module = f"defs_remote_status_{via}"
+    _write_module(resolved_tmp_path, module, PURGE_MODULE)
     store, endpoints = _connect_to(monkeypatch, resolved_tmp_path / "shared_db")
-    ran = runner.invoke(
-        app,
-        [
-            *_purge_events_p1("backfill", "defs_remote_status"),
-            "--surreal-endpoint",
-            ENDPOINT,
-        ],
-    )
-    assert ran.exit_code == 0, ran.output
+    endpoint_args = _use_endpoint(monkeypatch, via)
+    ran = runner.invoke(app, [*_purge_events_p1("backfill", module), *endpoint_args])
+    assert ran.exit_code == 0, ran.output or ran.exception
     (run,) = [r for r in store.get_runs() if r.action == "purge"]
     backfill_id = run.launched_by.backfill_id
 
     status = runner.invoke(
-        app,
-        [
-            "backfill-status",
-            backfill_id,
-            "defs_remote_status",
-            "--surreal-endpoint",
-            ENDPOINT,
-        ],
+        app, ["backfill-status", backfill_id, module, *endpoint_args]
     )
-    assert status.exit_code == 0, status.output
+    assert status.exit_code == 0, status.output or status.exception
     assert f"Backfill {backfill_id}: CompletedSuccess" in status.output
     assert "Action: purge" in status.output
 
     canceled = runner.invoke(
-        app,
-        [
-            "backfill-cancel",
-            backfill_id,
-            "defs_remote_status",
-            "--surreal-endpoint",
-            ENDPOINT,
-        ],
+        app, ["backfill-cancel", backfill_id, module, *endpoint_args]
     )
-    assert canceled.exit_code == 0, canceled.output
+    assert canceled.exit_code == 0, canceled.output or canceled.exception
     assert endpoints == [ENDPOINT] * 3
 
 

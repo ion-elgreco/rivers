@@ -21,11 +21,13 @@ rivers materialize my_pipeline --repo-var pipeline_repo
 
 | Flag | Description |
 |------|-------------|
-| `--surreal-endpoint` | Remote SurrealDB endpoint, e.g. `ws://surrealdb:8000`. Overrides `--storage-path` and `--memory`. |
+| `--surreal-endpoint` | Remote SurrealDB endpoint, e.g. `ws://surrealdb:8000`. Also read from `RIVERS_SURREAL_ENDPOINT`. Overrides `--storage-path` and `--memory`. |
 | `--storage-path` | Embedded SurrealDB+RocksDB path. Kept at exit. |
 | `--memory` | In-memory storage, lost at exit. |
 
-Without `--surreal-endpoint` or `--storage-path`, the run's state and its pool claims go to a scratch store at `.rivers/storage/`. The CLI removes that store at exit, and no other process reads it. So a `delete` removes the real data, but the code location never sees the deletion, and the verb's pool claims do not block the code location's runs. To act on a code location's data, point the command at the storage that the code location uses.
+When `RIVERS_SURREAL_ENDPOINT` is set (the operator sets it on rivers pods), these commands use that endpoint without the flag, and it also overrides `--storage-path` and `--memory`.
+
+Without `--surreal-endpoint`, `RIVERS_SURREAL_ENDPOINT` or `--storage-path`, the run's state and its pool claims go to a scratch store at `.rivers/storage/`. The CLI removes that store at exit, and no other process reads it. So a `delete` removes the real data, but the code location never sees the deletion, and the verb's pool claims do not block the code location's runs. To act on a code location's data, point the command at the storage that the code location uses.
 
 ---
 

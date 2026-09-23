@@ -475,7 +475,9 @@ def materialize(
         help="Path for embedded storage (default: a scratch store, removed at exit)",
     ),
     surreal_endpoint: str | None = typer.Option(
-        None, help="Remote SurrealDB endpoint (overrides --storage-path)"
+        None,
+        envvar="RIVERS_SURREAL_ENDPOINT",
+        help="Remote SurrealDB endpoint (overrides --storage-path)",
     ),
 ) -> None:
     """Materialize all assets in a repository."""
@@ -509,7 +511,9 @@ def run_action(
         help="Path for embedded storage (default: a scratch store, removed at exit)",
     ),
     surreal_endpoint: str | None = typer.Option(
-        None, help="Remote SurrealDB endpoint (overrides --storage-path)"
+        None,
+        envvar="RIVERS_SURREAL_ENDPOINT",
+        help="Remote SurrealDB endpoint (overrides --storage-path)",
     ),
 ) -> None:
     """Run an asset action (a verb besides materialize) over a selection."""
@@ -615,7 +619,9 @@ def backfill(
         help="Path for embedded storage (default: a scratch store, removed at exit)",
     ),
     surreal_endpoint: str | None = typer.Option(
-        None, help="Remote SurrealDB endpoint (overrides --storage-path)"
+        None,
+        envvar="RIVERS_SURREAL_ENDPOINT",
+        help="Remote SurrealDB endpoint (overrides --storage-path)",
     ),
 ) -> None:
     """Backfill partitions for selected assets."""
@@ -683,7 +689,9 @@ def backfill_status(
         help="Path for embedded storage (default: a scratch store, removed at exit)",
     ),
     surreal_endpoint: str | None = typer.Option(
-        None, help="Remote SurrealDB endpoint (overrides --storage-path)"
+        None,
+        envvar="RIVERS_SURREAL_ENDPOINT",
+        help="Remote SurrealDB endpoint (overrides --storage-path)",
     ),
 ) -> None:
     """Check status of a backfill."""
@@ -720,7 +728,9 @@ def backfill_cancel(
         help="Path for embedded storage (default: a scratch store, removed at exit)",
     ),
     surreal_endpoint: str | None = typer.Option(
-        None, help="Remote SurrealDB endpoint (overrides --storage-path)"
+        None,
+        envvar="RIVERS_SURREAL_ENDPOINT",
+        help="Remote SurrealDB endpoint (overrides --storage-path)",
     ),
 ) -> None:
     """Cancel a running backfill."""
