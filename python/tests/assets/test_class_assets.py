@@ -743,6 +743,35 @@ def test_assetdef_shared_across_classes_is_an_error():
         rs.CodeRepository(assets=[First, Second], default_executor=IP).resolve()
 
 
+def test_same_asset_listed_twice_registers_once():
+    """Composing asset lists (`[*common, *team_a]`) can list one asset twice.
+    That is one definition, not two: the duplicate-name check rejected it.
+    Two *different* definitions under one name still fail."""
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler())
+    def orders() -> int:
+        return 1
+
+    class Customers(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+
+        @classmethod
+        def materialize(cls) -> int:
+            return 2
+
+    common = [orders, Customers]
+    repo = rs.CodeRepository(assets=[*common, orders, Customers], default_executor=IP)
+    repo.resolve()
+    assert repo.materialize().success
+
+    @rs.Asset(name="orders", io_handler=rs.InMemoryIOHandler())
+    def other_orders() -> int:
+        return 3
+
+    with pytest.raises(AssetDefinitionError, match="duplicate asset name 'orders'"):
+        rs.CodeRepository(assets=[orders, other_orders], default_executor=IP).resolve()
+
+
 def test_declared_config_reads_back_off_the_asset():
     """Attributes the stubs declare must exist at runtime — `retry`, `compute`
     and `backfill_strategy` raised AttributeError while type-checking clean."""

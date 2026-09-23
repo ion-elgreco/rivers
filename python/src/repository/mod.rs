@@ -3556,7 +3556,14 @@ impl PyCodeRepository {
         // Class-form assets (types subclassing Asset) desugar here — at
         // registration, not at class creation.
         let mut raw_assets: Vec<Py<PyAsset>> = Vec::with_capacity(assets.len());
+        // Composed lists (`[*common, *team_a]`) may name one asset twice; that
+        // is one definition, registered once. Distinct definitions sharing a
+        // name still fail at resolve.
+        let mut seen: HashSet<usize> = HashSet::new();
         for item in &assets {
+            if !seen.insert(item.as_ptr() as usize) {
+                continue;
+            }
             if let Ok(instance) = item.extract::<Py<PyAsset>>() {
                 raw_assets.push(instance);
             } else if let Ok(t) = item.cast::<pyo3::types::PyType>() {
