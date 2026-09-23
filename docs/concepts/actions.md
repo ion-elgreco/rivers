@@ -88,6 +88,11 @@ rs.Job(name="nightly_optimize", assets=[Orders, Customers], action="optimize")
 rs.Schedule(cron_schedule="0 3 * * *", job_name="nightly_optimize")
 ```
 
+A `RunRequest` from that schedule runs the job, so it runs the verb. A
+`BackfillRequest` names its own selection and does **not** take the job's verb —
+pass it explicitly (`rs.BackfillRequest(selection=[...], partition_keys=..., action="delete")`),
+or the backfill materializes.
+
 The UI shows a button per action on the asset page, and action runs display their
 verb in the runs list and run header. A verb declaring `Outcome.Unmaterialize`
 renders as a danger button and always routes through the confirmation dialog,

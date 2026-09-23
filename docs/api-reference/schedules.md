@@ -184,7 +184,7 @@ def weekly_recompute(context: rs.ScheduleEvaluationContext):
 | `failure_policy` | `str \| None` | `"continue"` | `"continue"` or `"stop_on_failure"`. |
 | `max_concurrency` | `int` | `4` | Max concurrent partition runs. |
 | `tags` | `dict[str, str] \| None` | `None` | Tags applied to every spawned run. |
-| `action` | `str \| None` | `None` | Verb the spawned runs execute instead of materializing. |
+| `action` | `str \| None` | `None` | Verb the spawned runs execute instead of materializing. Not taken from the schedule's job: a schedule on an action job that yields a `BackfillRequest` must pass the verb here, or the backfill materializes. |
 
 ---
 
