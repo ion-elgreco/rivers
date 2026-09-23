@@ -780,10 +780,20 @@ mod tests {
             .into_iter()
             .map(|r| (r.asset_key, r.last_deletion_timestamp))
             .collect();
-        assert_eq!(by_key["report"], Some(3000), "the newest whole-asset deletion");
-        assert_eq!(by_key["kept"], None, "an asset never deleted has no tombstone");
+        assert_eq!(
+            by_key["report"],
+            Some(3000),
+            "the newest whole-asset deletion"
+        );
+        assert_eq!(
+            by_key["kept"], None,
+            "an asset never deleted has no tombstone"
+        );
         assert_eq!(tombs.len(), 1);
-        assert_eq!((tombs[0].asset_key.as_str(), tombs[0].timestamp), ("events", 4000));
+        assert_eq!(
+            (tombs[0].asset_key.as_str(), tombs[0].timestamp),
+            ("events", 4000)
+        );
     }
 
     /// V5 adds `exclusive`/`partitions` to a SCHEMAFULL table. `DEFAULT` only

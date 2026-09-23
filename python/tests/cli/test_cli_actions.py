@@ -70,7 +70,14 @@ def test_run_action_command_runs_the_verb(resolved_tmp_path):
     _write_module(resolved_tmp_path, "defs_run_action")
     result = runner.invoke(
         app,
-        ["run-action", "defs_run_action", "compact", "--partition-key", "p1", "--memory"],
+        [
+            "run-action",
+            "defs_run_action",
+            "compact",
+            "--partition-key",
+            "p1",
+            "--memory",
+        ],
     )
     assert result.exit_code == 0, result.output
     assert "compact" in result.output
@@ -98,7 +105,9 @@ def test_queue_commands_name_the_verb(resolved_tmp_path, monkeypatch):
     path = str(resolved_tmp_path / "queue_db")
     storage = embedded_storage(path)
     # An ad-hoc run (no job) crashed `queue list` on its None job name.
-    storage._create_run("q-purge", "", "Queued", 1000, node_names=["events"], action="delete")
+    storage._create_run(
+        "q-purge", "", "Queued", 1000, node_names=["events"], action="delete"
+    )
     storage._create_run("q-etl", "etl", "Queued", 2000)
     # RocksDB allows one opener per process: hand the CLI the open store.
     monkeypatch.setattr(

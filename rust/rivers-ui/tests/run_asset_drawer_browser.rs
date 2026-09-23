@@ -99,7 +99,10 @@ async fn deletion_events_show_in_the_asset_drawer() {
         .iter()
         .filter_map(|e| e.text_content())
         .collect();
-    assert!(kv.iter().any(|t| t == "DELETIONS1"), "no deletion count: {kv:?}");
+    assert!(
+        kv.iter().any(|t| t == "DELETIONS1"),
+        "no deletion count: {kv:?}"
+    );
     // Four event kinds, one row each, and no step events.
     assert!(kv.iter().any(|t| t == "EVENTS4"), "events count: {kv:?}");
 }

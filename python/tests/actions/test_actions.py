@@ -775,9 +775,9 @@ def test_keyless_observe_job_on_partitioned_observable_is_allowed():
 
 
 def _vacuumable(name, keys, partitioning):
-    vacuum = rs.AssetAction(name="vacuum", outcome=rs.Outcome.Unchanged, partitioning=partitioning)(
-        lambda ctx: None
-    )
+    vacuum = rs.AssetAction(
+        name="vacuum", outcome=rs.Outcome.Unchanged, partitioning=partitioning
+    )(lambda ctx: None)
     return rs.Asset(
         name=name,
         io_handler=rs.InMemoryIOHandler(),
@@ -814,7 +814,9 @@ def test_action_job_mixing_keyed_and_whole_asset_targets_is_rejected():
     and needs a key on another can never run as one job — say so at resolve."""
     daily = _vacuumable("daily", ["2024-01-01"], rs.ActionPartitioning.Keyless)
     region = _vacuumable("region", ["2024-01-01"], rs.ActionPartitioning.Required)
-    with pytest.raises(Exception, match="whole-asset on .*daily.* but needs a key on .*region"):
+    with pytest.raises(
+        Exception, match="whole-asset on .*daily.* but needs a key on .*region"
+    ):
         rs.CodeRepository(
             assets=[daily, region],
             jobs=[rs.Job(name="mixed", assets=[daily, region], action="vacuum")],
@@ -1228,7 +1230,9 @@ def test_resume_skips_completed_action_steps():
     )
     assert not result.success
     assert calls.count("first") == 1, "a completed action step re-ran its side effect"
-    assert calls.count("second") == 1, "a failed action step without a retry policy re-ran"
+    assert calls.count("second") == 1, (
+        "a failed action step without a retry policy re-ran"
+    )
 
 
 _INTERRUPTED_ACTION_SCRIPT = textwrap.dedent(
@@ -1300,7 +1304,15 @@ def test_resume_runs_an_interrupted_action_at_most_once(tmp_path, verb, reruns):
 
     def run(phase):
         return subprocess.run(
-            [sys.executable, "-c", _INTERRUPTED_ACTION_SCRIPT, db, phase, verb, str(calls)],
+            [
+                sys.executable,
+                "-c",
+                _INTERRUPTED_ACTION_SCRIPT,
+                db,
+                phase,
+                verb,
+                str(calls),
+            ],
             capture_output=True,
             text=True,
             timeout=120,
@@ -1519,7 +1531,9 @@ def test_asset_pool_wait_outlives_the_claim_timeout():
         text=True,
         timeout=120,
     )
-    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr[-3000:]}"
+    assert proc.returncode == 0, (
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr[-3000:]}"
+    )
 
 
 @pytest.mark.timeout(120)
@@ -2495,7 +2509,12 @@ def test_action_context_can_be_built_for_unit_tests():
     assert ctx.asset_metadata == {"delta/root_name": "evt"}
     purge(ctx)
     bare = rs.ActionContext(asset_name="events", action="vacuum", run_id="r1")
-    assert (bare.partition, bare.io_handler, bare.config, bare.run_id) == (None, None, None, "r1")
+    assert (bare.partition, bare.io_handler, bare.config, bare.run_id) == (
+        None,
+        None,
+        None,
+        "r1",
+    )
     assert not bare.has_partition_key
 
 
@@ -2887,7 +2906,9 @@ def test_backfill_of_a_whole_asset_verb_is_rejected_up_front():
         def materialize(cls, context: rs.AssetExecutionContext):
             return context.partition_key
 
-        @rs.action(outcome=rs.Outcome.Unchanged, partitioning=rs.ActionPartitioning.Keyless)
+        @rs.action(
+            outcome=rs.Outcome.Unchanged, partitioning=rs.ActionPartitioning.Keyless
+        )
         @classmethod
         def optimize(cls, ctx):
             calls.append(ctx.asset_name)
@@ -2905,7 +2926,10 @@ def test_backfill_of_a_whole_asset_verb_is_rejected_up_front():
     for dry_run in (True, False):
         with pytest.raises(Exception, match="Action 'optimize' is whole-asset"):
             repo.backfill(
-                selection=["events"], partition_keys=keys, action="optimize", dry_run=dry_run
+                selection=["events"],
+                partition_keys=keys,
+                action="optimize",
+                dry_run=dry_run,
             )
     with pytest.raises(Exception, match="Action 'optimize' is whole-asset"):
         repo.backfill(

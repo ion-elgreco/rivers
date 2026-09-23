@@ -125,18 +125,21 @@ pub fn RunsListPage() -> impl IntoView {
             refresh_tick.get(),
         )
     };
-    let runs_page = Resource::new(page_key, |(tab, job, asset, partition, verb, p, ps, _tick)| {
-        // Empty strings are coerced to `None` server-side in the `From` impl.
-        let filter = RunFilter {
-            status: status_from_tab(&tab),
-            job_name: None,
-            job_substring: Some(job),
-            asset_substring: Some(asset),
-            partition_substring: Some(partition),
-            action: crate::helpers::verb_filter_from_input(&verb),
-        };
-        async move { get_runs_page(p * ps, ps, filter).await }
-    });
+    let runs_page = Resource::new(
+        page_key,
+        |(tab, job, asset, partition, verb, p, ps, _tick)| {
+            // Empty strings are coerced to `None` server-side in the `From` impl.
+            let filter = RunFilter {
+                status: status_from_tab(&tab),
+                job_name: None,
+                job_substring: Some(job),
+                asset_substring: Some(asset),
+                partition_substring: Some(partition),
+                action: crate::helpers::verb_filter_from_input(&verb),
+            };
+            async move { get_runs_page(p * ps, ps, filter).await }
+        },
+    );
 
     let locations = Resource::new(|| (), |_| list_code_locations());
 

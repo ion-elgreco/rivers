@@ -990,7 +990,10 @@ mod tests {
         use crate::types::VerbFilter;
         assert_eq!(verb_filter_from_input(""), VerbFilter::Any);
         assert_eq!(verb_filter_from_input("  "), VerbFilter::Any);
-        assert_eq!(verb_filter_from_input("materialize"), VerbFilter::MaterializeOnly);
+        assert_eq!(
+            verb_filter_from_input("materialize"),
+            VerbFilter::MaterializeOnly
+        );
         assert_eq!(
             verb_filter_from_input(" delete "),
             VerbFilter::Verb("delete".to_string())
@@ -1015,7 +1018,10 @@ mod tests {
     #[test]
     fn run_labels_name_the_verb() {
         assert_eq!(with_verb("orders".to_string(), None), "orders");
-        assert_eq!(with_verb("orders".to_string(), Some("delete")), "delete · orders");
+        assert_eq!(
+            with_verb("orders".to_string(), Some("delete")),
+            "delete · orders"
+        );
     }
 
     #[test]
@@ -1263,7 +1269,12 @@ mod tests {
         info
     }
 
-    fn partitioned_with(asset_key: &str, verb: &str, outcome: &str, partitioning: &str) -> AssetDefinitionInfo {
+    fn partitioned_with(
+        asset_key: &str,
+        verb: &str,
+        outcome: &str,
+        partitioning: &str,
+    ) -> AssetDefinitionInfo {
         let mut info = make_info(asset_key, Some(&["p1", "p2"]));
         info.actions = vec![crate::types::AssetActionInfo {
             name: verb.to_string(),
@@ -1285,12 +1296,20 @@ mod tests {
         assert_eq!(job_verb(None, &assets("events"), &infos), None);
         let vacuum = job_verb(Some("vacuum"), &assets("events"), &infos).unwrap();
         assert!(vacuum.is_keyless() && !vacuum.is_destructive());
-        assert!(job_verb(Some("delete"), &assets("orders"), &infos).unwrap().is_destructive());
+        assert!(
+            job_verb(Some("delete"), &assets("orders"), &infos)
+                .unwrap()
+                .is_destructive()
+        );
         // Infos not loaded yet: assume the verb destroys data and needs a key.
         let unknown = job_verb(Some("delete"), &assets("ghost"), &infos).unwrap();
         assert!(unknown.is_destructive() && !unknown.is_keyless());
         // `observe` never destroys and takes a key or not.
-        assert!(job_verb(Some("observe"), &assets("ghost"), &infos).unwrap().key_optional());
+        assert!(
+            job_verb(Some("observe"), &assets("ghost"), &infos)
+                .unwrap()
+                .key_optional()
+        );
     }
 
     #[test]
@@ -1308,7 +1327,12 @@ mod tests {
 
     #[test]
     fn a_whole_asset_verb_job_gets_no_partition_picker() {
-        let infos = make_map(vec![partitioned_with("events", "vacuum", "unchanged", "keyless")]);
+        let infos = make_map(vec![partitioned_with(
+            "events",
+            "vacuum",
+            "unchanged",
+            "keyless",
+        )]);
         let assets = vec!["events".to_string()];
         let vacuum = job_verb(Some("vacuum"), &assets, &infos);
         assert!(matches!(

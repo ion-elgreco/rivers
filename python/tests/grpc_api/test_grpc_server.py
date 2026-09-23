@@ -902,7 +902,9 @@ def backfill_grpc_channel(grpc_stubs, storage):
     """gRPC server with a partitioned asset for backfill tests."""
     handler = DictIOHandler()
     pd = rs.PartitionsDefinition.static_(["p1", "p2", "p3"])
-    compact = rs.AssetAction(name="compact", outcome=rs.Outcome.Unchanged)(lambda ctx: None)
+    compact = rs.AssetAction(name="compact", outcome=rs.Outcome.Unchanged)(
+        lambda ctx: None
+    )
 
     @rs.Asset(io_handler=handler, partitions_def=pd, actions=[compact])
     def partitioned_asset(context: rs.AssetExecutionContext):

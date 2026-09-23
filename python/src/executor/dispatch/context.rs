@@ -409,7 +409,13 @@ impl<'a> BatchContext<'a> {
                 .map(|s| s.event_names().to_vec())
                 .unwrap_or_else(|| vec![dep.clone()]);
             for name in names {
-                for (key, _) in self.state.failed_partitions.get(&name).into_iter().flatten() {
+                for (key, _) in self
+                    .state
+                    .failed_partitions
+                    .get(&name)
+                    .into_iter()
+                    .flatten()
+                {
                     if seen.insert(key.clone()) {
                         out.push((
                             key.clone(),

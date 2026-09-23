@@ -11,8 +11,8 @@ use crate::components::ui_kit::{Crumb, EmptyState, Topbar, UnderlineTabs};
 use crate::helpers::{job_actions_by_name, short_id, use_query_param};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::automation::{
-    evaluate_schedule, evaluate_sensor, get_condition_tick_detail, get_condition_ticks,
-    get_jobs, get_latest_condition_evals, get_next_ticks, get_schedules, get_sensors,
+    evaluate_schedule, evaluate_sensor, get_condition_tick_detail, get_condition_ticks, get_jobs,
+    get_latest_condition_evals, get_next_ticks, get_schedules, get_sensors,
 };
 use crate::server_fns::overview::get_assets_info;
 use crate::types::{

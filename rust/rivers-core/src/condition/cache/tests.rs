@@ -39,7 +39,10 @@ fn rec_with_run(asset: &str, last_run_id: Option<&str>, ts: i64) -> AssetRecord 
 
 /// Register `assets` the way `resolve()` does: definition rows, no history.
 /// A whole-asset deletion's time lives on this row.
-async fn register_blank(storage: &crate::storage::surrealdb_backend::SurrealStorage, assets: &[&str]) {
+async fn register_blank(
+    storage: &crate::storage::surrealdb_backend::SurrealStorage,
+    assets: &[&str],
+) {
     let ctx = crate::storage::CodeLocationContext::new(crate::storage::default_code_location_id());
     let records: Vec<AssetRecord> = assets
         .iter()
@@ -48,7 +51,11 @@ async fn register_blank(storage: &crate::storage::surrealdb_backend::SurrealStor
             ..rec_with_run(a, None, 0)
         })
         .collect();
-    storage.for_code_location(&ctx).register_assets(&records).await.unwrap();
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&records)
+        .await
+        .unwrap();
 }
 
 #[test]
@@ -572,7 +579,12 @@ async fn keyless_delete_evicts_every_cached_partition() {
     cache.set_partitioned_assets(vec!["events".to_string()]);
     cache.refresh(&storage, 0).await.unwrap();
     assert_eq!(
-        cache.partition_status.get("events").unwrap().timestamps.len(),
+        cache
+            .partition_status
+            .get("events")
+            .unwrap()
+            .timestamps
+            .len(),
         3,
         "all three partitions cached after initial load"
     );
@@ -644,7 +656,12 @@ async fn keyless_action_without_deletion_keeps_cached_partitions() {
 
     cache.refresh(&storage, 1).await.unwrap();
     assert_eq!(
-        cache.partition_status.get("events").unwrap().timestamps.len(),
+        cache
+            .partition_status
+            .get("events")
+            .unwrap()
+            .timestamps
+            .len(),
         2,
         "a keyless action without a deletion must not evict partitions"
     );
@@ -1264,7 +1281,12 @@ async fn deleting_the_delete_run_keeps_deletion_supersession() {
     cache.set_partitioned_assets(vec!["events".to_string()]);
     cache.refresh(&storage, 0).await.unwrap();
     assert!(
-        !cache.partition_status.get("events").unwrap().failed.contains(&single("p1")),
+        !cache
+            .partition_status
+            .get("events")
+            .unwrap()
+            .failed
+            .contains(&single("p1")),
         "a deleted partition resurrected as failed after its delete run was deleted"
     );
     assert!(

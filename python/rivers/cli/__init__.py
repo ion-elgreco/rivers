@@ -466,7 +466,9 @@ def materialize(
 def run_action(
     module: str = typer.Argument(help="Python module path containing CodeRepository"),
     action: str = typer.Argument(help="The verb to run, e.g. optimize or delete"),
-    repo_var: str = typer.Option("repo", help="Variable name of CodeRepository in module"),
+    repo_var: str = typer.Option(
+        "repo", help="Variable name of CodeRepository in module"
+    ),
     select: str | None = typer.Option(
         None,
         "--select",
@@ -474,8 +476,12 @@ def run_action(
         help="Comma-separated asset names (default: every asset that defines the verb)",
     ),
     partition_key: str | None = typer.Option(None, help="Partition key to act on"),
-    memory: bool = typer.Option(False, help="Use in-memory storage instead of embedded"),
-    storage_path: str = typer.Option(".rivers/storage/", help="Path for embedded storage"),
+    memory: bool = typer.Option(
+        False, help="Use in-memory storage instead of embedded"
+    ),
+    storage_path: str = typer.Option(
+        ".rivers/storage/", help="Path for embedded storage"
+    ),
 ) -> None:
     """Run an asset action (a verb besides materialize) over a selection."""
     from rivers import PartitionKey
