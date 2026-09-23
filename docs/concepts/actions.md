@@ -227,6 +227,13 @@ class GdprDeletable(rs.Asset):
 repo.run_action("delete", selection=["events", "event_rollups"], partition_key=pk)
 ```
 
+!!! warning "Automation rebuilds deleted data"
+    A deleted asset or partition is *missing* again, and it has no failure left
+    to hold it back. `eager()` and `on_missing()` therefore rebuild it on the next
+    tick from whatever upstream still holds, and **Materialize Missing** in the UI
+    offers it too. To keep deleted data gone, delete the upstream as well (see the
+    ordering below), or remove the condition before you delete.
+
 `DownstreamFirst` deletes downstream before upstream — a failure midway leaves a
 rollup missing rather than a rollup derived from deleted source data. This holds per
 key in a batched run too: a key the downstream step marks failed is skipped upstream.

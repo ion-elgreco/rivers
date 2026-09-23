@@ -27,7 +27,7 @@ def fill_gaps() -> int:
 |--------|-------------|
 | `AutomationCondition.eager()` | Materialize whenever any dependency is updated. Skips anything already in flight (a run *or* an active backfill). Excludes failed partitions/assets, so they aren't auto-retried until re-run. |
 | `AutomationCondition.on_cron(cron_schedule, timezone=None)` | Materialize on a cron schedule. Won't start a new run while the previous one is still in flight. |
-| `AutomationCondition.on_missing()` | Materialize only when the asset has never been materialized; leaves failed partitions alone. |
+| `AutomationCondition.on_missing()` | Materialize only when the asset is missing — never materialized, or [deleted](../concepts/actions.md#delete) since; leaves failed partitions alone. |
 
 !!! note "Conditions are the only dispatch gate"
     The daemon dispatches whatever a condition fires — there's no separate
@@ -43,7 +43,7 @@ Fine-grained conditions for building custom rules. All are static methods on `Au
 
 | Method | Description |
 |--------|-------------|
-| `.missing()` | Asset has never been materialized. |
+| `.missing()` | Asset has never been materialized, or a delete action cleared it since. |
 | `.in_progress()` | Asset is part of an in-progress materialize run. An [action](../concepts/actions.md) run does not count. |
 | `.execution_failed()` | Latest execution of this asset failed. |
 | `.newly_updated()` | Asset's materialization timestamp changed since the previous tick. |
