@@ -30,7 +30,7 @@ use super::super::event_writer::WriterMsg;
 use super::super::ops::{self, now_ts};
 use super::context::BatchContext;
 use super::failure::{self, classify_pyerr};
-use super::pool_claim::PoolGuard;
+use super::pool_claim::{ClaimCancelled, PoolGuard};
 use super::results::{emit_captured_logs, process_outcome};
 use super::types::WorkOutcome;
 
@@ -81,6 +81,9 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
             ctx.event_sender(),
         ) {
             Ok(g) => Some(g),
+            // Cancelled mid-wait: the step never starts, like the rest of a
+            // cancelled level — no failure, no floor.
+            Err(e) if e.is::<ClaimCancelled>() => return,
             Err(e) => {
                 ctx.record_failure_no_hooks(
                     step_name,
@@ -91,6 +94,14 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
             }
         }
     };
+    if guard.is_some()
+        && failure::run_cancelled_blocking(py, ctx.sink.storage.backend(), ctx.scope.run_id)
+    {
+        if let Some(g) = guard {
+            g.release_blocking(py);
+        }
+        return;
+    }
 
     for name in event_names {
         ctx.emit_start(name, now_ts());
@@ -232,11 +243,24 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         .await
         {
             Ok(g) => Some(g),
+            Err(e) if e.is::<ClaimCancelled>() => return WorkOutcome::Cancelled,
             Err(e) => {
                 return prep_error(format!("Failed to claim pool slots: {e}"));
             }
         }
     };
+    if guard.is_some()
+        && storage
+            .backend()
+            .is_cancelled(&run_id)
+            .await
+            .unwrap_or(false)
+    {
+        if let Some(g) = guard {
+            g.release().await;
+        }
+        return WorkOutcome::Cancelled;
+    }
 
     let start_ts = now_ts();
     let code_location_id = storage.code_location_id().to_string();

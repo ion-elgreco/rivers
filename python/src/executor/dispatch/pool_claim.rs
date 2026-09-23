@@ -41,6 +41,19 @@ static CLAIM_POLL_JITTER: LazyLock<Duration> =
 static CLAIM_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| parse_duration_env("RIVERS_CLAIM_TIMEOUT", DEFAULT_CLAIM_TIMEOUT));
 
+/// The run was cancelled while the step waited for its slots. Asset-pool waits
+/// never time out, so the wait polls cancellation instead.
+#[derive(Debug)]
+pub(crate) struct ClaimCancelled;
+
+impl std::fmt::Display for ClaimCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("run cancelled while waiting for pool slots")
+    }
+}
+
+impl std::error::Error for ClaimCancelled {}
+
 /// Holds claimed concurrency slots and a background lease renewal task.
 /// If dropped without calling `release()`, slots are reclaimed by lease expiry
 /// and the renewal task is aborted via `AbortOnDrop` — without this, the task
@@ -309,6 +322,14 @@ async fn claim_async_poll(
                         reason = %reason,
                         "step pending for pool slots, will retry"
                     );
+                }
+                if storage
+                    .backend()
+                    .is_cancelled(run_id)
+                    .await
+                    .unwrap_or(false)
+                {
+                    return Err(ClaimCancelled.into());
                 }
                 let jitter = rand_jitter(attempt, max_jitter);
                 tokio::time::sleep(poll_interval + jitter).await;

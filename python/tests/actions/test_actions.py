@@ -1458,6 +1458,74 @@ def test_exclusive_action_serializes_with_materialize():
     assert "StepSlotWaiting" in waiting
 
 
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("style", ["sync", "async"])
+def test_cancelled_action_waiting_on_its_asset_pool_never_runs(style):
+    """Asset-pool waits never time out, so a cancel is the only way out of one:
+    the delete used to keep waiting and run once the holder finished."""
+    import threading
+
+    holding = threading.Event()
+    release = threading.Event()
+    purged = []
+
+    def _purge(ctx):
+        purged.append(ctx.asset_name)
+
+    async def _apurge(ctx):
+        purged.append(ctx.asset_name)
+
+    class SlowTable(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+        purge = rs.AssetAction(
+            name="purge",
+            outcome=rs.Outcome.Unmaterialize,
+            concurrency=rs.ActionConcurrency.Exclusive,
+        )(_purge if style == "sync" else _apurge)
+
+        @classmethod
+        def materialize(cls):
+            holding.set()
+            assert release.wait(timeout=60), "test driver never released the holder"
+            return 1
+
+    repo = rs.CodeRepository(assets=[SlowTable], default_executor=IP)
+    act = {}
+    t_mat = threading.Thread(target=repo.materialize)
+    t_act = threading.Thread(
+        target=lambda: act.update(r=repo.run_action("purge", raise_on_error=False))
+    )
+    t_mat.start()
+    try:
+        assert holding.wait(timeout=30)
+        t_act.start()
+
+        def waiting_run():
+            for r in repo.storage.get_runs(limit=10):
+                events = repo.storage.get_events_for_run(r.run_id)
+                if r.action == "purge" and any(
+                    e.event_type == "StepSlotWaiting" for e in events
+                ):
+                    return r.run_id
+            return None
+
+        assert wait_until(lambda: waiting_run() is not None, timeout=30)
+        run_id = waiting_run()
+        repo.storage.request_cancellation(run_id)
+        t_act.join(timeout=30)
+        assert not t_act.is_alive(), "the cancelled step kept waiting on the pool"
+    finally:
+        release.set()
+        t_mat.join(timeout=60)
+        if t_act.ident is not None:
+            t_act.join(timeout=60)
+
+    assert purged == []
+    assert repo.storage.get_run(run_id).status == "Canceled"
+    kinds = [str(e.event_type) for e in repo.storage.get_events_for_run(run_id)]
+    assert "StepStart" not in kinds and "StepFailure" not in kinds, kinds
+
+
 def test_asset_pool_wait_outlives_the_claim_timeout():
     """A materialize waiting on its asset's exclusive-action pool must wait for
     the action, not fail at the claim timeout: the failure set a floor that

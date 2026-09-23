@@ -75,4 +75,7 @@ pub(crate) enum WorkOutcome {
         captured_logs: CapturedLogs,
         failure_config: Option<Py<PyAny>>,
     },
+    /// The run was cancelled before the step started (it was waiting for pool
+    /// slots). Nothing ran, so nothing is recorded.
+    Cancelled,
 }

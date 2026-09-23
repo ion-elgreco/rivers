@@ -526,6 +526,7 @@ pub(crate) fn process_outcome(
                 failures,
             );
         }
+        WorkOutcome::Cancelled => {}
     }
 }
 
