@@ -6,6 +6,9 @@ Base class for execution strategies. Construct via the static factories and pass
 
 The variants — `Executor.InProcess`, `Executor.Parallel`, `Executor.Kubernetes` — are exposed as nested classes for `isinstance` checks.
 
+!!! note "Action runs ignore the executor"
+    The steps of an [action](../concepts/actions.md#where-actions-run) run always execute in the run's own process (the run pod on Kubernetes), one at a time, whatever executor is set.
+
 ### `Executor.in_process()`
 
 Runs every step serially in the calling Python process.

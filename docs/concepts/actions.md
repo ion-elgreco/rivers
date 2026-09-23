@@ -121,9 +121,19 @@ def compact(cls, ctx: rs.ActionContext, warehouse: DuckDB) -> None:
     warehouse.execute(f"VACUUM {ctx.asset_name}")
 ```
 
-Handlers must carry **configuration, not live connections** — an action may run in a
-worker or pod and must be able to resolve its table there (see
-[IO Handlers](io-handlers.md)).
+Handlers must carry **configuration, not live connections** — an action runs in the
+run's own process, which on Kubernetes is the run pod, and must be able to resolve its
+table there (see [IO Handlers](io-handlers.md)).
+
+### Where actions run
+
+Action steps always run in the run's own process — the orchestrator for a local run,
+the run pod on Kubernetes — whatever executor the repository or job sets. So
+`Executor.parallel(...)`, step pods, per-asset `compute=` and retry escalation do not
+apply to them: size the run pod (`run_cpu` / `run_memory`) for heavy maintenance verbs
+like `optimize`. The steps of one run execute one at a time; an exclusive verb whose
+asset is busy steps aside, so the free targets go first and it runs when its asset is
+free.
 
 ### Action config
 

@@ -64,7 +64,7 @@ repo.get_job("my_pipeline").execute(
 
 ## Executors
 
-An `Executor` picks how a job's steps are dispatched. Construct one through the static factories on `Executor`:
+An `Executor` picks how a job's steps are dispatched — for materialize runs; an [action](actions.md#where-actions-run) job's steps always run in the run's own process. Construct one through the static factories on `Executor`:
 
 ### InProcess
 
