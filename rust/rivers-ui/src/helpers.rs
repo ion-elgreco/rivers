@@ -595,6 +595,15 @@ pub fn records_by_key(
     (records, failed)
 }
 
+/// Prefix a run's summary label with its verb, so an action run never reads
+/// as a plain materialization (a finished delete is not a green rebuild).
+pub fn with_verb(label: String, action: Option<&str>) -> String {
+    match action {
+        Some(verb) => format!("{verb} · {label}"),
+        None => label,
+    }
+}
+
 /// Click on a replay button (re-run a run, re-execute a backfill). Replaying
 /// an action re-applies its verb — a delete deletes again — so it takes a
 /// second click; a materialize replays at once. Returns `(dispatch, armed)`.
@@ -936,6 +945,12 @@ pub fn launched_by_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_labels_name_the_verb() {
+        assert_eq!(with_verb("orders".to_string(), None), "orders");
+        assert_eq!(with_verb("orders".to_string(), Some("delete")), "delete · orders");
+    }
 
     #[test]
     fn replaying_an_action_takes_a_second_click() {
