@@ -119,7 +119,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
             ctx.scope.run_id,
             first,
         );
-        attempt += u32::from(ctx.resumed_cut_off(first));
+        attempt += ctx.resumed_cut_offs(first);
     }
     let outcome = loop {
         let mut outcome = worker.run_work(py, ctx);
@@ -215,8 +215,8 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
     semaphore: Option<Arc<Semaphore>>,
     retry_policy: Option<rivers_core::execution::retry::RetryPolicy>,
     resume: bool,
-    // The crashed attempt cut this step off: it used a try no StepRetry records.
-    cut_off: bool,
+    // Attempts a crash cut off: each used a try no StepRetry records.
+    cut_offs: u32,
     worker: W,
 ) -> WorkOutcome {
     let mut permit = match &semaphore {
@@ -275,7 +275,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         && let Some(first) = start_event_names.first()
     {
         attempt += failure::prior_step_retries(storage.backend(), &run_id, first).await;
-        attempt += u32::from(cut_off);
+        attempt += cut_offs;
     }
     let want_classify = retry_policy.is_some();
     let outcome = loop {

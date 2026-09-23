@@ -379,16 +379,17 @@ impl<'a> BatchContext<'a> {
         }
     }
 
-    /// An action step the crashed attempt cut off mid-run: it spent an
-    /// attempt no StepRetry records.
-    pub(crate) fn resumed_cut_off(&self, name: &str) -> bool {
-        self.scope.resume
-            && self.scope.plan.is_action()
-            && self
-                .scope
-                .prior_attempts
-                .get(name)
-                .is_some_and(|a| a.started && !a.failed)
+    /// Attempts of an action step that a crash cut off mid-run: begun, but
+    /// ended by neither a StepRetry nor a StepFailure. Each spent a try.
+    pub(crate) fn resumed_cut_offs(&self, name: &str) -> u32 {
+        if !self.scope.resume || !self.scope.plan.is_action() {
+            return 0;
+        }
+        self.scope
+            .prior_attempts
+            .get(name)
+            .filter(|a| !a.failed)
+            .map_or(0, |a| a.starts.saturating_sub(a.retries))
     }
 
     /// Members of the run's key that a plan dependency of `step` marked

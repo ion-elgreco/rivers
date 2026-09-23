@@ -113,7 +113,7 @@ mod tests {
                 step_attempts: HashMap::from([(
                     "step_b".to_string(),
                     StepAttempts {
-                        started: true,
+                        starts: 1,
                         ..Default::default()
                     },
                 )]),

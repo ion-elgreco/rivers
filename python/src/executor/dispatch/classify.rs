@@ -3,6 +3,7 @@ use std::collections::HashSet;
 
 use pyo3::prelude::*;
 use rivers_core::execution::plan::StepKind;
+use rivers_core::execution::retry::{FailureReason, should_retry};
 
 use crate::partitions::PyPartitionKey;
 
@@ -38,7 +39,10 @@ pub(crate) fn classify_step(
 
     // An action step runs at most once per retry budget: a resume after a
     // crash must not re-apply a half-done merge or delete on its own. A
-    // recorded step failure ends the ladder; a cut-off attempt used one try.
+    // recorded step failure ends the ladder. A cut-off attempt (begun, never
+    // ended) used a try, and its crash is an infrastructure failure: the step
+    // runs again only if the policy retries one with budget left. A crash in
+    // the backoff after a StepRetry cut nothing off — that retry was granted.
     if ctx.scope.resume && ctx.scope.plan.is_action() {
         let prior = step
             .event_names()
@@ -54,10 +58,11 @@ pub(crate) fn classify_step(
                 }
                 return StepAction::Handled;
             }
-            let budget_left = ctx
-                .retry_policy_for(step)
-                .is_some_and(|p| prior.retries < p.max_retries);
-            if prior.started && !budget_left {
+            let cut_off = prior.starts > prior.retries;
+            let may_rerun = ctx.retry_policy_for(step).is_some_and(|p| {
+                should_retry(&p, FailureReason::Infrastructure, &[], prior.starts)
+            });
+            if cut_off && !may_rerun {
                 let msg = "Interrupted by a restart; an action with no retry budget left \
                            is not run again";
                 for name in step.event_names() {

@@ -3192,7 +3192,7 @@ impl StorageBackend for SurrealStorage {
             let mut out: HashMap<String, super::StepAttempts> = HashMap::new();
             let started: Vec<Row> = result.take(0)?;
             for key in started.into_iter().filter_map(|r| r.asset_key) {
-                out.entry(key).or_default().started = true;
+                out.entry(key).or_default().starts += 1;
             }
             let failed: Vec<Row> = result.take(1)?;
             for key in failed.into_iter().filter_map(|r| r.asset_key) {
@@ -14748,6 +14748,7 @@ mod tests {
             .store_events(&[
                 event(EventType::StepStart, "cut_off", None),
                 event(EventType::StepRetry, "cut_off", None),
+                event(EventType::StepStart, "cut_off", None),
                 event(EventType::StepStart, "failed", None),
                 event(EventType::StepFailure, "failed", None),
                 // A keyed failure is one partition of a batch, not the step.
@@ -14762,14 +14763,14 @@ mod tests {
         assert_eq!(
             get("cut_off"),
             crate::storage::StepAttempts {
-                started: true,
+                starts: 2,
                 failed: false,
                 retries: 1,
                 failed_keys: vec![],
             }
         );
         assert!(get("failed").failed);
-        assert!(get("one_key").started && !get("one_key").failed);
+        assert!(get("one_key").starts == 1 && !get("one_key").failed);
         assert_eq!(
             get("one_key").failed_keys,
             vec![PartitionKey::Single {

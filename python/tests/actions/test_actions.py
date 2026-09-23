@@ -1237,7 +1237,7 @@ def test_resume_skips_completed_action_steps():
 
 _INTERRUPTED_ACTION_SCRIPT = textwrap.dedent(
     """
-    import os, sys, time
+    import os, sys, threading, time
     import rivers as rs
     from rivers.testing import embedded_storage
 
@@ -1246,20 +1246,37 @@ _INTERRUPTED_ACTION_SCRIPT = textwrap.dedent(
     def body(ctx):
         with open(calls_file, "a") as f:
             f.write(ctx.asset_name + "\\n")
-        if phase == "crash":
-            # Die mid-body once the StepStart is durable — a pod OOM kill.
+        attempts = len(open(calls_file).read().splitlines())
+        if phase in ("crash", "resume-crash"):
+            # Die mid-body once this attempt's StepStart is durable — a pod
+            # OOM kill.
             deadline = time.time() + 20
             while time.time() < deadline:
                 events = storage.get_events_for_run(ctx.run_id)
-                if any(e.event_type == "StepStart" for e in events):
+                if sum(e.event_type == "StepStart" for e in events) >= attempts:
                     os._exit(3)
                 time.sleep(0.05)
             raise SystemExit("StepStart never became visible")
+        if phase == "crash-in-backoff":
+            # Fail, then die while the retry backoff sleeps.
+            def die_in_backoff():
+                deadline = time.time() + 20
+                while time.time() < deadline:
+                    events = storage.get_events_for_run(ctx.run_id)
+                    if any(e.event_type == "StepRetry" for e in events):
+                        os._exit(3)
+                    time.sleep(0.05)
+                os._exit(4)
+
+            threading.Thread(target=die_in_backoff, daemon=True).start()
+            raise RuntimeError("first attempt fails")
 
     policies = {
         "merge": None,
         "merge_retry": rs.RetryPolicy(max_retries=1),
         "merge_spent": rs.RetryPolicy(max_retries=0),
+        "merge_conn": rs.RetryPolicy(max_retries=3, retry_on=[ConnectionError]),
+        "merge_backoff": rs.RetryPolicy(max_retries=1, backoff=rs.Backoff.constant(60)),
     }
     actions = [
         rs.AssetAction(name=name, outcome=rs.Outcome.MayMaterialize, retry=retry)(body)
@@ -1279,11 +1296,23 @@ _INTERRUPTED_ACTION_SCRIPT = textwrap.dedent(
     repo = rs.CodeRepository(assets=[Table], default_executor=rs.Executor.in_process())
     repo.resolve(storage=storage)
     result = repo.run_action(
-        verb, run_id_override="crashed-run", resume=phase == "resume", raise_on_error=False
+        verb,
+        run_id_override="crashed-run",
+        resume=phase.startswith("resume"),
+        raise_on_error=False,
     )
     print("RESULT", result.success)
     """
 )
+
+
+def _run_interrupted_action(db, phase, verb, calls):
+    return subprocess.run(
+        [sys.executable, "-c", _INTERRUPTED_ACTION_SCRIPT, db, phase, verb, str(calls)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
 
 
 @pytest.mark.parametrize(
@@ -1292,6 +1321,8 @@ _INTERRUPTED_ACTION_SCRIPT = textwrap.dedent(
         pytest.param("merge", False, id="no-retry-policy"),
         pytest.param("merge_spent", False, id="budget-used-up"),
         pytest.param("merge_retry", True, id="budget-left"),
+        # A crash is an infrastructure failure; this policy never retries one.
+        pytest.param("merge_conn", False, id="retry-on-excludes-crashes"),
     ],
 )
 def test_resume_runs_an_interrupted_action_at_most_once(tmp_path, verb, reruns):
@@ -1302,31 +1333,46 @@ def test_resume_runs_an_interrupted_action_at_most_once(tmp_path, verb, reruns):
     db = str(tmp_path / "db")
     calls = tmp_path / "calls.txt"
 
-    def run(phase):
-        return subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                _INTERRUPTED_ACTION_SCRIPT,
-                db,
-                phase,
-                verb,
-                str(calls),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-
-    crashed = run("crash")
+    crashed = _run_interrupted_action(db, "crash", verb, calls)
     assert crashed.returncode == 3, crashed.stderr[-2000:]
     assert calls.read_text().splitlines() == ["table"]
 
-    resumed = run("resume")
+    resumed = _run_interrupted_action(db, "resume", verb, calls)
     assert resumed.returncode == 0, resumed.stderr[-2000:]
     ran_again = calls.read_text().splitlines() == ["table", "table"]
     assert ran_again is reruns, calls.read_text()
     assert f"RESULT {reruns}" in resumed.stdout, resumed.stdout[-2000:]
+
+
+def test_repeated_crashes_use_up_the_retry_budget(tmp_path):
+    """Every crashed attempt used a try. The resume check read one bool
+    "started", so a crash-looping merge ran again on every restart."""
+    db = str(tmp_path / "db")
+    calls = tmp_path / "calls.txt"
+
+    for phase in ("crash", "resume-crash"):
+        crashed = _run_interrupted_action(db, phase, "merge_retry", calls)
+        assert crashed.returncode == 3, crashed.stderr[-2000:]
+    resumed = _run_interrupted_action(db, "resume", "merge_retry", calls)
+    assert resumed.returncode == 0, resumed.stderr[-2000:]
+    assert calls.read_text().splitlines() == ["table", "table"], (
+        "a third attempt ran past a budget of two"
+    )
+    assert "RESULT False" in resumed.stdout, resumed.stdout[-2000:]
+
+
+def test_a_crash_in_the_retry_backoff_keeps_the_granted_retry(tmp_path):
+    """The retry was granted before the crash, so resume runs it — the step
+    that slept in its backoff was not cut off mid-attempt."""
+    db = str(tmp_path / "db")
+    calls = tmp_path / "calls.txt"
+
+    crashed = _run_interrupted_action(db, "crash-in-backoff", "merge_backoff", calls)
+    assert crashed.returncode == 3, crashed.stderr[-2000:]
+    resumed = _run_interrupted_action(db, "resume", "merge_backoff", calls)
+    assert resumed.returncode == 0, resumed.stderr[-2000:]
+    assert calls.read_text().splitlines() == ["table", "table"]
+    assert "RESULT True" in resumed.stdout, resumed.stdout[-2000:]
 
 
 _DOWNSTREAM_FIRST_RESUME_SCRIPT = textwrap.dedent(

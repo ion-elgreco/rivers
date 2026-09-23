@@ -1141,8 +1141,8 @@ pub struct SlotHolder {
 /// A step's recorded attempts in one run (see `get_step_attempts`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StepAttempts {
-    /// A `StepStart` was recorded.
-    pub started: bool,
+    /// `StepStart` events recorded: one per attempt begun, crashed ones too.
+    pub starts: u32,
     /// A step-level `StepFailure` was recorded: the retry ladder is over.
     pub failed: bool,
     /// `StepRetry` events recorded.
