@@ -494,7 +494,9 @@ impl AssetConditionCache {
         let scoped = storage.for_code_location(ctx);
         for status in [BackfillStatus::Requested, BackfillStatus::InProgress] {
             let backfills = scoped.get_backfills(None, Some(status)).await?;
-            for bf in &backfills {
+            // An action backfill is not a materialization in flight — the
+            // same rule as a live action run.
+            for bf in backfills.iter().filter(|bf| bf.action.is_none()) {
                 for asset in &bf.asset_selection {
                     state
                         .assets

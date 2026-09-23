@@ -635,6 +635,57 @@ async fn keyless_action_without_deletion_keeps_cached_partitions() {
     );
 }
 
+/// An action backfill is not a materialization in flight — the same rule
+/// action runs follow. Counting it made an optimize backfill pause eager and
+/// on_cron on every targeted partition for its whole run.
+#[tokio::test]
+async fn action_backfills_are_not_in_flight() {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{
+        BackfillFailurePolicy, BackfillRecord, BackfillStatus, BackfillStrategy, LaunchedBy,
+    };
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+    let backfill = |id: &str, asset: &str, action: Option<&str>| BackfillRecord {
+        code_location_id: cl.clone(),
+        backfill_id: id.to_string(),
+        status: BackfillStatus::InProgress,
+        strategy: BackfillStrategy::MultiRun,
+        failure_policy: BackfillFailurePolicy::Continue,
+        asset_selection: vec![asset.to_string()],
+        job_name: None,
+        partition_keys: vec![],
+        run_ids: vec![],
+        completed_partitions: vec![],
+        failed_partitions: vec![],
+        canceled_partitions: vec![],
+        max_concurrency: 1,
+        tags: vec![],
+        create_time: 1000,
+        end_time: None,
+        error: None,
+        launched_by: LaunchedBy::default(),
+        action: action.map(String::from),
+    };
+    storage
+        .create_backfill(&backfill("bf-mat", "rebuilt", None))
+        .await
+        .unwrap();
+    storage
+        .create_backfill(&backfill("bf-act", "compacted", Some("compact")))
+        .await
+        .unwrap();
+
+    let mut cache = AssetConditionCache::new(cl.clone());
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(cache.backfill.assets.contains_key("rebuilt"));
+    assert!(
+        !cache.backfill.assets.contains_key("compacted"),
+        "an action backfill must not mark its assets in flight"
+    );
+}
+
 fn mat_events_for(
     cl: &str,
     asset: &str,
