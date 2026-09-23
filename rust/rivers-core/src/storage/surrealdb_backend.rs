@@ -4021,6 +4021,42 @@ impl PerCodeLocationStorage for SurrealStorage {
             }
         }
 
+        // A run that materialized one of this asset's partitions and then failed
+        // on another asset did not fail that partition — the unpartitioned
+        // path's `materialized_here` rule, read off the partition rows.
+        let failed_keyed_runs: Vec<String> = scan
+            .iter()
+            .filter(|r| r.status == "Failure" && r.action.is_none() && r.partition_key.is_some())
+            .map(|r| r.run_id.clone())
+            .collect();
+        let mut materialized_by: std::collections::HashMap<PartitionKey, String> =
+            std::collections::HashMap::new();
+        if !failed_keyed_runs.is_empty() {
+            let mut result = self
+                .db
+                .query(
+                    "SELECT partition_key, last_run_id FROM asset_partitions \
+                     WHERE code_location_id = $cl AND asset_key = $asset_key \
+                     AND last_run_id IN $runs",
+                )
+                .bind(("cl", code_location_id.to_string()))
+                .bind(("asset_key", asset_key.to_string()))
+                .bind(("runs", failed_keyed_runs))
+                .await?;
+
+            #[derive(Debug, SurrealValue)]
+            struct OwnRow {
+                partition_key: PartitionKey,
+                last_run_id: String,
+            }
+
+            let own_rows: Vec<OwnRow> = result.take(0)?;
+            materialized_by = own_rows
+                .into_iter()
+                .map(|r| (r.partition_key, r.last_run_id))
+                .collect();
+        }
+
         for row in &scan {
             if row.status != "Failure" || row.action.is_some() {
                 continue;
@@ -4033,6 +4069,9 @@ impl PerCodeLocationStorage for SurrealStorage {
             // during the run must not outrank it.
             let ts = row.end_time.unwrap_or(row.start_time);
             for member in pk.members() {
+                if materialized_by.get(&member) == Some(&row.run_id) {
+                    continue;
+                }
                 latest_failure
                     .entry(member)
                     .and_modify(|t| *t = (*t).max(ts))
@@ -9666,6 +9705,62 @@ mod tests {
             }),
             "a deletion at 100 must not clear a failure that ended at 110"
         );
+    }
+
+    /// A joint run that materialized `raw`'s partition, then failed on `clean`,
+    /// did not fail `raw`'s partition: the end-time floor would otherwise
+    /// outrank the run's own materialization and stop `eager()` for good.
+    #[tokio::test]
+    async fn a_failed_run_does_not_fail_the_partitions_it_materialized() {
+        let storage = make_storage().await;
+        register(&storage, &["raw", "clean"]).await;
+        let p1 = PartitionKey::Single {
+            keys: vec!["p1".to_string()],
+        };
+
+        let run = RunRecord {
+            run_id: "joint".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Failure,
+            start_time: 90,
+            end_time: Some(110),
+            tags: vec![],
+            node_names: vec!["raw".to_string(), "clean".to_string()],
+            priority: 0,
+            partition_key: Some(p1.clone()),
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+        };
+        storage.create_run(&run).await.unwrap();
+
+        let mut mat = make_event("raw", "joint", 100);
+        mat.partition_key = Some(p1.clone());
+        storage.store_event(&mat).await.unwrap();
+
+        let raw_failed = storage
+            .get_failed_partitions(
+                DEFAULT_CODE_LOCATION_ID,
+                "raw",
+                &std::collections::HashMap::from([(p1.clone(), 100)]),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !raw_failed.contains_key(&p1),
+            "raw/p1 materialized in the run that later failed on clean"
+        );
+
+        let clean_failed = storage
+            .get_failed_partitions(
+                DEFAULT_CODE_LOCATION_ID,
+                "clean",
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(clean_failed.contains_key(&p1), "clean really failed");
     }
 
     #[tokio::test]
