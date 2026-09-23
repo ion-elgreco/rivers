@@ -117,6 +117,7 @@ pub fn MaterializeDialog(
     let destructive: Signal<bool> = destructive.unwrap_or_else(|| Signal::derive(|| false));
     let (selected, set_selected) = signal(Vec::<String>::new());
     let partition_keys = RwSignal::new(Vec::<SubmitPartitionKey>::new());
+    let partial_pick = RwSignal::new(false);
     let (tag_key, set_tag_key) = signal(String::new());
     let (tag_val, set_tag_val) = signal(String::new());
     let (tags, set_tags) = signal(Vec::<(String, String)>::new());
@@ -129,6 +130,7 @@ pub fn MaterializeDialog(
             // partitioned selection — without this an unpartitioned open would
             // submit the previous open's keys.
             partition_keys.set(Vec::new());
+            partial_pick.set(false);
             // Tags feed the submitted run (including `rivers/priority`), so a
             // tag typed for one open must not ride along on the next.
             set_tags.set(Vec::new());
@@ -231,7 +233,7 @@ pub fn MaterializeDialog(
             selected.get().len(),
             partition_keys.get().len(),
             is_partitioned.get(),
-            key_optional.get(),
+            key_optional.get() && !partial_pick.get(),
         )
     });
     let submit_label = Signal::derive(move || {
@@ -358,7 +360,12 @@ pub fn MaterializeDialog(
                                         </div>
                                     }
                                 >
-                                    <PartitionPicker picker=picker_signal selected=partition_keys reset=show/>
+                                    <PartitionPicker
+                                        picker=picker_signal
+                                        selected=partition_keys
+                                        reset=show
+                                        partial=partial_pick
+                                    />
                                 </Show>
 
                                 <div class="form-group">
@@ -422,7 +429,7 @@ pub fn MaterializeDialog(
                                     }
                                     is_partitioned.get()
                                         && partition_keys.get().is_empty()
-                                        && !key_optional.get()
+                                        && (!key_optional.get() || partial_pick.get())
                                 }
                             >
                                 {move || submit_label.get()}

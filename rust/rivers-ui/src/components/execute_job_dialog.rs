@@ -43,6 +43,7 @@ pub fn ExecuteJobDialog(
     // PartitionPicker on every toggle. Read at submit and to drive the
     // run-count label.
     let selected = RwSignal::new(Vec::<SubmitPartitionKey>::new());
+    let partial = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let nav_to = RwSignal::new(None::<String>);
 
@@ -151,7 +152,7 @@ pub fn ExecuteJobDialog(
                                 "Clears materialization state for the job's assets."
                             </p>
                         </Show>
-                        <PartitionPicker picker=picker selected=selected reset=show/>
+                        <PartitionPicker picker=picker selected=selected reset=show partial=partial/>
                         {move || error.get().map(|msg| view! {
                             <div class="error-msg">{msg}</div>
                         })}
@@ -167,7 +168,7 @@ pub fn ExecuteJobDialog(
                                     verb.get_untracked().is_some_and(|v| v.key_optional());
                                 let needs_partition =
                                     !matches!(p, JobPartitionPicker::None) && !key_optional;
-                                if needs_partition && keys.is_empty() {
+                                if keys.is_empty() && (needs_partition || partial.get_untracked()) {
                                     let msg = if matches!(p, JobPartitionPicker::Multi { .. }) {
                                         "Select at least one value for every dimension."
                                     } else {

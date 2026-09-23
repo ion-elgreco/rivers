@@ -459,6 +459,73 @@ async fn reopening_unpartitioned_drops_the_previous_partition_keys() {
     );
 }
 
+/// Values in only some dimensions expand to no key; an optional-key verb must
+/// not read that as "whole asset" and submit a keyless delete.
+#[wasm_bindgen_test]
+async fn optional_key_verb_blocks_a_partial_multi_pick() {
+    let show = RwSignal::new(true);
+    nav_to("/locations/default/demo");
+    let target = fresh_mount_target();
+    let host = target.clone();
+    mount_to(target, move || {
+        view! {
+            <Router>
+                <MaterializeDialog
+                    show=show
+                    asset_keys=Signal::derive(|| vec!["a".to_string()])
+                    records=Signal::derive(HashMap::new)
+                    picker=Signal::derive(|| JobPartitionPicker::Multi {
+                        dimensions: vec![
+                            PartitionDimensionInfo {
+                                name: "color".into(),
+                                keys: vec!["r".into(), "g".into()],
+                                total_count: 2,
+                                keys_truncated: false,
+                            },
+                            PartitionDimensionInfo {
+                                name: "size".into(),
+                                keys: vec!["s".into(), "m".into()],
+                                total_count: 2,
+                                keys_truncated: false,
+                            },
+                        ],
+                        asset_key: None,
+                        truncated: false,
+                    })
+                    action=Signal::derive(|| {
+                        Some(AssetActionInfo {
+                            name: "delete".to_string(),
+                            outcome: "unmaterialize".to_string(),
+                            exclusive: true,
+                            partitioning: "optional".to_string(),
+                            description: None,
+                        })
+                    })
+                    destructive=Signal::derive(|| true)
+                />
+            </Router>
+        }
+    })
+    .forget();
+    flush_effects().await;
+
+    let rows = query_all(&host, ".exec-dialog-partition-row");
+    click(&rows[0], false); // color = r; size left empty
+    flush_effects().await;
+
+    let submit = query_one(&host, ".modal-footer .btn-danger");
+    assert!(
+        submit.has_attribute("disabled"),
+        "a partial pick would submit a keyless delete"
+    );
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "1 asset · select a partition"
+    );
+}
+
 /// Nothing else in the product distinguishes an `Outcome.Unmaterialize` verb
 /// from a benign one, so the dialog has to.
 #[wasm_bindgen_test]

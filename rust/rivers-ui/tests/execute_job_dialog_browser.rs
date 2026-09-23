@@ -70,6 +70,47 @@ fn mount_verb_dialog(verb: AssetActionInfo) -> web_sys::HtmlElement {
     target
 }
 
+fn two_dim_picker() -> JobPartitionPicker {
+    JobPartitionPicker::Multi {
+        dimensions: vec![
+            PartitionDimensionInfo {
+                name: "color".into(),
+                keys: vec!["r".into(), "g".into()],
+                total_count: 2,
+                keys_truncated: false,
+            },
+            PartitionDimensionInfo {
+                name: "size".into(),
+                keys: vec!["s".into(), "m".into()],
+                total_count: 2,
+                keys_truncated: false,
+            },
+        ],
+        asset_key: None,
+        truncated: false,
+    }
+}
+
+fn mount_multi_verb_dialog(verb: AssetActionInfo) -> web_sys::HtmlElement {
+    nav_to("/locations/default/demo");
+    let target = fresh_mount_target();
+    let show = RwSignal::new(true);
+    mount_to(target.clone(), move || {
+        view! {
+            <Router>
+                <ExecuteJobDialog
+                    show=show
+                    job_name=Signal::derive(|| "purge_job".to_string())
+                    picker=Signal::derive(two_dim_picker)
+                    verb=Signal::derive(move || Some(verb.clone()))
+                />
+            </Router>
+        }
+    })
+    .forget();
+    target
+}
+
 fn verb(name: &str, outcome: &str, partitioning: &str) -> AssetActionInfo {
     AssetActionInfo {
         name: name.to_string(),
@@ -97,6 +138,30 @@ async fn optional_key_verb_may_submit_without_a_partition() {
     assert!(
         !errors.iter().any(|e| e == "Select at least one partition."),
         "an optional-key verb was blocked on an empty selection: {errors:?}"
+    );
+}
+
+/// Values in only some dimensions expand to no key, but that is not an empty
+/// pick: submitting it keyless would run an optional-key delete on the whole
+/// asset.
+#[wasm_bindgen_test]
+async fn optional_key_verb_rejects_a_partial_multi_pick() {
+    let host = mount_multi_verb_dialog(verb("delete", "unmaterialize", "optional"));
+    flush_effects().await;
+
+    let rows = query_all(&host, ".exec-dialog-partition-row");
+    click(&rows[0], false); // color = r; size left empty
+    flush_effects().await;
+    click(&query_one(&host, ".modal-footer .btn-danger"), false);
+    flush_effects().await;
+
+    let errors: Vec<String> = query_all(&host, ".error-msg")
+        .iter()
+        .filter_map(|e| e.text_content())
+        .collect();
+    assert_eq!(
+        errors,
+        vec!["Select at least one value for every dimension.".to_string()]
     );
 }
 
