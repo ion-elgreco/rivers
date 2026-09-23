@@ -324,8 +324,6 @@ pub(crate) fn process_step_result(
     }
 }
 
-/// External asset observation: emit Observation event (no IO write), record
-/// data_version for downstream provenance.
 /// Consume one action step's result. The declared outcome is the
 /// planning upper bound; the returned `ActionResult` is what actually
 /// happened: `materialized()` emits a real `Materialization` event (downstream
@@ -447,6 +445,8 @@ fn handle_action_result(
     }
 }
 
+/// External asset observation: emit Observation event (no IO write), record
+/// data_version for downstream provenance.
 fn handle_observation_result(
     ctx: &mut BatchContext,
     step_name: &str,

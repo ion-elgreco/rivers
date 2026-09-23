@@ -2522,15 +2522,9 @@ impl PyCodeRepository {
         self.run_queue_config.is_some()
     }
 
-    /// Internal counterpart of the pymethod `materialize`, accepting an
-    /// explicit `LaunchedBy` so internal callers (backfill executor, condition
-    /// daemon) can stamp the run origin. The pymethod version delegates here
-    /// with `LaunchedBy::Manual`.
-    #[allow(clippy::too_many_arguments)]
     /// Shared tail of the two launcher paths: reuse the caller's run id (a
     /// queue- or dispatcher-created record) or mint one, write the record when
-    /// it's new, then execute the prepared plan. `action` is `None` for
-    /// materialize.
+    /// it's new, then execute the prepared plan. The job carries the verb.
     #[allow(clippy::too_many_arguments)]
     fn launch_prepared_job(
         &self,
@@ -2581,6 +2575,11 @@ impl PyCodeRepository {
         })
     }
 
+    /// Internal counterpart of the pymethod `materialize`, accepting an
+    /// explicit `LaunchedBy` so internal callers (backfill executor, condition
+    /// daemon) can stamp the run origin. The pymethod version delegates here
+    /// with `LaunchedBy::Manual`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn materialize_with_launcher(
         &self,
         selection: Option<Vec<String>>,
