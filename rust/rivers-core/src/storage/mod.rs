@@ -1623,14 +1623,14 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         since_timestamp: i64,
     ) -> impl Future<Output = Result<Vec<(PartitionKey, i64)>>> + Send;
 
-    /// Timestamps for exactly `keys` — keys with no row (e.g. deleted
-    /// partitions) are simply absent from the result.
+    /// Timestamp and last run of exactly `keys` — keys with no row (e.g.
+    /// deleted partitions) are simply absent from the result.
     fn get_partition_timestamps_for_keys(
         &self,
         code_location_id: &str,
         asset_key: &str,
         keys: &[PartitionKey],
-    ) -> impl Future<Output = Result<Vec<(PartitionKey, i64)>>> + Send;
+    ) -> impl Future<Output = Result<Vec<(PartitionKey, i64, Option<String>)>>> + Send;
 
     fn get_in_progress_partitions(
         &self,
@@ -2026,7 +2026,7 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
         &self,
         asset_key: &str,
         keys: &[PartitionKey],
-    ) -> Result<Vec<(PartitionKey, i64)>> {
+    ) -> Result<Vec<(PartitionKey, i64, Option<String>)>> {
         self.backend
             .get_partition_timestamps_for_keys(self.code_location_id, asset_key, keys)
             .await

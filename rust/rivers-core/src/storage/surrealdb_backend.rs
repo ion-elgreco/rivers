@@ -3899,14 +3899,14 @@ impl PerCodeLocationStorage for SurrealStorage {
         code_location_id: &str,
         asset_key: &str,
         keys: &[PartitionKey],
-    ) -> Result<Vec<(PartitionKey, i64)>> {
+    ) -> Result<Vec<(PartitionKey, i64, Option<String>)>> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
         let mut result = self
             .db
             .query(
-                "SELECT partition_key, last_timestamp FROM asset_partitions \
+                "SELECT partition_key, last_timestamp, last_run_id FROM asset_partitions \
                  WHERE code_location_id = $cl AND asset_key = $asset_key \
                  AND partition_key IN $keys AND last_timestamp IS NOT NONE",
             )
@@ -3919,12 +3919,13 @@ impl PerCodeLocationStorage for SurrealStorage {
         struct PartTsRow {
             partition_key: PartitionKey,
             last_timestamp: i64,
+            last_run_id: Option<String>,
         }
 
         let rows: Vec<PartTsRow> = result.take(0)?;
         Ok(rows
             .into_iter()
-            .map(|r| (r.partition_key, r.last_timestamp))
+            .map(|r| (r.partition_key, r.last_timestamp, r.last_run_id))
             .collect())
     }
 
@@ -9384,7 +9385,7 @@ mod tests {
             .expect("an unset last_timestamp must not fail the whole keyed read");
         assert_eq!(
             timestamps,
-            vec![(single("p2"), 1500)],
+            vec![(single("p2"), 1500, Some("r1".to_string()))],
             "the unset row must be skipped, the real one still returned"
         );
 

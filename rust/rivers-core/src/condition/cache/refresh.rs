@@ -396,11 +396,29 @@ impl AssetConditionCache {
                 .await?;
             delta.record_updates.extend(downstream_records);
 
+            // A keyed last-run entry no override vouches for holds only if its
+            // run materialized that key — which the key's own row says.
+            let mut run_checks: HashMap<String, HashSet<PartitionKey>> = HashMap::new();
+            for (asset, pk, run_id, ..) in &delta.last_run_updates {
+                let overridden = delta
+                    .materialized_overrides
+                    .get(asset)
+                    .is_some_and(|runs| runs.contains(run_id));
+                if let Some(pk) = pk
+                    && !overridden
+                {
+                    run_checks
+                        .entry(asset.clone())
+                        .or_default()
+                        .insert(pk.clone());
+                }
+            }
             let partition_status = self
                 .fetch_partition_status_for_invalidated(
                     storage,
                     &invalidated_keys,
                     &delta.action_partition_checks,
+                    &run_checks,
                     &delta.partition_reloads,
                 )
                 .await?;
@@ -632,6 +650,8 @@ impl AssetConditionCache {
     /// `action_checks` holds partition keys touched by completed action runs:
     /// their rows are re-fetched by key, and keys with no row (deleted) are
     /// marked for eviction — the incremental fetch can't observe deletions.
+    /// `run_checks` holds keys whose last-run entry waits on the run that
+    /// materialized them: their rows are re-read too, for the run they name.
     /// `reloads` are assets whose rows were all dropped by a whole-asset
     /// deletion: they are fetched in full and every cached key without a row
     /// is evicted.
@@ -640,6 +660,7 @@ impl AssetConditionCache {
         storage: &S,
         invalidated_keys: &[String],
         action_checks: &HashMap<String, HashSet<PartitionKey>>,
+        run_checks: &HashMap<String, HashSet<PartitionKey>>,
         reloads: &HashSet<String>,
     ) -> anyhow::Result<HashMap<String, PartitionStatusPatch>> {
         let scoped = storage.for_code_location(&self.ctx);
@@ -680,22 +701,40 @@ impl AssetConditionCache {
             let failed = scoped
                 .get_failed_partitions(asset_key, &current.timestamps)
                 .await?;
-            let mut deleted = match action_checks.get(asset_key.as_str()) {
-                Some(touched) if !touched.is_empty() => {
-                    let touched: Vec<PartitionKey> = touched.iter().cloned().collect();
-                    let existing: HashSet<PartitionKey> = scoped
-                        .get_partition_timestamps_for_keys(asset_key, &touched)
-                        .await?
-                        .into_iter()
-                        .map(|(pk, _)| pk)
-                        .collect();
-                    touched
-                        .into_iter()
-                        .filter(|pk| !existing.contains(pk))
-                        .collect()
-                }
-                _ => HashSet::new(),
+            let action_touched = action_checks.get(asset_key.as_str());
+            let reread: Vec<PartitionKey> = action_touched
+                .into_iter()
+                .chain(run_checks.get(asset_key.as_str()))
+                .flatten()
+                .cloned()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            let row_runs: HashMap<PartitionKey, Option<String>> = if reread.is_empty() {
+                HashMap::new()
+            } else {
+                scoped
+                    .get_partition_timestamps_for_keys(asset_key, &reread)
+                    .await?
+                    .into_iter()
+                    .map(|(pk, _, run_id)| (pk, run_id))
+                    .collect()
             };
+            // Only an action's touched key can have lost its row to a delete;
+            // a failed run's key may never have been built.
+            let mut deleted: HashSet<PartitionKey> = action_touched
+                .into_iter()
+                .flatten()
+                .filter(|pk| !row_runs.contains_key(*pk))
+                .cloned()
+                .collect();
+            let last_runs: HashMap<PartitionKey, Option<String>> = reread
+                .into_iter()
+                .map(|pk| {
+                    let run_id = row_runs.get(&pk).cloned().flatten();
+                    (pk, run_id)
+                })
+                .collect();
             if reload {
                 let live: HashSet<&PartitionKey> =
                     fresh_timestamps.iter().map(|(pk, _)| pk).collect();
@@ -714,6 +753,7 @@ impl AssetConditionCache {
                     in_progress,
                     failed,
                     deleted,
+                    last_runs,
                 },
             );
         }
@@ -757,6 +797,31 @@ impl AssetConditionCache {
             || overrides
                 .get(asset)
                 .is_some_and(|runs| runs.contains(run_id))
+    }
+
+    /// [`Self::run_materialized_asset`] for one slot. A partition key re-read
+    /// this refresh answers from its own row: the asset row names only the
+    /// asset's newest run, whichever key that run wrote.
+    fn run_materialized_slot(
+        &self,
+        asset: &str,
+        pk: &Option<PartitionKey>,
+        run_id: &str,
+        overrides: &HashMap<String, HashSet<String>>,
+        partitions: &HashMap<String, PartitionStatusPatch>,
+    ) -> bool {
+        let row_run = pk
+            .as_ref()
+            .and_then(|pk| partitions.get(asset)?.last_runs.get(pk));
+        match row_run {
+            Some(row_run) => {
+                row_run.as_deref() == Some(run_id)
+                    || overrides
+                        .get(asset)
+                        .is_some_and(|runs| runs.contains(run_id))
+            }
+            None => self.run_materialized_asset(asset, run_id, overrides),
+        }
     }
 
     /// Apply phase: replay the planned delta against the cache. Returns `delta.changed`.
@@ -852,7 +917,13 @@ impl AssetConditionCache {
         for (asset, pk, run_id, run_ts, tags, names) in last_run_updates {
             // LastExecutedWithTags/LastRunIncludesTarget reflect the latest run
             // that MATERIALIZED the asset — mirror the failure-floor gate.
-            if self.run_materialized_asset(&asset, &run_id, &materialized_overrides) {
+            if self.run_materialized_slot(
+                &asset,
+                &pk,
+                &run_id,
+                &materialized_overrides,
+                &partition_status,
+            ) {
                 self.update_last_run_maps(&asset, &pk, run_ts, &tags, &names);
             }
         }
@@ -883,7 +954,13 @@ impl AssetConditionCache {
         for (asset, pk, run_id, tags) in tick_tag_updates {
             // The last_run gate: a successful materialize run's overrides cover
             // all its assets; a failed run or a verb counts only where it materialized.
-            if self.run_materialized_asset(&asset, &run_id, &materialized_overrides) {
+            if self.run_materialized_slot(
+                &asset,
+                &pk,
+                &run_id,
+                &materialized_overrides,
+                &partition_status,
+            ) {
                 self.update_tick_materialization_tags(&asset, &pk, &tags);
             }
         }

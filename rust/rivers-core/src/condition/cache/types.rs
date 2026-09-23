@@ -50,6 +50,9 @@ pub(super) struct PartitionStatusPatch {
     /// action) — evicted from the cached timestamps at apply. A set: the
     /// apply loop probes it per failed partition.
     pub(super) deleted: HashSet<PartitionKey>,
+    /// The run each re-read key's row names (`None`: no row). It decides which
+    /// run materialized that key, where the asset row speaks for all keys.
+    pub(super) last_runs: HashMap<PartitionKey, Option<String>>,
 }
 
 /// Backfill tracking state — which assets are in active backfills and which partitions they target.

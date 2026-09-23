@@ -944,8 +944,8 @@ fn tick_tag_values(
         .unwrap_or_default()
 }
 
-/// Storage where r1 materialized `events` at `slot` together with `rollup`,
-/// tagged team=data.
+/// Storage where r1 materialized `events` at `slot` (each of its keys)
+/// together with `rollup`, tagged team=data.
 async fn events_built_with_rollup(
     slot: &Option<PartitionKey>,
 ) -> crate::storage::surrealdb_backend::SurrealStorage {
@@ -962,10 +962,15 @@ async fn events_built_with_rollup(
     mat.tags = vec![("team".to_string(), "data".to_string())];
     mat.partition_key = slot.clone();
     storage.create_run(&mat).await.unwrap();
-    storage
-        .store_events(&[events_event("r1", 1000, true, slot)])
-        .await
-        .unwrap();
+    let events: Vec<_> = match slot {
+        Some(pk) => pk
+            .members()
+            .into_iter()
+            .map(|member| events_event("r1", 1000, true, &Some(member)))
+            .collect(),
+        None => vec![events_event("r1", 1000, true, slot)],
+    };
+    storage.store_events(&events).await.unwrap();
     storage
 }
 
@@ -1084,6 +1089,165 @@ async fn an_action_that_did_not_materialize_leaves_the_last_run() {
             data_tags,
             "{slot:?}"
         );
+    }
+}
+
+fn part(key: &str) -> Option<PartitionKey> {
+    Some(PartitionKey::Single {
+        keys: vec![key.to_string()],
+    })
+}
+
+fn parts(keys: &[&str]) -> Option<PartitionKey> {
+    Some(PartitionKey::Set {
+        keys: keys.iter().filter_map(|key| part(key)).collect(),
+    })
+}
+
+fn team(value: &str) -> Vec<(String, String)> {
+    vec![("team".to_string(), value.to_string())]
+}
+
+/// Run `run_id` on `events` over `pk`, tagged team=`run_id`, whose
+/// Materializations cover exactly the `materialized` keys.
+async fn run_on_events(
+    storage: &crate::storage::surrealdb_backend::SurrealStorage,
+    run_id: &str,
+    action: Option<&str>,
+    status: RunStatus,
+    pk: Option<PartitionKey>,
+    materialized: &[&str],
+    ts: i64,
+) {
+    let mut run = mk_run(run_id, status, &["events"], ts);
+    run.action = action.map(str::to_string);
+    run.tags = team(run_id);
+    run.partition_key = pk;
+    storage.create_run(&run).await.unwrap();
+    let events: Vec<_> = materialized
+        .iter()
+        .map(|key| events_event(run_id, ts, true, &part(key)))
+        .collect();
+    storage.store_events(&events).await.unwrap();
+}
+
+/// Verb runs on p1 and p2 finish before one refresh. The asset row names
+/// only the newer, so each key's last run must come from its own row. p3's
+/// verb did not materialize: p3 keeps r1.
+#[tokio::test]
+async fn each_partition_takes_its_last_run_from_its_own_row() {
+    let slot = parts(&["p1", "p2", "p3"]);
+    let storage = events_built_with_rollup(&slot).await;
+    let mut cache = events_cache(&slot);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let refresh = Some("refresh");
+    run_on_events(
+        &storage,
+        "r2a",
+        refresh,
+        RunStatus::Success,
+        part("p1"),
+        &["p1"],
+        2000,
+    )
+    .await;
+    run_on_events(
+        &storage,
+        "r2b",
+        refresh,
+        RunStatus::Success,
+        part("p2"),
+        &["p2"],
+        2001,
+    )
+    .await;
+    run_on_events(
+        &storage,
+        "r2c",
+        Some("optimize"),
+        RunStatus::Success,
+        part("p3"),
+        &[],
+        2002,
+    )
+    .await;
+    cache.refresh(&storage, 1).await.unwrap();
+
+    for (key, run) in [("p1", "r2a"), ("p2", "r2b")] {
+        assert_eq!(last_run_names(&cache, &part(key)), ["events"], "{key}");
+        assert_eq!(last_run_tag_values(&cache, &part(key)), team(run), "{key}");
+        assert_eq!(
+            tick_tag_values(&cache, &part(key)),
+            vec![team(run)],
+            "{key}"
+        );
+    }
+    assert_eq!(last_run_names(&cache, &part("p3")), ["events", "rollup"]);
+    assert_eq!(last_run_tag_values(&cache, &part("p3")), team("data"));
+    assert!(tick_tag_values(&cache, &part("p3")).is_empty());
+}
+
+/// A run over p1 and p2 that materialized only p1 (a verb or a materialize
+/// that failed on p2) is the last run of p1 only — whether the asset row
+/// still names it or a later run on p3 moved the asset row on.
+#[tokio::test]
+async fn a_run_is_the_last_run_of_only_the_partitions_it_materialized() {
+    for action in [Some("refresh"), None] {
+        for later_run_on_p3 in [false, true] {
+            let case = format!("action {action:?}, later run on p3: {later_run_on_p3}");
+            let slot = parts(&["p1", "p2", "p3"]);
+            let storage = events_built_with_rollup(&slot).await;
+            let mut cache = events_cache(&slot);
+            cache.refresh(&storage, 0).await.unwrap();
+
+            run_on_events(
+                &storage,
+                "r2",
+                action,
+                RunStatus::Failure,
+                parts(&["p1", "p2"]),
+                &["p1"],
+                2000,
+            )
+            .await;
+            if later_run_on_p3 {
+                run_on_events(
+                    &storage,
+                    "r3",
+                    None,
+                    RunStatus::Success,
+                    part("p3"),
+                    &["p3"],
+                    2001,
+                )
+                .await;
+            }
+            cache.refresh(&storage, 1).await.unwrap();
+
+            assert_eq!(last_run_names(&cache, &part("p1")), ["events"], "{case}");
+            assert_eq!(
+                last_run_tag_values(&cache, &part("p1")),
+                team("r2"),
+                "{case}"
+            );
+            assert_eq!(
+                tick_tag_values(&cache, &part("p1")),
+                vec![team("r2")],
+                "{case}"
+            );
+            assert_eq!(
+                last_run_names(&cache, &part("p2")),
+                ["events", "rollup"],
+                "{case}"
+            );
+            assert_eq!(
+                last_run_tag_values(&cache, &part("p2")),
+                team("data"),
+                "{case}"
+            );
+            assert!(tick_tag_values(&cache, &part("p2")).is_empty(), "{case}");
+        }
     }
 }
 
