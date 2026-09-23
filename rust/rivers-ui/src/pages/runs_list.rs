@@ -31,7 +31,7 @@ use crate::now::RelTime;
 use crate::server_fns::locations::list_code_locations;
 use crate::server_fns::mutations::{BulkRunActionResult, cancel_runs, delete_runs};
 use crate::server_fns::runs::{get_runs_page, get_runs_summary};
-use crate::types::{CodeLocationEntry, RunFilter, RunRecord, RunStatus, RunsSummary, VerbFilter};
+use crate::types::{CodeLocationEntry, RunFilter, RunRecord, RunStatus, RunsSummary};
 
 const GRID: &str = "grid-template-columns: 32px 80px 1.2fr 0.7fr 1.4fr 0.6fr 0.9fr 0.8fr 1fr";
 
@@ -105,6 +105,7 @@ pub fn RunsListPage() -> impl IntoView {
     let (filter_job, set_filter_job) = signal(String::new());
     let (filter_asset, set_filter_asset) = signal(String::new());
     let (filter_partition, set_filter_partition) = signal(String::new());
+    let (filter_verb, set_filter_verb) = signal(String::new());
     let (page, set_page) = signal(0u64);
     let (page_size, set_page_size) = signal(25u64);
 
@@ -118,12 +119,13 @@ pub fn RunsListPage() -> impl IntoView {
             filter_job.get(),
             filter_asset.get(),
             filter_partition.get(),
+            filter_verb.get(),
             page.get(),
             page_size.get(),
             refresh_tick.get(),
         )
     };
-    let runs_page = Resource::new(page_key, |(tab, job, asset, partition, p, ps, _tick)| {
+    let runs_page = Resource::new(page_key, |(tab, job, asset, partition, verb, p, ps, _tick)| {
         // Empty strings are coerced to `None` server-side in the `From` impl.
         let filter = RunFilter {
             status: status_from_tab(&tab),
@@ -131,7 +133,7 @@ pub fn RunsListPage() -> impl IntoView {
             job_substring: Some(job),
             asset_substring: Some(asset),
             partition_substring: Some(partition),
-            action: VerbFilter::Any,
+            action: crate::helpers::verb_filter_from_input(&verb),
         };
         async move { get_runs_page(p * ps, ps, filter).await }
     });
@@ -308,6 +310,11 @@ pub fn RunsListPage() -> impl IntoView {
                 value=Signal::derive(move || filter_partition.get())
                 on_input=Callback::new(move |v| { set_filter_partition.set(v); set_page.set(0); })
                 placeholder="partition…"
+            />
+            <RiversSearch
+                value=Signal::derive(move || filter_verb.get())
+                on_input=Callback::new(move |v| { set_filter_verb.set(v); set_page.set(0); })
+                placeholder="verb (materialize, delete…)"
             />
         </div>
 

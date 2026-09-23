@@ -595,6 +595,17 @@ pub fn records_by_key(
     (records, failed)
 }
 
+/// The runs list's verb input: empty is any run, `materialize` is runs with no
+/// verb, anything else is runs of exactly that verb.
+pub fn verb_filter_from_input(input: &str) -> crate::types::VerbFilter {
+    use crate::types::VerbFilter;
+    match input.trim() {
+        "" => VerbFilter::Any,
+        "materialize" => VerbFilter::MaterializeOnly,
+        verb => VerbFilter::Verb(verb.to_string()),
+    }
+}
+
 /// The asset an implicit exclusive-action pool (`__asset__:<asset>`) belongs
 /// to; `None` for a user pool.
 pub fn asset_pool_asset(pool_key: &str) -> Option<&str> {
@@ -973,6 +984,18 @@ pub fn launched_by_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verb_filter_reads_the_runs_list_input() {
+        use crate::types::VerbFilter;
+        assert_eq!(verb_filter_from_input(""), VerbFilter::Any);
+        assert_eq!(verb_filter_from_input("  "), VerbFilter::Any);
+        assert_eq!(verb_filter_from_input("materialize"), VerbFilter::MaterializeOnly);
+        assert_eq!(
+            verb_filter_from_input(" delete "),
+            VerbFilter::Verb("delete".to_string())
+        );
+    }
 
     #[test]
     fn implicit_asset_pools_stay_out_of_slot_totals() {
