@@ -195,8 +195,18 @@ impl PyBackfillRequest {
         max_concurrency: u32,
         tags: Option<HashMap<String, String>>,
         action: Option<String>,
-    ) -> Self {
-        Self {
+    ) -> PyResult<Self> {
+        // An empty selection means "every asset" to backfill_inner — for a
+        // verb that is a fan-out across the code location, never a default.
+        if let Some(verb) = &action
+            && selection.is_empty()
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "BackfillRequest(action='{verb}') got an empty selection: name the \
+                 assets to run '{verb}' on"
+            )));
+        }
+        Ok(Self {
             selection,
             partition_keys,
             partition_range,
@@ -205,18 +215,19 @@ impl PyBackfillRequest {
             max_concurrency,
             tags,
             action,
-        }
+        })
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "BackfillRequest(selection={:?}, partitions={}, max_concurrency={})",
+            "BackfillRequest(selection={:?}, partitions={}, max_concurrency={}, action={:?})",
             self.selection,
             self.partition_keys
                 .as_ref()
                 .map(|k| k.len().to_string())
                 .unwrap_or_else(|| "range".to_string()),
             self.max_concurrency,
+            self.action,
         )
     }
 

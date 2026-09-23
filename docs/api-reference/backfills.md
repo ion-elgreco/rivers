@@ -147,7 +147,7 @@ Launch a backfill to reprocess partitions.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `selection` | `list[str] \| None` | `None` | Asset keys to backfill. `None` selects all partitioned assets. |
+| `selection` | `list[str] \| None` | `None` | Asset keys to backfill. `None` selects all partitioned assets — or, with `action`, every asset that defines the verb. With `action`, an empty list is an error. |
 | `partition_keys` | `list[PartitionKey] \| None` | `None` | Explicit list of partition keys to process. |
 | `partition_range` | `PartitionKeyRange \| None` | `None` | Range of partition keys. Mutually exclusive with `partition_keys`. |
 | `strategy` | `BackfillStrategy \| None` | `None` | How to group partitions into runs. Falls back to asset-level strategy, then `MultiRun`. |

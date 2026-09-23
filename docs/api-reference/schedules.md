@@ -177,7 +177,7 @@ def weekly_recompute(context: rs.ScheduleEvaluationContext):
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `selection` | `list[str]` | required | Asset names to backfill. |
+| `selection` | `list[str]` | required | Asset names to backfill. Must not be empty when `action` is set — the constructor raises `ValueError`. |
 | `partition_keys` | `list[PartitionKey] \| None` | `None` | Explicit partition keys (alternative to `partition_range`). |
 | `partition_range` | `PartitionKeyRange \| None` | `None` | Range / cartesian-product spec. |
 | `strategy` | `BackfillStrategy \| None` | `None` | How partitions are grouped into runs. |

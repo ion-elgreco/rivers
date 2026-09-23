@@ -3976,6 +3976,16 @@ impl PyCodeRepository {
         dry_run: bool,
         action: Option<String>,
     ) -> PyResult<PyBackfillResult> {
+        // `None` is the explicit "every asset that defines the verb"; an empty
+        // list is a caller's computed selection that came out empty.
+        if let Some(verb) = &action
+            && selection.as_ref().is_some_and(Vec::is_empty)
+        {
+            return Err(ExecutionError::new_err(format!(
+                "backfill(action='{verb}') got an empty selection: pass selection=None \
+                 to target every asset that defines it"
+            )));
+        }
         py.detach(|| {
             self.backfill_inner(
                 crate::daemon::RunType::Materialization(selection.unwrap_or_default()),

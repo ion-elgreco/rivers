@@ -2579,6 +2579,44 @@ def test_backfill_request_carries_the_action(storage):
     assert calls == ["p1"]
 
 
+def test_empty_action_backfill_selection_is_rejected(storage):
+    """An empty selection with a verb ran the verb on every asset declaring
+    it — a sensor that filtered its candidates down to [] fanned a delete
+    across the code location. gRPC and the UI refuse this; so must a
+    BackfillRequest and repo.backfill. `selection=None` stays the explicit
+    "every asset that defines the verb", as for `run_action`."""
+    deleted = []
+
+    class Events(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = rs.PartitionsDefinition.static_(["p1"])
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext):
+            return context.partition_key
+
+        @rs.action(outcome=rs.Outcome.Unmaterialize)
+        @classmethod
+        def delete(cls, ctx):
+            deleted.append(ctx.partition_key)
+
+    p1 = rs.PartitionKey.single("p1")
+    with pytest.raises(ValueError, match="empty selection"):
+        rs.BackfillRequest(selection=[], partition_keys=[p1], action="delete")
+    # Without a verb an empty selection keeps its meaning (every asset).
+    assert rs.BackfillRequest(selection=[], partition_keys=[p1]).selection == []
+
+    repo = rs.CodeRepository(assets=[Events], default_executor=IP)
+    repo.resolve(storage=storage)
+    repo.materialize(partition_key=p1)
+    with pytest.raises(Exception, match="empty selection"):
+        repo.backfill(selection=[], partition_keys=[p1], action="delete")
+    assert deleted == []
+
+    repo.backfill(selection=None, partition_keys=[p1], action="delete")
+    assert deleted == ["p1"]
+
+
 def test_unchanged_reports_metadata_on_the_event():
     """An action that changes nothing still has something to report (rows
     scanned, bytes reclaimed) — the outcome carries metadata now."""
