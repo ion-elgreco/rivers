@@ -2136,6 +2136,77 @@ def test_batched_action_can_fail_one_partition(executor, style):
     assert "p2" in remaining[0]
 
 
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize("style", ["sync", "async"])
+def test_downstream_first_keeps_the_source_of_a_failed_key(executor, style):
+    """DownstreamFirst deletes a rollup before its source, so a failure leaves a
+    missing rollup, never a rollup built from deleted data. In a batched run
+    the rollup step can fail one key; the source step must then leave that key
+    alone. The ordering read only step-level failures, so the source step
+    deleted every key of the batch."""
+    seen = {}
+
+    def record(ctx):
+        seen[ctx.asset_name] = sorted(str(k) for k in ctx.partition.keys)
+        if ctx.asset_name == "rollups":
+            for key in ctx.partition.keys:
+                if "p2" in str(key):
+                    ctx.mark_partition_failed(key, "rollup locked")
+
+    if style == "sync":
+
+        def _purge(ctx):
+            record(ctx)
+    else:
+
+        async def _purge(ctx):
+            await asyncio.sleep(0)
+            record(ctx)
+
+    purge = rs.AssetAction(
+        name="purge",
+        outcome=rs.Outcome.Unmaterialize,
+        ordering=rs.ActionOrdering.DownstreamFirst,
+    )(_purge)
+
+    class Events(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = rs.PartitionsDefinition.static_(["p1", "p2", "p3"])
+        actions = [purge]
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext):
+            return context.partition_key
+
+    class Rollups(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = rs.PartitionsDefinition.static_(["p1", "p2", "p3"])
+        actions = [purge]
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext, events):
+            return events
+
+    repo = rs.CodeRepository(assets=[Events, Rollups], default_executor=executor)
+    for p in ("p1", "p2", "p3"):
+        repo.materialize(partition_key=rs.PartitionKey.single(p))
+
+    repo.backfill(
+        selection=["events", "rollups"],
+        partition_keys=[rs.PartitionKey.single(p) for p in ("p1", "p2", "p3")],
+        action="purge",
+        strategy=rs.BackfillStrategy.single_run(),
+    )
+
+    assert len(seen["rollups"]) == 3
+    assert len(seen["events"]) == 2 and not any("p2" in k for k in seen["events"]), (
+        f"the source step acted on the key its rollup failed: {seen['events']}"
+    )
+    for asset in ("events", "rollups"):
+        remaining = [str(k) for k in repo.storage.get_materialized_partitions(asset)]
+        assert len(remaining) == 1 and "p2" in remaining[0], (asset, remaining)
+
+
 def _batched_action_repo(body):
     delete = rs.AssetAction(name="delete", outcome=rs.Outcome.Unmaterialize)(body)
 

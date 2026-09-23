@@ -88,14 +88,14 @@ fn stash_failed_partitions(
     if marks.is_empty() {
         return;
     }
-    if step.outputs.is_empty() {
-        ctx.state.failed_partitions.insert(step.name.clone(), marks);
-    } else {
-        for out in &step.outputs {
-            ctx.state
-                .failed_partitions
-                .insert(out.clone(), marks.clone());
-        }
+    // Merge: keys an ordering dependency failed are pre-marked before the
+    // step runs, and the step's own marks must not drop them.
+    for name in step.event_names() {
+        ctx.state
+            .failed_partitions
+            .entry(name.clone())
+            .or_default()
+            .extend(marks.iter().cloned());
     }
 }
 

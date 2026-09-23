@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
-use rivers_core::execution::plan::ExecutionPlan;
+use rivers_core::execution::plan::{ExecutionPlan, ExecutionStep};
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{AssetScope, ScopedStorageHandle};
 use tokio::sync::mpsc;
@@ -375,6 +375,62 @@ impl<'a> BatchContext<'a> {
                 ts,
             ),
         }
+    }
+
+    /// Members of the run's key that a plan dependency of `step` marked
+    /// failed, each with the reason this step skips it.
+    pub(crate) fn dependency_failed_members(
+        &self,
+        step: &ExecutionStep,
+    ) -> Vec<(PyPartitionKey, String)> {
+        let mut out: Vec<(PyPartitionKey, String)> = Vec::new();
+        let mut seen: HashSet<PyPartitionKey> = HashSet::new();
+        for dep in &step.plan_dependencies {
+            let names = self
+                .scope
+                .plan
+                .steps
+                .iter()
+                .find(|s| &s.name == dep)
+                .map(|s| s.event_names().to_vec())
+                .unwrap_or_else(|| vec![dep.clone()]);
+            for name in names {
+                for (key, _) in self.state.failed_partitions.get(&name).into_iter().flatten() {
+                    if seen.insert(key.clone()) {
+                        out.push((
+                            key.clone(),
+                            format!("Skipped: ordering dependency '{dep}' failed on this key"),
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The key an action step acts on: the run's key minus the members
+    /// already failed for it (keys an ordering dependency failed).
+    pub(crate) fn action_step_partition_key(&self, step: &ExecutionStep) -> Option<PyPartitionKey> {
+        let pk = self.scope.partition_key.as_ref()?;
+        let failed: HashSet<&PyPartitionKey> = step
+            .event_names()
+            .iter()
+            .filter_map(|name| self.state.failed_partitions.get(name))
+            .flatten()
+            .map(|(key, _)| key)
+            .collect();
+        if failed.is_empty() {
+            return Some(pk.clone());
+        }
+        let surviving: Vec<rivers_core::storage::PartitionKey> = pk
+            .members()
+            .iter()
+            .filter(|m| !failed.contains(m))
+            .map(Into::into)
+            .collect();
+        Some(PyPartitionKey::from(
+            &rivers_core::execution::backfill::bundle_keys(&surviving),
+        ))
     }
 
     /// Members of a batched key the step actually completed, with the keys the

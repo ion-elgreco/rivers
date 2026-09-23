@@ -172,12 +172,13 @@ pub(crate) fn execute_step_with_capture(
     // the success path puts on `StepResult.config_instance`.
     let mut resolved_config: Option<Py<PyAny>> = None;
     let result = if let Some(verb) = &ctx.scope.plan.action {
+        let action_key = ctx.action_step_partition_key(step);
         ops::execute_action_step(
             py,
             verb,
             step,
             ctx.repo.node_map,
-            ctx.scope.partition_key,
+            &action_key,
             ctx.repo.resources,
             ctx.repo.config_overrides,
             ctx.repo.io_handler_registry,

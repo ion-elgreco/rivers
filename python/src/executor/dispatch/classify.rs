@@ -1,6 +1,10 @@
 //! Step classification — determines which executor backend handles each step.
+use std::collections::HashSet;
+
 use pyo3::prelude::*;
 use rivers_core::execution::plan::StepKind;
+
+use crate::partitions::PyPartitionKey;
 
 use crate::errors::ExecutionError;
 
@@ -37,7 +41,13 @@ pub(crate) fn classify_step(
         .iter()
         .any(|d| ctx.state.was_failed(d));
     if dep_failed {
-        let msg = "Skipped: upstream dependency failed";
+        // An action plan's dependencies are ordering, not data: under
+        // DownstreamFirst the failed step is the downstream one.
+        let msg = if ctx.scope.plan.is_action() {
+            "Skipped: ordering dependency failed"
+        } else {
+            "Skipped: upstream dependency failed"
+        };
         for name in step.event_names() {
             ctx.record_failure_no_hooks(name, ExecutionError::new_err(msg.to_string()), failures);
         }
@@ -64,6 +74,32 @@ pub(crate) fn classify_step(
             });
         }
         return StepAction::Handled;
+    }
+
+    // Ordering bounds partial failure per key too: in a batched action run a
+    // dependency can fail single keys, and this step must leave them alone
+    // (DownstreamFirst: a missing rollup, never one built from deleted data).
+    if ctx.scope.plan.is_action()
+        && let Some(pk) = ctx.scope.partition_key
+    {
+        let blocked = ctx.dependency_failed_members(step);
+        if !blocked.is_empty() {
+            let blocked_keys: HashSet<&PyPartitionKey> = blocked.iter().map(|(k, _)| k).collect();
+            if pk.members().iter().all(|m| blocked_keys.contains(m)) {
+                let msg = "Skipped: ordering dependency failed on every key";
+                for name in step.event_names() {
+                    ctx.record_failure_no_hooks(name, ExecutionError::new_err(msg), failures);
+                }
+                return StepAction::Handled;
+            }
+            for name in step.event_names() {
+                ctx.state
+                    .failed_partitions
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(blocked.iter().cloned());
+            }
+        }
     }
 
     if let StepKind::Mapped {

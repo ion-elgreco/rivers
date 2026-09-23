@@ -228,8 +228,9 @@ repo.run_action("delete", selection=["events", "event_rollups"], partition_key=p
 ```
 
 `DownstreamFirst` deletes downstream before upstream — a failure midway leaves a
-rollup missing rather than a rollup derived from deleted source data. Ordering bounds
-partial failure; it cannot make a multi-asset delete atomic.
+rollup missing rather than a rollup derived from deleted source data. This holds per
+key in a batched run too: a key the downstream step marks failed is skipped upstream.
+Ordering bounds partial failure; it cannot make a multi-asset delete atomic.
 
 **Delete acts on exactly what you name.** There is no implicit lineage expansion in
 v1 — downstream left out of the selection keeps its data. Returning

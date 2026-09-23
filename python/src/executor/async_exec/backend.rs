@@ -89,6 +89,7 @@ fn execute_with_capture(
     py: Python,
     step: &ExecutionStep,
     shared: &SharedStepContext,
+    action_key: &Option<PyPartitionKey>,
     input_overrides: &HashMap<String, Py<PyAny>>,
     locals: Option<&pyo3_async_runtimes::TaskLocals>,
 ) -> WorkOutcome {
@@ -109,7 +110,7 @@ fn execute_with_capture(
             verb,
             step,
             &shared.node_map,
-            &shared.partition_key,
+            action_key,
             &shared.resources,
             &shared.config_overrides,
             &shared.io_handler_registry,
@@ -159,6 +160,9 @@ fn execute_with_capture(
 struct StepDispatch {
     shared: Arc<SharedStepContext>,
     step: ExecutionStep,
+    /// The key an action step acts on — the run's key minus members an
+    /// ordering dependency failed.
+    action_key: Option<PyPartitionKey>,
     input_overrides: HashMap<String, Py<PyAny>>,
     pools: Vec<(String, u32)>,
     asset_scope: Option<rivers_core::storage::AssetScope>,
@@ -182,6 +186,7 @@ struct StepDispatch {
 struct AsyncStepWorker {
     shared: Arc<SharedStepContext>,
     step: ExecutionStep,
+    action_key: Option<PyPartitionKey>,
     input_overrides: HashMap<String, Py<PyAny>>,
     locals: Option<pyo3_async_runtimes::TaskLocals>,
 }
@@ -193,6 +198,7 @@ impl AsyncWorker for AsyncStepWorker {
                 py,
                 &self.step,
                 &self.shared,
+                &self.action_key,
                 &self.input_overrides,
                 self.locals.as_ref(),
             )
@@ -205,6 +211,7 @@ async fn dispatch_step(d: StepDispatch) -> WorkOutcome {
     let StepDispatch {
         shared,
         step,
+        action_key,
         input_overrides,
         pools,
         asset_scope,
@@ -232,6 +239,7 @@ async fn dispatch_step(d: StepDispatch) -> WorkOutcome {
         AsyncStepWorker {
             shared,
             step,
+            action_key,
             input_overrides,
             locals,
         },
@@ -282,12 +290,14 @@ impl ExecutorBackend for AsyncBackend {
                 let pool_step_name = inst.instance_name.clone();
                 let start_event_names = inst.event_names.clone();
                 let retry = ctx.retry_policy_for(&step);
+                let action_key = ctx.action_step_partition_key(&step);
                 (
                     inst.idx,
                     inst.instance_name,
                     inst.event_names,
                     StepDispatch {
                         shared: Arc::clone(&shared),
+                        action_key,
                         step,
                         input_overrides,
                         pools: inst.pools,
