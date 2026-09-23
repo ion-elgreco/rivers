@@ -16,8 +16,8 @@ use crate::components::ui_kit::{
     StripRun, Topbar,
 };
 use crate::helpers::{
-    JobPartitionPicker, format_duration, format_timestamp, partition_picker_for_assets,
-    run_status_class, run_status_kind, short_id,
+    JobPartitionPicker, format_duration, format_timestamp, job_partition_picker, job_verb,
+    replay_click, run_status_class, run_status_kind, short_id,
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::get_assets;
@@ -25,7 +25,7 @@ use crate::server_fns::automation::get_jobs;
 use crate::server_fns::mutations::execute_job;
 use crate::server_fns::overview::get_assets_info;
 use crate::server_fns::runs::get_runs_page;
-use crate::types::{AssetDefinitionInfo, RunFilter};
+use crate::types::{AssetActionInfo, AssetDefinitionInfo, RunFilter};
 
 #[component]
 pub fn JobDetailPage() -> impl IntoView {
@@ -80,25 +80,30 @@ pub fn JobDetailPage() -> impl IntoView {
     let show_dialog = RwSignal::new(false);
     let navigate = leptos_router::hooks::use_navigate();
 
-    // `JobPartitionPicker::None` means there's nothing for the dialog to
-    // show — skip it and submit directly.
-    let job_picker = Signal::derive(move || -> JobPartitionPicker {
+    // The job, resolved against its assets' declarations: the verb it runs
+    // (if any) and the partition picker that verb allows.
+    let job_launch = Memo::new(move |_| -> (Option<AssetActionInfo>, JobPartitionPicker) {
         let current = name();
         let Some(Ok(jobs_list)) = jobs.get() else {
-            return JobPartitionPicker::None;
+            return (None, JobPartitionPicker::None);
         };
         let Some(job) = jobs_list.into_iter().find(|j| j.name == current) else {
-            return JobPartitionPicker::None;
+            return (None, JobPartitionPicker::None);
         };
-        let Some(Ok(infos)) = assets_info.get() else {
-            return JobPartitionPicker::None;
-        };
+        let infos = assets_info.get().and_then(|r| r.ok()).unwrap_or_default();
         let by_key: std::collections::HashMap<String, AssetDefinitionInfo> = infos
             .into_iter()
             .map(|i| (i.asset_key.clone(), i))
             .collect();
-        partition_picker_for_assets(&job.asset_selection, &by_key)
+        let verb = job_verb(job.action.as_deref(), &job.asset_selection, &by_key);
+        let picker = job_partition_picker(verb.as_ref(), &job.asset_selection, &by_key);
+        (verb, picker)
     });
+    // `JobPartitionPicker::None` means there's nothing for the dialog to
+    // show — skip it and submit directly.
+    let job_picker = Signal::derive(move || job_launch.get().1);
+    let job_verb_signal = Signal::derive(move || job_launch.get().0);
+    let exec_armed = RwSignal::new(false);
 
     let dialog_job_name: Signal<String> = Signal::derive(name);
 
@@ -106,6 +111,13 @@ pub fn JobDetailPage() -> impl IntoView {
         if !matches!(job_picker.get(), JobPartitionPicker::None) {
             set_exec_error.set(None);
             show_dialog.set(true);
+            return;
+        }
+        // A destructive verb takes a second click, as on the run page.
+        let destructive = job_verb_signal.get().is_some_and(|v| v.is_destructive());
+        let (dispatch, now_armed) = replay_click(destructive, exec_armed.get());
+        exec_armed.set(now_armed);
+        if !dispatch {
             return;
         }
         let job_name = name();
@@ -162,7 +174,16 @@ pub fn JobDetailPage() -> impl IntoView {
                 <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
                     <path d="M3 2l7 4-7 4V2z"/>
                 </svg>
-                {move || if exec_pending.get() { "Executing..." } else { "Execute" }}
+                {move || if exec_pending.get() {
+                    "Executing...".to_string()
+                } else if exec_armed.get() {
+                    format!(
+                        "Confirm {}?",
+                        job_verb_signal.get().map(|v| v.name).unwrap_or_default()
+                    )
+                } else {
+                    "Execute".to_string()
+                }}
             </button>
             {move || exec_error.get().map(|msg| view! {
                 <span class="text-error" style="margin-left: 0.5rem">{msg}</span>
@@ -173,6 +194,7 @@ pub fn JobDetailPage() -> impl IntoView {
             show=show_dialog
             job_name=dialog_job_name
             picker=job_picker
+            verb=job_verb_signal
         />
 
         <Transition fallback=move || view! { <div class="loading">"Loading..."</div> }>
@@ -227,8 +249,15 @@ pub fn JobDetailPage() -> impl IntoView {
                                         </div>
                                     </div>
                                     <div class="meta-tile">
-                                        <div class="meta-tile-label">"EXECUTOR"</div>
-                                        <div class="meta-tile-value"><KindBadge kind=executor_type/></div>
+                                        <div class="meta-tile-label">{if job.action.is_some() { "ACTION" } else { "EXECUTOR" }}</div>
+                                        <div class="meta-tile-value">
+                                            // Action steps run in the run's own process whatever
+                                            // the executor, so the verb is the useful fact here.
+                                            {match job.action.clone() {
+                                                Some(verb) => view! { <span class="grid-cell-mono">{verb}</span> }.into_any(),
+                                                None => view! { <KindBadge kind=executor_type/> }.into_any(),
+                                            }}
+                                        </div>
                                     </div>
                                     <div class="meta-tile">
                                         <div class="meta-tile-label">"ASSETS"</div>

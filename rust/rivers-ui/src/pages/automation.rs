@@ -8,11 +8,11 @@ use leptos_router::components::A;
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::TableSkeleton;
 use crate::components::ui_kit::{Crumb, EmptyState, Topbar, UnderlineTabs};
-use crate::helpers::{short_id, use_query_param};
+use crate::helpers::{job_actions_by_name, short_id, use_query_param};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::automation::{
     evaluate_schedule, evaluate_sensor, get_condition_tick_detail, get_condition_ticks,
-    get_latest_condition_evals, get_next_ticks, get_schedules, get_sensors,
+    get_jobs, get_latest_condition_evals, get_next_ticks, get_schedules, get_sensors,
 };
 use crate::server_fns::overview::get_assets_info;
 use crate::types::{
@@ -53,6 +53,18 @@ pub fn AutomationPage() -> impl IntoView {
         move || (refresh_tick.get(), loc.get()),
         |(_tick, (ns, name))| async move { get_assets_info(ns, name).await },
     );
+    // Job definitions are static for the session; they say which job a
+    // schedule or sensor runs as an action.
+    let jobs = Resource::new(
+        move || loc.get(),
+        |(ns, name)| async move { get_jobs(ns, name).await },
+    );
+    let job_actions = move || -> HashMap<String, String> {
+        jobs.get()
+            .and_then(|r| r.ok())
+            .map(|js| job_actions_by_name(&js))
+            .unwrap_or_default()
+    };
 
     let sched_records =
         move || -> Vec<ScheduleRecord> { schedules.get().and_then(|r| r.ok()).unwrap_or_default() };
@@ -248,7 +260,7 @@ pub fn AutomationPage() -> impl IntoView {
                     "sensors" => {
                         let mut records = sensor_records();
                         sort_sensors(&mut records, &field, asc);
-                        render_sensors_table(records, loc_ns, loc_name, toggle_sort.clone(), sort_indicator.clone())
+                        render_sensors_table(records, job_actions(), loc_ns, loc_name, toggle_sort.clone(), sort_indicator.clone())
                     }
                     "conditions" => {
                         let mut assets = condition_assets();
@@ -266,7 +278,7 @@ pub fn AutomationPage() -> impl IntoView {
                         let mut records = sched_records();
                         let ticks = next_ticks_map();
                         sort_schedules(&mut records, &field, asc);
-                        render_schedules_table(records, ticks, loc_ns, loc_name, toggle_sort.clone(), sort_indicator.clone())
+                        render_schedules_table(records, ticks, job_actions(), loc_ns, loc_name, toggle_sort.clone(), sort_indicator.clone())
                     }
                 }
             }}
@@ -324,6 +336,7 @@ type SortIndicator = std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>;
 fn render_schedules_table(
     records: Vec<ScheduleRecord>,
     next_ticks: HashMap<String, String>,
+    job_actions: HashMap<String, String>,
     loc_ns: String,
     loc_name: String,
     toggle_sort: SortToggle,
@@ -405,7 +418,9 @@ fn render_schedules_table(
                                 </svg>
                             </button>
                         </span>
-                        <span class="grid-cell-mono" style="color:var(--secondary); font-size:11.5px">{job_name}</span>
+                        <span class="grid-cell-mono" style="color:var(--secondary); font-size:11.5px">
+                            {job_actions.get(&job_name).map(|v| format!("{job_name} · {v}")).unwrap_or(job_name)}
+                        </span>
                         <span class="status-dot-row">
                             <span class=format!("status-dot status-dot--{}", if status_running { "ok" } else { "muted" })></span>
                             <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{status_raw}</span>
@@ -447,6 +462,7 @@ fn render_schedules_table(
 
 fn render_sensors_table(
     records: Vec<SensorRecord>,
+    job_actions: HashMap<String, String>,
     loc_ns: String,
     loc_name: String,
     toggle_sort: SortToggle,
@@ -517,8 +533,9 @@ fn render_sensors_table(
                         {match job_name.clone() {
                             Some(jn) => {
                                 let job_href = loc_path(&loc_ns, &loc_name, &format!("jobs/{}", jn));
+                                let label = job_actions.get(&jn).map(|v| format!("{jn} · {v}")).unwrap_or(jn);
                                 view! {
-                                    <A href=job_href attr:class="grid-cell-mono sensor-job-link">{jn}</A>
+                                    <A href=job_href attr:class="grid-cell-mono sensor-job-link">{label}</A>
                                 }.into_any()
                             }
                             None => view! { <span class="grid-cell-muted">"—"</span> }.into_any()

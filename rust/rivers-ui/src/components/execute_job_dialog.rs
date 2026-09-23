@@ -11,7 +11,7 @@ use crate::components::partition_picker::PartitionPicker;
 use crate::helpers::JobPartitionPicker;
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::mutations::{execute_job, launch_backfill};
-use crate::types::SubmitPartitionKey;
+use crate::types::{AssetActionInfo, SubmitPartitionKey};
 
 /// Above this many selected partitions, submit one job-aware backfill instead of
 /// a run each (mirrors `MaterializeDialog`).
@@ -32,7 +32,13 @@ pub fn ExecuteJobDialog(
     #[prop(into)] show: RwSignal<bool>,
     #[prop(into)] job_name: Signal<String>,
     #[prop(into)] picker: Signal<JobPartitionPicker>,
+    /// The verb an action job runs. An optional-key verb may submit without
+    /// a partition (one whole-asset run); a destructive one says so.
+    #[prop(optional, into)]
+    verb: Option<Signal<Option<AssetActionInfo>>>,
 ) -> impl IntoView {
+    let verb: Signal<Option<AssetActionInfo>> = verb.unwrap_or_else(|| Signal::derive(|| None));
+    let destructive = Memo::new(move |_| verb.get().is_some_and(|v| v.is_destructive()));
     // Cartesian-expanded selection — owned by us, written by
     // PartitionPicker on every toggle. Read at submit and to drive the
     // run-count label.
@@ -134,6 +140,17 @@ pub fn ExecuteJobDialog(
                             <label>"Job"</label>
                             <div class="grid-cell-mono">{move || job_name.get()}</div>
                         </div>
+                        {move || verb.get().map(|v| view! {
+                            <div class="form-group">
+                                <label>"Action"</label>
+                                <div class="grid-cell-mono">{v.name}</div>
+                            </div>
+                        })}
+                        <Show when=move || destructive.get()>
+                            <p class="text-error mat-dialog-warning">
+                                "Clears materialization state for the job's assets."
+                            </p>
+                        </Show>
                         <PartitionPicker picker=picker selected=selected reset=show/>
                         {move || error.get().map(|msg| view! {
                             <div class="error-msg">{msg}</div>
@@ -142,11 +159,14 @@ pub fn ExecuteJobDialog(
                     <div class="modal-footer">
                         <button class="btn" on:click=move |_| show.set(false)>"Cancel"</button>
                         <button
-                            class="btn btn-primary"
+                            class=move || if destructive.get() { "btn btn-danger" } else { "btn btn-primary" }
                             on:click=move |_| {
                                 let p = picker.get_untracked();
                                 let keys = selected.get_untracked();
-                                let needs_partition = !matches!(p, JobPartitionPicker::None);
+                                let key_optional =
+                                    verb.get_untracked().is_some_and(|v| v.key_optional());
+                                let needs_partition =
+                                    !matches!(p, JobPartitionPicker::None) && !key_optional;
                                 if needs_partition && keys.is_empty() {
                                     let msg = if matches!(p, JobPartitionPicker::Multi { .. }) {
                                         "Select at least one value for every dimension."

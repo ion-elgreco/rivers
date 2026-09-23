@@ -694,6 +694,57 @@ pub fn common_actions(
         .collect()
 }
 
+/// The verb a job's runs execute, resolved against its assets' declarations
+/// (a destructive variant on any asset wins, as in [`common_actions`]).
+/// `None` is a materialize job. Declarations not loaded yet read as the worst
+/// case — destructive, key required — so a confirmation is never skipped.
+pub fn job_verb(
+    action: Option<&str>,
+    assets: &[String],
+    asset_info_by_key: &std::collections::HashMap<String, AssetDefinitionInfo>,
+) -> Option<crate::types::AssetActionInfo> {
+    let verb = action?;
+    let fallback = |outcome: &str, partitioning: &str| crate::types::AssetActionInfo {
+        name: verb.to_string(),
+        outcome: outcome.to_string(),
+        exclusive: false,
+        partitioning: partitioning.to_string(),
+        description: None,
+    };
+    if verb == "observe" {
+        return Some(fallback("observe", "optional"));
+    }
+    Some(
+        common_actions(assets, asset_info_by_key)
+            .into_iter()
+            .find(|a| a.name == verb)
+            .unwrap_or_else(|| fallback("unmaterialize", "required")),
+    )
+}
+
+/// `job name → verb` for the code location's action jobs; materialize jobs
+/// are absent. Schedules and sensors name a job, and this says what it does.
+pub fn job_actions_by_name(
+    jobs: &[crate::types::JobRecord],
+) -> std::collections::HashMap<String, String> {
+    jobs.iter()
+        .filter_map(|j| Some((j.name.clone(), j.action.clone()?)))
+        .collect()
+}
+
+/// Picker shape for launching a job: a whole-asset verb takes no key, so its
+/// job gets no picker; everything else picks from the assets' partitions.
+pub fn job_partition_picker(
+    verb: Option<&crate::types::AssetActionInfo>,
+    assets: &[String],
+    asset_info_by_key: &std::collections::HashMap<String, AssetDefinitionInfo>,
+) -> JobPartitionPicker {
+    if verb.is_some_and(|v| v.is_keyless()) {
+        return JobPartitionPicker::None;
+    }
+    partition_picker_for_assets(assets, asset_info_by_key)
+}
+
 /// Cartesian product of per-dimension selections — used by the Multi
 /// dialog flow to expand the user's `{color: [r,g], size: [s]}` choices
 /// into individual partition keys, one per concrete combination. Each
@@ -1129,6 +1180,65 @@ mod tests {
             })
             .collect();
         info
+    }
+
+    fn partitioned_with(asset_key: &str, verb: &str, outcome: &str, partitioning: &str) -> AssetDefinitionInfo {
+        let mut info = make_info(asset_key, Some(&["p1", "p2"]));
+        info.actions = vec![crate::types::AssetActionInfo {
+            name: verb.to_string(),
+            outcome: outcome.to_string(),
+            exclusive: true,
+            partitioning: partitioning.to_string(),
+            description: None,
+        }];
+        info
+    }
+
+    #[test]
+    fn job_verb_resolves_the_declaration_behind_a_job() {
+        let infos = make_map(vec![
+            partitioned_with("events", "vacuum", "unchanged", "keyless"),
+            partitioned_with("orders", "delete", "unmaterialize", "optional"),
+        ]);
+        let assets = |a: &str| vec![a.to_string()];
+        assert_eq!(job_verb(None, &assets("events"), &infos), None);
+        let vacuum = job_verb(Some("vacuum"), &assets("events"), &infos).unwrap();
+        assert!(vacuum.is_keyless() && !vacuum.is_destructive());
+        assert!(job_verb(Some("delete"), &assets("orders"), &infos).unwrap().is_destructive());
+        // Infos not loaded yet: assume the verb destroys data and needs a key.
+        let unknown = job_verb(Some("delete"), &assets("ghost"), &infos).unwrap();
+        assert!(unknown.is_destructive() && !unknown.is_keyless());
+        // `observe` never destroys and takes a key or not.
+        assert!(job_verb(Some("observe"), &assets("ghost"), &infos).unwrap().key_optional());
+    }
+
+    #[test]
+    fn job_actions_by_name_keeps_only_action_jobs() {
+        let job = |name: &str, action: Option<&str>| crate::types::JobRecord {
+            name: name.to_string(),
+            asset_selection: vec![],
+            executor_type: "in_process".to_string(),
+            action: action.map(String::from),
+        };
+        let map = job_actions_by_name(&[job("etl", None), job("purge", Some("delete"))]);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("purge").map(String::as_str), Some("delete"));
+    }
+
+    #[test]
+    fn a_whole_asset_verb_job_gets_no_partition_picker() {
+        let infos = make_map(vec![partitioned_with("events", "vacuum", "unchanged", "keyless")]);
+        let assets = vec!["events".to_string()];
+        let vacuum = job_verb(Some("vacuum"), &assets, &infos);
+        assert!(matches!(
+            job_partition_picker(vacuum.as_ref(), &assets, &infos),
+            JobPartitionPicker::None
+        ));
+        // A materialize job over the same asset still picks keys.
+        assert!(!matches!(
+            job_partition_picker(None, &assets, &infos),
+            JobPartitionPicker::None
+        ));
     }
 
     #[test]

@@ -20,7 +20,7 @@ use leptos::prelude::*;
 use leptos_router::components::Router;
 use rivers_ui::components::execute_job_dialog::ExecuteJobDialog;
 use rivers_ui::helpers::JobPartitionPicker;
-use rivers_ui::types::PartitionDimensionInfo;
+use rivers_ui::types::{AssetActionInfo, PartitionDimensionInfo};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -45,6 +45,81 @@ fn mount_dialog(
     })
     .forget();
     target
+}
+
+fn mount_verb_dialog(verb: AssetActionInfo) -> web_sys::HtmlElement {
+    nav_to("/locations/default/demo");
+    let target = fresh_mount_target();
+    let show = RwSignal::new(true);
+    mount_to(target.clone(), move || {
+        view! {
+            <Router>
+                <ExecuteJobDialog
+                    show=show
+                    job_name=Signal::derive(|| "purge_job".to_string())
+                    picker=Signal::derive(|| JobPartitionPicker::SingleDim {
+                        keys: vec!["p1".into(), "p2".into()],
+                        truncated: false,
+                    })
+                    verb=Signal::derive(move || Some(verb.clone()))
+                />
+            </Router>
+        }
+    })
+    .forget();
+    target
+}
+
+fn verb(name: &str, outcome: &str, partitioning: &str) -> AssetActionInfo {
+    AssetActionInfo {
+        name: name.to_string(),
+        outcome: outcome.to_string(),
+        exclusive: true,
+        partitioning: partitioning.to_string(),
+        description: None,
+    }
+}
+
+/// An `Optional` verb (delete) covers the whole asset without a key, so the
+/// dialog must not demand a partition the backend would accept without one.
+#[wasm_bindgen_test]
+async fn optional_key_verb_may_submit_without_a_partition() {
+    let host = mount_verb_dialog(verb("purge", "unchanged", "optional"));
+    flush_effects().await;
+
+    click(&query_one(&host, ".modal-footer .btn-primary"), false);
+    flush_effects().await;
+
+    let errors: Vec<String> = query_all(&host, ".error-msg")
+        .iter()
+        .filter_map(|e| e.text_content())
+        .collect();
+    assert!(
+        !errors.iter().any(|e| e == "Select at least one partition."),
+        "an optional-key verb was blocked on an empty selection: {errors:?}"
+    );
+}
+
+/// The job pages are another route to a destructive verb; the dialog must
+/// flag it the way the materialize dialog does.
+#[wasm_bindgen_test]
+async fn destructive_job_verb_is_flagged() {
+    let host = mount_verb_dialog(verb("purge", "unmaterialize", "required"));
+    flush_effects().await;
+
+    assert!(
+        query_one(&host, ".mat-dialog-warning")
+            .text_content()
+            .unwrap()
+            .contains("Clears materialization state")
+    );
+    assert_eq!(query_all(&host, ".modal-footer .btn-danger").len(), 1);
+    assert!(
+        query_one(&host, ".modal-body")
+            .text_content()
+            .unwrap()
+            .contains("purge")
+    );
 }
 
 #[wasm_bindgen_test]
