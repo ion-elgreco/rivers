@@ -325,10 +325,46 @@ pub(crate) fn extract_module_qualname(py: Python, func: &Py<PyAny>) -> PyResult<
 }
 
 /// Wrap a callable in a `FuncRef` for pickle-safe transport to loky workers.
-/// Falls back to direct pickling for closures/local functions.
+/// Falls back to direct pickling for closures/local functions, and whenever
+/// the path would not rebuild `func` (probed parent-side, as in
+/// `make_io_handler_ref`). The worker rebuilds the ref while it unpickles the
+/// call, and loky fails every pending step when that raises, not only this one.
 pub(crate) fn make_func_ref(py: Python, func: &Py<PyAny>) -> PyResult<Py<PyAny>> {
     let (module, qualname) = extract_module_qualname(py, func)?;
+    let found = super::worker::_reconstruct_func_ref(py, module.clone(), qualname.clone())?;
+    if !same_callable(found.bind(py), func.bind(py)) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "module path does not reach this callable; ship it by value",
+        ));
+    }
     Ok(Py::new(py, super::worker::PyFuncRef::new(module, qualname))?.into_any())
+}
+
+/// A bound method ships as its function and owner: loky's own method reducer
+/// rebuilds it as `getattr(owner, func.__name__)`, which misses a verb stored
+/// under another name (`materialize = classmethod(_load)`).
+fn func_by_value(py: Python, func: &Py<PyAny>) -> PyResult<Py<PyAny>> {
+    let f = func.bind(py);
+    match (f.getattr("__func__"), f.getattr("__self__")) {
+        (Ok(inner), Ok(owner)) => {
+            let method = super::worker::PyBoundMethod::new(inner.unbind(), owner.unbind());
+            Ok(Py::new(py, method)?.into_any())
+        }
+        _ => Ok(func.clone_ref(py)),
+    }
+}
+
+/// Each attribute access builds a new bound method, so two bound methods
+/// match when they bind the same function to the same owner.
+fn same_callable(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> bool {
+    if a.is(b) {
+        return true;
+    }
+    let same = |attr: &str| match (a.getattr(attr), b.getattr(attr)) {
+        (Ok(x), Ok(y)) => x.is(&y),
+        _ => false,
+    };
+    same("__func__") && same("__self__")
 }
 
 /// Wrap an IO handler in an `IOHandlerRef` for pickle-safe transport.
@@ -438,9 +474,9 @@ pub(super) fn build_worker_submit_args(
         py_resource_specs.append(tuple)?;
     }
 
-    // Wrap func in _FuncRef for pickle-safe transport. Falls back to raw
-    // func if __module__/__qualname__ are unavailable (e.g. lambdas in tests).
-    let pickled_func = make_func_ref(py, &func).unwrap_or_else(|_| func.clone_ref(py));
+    // Wrap func in _FuncRef for pickle-safe transport. Falls back to shipping
+    // func by value when no module path reaches it (lambdas, locals, aliased verbs).
+    let pickled_func = make_func_ref(py, &func).or_else(|_| func_by_value(py, &func))?;
 
     let io_spec = if is_multi {
         build_multi_output_specs(py, multi_outputs, &func, node_map, partition_key, registry)?

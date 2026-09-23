@@ -72,6 +72,31 @@ pub fn _reconstruct_func_ref(py: Python, module: String, qualname: String) -> Py
     Ok(unwrap_callable(py, &obj))
 }
 
+/// A bound method that pickles as its function and owner, and unpickles as
+/// the same bound method.
+#[pyclass(name = "BoundMethod", module = "rivers._core")]
+pub struct PyBoundMethod {
+    func: Py<PyAny>,
+    owner: Py<PyAny>,
+}
+
+impl PyBoundMethod {
+    pub fn new(func: Py<PyAny>, owner: Py<PyAny>) -> Self {
+        Self { func, owner }
+    }
+}
+
+#[pymethods]
+impl PyBoundMethod {
+    fn __reduce__(&self, py: Python) -> PyResult<(Py<PyAny>, (Py<PyAny>, Py<PyAny>))> {
+        let method_type = py.import("types")?.getattr("MethodType")?;
+        Ok((
+            method_type.unbind(),
+            (self.func.clone_ref(py), self.owner.clone_ref(py)),
+        ))
+    }
+}
+
 /// Lightweight IO handler reference that reconstructs from the asset definition.
 #[pyclass(name = "IOHandlerRef", module = "rivers._core")]
 pub struct PyIOHandlerRef {

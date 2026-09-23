@@ -149,6 +149,47 @@ if _store_dir:
         async def materialize(cls) -> int:
             return 7
 
+    # Verbs whose `Owner.<function __name__>` path is not a module attribute.
+    # A FuncRef built from it fails while the worker unpickles the call, which
+    # breaks the whole loky pool, so these must ship by value.
+    def _aliased_body(cls) -> int:
+        return 30
+
+    class AliasedVerb(rs.Asset):
+        io_handler = handler
+        materialize = classmethod(_aliased_body)
+
+    def _factory_body(cls) -> int:
+        return cls.payload
+
+    def make_payload_asset(name: str, payload: int) -> type:
+        return type(
+            name,
+            (rs.Asset,),
+            {
+                "io_handler": handler,
+                "payload": payload,
+                "materialize": classmethod(_factory_body),
+            },
+        )
+
+    # Bound under another name: the class's own qualname is not importable.
+    factory_made = make_payload_asset("FactoryMade", 41)
+
+    def _no_wraps(fn):
+        def wrapper(cls):
+            return fn(cls)
+
+        return wrapper
+
+    class NoWrapsVerb(rs.Asset):
+        io_handler = handler
+
+        @classmethod
+        @_no_wraps
+        def materialize(cls) -> int:
+            return 50
+
     # Graph asset for the by-ref suite: its 2-wide seed level ships through
     # loky; the composed task runs with the parent handler override.
     @rs.Asset(io_handler=handler)

@@ -145,6 +145,26 @@ def test_loky_local_class_assets_fall_back_to_pickle(tmp_path):
     assert repo.load_node("ld") == 22
 
 
+@pytest.mark.parametrize(
+    ("attr", "node", "expected"),
+    [
+        ("AliasedVerb", "aliased_verb", 30),
+        ("factory_made", "factory_made", 41),
+        ("NoWrapsVerb", "no_wraps_verb", 50),
+    ],
+    ids=["classmethod-alias", "type-factory", "no-wraps-decorator"],
+)
+def test_loky_unimportable_verb_path_ships_by_value(class_mod, attr, node, expected):
+    """A verb whose `Owner.<__name__>` path is not a module attribute ships by
+    value. A FuncRef built from that path fails while the worker unpickles the
+    call, so loky marks the pool broken and the sibling step fails too."""
+    m = class_mod
+    repo = rs.CodeRepository(assets=[getattr(m, attr), m.CA], default_executor=MP)
+    repo.materialize()
+    assert repo.load_node(node) == expected
+    assert repo.load_node("ca") == 10
+
+
 def test_loky_async_class_assets_coexist(class_mod):
     """Async bodies run on the orchestrator while sync siblings cross loky —
     the submit-before-async ordering must hold for class-form assets too."""
