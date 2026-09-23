@@ -36,6 +36,38 @@ pub(crate) fn classify_step(
         return StepAction::Handled;
     }
 
+    // An action step runs at most once per retry budget: a resume after a
+    // crash must not re-apply a half-done merge or delete on its own. A
+    // recorded step failure ends the ladder; a cut-off attempt used one try.
+    if ctx.scope.resume && ctx.scope.plan.is_action() {
+        let prior = step
+            .event_names()
+            .iter()
+            .find_map(|n| ctx.scope.prior_attempts.get(n))
+            .cloned();
+        if let Some(prior) = prior {
+            if prior.failed {
+                let msg = "Failed before the restart; an action step is not run again";
+                for name in step.event_names() {
+                    ctx.state.mark_failed(name.clone());
+                    failures.push((name.clone(), ExecutionError::new_err(msg)));
+                }
+                return StepAction::Handled;
+            }
+            let budget_left = ctx
+                .retry_policy_for(step)
+                .is_some_and(|p| prior.retries < p.max_retries);
+            if prior.started && !budget_left {
+                let msg = "Interrupted by a restart; an action with no retry budget left \
+                           is not run again";
+                for name in step.event_names() {
+                    ctx.record_failure_no_hooks(name, ExecutionError::new_err(msg), failures);
+                }
+                return StepAction::Handled;
+            }
+        }
+    }
+
     let dep_failed = step
         .plan_dependencies
         .iter()

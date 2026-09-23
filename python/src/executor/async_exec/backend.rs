@@ -179,6 +179,7 @@ struct StepDispatch {
     start_event_names: Vec<String>,
     retry: Option<rivers_core::execution::retry::RetryPolicy>,
     resume: bool,
+    cut_off: bool,
 }
 
 /// Phase-4 worker for the async backend: hops onto a blocking thread, attaches
@@ -222,6 +223,7 @@ async fn dispatch_step(d: StepDispatch) -> WorkOutcome {
         start_event_names,
         retry,
         resume,
+        cut_off,
     } = d;
     let storage = shared.storage.clone();
     let run_id = shared.run_id.clone();
@@ -236,6 +238,7 @@ async fn dispatch_step(d: StepDispatch) -> WorkOutcome {
         semaphore,
         retry,
         resume,
+        cut_off,
         AsyncStepWorker {
             shared,
             step,
@@ -291,6 +294,10 @@ impl ExecutorBackend for AsyncBackend {
                 let start_event_names = inst.event_names.clone();
                 let retry = ctx.retry_policy_for(&step);
                 let action_key = ctx.action_step_partition_key(&step);
+                let cut_off = step
+                    .event_names()
+                    .first()
+                    .is_some_and(|n| ctx.resumed_cut_off(n));
                 (
                     inst.idx,
                     inst.instance_name,
@@ -309,6 +316,7 @@ impl ExecutorBackend for AsyncBackend {
                         start_event_names,
                         retry,
                         resume: ctx.scope.resume,
+                        cut_off,
                     },
                 )
             })

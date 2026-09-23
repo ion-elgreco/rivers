@@ -1140,7 +1140,8 @@ def test_resume_skips_completed_action_steps():
 
     The K8s operator restarts a crashed executor pod with ``--resume``
     unconditionally, so without this every already-completed delete/compact
-    step runs its side effect a second time.
+    step runs its side effect a second time. A step that already failed stays
+    failed: an action without a retry policy runs at most once.
     """
     calls = []
 
@@ -1177,9 +1178,95 @@ def test_resume_skips_completed_action_steps():
     result = repo.run_action(
         "purge", run_id_override=run_id, raise_on_error=False, resume=True
     )
-    assert result.success
+    assert not result.success
     assert calls.count("first") == 1, "a completed action step re-ran its side effect"
-    assert calls.count("second") == 2
+    assert calls.count("second") == 1, "a failed action step without a retry policy re-ran"
+
+
+_INTERRUPTED_ACTION_SCRIPT = textwrap.dedent(
+    """
+    import os, sys, time
+    import rivers as rs
+    from rivers.testing import embedded_storage
+
+    path, phase, verb, calls_file = sys.argv[1:5]
+
+    def body(ctx):
+        with open(calls_file, "a") as f:
+            f.write(ctx.asset_name + "\\n")
+        if phase == "crash":
+            # Die mid-body once the StepStart is durable — a pod OOM kill.
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                events = storage.get_events_for_run(ctx.run_id)
+                if any(e.event_type == "StepStart" for e in events):
+                    os._exit(3)
+                time.sleep(0.05)
+            raise SystemExit("StepStart never became visible")
+
+    policies = {
+        "merge": None,
+        "merge_retry": rs.RetryPolicy(max_retries=1),
+        "merge_spent": rs.RetryPolicy(max_retries=0),
+    }
+    actions = [
+        rs.AssetAction(name=name, outcome=rs.Outcome.MayMaterialize, retry=retry)(body)
+        for name, retry in policies.items()
+    ]
+
+    class Table(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+
+        @classmethod
+        def materialize(cls):
+            return 1
+
+    Table.actions = actions
+
+    storage = embedded_storage(path)
+    repo = rs.CodeRepository(assets=[Table], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+    result = repo.run_action(
+        verb, run_id_override="crashed-run", resume=phase == "resume", raise_on_error=False
+    )
+    print("RESULT", result.success)
+    """
+)
+
+
+@pytest.mark.parametrize(
+    ("verb", "reruns"),
+    [
+        pytest.param("merge", False, id="no-retry-policy"),
+        pytest.param("merge_spent", False, id="budget-used-up"),
+        pytest.param("merge_retry", True, id="budget-left"),
+    ],
+)
+def test_resume_runs_an_interrupted_action_at_most_once(tmp_path, verb, reruns):
+    """A pod killed mid-action restarts with --resume. The cut-off step had no
+    terminal event, so resume ran it again — an automatic retry of a possibly
+    half-applied merge that the action never asked for. Without budget left it
+    now fails as interrupted; with budget it runs again."""
+    db = str(tmp_path / "db")
+    calls = tmp_path / "calls.txt"
+
+    def run(phase):
+        return subprocess.run(
+            [sys.executable, "-c", _INTERRUPTED_ACTION_SCRIPT, db, phase, verb, str(calls)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    crashed = run("crash")
+    assert crashed.returncode == 3, crashed.stderr[-2000:]
+    assert calls.read_text().splitlines() == ["table"]
+
+    resumed = run("resume")
+    assert resumed.returncode == 0, resumed.stderr[-2000:]
+    ran_again = calls.read_text().splitlines() == ["table", "table"]
+    assert ran_again is reruns, calls.read_text()
+    assert f"RESULT {reruns}" in resumed.stdout, resumed.stdout[-2000:]
 
 
 def test_declaring_exclusive_action_does_not_serialize_materialize(tmp_path):

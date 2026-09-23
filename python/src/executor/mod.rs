@@ -296,6 +296,8 @@ impl Executor {
             let mut data_versions: HashMap<String, String> = HashMap::new();
             let mut failed_names: HashSet<String> = HashSet::new();
 
+            let mut prior_attempts: HashMap<String, rivers_core::storage::StepAttempts> =
+                HashMap::new();
             let completed_steps: HashSet<String> = if resume {
                 match rt().block_on(rivers_k8s::resume::build_resume_state(
                     storage.backend().as_ref(),
@@ -303,6 +305,7 @@ impl Executor {
                 )) {
                     Ok(state) => {
                         data_versions.extend(state.data_versions);
+                        prior_attempts = state.step_attempts;
                         state.completed_steps
                     }
                     Err(e) => {
@@ -429,6 +432,7 @@ impl Executor {
                             plan,
                             completed_steps: &completed_steps,
                             resume,
+                            prior_attempts: &prior_attempts,
                         },
                         state: dispatch::RunState {
                             data_versions: &mut data_versions,

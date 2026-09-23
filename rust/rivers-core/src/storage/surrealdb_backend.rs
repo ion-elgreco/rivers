@@ -3116,6 +3116,48 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
+    async fn get_step_attempts(
+        &self,
+        run_id: &str,
+    ) -> Result<HashMap<String, super::StepAttempts>> {
+        super::retry::with_retry(&self.retry_config, || async {
+            // One statement per type so each anchors on idx_events_run_type.
+            let mut result = self
+                .db
+                .query(
+                    "SELECT asset_key FROM events \
+                         WHERE run_id = $run_id AND event_type = 'StepStart'; \
+                     SELECT asset_key FROM events \
+                         WHERE run_id = $run_id AND event_type = 'StepFailure' \
+                         AND partition_key IS NONE; \
+                     SELECT asset_key FROM events \
+                         WHERE run_id = $run_id AND event_type = 'StepRetry';",
+                )
+                .bind(("run_id", run_id.to_string()))
+                .await?;
+
+            #[derive(SurrealValue, serde::Deserialize)]
+            struct Row {
+                asset_key: Option<String>,
+            }
+            let mut out: HashMap<String, super::StepAttempts> = HashMap::new();
+            let started: Vec<Row> = result.take(0)?;
+            for key in started.into_iter().filter_map(|r| r.asset_key) {
+                out.entry(key).or_default().started = true;
+            }
+            let failed: Vec<Row> = result.take(1)?;
+            for key in failed.into_iter().filter_map(|r| r.asset_key) {
+                out.entry(key).or_default().failed = true;
+            }
+            let retries: Vec<Row> = result.take(2)?;
+            for key in retries.into_iter().filter_map(|r| r.asset_key) {
+                out.entry(key).or_default().retries += 1;
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     async fn get_step_data_versions(&self, run_id: &str) -> Result<HashMap<String, String>> {
         super::retry::with_retry(&self.retry_config, || async {
             let mut result = self
@@ -14530,6 +14572,49 @@ mod tests {
             .unwrap();
         assert_eq!(run2_events.len(), 1);
         assert_eq!(run2_events[0].run_id, "run-2");
+    }
+
+    #[tokio::test]
+    async fn test_get_step_attempts() {
+        let storage = make_storage().await;
+        let event = |event_type, asset: &str, pk: Option<&str>| EventRecord {
+            code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+            event_type,
+            asset_key: Some(asset.to_string()),
+            run_id: "run-1".to_string(),
+            partition_key: pk.map(|k| PartitionKey::Single {
+                keys: vec![k.to_string()],
+            }),
+            timestamp: 100,
+            metadata: vec![],
+            input_data_versions: vec![],
+        };
+        storage
+            .store_events(&[
+                event(EventType::StepStart, "cut_off", None),
+                event(EventType::StepRetry, "cut_off", None),
+                event(EventType::StepStart, "failed", None),
+                event(EventType::StepFailure, "failed", None),
+                // A keyed failure is one partition of a batch, not the step.
+                event(EventType::StepStart, "one_key", None),
+                event(EventType::StepFailure, "one_key", Some("p1")),
+            ])
+            .await
+            .unwrap();
+
+        let attempts = storage.get_step_attempts("run-1").await.unwrap();
+        let get = |k: &str| attempts.get(k).cloned().unwrap_or_default();
+        assert_eq!(
+            get("cut_off"),
+            crate::storage::StepAttempts {
+                started: true,
+                failed: false,
+                retries: 1
+            }
+        );
+        assert!(get("failed").failed);
+        assert!(get("one_key").started && !get("one_key").failed);
+        assert!(storage.get_step_attempts("other").await.unwrap().is_empty());
     }
 
     #[tokio::test]

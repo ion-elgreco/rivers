@@ -1138,6 +1138,17 @@ pub struct SlotHolder {
     pub lease_expires_at: i64,
 }
 
+/// A step's recorded attempts in one run (see `get_step_attempts`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepAttempts {
+    /// A `StepStart` was recorded.
+    pub started: bool,
+    /// A step-level `StepFailure` was recorded: the retry ladder is over.
+    pub failed: bool,
+    /// `StepRetry` events recorded.
+    pub retries: u32,
+}
+
 /// Why a step is blocked from claiming concurrency slots.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum BlockReason {
@@ -2495,6 +2506,13 @@ pub trait StorageBackend: PerCodeLocationStorage {
         &self,
         run_id: &str,
     ) -> impl Future<Output = Result<HashSet<String>>> + Send;
+
+    /// What each step of a run already did, for resuming it: started, failed
+    /// at step level, and how many retries it recorded.
+    fn get_step_attempts(
+        &self,
+        run_id: &str,
+    ) -> impl Future<Output = Result<HashMap<String, StepAttempts>>> + Send;
 
     /// Get data versions produced by materialization events in a run.
     fn get_step_data_versions(

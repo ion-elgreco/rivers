@@ -255,4 +255,8 @@ like any action: `rs.Job(name="obs", assets=[VendorFeed], action="observe")`.
   half-completed merge has different safety properties from retrying a pure
   materialize, so a verb declares its own `retry=`, defaulting to none; a job-level
   `retry` together with `action=` is rejected rather than silently dropped.
+- **A resumed action run does not re-run spent steps.** When a crashed run resumes
+  (the Kubernetes operator restarts its pod with `--resume`), completed steps are
+  skipped, a step that failed stays failed, and a step the crash cut off runs again
+  only if its `retry=` budget has an attempt left — the cut-off attempt counts.
 - **Upstream is never pulled in.** An action plan has one step per named target.

@@ -664,6 +664,8 @@ impl ParallelBackend {
                             window,
                             retry,
                             resume,
+                            // Action steps never reach the parallel backend.
+                            false,
                             worker,
                         )
                         .await;

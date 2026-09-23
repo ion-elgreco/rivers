@@ -1,21 +1,25 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use rivers_core::storage::StorageBackend;
+use rivers_core::storage::{StepAttempts, StorageBackend};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResumeState {
     pub completed_steps: HashSet<String>,
     pub data_versions: HashMap<String, String>,
+    /// What each step did before the crash — lets an action step run at most
+    /// once when it has no retry budget left.
+    pub step_attempts: HashMap<String, StepAttempts>,
 }
 
 pub async fn build_resume_state(
     storage: &impl StorageBackend,
     run_id: &str,
 ) -> Result<ResumeState> {
-    let (completed_steps, data_versions) = tokio::try_join!(
+    let (completed_steps, data_versions, step_attempts) = tokio::try_join!(
         storage.get_completed_step_keys(run_id),
         storage.get_step_data_versions(run_id),
+        storage.get_step_attempts(run_id),
     )?;
 
     tracing::info!(
@@ -27,6 +31,7 @@ pub async fn build_resume_state(
     Ok(ResumeState {
         completed_steps,
         data_versions,
+        step_attempts,
     })
 }
 
@@ -45,6 +50,7 @@ mod tests {
             ResumeState {
                 completed_steps: HashSet::new(),
                 data_versions: HashMap::new(),
+                step_attempts: HashMap::new(),
             }
         );
     }
@@ -104,6 +110,13 @@ mod tests {
             ResumeState {
                 completed_steps: HashSet::from(["step_a".to_string()]),
                 data_versions: HashMap::from([("step_a".to_string(), "dv1".to_string())]),
+                step_attempts: HashMap::from([(
+                    "step_b".to_string(),
+                    StepAttempts {
+                        started: true,
+                        ..Default::default()
+                    },
+                )]),
             }
         );
     }

@@ -33,6 +33,8 @@ pub(crate) struct RunScope<'a> {
     /// Resuming a prior run: retry ladders seed their attempt number from
     /// recorded StepRetry events instead of restarting the budget.
     pub resume: bool,
+    /// What each step did before the crash (resume case). Read-only.
+    pub prior_attempts: &'a HashMap<String, rivers_core::storage::StepAttempts>,
 }
 
 /// Mutable per-batch progress tracking.
@@ -375,6 +377,18 @@ impl<'a> BatchContext<'a> {
                 ts,
             ),
         }
+    }
+
+    /// An action step the crashed attempt cut off mid-run: it spent an
+    /// attempt no StepRetry records.
+    pub(crate) fn resumed_cut_off(&self, name: &str) -> bool {
+        self.scope.resume
+            && self.scope.plan.is_action()
+            && self
+                .scope
+                .prior_attempts
+                .get(name)
+                .is_some_and(|a| a.started && !a.failed)
     }
 
     /// Members of the run's key that a plan dependency of `step` marked
