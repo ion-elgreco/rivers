@@ -12,8 +12,9 @@ pub type RunTags = Arc<[(String, String)]>;
 /// unpartitioned assets alike.
 pub type SlotMap<V> = HashMap<String, HashMap<Option<PartitionKey>, V>>;
 
-/// Tag-update entry: `(asset_key, optional partition, tags)`.
-type RunTagUpdate = (String, Option<PartitionKey>, String, bool, RunTags);
+/// Tick tag update: `(asset_key, optional partition, run_id, tags)`.
+/// Applied only when the run actually materialized the asset.
+type RunTagUpdate = (String, Option<PartitionKey>, String, RunTags);
 
 /// Latest-run map update: `(asset_key, optional partition, run_id, run_ts, tags, asset_names)`.
 /// Applied only when the run actually materialized the asset, newest run last.

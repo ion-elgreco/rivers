@@ -4174,30 +4174,6 @@ impl PerCodeLocationStorage for SurrealStorage {
         Ok(rows.into_iter().map(|r| (r.asset_key, r.ts)).collect())
     }
 
-    async fn get_latest_materialize_run(
-        &self,
-        code_location_id: &str,
-        asset_key: &str,
-    ) -> Result<Option<RunRecord>> {
-        super::retry::with_retry(&self.retry_config, || async {
-            let mut response = self
-                .db
-                .query(
-                    "SELECT * FROM runs WHERE code_location_id = $cl \
-                     AND $asset IN node_names AND action IS NONE \
-                     AND status = 'Success' \
-                     ORDER BY start_time DESC LIMIT 1",
-                )
-                .bind(("cl", code_location_id.to_string()))
-                .bind(("asset", asset_key.to_string()))
-                .await
-                .context("failed to fetch latest materialize run")?;
-            let runs: Vec<RunRecord> = response.take(0)?;
-            Ok(runs.into_iter().next())
-        })
-        .await
-    }
-
     async fn get_backfills(
         &self,
         code_location_id: &str,

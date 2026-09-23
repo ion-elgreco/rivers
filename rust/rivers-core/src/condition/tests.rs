@@ -3021,9 +3021,7 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
         cron_schedule: None,
         interval_seconds: Some(86400.0),
         start: jiff::civil::date(2024, 1, 1).at(0, 0, 0, 0),
-        end: Some(
-            jiff::civil::date(2024, 2, 1).at(0, 0, 0, 0),
-        ),
+        end: Some(jiff::civil::date(2024, 2, 1).at(0, 0, 0, 0)),
         fmt: "%Y-%m-%d".to_string(),
     };
 
@@ -8231,6 +8229,124 @@ async fn test_initial_load_ignores_failed_action_runs() {
     assert!(
         !out.plan.unpartitioned.contains(&"a".to_string()),
         "a failed action run must not raise the materialization failure floor"
+    );
+}
+
+#[tokio::test]
+async fn test_materializing_action_triggers_downstream_eager() {
+    // events → rollup, both built by the joint run r1. A `refresh` verb whose
+    // `materialized()` rewrote events is new data rollup has not seen, like a
+    // materialize of events alone: eager() must request rollup, in steady
+    // state and after a restart.
+    use crate::assets::graph::{NodeKind, TopologyNode};
+    use crate::condition::pass::{AssetConditionInfo, ConditionPass};
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{EventRecord, EventType};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[make_record("events"), make_record("rollup")])
+        .await
+        .unwrap();
+    let node = |name: &str| TopologyNode {
+        name: name.into(),
+        kind: NodeKind::Asset,
+        group: None,
+        parent_graph: None,
+    };
+    storage
+        .kv_set(
+            &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
+            &serde_json::to_vec(&GraphTopology {
+                nodes: vec![node("events"), node("rollup")],
+                edges: vec![("rollup".to_string(), "events".to_string())],
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let run = |run_id: &str, assets: &[&str], ts: i64, action: Option<&str>| RunRecord {
+        run_id: run_id.to_string(),
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        job_name: None,
+        status: RunStatus::Success,
+        start_time: ts,
+        end_time: Some(ts),
+        tags: vec![],
+        node_names: assets.iter().map(|a| a.to_string()).collect(),
+        priority: 0,
+        partition_key: None,
+        block_reason: None,
+        launched_by: LaunchedBy::Manual { user: None },
+        action: action.map(str::to_string),
+    };
+    let materialization = |run_id: &str, asset: &str, ts: i64| EventRecord {
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        event_type: EventType::Materialization {
+            data_version: Some(format!("dv_{run_id}")),
+        },
+        asset_key: Some(asset.to_string()),
+        run_id: run_id.to_string(),
+        partition_key: None,
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+    storage
+        .create_run(&run("r1", &["events", "rollup"], 1_000, None))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[
+            materialization("r1", "events", 1_000),
+            materialization("r1", "rollup", 1_000),
+        ])
+        .await
+        .unwrap();
+
+    let eager_rollup = || {
+        ConditionPass::new(
+            AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "rollup".to_string(),
+                condition: ConditionNode::eager(),
+                partition_info: None,
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        )
+    };
+    let mut pass = eager_rollup();
+    pass.refresh_cache(&storage, 1_500).await.unwrap();
+    assert!(
+        pass.run(1_500, false).plan.unpartitioned.is_empty(),
+        "precondition: r1 built rollup together with events"
+    );
+
+    storage
+        .create_run(&run("r2", &["events"], 2_000, Some("refresh")))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[materialization("r2", "events", 2_000)])
+        .await
+        .unwrap();
+    pass.refresh_cache(&storage, 2_500).await.unwrap();
+    assert_eq!(
+        pass.run(2_500, false).plan.unpartitioned,
+        ["rollup"],
+        "the verb's materialized() must trigger eager() on rollup"
+    );
+
+    let mut restarted = eager_rollup();
+    restarted.refresh_cache(&storage, 3_000).await.unwrap();
+    assert_eq!(
+        restarted.run(3_000, false).plan.unpartitioned,
+        ["rollup"],
+        "a restarted daemon must reach the same answer"
     );
 }
 

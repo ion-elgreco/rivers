@@ -401,7 +401,10 @@ fn action_runs_are_not_materialization_attempts() {
     // count as a materialization for condition bookkeeping — its effects
     // reach the cache through the record refresh instead. A failed action
     // run must not raise the failure floor either.
-    let cache = AssetConditionCache::new("default".to_string());
+    let mut cache = AssetConditionCache::new("default".to_string());
+    cache
+        .records
+        .insert("R".to_string(), rec_with_run("R", Some("mat"), 50));
     let mut delta = RefreshDelta::default();
 
     let mut ok = mk_run("act-ok", RunStatus::Success, &["R"], 100);
@@ -420,12 +423,14 @@ fn action_runs_are_not_materialization_attempts() {
         delta.failed_adds.is_empty(),
         "action failure must not raise the failure floor"
     );
-    assert!(
-        delta.last_run_updates.is_empty(),
-        "action runs must not become per-partition materialization attempts"
-    );
     // Both runs are still marked applied so the cursor dedup works.
     assert_eq!(delta.applied_runs.len(), 2);
+
+    cache.apply_refresh_delta(delta);
+    assert!(
+        cache.last_run_asset_names.is_empty() && cache.last_run_tags.is_empty(),
+        "R's record names another run, so neither verb is R's last run"
+    );
 }
 
 /// A deleted partition must leave the cached partition status: the
@@ -882,80 +887,68 @@ async fn action_completion_survives_daemon_restart() {
     );
 }
 
-/// Restart must not adopt an action run as an asset's "last run" for the
-/// `LastExecutedWithTags`/`LastRunIncludesTarget` maps — steady state never
-/// does (`apply_run_effects_to_delta` skips action runs), so seeding them
-/// at initial load makes those conditions flip on every daemon restart.
-#[tokio::test]
-async fn initial_load_skips_action_runs_in_last_run_maps() {
-    use crate::storage::PerCodeLocationStorage;
-    use crate::storage::surrealdb_backend::SurrealStorage;
-
-    let storage = SurrealStorage::new_memory().await.unwrap();
-    let cl = crate::storage::default_code_location_id();
-
-    // The assets row must exist for the event rollforward to stamp it.
-    storage
-        .register_assets(
-            &cl,
-            &[AssetRecord {
-                code_location_id: cl.clone(),
-                asset_key: "events".to_string(),
-                tags: vec![],
-                kinds: vec![],
-                asset_group: None,
-                code_version: None,
-                last_event_id: None,
-                last_run_id: None,
-                last_timestamp: None,
-                last_data_version: None,
-                last_materialization_code_version: None,
-                last_input_data_versions: vec![],
-                pool: vec![],
-            }],
-        )
-        .await
-        .unwrap();
-
-    // A MayMaterialize action run is the asset's newest run at restart.
-    let mut act = mk_run("ra", RunStatus::Success, &["events"], 2000);
-    act.action = Some("optimize".to_string());
-    act.tags = vec![("team".to_string(), "data".to_string())];
-    storage.create_run(&act).await.unwrap();
-    storage
-        .store_events(&[crate::storage::EventRecord {
-            code_location_id: cl.clone(),
-            event_type: crate::storage::EventType::Materialization {
-                data_version: Some("dv_1".to_string()),
-            },
-            asset_key: Some("events".to_string()),
-            run_id: "ra".to_string(),
-            partition_key: None,
-            timestamp: 2000,
-            metadata: vec![],
-            input_data_versions: vec![],
-        }])
-        .await
-        .unwrap();
-
-    let mut cache = AssetConditionCache::new(cl.clone());
-    cache.refresh(&storage, 0).await.unwrap();
-    assert!(
-        cache.last_run_tags.get("events").is_none(),
-        "action run must not seed the last-run tag map on restart"
-    );
-    assert!(
-        cache.last_run_asset_names.get("events").is_none(),
-        "action run must not seed the last-run asset-names map on restart"
-    );
+/// The slots an `events` run writes: the whole asset, or partition p1.
+fn events_slots() -> [Option<PartitionKey>; 2] {
+    [
+        None,
+        Some(PartitionKey::Single {
+            keys: vec!["p1".to_string()],
+        }),
+    ]
 }
 
-/// When the newest consolidated run is an action, restart adopts the newest
-/// non-action run instead: steady state keeps the previous materialize's
-/// entry, so a restart must not flip `LastExecutedWithTags` or `eager()`'s
-/// last-run suppression.
-#[tokio::test]
-async fn initial_load_adopts_newest_non_action_run_behind_an_action() {
+/// A fresh cache that tracks tick tags, with `events` partitioned when
+/// `slot` is a partition.
+fn events_cache(slot: &Option<PartitionKey>) -> AssetConditionCache {
+    let mut cache = AssetConditionCache::new(crate::storage::default_code_location_id());
+    if slot.is_some() {
+        cache.set_partitioned_assets(vec!["events".to_string()]);
+    }
+    cache.set_needs_tick_tags([&ConditionNode::HasRunWithTags {
+        tag_keys: vec![],
+        tag_values: vec![],
+    }]);
+    cache
+}
+
+fn last_run_names(cache: &AssetConditionCache, slot: &Option<PartitionKey>) -> Vec<String> {
+    cache
+        .last_run_asset_names
+        .get("events")
+        .and_then(|slots| slots.get(slot))
+        .map(|names| names.to_vec())
+        .unwrap_or_default()
+}
+
+fn last_run_tag_values(
+    cache: &AssetConditionCache,
+    slot: &Option<PartitionKey>,
+) -> Vec<(String, String)> {
+    cache
+        .last_run_tags
+        .get("events")
+        .and_then(|slots| slots.get(slot))
+        .map(|tags| tags.to_vec())
+        .unwrap_or_default()
+}
+
+fn tick_tag_values(
+    cache: &AssetConditionCache,
+    slot: &Option<PartitionKey>,
+) -> Vec<Vec<(String, String)>> {
+    cache
+        .tick_materialization_tags
+        .get("events")
+        .and_then(|slots| slots.get(slot))
+        .map(|sets| sets.iter().map(|tags| tags.to_vec()).collect())
+        .unwrap_or_default()
+}
+
+/// Storage where r1 materialized `events` at `slot` together with `rollup`,
+/// tagged team=data.
+async fn events_built_with_rollup(
+    slot: &Option<PartitionKey>,
+) -> crate::storage::surrealdb_backend::SurrealStorage {
     use crate::storage::PerCodeLocationStorage;
     use crate::storage::surrealdb_backend::SurrealStorage;
 
@@ -965,57 +958,133 @@ async fn initial_load_adopts_newest_non_action_run_behind_an_action() {
         .register_assets(&cl, &[rec_with_run("events", None, 0)])
         .await
         .unwrap();
+    let mut mat = mk_run("r1", RunStatus::Success, &["events", "rollup"], 1000);
+    mat.tags = vec![("team".to_string(), "data".to_string())];
+    mat.partition_key = slot.clone();
+    storage.create_run(&mat).await.unwrap();
+    storage
+        .store_events(&[events_event("r1", 1000, true, slot)])
+        .await
+        .unwrap();
+    storage
+}
 
-    let mat_event = |run: &str, ts: i64| crate::storage::EventRecord {
-        code_location_id: cl.clone(),
-        event_type: crate::storage::EventType::Materialization {
-            data_version: Some(format!("dv_{ts}")),
+/// Run r2: verb `verb` on `events` at `slot`, tagged team=merge, which reports
+/// `materialized()` or completes without a materialization.
+async fn run_verb_on_events(
+    storage: &crate::storage::surrealdb_backend::SurrealStorage,
+    verb: &str,
+    slot: &Option<PartitionKey>,
+    materialized: bool,
+) {
+    let mut run = mk_run("r2", RunStatus::Success, &["events"], 2000);
+    run.action = Some(verb.to_string());
+    run.tags = vec![("team".to_string(), "merge".to_string())];
+    run.partition_key = slot.clone();
+    storage.create_run(&run).await.unwrap();
+    storage
+        .store_events(&[events_event("r2", 2000, materialized, slot)])
+        .await
+        .unwrap();
+}
+
+fn events_event(
+    run: &str,
+    ts: i64,
+    materialized: bool,
+    slot: &Option<PartitionKey>,
+) -> crate::storage::EventRecord {
+    crate::storage::EventRecord {
+        code_location_id: crate::storage::default_code_location_id(),
+        event_type: if materialized {
+            crate::storage::EventType::Materialization {
+                data_version: Some(format!("dv_{ts}")),
+            }
+        } else {
+            crate::storage::EventType::ActionCompleted
         },
         asset_key: Some("events".to_string()),
         run_id: run.to_string(),
-        partition_key: None,
+        partition_key: slot.clone(),
         timestamp: ts,
         metadata: vec![],
         input_data_versions: vec![],
-    };
+    }
+}
 
-    // R1: a real materialize, tagged, co-materializing a sibling.
-    let mut mat = mk_run("r1", RunStatus::Success, &["events", "rollup"], 1000);
-    mat.tags = vec![("team".to_string(), "data".to_string())];
-    storage.create_run(&mat).await.unwrap();
-    storage
-        .store_events(&[mat_event("r1", 1000)])
-        .await
-        .unwrap();
+/// An action whose `materialized()` wrote a real Materialization is the
+/// asset's last run, like a materialize: a merge of `events` must trigger
+/// `eager()` on a rollup that r1 once built together with it
+/// (`LastRunIncludesTarget` reads these maps), and it is a materialization
+/// this tick for `has_run_with_tags()`. Steady state and a restart agree,
+/// for the whole asset and per partition.
+#[tokio::test]
+async fn a_materializing_action_is_the_assets_last_run() {
+    let merge_tags = vec![("team".to_string(), "merge".to_string())];
+    for slot in events_slots() {
+        let storage = events_built_with_rollup(&slot).await;
+        let mut cache = events_cache(&slot);
+        cache.refresh(&storage, 0).await.unwrap();
+        assert_eq!(
+            last_run_names(&cache, &slot),
+            ["events", "rollup"],
+            "{slot:?}"
+        );
 
-    // R2: a MayMaterialize verb reports materialized() → last_run_id = r2.
-    let mut act = mk_run("r2", RunStatus::Success, &["events"], 2000);
-    act.action = Some("refresh".to_string());
-    storage.create_run(&act).await.unwrap();
-    storage
-        .store_events(&[mat_event("r2", 2000)])
-        .await
-        .unwrap();
+        run_verb_on_events(&storage, "refresh", &slot, true).await;
+        cache.refresh(&storage, 1).await.unwrap();
+        assert_eq!(last_run_names(&cache, &slot), ["events"], "{slot:?}");
+        assert_eq!(last_run_tag_values(&cache, &slot), merge_tags, "{slot:?}");
+        assert_eq!(
+            tick_tag_values(&cache, &slot),
+            vec![merge_tags.clone()],
+            "{slot:?}"
+        );
 
-    let mut cache = AssetConditionCache::new(cl.clone());
-    cache.refresh(&storage, 0).await.unwrap();
+        let mut restarted = events_cache(&slot);
+        restarted.refresh(&storage, 0).await.unwrap();
+        assert_eq!(last_run_names(&restarted, &slot), ["events"], "{slot:?}");
+        assert_eq!(
+            last_run_tag_values(&restarted, &slot),
+            merge_tags,
+            "{slot:?}"
+        );
+    }
+}
 
-    let tags = cache
-        .last_run_tags
-        .get("events")
-        .and_then(|slots| slots.get(&None))
-        .expect("restart must adopt r1 (newest non-action) into the tag map");
-    assert_eq!(
-        tags.as_ref(),
-        &[("team".to_string(), "data".to_string())],
-        "adopted tags must be r1's, not the action run's"
-    );
-    let names = cache
-        .last_run_asset_names
-        .get("events")
-        .and_then(|slots| slots.get(&None))
-        .expect("restart must adopt r1 into the asset-names map");
-    assert!(names.contains(&"rollup".to_string()));
+/// An action that did not materialize (optimize) is not a materialization of
+/// the asset: the last run stays r1, in steady state and after a restart.
+#[tokio::test]
+async fn an_action_that_did_not_materialize_leaves_the_last_run() {
+    let data_tags = vec![("team".to_string(), "data".to_string())];
+    for slot in events_slots() {
+        let storage = events_built_with_rollup(&slot).await;
+        let mut cache = events_cache(&slot);
+        cache.refresh(&storage, 0).await.unwrap();
+
+        run_verb_on_events(&storage, "optimize", &slot, false).await;
+        cache.refresh(&storage, 1).await.unwrap();
+        assert_eq!(
+            last_run_names(&cache, &slot),
+            ["events", "rollup"],
+            "{slot:?}"
+        );
+        assert_eq!(last_run_tag_values(&cache, &slot), data_tags, "{slot:?}");
+        assert!(tick_tag_values(&cache, &slot).is_empty(), "{slot:?}");
+
+        let mut restarted = events_cache(&slot);
+        restarted.refresh(&storage, 0).await.unwrap();
+        assert_eq!(
+            last_run_names(&restarted, &slot),
+            ["events", "rollup"],
+            "{slot:?}"
+        );
+        assert_eq!(
+            last_run_tag_values(&restarted, &slot),
+            data_tags,
+            "{slot:?}"
+        );
+    }
 }
 
 /// A completed whole-asset delete clears the last-run maps in steady state —

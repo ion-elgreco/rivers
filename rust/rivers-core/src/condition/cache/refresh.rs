@@ -519,7 +519,8 @@ impl AssetConditionCache {
         // keys are recorded so the plan phase can detect row deletions the
         // incremental timestamp fetch can't see — on ANY terminal status:
         // events flush before the terminal write, so even a Canceled delete
-        // may already have consolidated Deletion events.
+        // may already have consolidated Deletion events. A verb that reported
+        // `materialized()` is still the asset's last run, like a materialize.
         if run.is_action() {
             if !run_status_is_terminal(&run.status) {
                 return false;
@@ -528,6 +529,7 @@ impl AssetConditionCache {
                 .applied_runs
                 .push((run.run_id.clone(), run.start_time));
             self.queue_action_partition_checks(&run.node_names, run.partition_key.as_ref(), delta);
+            self.queue_last_run_updates(run, delta);
             return true;
         }
         if !matches!(run.status, RunStatus::Success | RunStatus::Failure) {
@@ -536,8 +538,6 @@ impl AssetConditionCache {
         delta
             .applied_runs
             .push((run.run_id.clone(), run.start_time));
-        let run_asset_names: Arc<[String]> = Arc::from(run.node_names.as_slice());
-        let run_tags: Arc<[(String, String)]> = Arc::from(run.tags.as_slice());
         let is_failure = matches!(run.status, RunStatus::Failure);
         let run_ts = run.end_time.unwrap_or(run.start_time);
         for asset in &run.node_names {
@@ -571,6 +571,18 @@ impl AssetConditionCache {
                     .or_default()
                     .insert(run.run_id.clone());
             }
+        }
+        self.queue_last_run_updates(run, delta);
+        true
+    }
+
+    /// Queue `run`'s last-run and tick-tag entries for each of its assets,
+    /// applied only where the run materialized the asset.
+    fn queue_last_run_updates(&self, run: &RunRecord, delta: &mut RefreshDelta) {
+        let run_asset_names: Arc<[String]> = Arc::from(run.node_names.as_slice());
+        let run_tags: Arc<[(String, String)]> = Arc::from(run.tags.as_slice());
+        let run_ts = run.end_time.unwrap_or(run.start_time);
+        for asset in &run.node_names {
             // Route by the ASSET's partitioning, not the run's key: a joint
             // partition-keyed run still writes an unpartitioned asset's entry
             // into the scalar maps the unpartitioned eval path reads.
@@ -588,13 +600,11 @@ impl AssetConditionCache {
                         asset.clone(),
                         partition_key.clone(),
                         run.run_id.clone(),
-                        is_failure,
                         Arc::clone(&run_tags),
                     ));
                 }
             }
         }
-        true
     }
 
     /// Plan-phase helper: fetch fresh records for `keys` and their transitive downstream dependents.
@@ -870,12 +880,10 @@ impl AssetConditionCache {
                 }
             }
         }
-        for (asset, pk, run_id, run_failed, tags) in tick_tag_updates {
-            // Success runs materialize all covered assets; a failed run counts only
-            // where it actually materialized (mirrors the last_run gate).
-            let record_it = !run_failed
-                || self.run_materialized_asset(&asset, &run_id, &materialized_overrides);
-            if record_it {
+        for (asset, pk, run_id, tags) in tick_tag_updates {
+            // The last_run gate: a successful materialize run's overrides cover
+            // all its assets; a failed run or a verb counts only where it materialized.
+            if self.run_materialized_asset(&asset, &run_id, &materialized_overrides) {
                 self.update_tick_materialization_tags(&asset, &pk, &tags);
             }
         }
