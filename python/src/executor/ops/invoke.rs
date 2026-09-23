@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use pyo3::PyTypeInfo;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyNone, PyTuple};
+use pyo3::types::{PyDict, PyNone, PyString, PyTuple};
 use rivers_core::execution::plan::ExecutionStep;
 
 use crate::assets::io_handler_registry::IOHandlerRegistry;
@@ -53,6 +53,27 @@ pub(crate) fn get_annotations<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let annotations = func.getattr(py, "__annotations__")?;
     Ok(annotations.cast_bound::<PyDict>(py)?.clone())
+}
+
+/// A parameter annotation as an object. Under PEP 563 it is a string,
+/// evaluated in the function's module globals. Only this one annotation is
+/// evaluated: `typing.get_type_hints` fails as a whole when any other name in
+/// the signature exists only for type checkers.
+fn resolve_annotation<'py>(
+    py: Python<'py>,
+    func: &Py<PyAny>,
+    annotation: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if !annotation.is_instance_of::<PyString>() {
+        return Ok(annotation.clone());
+    }
+    let globals = py
+        .import("inspect")?
+        .call_method1("unwrap", (func,))?
+        .getattr("__globals__")?;
+    py.import("builtins")?
+        .getattr("eval")?
+        .call1((annotation, globals))
 }
 
 /// One resource argument: config-instantiated when per-run overrides exist,
@@ -737,15 +758,30 @@ pub(crate) fn execute_action_step(
             }
         } else {
             let partition = super::build_partition_context(node, partition_key)?;
-            let config_instance = get_annotations(py, &func)?
-                .iter()
-                .find(|(k, v)| {
-                    k.extract::<String>().ok().as_deref() != Some("return")
-                        && is_action_context_annotation(py, v)
-                })
-                .map(|(_, v)| extract_config_from_annotation(py, &v, overrides_dict))
-                .transpose()?
-                .flatten();
+            // First parameter is the context; the rest are resources injected
+            // by name — the same rule materialize functions use.
+            let params = enumerate_params(py, &func)?;
+            let config_instance = match params.first() {
+                Some((param, Some(annotation))) => {
+                    match resolve_annotation(py, &func, annotation) {
+                        Ok(a) if is_action_context_annotation(py, &a) => {
+                            extract_config_from_annotation(py, &a, overrides_dict)?
+                        }
+                        Ok(_) => None,
+                        // The annotation may carry no config type at all, so
+                        // fail only when the caller's config would be dropped.
+                        Err(e) if overrides_dict.is_some() => {
+                            return Err(ConfigurationError::new_err(format!(
+                                "Action '{}' on asset '{}': config was given, but the \
+                                 annotation of '{}' cannot be resolved: {}",
+                                verb, step.name, param, e
+                            )));
+                        }
+                        Err(_) => None,
+                    }
+                }
+                _ => None,
+            };
             let ctx = crate::context::action::PyActionContext::new(
                 step.name.clone(),
                 verb.to_string(),
@@ -755,9 +791,6 @@ pub(crate) fn execute_action_step(
                 handler,
                 config_instance,
             );
-            // First parameter is the context; the rest are resources injected
-            // by name — the same rule materialize functions use.
-            let params = enumerate_params(py, &func)?;
             let mut args: Vec<Py<PyAny>> = Vec::new();
             if let Some((first_name, _)) = params.first()
                 && resources.contains_key(first_name)

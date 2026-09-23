@@ -170,7 +170,10 @@ class EventLog(rs.Asset):
 repo.run_action("tune", config={"event_log": {"target_size_mb": 512}})
 ```
 
-Without the generic annotation, `ctx.config` is `None`.
+Without the generic annotation, `ctx.config` is `None`. Modules with
+`from __future__ import annotations` work too, but the config type must be a
+module-level name: if the annotation cannot be resolved, `ctx.config` is `None`
+and a `config=` override fails the run.
 
 ## Outcomes
 

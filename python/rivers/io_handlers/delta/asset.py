@@ -6,9 +6,6 @@ Subclass :class:`DeltaAsset`, define ``materialize``, and the asset carries
 options the write path uses. Override any verb in the subclass to replace it.
 """
 
-# No `from __future__ import annotations`: the executor reads raw
-# `__annotations__` to detect the context parameter's config generic, so
-# `ActionContext[...]` must stay a real object, not a string.
 from typing import TYPE_CHECKING
 
 from deltalake import DeltaTable
