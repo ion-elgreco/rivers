@@ -101,8 +101,10 @@ or the backfill materializes.
 The UI shows a button per action on the asset page, and action runs display their
 verb in the runs list and run header. A verb declaring `Outcome.Unmaterialize`
 renders as a danger button and always routes through the confirmation dialog,
-which names the verb and says it clears materialization state — nothing else in
-the product distinguishes a destructive verb from a benign one.
+which names the verb and says it clears materialization state. The CLI warns when
+such a verb runs on a store that is removed at exit (see
+[CLI › Storage flags](../api-reference/cli.md#storage-flags)). Nothing else in the
+product distinguishes a destructive verb from a benign one.
 
 ## ActionContext
 

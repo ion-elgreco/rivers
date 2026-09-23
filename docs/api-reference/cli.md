@@ -29,6 +29,8 @@ When `RIVERS_SURREAL_ENDPOINT` is set (the operator sets it on rivers pods), the
 
 Without `--surreal-endpoint`, `RIVERS_SURREAL_ENDPOINT` or `--storage-path`, the run's state and its pool claims go to a scratch store at `.rivers/storage/`. The CLI removes that store at exit, and no other process reads it. So a `delete` removes the real data, but the code location never sees the deletion, and the verb's pool claims do not block the code location's runs. To act on a code location's data, point the command at the storage that the code location uses.
 
+`run-action` and `backfill --action` write a warning to stderr when a verb with outcome `Unmaterialize` (such as `delete`) runs on the scratch store or with `--memory`, which is also removed at exit. The command still runs.
+
 ---
 
 ## `dev` — local development server

@@ -528,9 +528,45 @@ def run_action(
         )
         raise typer.Exit(1)
     repo_obj = _load_repo(module, repo_var, memory, storage_path, surreal_endpoint)
+    _warn_if_destructive_on_scratch(
+        repo_obj, action, selection, memory, storage_path, surreal_endpoint
+    )
     pk = PartitionKey.single(partition_key) if partition_key is not None else None
     result = repo_obj.run_action(action, selection=selection, partition_key=pk)
     typer.echo(f"Action '{action}' complete. Run: {result.run_id}")
+
+
+def _warn_if_destructive_on_scratch(
+    repo_obj,
+    verb: str,
+    selection: list[str] | None,
+    memory: bool,
+    storage_path: str | None,
+    surreal_endpoint: str | None,
+) -> None:
+    """Warn when a verb that clears materialization state keeps its state and
+    pool claims in a store that is gone at exit (the scratch store or memory)."""
+    if surreal_endpoint is not None or (storage_path is not None and not memory):
+        return
+    from rivers import MultiAsset, Outcome
+
+    for name, asset in repo_obj.assets.items():
+        if selection is not None and name not in selection:
+            continue
+        actions = asset.actions
+        if actions is None and isinstance(asset, MultiAsset):
+            # A multi-asset's verbs live on each output.
+            actions = next((d.actions for d in asset.output_defs if d.name == name), [])
+        if any(
+            a.name == verb and a.outcome == Outcome.Unmaterialize for a in actions or []
+        ):
+            typer.echo(
+                f"Warning: '{verb}' is destructive, but its state and pool claims go "
+                "to a scratch store that is removed at exit; pass --surreal-endpoint "
+                "to record them in shared storage.",
+                err=True,
+            )
+            return
 
 
 def _load_repo(
@@ -654,6 +690,11 @@ def backfill(
         raise typer.Exit(1)
 
     resolved_strategy = _parse_strategy(strategy)
+
+    if action is not None:
+        _warn_if_destructive_on_scratch(
+            repo_obj, action, selection, memory, storage_path, surreal_endpoint
+        )
 
     result = repo_obj.backfill(
         selection=selection,

@@ -224,18 +224,22 @@ PURGE_MODULE = """
 import rivers as rs
 
 
-def _purge(ctx):
+def _record(ctx):
     with open("calls.txt", "a") as f:
         f.write(f"{ctx.asset_name}:{ctx.partition_key}\\n")
 
 
-purge = rs.AssetAction(name="purge", outcome=rs.Outcome.Unmaterialize)(_purge)
+purge = rs.AssetAction(name="purge", outcome=rs.Outcome.Unmaterialize)(_record)
+touch = rs.AssetAction(name="touch", outcome=rs.Outcome.Unchanged)(_record)
 
 PARTS = rs.PartitionsDefinition.static_(["p1", "p2"])
 
 
 @rs.Asset(
-    name="events", io_handler=rs.InMemoryIOHandler(), partitions_def=PARTS, actions=[purge]
+    name="events",
+    io_handler=rs.InMemoryIOHandler(),
+    partitions_def=PARTS,
+    actions=[purge, touch],
 )
 def events(context: rs.AssetExecutionContext):
     return context.partition_key
@@ -256,12 +260,22 @@ repo = rs.CodeRepository(
 
 ENDPOINT = "ws://surrealdb:8000"
 
+PURGE_WARNING = (
+    "Warning: 'purge' is destructive, but its state and pool claims go to a "
+    "scratch store that is removed at exit; pass --surreal-endpoint to record "
+    "them in shared storage."
+)
 
-def _purge_events_p1(command, module):
-    """The same delete of `events` p1, as `run-action` or as `backfill --action`."""
+
+def _warnings(stderr):
+    return [line for line in stderr.splitlines() if line.startswith("Warning:")]
+
+
+def _verb_on_events_p1(command, module, verb="purge"):
+    """The same verb on `events` p1, as `run-action` or as `backfill --action`."""
     if command == "run-action":
-        return ["run-action", module, "purge", "-s", "events", "--partition-key", "p1"]
-    return ["backfill", module, "--assets", "events", "-p", "p1", "--action", "purge"]
+        return ["run-action", module, verb, "-s", "events", "--partition-key", "p1"]
+    return ["backfill", module, "--assets", "events", "-p", "p1", "--action", verb]
 
 
 def _rivers(cwd, *args):
@@ -325,7 +339,7 @@ def test_a_storage_path_the_user_passes_keeps_the_verbs_state(
 
     for args in (
         ["materialize", module, "--partition-key", "p1"],
-        _purge_events_p1(command, module),
+        _verb_on_events_p1(command, module),
     ):
         done = _rivers(resolved_tmp_path, *args, "--storage-path", str(path))
         assert done.returncode == 0, done.stderr
@@ -349,10 +363,11 @@ def test_surreal_endpoint_records_the_verb_in_the_shared_store(
 
     for args in (
         ["materialize", module, "--partition-key", "p1"],
-        _purge_events_p1(command, module),
+        _verb_on_events_p1(command, module),
     ):
         done = runner.invoke(app, [*args, *endpoint_args])
         assert done.exit_code == 0, done.output or done.exception
+        assert _warnings(done.stderr) == []
 
     assert endpoints == [ENDPOINT, ENDPOINT]
     assert not (resolved_tmp_path / ".rivers").exists()
@@ -367,7 +382,7 @@ def test_backfill_status_and_cancel_read_the_shared_store(
     _write_module(resolved_tmp_path, module, PURGE_MODULE)
     store, endpoints = _connect_to(monkeypatch, resolved_tmp_path / "shared_db")
     endpoint_args = _use_endpoint(monkeypatch, via)
-    ran = runner.invoke(app, [*_purge_events_p1("backfill", module), *endpoint_args])
+    ran = runner.invoke(app, [*_verb_on_events_p1("backfill", module), *endpoint_args])
     assert ran.exit_code == 0, ran.output or ran.exception
     (run,) = [r for r in store.get_runs() if r.action == "purge"]
     backfill_id = run.launched_by.backfill_id
@@ -393,8 +408,74 @@ def test_without_a_storage_flag_the_scratch_store_is_removed_at_exit(
     module = f"defs_scratch_{command.replace('-', '_')}"
     _write_module(resolved_tmp_path, module, PURGE_MODULE)
 
-    done = _rivers(resolved_tmp_path, *_purge_events_p1(command, module))
+    done = _rivers(resolved_tmp_path, *_verb_on_events_p1(command, module))
 
     assert done.returncode == 0, done.stderr
     assert (resolved_tmp_path / "calls.txt").read_text().split() == ["events:p1"]
     assert not (resolved_tmp_path / ".rivers").exists()
+
+
+@pytest.mark.parametrize("command", ["run-action", "backfill"])
+@pytest.mark.parametrize(
+    ("verb", "storage_args", "warnings"),
+    [
+        ("purge", [], [PURGE_WARNING]),
+        ("purge", ["--memory"], [PURGE_WARNING]),
+        ("purge", ["--storage-path", "kept_db"], []),
+        ("touch", [], []),
+    ],
+    ids=["scratch", "memory", "storage-path", "not-destructive"],
+)
+def test_a_destructive_verb_on_a_scratch_store_warns(
+    resolved_tmp_path, command, verb, storage_args, warnings
+):
+    """A delete on a scratch store changes real data, but its state and pool
+    claims live where no other process reads them: the CLI says so and still
+    runs the verb."""
+    _write_module(resolved_tmp_path, "defs_warn", PURGE_MODULE)
+
+    done = _rivers(
+        resolved_tmp_path,
+        *_verb_on_events_p1(command, "defs_warn", verb),
+        *storage_args,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert _warnings(done.stderr) == warnings
+    assert (resolved_tmp_path / "calls.txt").read_text().split() == ["events:p1"]
+
+
+MULTI_PURGE_MODULE = """
+import rivers as rs
+
+
+def _record(ctx):
+    with open("calls.txt", "a") as f:
+        f.write(ctx.asset_name + "\\n")
+
+
+purge = rs.AssetAction(name="purge", outcome=rs.Outcome.Unmaterialize)(_record)
+
+
+class Ingest(rs.MultiAsset):
+    m_left = rs.AssetDef(actions=[purge])
+    m_right = rs.AssetDef()
+
+    @classmethod
+    def materialize(cls):
+        return {"m_left": 1, "m_right": 2}
+
+
+repo = rs.CodeRepository(assets=[Ingest])
+"""
+
+
+def test_a_multi_asset_output_verb_warns_too(resolved_tmp_path):
+    """A multi-asset keeps its verbs on each output, not on the asset."""
+    _write_module(resolved_tmp_path, "defs_warn_multi", MULTI_PURGE_MODULE)
+
+    done = runner.invoke(app, ["run-action", "defs_warn_multi", "purge", "--memory"])
+
+    assert done.exit_code == 0, done.output or done.exception
+    assert _warnings(done.stderr) == [PURGE_WARNING]
+    assert (resolved_tmp_path / "calls.txt").read_text().split() == ["m_left"]
