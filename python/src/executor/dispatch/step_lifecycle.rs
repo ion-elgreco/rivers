@@ -26,7 +26,7 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::errors::ExecutionError;
 
-use super::super::event_writer::WriterMsg;
+use super::super::event_writer::{self, WriterMsg};
 use super::super::ops::{self, now_ts};
 use super::context::BatchContext;
 use super::failure::{self, classify_pyerr};
@@ -103,10 +103,6 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
         return;
     }
 
-    for name in event_names {
-        ctx.emit_start(name, now_ts());
-    }
-
     let policy = ctx.retry_policy_for(step);
     let mut attempt: u32 = 1;
     if ctx.scope.resume
@@ -122,6 +118,9 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
         attempt += ctx.resumed_cut_offs(first);
     }
     let outcome = loop {
+        if let Err(e) = start_attempt(py, ctx, event_names) {
+            break start_not_stored(e);
+        }
         let mut outcome = worker.run_work(py, ctx);
         let (WorkOutcome::Error { error, .. }, Some(policy)) = (&outcome, &policy) else {
             break outcome;
@@ -181,10 +180,6 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
             break outcome;
         }
         attempt += 1;
-        let ts = now_ts();
-        for name in event_names {
-            ctx.emit_start(name, ts);
-        }
     };
 
     if let Some(g) = guard {
@@ -217,6 +212,8 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
     resume: bool,
     // Attempts a crash cut off: each used a try no StepRetry records.
     cut_offs: u32,
+    // An action step: its StepStart is stored before the work runs.
+    store_start: bool,
     worker: W,
 ) -> WorkOutcome {
     let mut permit = match &semaphore {
@@ -262,12 +259,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         return WorkOutcome::Cancelled;
     }
 
-    let start_ts = now_ts();
     let code_location_id = storage.code_location_id().to_string();
-    for name in &start_event_names {
-        ops::emit_step_start_via_tx(&events_tx, &code_location_id, &run_id, name, start_ts);
-    }
-
     let worker = Arc::new(worker);
     let mut attempt: u32 = 1;
     if resume
@@ -279,6 +271,17 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
     }
     let want_classify = retry_policy.is_some();
     let outcome = loop {
+        if let Err(e) = start_attempt_async(
+            &events_tx,
+            &code_location_id,
+            &run_id,
+            &start_event_names,
+            store_start,
+        )
+        .await
+        {
+            break start_not_stored(e);
+        }
         let w = Arc::clone(&worker);
         // Classification needs the GIL; attach on the blocking thread, not here.
         let joined = tokio::task::spawn_blocking(move || {
@@ -382,10 +385,6 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
             break outcome;
         }
         attempt += 1;
-        let ts = now_ts();
-        for name in &start_event_names {
-            ops::emit_step_start_via_tx(&events_tx, &code_location_id, &run_id, name, ts);
-        }
     };
 
     drop(permit);
@@ -402,4 +401,50 @@ fn prep_error(msg: String) -> WorkOutcome {
         captured_logs: None,
         failure_config: None,
     }
+}
+
+/// StepStart for every name. An action's is stored before its body runs:
+/// resume counts the attempts a crash cut off from these rows.
+fn start_attempt(py: Python, ctx: &BatchContext, names: &[String]) -> anyhow::Result<()> {
+    let ts = now_ts();
+    if !ctx.scope.plan.is_action() {
+        for name in names {
+            ctx.emit_start(name, ts);
+        }
+        return Ok(());
+    }
+    let starts = names
+        .iter()
+        .map(|name| ops::step_start_record("", ctx.scope.run_id, name, ts))
+        .collect();
+    let writer = ctx.sink.writer;
+    py.detach(|| writer.emit_stored(starts))
+}
+
+/// [`start_attempt`] for the async lifecycle; `stored` marks an action step.
+async fn start_attempt_async(
+    tx: &mpsc::UnboundedSender<WriterMsg>,
+    code_location_id: &str,
+    run_id: &str,
+    names: &[String],
+    stored: bool,
+) -> anyhow::Result<()> {
+    let ts = now_ts();
+    if !stored {
+        for name in names {
+            ops::emit_step_start_via_tx(tx, code_location_id, run_id, name, ts);
+        }
+        return Ok(());
+    }
+    let starts = names
+        .iter()
+        .map(|name| ops::step_start_record(code_location_id, run_id, name, ts))
+        .collect();
+    event_writer::store_now(tx, starts).await
+}
+
+fn start_not_stored(e: anyhow::Error) -> WorkOutcome {
+    prep_error(format!(
+        "Failed to store the step start, so the action did not run: {e}"
+    ))
 }

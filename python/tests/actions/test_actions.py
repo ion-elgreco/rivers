@@ -1241,11 +1241,14 @@ _INTERRUPTED_ACTION_SCRIPT = textwrap.dedent(
     import rivers as rs
     from rivers.testing import embedded_storage
 
-    path, phase, verb, calls_file = sys.argv[1:5]
+    path, phase, verb, calls_file, style = sys.argv[1:6]
 
     def body(ctx):
         with open(calls_file, "a") as f:
             f.write(ctx.asset_name + "\\n")
+        if phase == "crash-at-once":
+            # Die as the body begins, with no wait for any event to land.
+            os._exit(3)
         attempts = len(open(calls_file).read().splitlines())
         if phase in ("crash", "resume-crash"):
             # Die mid-body once this attempt's StepStart is durable — a pod
@@ -1271,6 +1274,9 @@ _INTERRUPTED_ACTION_SCRIPT = textwrap.dedent(
             threading.Thread(target=die_in_backoff, daemon=True).start()
             raise RuntimeError("first attempt fails")
 
+    async def async_body(ctx):
+        body(ctx)
+
     policies = {
         "merge": None,
         "merge_retry": rs.RetryPolicy(max_retries=1),
@@ -1279,7 +1285,9 @@ _INTERRUPTED_ACTION_SCRIPT = textwrap.dedent(
         "merge_backoff": rs.RetryPolicy(max_retries=1, backoff=rs.Backoff.constant(60)),
     }
     actions = [
-        rs.AssetAction(name=name, outcome=rs.Outcome.MayMaterialize, retry=retry)(body)
+        rs.AssetAction(name=name, outcome=rs.Outcome.MayMaterialize, retry=retry)(
+            async_body if style == "async" else body
+        )
         for name, retry in policies.items()
     ]
 
@@ -1302,13 +1310,24 @@ _INTERRUPTED_ACTION_SCRIPT = textwrap.dedent(
         raise_on_error=False,
     )
     print("RESULT", result.success)
+    for asset, error in result.failed_assets:
+        print("FAILED", asset, error)
     """
 )
 
 
-def _run_interrupted_action(db, phase, verb, calls):
+def _run_interrupted_action(db, phase, verb, calls, style="sync"):
     return subprocess.run(
-        [sys.executable, "-c", _INTERRUPTED_ACTION_SCRIPT, db, phase, verb, str(calls)],
+        [
+            sys.executable,
+            "-c",
+            _INTERRUPTED_ACTION_SCRIPT,
+            db,
+            phase,
+            verb,
+            str(calls),
+            style,
+        ],
         capture_output=True,
         text=True,
         timeout=120,
@@ -1373,6 +1392,29 @@ def test_a_crash_in_the_retry_backoff_keeps_the_granted_retry(tmp_path):
     assert resumed.returncode == 0, resumed.stderr[-2000:]
     assert calls.read_text().splitlines() == ["table", "table"]
     assert "RESULT True" in resumed.stdout, resumed.stdout[-2000:]
+
+
+@pytest.mark.parametrize("style", ["sync", "async"])
+def test_an_action_killed_as_its_body_starts_is_not_run_again(tmp_path, style):
+    """The StepStart went to the batched event writer and the body began at
+    once, so a kill inside the flush window left no StepStart row. Resume then
+    took the merge for never begun and ran it a second time."""
+    db = str(tmp_path / "db")
+    calls = tmp_path / "calls.txt"
+
+    crashed = _run_interrupted_action(db, "crash-at-once", "merge", calls, style)
+    assert crashed.returncode == 3, crashed.stderr[-2000:]
+    assert calls.read_text().splitlines() == ["table"]
+
+    resumed = _run_interrupted_action(db, "resume", "merge", calls, style)
+    assert resumed.returncode == 0, resumed.stderr[-2000:]
+    assert calls.read_text().splitlines() == ["table"], "the merge ran a second time"
+    assert "RESULT False" in resumed.stdout, resumed.stdout[-2000:]
+    failed = [line for line in resumed.stdout.splitlines() if line.startswith("FAILED")]
+    assert failed == [
+        "FAILED table ExecutionError: Interrupted by a restart; an action with no "
+        "retry budget left is not run again"
+    ], resumed.stdout[-2000:]
 
 
 _DOWNSTREAM_FIRST_RESUME_SCRIPT = textwrap.dedent(

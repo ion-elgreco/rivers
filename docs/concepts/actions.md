@@ -298,4 +298,6 @@ like any action: `rs.Job(name="obs", assets=[VendorFeed], action="observe")`.
   (the Kubernetes operator restarts its pod with `--resume`), completed steps are
   skipped, a step that failed stays failed, and a step the crash cut off runs again
   only if its `retry=` budget has an attempt left — the cut-off attempt counts.
+  Each attempt's start is stored before the action body runs; if it cannot be
+  stored, the step fails and the body does not run.
 - **Upstream is never pulled in.** An action plan has one step per named target.

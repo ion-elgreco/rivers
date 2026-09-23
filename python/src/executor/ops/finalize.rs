@@ -64,19 +64,25 @@ pub(crate) fn emit_step_start_via_tx(
     step_name: &str,
     ts: i64,
 ) {
-    let _ = tx.send(
-        EventRecord {
-            code_location_id: code_location_id.to_string(),
-            event_type: EventType::StepStart,
-            asset_key: Some(step_name.to_string()),
-            run_id: run_id.to_string(),
-            partition_key: None,
-            timestamp: ts,
-            metadata: Vec::new(),
-            input_data_versions: vec![],
-        }
-        .into(),
-    );
+    let _ = tx.send(step_start_record(code_location_id, run_id, step_name, ts).into());
+}
+
+pub(crate) fn step_start_record(
+    code_location_id: &str,
+    run_id: &str,
+    step_name: &str,
+    ts: i64,
+) -> EventRecord {
+    EventRecord {
+        code_location_id: code_location_id.to_string(),
+        event_type: EventType::StepStart,
+        asset_key: Some(step_name.to_string()),
+        run_id: run_id.to_string(),
+        partition_key: None,
+        timestamp: ts,
+        metadata: Vec::new(),
+        input_data_versions: vec![],
+    }
 }
 
 pub(crate) fn emit_step_success(writer: &EventWriter, run_id: &str, step_name: &str, ts: i64) {

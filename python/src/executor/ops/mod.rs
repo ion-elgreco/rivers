@@ -95,6 +95,7 @@ pub(crate) use finalize::{
     emit_step_failure, emit_step_retry, emit_step_retry_via_tx, emit_step_start,
     emit_step_start_via_tx, emit_step_success, extract_data_version, now_ts,
     register_assets_from_nodes, run_failure_hooks, run_success_hooks, step_retry_record,
+    step_start_record,
 };
 pub(crate) use invoke::{
     annotation_is, drain_failed_partitions, enumerate_params, execute_action_step, execute_step,

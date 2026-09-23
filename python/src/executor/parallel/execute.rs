@@ -666,6 +666,7 @@ impl ParallelBackend {
                             resume,
                             // Action steps never reach the parallel backend.
                             0,
+                            false,
                             worker,
                         )
                         .await;

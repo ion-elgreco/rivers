@@ -227,6 +227,7 @@ async fn dispatch_step(d: StepDispatch) -> WorkOutcome {
     } = d;
     let storage = shared.storage.clone();
     let run_id = shared.run_id.clone();
+    let action = shared.action.is_some();
     run_step_async_lifecycle(
         storage,
         pools,
@@ -239,6 +240,7 @@ async fn dispatch_step(d: StepDispatch) -> WorkOutcome {
         retry,
         resume,
         cut_offs,
+        action,
         AsyncStepWorker {
             shared,
             step,
