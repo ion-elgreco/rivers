@@ -1,6 +1,7 @@
 //! PyO3 wrapper for the executor-neutral per-asset `Compute`.
 
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyTuple};
 use rivers_core::execution::compute::Compute;
 
 /// Per-asset compute resources (`@Asset(compute=…)`). Values are Kubernetes-style
@@ -34,6 +35,22 @@ impl PyCompute {
     #[getter]
     fn gpu(&self) -> Option<String> {
         self.inner.gpu.clone()
+    }
+
+    /// A class-form asset defined in a script ships to loky workers by value,
+    /// `compute` included.
+    fn __getnewargs_ex__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyTuple>, Bound<'py, PyDict>)> {
+        let Self {
+            inner: Compute { cpu, memory, gpu },
+        } = self;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("cpu", cpu)?;
+        kwargs.set_item("memory", memory)?;
+        kwargs.set_item("gpu", gpu)?;
+        Ok((PyTuple::empty(py), kwargs))
     }
 
     fn __repr__(&self) -> String {

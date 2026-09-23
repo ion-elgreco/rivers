@@ -198,6 +198,14 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         assets::action::_reconstruct_asset_action,
         m
     )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        assets::dep_def::_reconstruct_dep_def,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        automation::condition::_reconstruct_automation_condition,
+        m
+    )?)?;
     m.add_function(pyo3::wrap_pyfunction!(runtime::runtime_info, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(
         daemon::eval_schedule_in_subprocess,

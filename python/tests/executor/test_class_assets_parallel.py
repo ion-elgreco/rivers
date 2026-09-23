@@ -11,7 +11,12 @@ short-circuits to InProcess and never touches loky transport.
 """
 
 import importlib
+import json
 import os
+import pickle
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import obstore.store
@@ -191,3 +196,236 @@ def test_loky_graph_asset_by_reference(class_mod):
     repo.materialize()
     assert repo.load_node("g_loky_pipeline") == 4
     assert repo.load_node("g_seed_b") == 4
+
+
+# `__main__` is not importable in a loky worker, so every class below ships by
+# value with its whole class body, declarations included.
+PIPELINE_SCRIPT = textwrap.dedent(
+    """
+    import json
+    import pathlib
+    import sys
+
+    import obstore.store
+
+    import rivers as rs
+
+    root = pathlib.Path(sys.argv[1])
+    handler = rs.PickleIOHandler(
+        store=obstore.store.LocalStore(str(root / "store"), mkdir=True)
+    )
+
+
+    def record_success(context: rs.HookContext):
+        (root / "hook_ran").write_text(context.asset_name)
+
+
+    class Orders(rs.MultiAsset):
+        io_handler = handler
+        orders = rs.AssetDef()
+        returns = rs.AssetDef()
+
+        @classmethod
+        def materialize(cls):
+            return {"orders": 10, "returns": 2}
+
+
+    class Regions(rs.Asset):
+        io_handler = handler
+
+        @classmethod
+        def materialize(cls) -> int:
+            return 3
+
+
+    class Customers(rs.Asset):
+        io_handler = handler
+        automation_condition = rs.AutomationCondition.eager()
+        deps = [rs.AssetDef.dep("regions")]
+        hooks = [rs.Hook.success(record_success)]
+        compute = rs.Compute(cpu="1", memory="512Mi")
+
+        @classmethod
+        def materialize(cls, orders: int) -> int:
+            return orders * 2
+
+
+    class ReturnRate(rs.Asset):
+        io_handler = handler
+
+        @classmethod
+        def materialize(cls, returns: int) -> int:
+            return returns + 100
+
+
+    if __name__ == "__main__":
+        repo = rs.CodeRepository(
+            assets=[Orders, Regions, Customers, ReturnRate],
+            default_executor=rs.Executor.parallel(max_workers=2),
+        )
+        repo.materialize()
+        names = ["orders", "returns", "regions", "customers", "return_rate"]
+        print(json.dumps({n: repo.load_node(n) for n in names}))
+    """
+)
+
+
+def test_script_class_assets_with_declarations_run_on_parallel(tmp_path):
+    """`python pipeline.py` with class-form assets that carry AssetDef outputs,
+    an automation condition, deps, hooks and compute. Both levels are 2 wide,
+    so every step crosses the loky boundary."""
+    script = tmp_path / "pipeline.py"
+    script.write_text(PIPELINE_SCRIPT)
+    result = subprocess.run(
+        [sys.executable, str(script), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=50,
+        cwd=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+    printed = [line for line in result.stdout.splitlines() if line.startswith("{")]
+    assert json.loads(printed[-1]) == {
+        "orders": 10,
+        "returns": 2,
+        "regions": 3,
+        "customers": 20,
+        "return_rate": 102,
+    }
+    assert (tmp_path / "hook_ran").read_text() == "customers"
+
+
+class _LabelHandler(rs.BaseIOHandler):
+    """A picklable handler that compares by value."""
+
+    label: str = ""
+
+    def handle_output(self, context, obj):
+        pass
+
+    def load_input(self, context):
+        return None
+
+
+def _optimize(ctx):
+    return None
+
+
+def _alert(context):
+    return None
+
+
+class TestDeclarationPickling:
+    """Each declaration type round-trips through pickle with every field set."""
+
+    @pytest.mark.parametrize(
+        ("io_handler", "partitions_def"),
+        [
+            (_LabelHandler(label="orders"), rs.PartitionsDefinition.static_(["eu"])),
+            ("warehouse", "regions"),
+        ],
+        ids=["inline", "by-name"],
+    )
+    def test_asset_def(self, io_handler, partitions_def):
+        ad = rs.AssetDef(
+            name="orders",
+            tags=["core"],
+            kinds=["delta", "table"],
+            group="sales",
+            code_version="v2",
+            io_handler=io_handler,
+            metadata={"owner": "data"},
+            partitions_def=partitions_def,
+            partition_mapping={"raw": rs.PartitionMapping.time_window(-1)},
+            pool=["db", "api"],
+            pool_slots={"db": 3},
+            deps=[rs.AssetDef.input("raw", metadata={"k": "v"})],
+            actions=[
+                rs.AssetAction(
+                    name="optimize", outcome=rs.Outcome.Unchanged, description="compact"
+                )(_optimize)
+            ],
+        )
+        restored = pickle.loads(pickle.dumps(ad))
+        assert restored == ad
+        assert restored.kinds == ["delta", "table"]
+        assert restored.pool == [("db", 3), ("api", 1)]
+        assert restored.partitions_def == partitions_def
+        assert restored.partition_mapping == {
+            "raw": rs.PartitionMapping.time_window(-1)
+        }
+        assert [(d.name, d.is_input, d.metadata) for d in restored.deps] == [
+            ("raw", True, {"k": "v"})
+        ]
+        assert [(a.name, a.outcome, a.description) for a in restored.actions] == [
+            ("optimize", rs.Outcome.Unchanged, "compact")
+        ]
+
+    def test_unnamed_asset_def(self):
+        restored = pickle.loads(pickle.dumps(rs.AssetDef()))
+        assert restored.name is None
+        assert restored == rs.AssetDef()
+
+    @pytest.mark.parametrize(
+        "dep",
+        [
+            rs.AssetDef.input(
+                "raw",
+                partition_mapping=rs.PartitionMapping.time_window(-1),
+                io_handler=_LabelHandler(label="raw"),
+                metadata={"k": "v"},
+            ),
+            rs.AssetDef.dep(
+                "upstream", partition_mapping=rs.PartitionMapping.all_partitions()
+            ),
+        ],
+        ids=["input", "lineage"],
+    )
+    def test_dep_def(self, dep):
+        restored = pickle.loads(pickle.dumps(dep))
+        assert repr(restored) == repr(dep)
+        assert (
+            restored.name,
+            restored.is_input,
+            restored.metadata,
+            restored.partition_mapping,
+        ) == (dep.name, dep.is_input, dep.metadata, dep.partition_mapping)
+
+    @pytest.mark.parametrize(
+        "hook",
+        [rs.Hook.success(_alert), rs.Hook.failure(_alert, name="page")],
+        ids=["success", "failure"],
+    )
+    def test_hook(self, hook):
+        restored = pickle.loads(pickle.dumps(hook))
+        assert type(restored) is type(hook)
+        assert restored.name == hook.name
+        with pytest.raises(Exception, match="already bound"):
+            restored(_alert)
+
+    def test_compute(self):
+        restored = pickle.loads(
+            pickle.dumps(rs.Compute(cpu="2", memory="4Gi", gpu="1"))
+        )
+        assert (restored.cpu, restored.memory, restored.gpu) == ("2", "4Gi", "1")
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            (
+                rs.AutomationCondition.on_cron("0 6 * * *", timezone="Europe/Amsterdam")
+                & ~rs.AutomationCondition.last_executed_with_tags(
+                    tag_values=[("team", "data")]
+                )
+            ).with_label("nightly"),
+            rs.AutomationCondition.eager() | rs.AutomationCondition.missing(),
+        ],
+        ids=["labelled", "unlabelled"],
+    )
+    def test_automation_condition(self, condition):
+        restored = pickle.loads(pickle.dumps(condition))
+        assert restored.label == condition.label
+        assert restored.description == condition.description
+        assert [c.description for c in restored.children] == [
+            c.description for c in condition.children
+        ]

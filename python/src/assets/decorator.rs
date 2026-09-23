@@ -554,6 +554,49 @@ impl AssetDef {
         hasher.finish()
     }
 
+    /// A class-form multi asset defined in a script ships to loky workers by
+    /// value, and its outputs are `AssetDef` attributes.
+    fn __getnewargs_ex__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyTuple>, Bound<'py, PyDict>)> {
+        let Self {
+            name,
+            tags,
+            kinds,
+            group,
+            code_version,
+            io_handler,
+            metadata,
+            partitions_def,
+            partition_mapping,
+            pool,
+            deps,
+            actions,
+        } = self;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("name", name)?;
+        kwargs.set_item("tags", tags)?;
+        kwargs.set_item("kinds", &kinds.0)?;
+        kwargs.set_item("group", group)?;
+        kwargs.set_item("code_version", code_version)?;
+        kwargs.set_item("io_handler", io_handler.as_ref().map(|h| h.to_object(py)))?;
+        kwargs.set_item("metadata", metadata)?;
+        kwargs.set_item(
+            "partitions_def",
+            partitions_def.as_ref().map(|p| p.to_object(py)),
+        )?;
+        kwargs.set_item("partition_mapping", partition_mapping)?;
+        kwargs.set_item("pool", pool.iter().map(|(key, _)| key).collect::<Vec<_>>())?;
+        kwargs.set_item(
+            "pool_slots",
+            pool.iter().cloned().collect::<HashMap<_, _>>(),
+        )?;
+        kwargs.set_item("deps", deps)?;
+        kwargs.set_item("actions", actions)?;
+        Ok((PyTuple::empty(py), kwargs))
+    }
+
     /// Create a new output definition for use with `Asset.from_multi()`.
     ///
     /// `name` may be omitted only when the def is assigned as a class attribute

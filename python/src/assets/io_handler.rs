@@ -68,6 +68,14 @@ impl IOHandler {
             IOHandler::ResourceRef(k) => IOHandler::ResourceRef(k.clone()),
         }
     }
+
+    /// The handler instance, or the resource key string.
+    pub fn to_object(&self, py: Python) -> Py<PyAny> {
+        match self {
+            IOHandler::Instance(h) => h.clone_ref(py),
+            IOHandler::ResourceRef(k) => pyo3::types::PyString::new(py, k).unbind().into_any(),
+        }
+    }
 }
 
 pub fn validate_io_handler_protocol(py: Python, handler: &Py<PyAny>) -> PyResult<()> {
