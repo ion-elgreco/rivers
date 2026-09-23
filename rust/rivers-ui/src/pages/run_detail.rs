@@ -159,11 +159,14 @@ pub fn RunDetailPage() -> impl IntoView {
     let (mat_page, set_mat_page) = signal(0u64);
     let (obs_page, set_obs_page) = signal(0u64);
     let (act_page, set_act_page) = signal(0u64);
+    let (del_page, set_del_page) = signal(0u64);
     Effect::new(move |_| {
         selected_step.track();
         run_id_memo.track();
         set_mat_page.set(0);
         set_obs_page.set(0);
+        set_act_page.set(0);
+        set_del_page.set(0);
     });
     let (log_tab, set_log_tab) = signal("events".to_string());
     let (log_level, set_log_level) = signal("all".to_string());
@@ -461,6 +464,8 @@ pub fn RunDetailPage() -> impl IntoView {
                             set_obs_page=set_obs_page
                             act_page=act_page
                             set_act_page=set_act_page
+                            del_page=del_page
+                            set_del_page=set_del_page
                             on_close=set_selected_step
                         />
                     })
@@ -558,7 +563,7 @@ fn asset_chip_status(asset_events: &[StoredEvent]) -> (&'static str, &'static st
 /// Event log lives in the main LogPanel below — selection filters it, so we
 /// don't duplicate here.
 #[component]
-fn RunAssetDrawer(
+pub fn RunAssetDrawer(
     asset_key: String,
     run_id: String,
     step_events: Vec<StoredEvent>,
@@ -569,6 +574,8 @@ fn RunAssetDrawer(
     set_obs_page: WriteSignal<u64>,
     act_page: ReadSignal<u64>,
     set_act_page: WriteSignal<u64>,
+    del_page: ReadSignal<u64>,
+    set_del_page: WriteSignal<u64>,
     on_close: WriteSignal<Option<String>>,
 ) -> impl IntoView {
     // Status/timing from this asset's step events; materializations paginated below.
@@ -690,6 +697,30 @@ fn RunAssetDrawer(
             },
         )
     };
+    // A delete run's only asset event is its Deletion.
+    let (del_page_size, set_del_page_size) = signal(25u64);
+    let deletions_page = {
+        let run_id = run_id.clone();
+        let asset_key = asset_key.clone();
+        Resource::new(
+            move || (del_page.get(), del_page_size.get()),
+            move |(p, ps)| {
+                let run_id = run_id.clone();
+                let asset_key = asset_key.clone();
+                async move {
+                    get_run_asset_events_page(run_id, asset_key, "Deletion".to_string(), p * ps, ps)
+                        .await
+                }
+            },
+        )
+    };
+    let del_total = Signal::derive(move || {
+        deletions_page
+            .get()
+            .and_then(|r| r.ok())
+            .map(|p| p.total)
+            .unwrap_or(0)
+    });
     let mat_total = Signal::derive(move || {
         materializations_page
             .get()
@@ -748,7 +779,7 @@ fn RunAssetDrawer(
                     </div>
                     <div class="run-asset-drawer-kv">
                         <div class="run-asset-drawer-kv-label">"EVENTS"</div>
-                        <div class="run-asset-drawer-kv-value">{move || (mat_total.get() + obs_total.get() + act_total.get() + step_count).to_string()}</div>
+                        <div class="run-asset-drawer-kv-value">{move || (mat_total.get() + obs_total.get() + act_total.get() + del_total.get() + step_count).to_string()}</div>
                     </div>
                     <div class="run-asset-drawer-kv">
                         <div class="run-asset-drawer-kv-label">"UPSTREAM"</div>
@@ -766,6 +797,12 @@ fn RunAssetDrawer(
                         <div class="run-asset-drawer-kv">
                             <div class="run-asset-drawer-kv-label">"ACTIONS"</div>
                             <div class="run-asset-drawer-kv-value">{move || act_total.get().to_string()}</div>
+                        </div>
+                    </Show>
+                    <Show when={move || del_total.get() > 0}>
+                        <div class="run-asset-drawer-kv">
+                            <div class="run-asset-drawer-kv-label">"DELETIONS"</div>
+                            <div class="run-asset-drawer-kv-value">{move || del_total.get().to_string()}</div>
                         </div>
                     </Show>
                 </div>
@@ -830,6 +867,22 @@ fn RunAssetDrawer(
                         set_page_size=set_act_page_size
                         render={move |rows: Vec<crate::types::StoredEvent>| view! {
                             <div class="run-asset-drawer-materializations">{render_event_cards(rows, "action")}</div>
+                        }.into_any()}
+                    />
+                </div>
+            </Show>
+
+            <Show when={move || del_total.get() > 0}>
+                <div class="run-asset-drawer-section">
+                    <div class="section-header-label" style="margin-bottom:8px">"DELETION"</div>
+                    <PaginatedView
+                        data=deletions_page
+                        page=del_page
+                        set_page=set_del_page
+                        page_size=del_page_size
+                        set_page_size=set_del_page_size
+                        render={move |rows: Vec<crate::types::StoredEvent>| view! {
+                            <div class="run-asset-drawer-materializations">{render_event_cards(rows, "deletion")}</div>
                         }.into_any()}
                     />
                 </div>
