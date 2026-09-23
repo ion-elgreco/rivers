@@ -474,6 +474,7 @@ An `AssetAction` is reusable: the same object can be attached to many assets.
 | `outcome` | `Outcome` | required | What the verb does to materialization state. See [`Outcome`](#outcome). |
 | `concurrency` | `ActionConcurrency \| None` | `None` | Whether the verb may run alongside a materialize. See [`ActionConcurrency`](#actionconcurrency). |
 | `ordering` | `ActionOrdering \| None` | `None` | Step order across several targets in one run. See [`ActionOrdering`](#actionordering). |
+| `partitioning` | `ActionPartitioning \| None` | `None` | Whether the verb takes a partition key on a partitioned asset (`Required` when omitted). See [`ActionPartitioning`](#actionpartitioning). |
 | `retry` | `RetryPolicy \| str \| None` | `None` | Retry policy for this verb. Actions never inherit the asset's materialize policy. |
 | `description` | `str \| None` | `None` | Shown next to the verb in the UI. |
 
@@ -497,7 +498,18 @@ the planning upper bound; [`ActionResult`](#actionresult) reports what actually 
 | Value | Meaning |
 |-------|---------|
 | `ActionConcurrency.Shared` | No special claim (the default when omitted). |
-| `ActionConcurrency.Exclusive` | Takes the asset's implicit pool whole, so the verb and a materialize of the same asset never overlap. A blocked run shows as `StepSlotWaiting`. |
+| `ActionConcurrency.Exclusive` | Claims the asset's implicit pool for the partitions it touches (the whole asset when keyless), so the verb and a materialize of the same partitions never overlap; other partitions proceed. A blocked step shows as `StepSlotWaiting` and waits for the holder without a timeout. |
+
+## `ActionPartitioning`
+
+Whether a verb takes a partition key on a partitioned asset. Unpartitioned assets
+never take one.
+
+| Value | Meaning |
+|-------|---------|
+| `ActionPartitioning.Required` | A partitioned target needs a key, like materialize (the default when omitted). |
+| `ActionPartitioning.Keyless` | Whole-asset verb: never takes a key — `optimize`, `vacuum`. A backfill of it is rejected, since backfills always run keyed. |
+| `ActionPartitioning.Optional` | A key scopes the run to that partition; without one the run covers the whole asset — `delete`. |
 
 ## `ActionOrdering`
 
@@ -558,9 +570,9 @@ class Orders(rs.Asset):
         DeltaTable(ctx.io_handler.asset_table_uri(ctx.asset_name)).delete()
 ```
 
-**Parameters:** `name`, `outcome`, `concurrency`, `ordering`, `retry`,
-`description` — the same set [`AssetAction`](#assetaction) takes. `name` defaults
-to the method name.
+**Parameters:** `name`, `outcome`, `concurrency`, `ordering`, `partitioning`,
+`retry`, `description` — the same set [`AssetAction`](#assetaction) takes. `name`
+defaults to the method name.
 
 A reusable `AssetAction` can also be assigned as a class attribute
 (`optimize = delta_optimize`), which participates in MRO so a subclass can

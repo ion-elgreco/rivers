@@ -364,7 +364,8 @@ class Events(DeltaAsset):
 - `partition_predicate(asset_metadata, ctx.partition)` — the SQL predicate for the
   partition(s) being acted on, honoring `delta/partition_expr`.
 
-Because `optimize` declares `Exclusive`, it takes the asset's implicit pool whole:
-it never overlaps a materialize of the same asset, and contention shows up in the UI
-as `StepSlotWaiting`. Materialize steps take a single slot each, so declaring an
-exclusive action does not serialize ordinary runs.
+Because `optimize` declares `Exclusive` and runs keyless, it claims the asset's
+implicit pool for the whole asset: it never overlaps a materialize of the same asset,
+and contention shows up in the UI as `StepSlotWaiting`. A keyed `delete` claims only
+its partition. Materialize steps never exclude each other, so declaring an exclusive
+action does not serialize ordinary runs.

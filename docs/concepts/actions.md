@@ -224,6 +224,7 @@ class GdprDeletable(rs.Asset):
         outcome=rs.Outcome.Unmaterialize,
         concurrency=rs.ActionConcurrency.Exclusive,
         ordering=rs.ActionOrdering.DownstreamFirst,
+        partitioning=rs.ActionPartitioning.Optional,
     )
     @classmethod
     def delete(cls, ctx) -> None:

@@ -205,7 +205,7 @@ Run a named [asset action](../concepts/actions.md) over a selection. The plan ha
 |-----------|------|---------|-------------|
 | `action` | `str` | required | The verb to run; every targeted asset must define it. |
 | `selection` | `list[str] \| None` | `None` | Asset names. `None` targets every asset that defines the action. |
-| `partition_key` | `PartitionKey \| None` | `None` | Partition to act on. Required when any target is partitioned. |
+| `partition_key` | `PartitionKey \| None` | `None` | Partition to act on. The verb's [`partitioning`](assets.md#actionpartitioning) decides: required on partitioned targets for `Required`, rejected for `Keyless`, optional for `Optional` (none = the whole asset). |
 | `tags` | `list[tuple[str, str]] \| None` | `None` | Run tags. |
 | `raise_on_error` | `bool` | `True` | Raise the first failure instead of reporting it on the result. |
 | `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config overrides, keyed by asset name. Python API only — gRPC and UI launches use the definition's defaults. |
