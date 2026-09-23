@@ -327,6 +327,20 @@ impl Executor {
             let mut step_dynamic_keys: HashMap<String, Vec<String>> = HashMap::new();
             let mut step_failed_partitions: HashMap<String, Vec<(PyPartitionKey, String)>> =
                 HashMap::new();
+            // A finished step's per-key failures lived only in memory; without
+            // them ordering would hand its dependents those keys again.
+            for (name, attempts) in &prior_attempts {
+                if completed_steps.contains(name) && !attempts.failed_keys.is_empty() {
+                    step_failed_partitions.insert(
+                        name.clone(),
+                        attempts
+                            .failed_keys
+                            .iter()
+                            .map(|k| (PyPartitionKey::from(k), "failed before a restart".into()))
+                            .collect(),
+                    );
+                }
+            }
 
             prefill_external_dep_versions(plan, storage, &mut data_versions);
 

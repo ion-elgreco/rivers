@@ -1147,6 +1147,9 @@ pub struct StepAttempts {
     pub failed: bool,
     /// `StepRetry` events recorded.
     pub retries: u32,
+    /// Keys the step failed one by one (keyed `StepFailure`), which ordering
+    /// keeps its dependents off.
+    pub failed_keys: Vec<PartitionKey>,
 }
 
 /// Why a step is blocked from claiming concurrency slots.

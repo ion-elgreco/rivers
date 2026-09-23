@@ -1329,6 +1329,123 @@ def test_resume_runs_an_interrupted_action_at_most_once(tmp_path, verb, reruns):
     assert f"RESULT {reruns}" in resumed.stdout, resumed.stdout[-2000:]
 
 
+_DOWNSTREAM_FIRST_RESUME_SCRIPT = textwrap.dedent(
+    """
+    import os, sys, time
+    import rivers as rs
+    from rivers.testing import embedded_storage
+
+    path, phase, calls_file = sys.argv[1:4]
+
+    def body(ctx):
+        keys = ";".join(sorted(str(k) for k in ctx.partition.keys))
+        with open(calls_file, "a") as f:
+            f.write(f"{ctx.asset_name} {keys}\\n")
+        if ctx.asset_name == "rollups":
+            for key in ctx.partition.keys:
+                if "p2" in str(key):
+                    ctx.mark_partition_failed(key, "rollup locked")
+        elif phase == "crash":
+            # Die mid-body once this step's StepStart is durable — a pod
+            # evicted after the rollup step finished.
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if any(
+                    e.event_type == "StepStart" and e.asset_key == "events"
+                    for e in storage.get_events_for_run(ctx.run_id)
+                ):
+                    os._exit(3)
+                time.sleep(0.05)
+            raise SystemExit("StepStart never became visible")
+
+    purge = rs.AssetAction(
+        name="purge",
+        outcome=rs.Outcome.Unmaterialize,
+        ordering=rs.ActionOrdering.DownstreamFirst,
+        retry=rs.RetryPolicy(max_retries=1),
+    )(body)
+    parts = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+    class Events(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = parts
+        actions = [purge]
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext):
+            return context.partition_key
+
+    class Rollups(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = parts
+        actions = [purge]
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext, events):
+            return events
+
+    storage = embedded_storage(path)
+    repo = rs.CodeRepository(
+        assets=[Events, Rollups], default_executor=rs.Executor.in_process()
+    )
+    repo.resolve(storage=storage)
+    if phase == "crash":
+        for p in ("p1", "p2"):
+            repo.materialize(partition_key=rs.PartitionKey.single(p))
+        repo.backfill(
+            selection=["events", "rollups"],
+            partition_keys=[rs.PartitionKey.single(p) for p in ("p1", "p2")],
+            action="purge",
+            strategy=rs.BackfillStrategy.single_run(),
+        )
+    else:
+        run = next(r for r in storage.get_runs(limit=20) if r.action == "purge")
+        result = repo.run_action(
+            "purge",
+            selection=run.node_names,
+            partition_key=run.partition_key,
+            run_id_override=run.run_id,
+            resume=True,
+            raise_on_error=False,
+        )
+        print("RESULT", result.success)
+    """
+)
+
+
+def test_resume_keeps_the_keys_a_finished_downstream_step_failed(tmp_path):
+    """DownstreamFirst leaves the source of a key the rollup step failed. The
+    per-key failures lived only in memory, so a resumed run handed the source
+    step every key of the batch and deleted the failed key's source."""
+    db = str(tmp_path / "db")
+    calls = tmp_path / "calls.txt"
+
+    def run(phase):
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _DOWNSTREAM_FIRST_RESUME_SCRIPT,
+                db,
+                phase,
+                str(calls),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    crashed = run("crash")
+    assert crashed.returncode == 3, crashed.stderr[-2000:]
+    resumed = run("resume")
+    assert resumed.returncode == 0, resumed.stderr[-2000:]
+
+    lines = calls.read_text().splitlines()
+    source_calls = [line for line in lines if line.startswith("events ")]
+    assert len(source_calls) == 2, lines  # the cut-off attempt, then the resumed one
+    assert all("p2" not in line for line in source_calls), lines
+
+
 def test_declaring_exclusive_action_does_not_serialize_materialize(tmp_path):
     """The implicit pool is a reader/writer lock, not a global mutex.
 

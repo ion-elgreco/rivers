@@ -3172,7 +3172,10 @@ impl StorageBackend for SurrealStorage {
                          WHERE run_id = $run_id AND event_type = 'StepFailure' \
                          AND partition_key IS NONE; \
                      SELECT asset_key FROM events \
-                         WHERE run_id = $run_id AND event_type = 'StepRetry';",
+                         WHERE run_id = $run_id AND event_type = 'StepRetry'; \
+                     SELECT asset_key, partition_key FROM events \
+                         WHERE run_id = $run_id AND event_type = 'StepFailure' \
+                         AND partition_key IS NOT NONE;",
                 )
                 .bind(("run_id", run_id.to_string()))
                 .await?;
@@ -3180,6 +3183,11 @@ impl StorageBackend for SurrealStorage {
             #[derive(SurrealValue, serde::Deserialize)]
             struct Row {
                 asset_key: Option<String>,
+            }
+            #[derive(SurrealValue)]
+            struct KeyedRow {
+                asset_key: Option<String>,
+                partition_key: PartitionKey,
             }
             let mut out: HashMap<String, super::StepAttempts> = HashMap::new();
             let started: Vec<Row> = result.take(0)?;
@@ -3193,6 +3201,15 @@ impl StorageBackend for SurrealStorage {
             let retries: Vec<Row> = result.take(2)?;
             for key in retries.into_iter().filter_map(|r| r.asset_key) {
                 out.entry(key).or_default().retries += 1;
+            }
+            let keyed: Vec<KeyedRow> = result.take(3)?;
+            for row in keyed {
+                if let Some(key) = row.asset_key {
+                    out.entry(key)
+                        .or_default()
+                        .failed_keys
+                        .extend(row.partition_key.members());
+                }
             }
             Ok(out)
         })
@@ -14747,11 +14764,18 @@ mod tests {
             crate::storage::StepAttempts {
                 started: true,
                 failed: false,
-                retries: 1
+                retries: 1,
+                failed_keys: vec![],
             }
         );
         assert!(get("failed").failed);
         assert!(get("one_key").started && !get("one_key").failed);
+        assert_eq!(
+            get("one_key").failed_keys,
+            vec![PartitionKey::Single {
+                keys: vec!["p1".to_string()]
+            }]
+        );
         assert!(storage.get_step_attempts("other").await.unwrap().is_empty());
     }
 
