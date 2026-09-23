@@ -912,6 +912,7 @@ def backfill_grpc_channel(grpc_stubs, storage):
 
     repo = rs.CodeRepository(
         assets=[partitioned_asset],
+        jobs=[rs.Job(name="compact_job", assets=[partitioned_asset], action="compact")],
         default_executor=rs.Executor.in_process(),
     )
     repo.resolve(storage=storage)
@@ -1098,6 +1099,40 @@ def test_get_backfill_status_carries_the_verb(backfill_grpc_channel):
 
     assert launch(action="compact").action == "compact"
     assert not launch().HasField("action")
+
+
+def test_job_backfill_records_the_jobs_verb(backfill_grpc_channel):
+    """The children of an action job's backfill run the job's verb, so the
+    record must name it: the condition cache's in-flight rule, the UI's
+    two-click replay and GetBackfillStatus all read it."""
+    channel, pb2, pb2_grpc, repo, _ = backfill_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    def status(backfill_id):
+        return stub.GetBackfillStatus(
+            pb2.GetBackfillStatusRequest(backfill_id=backfill_id)
+        )
+
+    launch = stub.LaunchBackfill(
+        pb2.LaunchBackfillRequest(
+            job_name="compact_job",
+            partition_keys=[
+                _single_partition_key(pb2, "p1"),
+                _single_partition_key(pb2, "p2"),
+            ],
+            failure_policy="continue",
+            max_concurrency=1,
+        )
+    )
+    assert status(launch.backfill_id).action == "compact"
+    assert repo.get_backfill(launch.backfill_id).action == "compact"
+
+    # A rerun replays the job, which carries its own verb.
+    rerun = stub.RerunBackfill(
+        pb2.RerunBackfillRequest(backfill_id=launch.backfill_id, dry_run=False)
+    )
+    assert status(rerun.backfill_id).action == "compact"
+    assert repo.rerun_backfill(launch.backfill_id).num_partitions == 2
 
 
 def test_get_backfill_status_carries_launched_by(backfill_grpc_channel):

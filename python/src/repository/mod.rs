@@ -2121,9 +2121,13 @@ impl RepoHandle {
         let mut tag_map: HashMap<String, String> = record.tags.into_iter().collect();
         tag_map.insert(tag_keys::RERUN_OF.to_string(), backfill_id.to_string());
 
-        let target = match record.job_name {
-            Some(name) => crate::daemon::RunType::Job(name),
-            None => crate::daemon::RunType::Materialization(record.asset_selection),
+        // A Job target carries its own verb; the record names it for readers.
+        let (target, action) = match record.job_name {
+            Some(name) => (crate::daemon::RunType::Job(name), None),
+            None => (
+                crate::daemon::RunType::Materialization(record.asset_selection),
+                record.action,
+            ),
         };
 
         Ok(crate::daemon::BackfillRequestData {
@@ -2137,7 +2141,7 @@ impl RepoHandle {
             launched_by,
             dry_run,
             backfill_id: None,
-            action: record.action,
+            action,
         })
     }
 
@@ -4204,9 +4208,13 @@ impl PyCodeRepository {
             let mut tags = record.tags.clone();
             tags.push((tag_keys::RERUN_OF.to_string(), backfill_id));
 
-            let target = match &record.job_name {
-                Some(name) => crate::daemon::RunType::Job(name.clone()),
-                None => crate::daemon::RunType::Materialization(record.asset_selection.clone()),
+            // A Job target carries its own verb; the record names it for readers.
+            let (target, action) = match &record.job_name {
+                Some(name) => (crate::daemon::RunType::Job(name.clone()), None),
+                None => (
+                    crate::daemon::RunType::Materialization(record.asset_selection.clone()),
+                    record.action.clone(),
+                ),
             };
 
             self.backfill_inner(
@@ -4222,7 +4230,7 @@ impl PyCodeRepository {
                 dry_run,
                 None,
                 rivers_core::storage::LaunchedBy::default(),
-                record.action.clone(),
+                action,
             )
         })
     }
@@ -4626,7 +4634,8 @@ impl PyCodeRepository {
             end_time: None,
             error: None,
             launched_by,
-            action,
+            // The verb the children run — a Job target's own, not `None`.
+            action: child_verb,
         };
 
         io_rt()
