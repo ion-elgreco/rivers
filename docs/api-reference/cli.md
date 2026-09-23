@@ -15,7 +15,17 @@ rivers dev my_pipeline                        # loads my_pipeline.repo
 rivers materialize my_pipeline --repo-var pipeline_repo
 ```
 
-Storage flags follow the same pattern — `--memory` for in-memory or `--storage-path .rivers/storage` (default) for embedded SurrealDB+RocksDB.
+### Storage flags
+
+`materialize`, `run-action`, `backfill`, `backfill-status` and `backfill-cancel` choose their storage with the same flags:
+
+| Flag | Description |
+|------|-------------|
+| `--surreal-endpoint` | Remote SurrealDB endpoint, e.g. `ws://surrealdb:8000`. Overrides `--storage-path` and `--memory`. |
+| `--storage-path` | Embedded SurrealDB+RocksDB path. Kept at exit. |
+| `--memory` | In-memory storage, lost at exit. |
+
+Without `--surreal-endpoint` or `--storage-path`, the run's state and its pool claims go to a scratch store at `.rivers/storage/`. The CLI removes that store at exit, and no other process reads it. So a `delete` removes the real data, but the code location never sees the deletion, and the verb's pool claims do not block the code location's runs. To act on a code location's data, point the command at the storage that the code location uses.
 
 ---
 
@@ -71,15 +81,16 @@ Resolves the repository and runs `repo.materialize()` synchronously. Useful for 
 | Flag | Description |
 |------|-------------|
 | `--partition-key` | Partition key (string). |
-| `--memory` / `--storage-path` | Backend selection. |
+| `--surreal-endpoint` / `--storage-path` / `--memory` | Storage. See [Storage flags](#storage-flags). |
 
 ---
 
 ## `run-action` — run an asset action
 
 ```bash
-rivers run-action my_pipeline optimize
-rivers run-action my_pipeline delete --select events --partition-key 2024-01-15
+rivers run-action my_pipeline optimize --surreal-endpoint ws://surrealdb:8000
+rivers run-action my_pipeline delete --select events --partition-key 2024-01-15 \
+  --surreal-endpoint ws://surrealdb:8000
 ```
 
 Resolves the repository and runs `repo.run_action(VERB, ...)` synchronously — the
@@ -89,7 +100,7 @@ Resolves the repository and runs `repo.run_action(VERB, ...)` synchronously — 
 |------|-------------|
 | `--select`, `-s` | Comma-separated asset names. Default: every asset that defines the verb. |
 | `--partition-key` | Partition key (string), as the verb's `partitioning` allows. |
-| `--memory` / `--storage-path` | Backend selection. |
+| `--surreal-endpoint` / `--storage-path` / `--memory` | Storage. See [Storage flags](#storage-flags). A verb that changes data needs the code location's storage. |
 
 ---
 
@@ -100,7 +111,8 @@ rivers backfill my_pipeline \
   --assets daily_events \
   --from 2024-01-01 --to 2024-01-31 \
   --strategy multi_run \
-  --concurrency 4
+  --concurrency 4 \
+  --surreal-endpoint ws://surrealdb:8000
 ```
 
 Launches `repo.backfill()` against either:
@@ -117,15 +129,18 @@ Launches `repo.backfill()` against either:
 | `--on-failure` | `continue` | `continue` or `stop_on_failure`. |
 | `--dry-run` | `False` | Preview without executing. |
 | `--action` | none | Run this verb in every child run instead of materializing. |
+| `--surreal-endpoint` / `--storage-path` / `--memory` | scratch store | Storage. See [Storage flags](#storage-flags). |
 
 ---
 
 ## `backfill-status` / `backfill-cancel`
 
 ```bash
-rivers backfill-status BACKFILL_ID my_pipeline
-rivers backfill-cancel BACKFILL_ID my_pipeline
+rivers backfill-status BACKFILL_ID my_pipeline --surreal-endpoint ws://surrealdb:8000
+rivers backfill-cancel BACKFILL_ID my_pipeline --surreal-endpoint ws://surrealdb:8000
 ```
+
+Both take the [storage flags](#storage-flags). Point them at the storage that the backfill runs against: a scratch store never holds an earlier backfill.
 
 ---
 

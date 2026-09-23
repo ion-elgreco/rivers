@@ -5,6 +5,8 @@ queue commands never showed one — a queued purge read as an ordinary run.
 """
 
 import importlib
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -216,3 +218,190 @@ def test_queue_commands_name_the_verb(resolved_tmp_path, monkeypatch):
     why = runner.invoke(app, ["queue", "why", "q-purge", "--storage-path", path])
     assert why.exit_code == 0, why.output
     assert "Action:       delete" in why.output
+
+
+PURGE_MODULE = """
+import rivers as rs
+
+
+def _purge(ctx):
+    with open("calls.txt", "a") as f:
+        f.write(f"{ctx.asset_name}:{ctx.partition_key}\\n")
+
+
+purge = rs.AssetAction(name="purge", outcome=rs.Outcome.Unmaterialize)(_purge)
+
+PARTS = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+
+@rs.Asset(
+    name="events", io_handler=rs.InMemoryIOHandler(), partitions_def=PARTS, actions=[purge]
+)
+def events(context: rs.AssetExecutionContext):
+    return context.partition_key
+
+
+@rs.Asset(
+    name="rollup", io_handler=rs.InMemoryIOHandler(), partitions_def=PARTS, actions=[purge]
+)
+def rollup(context: rs.AssetExecutionContext):
+    return context.partition_key
+
+
+# Materialize runs here: InMemoryIOHandler cannot cross a worker process.
+repo = rs.CodeRepository(
+    assets=[events, rollup], default_executor=rs.Executor.in_process()
+)
+"""
+
+ENDPOINT = "ws://surrealdb:8000"
+
+
+def _purge_events_p1(command, module):
+    """The same delete of `events` p1, as `run-action` or as `backfill --action`."""
+    if command == "run-action":
+        return ["run-action", module, "purge", "-s", "events", "--partition-key", "p1"]
+    return ["backfill", module, "--assets", "events", "-p", "p1", "--action", "purge"]
+
+
+def _rivers(cwd, *args):
+    # A process of its own: the CLI decides the store's fate at exit.
+    return subprocess.run(
+        [sys.executable, "-c", "from rivers.cli import main; main()", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def _assert_events_p1_purged(storage):
+    assert storage.get_materialized_partitions("events") == []
+    assert [str(k) for k in storage.get_materialized_partitions("rollup")] == [
+        'PartitionKey("p1")'
+    ]
+    runs = [r for r in storage.get_runs() if r.action == "purge"]
+    assert [(r.status, r.node_names) for r in runs] == [("Success", ["events"])]
+    events = storage.get_events_for_run(runs[0].run_id)
+    assert "Deletion" in [e.event_type for e in events]
+
+
+def _connect_to(monkeypatch, path):
+    """Stand in for a shared SurrealDB with an embedded store.
+
+    The stub has `connect` only: a command that opened a scratch or embedded
+    store instead fails.
+    """
+    store = embedded_storage(str(path))
+    endpoints = []
+
+    def connect(endpoint):
+        endpoints.append(endpoint)
+        return store
+
+    monkeypatch.setattr(
+        "rivers.cli.Storage", type("_S", (), {"connect": staticmethod(connect)})
+    )
+    return store, endpoints
+
+
+@pytest.mark.parametrize("command", ["run-action", "backfill"])
+def test_a_storage_path_the_user_passes_keeps_the_verbs_state(
+    resolved_tmp_path, command
+):
+    """The CLI removed a `--storage-path` the user passed at exit, with the
+    delete's state in it — while the verb had already changed the data."""
+    module = f"defs_kept_{command.replace('-', '_')}"
+    _write_module(resolved_tmp_path, module, PURGE_MODULE)
+    path = resolved_tmp_path / "shared_db"
+
+    for args in (
+        ["materialize", module, "--partition-key", "p1"],
+        _purge_events_p1(command, module),
+    ):
+        done = _rivers(resolved_tmp_path, *args, "--storage-path", str(path))
+        assert done.returncode == 0, done.stderr
+
+    assert path.exists()
+    _assert_events_p1_purged(embedded_storage(str(path)))
+
+
+@pytest.mark.parametrize("command", ["run-action", "backfill"])
+def test_surreal_endpoint_records_the_verb_in_the_shared_store(
+    resolved_tmp_path, monkeypatch, command
+):
+    """A delete from the CLI must land in the store the code location reads,
+    not in a scratch store that no other process sees."""
+    module = f"defs_remote_{command.replace('-', '_')}"
+    _write_module(resolved_tmp_path, module, PURGE_MODULE)
+    store, endpoints = _connect_to(monkeypatch, resolved_tmp_path / "shared_db")
+
+    for args in (
+        ["materialize", module, "--partition-key", "p1"],
+        _purge_events_p1(command, module),
+    ):
+        done = runner.invoke(app, [*args, "--surreal-endpoint", ENDPOINT])
+        assert done.exit_code == 0, done.output
+
+    assert endpoints == [ENDPOINT, ENDPOINT]
+    assert not (resolved_tmp_path / ".rivers").exists()
+    _assert_events_p1_purged(store)
+
+
+def test_backfill_status_and_cancel_read_the_shared_store(
+    resolved_tmp_path, monkeypatch
+):
+    _write_module(resolved_tmp_path, "defs_remote_status", PURGE_MODULE)
+    store, endpoints = _connect_to(monkeypatch, resolved_tmp_path / "shared_db")
+    ran = runner.invoke(
+        app,
+        [
+            *_purge_events_p1("backfill", "defs_remote_status"),
+            "--surreal-endpoint",
+            ENDPOINT,
+        ],
+    )
+    assert ran.exit_code == 0, ran.output
+    (run,) = [r for r in store.get_runs() if r.action == "purge"]
+    backfill_id = run.launched_by.backfill_id
+
+    status = runner.invoke(
+        app,
+        [
+            "backfill-status",
+            backfill_id,
+            "defs_remote_status",
+            "--surreal-endpoint",
+            ENDPOINT,
+        ],
+    )
+    assert status.exit_code == 0, status.output
+    assert f"Backfill {backfill_id}: CompletedSuccess" in status.output
+    assert "Action: purge" in status.output
+
+    canceled = runner.invoke(
+        app,
+        [
+            "backfill-cancel",
+            backfill_id,
+            "defs_remote_status",
+            "--surreal-endpoint",
+            ENDPOINT,
+        ],
+    )
+    assert canceled.exit_code == 0, canceled.output
+    assert endpoints == [ENDPOINT] * 3
+
+
+@pytest.mark.parametrize("command", ["run-action", "backfill"])
+def test_without_a_storage_flag_the_scratch_store_is_removed_at_exit(
+    resolved_tmp_path, command
+):
+    module = f"defs_scratch_{command.replace('-', '_')}"
+    _write_module(resolved_tmp_path, module, PURGE_MODULE)
+
+    done = _rivers(resolved_tmp_path, *_purge_events_p1(command, module))
+
+    assert done.returncode == 0, done.stderr
+    assert (resolved_tmp_path / "calls.txt").read_text().split() == ["events:p1"]
+    assert not (resolved_tmp_path / ".rivers").exists()

@@ -342,14 +342,14 @@ def test_cleanup_storage_noop_if_missing(tmp_path: Path):
 
 def test_create_storage_memory():
     """_create_storage with memory=True returns in-memory storage."""
-    storage = _create_storage(memory=True, storage_path="unused")
+    storage = _create_storage(memory=True, storage_path="unused", surreal_endpoint=None)
     assert storage.type == rs.StorageType.Memory
 
 
 def test_create_storage_embedded(tmp_path: Path):
     """_create_storage with memory=False returns embedded storage."""
     path = str(tmp_path / "db")
-    storage = _create_storage(memory=False, storage_path=path)
+    storage = _create_storage(memory=False, storage_path=path, surreal_endpoint=None)
     assert storage.type == rs.StorageType.Embedded
     assert Path(path).exists()
 

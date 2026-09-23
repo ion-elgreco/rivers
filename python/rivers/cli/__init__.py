@@ -55,12 +55,25 @@ def _cleanup_storage(path: str) -> None:
             parent.rmdir()
 
 
-def _create_storage(memory: bool, storage_path: str) -> Storage:
-    """Create storage backend based on CLI flags."""
+_SCRATCH_STORAGE_PATH = ".rivers/storage/"
+
+
+def _create_storage(
+    memory: bool, storage_path: str | None, surreal_endpoint: str | None
+) -> Storage:
+    """Create storage backend based on CLI flags.
+
+    Only the scratch store picked here is removed at exit, never a path the
+    user passed.
+    """
+    if surreal_endpoint is not None:
+        return Storage.connect(surreal_endpoint)
     if memory:
         return Storage.memory()
-    storage = Storage.embedded(storage_path)
-    atexit.register(_cleanup_storage, storage_path)
+    if storage_path is not None:
+        return Storage.embedded(storage_path)
+    storage = Storage.embedded(_SCRATCH_STORAGE_PATH)
+    atexit.register(_cleanup_storage, _SCRATCH_STORAGE_PATH)
     return storage
 
 
@@ -457,14 +470,18 @@ def materialize(
     memory: bool = typer.Option(
         False, help="Use in-memory storage instead of embedded"
     ),
-    storage_path: str = typer.Option(
-        ".rivers/storage/", help="Path for embedded storage"
+    storage_path: str | None = typer.Option(
+        None,
+        help="Path for embedded storage (default: a scratch store, removed at exit)",
+    ),
+    surreal_endpoint: str | None = typer.Option(
+        None, help="Remote SurrealDB endpoint (overrides --storage-path)"
     ),
 ) -> None:
     """Materialize all assets in a repository."""
     from rivers import PartitionKey
 
-    repo_obj = _load_repo(module, repo_var, memory, storage_path)
+    repo_obj = _load_repo(module, repo_var, memory, storage_path, surreal_endpoint)
     pk = PartitionKey.single(partition_key) if partition_key else None
     result = repo_obj.materialize(partition_key=pk)
     typer.echo(f"Materialization complete. Assets: {result.materialized_assets}")
@@ -487,8 +504,12 @@ def run_action(
     memory: bool = typer.Option(
         False, help="Use in-memory storage instead of embedded"
     ),
-    storage_path: str = typer.Option(
-        ".rivers/storage/", help="Path for embedded storage"
+    storage_path: str | None = typer.Option(
+        None,
+        help="Path for embedded storage (default: a scratch store, removed at exit)",
+    ),
+    surreal_endpoint: str | None = typer.Option(
+        None, help="Remote SurrealDB endpoint (overrides --storage-path)"
     ),
 ) -> None:
     """Run an asset action (a verb besides materialize) over a selection."""
@@ -502,13 +523,19 @@ def run_action(
             err=True,
         )
         raise typer.Exit(1)
-    repo_obj = _load_repo(module, repo_var, memory, storage_path)
+    repo_obj = _load_repo(module, repo_var, memory, storage_path, surreal_endpoint)
     pk = PartitionKey.single(partition_key) if partition_key is not None else None
     result = repo_obj.run_action(action, selection=selection, partition_key=pk)
     typer.echo(f"Action '{action}' complete. Run: {result.run_id}")
 
 
-def _load_repo(module: str, repo_var: str, memory: bool, storage_path: str):
+def _load_repo(
+    module: str,
+    repo_var: str,
+    memory: bool,
+    storage_path: str | None,
+    surreal_endpoint: str | None,
+):
     """Load and resolve a CodeRepository from a module."""
     sys.path.insert(0, ".")
     mod = importlib.import_module(module)
@@ -523,7 +550,7 @@ def _load_repo(module: str, repo_var: str, memory: bool, storage_path: str):
         typer.echo(f"Error: '{repo_var}' is not a CodeRepository", err=True)
         raise typer.Exit(1)
 
-    storage = _create_storage(memory, storage_path)
+    storage = _create_storage(memory, storage_path, surreal_endpoint)
     repo_obj.resolve(storage=storage)
     return repo_obj
 
@@ -583,14 +610,18 @@ def backfill(
         None, "--action", help="Run this verb instead of materializing"
     ),
     memory: bool = typer.Option(False, help="Use in-memory storage"),
-    storage_path: str = typer.Option(
-        ".rivers/storage/", help="Path for embedded storage"
+    storage_path: str | None = typer.Option(
+        None,
+        help="Path for embedded storage (default: a scratch store, removed at exit)",
+    ),
+    surreal_endpoint: str | None = typer.Option(
+        None, help="Remote SurrealDB endpoint (overrides --storage-path)"
     ),
 ) -> None:
     """Backfill partitions for selected assets."""
     from rivers import PartitionKey, PartitionKeyRange
 
-    repo_obj = _load_repo(module, repo_var, memory, storage_path)
+    repo_obj = _load_repo(module, repo_var, memory, storage_path, surreal_endpoint)
 
     selection = _split_names(assets)
 
@@ -647,12 +678,16 @@ def backfill_status(
     module: str = typer.Argument(help="Python module path"),
     repo_var: str = typer.Option("repo", help="Variable name of CodeRepository"),
     memory: bool = typer.Option(False, help="Use in-memory storage"),
-    storage_path: str = typer.Option(
-        ".rivers/storage/", help="Path for embedded storage"
+    storage_path: str | None = typer.Option(
+        None,
+        help="Path for embedded storage (default: a scratch store, removed at exit)",
+    ),
+    surreal_endpoint: str | None = typer.Option(
+        None, help="Remote SurrealDB endpoint (overrides --storage-path)"
     ),
 ) -> None:
     """Check status of a backfill."""
-    repo_obj = _load_repo(module, repo_var, memory, storage_path)
+    repo_obj = _load_repo(module, repo_var, memory, storage_path, surreal_endpoint)
     status = repo_obj.get_backfill(backfill_id)
     if status is None:
         typer.echo(f"Backfill '{backfill_id}' not found", err=True)
@@ -680,12 +715,16 @@ def backfill_cancel(
     module: str = typer.Argument(help="Python module path"),
     repo_var: str = typer.Option("repo", help="Variable name of CodeRepository"),
     memory: bool = typer.Option(False, help="Use in-memory storage"),
-    storage_path: str = typer.Option(
-        ".rivers/storage/", help="Path for embedded storage"
+    storage_path: str | None = typer.Option(
+        None,
+        help="Path for embedded storage (default: a scratch store, removed at exit)",
+    ),
+    surreal_endpoint: str | None = typer.Option(
+        None, help="Remote SurrealDB endpoint (overrides --storage-path)"
     ),
 ) -> None:
     """Cancel a running backfill."""
-    repo_obj = _load_repo(module, repo_var, memory, storage_path)
+    repo_obj = _load_repo(module, repo_var, memory, storage_path, surreal_endpoint)
     success = repo_obj.cancel_backfill(backfill_id)
     if success:
         typer.echo(
