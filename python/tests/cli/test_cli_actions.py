@@ -7,6 +7,7 @@ queue commands never showed one — a queued purge read as an ordinary run.
 import importlib
 from types import SimpleNamespace
 
+import pytest
 from rivers.testing import embedded_storage
 from typer.testing import CliRunner
 
@@ -40,11 +41,102 @@ repo = rs.CodeRepository(assets=[events])
 """
 
 
-def _write_module(tmp, name):
+OPTIONAL_VERB_MODULE = """
+import rivers as rs
+
+
+def _purge(ctx):
+    key = ctx.partition_key if ctx.has_partition_key else "*"
+    with open("calls.txt", "a") as f:
+        f.write(f"{ctx.asset_name}:{key}\\n")
+
+
+purge = rs.AssetAction(
+    name="purge",
+    outcome=rs.Outcome.Unmaterialize,
+    partitioning=rs.ActionPartitioning.Optional,
+)(_purge)
+
+PARTS = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+
+@rs.Asset(
+    name="events", io_handler=rs.InMemoryIOHandler(), partitions_def=PARTS, actions=[purge]
+)
+def events(context: rs.AssetExecutionContext):
+    return context.partition_key
+
+
+@rs.Asset(
+    name="rollup", io_handler=rs.InMemoryIOHandler(), partitions_def=PARTS, actions=[purge]
+)
+def rollup(context: rs.AssetExecutionContext):
+    return context.partition_key
+
+
+repo = rs.CodeRepository(assets=[events, rollup])
+"""
+
+
+def _write_module(tmp, name, source=ACTION_MODULE):
     # The CLI imports the module off `sys.path.insert(0, ".")`; each test runs
     # in its own tmp cwd, so the finder's cache for "." is stale.
     importlib.invalidate_caches()
-    (tmp / f"{name}.py").write_text(ACTION_MODULE)
+    (tmp / f"{name}.py").write_text(source)
+
+
+@pytest.mark.parametrize(
+    ("module", "args"),
+    [
+        (
+            "defs_empty_key",
+            [
+                "run-action",
+                "defs_empty_key",
+                "purge",
+                "-s",
+                "events",
+                "--partition-key",
+                "",
+            ],
+        ),
+        (
+            "defs_empty_select",
+            [
+                "run-action",
+                "defs_empty_select",
+                "purge",
+                "-s",
+                "",
+                "--partition-key",
+                "p1",
+            ],
+        ),
+        (
+            "defs_empty_assets",
+            [
+                "backfill",
+                "defs_empty_assets",
+                "--assets",
+                "",
+                "-p",
+                "p1",
+                "--action",
+                "purge",
+            ],
+        ),
+    ],
+    ids=["empty-key", "empty-select", "backfill-empty-assets"],
+)
+def test_an_empty_value_never_widens_a_destructive_verb(
+    resolved_tmp_path, module, args
+):
+    """An empty `$DAY` or `$ASSETS` in a script must fail, not purge the whole
+    table or every asset that declares the verb."""
+    _write_module(resolved_tmp_path, module, OPTIONAL_VERB_MODULE)
+    result = runner.invoke(app, [*args, "--memory"])
+    assert result.exit_code != 0, result.output
+    assert not (resolved_tmp_path / "calls.txt").exists()
 
 
 def test_backfill_takes_an_action(resolved_tmp_path):

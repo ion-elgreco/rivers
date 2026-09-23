@@ -36,6 +36,14 @@ def _parse_partition_key(raw: str | None):
     return PK.single(raw)
 
 
+def _split_names(raw: str | None) -> list[str] | None:
+    """``None`` when the flag is omitted. An explicit empty value stays ``[]``:
+    a caller's list that came out empty, never "every asset"."""
+    if raw is None:
+        return None
+    return [name.strip() for name in raw.split(",") if name.strip()]
+
+
 def _cleanup_storage(path: str) -> None:
     """Remove embedded storage directory on exit."""
     p = Path(path)
@@ -486,9 +494,16 @@ def run_action(
     """Run an asset action (a verb besides materialize) over a selection."""
     from rivers import PartitionKey
 
+    selection = _split_names(select)
+    if selection == []:
+        typer.echo(
+            "Error: --select is empty — omit it to run the verb on every asset "
+            "that defines it",
+            err=True,
+        )
+        raise typer.Exit(1)
     repo_obj = _load_repo(module, repo_var, memory, storage_path)
-    selection = [a.strip() for a in select.split(",")] if select else None
-    pk = PartitionKey.single(partition_key) if partition_key else None
+    pk = PartitionKey.single(partition_key) if partition_key is not None else None
     result = repo_obj.run_action(action, selection=selection, partition_key=pk)
     typer.echo(f"Action '{action}' complete. Run: {result.run_id}")
 
@@ -577,7 +592,7 @@ def backfill(
 
     repo_obj = _load_repo(module, repo_var, memory, storage_path)
 
-    selection = [a.strip() for a in assets.split(",")] if assets else None
+    selection = _split_names(assets)
 
     # Resolve partition keys or range
     pk_list: list[PartitionKey] | None = None
