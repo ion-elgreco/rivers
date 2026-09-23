@@ -197,10 +197,13 @@ CodeRepository.rerun_backfill(
 ) -> BackfillResult
 ```
 
-Re-launch the failed and canceled partitions of a previous backfill.
+Launch a previous backfill again as a new backfill, with the same selection, strategy, failure policy, concurrency, tags and verb. The rerun replays every partition of the original backfill, not only the failed or canceled ones. Keys that are no longer valid for the current definitions are dropped.
+
+!!! warning
+    A rerun of a `delete` backfill deletes every partition again, including partitions materialized again after the first run. To retry only some partitions, call `backfill()` with those `partition_keys` and the original `action`.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `backfill_id` | `str` | required | ID of the backfill to retry. |
+| `backfill_id` | `str` | required | ID of the backfill to rerun. |
 | `block` | `bool` | `True` | If `True`, wait for the rerun to complete before returning. |
 | `dry_run` | `bool` | `False` | If `True`, compute the plan without executing. |

@@ -234,14 +234,35 @@ print(f"Failed: {status.failed_partitions}, canceled: {status.canceled_partition
 
 # Cancel a running backfill
 repo.cancel_backfill(result.backfill_id)
-
-# Re-launch failed/canceled partitions of a previous backfill
-result = repo.rerun_backfill(result.backfill_id, block=True)
 ```
 
 ### Web UI
 
 The rivers web UI provides a dedicated **Backfills** page at `/backfills` that shows all backfills with their status, progress, and associated runs.
+
+## Rerunning a backfill
+
+`repo.rerun_backfill()` launches a previous backfill again as a new backfill, with the same selection, strategy and [verb](actions.md). The rerun replays every partition of the original backfill, not only the failed or canceled ones. Keys that are no longer valid for the current definitions are dropped. A rerun from the backfill's page in the web UI also replays every partition with the same verb.
+
+```python
+result = repo.rerun_backfill(result.backfill_id, block=True)
+```
+
+!!! warning "A rerun applies the verb to every partition again"
+    A rerun of a `delete` backfill deletes every partition again, including partitions materialized again after the first run.
+
+To retry only some partitions, start a new backfill with those keys and the original `action`. Without `action`, the new backfill materializes. The backfill's page in the web UI shows the status of each partition.
+
+```python
+repo.backfill(
+    selection=["daily_events"],
+    partition_keys=[
+        rs.PartitionKey.single("2024-01-03"),
+        rs.PartitionKey.single("2024-01-09"),
+    ],
+    action="delete",  # the original verb; omit it for a materialize backfill
+)
+```
 
 ## Launch recovery
 

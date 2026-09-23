@@ -334,7 +334,21 @@ class CodeRepository:
     def rerun_backfill(
         self, backfill_id: str, block: bool = True, dry_run: bool = False
     ) -> BackfillResult:
-        """Re-launch the failed/canceled partitions of a previous backfill."""
+        """Launch a previous backfill again as a new backfill.
+
+        The rerun replays every partition of the original backfill, not only the
+        failed or canceled ones. Keys that are no longer valid for the current
+        definitions are dropped. It keeps the original verb, so a rerun of a
+        ``delete`` backfill deletes every partition again, including partitions
+        materialized again after the first run. To retry only some partitions,
+        call :meth:`backfill` with those ``partition_keys`` and the original
+        ``action``.
+
+        Args:
+            backfill_id: ID of the backfill to rerun.
+            block: Wait for the rerun to finish before returning.
+            dry_run: Plan only — return the would-be run shape without launching.
+        """
         ...
     @overload
     def load_node(

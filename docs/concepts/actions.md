@@ -69,8 +69,7 @@ Partition-key rules are per-verb, declared with `partitioning=`. The default,
 on partitioned assets, and a supplied key is rejected up front. `Optional` accepts
 both: keyed runs are partition-scoped, keyless runs cover the whole asset.
 
-Multi-partition actions are ordinary backfills; child runs inherit the verb, and
-`rerun_backfill` preserves it:
+Multi-partition actions are ordinary backfills, and child runs inherit the verb:
 
 ```python
 repo.backfill(
@@ -80,6 +79,12 @@ repo.backfill(
     max_concurrency=4,
 )
 ```
+
+`rerun_backfill` keeps the verb and replays every partition of the backfill, not only
+the failed ones: a rerun of a `delete` backfill deletes every partition again,
+including partitions materialized again after the first run. To retry only some
+partitions, start a new backfill with their keys and the same `action` (see
+[Rerunning a backfill](backfills.md#rerunning-a-backfill)).
 
 Scheduling costs nothing new — the verb lives on the `Job`:
 
