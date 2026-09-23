@@ -13,6 +13,7 @@ Covers:
 - Subprocess parallelism via loky
 """
 
+import os
 import time
 
 import pytest
@@ -380,6 +381,29 @@ def _subprocess_sleep_sensor(context):
     return _rs.SkipReason("done")
 
 
+# Module-level decorators rebind each name to the Sensor / Schedule object, so
+# the eval function has no import path and must ship by value.
+@rs.Sensor(
+    name="decorated_subprocess_sensor",
+    asset_selection=["a"],
+    minimum_interval="1s",
+    default_status=rs.SensorStatus.Running,
+    eval_mode=rs.EvalMode.Subprocess,
+)
+def decorated_subprocess_sensor(context):
+    return rs.SkipReason(f"evaluated in pid {os.getpid()}")
+
+
+@rs.Schedule(
+    cron_schedule="* * * * * *",
+    job_name="decorated_job",
+    default_status=rs.ScheduleStatus.Running,
+    eval_mode=rs.EvalMode.Subprocess,
+)
+def decorated_subprocess_schedule(context):
+    return rs.SkipReason(f"evaluated in pid {os.getpid()}")
+
+
 @pytest.mark.skipif(not _has_loky(), reason="loky not installed")
 class TestDaemonSubprocessConcurrency:
     def test_subprocess_sensors_run_in_parallel(self, embedded_storage):
@@ -447,3 +471,42 @@ class TestDaemonSubprocessConcurrency:
             )
         finally:
             daemon.stop()
+
+    @pytest.mark.parametrize(
+        "automation",
+        [decorated_subprocess_sensor, decorated_subprocess_schedule],
+        ids=["sensor", "schedule"],
+    )
+    def test_decorated_automation_evaluates_in_subprocess(
+        self, embedded_storage, automation
+    ):
+        """A module-level decorated sensor or schedule evaluates in a worker
+        process and returns its own result."""
+        storage = embedded_storage
+
+        @rs.Asset(name="a")
+        def a() -> int:
+            return 1
+
+        is_sensor = isinstance(automation, rs.Sensor)
+        repo = rs.CodeRepository(
+            assets=[a],
+            jobs=[rs.Job(name="decorated_job", assets=[a])],
+            sensors=[automation] if is_sensor else [],
+            schedules=[] if is_sensor else [automation],
+        )
+        repo.resolve(storage=storage)
+
+        daemon = AutomationDaemon(repo=repo, storage=storage)
+        daemon.start()
+        try:
+            ticks = _wait_for_ticks(storage, automation.name, min_count=1, timeout=15)
+        finally:
+            daemon.stop()
+
+        assert ticks, f"{automation.name} recorded no tick"
+        tick = ticks[0]
+        assert tick.status == "Skipped", tick.error
+        prefix = "evaluated in pid "
+        assert tick.skip_reason.startswith(prefix), tick.skip_reason
+        assert int(tick.skip_reason.removeprefix(prefix)) != os.getpid()
