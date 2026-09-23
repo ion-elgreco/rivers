@@ -109,6 +109,15 @@ impl DbStoredRunLog {
     }
 }
 
+/// One partition deletion tombstone, written by [`DELETE_PARTITIONS`].
+#[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
+struct DbPartitionDeletion {
+    code_location_id: String,
+    asset_key: String,
+    partition_key: PartitionKey,
+    timestamp: i64,
+}
+
 /// One `asset_partitions` row, upserted via [`UPSERT_ASSET_PARTITIONS`] in
 /// the same transaction as its asset's row update.
 #[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
@@ -1503,16 +1512,8 @@ impl SurrealStorage {
     ) -> Result<()> {
         match &event.partition_key {
             Some(pk) => {
-                self.db
-                    .query(
-                        "DELETE FROM asset_partitions WHERE code_location_id = $cl \
-                         AND asset_key = $asset_key AND partition_key = $pk",
-                    )
-                    .bind(("cl", cl.to_string()))
-                    .bind(("asset_key", asset_key.to_string()))
-                    .bind(("pk", pk.clone()))
-                    .await?
-                    .check()?;
+                self.delete_partitions(cl, asset_key, vec![(pk.clone(), event.timestamp)])
+                    .await?;
             }
             None => {
                 // `last_timestamp` is cleared with the rest: downstream reads
@@ -1530,7 +1531,9 @@ impl SurrealStorage {
                         "BEGIN TRANSACTION; \
                          UPDATE assets SET last_event_id = $event_id, last_run_id = NONE, \
                          last_timestamp = NONE, last_data_version = NONE, \
-                         last_materialization_code_version = NONE, last_input_data_versions = [] \
+                         last_materialization_code_version = NONE, last_input_data_versions = [], \
+                         last_deletion_timestamp = IF last_deletion_timestamp > $ts \
+                         THEN last_deletion_timestamp ELSE $ts END \
                          WHERE code_location_id = $cl AND asset_key = $asset_key; \
                          DELETE FROM asset_partitions WHERE code_location_id = $cl \
                          AND asset_key = $asset_key; \
@@ -1539,10 +1542,47 @@ impl SurrealStorage {
                     .bind(("cl", cl.to_string()))
                     .bind(("asset_key", asset_key.to_string()))
                     .bind(("event_id", event_id.to_string()))
+                    .bind(("ts", event.timestamp))
                     .await?
                     .check()?;
             }
         }
+        Ok(())
+    }
+
+    /// Apply partition-scoped deletions of one asset: rows gone, tombstones
+    /// kept at each key's newest deletion time.
+    async fn delete_partitions(
+        &self,
+        cl: &str,
+        asset_key: &str,
+        deletions: Vec<(PartitionKey, i64)>,
+    ) -> Result<()> {
+        let mut newest: HashMap<PartitionKey, i64> = HashMap::new();
+        for (pk, ts) in deletions {
+            newest
+                .entry(pk)
+                .and_modify(|t| *t = (*t).max(ts))
+                .or_insert(ts);
+        }
+        let keys: Vec<PartitionKey> = newest.keys().cloned().collect();
+        let rows: Vec<DbPartitionDeletion> = newest
+            .into_iter()
+            .map(|(partition_key, timestamp)| DbPartitionDeletion {
+                code_location_id: cl.to_string(),
+                asset_key: asset_key.to_string(),
+                partition_key,
+                timestamp,
+            })
+            .collect();
+        self.db
+            .query(DELETE_PARTITIONS)
+            .bind(("cl", cl.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .bind(("keys", keys))
+            .bind(("rows", rows))
+            .await?
+            .check()?;
         Ok(())
     }
 
@@ -1800,6 +1840,16 @@ const MATERIALIZE_ASSET_UPDATE_ACTION: &str = "UPDATE assets SET last_event_id =
 /// partition, latest event wins. Always rides one transaction with the
 /// asset-row update above so the two never disagree under a concurrent
 /// whole-asset deletion.
+/// Drop deleted partitions' rows and record their tombstones, in one
+/// transaction. The tombstone outlives the Deletion event: failure
+/// supersession reads it, and deleting the run must not undo the deletion.
+const DELETE_PARTITIONS: &str = "BEGIN TRANSACTION; \
+     DELETE FROM asset_partitions WHERE code_location_id = $cl \
+     AND asset_key = $asset_key AND partition_key IN $keys; \
+     INSERT INTO asset_partition_deletions $rows ON DUPLICATE KEY UPDATE timestamp = \
+     IF $input.timestamp > timestamp THEN $input.timestamp ELSE timestamp END; \
+     COMMIT TRANSACTION;";
+
 const UPSERT_ASSET_PARTITIONS: &str = "INSERT INTO asset_partitions $rows ON DUPLICATE KEY UPDATE \
      last_event_id = $input.last_event_id, \
      last_run_id = $input.last_run_id, \
@@ -2068,7 +2118,7 @@ impl StorageBackend for SurrealStorage {
 
         // Partition-scoped deletions collapse to one DELETE per asset — a
         // purge over a date range lands thousands of them in one drain.
-        let mut part_deletes: HashMap<(&str, &str), Vec<PartitionKey>> = HashMap::new();
+        let mut part_deletes: HashMap<(&str, &str), Vec<(PartitionKey, i64)>> = HashMap::new();
         let mut whole_deletes: HashMap<(&str, &str), (&EventRecord, &String)> = HashMap::new();
         for (event, event_id) in events.iter().zip(event_ids.iter()) {
             let cl = event.code_location_id.as_str();
@@ -2091,7 +2141,7 @@ impl StorageBackend for SurrealStorage {
                         Some(pk) => part_deletes
                             .entry((cl, asset_key.as_str()))
                             .or_default()
-                            .push(pk.clone()),
+                            .push((pk.clone(), event.timestamp)),
                         // Latest deletion per asset wins — repeats in one drain
                         // only re-clear the same row.
                         None => {
@@ -2104,17 +2154,8 @@ impl StorageBackend for SurrealStorage {
             self.consolidate_deletion(cl, asset_key, event, event_id)
                 .await?;
         }
-        for ((cl, asset_key), keys) in part_deletes {
-            self.db
-                .query(
-                    "DELETE FROM asset_partitions WHERE code_location_id = $cl \
-                     AND asset_key = $asset_key AND partition_key IN $keys",
-                )
-                .bind(("cl", cl.to_string()))
-                .bind(("asset_key", asset_key.to_string()))
-                .bind(("keys", keys))
-                .await?
-                .check()?;
+        for ((cl, asset_key), deletions) in part_deletes {
+            self.delete_partitions(cl, asset_key, deletions).await?;
         }
 
         Ok(event_ids.clone())
@@ -4004,13 +4045,15 @@ impl PerCodeLocationStorage for SurrealStorage {
         // that superseded them, so without this the partition resurrects as
         // failed on the next load — and `eager()`'s failure gate then keeps it
         // from ever being rebuilt. A whole-asset deletion covers every key.
+        // Read off the tombstone rows, which outlive the delete run's events.
         let mut result = self
             .db
             .query(
-                "SELECT partition_key, math::max(timestamp) AS ts FROM events \
+                "SELECT partition_key, timestamp AS ts FROM asset_partition_deletions \
+                 WHERE code_location_id = $cl AND asset_key = $asset_key; \
+                 SELECT last_deletion_timestamp AS ts FROM assets \
                  WHERE code_location_id = $cl AND asset_key = $asset_key \
-                 AND event_type = 'Deletion' \
-                 GROUP BY partition_key",
+                 AND last_deletion_timestamp IS NOT NONE;",
             )
             .bind(("cl", code_location_id.to_string()))
             .bind(("asset_key", asset_key.to_string()))
@@ -4018,27 +4061,27 @@ impl PerCodeLocationStorage for SurrealStorage {
 
         #[derive(Debug, SurrealValue)]
         struct DelRow {
-            partition_key: Option<PartitionKey>,
+            partition_key: PartitionKey,
+            ts: i64,
+        }
+        #[derive(Debug, SurrealValue)]
+        struct AssetDelRow {
             ts: i64,
         }
 
         let del_rows: Vec<DelRow> = result.take(0)?;
         let mut latest_deletion: std::collections::HashMap<PartitionKey, i64> =
             std::collections::HashMap::new();
-        let mut asset_deletion_ts: Option<i64> = None;
         for row in del_rows {
-            match row.partition_key {
-                Some(pk) => {
-                    for member in pk.members() {
-                        latest_deletion
-                            .entry(member)
-                            .and_modify(|t| *t = (*t).max(row.ts))
-                            .or_insert(row.ts);
-                    }
-                }
-                None => asset_deletion_ts = asset_deletion_ts.max(Some(row.ts)),
+            for member in row.partition_key.members() {
+                latest_deletion
+                    .entry(member)
+                    .and_modify(|t| *t = (*t).max(row.ts))
+                    .or_insert(row.ts);
             }
         }
+        let asset_rows: Vec<AssetDelRow> = result.take(1)?;
+        let asset_deletion_ts: Option<i64> = asset_rows.into_iter().map(|r| r.ts).max();
 
         Ok(latest_failure
             .into_iter()
@@ -4054,13 +4097,13 @@ impl PerCodeLocationStorage for SurrealStorage {
         &self,
         code_location_id: &str,
     ) -> Result<std::collections::HashMap<String, i64>> {
+        // The asset rows, not Deletion events: the time outlives the delete
+        // run, and a code location has far fewer assets than deletions.
         let mut result = self
             .db
             .query(
-                "SELECT asset_key, math::max(timestamp) AS ts FROM events \
-                 WHERE code_location_id = $cl AND event_type = 'Deletion' \
-                 AND partition_key IS NONE AND asset_key IS NOT NONE \
-                 GROUP BY asset_key",
+                "SELECT asset_key, last_deletion_timestamp AS ts FROM assets \
+                 WHERE code_location_id = $cl AND last_deletion_timestamp IS NOT NONE",
             )
             .bind(("cl", code_location_id.to_string()))
             .await?;

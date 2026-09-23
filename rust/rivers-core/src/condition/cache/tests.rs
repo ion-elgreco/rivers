@@ -37,6 +37,20 @@ fn rec_with_run(asset: &str, last_run_id: Option<&str>, ts: i64) -> AssetRecord 
     }
 }
 
+/// Register `assets` the way `resolve()` does: definition rows, no history.
+/// A whole-asset deletion's time lives on this row.
+async fn register_blank(storage: &crate::storage::surrealdb_backend::SurrealStorage, assets: &[&str]) {
+    let ctx = crate::storage::CodeLocationContext::new(crate::storage::default_code_location_id());
+    let records: Vec<AssetRecord> = assets
+        .iter()
+        .map(|a| AssetRecord {
+            last_timestamp: None,
+            ..rec_with_run(a, None, 0)
+        })
+        .collect();
+    storage.for_code_location(&ctx).register_assets(&records).await.unwrap();
+}
+
 #[test]
 fn failure_floor_survives_co_batched_older_success() {
     let mut cache = AssetConditionCache::new("default".to_string());
@@ -543,6 +557,7 @@ async fn keyless_delete_evicts_every_cached_partition() {
     let single = |k: &str| PartitionKey::Single {
         keys: vec![k.to_string()],
     };
+    register_blank(&storage, &["events"]).await;
 
     storage
         .create_run(&mk_run("r0", RunStatus::Success, &["events"], 1000))
@@ -1135,6 +1150,7 @@ async fn deleted_asset_does_not_resurrect_failure_floor() {
 
     let storage = SurrealStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
+    register_blank(&storage, &["report"]).await;
 
     storage
         .create_run(&mk_run("rf", RunStatus::Failure, &["report"], 1000))
@@ -1181,6 +1197,79 @@ async fn deleted_asset_does_not_resurrect_failure_floor() {
     assert!(
         !cache.failed_assets.contains("report"),
         "deleted asset must not resurrect its failure floor on restart"
+    );
+}
+
+/// Deleting a delete run removes its Deletion events, but not what the delete
+/// did: the rows stay cleared. The deletion must keep superseding the older
+/// failures, or they resurrect on restart and eager()'s failure gate stops
+/// every rebuild.
+#[tokio::test]
+async fn deleting_the_delete_run_keeps_deletion_supersession() {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+    let single = |k: &str| PartitionKey::Single {
+        keys: vec![k.to_string()],
+    };
+    register_blank(&storage, &["events", "report"]).await;
+
+    // Partitioned: p1 fails, is rebuilt, then deleted by "rd".
+    let mut fail = mk_run("rf", RunStatus::Failure, &["events"], 1000);
+    fail.partition_key = Some(single("p1"));
+    storage.create_run(&fail).await.unwrap();
+    storage
+        .create_run(&mk_run("r0", RunStatus::Success, &["events"], 2000))
+        .await
+        .unwrap();
+    storage
+        .store_events(&mat_events_for(&cl, "events", &["p1"], 2000))
+        .await
+        .unwrap();
+    let mut del = mk_run("rd", RunStatus::Success, &["events"], 3000);
+    del.partition_key = Some(single("p1"));
+    del.action = Some("delete".to_string());
+    storage.create_run(&del).await.unwrap();
+    storage
+        .store_events(&[deletion_event(&cl, "events", "rd", "p1", 3000)])
+        .await
+        .unwrap();
+
+    // Whole asset: "report" fails, is rebuilt, then deleted by "rd2".
+    storage
+        .create_run(&mk_run("rf2", RunStatus::Failure, &["report"], 1000))
+        .await
+        .unwrap();
+    storage
+        .create_run(&mk_run("r2", RunStatus::Success, &["report"], 2000))
+        .await
+        .unwrap();
+    let mut rebuilt = mat_events_for(&cl, "report", &["x"], 2000);
+    rebuilt[0].partition_key = None;
+    rebuilt[0].run_id = "r2".to_string();
+    storage.store_events(&rebuilt).await.unwrap();
+    let mut del2 = mk_run("rd2", RunStatus::Success, &["report"], 3000);
+    del2.action = Some("delete".to_string());
+    storage.create_run(&del2).await.unwrap();
+    let mut whole = deletion_event(&cl, "report", "rd2", "x", 3000);
+    whole.partition_key = None;
+    storage.store_events(&[whole]).await.unwrap();
+
+    // The user deletes both delete runs, then the daemon restarts.
+    assert!(storage.delete_run("rd").await.unwrap());
+    assert!(storage.delete_run("rd2").await.unwrap());
+
+    let mut cache = AssetConditionCache::new(cl.clone());
+    cache.set_partitioned_assets(vec!["events".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+    assert!(
+        !cache.partition_status.get("events").unwrap().failed.contains(&single("p1")),
+        "a deleted partition resurrected as failed after its delete run was deleted"
+    );
+    assert!(
+        !cache.failed_assets.contains("report"),
+        "a deleted asset resurrected its failure floor after its delete run was deleted"
     );
 }
 

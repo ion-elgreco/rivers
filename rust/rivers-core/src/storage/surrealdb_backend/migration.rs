@@ -102,7 +102,7 @@ impl AsyncMigrate for SurrealMigrate {
 
 /// Highest embedded migration version. Bump by adding a `Vn__*.surql` + an
 /// [`embedded_migrations`] entry; a test pins this to that max.
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 /// One compat row per migration (the floors it set), folded by the open guard.
 const MIGRATION_META_TABLE: &str = "migration_meta";
@@ -132,6 +132,11 @@ fn embedded_migrations() -> Vec<Migration> {
             include_str!("migrations/V5__slot_partition_scope.surql"),
         )
         .expect("V5__slot_partition_scope migration name is well-formed"),
+        Migration::unapplied(
+            "V6__deletion_tombstones",
+            include_str!("migrations/V6__deletion_tombstones.surql"),
+        )
+        .expect("V6__deletion_tombstones migration name is well-formed"),
     ]
 }
 
@@ -640,9 +645,9 @@ mod tests {
         let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
         assert_eq!(
             (stamps.version, stamps.min_reader, stamps.min_writer),
-            (SCHEMA_VERSION, 2, 5),
-            "v2 raised the read floor to 2; v5 raised the write floor to 5, because a \
-             pre-v5 writer records an exclusive action in a way a v5 reader can't see"
+            (SCHEMA_VERSION, 2, 6),
+            "v2 raised the read floor to 2; v6 raised the write floor to 6, because a \
+             pre-v6 writer records a deletion without the rows a v6 reader reads"
         );
     }
 
@@ -707,6 +712,78 @@ mod tests {
             .unwrap()
             .check()
             .expect("legacy backfill row must be writable after V3");
+    }
+
+    /// V6 moves deletion times onto storage rows. Deletions recorded before it
+    /// exist only as events and must carry over, or they stop superseding
+    /// the failures they cleared.
+    #[tokio::test]
+    async fn test_v6_backfills_deletion_tombstones_from_events() {
+        let db = any::connect("mem://").await.unwrap();
+        db.use_ns(DEFAULT_NAMESPACE)
+            .use_db(DEFAULT_DATABASE)
+            .await
+            .unwrap();
+        let pre_v6: Vec<Migration> = embedded_migrations().into_iter().take(5).collect();
+        let mut backend = SurrealMigrate { db: db.clone() };
+        backend
+            .migrate(
+                &pre_v6,
+                true,
+                false,
+                false,
+                Target::Latest,
+                REFINERY_HISTORY_TABLE,
+            )
+            .await
+            .expect("apply V1..V5");
+
+        db.query(
+            "INSERT INTO assets { code_location_id: 'default', asset_key: 'report', tags: [], kinds: [] }; \
+             INSERT INTO assets { code_location_id: 'default', asset_key: 'kept', tags: [], kinds: [] }; \
+             INSERT INTO events [ \
+               { code_location_id: 'default', event_type: 'Deletion', asset_key: 'report', \
+                 run_id: 'r1', timestamp: 2000, metadata: [] }, \
+               { code_location_id: 'default', event_type: 'Deletion', asset_key: 'report', \
+                 run_id: 'r2', timestamp: 3000, metadata: [] }, \
+               { code_location_id: 'default', event_type: 'Deletion', asset_key: 'events', \
+                 run_id: 'r3', partition_key: { Single: { keys: ['p1'] } }, timestamp: 4000, metadata: [] } \
+             ];",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        apply_migrations(&db).await.expect("apply V6");
+
+        #[derive(Debug, SurrealValue)]
+        struct AssetRow {
+            asset_key: String,
+            last_deletion_timestamp: Option<i64>,
+        }
+        #[derive(Debug, SurrealValue)]
+        struct TombRow {
+            asset_key: String,
+            timestamp: i64,
+        }
+        let mut result = db
+            .query(
+                "SELECT asset_key, last_deletion_timestamp FROM assets ORDER BY asset_key; \
+                 SELECT asset_key, timestamp FROM asset_partition_deletions;",
+            )
+            .await
+            .unwrap();
+        let assets: Vec<AssetRow> = result.take(0).unwrap();
+        let tombs: Vec<TombRow> = result.take(1).unwrap();
+        let by_key: std::collections::HashMap<String, Option<i64>> = assets
+            .into_iter()
+            .map(|r| (r.asset_key, r.last_deletion_timestamp))
+            .collect();
+        assert_eq!(by_key["report"], Some(3000), "the newest whole-asset deletion");
+        assert_eq!(by_key["kept"], None, "an asset never deleted has no tombstone");
+        assert_eq!(tombs.len(), 1);
+        assert_eq!((tombs[0].asset_key.as_str(), tombs[0].timestamp), ("events", 4000));
     }
 
     /// V5 adds `exclusive`/`partitions` to a SCHEMAFULL table. `DEFAULT` only
