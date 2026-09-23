@@ -255,6 +255,12 @@ rollup missing rather than a rollup derived from deleted source data. This holds
 key in a batched run too: a key the downstream step marks failed is skipped upstream.
 Ordering bounds partial failure; it cannot make a multi-asset delete atomic.
 
+**Purging a dynamic partition takes two steps, in this order.** Run the delete for
+the key first, then remove the key with `delete_dynamic_partition`. The other order
+fails: `run_action` refuses a key that is no longer a dynamic partition. A delete does
+not remove the key, and a key left behind reads as missing, so automation and
+**Materialize Missing** would rebuild it.
+
 **Delete acts on exactly what you name.** There is no implicit lineage expansion in
 v1 — downstream left out of the selection keeps its data. Returning
 `rs.ActionResult.unchanged()` from a delete ("nothing to delete") preserves state and
