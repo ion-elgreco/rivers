@@ -17,7 +17,7 @@ use crate::components::ui_kit::{
 };
 use crate::helpers::{
     JobPartitionPicker, format_duration, format_timestamp, job_partition_picker, job_verb,
-    replay_click, run_status_class, run_status_kind, short_id,
+    replay_click, run_status_class, run_status_kind, short_id, use_confirm_armed,
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::get_assets;
@@ -103,7 +103,7 @@ pub fn JobDetailPage() -> impl IntoView {
     // show — skip it and submit directly.
     let job_picker = Signal::derive(move || job_launch.get().1);
     let job_verb_signal = Signal::derive(move || job_launch.get().0);
-    let exec_armed = RwSignal::new(false);
+    let exec_armed = use_confirm_armed(move || params.track());
 
     let dialog_job_name: Signal<String> = Signal::derive(name);
 

@@ -654,6 +654,18 @@ pub fn replay_click(is_action: bool, armed: bool) -> (bool, bool) {
     }
 }
 
+/// Armed state for a two-click confirm, disarmed whenever `track` reports a
+/// change. Pages outlive their route params, so a confirm armed on one job
+/// would otherwise fire the next job's verb on its first click.
+pub fn use_confirm_armed(track: impl Fn() + Send + Sync + 'static) -> RwSignal<bool> {
+    let armed = RwSignal::new(false);
+    Effect::new(move |_| {
+        track();
+        armed.set(false);
+    });
+    armed
+}
+
 /// Text for a replay button: an action replay names the verb it re-applies.
 pub fn replay_button_text(
     action: Option<&str>,

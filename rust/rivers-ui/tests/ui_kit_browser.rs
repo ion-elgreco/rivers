@@ -17,9 +17,39 @@ use leptos::prelude::*;
 use rivers_ui::components::ui_kit::{
     EmptyState, KindBadge, ProgressBar, SectionHeader, Sparkline, StatusChip, Tag,
 };
+use rivers_ui::helpers::use_confirm_armed;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_browser);
+
+/// A page survives route-param changes, so a confirm armed on job A must not
+/// fire job B's destructive verb on B's first click.
+#[wasm_bindgen_test]
+async fn confirm_disarms_when_its_key_changes() {
+    let key = RwSignal::new("job_a".to_string());
+    let armed_slot = RwSignal::new(None::<RwSignal<bool>>);
+    let target = fresh_mount_target();
+    let _handle = mount_to(target, move || {
+        armed_slot.set(Some(use_confirm_armed(move || key.track())));
+        view! { <span /> }
+    });
+    flush_effects().await;
+    let armed = armed_slot.get_untracked().unwrap();
+
+    armed.set(true);
+    flush_effects().await;
+    assert!(
+        armed.get_untracked(),
+        "arming must stick while the key holds"
+    );
+
+    key.set("job_b".to_string());
+    flush_effects().await;
+    assert!(
+        !armed.get_untracked(),
+        "the confirm followed the user to job_b"
+    );
+}
 
 #[wasm_bindgen_test]
 fn status_chip_uses_kind_in_class_and_label() {
