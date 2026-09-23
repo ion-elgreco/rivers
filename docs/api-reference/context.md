@@ -146,6 +146,10 @@ The **first parameter is always the context** (no annotation required); paramete
 it are resources injected by name. Annotate it as `ActionContext[Config]` to receive
 typed config.
 
+To unit-test an action body, build a context by hand and call the body with it:
+`rs.ActionContext(asset_name="events", action="purge", partition=..., io_handler=...)`
+(`run_id` defaults to `""`; everything else to `None`).
+
 ```python
 @rs.action(outcome=rs.Outcome.Unchanged)
 @classmethod

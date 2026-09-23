@@ -616,6 +616,20 @@ class ActionContext(Generic[ConfigT]):
     io_handler: Any
     config: ConfigT | None
 
+    def __init__(
+        self,
+        asset_name: str,
+        action: str,
+        run_id: str = "",
+        asset_metadata: dict[str, str] | None = None,
+        partition: PartitionContext | None = None,
+        io_handler: Any = None,
+        config: ConfigT | None = None,
+    ) -> None:
+        """Build a context by hand — to call an action body directly in a unit
+        test. Runs build their own."""
+        ...
+
     @property
     def has_partition_key(self) -> bool: ...
     @property

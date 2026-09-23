@@ -71,6 +71,30 @@ impl PyActionContext {
 
 #[pymethods]
 impl PyActionContext {
+    /// Build a context by hand — for calling an action body directly in a
+    /// unit test. Runs build their own.
+    #[new]
+    #[pyo3(signature = (asset_name, action, run_id=String::new(), asset_metadata=None, partition=None, io_handler=None, config=None))]
+    fn py_new(
+        asset_name: String,
+        action: String,
+        run_id: String,
+        asset_metadata: Option<HashMap<String, String>>,
+        partition: Option<PartitionContext>,
+        io_handler: Option<Py<PyAny>>,
+        config: Option<Py<PyAny>>,
+    ) -> Self {
+        Self::new(
+            asset_name,
+            action,
+            run_id,
+            asset_metadata,
+            partition,
+            io_handler,
+            config,
+        )
+    }
+
     /// True if this action is running against a partition.
     #[getter]
     fn has_partition_key(&self) -> bool {

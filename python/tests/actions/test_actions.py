@@ -2473,6 +2473,32 @@ class TuneConfig(BaseModel):
     force: bool = False
 
 
+def test_action_context_can_be_built_for_unit_tests():
+    """An action body is a plain function of its context: tests build one by
+    hand, like `AssetExecutionContext(asset_name=...)`, without running the
+    whole run spine."""
+
+    def purge(ctx: rs.ActionContext) -> None:
+        for key in ctx.partition.keys:
+            if "p2" in str(key):
+                ctx.mark_partition_failed(key, "locked")
+
+    pd = rs.PartitionsDefinition.static_(["p1", "p2"])
+    keys = [rs.PartitionKey.single("p1"), rs.PartitionKey.single("p2")]
+    ctx = rs.ActionContext(
+        asset_name="events",
+        action="purge",
+        partition=rs.PartitionContext(keys, pd),
+        asset_metadata={"delta/root_name": "evt"},
+    )
+    assert (ctx.asset_name, ctx.action, ctx.run_id) == ("events", "purge", "")
+    assert ctx.asset_metadata == {"delta/root_name": "evt"}
+    purge(ctx)
+    bare = rs.ActionContext(asset_name="events", action="vacuum", run_id="r1")
+    assert (bare.partition, bare.io_handler, bare.config, bare.run_id) == (None, None, None, "r1")
+    assert not bare.has_partition_key
+
+
 def test_action_context_subscriptable():
     alias = rs.ActionContext[TuneConfig]
     assert alias.__origin__ is rs.ActionContext
