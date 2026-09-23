@@ -66,11 +66,14 @@ class AssetRecord:
     code_version: str | None
     """Currently-declared code version on the asset definition."""
     last_event_id: str | None
-    """ID of the most recent materialization event (``None`` if never materialized)."""
+    """ID of the most recent materialization event — or of the ``Deletion`` event
+    after a whole-asset delete. ``None`` if neither happened."""
     last_run_id: str | None
-    """Run ID that produced the most recent materialization."""
+    """Run ID that produced the most recent materialization (``None`` after a
+    whole-asset delete)."""
     last_timestamp: int | None
-    """Nanosecond timestamp of the most recent materialization."""
+    """Nanosecond timestamp of the most recent materialization (``None`` after a
+    whole-asset delete)."""
     last_data_version: str | None
     """Data version recorded by the most recent materialization."""
     last_materialization_code_version: str | None
