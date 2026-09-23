@@ -774,6 +774,54 @@ def test_keyless_observe_job_on_partitioned_observable_is_allowed():
     assert repo.storage.get_run(result.run_id).action == "observe"
 
 
+def _vacuumable(name, keys, partitioning):
+    vacuum = rs.AssetAction(name="vacuum", outcome=rs.Outcome.Unchanged, partitioning=partitioning)(
+        lambda ctx: None
+    )
+    return rs.Asset(
+        name=name,
+        io_handler=rs.InMemoryIOHandler(),
+        partitions_def=rs.PartitionsDefinition.static_(keys),
+        actions=[vacuum],
+    )(lambda context: context.partition_key)
+
+
+def test_whole_asset_action_job_skips_partition_compatibility():
+    """A job over assets with disjoint partition definitions can never share a
+    key — which only matters when its verb takes one. A whole-asset vacuum job
+    across a daily and a regional table failed resolve() for the whole code
+    location, although `run_action("vacuum")` over the same assets works."""
+    daily = _vacuumable("daily", ["2024-01-01"], rs.ActionPartitioning.Keyless)
+    region = _vacuumable("region", ["eu", "us"], rs.ActionPartitioning.Keyless)
+    repo = rs.CodeRepository(
+        assets=[daily, region],
+        jobs=[rs.Job(name="fleet_vacuum", assets=[daily, region], action="vacuum")],
+        default_executor=IP,
+    )
+    assert repo.get_job("fleet_vacuum").execute().success
+
+    # A materialize job over the same assets is still unrunnable and rejected.
+    with pytest.raises(Exception, match="incompatible partition definitions"):
+        rs.CodeRepository(
+            assets=[daily, region],
+            jobs=[rs.Job(name="fleet", assets=[daily, region])],
+            default_executor=IP,
+        ).resolve()
+
+
+def test_action_job_mixing_keyed_and_whole_asset_targets_is_rejected():
+    """One run has one partition key: a verb that is whole-asset on one target
+    and needs a key on another can never run as one job — say so at resolve."""
+    daily = _vacuumable("daily", ["2024-01-01"], rs.ActionPartitioning.Keyless)
+    region = _vacuumable("region", ["2024-01-01"], rs.ActionPartitioning.Required)
+    with pytest.raises(Exception, match="whole-asset on .*daily.* but needs a key on .*region"):
+        rs.CodeRepository(
+            assets=[daily, region],
+            jobs=[rs.Job(name="mixed", assets=[daily, region], action="vacuum")],
+            default_executor=IP,
+        ).resolve()
+
+
 def _queued_vacuum_repo(storage, calls, **repo_kwargs):
     """Partitioned table with a whole-asset `vacuum` and an Optional `purge`,
     each behind a Job, in run-queue mode."""

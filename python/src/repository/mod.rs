@@ -378,8 +378,36 @@ fn validate_job_partition_compatibility(
     job_name: &str,
     asset_names: &[String],
     node_map: &HashMap<String, ResolvedNode>,
+    verb: Option<&str>,
 ) -> PyResult<()> {
-    let partitioned = iter_partitioned_assets(node_map, asset_names.iter().map(String::as_str));
+    use crate::assets::action::PyActionPartitioning;
+    let mut partitioned = iter_partitioned_assets(node_map, asset_names.iter().map(String::as_str));
+
+    // A run has one key. A verb that is whole-asset on one target and needs a
+    // key on another can never run as one job.
+    let rule = |name: &str| action_partitioning(node_map, name, verb);
+    let keyless: Vec<&str> = partitioned
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| rule(n) == PyActionPartitioning::Keyless)
+        .collect();
+    let required: Vec<&str> = partitioned
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| rule(n) == PyActionPartitioning::Required)
+        .collect();
+    if let (Some(verb), false, false) = (verb, keyless.is_empty(), required.is_empty()) {
+        return Err(PartitionValidationError::new_err(format!(
+            "Job '{job_name}' runs '{verb}' whole-asset on {keyless:?} but needs a key on \
+             {required:?}: one run can't do both — split the job."
+        )));
+    }
+    // Only a key-taking run needs one key valid for every target; a job whose
+    // verb never requires a key can always run keyless.
+    if required.is_empty() {
+        return Ok(());
+    }
+    partitioned.retain(|(n, _)| rule(n) != PyActionPartitioning::Keyless);
 
     if partitioned.len() < 2 {
         return Ok(());
@@ -2994,7 +3022,12 @@ impl PyCodeRepository {
                 )?;
                 job.resolve_retry_ref(&self.raw_retries)?;
                 job.fill_retry_defaults(default_retry.as_ref());
-                validate_job_partition_compatibility(&name, &job.node_names, node_map)?;
+                validate_job_partition_compatibility(
+                    &name,
+                    &job.node_names,
+                    node_map,
+                    job.action.as_deref(),
+                )?;
             }
         }
 
