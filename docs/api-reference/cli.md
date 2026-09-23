@@ -75,6 +75,24 @@ Resolves the repository and runs `repo.materialize()` synchronously. Useful for 
 
 ---
 
+## `run-action` — run an asset action
+
+```bash
+rivers run-action my_pipeline optimize
+rivers run-action my_pipeline delete --select events --partition-key 2024-01-15
+```
+
+Resolves the repository and runs `repo.run_action(VERB, ...)` synchronously — the
+[action](../concepts/actions.md) counterpart of `materialize`.
+
+| Flag | Description |
+|------|-------------|
+| `--select`, `-s` | Comma-separated asset names. Default: every asset that defines the verb. |
+| `--partition-key` | Partition key (string), as the verb's `partitioning` allows. |
+| `--memory` / `--storage-path` | Backend selection. |
+
+---
+
 ## `backfill` — partition-range execution
 
 ```bash
@@ -98,6 +116,7 @@ Launches `repo.backfill()` against either:
 | `--concurrency`, `-c` | `4` | Max concurrent partition runs. |
 | `--on-failure` | `continue` | `continue` or `stop_on_failure`. |
 | `--dry-run` | `False` | Preview without executing. |
+| `--action` | none | Run this verb in every child run instead of materializing. |
 
 ---
 
@@ -140,6 +159,9 @@ rivers queue list                # queued runs sorted by priority + start time
 rivers queue cancel RUN_ID       # cancel a not-yet-started run
 rivers queue why RUN_ID          # explain why a queued run is blocked
 ```
+
+`queue list` and `queue why` show each run's verb (`materialize` for a plain run),
+and `backfill-status` shows the backfill's verb when it runs one.
 
 ## `db migrate` — storage schema migration
 

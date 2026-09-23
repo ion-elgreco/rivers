@@ -462,6 +462,31 @@ def materialize(
     typer.echo(f"Materialization complete. Assets: {result.materialized_assets}")
 
 
+@app.command(name="run-action")
+def run_action(
+    module: str = typer.Argument(help="Python module path containing CodeRepository"),
+    action: str = typer.Argument(help="The verb to run, e.g. optimize or delete"),
+    repo_var: str = typer.Option("repo", help="Variable name of CodeRepository in module"),
+    select: str | None = typer.Option(
+        None,
+        "--select",
+        "-s",
+        help="Comma-separated asset names (default: every asset that defines the verb)",
+    ),
+    partition_key: str | None = typer.Option(None, help="Partition key to act on"),
+    memory: bool = typer.Option(False, help="Use in-memory storage instead of embedded"),
+    storage_path: str = typer.Option(".rivers/storage/", help="Path for embedded storage"),
+) -> None:
+    """Run an asset action (a verb besides materialize) over a selection."""
+    from rivers import PartitionKey
+
+    repo_obj = _load_repo(module, repo_var, memory, storage_path)
+    selection = [a.strip() for a in select.split(",")] if select else None
+    pk = PartitionKey.single(partition_key) if partition_key else None
+    result = repo_obj.run_action(action, selection=selection, partition_key=pk)
+    typer.echo(f"Action '{action}' complete. Run: {result.run_id}")
+
+
 def _load_repo(module: str, repo_var: str, memory: bool, storage_path: str):
     """Load and resolve a CodeRepository from a module."""
     sys.path.insert(0, ".")
@@ -533,6 +558,9 @@ def backfill(
         "continue", "--on-failure", help="continue or stop_on_failure"
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without executing"),
+    action: str | None = typer.Option(
+        None, "--action", help="Run this verb instead of materializing"
+    ),
     memory: bool = typer.Option(False, help="Use in-memory storage"),
     storage_path: str = typer.Option(
         ".rivers/storage/", help="Path for embedded storage"
@@ -578,6 +606,7 @@ def backfill(
         max_concurrency=concurrency,
         block=True,
         dry_run=dry_run,
+        action=action,
     )
 
     if dry_run:
@@ -607,14 +636,21 @@ def backfill_status(
     if status is None:
         typer.echo(f"Backfill '{backfill_id}' not found", err=True)
         raise typer.Exit(1)
-    typer.echo(
-        f"Backfill {status.backfill_id}: {status.status}\n"
+    typer.echo(_format_backfill_status(status))
+
+
+def _format_backfill_status(status) -> str:
+    lines = [
+        f"Backfill {status.backfill_id}: {status.status}",
         f"  Partitions: {status.completed_partitions}/{status.total_partitions} completed, "
-        f"{status.failed_partitions} failed, {status.canceled_partitions} canceled\n"
-        f"  Runs: {len(status.run_ids)}"
-    )
+        f"{status.failed_partitions} failed, {status.canceled_partitions} canceled",
+        f"  Runs: {len(status.run_ids)}",
+    ]
+    if status.action:
+        lines.append(f"  Action: {status.action}")
     if status.error:
-        typer.echo(f"  Error: {status.error}")
+        lines.append(f"  Error: {status.error}")
+    return "\n".join(lines)
 
 
 @app.command(name="backfill-cancel")
@@ -733,14 +769,16 @@ def queue_list(storage_path: str = _STORAGE_PATH_OPT) -> None:
         return
     runs.sort(key=_QUEUE_SORT_KEY)
     typer.echo(
-        f"{'POS':>4} {'RUN ID':<38} {'JOB':<20} {'PRI':>4} {'QUEUED AT':>24} {'BLOCK REASON'}"
+        f"{'POS':>4} {'RUN ID':<38} {'JOB':<20} {'VERB':<12} {'PRI':>4} "
+        f"{'QUEUED AT':>24} {'BLOCK REASON'}"
     )
-    typer.echo("-" * 120)
+    typer.echo("-" * 133)
     for i, r in enumerate(runs, 1):
         reason = r.block_reason or "-"
+        # An ad-hoc run has no job; a materialize run has no verb.
         typer.echo(
-            f"{i:>4} {r.run_id:<38} {r.job_name:<20} {r.priority:>4} "
-            f"{_ns_to_iso(r.start_time):>24} {reason}"
+            f"{i:>4} {r.run_id:<38} {r.job_name or '-':<20} {r.action or 'materialize':<12} "
+            f"{r.priority:>4} {_ns_to_iso(r.start_time):>24} {reason}"
         )
 
 
@@ -781,7 +819,8 @@ def queue_why(
     )
 
     typer.echo(f"Run:          {run.run_id}")
-    typer.echo(f"Job:          {run.job_name}")
+    typer.echo(f"Job:          {run.job_name or '-'}")
+    typer.echo(f"Action:       {run.action or 'materialize'}")
     typer.echo(f"Priority:     {run.priority}")
     typer.echo(f"Position:     {position}/{len(all_queued)}")
     typer.echo(f"Queued since: {_ns_to_iso(run.start_time)}")
