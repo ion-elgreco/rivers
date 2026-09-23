@@ -137,6 +137,54 @@ impl PoolGuard {
         })
     }
 
+    /// One claim attempt, never waiting: `None` when a pool is busy right now.
+    /// Lets a caller run free steps first and come back to busy ones.
+    pub fn try_acquire_blocking(
+        py: Python,
+        storage: &ScopedStorageHandle<SurrealStorage>,
+        pools: &[(String, u32)],
+        scope: Option<&AssetScope>,
+        run_id: &str,
+        step_key: &str,
+        events: mpsc::UnboundedSender<WriterMsg>,
+    ) -> anyhow::Result<Option<Self>> {
+        let status = py.detach(|| {
+            io_rt().block_on(storage.scoped().claim_concurrency_slots(
+                pools,
+                run_id,
+                step_key,
+                0,
+                DEFAULT_LEASE_DURATION_SECS,
+                scope,
+            ))
+        })?;
+        if !matches!(status, ConcurrencyClaimStatus::Claimed) {
+            return Ok(None);
+        }
+        let pool_names: Vec<String> = pools.iter().map(|(k, _)| k.clone()).collect();
+        emit_event(
+            &events,
+            storage.code_location_id(),
+            run_id,
+            step_key,
+            EventType::StepSlotClaimed,
+            vec![("pools".to_string(), pool_names.join(","))],
+        );
+        let renewal = AbortOnDrop(spawn_lease_renewal(
+            storage.clone(),
+            run_id.to_string(),
+            step_key.to_string(),
+            events.clone(),
+        ));
+        Ok(Some(Self {
+            storage: storage.clone(),
+            run_id: run_id.to_string(),
+            step_key: step_key.to_string(),
+            renewal,
+            events,
+        }))
+    }
+
     /// Release slots and stop lease renewal (async).
     pub async fn release(self) {
         self.renewal.abort();

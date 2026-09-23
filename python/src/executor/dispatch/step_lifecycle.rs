@@ -61,11 +61,15 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
     event_names: &[String],
     pools: Vec<(String, u32)>,
     asset_scope: Option<rivers_core::storage::AssetScope>,
+    // A claim the caller already holds for `pools` (see `try_acquire_blocking`).
+    claimed: Option<PoolGuard>,
     worker: W,
     failures: &mut Vec<(String, PyErr)>,
 ) {
     let mut guard = if pools.is_empty() {
         None
+    } else if claimed.is_some() {
+        claimed
     } else {
         match PoolGuard::acquire_blocking(
             py,

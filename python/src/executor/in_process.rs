@@ -49,8 +49,12 @@ impl ExecutorBackend for InProcessBackend {
         // execution, so pipelining only gains the share of sync time spent
         // inside `py.detach` (Rust IO etc.). Mixed sync/async batches are
         // also uncommon — same-level uniform-async-ness is the norm.
-        for inst in &sync_instances {
-            Self::run_step_to_completion(py, ctx, inst, failures);
+        if ctx.scope.plan.is_action() {
+            Self::run_free_targets_first(py, ctx, &sync_instances, failures);
+        } else {
+            for inst in &sync_instances {
+                Self::run_step_to_completion(py, ctx, inst, None, failures);
+            }
         }
 
         if !async_instances.is_empty() {
@@ -97,10 +101,60 @@ pub(crate) fn resolve_in_memory_collect_overrides(
 }
 
 impl InProcessBackend {
+    /// Action targets run one at a time here, and an exclusive verb waits for
+    /// its asset's pool. A busy target must not hold up free ones: claim
+    /// without waiting, run whatever is free, and come back to the busy ones.
+    /// When nothing is free, wait on the first busy one, then try again.
+    fn run_free_targets_first(
+        py: Python,
+        ctx: &mut BatchContext,
+        instances: &[StepInstance],
+        failures: &mut Vec<(String, PyErr)>,
+    ) {
+        let mut queue: Vec<&StepInstance> = instances.iter().collect();
+        while !queue.is_empty() {
+            let mut busy: Vec<&StepInstance> = Vec::new();
+            let mut progressed = false;
+            for inst in queue {
+                if inst.pools.is_empty() {
+                    Self::run_step_to_completion(py, ctx, inst, None, failures);
+                    progressed = true;
+                    continue;
+                }
+                match crate::executor::dispatch::pool_claim::PoolGuard::try_acquire_blocking(
+                    py,
+                    ctx.sink.storage,
+                    &inst.pools,
+                    inst.asset_scope.as_ref(),
+                    ctx.scope.run_id,
+                    &inst.instance_name,
+                    ctx.event_sender(),
+                ) {
+                    Ok(Some(guard)) => {
+                        Self::run_step_to_completion(py, ctx, inst, Some(guard), failures);
+                        progressed = true;
+                    }
+                    Ok(None) => busy.push(inst),
+                    // The blocking claim reports the failure through the step.
+                    Err(_) => {
+                        Self::run_step_to_completion(py, ctx, inst, None, failures);
+                        progressed = true;
+                    }
+                }
+            }
+            if !progressed && let Some(first) = busy.first().copied() {
+                busy.remove(0);
+                Self::run_step_to_completion(py, ctx, first, None, failures);
+            }
+            queue = busy;
+        }
+    }
+
     pub(crate) fn run_step_to_completion(
         py: Python,
         ctx: &mut BatchContext,
         instance: &StepInstance,
+        claimed: Option<crate::executor::dispatch::pool_claim::PoolGuard>,
         failures: &mut Vec<(String, PyErr)>,
     ) {
         let step = &ctx.scope.plan.steps[instance.idx];
@@ -127,6 +181,7 @@ impl InProcessBackend {
             &instance.event_names,
             instance.pools.clone(),
             instance.asset_scope.clone(),
+            claimed,
             InProcessStepWorker {
                 step,
                 input_overrides: overrides_ref,

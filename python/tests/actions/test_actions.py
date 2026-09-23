@@ -1522,6 +1522,68 @@ def test_asset_pool_wait_outlives_the_claim_timeout():
     assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr[-3000:]}"
 
 
+@pytest.mark.timeout(120)
+def test_busy_target_does_not_hold_up_the_others():
+    """A fleet-wide exclusive action runs its targets one at a time. A target
+    whose asset is being materialized waited in place, and every target after
+    it waited behind it. It now steps aside: free targets run first."""
+    import threading
+
+    order = []
+    writing = threading.Event()
+    release = threading.Event()
+
+    class Table(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+
+        @rs.action(
+            outcome=rs.Outcome.Unchanged, concurrency=rs.ActionConcurrency.Exclusive
+        )
+        @classmethod
+        def optimize(cls, ctx):
+            order.append(ctx.asset_name)
+
+    class ATable(Table):
+        @classmethod
+        def materialize(cls):
+            return 1
+
+    class BOrders(Table):
+        @classmethod
+        def materialize(cls):
+            writing.set()
+            assert release.wait(timeout=60), "driver never released the write"
+            return 2
+
+    class CTable(Table):
+        @classmethod
+        def materialize(cls):
+            return 3
+
+    repo = rs.CodeRepository(assets=[ATable, BOrders, CTable], default_executor=IP)
+    repo.materialize(selection=["a_table", "c_table"])
+
+    mat = threading.Thread(target=lambda: repo.materialize(selection=["b_orders"]))
+    mat.start()
+    assert writing.wait(timeout=30), "the b_orders write never started"
+
+    out = {}
+    act = threading.Thread(target=lambda: out.update(r=repo.run_action("optimize")))
+    act.start()
+    try:
+        # b_orders sorts between the other two; c_table must not wait for it.
+        assert wait_until(lambda: "c_table" in order, timeout=20), (
+            f"c_table waited behind the busy b_orders: ran {order}"
+        )
+        assert "b_orders" not in order
+    finally:
+        release.set()
+        mat.join(timeout=60)
+        act.join(timeout=60)
+    assert out["r"].success
+    assert order == ["a_table", "c_table", "b_orders"]
+
+
 def _slow_partitioned_exclusive(started, release, windows):
     """Asset whose exclusive `purge` blocks until the driver releases it."""
 
