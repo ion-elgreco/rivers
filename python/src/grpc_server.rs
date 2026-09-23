@@ -808,6 +808,7 @@ impl CodeLocationService for CodeLocationImpl {
                     launched_by_kind,
                     launched_by_name,
                     launched_by_user,
+                    action: s.action,
                 }))
             }
             None => Err(Status::not_found(format!(

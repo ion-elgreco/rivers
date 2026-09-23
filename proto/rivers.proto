@@ -417,6 +417,8 @@ message GetBackfillStatusResponse {
   string launched_by_kind = 9;
   optional string launched_by_name = 10;
   optional UserRef launched_by_user = 11;
+  // The verb the backfill's runs execute. Unset means materialize.
+  optional string action = 12;
 }
 
 message CancelBackfillRequest {

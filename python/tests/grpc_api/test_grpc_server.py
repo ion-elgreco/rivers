@@ -902,8 +902,9 @@ def backfill_grpc_channel(grpc_stubs, storage):
     """gRPC server with a partitioned asset for backfill tests."""
     handler = DictIOHandler()
     pd = rs.PartitionsDefinition.static_(["p1", "p2", "p3"])
+    compact = rs.AssetAction(name="compact", outcome=rs.Outcome.Unchanged)(lambda ctx: None)
 
-    @rs.Asset(io_handler=handler, partitions_def=pd)
+    @rs.Asset(io_handler=handler, partitions_def=pd, actions=[compact])
     def partitioned_asset(context: rs.AssetExecutionContext):
         return context.partition_key
 
@@ -1072,6 +1073,29 @@ def test_get_backfill_status(backfill_grpc_channel):
     )
     assert status.backfill_id == launch.backfill_id
     assert status.total_partitions == 2
+
+
+def test_get_backfill_status_carries_the_verb(backfill_grpc_channel):
+    """A client polling a purge must be able to tell it from a rebuild."""
+    channel, pb2, pb2_grpc, _, _ = backfill_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    def launch(**kw):
+        resp = stub.LaunchBackfill(
+            pb2.LaunchBackfillRequest(
+                selection=["partitioned_asset"],
+                partition_keys=[_single_partition_key(pb2, "p1")],
+                failure_policy="continue",
+                max_concurrency=1,
+                **kw,
+            )
+        )
+        return stub.GetBackfillStatus(
+            pb2.GetBackfillStatusRequest(backfill_id=resp.backfill_id)
+        )
+
+    assert launch(action="compact").action == "compact"
+    assert not launch().HasField("action")
 
 
 def test_get_backfill_status_carries_launched_by(backfill_grpc_channel):
