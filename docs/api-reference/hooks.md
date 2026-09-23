@@ -2,6 +2,8 @@
 
 Hooks run after an asset step succeeds or fails. Hook errors are logged but never fail the step.
 
+Hooks belong to materialize runs: an [action](../concepts/actions.md) run never fires them, even one that reports `ActionResult.materialized()`. To act on a failed action run, read its run record — it carries the verb in `action`.
+
 ## `Hook.success`
 
 Runs after an asset step completes successfully. Can be used as a bare decorator or with a custom name.
