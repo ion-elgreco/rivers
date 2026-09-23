@@ -595,6 +595,33 @@ pub fn records_by_key(
     (records, failed)
 }
 
+/// Click on a replay button (re-run a run, re-execute a backfill). Replaying
+/// an action re-applies its verb — a delete deletes again — so it takes a
+/// second click; a materialize replays at once. Returns `(dispatch, armed)`.
+pub fn replay_click(is_action: bool, armed: bool) -> (bool, bool) {
+    match (is_action, armed) {
+        (false, _) => (true, false),
+        (true, false) => (false, true),
+        (true, true) => (true, false),
+    }
+}
+
+/// Text for a replay button: an action replay names the verb it re-applies.
+pub fn replay_button_text(
+    action: Option<&str>,
+    idle: &str,
+    armed: bool,
+    pending: bool,
+    busy: &str,
+) -> String {
+    match action {
+        _ if pending => busy.to_string(),
+        Some(verb) if armed => format!("Confirm re-run {verb}?"),
+        Some(verb) => format!("Re-run {verb}"),
+        None => idle.to_string(),
+    }
+}
+
 /// Actions an asset offers as generic verb buttons — everything but
 /// `observe`, which external assets surface through their own Observe button.
 pub fn offered_actions(info: &AssetDefinitionInfo) -> Vec<crate::types::AssetActionInfo> {
@@ -858,6 +885,26 @@ pub fn launched_by_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replaying_an_action_takes_a_second_click() {
+        // Materialize: dispatch at once, nothing armed.
+        assert_eq!(replay_click(false, false), (true, false));
+        // A verb: the first click arms, the second dispatches and disarms.
+        assert_eq!(replay_click(true, false), (false, true));
+        assert_eq!(replay_click(true, true), (true, false));
+    }
+
+    #[test]
+    fn replay_button_names_the_verb_it_reapplies() {
+        let text = |action, armed, pending| {
+            replay_button_text(action, "Retry from", armed, pending, "Retrying...")
+        };
+        assert_eq!(text(None, false, false), "Retry from");
+        assert_eq!(text(Some("delete"), false, false), "Re-run delete");
+        assert_eq!(text(Some("delete"), true, false), "Confirm re-run delete?");
+        assert_eq!(text(Some("delete"), true, true), "Retrying...");
+    }
 
     #[test]
     fn initials_take_first_and_last_word() {

@@ -123,6 +123,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
                         let short_bid = short_id(&record.backfill_id, 8);
                         let full_id = record.backfill_id.clone();
                         let rerun_id = record.backfill_id.clone();
+                        let rerun_verb = record.action.clone();
                         let (ns_t, name_t) = loc.get();
                         let bf_href = loc_path(&ns_t, &name_t, "backfills");
                         let cl_id = record.code_location_id.clone();
@@ -153,12 +154,22 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                 })}
                                 {(!cancelable).then(move || {
                                     let (pending, set_pending) = signal(false);
+                                    let armed = RwSignal::new(false);
                                     let navigate = leptos_router::hooks::use_navigate();
+                                    let verb_text = rerun_verb.clone();
                                     view! {
                                         <button
                                             class="btn btn-primary"
                                             disabled=move || pending.get()
                                             on:click=move |_| {
+                                                let (dispatch, now_armed) = crate::helpers::replay_click(
+                                                    rerun_verb.is_some(),
+                                                    armed.get(),
+                                                );
+                                                armed.set(now_armed);
+                                                if !dispatch {
+                                                    return;
+                                                }
                                                 let id = rerun_id.clone();
                                                 let navigate = navigate.clone();
                                                 let (ns, lname) = loc.get();
@@ -178,7 +189,13 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                                 });
                                             }
                                         >
-                                            {move || if pending.get() { "Re-executing…" } else { "Re-execute" }}
+                                            {move || crate::helpers::replay_button_text(
+                                                verb_text.as_deref(),
+                                                "Re-execute",
+                                                armed.get(),
+                                                pending.get(),
+                                                "Re-executing…",
+                                            )}
                                         </button>
                                     }
                                 })}
@@ -210,8 +227,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                     </div>
                                 </div>
                                 // Without this the page is verb-blind, and
-                                // "Re-run" threads the record's verb — so a
-                                // delete sweep re-deletes on one click.
+                                // "Re-execute" threads the record's verb.
                                 {record.action.clone().map(|verb| view! {
                                     <div class="backfill-meta-tile">
                                         <div class="backfill-meta-label">"Action"</div>

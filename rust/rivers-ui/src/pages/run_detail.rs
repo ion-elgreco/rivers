@@ -177,6 +177,7 @@ pub fn RunDetailPage() -> impl IntoView {
         async move { rerun_run(run_id).await }
     });
     let reexecute_pending = reexecute.pending();
+    let reexecute_armed = RwSignal::new(false);
 
     let cancel = Action::new(move |id: &String| {
         let id = id.clone();
@@ -194,6 +195,7 @@ pub fn RunDetailPage() -> impl IntoView {
     Effect::new(move |_| {
         run_id_memo.track();
         delete_armed.set(false);
+        reexecute_armed.set(false);
     });
     // A deleted run has no page to stay on — back to the list. Ok(false)
     // means the run was already gone, which lands in the same place.
@@ -219,6 +221,8 @@ pub fn RunDetailPage() -> impl IntoView {
                 run.get().map(|result| match result {
                     Ok(Some(record)) => {
                         let rerun_run_id = record.run_id.clone();
+                        let rerun_verb = record.action.clone();
+                        let rerun_verb_text = rerun_verb.clone();
                         let status_kind = run_status_kind(&record.status);
                         let sid = short_id(&record.run_id, 8);
                         let is_active_status = crate::helpers::run_is_active(&record.status);
@@ -259,13 +263,28 @@ pub fn RunDetailPage() -> impl IntoView {
                                 </button>
                                 <button
                                     class="btn btn-tertiary"
-                                    on:click=move |_| { reexecute.dispatch(rerun_run_id.clone()); }
+                                    on:click=move |_| {
+                                        let (dispatch, armed) = crate::helpers::replay_click(
+                                            rerun_verb.is_some(),
+                                            reexecute_armed.get(),
+                                        );
+                                        reexecute_armed.set(armed);
+                                        if dispatch {
+                                            reexecute.dispatch(rerun_run_id.clone());
+                                        }
+                                    }
                                     disabled=move || reexecute_pending.get()
                                 >
                                     <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
                                         <path d="M12 7a5 5 0 11-1.5-3.5M12 1.5V4H9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
                                     </svg>
-                                    {move || if reexecute_pending.get() { "Retrying..." } else { "Retry from" }}
+                                    {move || crate::helpers::replay_button_text(
+                                        rerun_verb_text.as_deref(),
+                                        "Retry from",
+                                        reexecute_armed.get(),
+                                        reexecute_pending.get(),
+                                        "Retrying...",
+                                    )}
                                 </button>
                                 {is_active_status.then(|| {
                                     let cancel_id = record.run_id.clone();
