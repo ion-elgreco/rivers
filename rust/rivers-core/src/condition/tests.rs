@@ -8350,6 +8350,156 @@ async fn test_materializing_action_triggers_downstream_eager() {
     );
 }
 
+#[tokio::test]
+async fn test_verb_run_requests_downstream_it_did_not_build_after_dep() {
+    // events → daily_summary, both built by r1. `refresh` over both runs its
+    // targets one at a time in name order, so daily_summary's step runs first.
+    // A daily_summary that materialized before events, returned unchanged()
+    // or failed has not seen the new events: eager() must request it. One
+    // that materialized after events needs no second build. Steady state and
+    // a restart agree.
+    use crate::assets::graph::{NodeKind, TopologyNode};
+    use crate::condition::pass::{AssetConditionInfo, ConditionPass};
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{EventRecord, EventType};
+
+    let node = |name: &str| TopologyNode {
+        name: name.into(),
+        kind: NodeKind::Asset,
+        group: None,
+        parent_graph: None,
+    };
+    let event = |run_id: &str, asset: &str, ts: i64, materialized: bool| EventRecord {
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        event_type: if materialized {
+            EventType::Materialization {
+                data_version: Some(format!("dv_{run_id}")),
+            }
+        } else {
+            EventType::ActionCompleted
+        },
+        asset_key: Some(asset.to_string()),
+        run_id: run_id.to_string(),
+        partition_key: None,
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+    let eager_summary = || {
+        ConditionPass::new(
+            AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "daily_summary".to_string(),
+                condition: ConditionNode::eager(),
+                partition_info: None,
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        )
+    };
+
+    for (case, summary, status, requested) in [
+        (
+            "built before events",
+            Some((2_000, true)),
+            RunStatus::Success,
+            &["daily_summary"][..],
+        ),
+        (
+            "unchanged",
+            Some((2_000, false)),
+            RunStatus::Success,
+            &["daily_summary"],
+        ),
+        ("failed", None, RunStatus::Failure, &["daily_summary"]),
+        (
+            "built after events",
+            Some((2_200, true)),
+            RunStatus::Success,
+            &[],
+        ),
+    ] {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+        storage
+            .for_code_location(&ctx)
+            .register_assets(&[make_record("events"), make_record("daily_summary")])
+            .await
+            .unwrap();
+        storage
+            .kv_set(
+                &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
+                &serde_json::to_vec(&GraphTopology {
+                    nodes: vec![node("events"), node("daily_summary")],
+                    edges: vec![("daily_summary".to_string(), "events".to_string())],
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let run = |run_id: &str, status: RunStatus, start: i64, end: i64, action: Option<&str>| {
+            RunRecord {
+                run_id: run_id.to_string(),
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                job_name: None,
+                status,
+                start_time: start,
+                end_time: Some(end),
+                tags: vec![],
+                node_names: vec!["daily_summary".to_string(), "events".to_string()],
+                priority: 0,
+                partition_key: None,
+                block_reason: None,
+                launched_by: LaunchedBy::Manual { user: None },
+                action: action.map(str::to_string),
+            }
+        };
+        storage
+            .create_run(&run("r1", RunStatus::Success, 1_000, 1_000, None))
+            .await
+            .unwrap();
+        storage
+            .store_events(&[
+                event("r1", "events", 1_000, true),
+                event("r1", "daily_summary", 1_000, true),
+            ])
+            .await
+            .unwrap();
+
+        let mut pass = eager_summary();
+        pass.refresh_cache(&storage, 1_500).await.unwrap();
+        assert!(
+            pass.run(1_500, false).plan.unpartitioned.is_empty(),
+            "{case}: precondition: r1 built daily_summary together with events"
+        );
+
+        storage
+            .create_run(&run("r2", status, 1_900, 2_300, Some("refresh")))
+            .await
+            .unwrap();
+        let mut events = vec![event("r2", "events", 2_100, true)];
+        events.extend(
+            summary.map(|(ts, materialized)| event("r2", "daily_summary", ts, materialized)),
+        );
+        storage.store_events(&events).await.unwrap();
+        pass.refresh_cache(&storage, 2_500).await.unwrap();
+        assert_eq!(
+            pass.run(2_500, false).plan.unpartitioned,
+            requested,
+            "{case}"
+        );
+
+        let mut restarted = eager_summary();
+        restarted.refresh_cache(&storage, 3_000).await.unwrap();
+        assert_eq!(
+            restarted.run(3_000, false).plan.unpartitioned,
+            requested,
+            "{case}: a restarted daemon must reach the same answer"
+        );
+    }
+}
+
 /// Storage + cache fixture for the live-action-run tests: one asset `a` and a
 /// `Started` run carrying `action`, created before the caller's first refresh.
 async fn storage_with_live_action_run(

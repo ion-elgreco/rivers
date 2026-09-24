@@ -56,7 +56,7 @@ Fine-grained conditions for building custom rules. All are static methods on `Au
 | `.backfill_in_progress()` | Asset is part of an active materialize backfill. An action backfill does not count. |
 | `.in_flight()` | Asset is being materialized by anything — a run (`in_progress()`) **or** an active backfill (`backfill_in_progress()`). Negate it as a re-dispatch guard. |
 | `.will_be_requested()` | Asset's condition already fired earlier this tick (same-tick cascading). |
-| `.last_run_includes_target()` | The dep's latest run also included the root asset being evaluated. |
+| `.last_run_includes_target()` | The dep's latest run also included the root asset being evaluated. An [action](../concepts/actions.md) run includes the root only if it materialized the root after the dep. |
 | `.last_executed_with_tags(tag_keys=None, tag_values=None)` | Latest run that materialized this asset had matching tags. |
 | `.has_run_with_tags(tag_keys=None, tag_values=None)` | Any new materialization this tick came from a run with matching tags. |
 | `.all_runs_have_tags(tag_keys=None, tag_values=None)` | All new materializations this tick came from runs with matching tags (vacuously true with no materializations). |

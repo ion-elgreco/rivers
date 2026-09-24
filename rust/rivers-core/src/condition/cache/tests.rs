@@ -1251,6 +1251,86 @@ async fn a_run_is_the_last_run_of_only_the_partitions_it_materialized() {
     }
 }
 
+/// A verb's steps may run in any order: `refresh` over rollup and events may
+/// run rollup first. The run includes rollup in events' last run only if
+/// rollup's own materialization came after events' — a rollup step that ran
+/// first, returned unchanged() or failed never saw the new events. Steady
+/// state and a restart agree, for the whole asset and per partition.
+#[tokio::test]
+async fn a_verb_run_includes_only_the_targets_it_built_after_the_asset() {
+    let rollup_event = |run: &str, ts: i64, materialized: bool, slot: &Option<PartitionKey>| {
+        crate::storage::EventRecord {
+            asset_key: Some("rollup".to_string()),
+            ..events_event(run, ts, materialized, slot)
+        }
+    };
+    for slot in events_slots() {
+        for (case, rollup, status, names) in [
+            (
+                "rollup built first",
+                Some((1_900, true)),
+                RunStatus::Success,
+                &["events"][..],
+            ),
+            (
+                "rollup unchanged",
+                Some((1_900, false)),
+                RunStatus::Success,
+                &["events"],
+            ),
+            ("rollup failed", None, RunStatus::Failure, &["events"]),
+            (
+                "rollup built last",
+                Some((2_100, true)),
+                RunStatus::Success,
+                &["rollup", "events"],
+            ),
+        ] {
+            let case = format!("{case}, {slot:?}");
+            let storage = crate::storage::surrealdb_backend::SurrealStorage::new_memory()
+                .await
+                .unwrap();
+            register_blank(&storage, &["events", "rollup"]).await;
+            let mut built = mk_run("r1", RunStatus::Success, &["events", "rollup"], 1_000);
+            built.partition_key = slot.clone();
+            storage.create_run(&built).await.unwrap();
+            storage
+                .store_events(&[
+                    events_event("r1", 1_000, true, &slot),
+                    rollup_event("r1", 1_000, true, &slot),
+                ])
+                .await
+                .unwrap();
+            let new_cache = || {
+                let mut cache = events_cache(&slot);
+                if slot.is_some() {
+                    cache.set_partitioned_assets(vec!["events".to_string(), "rollup".to_string()]);
+                }
+                cache
+            };
+            let mut cache = new_cache();
+            cache.refresh(&storage, 0).await.unwrap();
+
+            let mut verb = mk_run("r2", status, &["rollup", "events"], 1_500);
+            verb.action = Some("refresh".to_string());
+            verb.partition_key = slot.clone();
+            verb.end_time = Some(2_200);
+            storage.create_run(&verb).await.unwrap();
+            let mut events = vec![events_event("r2", 2_000, true, &slot)];
+            events.extend(
+                rollup.map(|(ts, materialized)| rollup_event("r2", ts, materialized, &slot)),
+            );
+            storage.store_events(&events).await.unwrap();
+
+            cache.refresh(&storage, 1).await.unwrap();
+            assert_eq!(last_run_names(&cache, &slot), names, "{case}");
+            let mut restarted = new_cache();
+            restarted.refresh(&storage, 0).await.unwrap();
+            assert_eq!(last_run_names(&restarted, &slot), names, "{case}: restart");
+        }
+    }
+}
+
 /// A completed whole-asset delete clears the last-run maps in steady state —
 /// the record is gone and a restart would adopt nothing, so keeping the
 /// entries makes `LastExecutedWithTags` flip on the next restart.

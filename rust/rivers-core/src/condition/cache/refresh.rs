@@ -612,6 +612,7 @@ impl AssetConditionCache {
                     run_ts,
                     Arc::clone(&run_tags),
                     Arc::clone(&run_asset_names),
+                    run.is_action(),
                 ));
                 if self.needs_tick_tags {
                     delta.tick_tag_updates.push((
@@ -914,7 +915,7 @@ impl AssetConditionCache {
             }
         }
 
-        for (asset, pk, run_id, run_ts, tags, names) in last_run_updates {
+        for (asset, pk, run_id, run_ts, tags, names, is_verb_run) in last_run_updates {
             // LastExecutedWithTags/LastRunIncludesTarget reflect the latest run
             // that MATERIALIZED the asset — mirror the failure-floor gate.
             if self.run_materialized_slot(
@@ -924,6 +925,11 @@ impl AssetConditionCache {
                 &materialized_overrides,
                 &partition_status,
             ) {
+                let names = if is_verb_run {
+                    self.verb_run_names(&asset, &run_id, &names)
+                } else {
+                    names
+                };
                 self.update_last_run_maps(&asset, &pk, run_ts, &tags, &names);
             }
         }

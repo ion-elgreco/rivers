@@ -50,7 +50,8 @@ pub struct AssetConditionCache {
     pub last_run_tags: SlotMap<RunTags>,
     /// Run tag sets from materializations completed this tick, per (asset, slot).
     pub tick_materialization_tags: SlotMap<Vec<RunTags>>,
-    /// Full `asset_names` from the latest completed run per (asset, slot).
+    /// `asset_names` from the latest completed run per (asset, slot); a verb
+    /// run keeps only the targets it materialized after the asset.
     pub last_run_asset_names: SlotMap<Arc<[String]>>,
     /// Asset keys that are partitioned.
     partitioned_asset_keys: HashSet<String>,
@@ -434,6 +435,11 @@ impl AssetConditionCache {
                     // materialized the asset — a verb's `materialized()` too.
                     let run = runs_by_id.get(record.last_run_id.as_deref()?)?;
                     let run_ts = run.end_time.unwrap_or(run.start_time);
+                    let names: Arc<[String]> = if run.is_action() {
+                        self.verb_run_names(&record.asset_key, &run.run_id, &run.node_names)
+                    } else {
+                        Arc::from(run.node_names.as_slice())
+                    };
                     let partitions =
                         run_partition_slots(self.is_partitioned(&record.asset_key), run);
                     let rows: Vec<AssetRunRow> = partitions
@@ -444,7 +450,7 @@ impl AssetConditionCache {
                                 pk,
                                 run_ts,
                                 Arc::from(run.tags.as_slice()),
-                                Arc::from(run.node_names.as_slice()),
+                                Arc::clone(&names),
                             )
                         })
                         .collect();
@@ -533,6 +539,28 @@ impl AssetConditionCache {
             .entry(asset.to_string())
             .or_default()
             .insert(partition_key.clone(), Arc::clone(asset_names));
+    }
+
+    /// The targets of verb run `run_id` built with `asset`. A verb's steps may
+    /// run in any order, so another target counts only if its own
+    /// materialization in the run is newer than `asset`'s: a step that ran
+    /// first, returned unchanged() or failed never saw the asset's new data.
+    fn verb_run_names(&self, asset: &str, run_id: &str, names: &[String]) -> Arc<[String]> {
+        let materialized_at = |name: &str| {
+            self.records
+                .get(name)
+                .filter(|r| r.last_run_id.as_deref() == Some(run_id))
+                .and_then(|r| r.last_timestamp)
+        };
+        let asset_ts = materialized_at(asset);
+        names
+            .iter()
+            .filter(|name| {
+                *name == asset
+                    || materialized_at(name).is_some_and(|ts| asset_ts.is_some_and(|a| ts > a))
+            })
+            .cloned()
+            .collect()
     }
 
     /// Track a materialization's run tags for the current tick.

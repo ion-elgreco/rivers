@@ -171,7 +171,8 @@ class AutomationCondition:
     def last_run_includes_target() -> AutomationCondition:
         """True if the dep's latest run also included the root asset being evaluated.
 
-        Used internally by ``any_deps_updated()`` to suppress re-fires
+        An action run includes the root only if it materialized the root after
+        the dep. Used internally by ``any_deps_updated()`` to suppress re-fires
         when a joint run already covered both the dep and the downstream.
         """
         ...

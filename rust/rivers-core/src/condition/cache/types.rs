@@ -16,8 +16,9 @@ pub type SlotMap<V> = HashMap<String, HashMap<Option<PartitionKey>, V>>;
 /// Applied only when the run actually materialized the asset.
 type RunTagUpdate = (String, Option<PartitionKey>, String, RunTags);
 
-/// Latest-run map update: `(asset_key, optional partition, run_id, run_ts, tags, asset_names)`.
-/// Applied only when the run actually materialized the asset, newest run last.
+/// Latest-run map update: `(asset_key, optional partition, run_id, run_ts, tags,
+/// asset_names, is_verb_run)`. Applied only when the run actually materialized
+/// the asset, newest run last.
 type LastRunUpdate = (
     String,
     Option<PartitionKey>,
@@ -25,6 +26,7 @@ type LastRunUpdate = (
     i64,
     RunTags,
     Arc<[String]>,
+    bool,
 );
 
 /// Per-asset partition status, loaded from storage and refreshed incrementally.
