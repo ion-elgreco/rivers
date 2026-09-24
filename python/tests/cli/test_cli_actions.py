@@ -5,6 +5,8 @@ queue commands never showed one — a queued purge read as an ordinary run.
 """
 
 import importlib
+import os
+import re
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -259,11 +261,17 @@ repo = rs.CodeRepository(
 """
 
 ENDPOINT = "ws://surrealdb:8000"
+# A deployed code location's scope: its CodeLocation's spec.identity.
+CODE_LOCATION_ID = "550e8400-e29b-41d4-a716-446655440000"
 
 PURGE_WARNING = (
     "Warning: 'purge' is destructive, but its state and pool claims go to a "
     "scratch store that is removed at exit; pass --surreal-endpoint to record "
     "them in shared storage."
+)
+DEFAULT_SCOPE_WARNING = (
+    "Warning: without --code-location-id, runs, asset state and pool claims go "
+    "to code location 'default', which a deployed code location does not read."
 )
 
 
@@ -278,7 +286,11 @@ def _verb_on_events_p1(command, module, verb="purge"):
     return ["backfill", module, "--assets", "events", "-p", "p1", "--action", verb]
 
 
-def _rivers(cwd, *args):
+def _backfill_id(stdout):
+    return re.search(r"^Backfill (\S+):", stdout, re.MULTILINE).group(1)
+
+
+def _rivers(cwd, *args, env=None):
     # A process of its own: the CLI decides the store's fate at exit.
     return subprocess.run(
         [sys.executable, "-c", "from rivers.cli import main; main()", *args],
@@ -286,6 +298,7 @@ def _rivers(cwd, *args):
         capture_output=True,
         text=True,
         timeout=120,
+        env=None if env is None else {**os.environ, **env},
     )
 
 
@@ -327,6 +340,29 @@ def _use_endpoint(monkeypatch, via):
     return ["--surreal-endpoint", ENDPOINT]
 
 
+def _in_code_location(via, args):
+    """One command that names CODE_LOCATION_ID by flag, or by env var as the
+    operator sets it on a pod. Like a process of its own, the command starts
+    and ends without the variable otherwise."""
+    if via == "env":
+        return runner.invoke(
+            app, args, env={"RIVERS_CODE_LOCATION_ID": CODE_LOCATION_ID}
+        )
+    return runner.invoke(
+        app,
+        [*args, "--code-location-id", CODE_LOCATION_ID],
+        env={"RIVERS_CODE_LOCATION_ID": None},
+    )
+
+
+def _as_code_location(monkeypatch, module, store):
+    """`store` as the deployed code location reads it."""
+    monkeypatch.setenv("RIVERS_CODE_LOCATION_ID", CODE_LOCATION_ID)
+    repo = sys.modules[module].repo
+    repo.resolve(storage=store)
+    return repo.storage
+
+
 @pytest.mark.parametrize("command", ["run-action", "backfill"])
 def test_a_storage_path_the_user_passes_keeps_the_verbs_state(
     resolved_tmp_path, command
@@ -350,12 +386,13 @@ def test_a_storage_path_the_user_passes_keeps_the_verbs_state(
 
 @pytest.mark.parametrize("via", ["flag", "env"])
 @pytest.mark.parametrize("command", ["run-action", "backfill"])
-def test_surreal_endpoint_records_the_verb_in_the_shared_store(
+def test_surreal_endpoint_records_the_verb_in_the_code_location(
     resolved_tmp_path, monkeypatch, command, via
 ):
-    """A delete from the CLI must land in the store the code location reads,
-    not in a scratch store that no other process sees. A cron pod names that
-    store only by `RIVERS_SURREAL_ENDPOINT`."""
+    """A delete from the CLI must land where the code location reads: its
+    store, under its id. Under code location "default", the code location
+    still read the partition as materialized, and its runs did not wait for
+    the delete's claim. A cron pod names both only by env var."""
     module = f"defs_remote_{command.replace('-', '_')}_{via}"
     _write_module(resolved_tmp_path, module, PURGE_MODULE)
     store, endpoints = _connect_to(monkeypatch, resolved_tmp_path / "shared_db")
@@ -365,13 +402,18 @@ def test_surreal_endpoint_records_the_verb_in_the_shared_store(
         ["materialize", module, "--partition-key", "p1"],
         _verb_on_events_p1(command, module),
     ):
-        done = runner.invoke(app, [*args, *endpoint_args])
+        done = _in_code_location(via, [*args, *endpoint_args])
         assert done.exit_code == 0, done.output or done.exception
         assert _warnings(done.stderr) == []
 
     assert endpoints == [ENDPOINT, ENDPOINT]
     assert not (resolved_tmp_path / ".rivers").exists()
-    _assert_events_p1_purged(store)
+    # `store` reads code location "default". It has no asset pool either, so
+    # the verb's claim on `events` was not taken there.
+    assert store.get_runs() == []
+    assert store.get_materialized_partitions("rollup") == []
+    assert store.get_pool_limits() == []
+    _assert_events_p1_purged(_as_code_location(monkeypatch, module, store))
 
 
 @pytest.mark.parametrize("via", ["flag", "env"])
@@ -382,23 +424,63 @@ def test_backfill_status_and_cancel_read_the_shared_store(
     _write_module(resolved_tmp_path, module, PURGE_MODULE)
     store, endpoints = _connect_to(monkeypatch, resolved_tmp_path / "shared_db")
     endpoint_args = _use_endpoint(monkeypatch, via)
-    ran = runner.invoke(app, [*_verb_on_events_p1("backfill", module), *endpoint_args])
+    ran = _in_code_location(
+        via, [*_verb_on_events_p1("backfill", module), *endpoint_args]
+    )
     assert ran.exit_code == 0, ran.output or ran.exception
-    (run,) = [r for r in store.get_runs() if r.action == "purge"]
-    backfill_id = run.launched_by.backfill_id
+    backfill_id = _backfill_id(ran.stdout)
 
-    status = runner.invoke(
-        app, ["backfill-status", backfill_id, module, *endpoint_args]
+    status = _in_code_location(
+        via, ["backfill-status", backfill_id, module, *endpoint_args]
     )
     assert status.exit_code == 0, status.output or status.exception
     assert f"Backfill {backfill_id}: CompletedSuccess" in status.output
     assert "Action: purge" in status.output
 
-    canceled = runner.invoke(
-        app, ["backfill-cancel", backfill_id, module, *endpoint_args]
+    canceled = _in_code_location(
+        via, ["backfill-cancel", backfill_id, module, *endpoint_args]
     )
     assert canceled.exit_code == 0, canceled.output or canceled.exception
     assert endpoints == [ENDPOINT] * 3
+    assert [_warnings(done.stderr) for done in (ran, status, canceled)] == [[]] * 3
+    # Each command registers the assets under the code location, not "default".
+    assert store.get_asset_records() == []
+
+
+@pytest.mark.parametrize("via", ["flag", "env"])
+def test_the_endpoint_without_a_code_location_id_warns(
+    resolved_tmp_path, monkeypatch, via
+):
+    """Outside a rivers pod, nothing names the code location: the command
+    records under code location "default", which a deployed code location
+    does not read. It says so, and still runs."""
+    module = f"defs_default_scope_{via}"
+    _write_module(resolved_tmp_path, module, PURGE_MODULE)
+    store, _ = _connect_to(monkeypatch, resolved_tmp_path / "shared_db")
+    endpoint_args = _use_endpoint(monkeypatch, via)
+
+    results = [
+        runner.invoke(app, [*args, *endpoint_args])
+        for args in (
+            ["materialize", module, "--partition-key", "p1"],
+            _verb_on_events_p1("run-action", module),
+            _verb_on_events_p1("backfill", module),
+        )
+    ]
+    backfill_id = _backfill_id(results[-1].stdout)
+    results += [
+        runner.invoke(app, [command, backfill_id, module, *endpoint_args])
+        for command in ("backfill-status", "backfill-cancel")
+    ]
+
+    for result in results:
+        assert result.exit_code == 0, result.output or result.exception
+        assert _warnings(result.stderr) == [DEFAULT_SCOPE_WARNING]
+    assert sorted(r.action or "materialize" for r in store.get_runs()) == [
+        "materialize",
+        "purge",
+        "purge",
+    ]
 
 
 @pytest.mark.parametrize("command", ["run-action", "backfill"])
@@ -407,12 +489,60 @@ def test_without_a_storage_flag_the_scratch_store_is_removed_at_exit(
 ):
     module = f"defs_scratch_{command.replace('-', '_')}"
     _write_module(resolved_tmp_path, module, PURGE_MODULE)
+    scratch_root = resolved_tmp_path / "tmp"
+    scratch_root.mkdir()
 
-    done = _rivers(resolved_tmp_path, *_verb_on_events_p1(command, module))
+    done = _rivers(
+        resolved_tmp_path,
+        *_verb_on_events_p1(command, module),
+        env={"TMPDIR": str(scratch_root)},
+    )
 
     assert done.returncode == 0, done.stderr
     assert (resolved_tmp_path / "calls.txt").read_text().split() == ["events:p1"]
+    assert list(scratch_root.iterdir()) == []
     assert not (resolved_tmp_path / ".rivers").exists()
+
+
+def test_a_command_without_a_storage_flag_leaves_a_kept_store_alone(
+    resolved_tmp_path,
+):
+    """The scratch store was `.rivers/storage/`, a path `--storage-path` keeps:
+    a command without a storage flag printed the backfill kept there, then
+    removed every run, backfill, asset state and pool limit in it at exit."""
+    _write_module(resolved_tmp_path, "defs_kept_store", PURGE_MODULE)
+    kept = ["--storage-path", ".rivers/storage/"]
+    scratch_root = resolved_tmp_path / "tmp"
+    scratch_root.mkdir()
+    ran = _rivers(
+        resolved_tmp_path,
+        "backfill",
+        "defs_kept_store",
+        "-a",
+        "events",
+        "-p",
+        "p1",
+        *kept,
+    )
+    assert ran.returncode == 0, ran.stderr
+    backfill_id = _backfill_id(ran.stdout)
+
+    flagless = _rivers(
+        resolved_tmp_path,
+        "backfill-status",
+        backfill_id,
+        "defs_kept_store",
+        env={"TMPDIR": str(scratch_root)},
+    )
+    assert flagless.returncode == 1, flagless.stdout
+    assert f"Backfill '{backfill_id}' not found" in flagless.stderr
+    assert list(scratch_root.iterdir()) == []
+
+    status = _rivers(
+        resolved_tmp_path, "backfill-status", backfill_id, "defs_kept_store", *kept
+    )
+    assert status.returncode == 0, status.stderr
+    assert f"Backfill {backfill_id}: CompletedSuccess" in status.stdout
 
 
 @pytest.mark.parametrize("command", ["run-action", "backfill"])

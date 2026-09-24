@@ -7,6 +7,7 @@ import importlib
 import os
 import shutil
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -55,26 +56,44 @@ def _cleanup_storage(path: str) -> None:
             parent.rmdir()
 
 
-_SCRATCH_STORAGE_PATH = ".rivers/storage/"
+_CODE_LOCATION_ID_OPT = typer.Option(
+    None,
+    envvar="RIVERS_CODE_LOCATION_ID",
+    help="Code location to record runs, asset state and pool claims under "
+    "(default: 'default')",
+)
 
 
 def _create_storage(
-    memory: bool, storage_path: str | None, surreal_endpoint: str | None
+    memory: bool,
+    storage_path: str | None,
+    surreal_endpoint: str | None,
+    code_location_id: str | None = None,
 ) -> Storage:
     """Create storage backend based on CLI flags.
 
-    Only the scratch store picked here is removed at exit, never a path the
-    user passed.
+    The storage and ``resolve()`` read the code location from the
+    environment. Only the scratch store picked here is removed at exit, never
+    a path the user passed.
     """
+    if code_location_id is not None:
+        os.environ["RIVERS_CODE_LOCATION_ID"] = code_location_id
     if surreal_endpoint is not None:
+        if not code_location_id:
+            typer.echo(
+                "Warning: without --code-location-id, runs, asset state and pool "
+                "claims go to code location 'default', which a deployed code "
+                "location does not read.",
+                err=True,
+            )
         return Storage.connect(surreal_endpoint)
     if memory:
         return Storage.memory()
     if storage_path is not None:
         return Storage.embedded(storage_path)
-    storage = Storage.embedded(_SCRATCH_STORAGE_PATH)
-    atexit.register(_cleanup_storage, _SCRATCH_STORAGE_PATH)
-    return storage
+    scratch = tempfile.mkdtemp(prefix="rivers-scratch-")
+    atexit.register(shutil.rmtree, scratch, ignore_errors=True)
+    return Storage.embedded(scratch)
 
 
 def _open_or_prompt_migrate(open_fn, migrate_fn) -> Storage:
@@ -492,11 +511,14 @@ def materialize(
         envvar="RIVERS_SURREAL_ENDPOINT",
         help="Remote SurrealDB endpoint (overrides --storage-path)",
     ),
+    code_location_id: str | None = _CODE_LOCATION_ID_OPT,
 ) -> None:
     """Materialize all assets in a repository."""
     from rivers import PartitionKey
 
-    repo_obj = _load_repo(module, repo_var, memory, storage_path, surreal_endpoint)
+    repo_obj = _load_repo(
+        module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
+    )
     pk = PartitionKey.single(partition_key) if partition_key else None
     result = repo_obj.materialize(partition_key=pk)
     typer.echo(f"Materialization complete. Assets: {result.materialized_assets}")
@@ -528,6 +550,7 @@ def run_action(
         envvar="RIVERS_SURREAL_ENDPOINT",
         help="Remote SurrealDB endpoint (overrides --storage-path)",
     ),
+    code_location_id: str | None = _CODE_LOCATION_ID_OPT,
 ) -> None:
     """Run an asset action (a verb besides materialize) over a selection."""
     from rivers import PartitionKey
@@ -540,7 +563,9 @@ def run_action(
             err=True,
         )
         raise typer.Exit(1)
-    repo_obj = _load_repo(module, repo_var, memory, storage_path, surreal_endpoint)
+    repo_obj = _load_repo(
+        module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
+    )
     _warn_if_destructive_on_scratch(
         repo_obj, action, selection, memory, storage_path, surreal_endpoint
     )
@@ -588,6 +613,7 @@ def _load_repo(
     memory: bool,
     storage_path: str | None,
     surreal_endpoint: str | None,
+    code_location_id: str | None,
 ):
     """Load and resolve a CodeRepository from a module."""
     sys.path.insert(0, ".")
@@ -603,7 +629,7 @@ def _load_repo(
         typer.echo(f"Error: '{repo_var}' is not a CodeRepository", err=True)
         raise typer.Exit(1)
 
-    storage = _create_storage(memory, storage_path, surreal_endpoint)
+    storage = _create_storage(memory, storage_path, surreal_endpoint, code_location_id)
     repo_obj.resolve(storage=storage)
     return repo_obj
 
@@ -672,11 +698,14 @@ def backfill(
         envvar="RIVERS_SURREAL_ENDPOINT",
         help="Remote SurrealDB endpoint (overrides --storage-path)",
     ),
+    code_location_id: str | None = _CODE_LOCATION_ID_OPT,
 ) -> None:
     """Backfill partitions for selected assets."""
     from rivers import PartitionKey, PartitionKeyRange
 
-    repo_obj = _load_repo(module, repo_var, memory, storage_path, surreal_endpoint)
+    repo_obj = _load_repo(
+        module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
+    )
 
     selection = _split_names(assets)
 
@@ -747,9 +776,12 @@ def backfill_status(
         envvar="RIVERS_SURREAL_ENDPOINT",
         help="Remote SurrealDB endpoint (overrides --storage-path)",
     ),
+    code_location_id: str | None = _CODE_LOCATION_ID_OPT,
 ) -> None:
     """Check status of a backfill."""
-    repo_obj = _load_repo(module, repo_var, memory, storage_path, surreal_endpoint)
+    repo_obj = _load_repo(
+        module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
+    )
     status = repo_obj.get_backfill(backfill_id)
     if status is None:
         typer.echo(f"Backfill '{backfill_id}' not found", err=True)
@@ -786,9 +818,12 @@ def backfill_cancel(
         envvar="RIVERS_SURREAL_ENDPOINT",
         help="Remote SurrealDB endpoint (overrides --storage-path)",
     ),
+    code_location_id: str | None = _CODE_LOCATION_ID_OPT,
 ) -> None:
     """Cancel a running backfill."""
-    repo_obj = _load_repo(module, repo_var, memory, storage_path, surreal_endpoint)
+    repo_obj = _load_repo(
+        module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
+    )
     success = repo_obj.cancel_backfill(backfill_id)
     if success:
         typer.echo(

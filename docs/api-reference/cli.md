@@ -22,12 +22,21 @@ rivers materialize my_pipeline --repo-var pipeline_repo
 | Flag | Description |
 |------|-------------|
 | `--surreal-endpoint` | Remote SurrealDB endpoint, e.g. `ws://surrealdb:8000`. Also read from `RIVERS_SURREAL_ENDPOINT`. Overrides `--storage-path` and `--memory`. |
+| `--code-location-id` | The code location to record runs, asset state and pool claims under. Also read from `RIVERS_CODE_LOCATION_ID`. Default: `default`. |
 | `--storage-path` | Embedded SurrealDB+RocksDB path. Kept at exit. |
 | `--memory` | In-memory storage, lost at exit. |
 
-When `RIVERS_SURREAL_ENDPOINT` is set (the operator sets it on rivers pods), these commands use that endpoint without the flag, and it also overrides `--storage-path` and `--memory`.
+When `RIVERS_SURREAL_ENDPOINT` and `RIVERS_CODE_LOCATION_ID` are set (the operator sets both on rivers pods), these commands use them without the flags. The endpoint also overrides `--storage-path` and `--memory`.
 
-Without `--surreal-endpoint`, `RIVERS_SURREAL_ENDPOINT` or `--storage-path`, the run's state and its pool claims go to a scratch store at `.rivers/storage/`. The CLI removes that store at exit, and no other process reads it. So a `delete` removes the real data, but the code location never sees the deletion, and the verb's pool claims do not block the code location's runs. To act on a code location's data, point the command at the storage that the code location uses.
+A deployed code location reads only what is recorded under its id: the `spec.identity` UUID of its `CodeLocation`.
+
+```bash
+kubectl get codelocation analytics -o jsonpath='{.spec.identity}'
+```
+
+Outside a rivers pod, pass that id with `--code-location-id`. Without it, the command records under code location `default`. So a `delete` removes the real data, but the code location still sees the partition as materialized, and the verb's pool claims do not block the code location's runs. The commands write a warning to stderr when they use `--surreal-endpoint` or `RIVERS_SURREAL_ENDPOINT` without a code location id. The command still runs.
+
+Without `--surreal-endpoint`, `RIVERS_SURREAL_ENDPOINT` or `--storage-path`, the run's state and its pool claims go to a scratch store in a new temporary directory for each command. The CLI removes that store at exit, and no other process reads it. So a `delete` removes the real data, but the code location never sees the deletion, and the verb's pool claims do not block the code location's runs. To act on a code location's data, point the command at the storage that the code location uses, and give the code location's id.
 
 `run-action` and `backfill --action` write a warning to stderr when a verb with outcome `Unmaterialize` (such as `delete`) runs on the scratch store or with `--memory`, which is also removed at exit. The command still runs.
 
@@ -85,16 +94,17 @@ Resolves the repository and runs `repo.materialize()` synchronously. Useful for 
 | Flag | Description |
 |------|-------------|
 | `--partition-key` | Partition key (string). |
-| `--surreal-endpoint` / `--storage-path` / `--memory` | Storage. See [Storage flags](#storage-flags). |
+| `--surreal-endpoint` / `--code-location-id` / `--storage-path` / `--memory` | Storage. See [Storage flags](#storage-flags). |
 
 ---
 
 ## `run-action` — run an asset action
 
 ```bash
-rivers run-action my_pipeline optimize --surreal-endpoint ws://surrealdb:8000
+rivers run-action my_pipeline optimize \
+  --surreal-endpoint ws://surrealdb:8000 --code-location-id CODE_LOCATION_ID
 rivers run-action my_pipeline delete --select events --partition-key 2024-01-15 \
-  --surreal-endpoint ws://surrealdb:8000
+  --surreal-endpoint ws://surrealdb:8000 --code-location-id CODE_LOCATION_ID
 ```
 
 Resolves the repository and runs `repo.run_action(VERB, ...)` synchronously — the
@@ -104,7 +114,7 @@ Resolves the repository and runs `repo.run_action(VERB, ...)` synchronously — 
 |------|-------------|
 | `--select`, `-s` | Comma-separated asset names. Default: every asset that defines the verb. |
 | `--partition-key` | Partition key (string), as the verb's `partitioning` allows. |
-| `--surreal-endpoint` / `--storage-path` / `--memory` | Storage. See [Storage flags](#storage-flags). A verb that changes data needs the code location's storage. |
+| `--surreal-endpoint` / `--code-location-id` / `--storage-path` / `--memory` | Storage. See [Storage flags](#storage-flags). A verb that changes data needs the code location's storage and id. |
 
 ---
 
@@ -116,7 +126,8 @@ rivers backfill my_pipeline \
   --from 2024-01-01 --to 2024-01-31 \
   --strategy multi_run \
   --concurrency 4 \
-  --surreal-endpoint ws://surrealdb:8000
+  --surreal-endpoint ws://surrealdb:8000 \
+  --code-location-id CODE_LOCATION_ID
 ```
 
 Launches `repo.backfill()` against either:
@@ -133,15 +144,17 @@ Launches `repo.backfill()` against either:
 | `--on-failure` | `continue` | `continue` or `stop_on_failure`. |
 | `--dry-run` | `False` | Preview without executing. |
 | `--action` | none | Run this verb in every child run instead of materializing. |
-| `--surreal-endpoint` / `--storage-path` / `--memory` | scratch store | Storage. See [Storage flags](#storage-flags). |
+| `--surreal-endpoint` / `--code-location-id` / `--storage-path` / `--memory` | scratch store | Storage. See [Storage flags](#storage-flags). |
 
 ---
 
 ## `backfill-status` / `backfill-cancel`
 
 ```bash
-rivers backfill-status BACKFILL_ID my_pipeline --surreal-endpoint ws://surrealdb:8000
-rivers backfill-cancel BACKFILL_ID my_pipeline --surreal-endpoint ws://surrealdb:8000
+rivers backfill-status BACKFILL_ID my_pipeline \
+  --surreal-endpoint ws://surrealdb:8000 --code-location-id CODE_LOCATION_ID
+rivers backfill-cancel BACKFILL_ID my_pipeline \
+  --surreal-endpoint ws://surrealdb:8000 --code-location-id CODE_LOCATION_ID
 ```
 
 Both take the [storage flags](#storage-flags). Point them at the storage that the backfill runs against: a scratch store never holds an earlier backfill.
