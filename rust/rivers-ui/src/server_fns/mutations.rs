@@ -330,8 +330,9 @@ pub async fn launch_backfill(
     partition_keys: Vec<SubmitPartitionKey>,
     tags: Option<Vec<(String, String)>>,
     job_name: Option<String>,
-    /// The verb the child runs execute; `None` materializes. A job target
-    /// carries its own verb, so this is for `selection` targets.
+    /// The verb the child runs execute; `None` materializes. For a job target
+    /// it is the verb the page showed for the job: the backend refuses the
+    /// backfill if the job now runs another one.
     action: Option<String>,
 ) -> Result<BackfillRerunResult, ServerFnError> {
     use rivers_api::rivers::LaunchBackfillRequest;
@@ -377,12 +378,15 @@ pub async fn launch_backfill(
 /// the `run_id` immediately; the caller polls the run-detail page for
 /// completion. The dispatcher mode (`"queued"` or `"direct"`) is not
 /// reported here — the UI navigates to the run page either way.
+/// `action` is the verb the page showed for the job (`None` materializes):
+/// the backend refuses the run if the job now runs another one.
 /// `whole_asset` is as for [`trigger_action`], for the job's verb.
 #[server]
 pub async fn execute_job(
     loc_ns: String,
     loc_name: String,
     job_name: String,
+    action: Option<String>,
     partition_key: Option<SubmitPartitionKey>,
     whole_asset: bool,
 ) -> Result<MaterializeResult, ServerFnError> {
@@ -400,6 +404,7 @@ pub async fn execute_job(
             partition_key: partition_key.map(submit_to_proto),
             user: current_user_ref().await,
             whole_asset,
+            action,
         })
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;

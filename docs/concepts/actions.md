@@ -76,6 +76,13 @@ build a key sends none either, and the verb would then run on every partition. T
 built-in `observe` changes no data and is exempt. `repo.run_action`, jobs run from
 Python, and the CLI keep the keyless form without the flag.
 
+A job runs its own verb, so a gRPC caller that starts a job also names the verb that
+it showed. `ExecuteJob` and a `LaunchBackfill` of a job carry it in `action` (unset
+means materialize). The server rejects the request when the job now runs a different
+verb. A page that has not loaded the job, or that loaded it before a redeploy, gets
+an error and nothing runs. The UI keeps the job page's **Execute** button disabled
+until it has loaded the job.
+
 Multi-partition actions are ordinary backfills, and child runs inherit the verb:
 
 ```python
@@ -92,6 +99,11 @@ the failed ones: a rerun of a `delete` backfill deletes every partition again,
 including partitions materialized again after the first run. To retry only some
 partitions, start a new backfill with their keys and the same `action` (see
 [Rerunning a backfill](backfills.md#rerunning-a-backfill)).
+
+A rerun of a job's backfill or run uses the verb that its record stores. If the job
+now runs a different verb, for example after a redeploy, the rerun is rejected. A
+job backfill that the daemon picks up after such a change fails, and none of its runs
+start.
 
 Scheduling costs nothing new — the verb lives on the `Job`:
 

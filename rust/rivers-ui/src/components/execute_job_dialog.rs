@@ -54,12 +54,14 @@ pub fn ExecuteJobDialog(
     let action = Action::new(move |input: &(Vec<SubmitPartitionKey>, bool)| {
         let (keys, whole_asset) = input.clone();
         let job = job_name.get_untracked();
+        // The server refuses a job that no longer runs the verb shown here.
+        let shown = verb.get_untracked().map(|v| v.name);
         let (ns, name) = loc.get_untracked();
         async move {
             if keys.len() > BACKFILL_THRESHOLD {
                 // >2 partitions → one job-aware backfill. `None` selection: the
                 // server resolves the job's assets.
-                let r = launch_backfill(ns, name, None, keys, None, Some(job), None)
+                let r = launch_backfill(ns, name, None, keys, None, Some(job), shown)
                     .await
                     .map_err(|e| format!("{e}"))?;
                 return Ok::<ExecOutcome, String>(ExecOutcome::Backfill(r.backfill_id));
@@ -71,10 +73,17 @@ pub fn ExecuteJobDialog(
             };
             let mut last_run_id = String::new();
             for pk in key_opts {
-                last_run_id = execute_job(ns.clone(), name.clone(), job.clone(), pk, whole_asset)
-                    .await
-                    .map_err(|e| format!("{e}"))?
-                    .run_id;
+                last_run_id = execute_job(
+                    ns.clone(),
+                    name.clone(),
+                    job.clone(),
+                    shown.clone(),
+                    pk,
+                    whole_asset,
+                )
+                .await
+                .map_err(|e| format!("{e}"))?
+                .run_id;
             }
             Ok(ExecOutcome::Run(last_run_id))
         }

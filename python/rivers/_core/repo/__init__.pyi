@@ -348,6 +348,10 @@ class CodeRepository:
             backfill_id: ID of the backfill to rerun.
             block: Wait for the rerun to finish before returning.
             dry_run: Plan only — return the would-be run shape without launching.
+
+        Raises:
+            ExecutionError: The backfill ran a job that now runs a different
+                verb than the recorded one.
         """
         ...
     @overload

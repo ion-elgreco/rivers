@@ -144,25 +144,53 @@ where
         } else {
             String::new()
         };
-        responder(&url)
+        match responder(&url) {
+            Some(json) => Reply::Json(json),
+            None => Reply::Error,
+        }
     })
 }
 
 /// [`install_fetch_mock`] that answers every call with `json` and keeps each
 /// `Request`, so a test can read what a server fn sent ([`request_bodies`]).
-pub fn install_recording_fetch_mock(
-    json: &'static str,
-) -> (
-    FetchMock,
-    std::rc::Rc<std::cell::RefCell<Vec<web_sys::Request>>>,
-) {
-    let requests = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+pub fn install_recording_fetch_mock(json: &'static str) -> (FetchMock, Requests) {
+    install_routing_fetch_mock(move |_| Reply::Json(json.to_string()))
+}
+
+/// What a mocked `fetch` answers.
+#[derive(Clone)]
+pub enum Reply {
+    /// HTTP 200 with this JSON body.
+    Json(String),
+    /// HTTP 500.
+    Error,
+    /// No answer: the server fn stays pending.
+    Pending,
+}
+
+/// The `Request`s a recording mock kept, in call order.
+pub type Requests = std::rc::Rc<std::cell::RefCell<Vec<web_sys::Request>>>;
+
+/// A `window.fetch` mock that answers each call by its URL and keeps each
+/// `Request`, so a test can read what a server fn sent ([`request_bodies`]).
+pub fn install_routing_fetch_mock<F>(route: F) -> (FetchMock, Requests)
+where
+    F: Fn(&str) -> Reply + 'static,
+{
+    let requests = Requests::default();
     let sink = requests.clone();
     let mock = install_fetch_handler(move |input| {
-        if let Ok(req) = input.dyn_into::<web_sys::Request>() {
-            sink.borrow_mut().push(req);
+        if let Some(url) = input.as_string() {
+            return route(&url);
         }
-        Some(json.to_string())
+        match input.dyn_into::<web_sys::Request>() {
+            Ok(req) => {
+                let reply = route(&req.url());
+                sink.borrow_mut().push(req);
+                reply
+            }
+            Err(_) => Reply::Error,
+        }
     });
     (mock, requests)
 }
@@ -179,10 +207,10 @@ pub async fn request_bodies(requests: &[web_sys::Request]) -> Vec<String> {
 }
 
 /// Replace `window.fetch` with `responder`, which gets the raw `input`
-/// argument and returns the JSON body (`None` = HTTP 500).
+/// argument and says what to answer.
 fn install_fetch_handler<F>(responder: F) -> FetchMock
 where
-    F: Fn(JsValue) -> Option<String> + 'static,
+    F: Fn(JsValue) -> Reply + 'static,
 {
     use wasm_bindgen::JsCast;
     use wasm_bindgen::closure::Closure;
@@ -201,10 +229,10 @@ where
 
     let closure: Closure<dyn FnMut(JsValue, JsValue) -> js_sys::Promise> =
         Closure::new(move |input: JsValue, _init: JsValue| {
-            let body = responder(input);
-            let (body_str, status) = match body {
-                Some(json) => (json, 200),
-                None => (String::new(), 500),
+            let (body_str, status) = match responder(input) {
+                Reply::Json(json) => (json, 200),
+                Reply::Error => (String::new(), 500),
+                Reply::Pending => return js_sys::Promise::new(&mut |_, _| {}),
             };
             let response_jsv = factory
                 .call2(

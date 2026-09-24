@@ -6,6 +6,9 @@ never exercises this command (`norecursedirs` excludes the only integration
 test that does).
 """
 
+import time
+
+import pytest
 import rivers as rs
 from rivers._core.storage import Storage
 from typer.testing import CliRunner
@@ -149,3 +152,98 @@ def test_execute_routes_a_materialize_run(resolved_tmp_path, monkeypatch):
         ],
     )
     assert result.exit_code == 0, result.output
+
+
+JOB_REPO_MODULE = """
+import rivers as rs
+
+
+def _touch(ctx):
+    return None
+
+
+touch = rs.AssetAction(name="touch", outcome=rs.Outcome.Unchanged)(_touch)
+
+
+@rs.Asset(name="tiny", actions=[touch])
+def tiny() -> int:
+    return 1
+
+
+repo = rs.CodeRepository(
+    assets=[tiny], jobs=[rs.Job(name="nightly", assets=[tiny], action={action!r})]
+)
+"""
+
+
+def _execute_nightly(resolved_tmp_path, monkeypatch, recorded, current):
+    """Run the pod command on a `nightly` run recorded with verb `recorded`,
+    from definitions whose `nightly` runs `current`."""
+    # One module name per pair: the command imports it, and an imported module
+    # stays bound to the store of the test that first imported it.
+    module = f"defs_nightly_{recorded or 'materialize'}_{current or 'materialize'}"
+    (resolved_tmp_path / f"{module}.py").write_text(
+        JOB_REPO_MODULE.format(action=current)
+    )
+    store = _cloud_env(monkeypatch, resolved_tmp_path / "storage")
+    store._create_run(
+        "pod-run-5",
+        "nightly",
+        "NotStarted",
+        time.time_ns(),
+        node_names=["tiny"],
+        action=recorded,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "execute",
+            module,
+            "--run-id",
+            "pod-run-5",
+            "--job",
+            "nightly",
+            "--surreal-endpoint",
+            "ws://unused",
+        ],
+    )
+    return store, result
+
+
+@pytest.mark.parametrize(
+    "recorded, current", [(None, "touch"), ("touch", None)], ids=["gained", "lost"]
+)
+def test_execute_job_refuses_a_verb_the_run_was_not_launched_with(
+    resolved_tmp_path, monkeypatch, recorded, current
+):
+    """The record keeps the verb the run was launched with, but the pod ran
+    the job as the image it starts defines it, which a redeploy may have
+    changed: a queued materialize ran the job's new delete. The pod fails
+    the run instead. It stores the outcome and exits non-zero, so the
+    operator writes the terminal status of a run that never started."""
+    store, result = _execute_nightly(resolved_tmp_path, monkeypatch, recorded, current)
+
+    message = (
+        f"job 'nightly' now runs '{current or 'materialize'}', "
+        f"not '{recorded or 'materialize'}'"
+    )
+    assert result.exit_code == 1, result.output
+    assert message in result.output
+    outcome = store.kv_get("run_outcome:pod-run-5")
+    assert outcome is not None and b"Failure" in outcome
+    assert message.encode() in outcome
+    assert store.get_events_for_run("pod-run-5") == []
+    assert store.get_run("pod-run-5").status == "NotStarted"
+
+
+def test_execute_job_runs_the_verb_the_run_was_launched_with(
+    resolved_tmp_path, monkeypatch
+):
+    """Falsifier: the job's verb and the record's agree, so the run runs."""
+    store, result = _execute_nightly(resolved_tmp_path, monkeypatch, "touch", "touch")
+
+    assert result.exit_code == 0, result.output
+    types = {e.event_type for e in store.get_events_for_run("pod-run-5")}
+    assert "ActionCompleted" in types and "Materialization" not in types
+    outcome = store.kv_get("run_outcome:pod-run-5")
+    assert outcome is not None and b"Success" in outcome

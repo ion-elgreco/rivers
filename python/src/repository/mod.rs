@@ -67,6 +67,55 @@ fn job_action(jobs_info: &HashMap<String, JobSummary>, job_name: Option<&str>) -
     job_name.and_then(|j| jobs_info.get(j).and_then(|s| s.action.clone()))
 }
 
+/// Reject running `job_name` as `expected` (`None` is materialize) when the
+/// job now runs another verb. A job runs its own verb, so a page that showed
+/// an older one, or a record that stores it, must not start the new one. An
+/// unknown job is left to the lookup that reports it.
+fn ensure_job_verb(
+    jobs_info: &HashMap<String, JobSummary>,
+    job_name: &str,
+    expected: Option<&str>,
+) -> PyResult<()> {
+    let Some(job) = jobs_info.get(job_name) else {
+        return Ok(());
+    };
+    let current = job.action.as_deref().unwrap_or("materialize");
+    let expected = expected.unwrap_or("materialize");
+    if current == expected {
+        return Ok(());
+    }
+    Err(ExecutionError::new_err(format!(
+        "job '{job_name}' now runs '{current}', not '{expected}'"
+    )))
+}
+
+/// A picked-up job backfill runs the verb it recorded. If its job now runs
+/// another one, fail the backfill (still `Requested`) instead of running it.
+fn fail_backfill_if_job_verb_changed(
+    state: &ResolvedState,
+    record: &BackfillRecord,
+) -> PyResult<()> {
+    let Some(job_name) = &record.job_name else {
+        return Ok(());
+    };
+    let Err(e) = ensure_job_verb(&state.jobs_info, job_name, record.action.as_deref()) else {
+        return Ok(());
+    };
+    if let Err(mark_err) = io_rt().block_on(
+        state
+            .storage
+            .fail_backfill(&record.backfill_id, &format!("{e}")),
+    ) {
+        tracing::error!(
+            target: "rivers::repo",
+            backfill_id = %record.backfill_id,
+            error = %mark_err,
+            "failed to mark backfill failed"
+        );
+    }
+    Err(e)
+}
+
 /// Assets defining `action`, sorted. Single source of truth for what
 /// `selection=None` means for an action — a queued or Kubernetes-backed run
 /// carries its asset list on the record, so "everything" has to be spelled out.
@@ -1534,7 +1583,8 @@ pub(crate) struct RunSubmission {
     /// `Some(job)` enqueues the run as a job execution (resolved with the job's
     /// plan + executor on dequeue); `None` for an ad-hoc materialization.
     pub(crate) job_name: Option<String>,
-    /// The verb the dequeued run executes; `None` means materialize.
+    /// The verb the dequeued run executes; `None` means materialize. For a
+    /// job, the verb its backfill recorded, checked against the job's own.
     pub(crate) action: Option<String>,
 }
 
@@ -1623,6 +1673,15 @@ impl RepoHandle {
             job.asset_names.iter().map(String::as_str),
             verb,
         )
+    }
+
+    /// See [`ensure_job_verb`].
+    pub(crate) fn validate_job_verb(&self, job_name: &str, expected: Option<&str>) -> PyResult<()> {
+        let guard = self.state.read().unwrap();
+        let state = guard.as_ref().ok_or_else(|| {
+            ExecutionError::new_err("CodeRepository not resolved — call resolve() first")
+        })?;
+        ensure_job_verb(&state.jobs_info, job_name, expected)
     }
 
     pub(crate) fn list_jobs(&self) -> Vec<JobSummary> {
@@ -1784,12 +1843,7 @@ impl RepoHandle {
 
             for sub in &runs {
                 let asset_names = sub.selection.clone().unwrap_or_else(|| all_names.clone());
-                // A job target carries its own verb; `sub.action` is the
-                // selection-target verb from `backfill(action=...)`.
-                let action = sub
-                    .action
-                    .clone()
-                    .or_else(|| job_action(&state.jobs_info, sub.job_name.as_deref()));
+                let action = sub.action.clone();
                 validate_partition_for_verb(
                     state,
                     asset_names.iter().map(String::as_str),
@@ -2188,13 +2242,9 @@ impl RepoHandle {
         let mut tag_map: HashMap<String, String> = record.tags.into_iter().collect();
         tag_map.insert(tag_keys::RERUN_OF.to_string(), backfill_id.to_string());
 
-        // A Job target carries its own verb; the record names it for readers.
-        let (target, action) = match record.job_name {
-            Some(name) => (crate::daemon::RunType::Job(name), None),
-            None => (
-                crate::daemon::RunType::Materialization(record.asset_selection),
-                record.action,
-            ),
+        let target = match record.job_name {
+            Some(name) => crate::daemon::RunType::Job(name),
+            None => crate::daemon::RunType::Materialization(record.asset_selection),
         };
 
         Ok(crate::daemon::BackfillRequestData {
@@ -2208,7 +2258,8 @@ impl RepoHandle {
             launched_by,
             dry_run,
             backfill_id: None,
-            action,
+            // A Job target must still run it: see `backfill_inner`.
+            action: record.action,
         })
     }
 
@@ -2246,15 +2297,19 @@ impl RepoHandle {
         tags.push((tag_keys::RERUN_OF.to_string(), run_id.to_string()));
 
         match record.job_name {
-            Some(job_name) => Ok(crate::daemon::RunRerunRequest::Job(
-                crate::daemon::RunRequestData {
-                    run_key: None,
-                    tags: Some(tags.into_iter().collect()),
-                    partition_key: record.partition_key.as_ref().map(PyPartitionKey::from),
-                    job_name: Some(job_name),
-                    launched_by,
-                },
-            )),
+            Some(job_name) => {
+                // The job is dispatched by name and runs its own verb.
+                self.validate_job_verb(&job_name, record.action.as_deref())?;
+                Ok(crate::daemon::RunRerunRequest::Job(
+                    crate::daemon::RunRequestData {
+                        run_key: None,
+                        tags: Some(tags.into_iter().collect()),
+                        partition_key: record.partition_key.as_ref().map(PyPartitionKey::from),
+                        job_name: Some(job_name),
+                        launched_by,
+                    },
+                ))
+            }
             None => Ok(crate::daemon::RunRerunRequest::Materialization(
                 crate::daemon::MaterializationRequestData {
                     run_id: uuid::Uuid::new_v4().to_string(),
@@ -4158,8 +4213,9 @@ impl PyCodeRepository {
 
     /// Loads the original `BackfillRecord` from storage and resubmits it via
     /// `backfill()`, preserving asset selection, partition keys, strategy,
-    /// failure policy, concurrency, and tags. Appends a `rivers/rerun_of`
-    /// tag pointing at the original backfill id.
+    /// failure policy, concurrency, tags and verb. Appends a `rivers/rerun_of`
+    /// tag pointing at the original backfill id. A job backfill whose job now
+    /// runs another verb is refused.
     #[pyo3(signature = (backfill_id, block = true, dry_run = false))]
     pub(crate) fn rerun_backfill(
         &self,
@@ -4203,10 +4259,6 @@ impl PyCodeRepository {
                         })?,
                     None => record.asset_selection.clone(),
                 };
-                let verb = record
-                    .action
-                    .clone()
-                    .or_else(|| job_action(&state.jobs_info, record.job_name.as_deref()));
                 let candidates: Vec<(PyPartitionKey, Vec<DynamicKeyCheck>)> = partition_keys
                     .into_iter()
                     .filter(|key| {
@@ -4214,7 +4266,7 @@ impl PyCodeRepository {
                             state,
                             selection_names.iter().map(String::as_str),
                             Some(key),
-                            verb.as_deref(),
+                            record.action.as_deref(),
                         )
                         .is_ok()
                     })
@@ -4275,13 +4327,9 @@ impl PyCodeRepository {
             let mut tags = record.tags.clone();
             tags.push((tag_keys::RERUN_OF.to_string(), backfill_id));
 
-            // A Job target carries its own verb; the record names it for readers.
-            let (target, action) = match &record.job_name {
-                Some(name) => (crate::daemon::RunType::Job(name.clone()), None),
-                None => (
-                    crate::daemon::RunType::Materialization(record.asset_selection.clone()),
-                    record.action.clone(),
-                ),
+            let target = match &record.job_name {
+                Some(name) => crate::daemon::RunType::Job(name.clone()),
+                None => crate::daemon::RunType::Materialization(record.asset_selection.clone()),
             };
 
             self.backfill_inner(
@@ -4297,7 +4345,7 @@ impl PyCodeRepository {
                 dry_run,
                 None,
                 rivers_core::storage::LaunchedBy::default(),
-                action,
+                record.action.clone(),
             )
         })
     }
@@ -4509,6 +4557,15 @@ impl PyCodeRepository {
                 (assets, Some(name))
             }
         };
+        // A Job target runs its own verb: `action` is the one the caller showed
+        // for it, or a rerun's recorded one.
+        let action = match &job_name {
+            Some(name) => {
+                ensure_job_verb(&state.jobs_info, name, action.as_deref())?;
+                None
+            }
+            None => action,
+        };
         // An empty Materialization selection means "all assets" — expand it
         // so key/strategy validation sees the effective selection.
         let selection: Vec<String> = if selection.is_empty() {
@@ -4527,12 +4584,6 @@ impl PyCodeRepository {
         };
 
         if let Some(verb) = &action {
-            if job_name.is_some() {
-                return Err(ExecutionError::new_err(
-                    "backfill(action=...) applies to an asset selection; a Job target \
-                     carries its own action",
-                ));
-            }
             if selection.is_empty() {
                 return Err(AssetNotFoundError::new_err(format!(
                     "No assets define action '{verb}'"
@@ -4821,6 +4872,7 @@ impl PyCodeRepository {
                 record.status
             )));
         }
+        fail_backfill_if_job_verb_changed(state, &record)?;
 
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
@@ -5032,6 +5084,7 @@ impl PyCodeRepository {
                 record.status
             )));
         }
+        fail_backfill_if_job_verb_changed(state, &record)?;
 
         io_rt()
             .block_on(state.storage.update_backfill_status(

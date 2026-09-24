@@ -155,7 +155,7 @@ def rerun_backfill(
 ) -> BackfillResult
 ```
 
-Launch a previous backfill again. The rerun replays every partition of the original backfill, not only the failed or canceled ones; keys that are no longer valid are dropped. It keeps the original verb, so a rerun of a `delete` backfill deletes every partition again, including partitions materialized again after the first run. To retry only some partitions, call `backfill()` with those keys and the original `action`. See [Backfills](backfills.md) for the full reference.
+Launch a previous backfill again. The rerun replays every partition of the original backfill, not only the failed or canceled ones; keys that are no longer valid are dropped. It keeps the original verb, so a rerun of a `delete` backfill deletes every partition again, including partitions materialized again after the first run. For a backfill of a job, it raises `ExecutionError` if the job now runs a different verb. To retry only some partitions, call `backfill()` with those keys and the original `action`. See [Backfills](backfills.md) for the full reference.
 
 ### `observe()`
 

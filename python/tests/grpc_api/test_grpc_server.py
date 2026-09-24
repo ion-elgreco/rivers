@@ -1,11 +1,15 @@
 """Integration tests for the gRPC CodeLocation server."""
 
+import contextlib
+import re
+
 import grpc
 import pytest
 
 import rivers as rs
 from _polling import wait_for_asset_materialized as _wait_for_asset_materialized
 from _polling import wait_for_run_terminal, wait_until
+from rivers.exceptions import ExecutionError
 
 
 # ── Test helpers ──
@@ -397,16 +401,22 @@ def queued_grpc_channel(grpc_stubs, storage):
     repo._stop_grpc_server()
 
 
-def test_launch_backfill_action_with_job_target_is_rejected(queued_grpc_channel):
-    """A Job target carries its own verb — `action` on top must refuse rather
-    than pick one."""
+def test_launch_backfill_action_with_job_target_must_be_the_jobs_verb(
+    queued_grpc_channel,
+):
+    """A Job target runs its own verb: `action` names the verb the caller
+    showed for it, and a different one is refused rather than picked."""
     channel, pb2, pb2_grpc, _, _ = queued_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)
     with pytest.raises(grpc.RpcError) as exc:
         stub.LaunchBackfill(
             pb2.LaunchBackfillRequest(job_name="test_job", action="compact")
         )
-    assert "carries its own action" in exc.value.details()
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert exc.value.details() == (
+        "ExecutionError: job 'test_job' now runs 'materialize', not 'compact'; "
+        "reload the page"
+    )
 
 
 def test_materialize_with_run_queue_creates_queued_run(queued_grpc_channel):
@@ -721,7 +731,7 @@ def _launch(pb2, stub, rpc, verb, asset, **fields):
         assert resp.success, resp.error
         return resp.run_id
     return stub.ExecuteJob(
-        pb2.ExecuteJobRequest(job_name=f"{verb}_{asset}", **fields)
+        pb2.ExecuteJobRequest(job_name=f"{verb}_{asset}", action=verb, **fields)
     ).run_id
 
 
@@ -1261,12 +1271,13 @@ def test_job_backfill_records_the_jobs_verb(backfill_grpc_channel):
             ],
             failure_policy="continue",
             max_concurrency=1,
+            action="compact",
         )
     )
     assert status(launch.backfill_id).action == "compact"
     assert repo.get_backfill(launch.backfill_id).action == "compact"
 
-    # A rerun replays the job, which carries its own verb.
+    # A rerun replays the recorded verb, which the job still runs.
     rerun = stub.RerunBackfill(
         pb2.RerunBackfillRequest(backfill_id=launch.backfill_id, dry_run=False)
     )
@@ -1596,7 +1607,9 @@ def test_execute_job_action_records_the_verb(grpc_stubs, storage):
     pb2, pb2_grpc = grpc_stubs
     try:
         stub = pb2_grpc.CodeLocationServiceStub(channel)
-        resp = stub.ExecuteJob(pb2.ExecuteJobRequest(job_name="compact_job"))
+        resp = stub.ExecuteJob(
+            pb2.ExecuteJobRequest(job_name="compact_job", action="compact")
+        )
         assert resp.run_id
 
         record = wait_for_run_terminal(storage, resp.run_id, timeout=15)
@@ -1661,6 +1674,243 @@ def test_rerun_run_not_found(rerun_grpc_channel):
     with pytest.raises(grpc.RpcError) as exc_info:
         stub.RerunRun(pb2.RerunRunRequest(run_id="missing-id"))
     assert exc_info.value.code() == grpc.StatusCode.INTERNAL
+
+
+# ── A job's verb: launches name the one shown, reruns and pickups the recorded one ──
+
+
+def _nightly_repo(storage, rows, action, **repo_kwargs):
+    """A code location whose `nightly` job runs `action` (`None` materializes)
+    on a partitioned `events`. `rows` stands in for the table: materialize
+    adds the partition, the Optional-key `delete` removes it."""
+
+    def _delete(ctx):
+        rows.discard(ctx.partition_key)
+
+    delete = rs.AssetAction(
+        name="delete",
+        outcome=rs.Outcome.Unmaterialize,
+        partitioning=rs.ActionPartitioning.Optional,
+    )(_delete)
+
+    @rs.Asset(
+        io_handler=rs.InMemoryIOHandler(),
+        actions=[delete],
+        partitions_def=rs.PartitionsDefinition.static_(["p1", "p2"]),
+    )
+    def events(context: rs.AssetExecutionContext):
+        rows.add(context.partition_key)
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[events],
+        jobs=[rs.Job(name="nightly", assets=[events], action=action)],
+        default_executor=rs.Executor.in_process(),
+        **repo_kwargs,
+    )
+    repo.resolve(storage=storage)
+    return repo
+
+
+@contextlib.contextmanager
+def _serving(repo, grpc_stubs):
+    """`repo`'s gRPC server and a stub for it. Stopping the server waits for
+    the runs it launched."""
+    port = repo._start_grpc_server("127.0.0.1", 0)
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+    pb2, pb2_grpc = grpc_stubs
+    try:
+        yield pb2, pb2_grpc.CodeLocationServiceStub(channel)
+    finally:
+        channel.close()
+        repo._stop_grpc_server()
+
+
+def _shown(verb):
+    """Request fields naming `verb` as the one the caller showed."""
+    return {} if verb is None else {"action": verb}
+
+
+def _nightly_backfill(pb2, **fields):
+    return pb2.LaunchBackfillRequest(
+        job_name="nightly",
+        partition_keys=[
+            _single_partition_key(pb2, "p1"),
+            _single_partition_key(pb2, "p2"),
+        ],
+        failure_policy="continue",
+        max_concurrency=1,
+        **fields,
+    )
+
+
+@pytest.mark.parametrize("queued", [False, True], ids=["direct", "queued"])
+@pytest.mark.parametrize(
+    "shown, verb",
+    [(None, "delete"), ("delete", None)],
+    ids=["not-loaded", "redeployed"],
+)
+def test_execute_job_refuses_a_verb_the_caller_did_not_show(
+    grpc_stubs, storage, queued, shown, verb
+):
+    """The job pages chose the dialog, warning and confirm from the UI's copy
+    of the job's verb, but ExecuteJob named only the job and the server ran
+    the job's current verb. A page still loading the job, or loaded before a
+    redeploy, deleted with one click and no confirm. The request now names the
+    verb the caller showed, and another verb is refused before a run exists."""
+    rows = {"p1", "p2"}
+    queue = (
+        {"run_queue": rs.RunQueueConfig(max_concurrent_runs=2, dequeue_interval="50ms")}
+        if queued
+        else {}
+    )
+    repo = _nightly_repo(storage, rows, verb, **queue)
+    with _serving(repo, grpc_stubs) as (pb2, stub):
+        key = _single_partition_key(pb2, "p1")
+        with pytest.raises(grpc.RpcError) as exc:
+            stub.ExecuteJob(
+                pb2.ExecuteJobRequest(
+                    job_name="nightly", partition_key=key, **_shown(shown)
+                )
+            )
+        assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert exc.value.details() == (
+            f"ExecutionError: job 'nightly' now runs '{verb or 'materialize'}', "
+            f"not '{shown or 'materialize'}'; reload the page"
+        )
+        assert storage.get_runs(limit=100) == []
+        assert rows == {"p1", "p2"}
+
+        run_id = stub.ExecuteJob(
+            pb2.ExecuteJobRequest(job_name="nightly", partition_key=key, **_shown(verb))
+        ).run_id
+        if not queued:
+            wait_for_run_terminal(storage, run_id, timeout=15)
+
+    record = storage.get_run(run_id)
+    assert (record.action, record.status) == (verb, "Queued" if queued else "Success")
+    assert rows == ({"p2"} if verb == "delete" and not queued else {"p1", "p2"})
+
+
+@pytest.mark.parametrize(
+    "shown, verb",
+    [(None, "delete"), ("delete", None)],
+    ids=["not-loaded", "redeployed"],
+)
+def test_job_backfill_refuses_a_verb_the_caller_did_not_show(
+    grpc_stubs, storage, shown, verb
+):
+    """The job dialog backfills more than two keys. Like ExecuteJob, the
+    backfill named only the job, and its children ran the job's current verb."""
+    rows = {"p1", "p2"}
+    repo = _nightly_repo(storage, rows, verb)
+    with _serving(repo, grpc_stubs) as (pb2, stub):
+        with pytest.raises(grpc.RpcError) as exc:
+            stub.LaunchBackfill(_nightly_backfill(pb2, **_shown(shown)))
+        assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert exc.value.details() == (
+            f"ExecutionError: job 'nightly' now runs '{verb or 'materialize'}', "
+            f"not '{shown or 'materialize'}'; reload the page"
+        )
+
+        launch = stub.LaunchBackfill(_nightly_backfill(pb2, **_shown(verb)))
+
+    repo.execute_backfill(launch.backfill_id)
+    status = repo.get_backfill(launch.backfill_id)
+    assert (status.status, status.action) == ("CompletedSuccess", verb)
+    assert [r.action for r in storage.get_runs(limit=100)] == [verb, verb]
+    assert rows == (set() if verb == "delete" else {"p1", "p2"})
+
+
+@pytest.mark.parametrize("rerun", ["RerunBackfill", "rerun_backfill"])
+def test_backfill_rerun_refuses_a_job_whose_verb_changed(grpc_stubs, storage, rerun):
+    """A rerun replayed a job backfill by the job's name, so it ran the job's
+    verb as it is now, while the backfill page confirmed (or did not confirm)
+    the recorded one. After a redeploy turned `nightly` into a delete, one
+    click on a materialize backfill's "Re-execute" deleted every partition.
+    A rerun runs the recorded verb or nothing."""
+    rows = set()
+    original = _nightly_repo(storage, rows, None)
+    with _serving(original, grpc_stubs) as (pb2, stub):
+        launch = stub.LaunchBackfill(_nightly_backfill(pb2))
+    original.execute_backfill(launch.backfill_id)
+    assert rows == {"p1", "p2"}
+
+    redeployed = _nightly_repo(storage, rows, "delete")
+    if rerun == "RerunBackfill":
+        with _serving(redeployed, grpc_stubs) as (pb2, stub):
+            with pytest.raises(grpc.RpcError) as exc:
+                stub.RerunBackfill(
+                    pb2.RerunBackfillRequest(backfill_id=launch.backfill_id)
+                )
+        message = exc.value.details()
+    else:
+        with pytest.raises(ExecutionError) as exc:
+            redeployed.rerun_backfill(launch.backfill_id)
+        message = str(exc.value)
+    assert "job 'nightly' now runs 'delete', not 'materialize'" in message
+    assert rows == {"p1", "p2"}
+    assert len(storage.get_runs(limit=100)) == 2, "only the original backfill's runs"
+
+
+def test_run_rerun_refuses_a_job_whose_verb_changed(grpc_stubs, storage):
+    """ "Retry from" replayed a job run by the job's name. A run of a
+    materialize job, retried after a redeploy to `action="delete"`, deleted
+    its partition on the first click. The rerun runs the recorded verb or
+    nothing."""
+    rows = set()
+    original = _nightly_repo(storage, rows, None)
+    with _serving(original, grpc_stubs) as (pb2, stub):
+        run_id = stub.ExecuteJob(
+            pb2.ExecuteJobRequest(
+                job_name="nightly", partition_key=_single_partition_key(pb2, "p1")
+            )
+        ).run_id
+        record = wait_for_run_terminal(storage, run_id, timeout=15)
+        assert record is not None and record.status == "Success"
+    assert rows == {"p1"}
+
+    redeployed = _nightly_repo(storage, rows, "delete")
+    with _serving(redeployed, grpc_stubs) as (pb2, stub):
+        with pytest.raises(grpc.RpcError) as exc:
+            stub.RerunRun(pb2.RerunRunRequest(run_id=run_id))
+    assert "job 'nightly' now runs 'delete', not 'materialize'" in exc.value.details()
+    assert rows == {"p1"}
+    assert [r.run_id for r in storage.get_runs(limit=100)] == [run_id]
+
+
+@pytest.mark.parametrize("pickup", ["execute_backfill", "execute_backfill_queued"])
+def test_job_backfill_pickup_refuses_a_job_whose_verb_changed(
+    grpc_stubs, storage, pickup
+):
+    """A job backfill still Requested at a redeploy was picked up by the new
+    code, and its children ran the job's new verb while the record, the UI
+    and the condition cache read a materialize backfill. The pickup fails the
+    backfill instead."""
+    rows = {"p1", "p2"}
+    original = _nightly_repo(storage, rows, None)
+    with _serving(original, grpc_stubs) as (pb2, stub):
+        launch = stub.LaunchBackfill(_nightly_backfill(pb2))
+
+    queue = (
+        {"run_queue": rs.RunQueueConfig(max_concurrent_runs=2, dequeue_interval="50ms")}
+        if pickup == "execute_backfill_queued"
+        else {}
+    )
+    redeployed = _nightly_repo(storage, rows, "delete", **queue)
+    message = "job 'nightly' now runs 'delete', not 'materialize'"
+    with pytest.raises(ExecutionError, match=re.escape(message)):
+        getattr(redeployed, pickup)(launch.backfill_id)
+
+    status = redeployed.get_backfill(launch.backfill_id)
+    assert (status.status, status.error, status.run_ids) == (
+        "CompletedFailed",
+        f"ExecutionError: {message}",
+        [],
+    )
+    assert storage.get_runs(limit=100) == []
+    assert rows == {"p1", "p2"}
 
 
 # ── materialize_missing ──

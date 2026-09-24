@@ -81,46 +81,60 @@ pub fn JobDetailPage() -> impl IntoView {
     let navigate = leptos_router::hooks::use_navigate();
 
     // The job, resolved against its assets' declarations: the verb it runs
-    // (if any) and the partition picker that verb allows.
-    let job_launch = Memo::new(move |_| -> (Option<AssetActionInfo>, JobPartitionPicker) {
-        let current = name();
-        let Some(Ok(jobs_list)) = jobs.get() else {
-            return (None, JobPartitionPicker::None);
-        };
-        let Some(job) = jobs_list.into_iter().find(|j| j.name == current) else {
-            return (None, JobPartitionPicker::None);
-        };
-        let infos = assets_info.get().and_then(|r| r.ok()).unwrap_or_default();
-        let by_key: std::collections::HashMap<String, AssetDefinitionInfo> = infos
-            .into_iter()
-            .map(|i| (i.asset_key.clone(), i))
-            .collect();
-        let verb = job_verb(job.action.as_deref(), &job.asset_selection, &by_key);
-        let picker = job_partition_picker(verb.as_ref(), &job.asset_selection, &by_key);
-        (verb, picker)
-    });
+    // (if any) and the partition picker that verb allows. `None` until the
+    // job's definition has loaded: with no verb to show, Execute waits.
+    let job_launch = Memo::new(
+        move |_| -> Option<(Option<AssetActionInfo>, JobPartitionPicker)> {
+            let current = name();
+            let Some(Ok(jobs_list)) = jobs.get() else {
+                return None;
+            };
+            let job = jobs_list.into_iter().find(|j| j.name == current)?;
+            let infos = assets_info.get().and_then(|r| r.ok()).unwrap_or_default();
+            let by_key: std::collections::HashMap<String, AssetDefinitionInfo> = infos
+                .into_iter()
+                .map(|i| (i.asset_key.clone(), i))
+                .collect();
+            let verb = job_verb(job.action.as_deref(), &job.asset_selection, &by_key);
+            let picker = job_partition_picker(verb.as_ref(), &job.asset_selection, &by_key);
+            Some((verb, picker))
+        },
+    );
     // `JobPartitionPicker::None` means there's nothing for the dialog to
     // show — skip it and submit directly.
-    let job_picker = Signal::derive(move || job_launch.get().1);
-    let job_verb_signal = Signal::derive(move || job_launch.get().0);
+    let job_picker = Signal::derive(move || {
+        job_launch
+            .get()
+            .map_or(JobPartitionPicker::None, |(_, picker)| picker)
+    });
+    let job_verb_signal = Signal::derive(move || job_launch.get().and_then(|(verb, _)| verb));
+    // Set from an Effect, which runs only in the browser: the server renders
+    // Execute disabled, and hydration keeps a server-rendered boolean
+    // attribute as it is.
+    let job_loaded = RwSignal::new(false);
+    Effect::new(move |_| job_loaded.set(job_launch.get().is_some()));
     let exec_armed = use_confirm_armed(move || params.track());
 
     let dialog_job_name: Signal<String> = Signal::derive(name);
 
     let on_execute = move |_| {
-        if !matches!(job_picker.get(), JobPartitionPicker::None) {
+        let Some((verb, picker)) = job_launch.get() else {
+            return;
+        };
+        if !matches!(picker, JobPartitionPicker::None) {
             set_exec_error.set(None);
             show_dialog.set(true);
             return;
         }
         // A destructive verb takes a second click, as on the run page.
-        let destructive = job_verb_signal.get().is_some_and(|v| v.is_destructive());
+        let destructive = verb.as_ref().is_some_and(|v| v.is_destructive());
         let (dispatch, now_armed) = replay_click(destructive, exec_armed.get());
         exec_armed.set(now_armed);
         if !dispatch {
             return;
         }
         let job_name = name();
+        let shown = verb.map(|v| v.name);
         let navigate = navigate.clone();
         let (ns, lname) = loc.get();
         set_exec_pending.set(true);
@@ -128,7 +142,7 @@ pub fn JobDetailPage() -> impl IntoView {
         leptos::task::spawn_local(async move {
             let path_ns = ns.clone();
             let path_name = lname.clone();
-            match execute_job(ns, lname, job_name, None, false).await {
+            match execute_job(ns, lname, job_name, shown, None, false).await {
                 Ok(result) if !result.run_id.is_empty() => {
                     let path = loc_path(&path_ns, &path_name, &format!("runs/{}", result.run_id));
                     navigate(&path, Default::default());
@@ -169,7 +183,7 @@ pub fn JobDetailPage() -> impl IntoView {
             <button
                 class="btn btn-primary"
                 on:click=on_execute
-                disabled=move || exec_pending.get()
+                disabled=move || exec_pending.get() || !job_loaded.get()
             >
                 <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
                     <path d="M3 2l7 4-7 4V2z"/>

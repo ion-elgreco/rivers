@@ -1,9 +1,10 @@
 //! Jobs list page.
 //!
-//! The job *definitions* come from the gRPC code-location service (static for
-//! the session); the *last-run-per-job* data comes from storage and live-
-//! updates on the `runs` channel. Splitting the two keeps the definitions
-//! Resource keyed on `()` (one fetch per session) while kicks only rerun the
+//! The job *definitions* come from the gRPC code-location service, fetched
+//! once per page (Execute sends the verb it shows, and the server refuses a
+//! job whose verb changed since); the *last-run-per-job* data comes from
+//! storage and live-updates on the `runs` channel. Splitting the two keeps
+//! the definitions Resource keyed on the location while kicks only rerun the
 //! much cheaper last-run query.
 
 use std::collections::HashMap;
@@ -158,6 +159,7 @@ pub fn JobsListPage() -> impl IntoView {
                                         let ns = ns.clone();
                                         let name = name.clone();
                                         let row_picker = row_picker.clone();
+                                        let shown = verb_name.clone();
                                         move |ev: leptos::ev::MouseEvent| {
                                             ev.prevent_default();
                                             ev.stop_propagation();
@@ -175,6 +177,7 @@ pub fn JobsListPage() -> impl IntoView {
                                                 return;
                                             }
                                             let n = exec_name.clone();
+                                            let shown = shown.clone();
                                             let navigate = navigate.clone();
                                             let ns = ns.clone();
                                             let name = name.clone();
@@ -182,7 +185,7 @@ pub fn JobsListPage() -> impl IntoView {
                                             leptos::task::spawn_local(async move {
                                                 let path_ns = ns.clone();
                                                 let path_name = name.clone();
-                                                match execute_job(ns, name, n, None, false).await {
+                                                match execute_job(ns, name, n, shown, None, false).await {
                                                     Ok(result) if !result.run_id.is_empty() => {
                                                         let path = loc_path(&path_ns, &path_name, &format!("runs/{}", result.run_id));
                                                         navigate(&path, Default::default());

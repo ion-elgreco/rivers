@@ -244,6 +244,8 @@ The rivers web UI provides a dedicated **Backfills** page at `/backfills` that s
 
 `repo.rerun_backfill()` launches a previous backfill again as a new backfill, with the same selection, strategy and [verb](actions.md). The rerun replays every partition of the original backfill, not only the failed or canceled ones. Keys that are no longer valid for the current definitions are dropped. A rerun from the backfill's page in the web UI also replays every partition with the same verb.
 
+A backfill of a job keeps the verb that it recorded. If the job now runs a different verb, for example after a redeploy, the rerun is rejected with an error that names both verbs. To run the job's new verb, launch a new backfill of the job.
+
 ```python
 result = repo.rerun_backfill(result.backfill_id, block=True)
 ```
@@ -266,4 +268,4 @@ repo.backfill(
 
 ## Launch recovery
 
-A daemon-executed backfill commits `Requested → InProgress` before submitting its runs. If run submission fails, the backfill is marked `CompletedFailed` with the error recorded on the record. If the daemon dies in between instead (no runs were ever submitted), the backfill monitor notices the zero-run `InProgress` record after a grace period (180s) and flips it back to `Requested`, so the pickup loop re-executes it from scratch. Run submission is atomic — either all of a backfill's runs and their `run_ids` link land, or none do — which is what makes the automatic re-execution safe.
+A daemon-executed backfill commits `Requested → InProgress` before submitting its runs. If run submission fails, the backfill is marked `CompletedFailed` with the error recorded on the record. A backfill of a job whose verb changed after the backfill was requested is marked `CompletedFailed` before any of its runs start. If the daemon dies in between instead (no runs were ever submitted), the backfill monitor notices the zero-run `InProgress` record after a grace period (180s) and flips it back to `Requested`, so the pickup loop re-executes it from scratch. Run submission is atomic — either all of a backfill's runs and their `run_ids` link land, or none do — which is what makes the automatic re-execution safe.

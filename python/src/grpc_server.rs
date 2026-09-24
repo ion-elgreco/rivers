@@ -177,6 +177,10 @@ impl CodeLocationService for CodeLocationImpl {
                 req.job_name
             )));
         }
+        let shown = req.action.filter(|a| !a.is_empty());
+        self.handle
+            .validate_job_verb(&req.job_name, shown.as_deref())
+            .map_err(|e| Status::invalid_argument(format!("{e}; reload the page")))?;
         let partition_key = req
             .partition_key
             .map(proto_partition_key_to_py)
@@ -676,6 +680,17 @@ impl CodeLocationService for CodeLocationImpl {
         let tags = proto_tags_to_pairs(req.tags)
             .map(|pairs| pairs.into_iter().collect::<HashMap<String, String>>());
 
+        // For a Job target, `action` is the verb the caller showed for the job.
+        let action = match &req.job_name {
+            Some(name) => {
+                let shown = req.action.filter(|a| !a.is_empty());
+                self.handle
+                    .validate_job_verb(name, shown.as_deref())
+                    .map_err(|e| Status::invalid_argument(format!("{e}; reload the page")))?;
+                shown
+            }
+            None => req.action,
+        };
         let target = match req.job_name {
             Some(name) => crate::daemon::RunType::Job(name),
             None => crate::daemon::RunType::Materialization(req.selection),
@@ -691,7 +706,7 @@ impl CodeLocationService for CodeLocationImpl {
             dry_run: req.dry_run,
             backfill_id: None,
             launched_by: manual_launch(req.user),
-            action: req.action,
+            action,
         };
 
         let mut outcome = self

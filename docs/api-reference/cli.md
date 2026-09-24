@@ -155,7 +155,7 @@ rivers execute my_pipeline --run-id RID --surreal-endpoint ws://surreal:8000
 rivers execute-step my_pipeline --run-id RID --step-key my_asset
 ```
 
-Designed for K8s execution pods. `execute` runs an entire run with a pre-assigned `run-id`; `execute-step` runs one step (used by step worker pods).
+Designed for K8s execution pods. `execute` runs an entire run with a pre-assigned `run-id`; `execute-step` runs one step (used by step worker pods). With `--job`, `execute` fails the run, without starting it, when the job's verb in the pod's code differs from the verb on the run record.
 
 ---
 

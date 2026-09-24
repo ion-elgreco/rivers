@@ -270,7 +270,63 @@ async fn execute_job_whole_asset_choice_sends_whole_asset() {
     let bodies = request_bodies(&requests.borrow()).await;
     assert_eq!(
         bodies,
-        vec!["loc_ns=default&loc_name=demo&job_name=purge_events&whole_asset=true".to_string()]
+        vec![
+            "loc_ns=default&loc_name=demo&job_name=purge_events&action=delete&whole_asset=true"
+                .to_string()
+        ]
+    );
+}
+
+/// More than two keys launch one job backfill. It names the verb the dialog
+/// showed, so the server can refuse a job that now runs another one.
+#[wasm_bindgen_test]
+async fn execute_job_backfill_sends_the_verb_it_showed() {
+    nav_to("/locations/default/demo/jobs/purge_events");
+    let target = fresh_mount_target();
+    let (_mock, requests) = install_recording_fetch_mock(
+        r#"{"backfill_id": "BF-DEL", "num_partitions": 3, "num_runs": 3, "status": "Requested"}"#,
+    );
+
+    let show = RwSignal::new(true);
+    mount_to(target.clone(), move || {
+        view! {
+            <Router>
+                <ExecuteJobDialog
+                    show=show
+                    job_name=Signal::derive(|| "purge_events".to_string())
+                    picker=Signal::derive(|| JobPartitionPicker::SingleDim {
+                        keys: vec!["p1".into(), "p2".into(), "p3".into()],
+                        truncated: false,
+                    })
+                    verb=Signal::derive(|| Some(delete_verb()))
+                />
+            </Router>
+        }
+    })
+    .forget();
+    flush_effects().await;
+
+    for row in query_all(&target, ".exec-dialog-partition-row") {
+        click(&row, false);
+        flush_effects().await;
+    }
+    click(&query_one(&target, ".modal-footer .btn-danger"), false);
+
+    let arrived = wait_until(|| current_path().ends_with("/backfills/BF-DEL")).await;
+    assert!(
+        arrived,
+        "expected redirect to /backfills/BF-DEL, got: {}",
+        current_path()
+    );
+    let bodies = request_bodies(&requests.borrow()).await;
+    assert_eq!(
+        bodies,
+        vec![
+            "loc_ns=default&loc_name=demo&partition_keys[0][Single]=p1\
+             &partition_keys[1][Single]=p2&partition_keys[2][Single]=p3\
+             &job_name=purge_events&action=delete"
+                .to_string()
+        ]
     );
 }
 

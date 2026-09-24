@@ -82,6 +82,10 @@ message ExecuteJobRequest {
   // could not build a key sends none either. So a keyless run of such a verb
   // on a partitioned asset is rejected unless this is set.
   bool whole_asset = 4;
+  // The verb the caller showed for the job. Unset or empty means materialize.
+  // The job runs its own verb, so a request naming another one (a page that
+  // has not loaded the job, or loaded it before a redeploy) is rejected.
+  optional string action = 5;
 }
 
 message ExecuteJobResponse {
@@ -372,8 +376,9 @@ message LaunchBackfillRequest {
   // job's own plan + executor. Mutually exclusive with `selection`.
   optional string job_name = 9;
   optional UserRef user = 10;
-  // Verb child runs execute. Unset means materialize. Applies to
-  // `selection` targets only — a Job target carries its own action.
+  // Verb child runs execute. Unset means materialize. For a Job target it is
+  // the verb the caller showed for the job, as in ExecuteJobRequest: a
+  // backfill naming another verb than the job's own is rejected.
   optional string action = 11;
 }
 

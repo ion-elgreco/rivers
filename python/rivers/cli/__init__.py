@@ -339,7 +339,20 @@ def execute(
 
     try:
         if job:
-            result = repo_obj.get_job(job)._execute_run(
+            job_obj = repo_obj.get_job(job)
+            # A job runs its own verb, which in this image may not be the one
+            # the run was launched with. The run never started: exit 1 with a
+            # stored outcome, which the operator honors, writing the run's
+            # terminal status.
+            if job_obj.action != action:
+                msg = (
+                    f"job '{job}' now runs '{job_obj.action or 'materialize'}', "
+                    f"not '{action or 'materialize'}'"
+                )
+                storage.set_run_outcome(run_id, "Failure", 0, 0, message=msg)
+                typer.echo(f"Run {run_id} failed: {msg}", err=True)
+                raise typer.Exit(1)
+            result = job_obj._execute_run(
                 run_id,
                 partition_key=pk,
                 resume=resume,
@@ -382,7 +395,7 @@ def execute(
             msg = f"Failed assets: {', '.join(failed_names)}"
             storage.set_run_outcome(run_id, "Failure", completed, total, message=msg)
             typer.echo(f"Run {run_id} failed: {msg}", err=True)
-    except SystemExit:
+    except (SystemExit, typer.Exit):
         raise
     except BaseException as exc:
         # Crash path: no outcome is written — the operator restarts the
