@@ -169,12 +169,20 @@ pub(crate) fn classify_step(
     // to Execute.
     if node.is_graph_asset() && ctx.scope.plan.is_materialize() {
         if !ctx.state.was_failed(&step.name) {
+            // The final task wrote the data inside its claim on the asset's
+            // pool. A later stamp would undo a delete admitted since then.
+            let written_at = ctx
+                .state
+                .graph_written_at
+                .get(&step.name)
+                .copied()
+                .unwrap_or(ts);
             ctx.emit_materialization(
                 &step.name,
                 &[],
                 None,
                 ops::collect_input_data_versions(ctx.state.data_versions, &step.graph_dependencies),
-                ts,
+                written_at,
             );
             ctx.emit_success(&step.name);
             // Graph asset success hooks: fire here since there's no per-step

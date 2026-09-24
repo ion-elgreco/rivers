@@ -318,6 +318,7 @@ impl Executor {
                 HashSet::new()
             };
             let mut graph_started: HashSet<String> = HashSet::new();
+            let mut graph_written_at: HashMap<String, i64> = HashMap::new();
             let mut failures: Vec<(String, PyErr)> = Vec::new();
             // Persistent across levels: fan-out mapping keys and collect results
             let mut mapped_instance_keys: HashMap<String, Vec<String>> = HashMap::new();
@@ -454,6 +455,7 @@ impl Executor {
                             failed_names: &mut failed_names,
                             cancelled_names: &mut cancelled_names,
                             graph_started: &mut graph_started,
+                            graph_written_at: &mut graph_written_at,
                             mapped_instance_keys: &mut mapped_instance_keys,
                             step_dynamic_keys: &mut step_dynamic_keys,
                             failed_partitions: &mut step_failed_partitions,

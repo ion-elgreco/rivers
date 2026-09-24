@@ -7,11 +7,15 @@
 //!   2. (optional) Pool-claim / semaphore acquisition
 //!   3. Emit `StepStart` events
 //!   4. Run the work — supplied by the backend via [`SyncWorker`] / [`AsyncWorker`]
-//!   5. Release pool guard (after the work completes)
-//!   6. (sync flavor only) Route outcome through `process_outcome`. The async
-//!      flavor returns the [`WorkOutcome`] so the orchestrator can route it
-//!      after the JoinSet collection — `process_outcome` requires `&mut
-//!      BatchContext` which isn't available inside spawned tasks.
+//!   5. Route the outcome through `process_outcome` (the IO write for
+//!      in-process steps, and the step's events)
+//!   6. Release the pool guard. The step's claim covers its write and the
+//!      time its events carry, so an Exclusive verb never overlaps them.
+//!
+//! The async flavor returns the [`WorkOutcome`] with the guard still held:
+//! `process_outcome` requires `&mut BatchContext`, which isn't available
+//! inside spawned tasks. [`process_finished_steps`] runs phases 5 and 6 for
+//! each task as it finishes.
 //!
 //! K8s does not use the lifecycle helper: its step pods write events directly
 //! and the orchestrator-side path is just "build Job, poll, mark failed."
@@ -23,8 +27,10 @@ use rivers_core::execution::plan::ExecutionStep;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{ScopedStorageHandle, StorageBackend};
 use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinSet;
 
 use crate::errors::ExecutionError;
+use crate::runtime::rt;
 
 use super::super::event_writer::{self, WriterMsg};
 use super::super::ops::{self, now_ts};
@@ -185,16 +191,59 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
         attempt += 1;
     };
 
+    process_outcome(py, ctx, step, step_name, event_names, outcome, failures);
+
     if let Some(g) = guard {
         g.release_blocking(py);
     }
+}
 
-    process_outcome(py, ctx, step, step_name, event_names, outcome, failures);
+/// A step whose async lifecycle finished, still holding its pool claim.
+pub(crate) struct FinishedStep {
+    pub idx: usize,
+    pub instance_name: String,
+    pub event_names: Vec<String>,
+    pub outcome: WorkOutcome,
+    pub guard: Option<PoolGuard>,
+}
+
+/// Route each step's outcome through `process_outcome` as its task finishes,
+/// then release the step's claim. Waiting for the whole set would keep a
+/// finished step's claim until its slowest sibling ends.
+pub(crate) fn process_finished_steps(
+    py: Python,
+    ctx: &mut BatchContext,
+    mut tasks: JoinSet<FinishedStep>,
+    failures: &mut Vec<(String, PyErr)>,
+) {
+    while let Some(joined) = py.detach(|| rt().block_on(tasks.join_next())) {
+        let finished = match joined {
+            Ok(finished) => finished,
+            Err(e) => {
+                tracing::error!("step task panicked: {e}");
+                continue;
+            }
+        };
+        let step = &ctx.scope.plan.steps[finished.idx];
+        process_outcome(
+            py,
+            ctx,
+            step,
+            &finished.instance_name,
+            &finished.event_names,
+            finished.outcome,
+            failures,
+        );
+        if let Some(g) = finished.guard {
+            g.release_blocking(py);
+        }
+    }
 }
 
 /// Run the asynchronous lifecycle around `worker`. The lifecycle returns a
-/// [`WorkOutcome`]; the orchestrator collects outcomes from its JoinSet and
-/// routes each through `process_outcome` against the live `&mut BatchContext`.
+/// [`WorkOutcome`] and the claim the step still holds; the orchestrator routes
+/// the outcome through `process_outcome` against the live `&mut BatchContext`
+/// and only then releases the claim (see [`process_finished_steps`]).
 ///
 /// Pool-claim failures and `spawn_blocking` panics are returned as
 /// `WorkOutcome::Error` (no captured logs, no resolved config) — when routed
@@ -218,7 +267,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
     // An action step: its StepStart is stored before the work runs.
     store_start: bool,
     worker: W,
-) -> WorkOutcome {
+) -> (WorkOutcome, Option<PoolGuard>) {
     let mut permit = match &semaphore {
         Some(sem) => Some(
             sem.clone()
@@ -243,9 +292,9 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         .await
         {
             Ok(g) => Some(g),
-            Err(e) if e.is::<ClaimCancelled>() => return WorkOutcome::Cancelled,
+            Err(e) if e.is::<ClaimCancelled>() => return (WorkOutcome::Cancelled, None),
             Err(e) => {
-                return prep_error(format!("Failed to claim pool slots: {e}"));
+                return (prep_error(format!("Failed to claim pool slots: {e}")), None);
             }
         }
     };
@@ -258,7 +307,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         if let Some(g) = guard {
             g.release().await;
         }
-        return WorkOutcome::Cancelled;
+        return (WorkOutcome::Cancelled, None);
     }
 
     let code_location_id = storage.code_location_id().to_string();
@@ -390,11 +439,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
     };
 
     drop(permit);
-    if let Some(g) = guard {
-        g.release().await;
-    }
-
-    outcome
+    (outcome, guard)
 }
 
 fn prep_error(msg: String) -> WorkOutcome {

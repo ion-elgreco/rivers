@@ -2,8 +2,9 @@
 //!
 //! Pool-requiring steps run through loky with claim-gated concurrency: a tokio
 //! JoinSet spawns one task per step that does `claim_async → spawn_blocking
-//! (loky submit + collect) → release_async`. The pool limit naturally throttles
-//! how many steps run simultaneously in the process pool.
+//! (loky submit + collect)`; each outcome is processed as its task finishes,
+//! then the step's claim is released. The pool limit naturally throttles how
+//! many steps run simultaneously in the process pool.
 use std::sync::Arc;
 
 use std::collections::HashMap;
@@ -17,8 +18,8 @@ use crate::errors::ExecutionError;
 use crate::runtime::rt;
 
 use super::super::dispatch::{
-    AsyncWorker, BatchContext, ExecutorBackend, StepInstance, WorkOutcome, process_outcome,
-    run_step_async_lifecycle,
+    AsyncWorker, BatchContext, ExecutorBackend, FinishedStep, StepInstance, WorkOutcome,
+    process_finished_steps, process_outcome, run_step_async_lifecycle,
 };
 use super::super::ops::{self, now_ts};
 use super::validate_not_in_memory_io;
@@ -570,7 +571,8 @@ impl ParallelBackend {
 
     /// Pool-requiring steps: pre-build submit args (GIL), then JoinSet where each
     /// task runs through the shared async lifecycle, which handles pool claim,
-    /// StepStart emission, the loky `spawn_blocking` hop, and pool release.
+    /// StepStart emission and the loky `spawn_blocking` hop. The pool release
+    /// follows each outcome's processing.
     /// `max_concurrency` (mapped-group windowing) gates the lifecycle with a
     /// semaphore so instances diverted here don't escape the window.
     fn schedule_pool_steps_loky(
@@ -623,80 +625,61 @@ impl ParallelBackend {
         let window = max_concurrency.map(|n| Arc::new(Semaphore::new(n)));
         let resume = ctx.scope.resume;
 
-        type PoolResult = (usize, String, Vec<String>, WorkOutcome);
+        let mut tasks: JoinSet<FinishedStep> = JoinSet::new();
+        for prep in prepared {
+            let PreparedPoolStep {
+                base,
+                pools,
+                asset_scope,
+                event_names,
+                instance_name,
+                retry,
+            } = prep;
+            let idx = base.idx;
+            let pool_step_name = instance_name.clone();
+            let storage = storage.clone();
+            let run_id = run_id.clone();
+            let events_tx = events_tx.clone();
+            let event_names_for_outcome = event_names.clone();
+            let window = window.clone();
+            let worker = LokyPoolWorker {
+                max_workers: self.max_workers,
+                submit_args: base.submit_args,
+                input_versions: base.input_versions,
+                failure_config: base.failure_config,
+            };
 
-        let results: Vec<PoolResult> = py.detach(|| {
-            rt().block_on(async {
-                let mut join_set: JoinSet<PoolResult> = JoinSet::new();
-
-                for prep in prepared {
-                    let PreparedPoolStep {
-                        base,
+            tasks.spawn_on(
+                async move {
+                    let (outcome, guard) = run_step_async_lifecycle(
+                        storage,
                         pools,
                         asset_scope,
+                        run_id,
+                        pool_step_name,
                         event_names,
-                        instance_name,
+                        events_tx,
+                        window,
                         retry,
-                    } = prep;
-                    let idx = base.idx;
-                    let pool_step_name = instance_name.clone();
-                    let storage = storage.clone();
-                    let run_id = run_id.clone();
-                    let events_tx = events_tx.clone();
-                    let event_names_for_outcome = event_names.clone();
-                    let window = window.clone();
-                    let worker = LokyPoolWorker {
-                        max_workers: self.max_workers,
-                        submit_args: base.submit_args,
-                        input_versions: base.input_versions,
-                        failure_config: base.failure_config,
-                    };
-
-                    join_set.spawn(async move {
-                        let outcome = run_step_async_lifecycle(
-                            storage,
-                            pools,
-                            asset_scope,
-                            run_id,
-                            pool_step_name,
-                            event_names,
-                            events_tx,
-                            window,
-                            retry,
-                            resume,
-                            // Action steps never reach the parallel backend.
-                            0,
-                            false,
-                            worker,
-                        )
-                        .await;
-                        (idx, instance_name, event_names_for_outcome, outcome)
-                    });
-                }
-
-                let mut results = Vec::new();
-                while let Some(join_result) = join_set.join_next().await {
-                    match join_result {
-                        Ok(r) => results.push(r),
-                        Err(e) => tracing::error!("pool step task panicked: {e}"),
+                        resume,
+                        // Action steps never reach the parallel backend.
+                        0,
+                        false,
+                        worker,
+                    )
+                    .await;
+                    FinishedStep {
+                        idx,
+                        instance_name,
+                        event_names: event_names_for_outcome,
+                        outcome,
+                        guard,
                     }
-                }
-                results
-            })
-        });
-
-        for (step_idx, instance_name, event_names, outcome) in results {
-            let step = &ctx.scope.plan.steps[step_idx];
-            process_outcome(
-                py,
-                ctx,
-                step,
-                &instance_name,
-                &event_names,
-                outcome,
-                failures,
+                },
+                rt().handle(),
             );
         }
+        process_finished_steps(py, ctx, tasks, failures);
     }
 }
 

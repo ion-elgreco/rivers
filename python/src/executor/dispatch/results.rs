@@ -131,6 +131,7 @@ pub(crate) fn process_step_result(
     //      stale on-disk `__keys`. Empty Vec = ran with plain values.
     //   2. dual IO write for final graph asset node — only non-mapped (a
     //      mapped instance is a per-key write, not the step's "final" output).
+    let mut wrote_graph: Option<String> = None;
     if is_single && is_non_mapped {
         ctx.state.record_dynamic_keys(
             step.name.clone(),
@@ -139,7 +140,8 @@ pub(crate) fn process_step_result(
 
         if let Some(graph_name) = ctx.repo.graph_nodes.final_nodes.get(&step.name)
             && let Some(graph_node) = ctx.repo.node_map.get(graph_name)
-            && let Err(e) = ops::handle_step_output(
+        {
+            match ops::handle_step_output(
                 py,
                 graph_name,
                 graph_node,
@@ -148,10 +150,13 @@ pub(crate) fn process_step_result(
                 step_result.return_hint.as_ref(),
                 Vec::new(),
                 ctx.repo.io_handler_registry,
-            )
-        {
-            let gn = graph_name.clone();
-            ctx.record_failure_no_hooks(&gn, e, failures);
+            ) {
+                Ok(_) => wrote_graph = Some(graph_name.clone()),
+                Err(e) => {
+                    let gn = graph_name.clone();
+                    ctx.record_failure_no_hooks(&gn, e, failures);
+                }
+            }
         }
     }
 
@@ -321,6 +326,12 @@ pub(crate) fn process_step_result(
                 }
             }
         });
+    }
+
+    // The graph's Materialization takes this time: after this task's own
+    // events, and before its claim on the graph's pool ends.
+    if let Some(graph_name) = wrote_graph {
+        ctx.state.graph_written_at.insert(graph_name, now_ts());
     }
 }
 

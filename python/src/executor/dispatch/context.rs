@@ -44,6 +44,9 @@ pub(crate) struct RunState<'a> {
     /// Steps a cancel skipped before they started.
     pub cancelled_names: &'a mut HashSet<String>,
     pub graph_started: &'a mut HashSet<String>,
+    /// When each graph asset's final task finished in this run, having
+    /// written the graph's data.
+    pub graph_written_at: &'a mut HashMap<String, i64>,
     pub mapped_instance_keys: &'a mut HashMap<String, Vec<String>>,
     pub failed_partitions: &'a mut HashMap<String, Vec<(PyPartitionKey, String)>>,
     /// Per-step record of `dynamic_keys` produced when an asset was executed

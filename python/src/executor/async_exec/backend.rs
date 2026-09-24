@@ -17,9 +17,10 @@ use crate::partitions::PyPartitionKey;
 use crate::repository::resolved_node::ResolvedNode;
 use crate::runtime::rt;
 
+use super::super::dispatch::pool_claim::PoolGuard;
 use super::super::dispatch::{
-    AsyncWorker, BatchContext, ExecutorBackend, StepInstance, WorkOutcome, process_outcome,
-    run_step_async_lifecycle,
+    AsyncWorker, BatchContext, ExecutorBackend, FinishedStep, StepInstance, WorkOutcome,
+    process_finished_steps, run_step_async_lifecycle,
 };
 use super::super::event_writer::WriterMsg;
 use super::super::ops::{self};
@@ -30,13 +31,6 @@ fn python_not_attached_outcome() -> WorkOutcome {
         captured_logs: None,
         failure_config: None,
     }
-}
-
-struct TaskResult {
-    idx: usize,
-    instance_name: String,
-    event_names: Vec<String>,
-    outcome: WorkOutcome,
 }
 
 struct SharedStepContext {
@@ -208,7 +202,7 @@ impl AsyncWorker for AsyncStepWorker {
     }
 }
 
-async fn dispatch_step(d: StepDispatch) -> WorkOutcome {
+async fn dispatch_step(d: StepDispatch) -> (WorkOutcome, Option<PoolGuard>) {
     let StepDispatch {
         shared,
         step,
@@ -324,47 +318,22 @@ impl ExecutorBackend for AsyncBackend {
             })
             .collect();
 
-        let results: Vec<TaskResult> = py.detach(|| {
-            rt().block_on(async {
-                let mut join_set: JoinSet<TaskResult> = JoinSet::new();
-                for (idx, instance_name, event_names, dispatch) in dispatches {
-                    join_set.spawn(async move {
-                        TaskResult {
-                            idx,
-                            instance_name,
-                            event_names,
-                            outcome: dispatch_step(dispatch).await,
-                        }
-                    });
-                }
-                let mut results = Vec::new();
-                while let Some(join_result) = join_set.join_next().await {
-                    match join_result {
-                        Ok(task_result) => results.push(task_result),
-                        Err(e) => tracing::error!("Task panicked in async executor: {e}"),
+        let mut tasks: JoinSet<FinishedStep> = JoinSet::new();
+        for (idx, instance_name, event_names, dispatch) in dispatches {
+            tasks.spawn_on(
+                async move {
+                    let (outcome, guard) = dispatch_step(dispatch).await;
+                    FinishedStep {
+                        idx,
+                        instance_name,
+                        event_names,
+                        outcome,
+                        guard,
                     }
-                }
-                results
-            })
-        });
-
-        for TaskResult {
-            idx,
-            instance_name,
-            event_names,
-            outcome,
-        } in results
-        {
-            let step = &ctx.scope.plan.steps[idx];
-            process_outcome(
-                py,
-                ctx,
-                step,
-                &instance_name,
-                &event_names,
-                outcome,
-                failures,
+                },
+                rt().handle(),
             );
         }
+        process_finished_steps(py, ctx, tasks, failures);
     }
 }
