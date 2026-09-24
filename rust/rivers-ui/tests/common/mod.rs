@@ -28,6 +28,16 @@ pub fn fresh_mount_target() -> HtmlElement {
     div.dyn_into::<HtmlElement>().unwrap()
 }
 
+/// Set the checkbox `el` and fire the `change` event its handler listens for.
+pub fn set_checked(el: &Element, checked: bool) {
+    let input: web_sys::HtmlInputElement = el.clone().dyn_into().unwrap();
+    input.set_checked(checked);
+    let init = web_sys::EventInit::new();
+    init.set_bubbles(true);
+    let ev = web_sys::Event::new_with_event_init_dict("change", &init).unwrap();
+    input.dispatch_event(&ev).unwrap();
+}
+
 /// Synthesize a click on `el`, optionally with the shift modifier set.
 /// Takes `&Element` (not `&HtmlElement`) so SVG nodes can also be
 /// click-targeted; `dispatch_event` lives on `EventTarget`, a base of
@@ -124,6 +134,56 @@ pub fn install_fetch_mock<F>(responder: F) -> FetchMock
 where
     F: Fn(&str) -> Option<String> + 'static,
 {
+    install_fetch_handler(move |input| {
+        // `input` is either a string URL or a `Request` object. Pull the URL
+        // out of either shape.
+        let url = if let Some(s) = input.as_string() {
+            s
+        } else if let Ok(req) = input.dyn_into::<web_sys::Request>() {
+            req.url()
+        } else {
+            String::new()
+        };
+        responder(&url)
+    })
+}
+
+/// [`install_fetch_mock`] that answers every call with `json` and keeps each
+/// `Request`, so a test can read what a server fn sent ([`request_bodies`]).
+pub fn install_recording_fetch_mock(
+    json: &'static str,
+) -> (
+    FetchMock,
+    std::rc::Rc<std::cell::RefCell<Vec<web_sys::Request>>>,
+) {
+    let requests = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = requests.clone();
+    let mock = install_fetch_handler(move |input| {
+        if let Ok(req) = input.dyn_into::<web_sys::Request>() {
+            sink.borrow_mut().push(req);
+        }
+        Some(json.to_string())
+    });
+    (mock, requests)
+}
+
+/// The bodies of `requests`, in order. A server fn posts its arguments
+/// form-encoded (`name=value&...`).
+pub async fn request_bodies(requests: &[web_sys::Request]) -> Vec<String> {
+    let mut bodies = Vec::with_capacity(requests.len());
+    for req in requests {
+        let text = JsFuture::from(req.text().unwrap()).await.unwrap();
+        bodies.push(text.as_string().unwrap_or_default());
+    }
+    bodies
+}
+
+/// Replace `window.fetch` with `responder`, which gets the raw `input`
+/// argument and returns the JSON body (`None` = HTTP 500).
+fn install_fetch_handler<F>(responder: F) -> FetchMock
+where
+    F: Fn(JsValue) -> Option<String> + 'static,
+{
     use wasm_bindgen::JsCast;
     use wasm_bindgen::closure::Closure;
 
@@ -141,16 +201,7 @@ where
 
     let closure: Closure<dyn FnMut(JsValue, JsValue) -> js_sys::Promise> =
         Closure::new(move |input: JsValue, _init: JsValue| {
-            // `input` is either a string URL or a `Request` object. Pull
-            // the URL out of either shape.
-            let url = if let Some(s) = input.as_string() {
-                s
-            } else if let Ok(req) = input.dyn_into::<web_sys::Request>() {
-                req.url()
-            } else {
-                String::new()
-            };
-            let body = responder(&url);
+            let body = responder(input);
             let (body_str, status) = match body {
                 Some(json) => (json, 200),
                 None => (String::new(), 500),

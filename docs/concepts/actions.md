@@ -69,6 +69,13 @@ Partition-key rules are per-verb, declared with `partitioning=`. The default,
 on partitioned assets, and a supplied key is rejected up front. `Optional` accepts
 both: keyed runs are partition-scoped, keyless runs cover the whole asset.
 
+Over gRPC (the backend the UI calls), the whole asset is an explicit choice: the
+`RunAction` and `ExecuteJob` calls reject a keyless run of an `Optional` verb on a
+partitioned asset unless the request sets `whole_asset`. A caller that could not
+build a key sends none either, and the verb would then run on every partition. The
+built-in `observe` changes no data and is exempt. `repo.run_action`, jobs run from
+Python, and the CLI keep the keyless form without the flag.
+
 Multi-partition actions are ordinary backfills, and child runs inherit the verb:
 
 ```python
@@ -101,7 +108,10 @@ or the backfill materializes.
 The UI shows a button per action on the asset page, and action runs display their
 verb in the runs list and run header. A verb declaring `Outcome.Unmaterialize`
 renders as a danger button and always routes through the confirmation dialog,
-which names the verb and says it clears materialization state. The CLI warns when
+which names the verb and says it clears materialization state. For an `Optional`
+verb on a partitioned asset, the asset and job dialogs offer **Whole asset (every
+partition)**. Without that choice an empty partition pick does not submit, so a
+pick lost to a page refresh never becomes a run on every partition. The CLI warns when
 such a verb runs on a store that is removed at exit (see
 [CLI › Storage flags](../api-reference/cli.md#storage-flags)). Nothing else in the
 product distinguishes a destructive verb from a benign one.

@@ -177,13 +177,19 @@ impl CodeLocationService for CodeLocationImpl {
                 req.job_name
             )));
         }
+        let partition_key = req
+            .partition_key
+            .map(proto_partition_key_to_py)
+            .transpose()?;
+        if partition_key.is_none() && !req.whole_asset {
+            self.handle
+                .validate_keyless_job(&req.job_name)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        }
         let run_request = crate::daemon::RunRequestData {
             run_key: None,
             tags: None,
-            partition_key: req
-                .partition_key
-                .map(proto_partition_key_to_py)
-                .transpose()?,
+            partition_key,
             job_name: Some(req.job_name),
             launched_by,
         };
@@ -596,6 +602,11 @@ impl CodeLocationService for CodeLocationImpl {
             .validate_partition_for_action(&asset_selection, pk.as_ref(), &req.action)
             .await
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        if pk.is_none() && !req.whole_asset {
+            self.handle
+                .validate_keyless_action(&asset_selection, &req.action)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        }
 
         let action_request = crate::daemon::MaterializationRequestData {
             run_id: uuid::Uuid::new_v4().to_string(),

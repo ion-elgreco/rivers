@@ -39,11 +39,6 @@ pub fn PartitionPicker(
     #[prop(into)] picker: Signal<JobPartitionPicker>,
     selected: RwSignal<Vec<SubmitPartitionKey>>,
     #[prop(into)] reset: Signal<bool>,
-    /// Set while a Multi pick has values in some dimensions but not all. It
-    /// expands to no key, yet it is not an empty pick: an optional-key verb
-    /// must not submit it as a whole-asset run.
-    #[prop(optional)]
-    partial: Option<RwSignal<bool>>,
 ) -> impl IntoView {
     let single_selected = RwSignal::new(Vec::<String>::new());
     let single_anchor = RwSignal::new(None::<usize>);
@@ -65,9 +60,6 @@ pub fn PartitionPicker(
         let s_single = single_selected.get();
         let s_multi = multi_selected.get();
         selected.set(collect_submit_keys(&p, &s_single, &s_multi));
-        if let Some(partial) = partial {
-            partial.set(is_partial_pick(&p, &s_multi));
-        }
     });
 
     let toggle_single = move |idx: usize, shift: bool| {
@@ -263,15 +255,31 @@ pub fn PartitionPicker(
     }
 }
 
-fn is_partial_pick(
-    picker: &JobPartitionPicker,
-    multi_selected: &HashMap<String, Vec<String>>,
-) -> bool {
-    let JobPartitionPicker::Multi { dimensions, .. } = picker else {
-        return false;
-    };
-    let picked = |name: &str| multi_selected.get(name).is_some_and(|v| !v.is_empty());
-    dimensions.iter().any(|d| picked(&d.name)) && !dimensions.iter().all(|d| picked(&d.name))
+/// The explicit choice to run a verb whose partition key is optional on every
+/// partition. An empty pick never means that: a pick emptied by a live refresh
+/// would otherwise run the verb on the whole asset. Choosing it clears `selected`;
+/// the host hides the picker while it is set.
+#[component]
+pub fn WholeAssetChoice(
+    checked: RwSignal<bool>,
+    selected: RwSignal<Vec<SubmitPartitionKey>>,
+) -> impl IntoView {
+    view! {
+        <label class="whole-asset-choice">
+            <input
+                type="checkbox"
+                prop:checked=move || checked.get()
+                on:change=move |ev| {
+                    let on = event_target_checked(&ev);
+                    if on {
+                        selected.set(Vec::new());
+                    }
+                    checked.set(on);
+                }
+            />
+            "Whole asset (every partition)"
+        </label>
+    }
 }
 
 /// Compute the structured partition keys to submit for a given picker

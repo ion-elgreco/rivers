@@ -77,6 +77,11 @@ message ExecuteJobRequest {
   string job_name = 1;
   optional ProtoPartitionKey partition_key = 2;
   optional UserRef user = 3;
+  // Run the job's verb on the whole asset. Without a partition_key, a verb
+  // whose key is Optional (delete) acts on every partition, and a caller that
+  // could not build a key sends none either. So a keyless run of such a verb
+  // on a partitioned asset is rejected unless this is set.
+  bool whole_asset = 4;
 }
 
 message ExecuteJobResponse {
@@ -281,6 +286,10 @@ message RunActionRequest {
   // and a caller that computed an empty list would silently fan a destructive
   // verb across the whole code location. Empty + unset is rejected instead.
   bool all_assets = 6;
+  // The same opt-in for partitions: without a partition_key, a verb whose key
+  // is Optional (delete) acts on every partition of a partitioned asset.
+  // Such a keyless run is rejected unless this is set.
+  bool whole_asset = 7;
 }
 message RunActionResponse {
   string run_id = 1;

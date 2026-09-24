@@ -16,7 +16,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use common::{
-    click, flush_effects, fresh_mount_target, install_fetch_mock, nav_to, query_all, query_one,
+    click, flush_effects, fresh_mount_target, install_fetch_mock, install_recording_fetch_mock,
+    nav_to, query_all, query_one, request_bodies, set_checked,
 };
 use leptos::mount::mount_to;
 use leptos::prelude::*;
@@ -24,6 +25,7 @@ use leptos_router::components::Router;
 use rivers_ui::components::execute_job_dialog::ExecuteJobDialog;
 use rivers_ui::components::materialize_dialog::MaterializeDialog;
 use rivers_ui::helpers::JobPartitionPicker;
+use rivers_ui::types::AssetActionInfo;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -210,6 +212,110 @@ async fn materialize_success_redirects_to_run_detail() {
         current_path()
     );
     assert!(!show.get_untracked(), "dialog should auto-close on success");
+}
+
+fn delete_verb() -> AssetActionInfo {
+    AssetActionInfo {
+        name: "delete".to_string(),
+        outcome: "unmaterialize".to_string(),
+        exclusive: true,
+        partitioning: "optional".to_string(),
+        description: None,
+    }
+}
+
+fn two_keys() -> JobPartitionPicker {
+    JobPartitionPicker::SingleDim {
+        keys: vec!["p1".into(), "p2".into()],
+        truncated: false,
+    }
+}
+
+/// The whole asset is an explicit choice, and the request says so: the
+/// backend rejects a keyless Optional-key verb on a partitioned asset without
+/// `whole_asset`.
+#[wasm_bindgen_test]
+async fn execute_job_whole_asset_choice_sends_whole_asset() {
+    nav_to("/locations/default/demo/jobs/purge_events");
+    let target = fresh_mount_target();
+    let (_mock, requests) =
+        install_recording_fetch_mock(r#"{"run_id": "RUN-WHOLE", "status": "direct"}"#);
+
+    let show = RwSignal::new(true);
+    mount_to(target.clone(), move || {
+        view! {
+            <Router>
+                <ExecuteJobDialog
+                    show=show
+                    job_name=Signal::derive(|| "purge_events".to_string())
+                    picker=Signal::derive(two_keys)
+                    verb=Signal::derive(|| Some(delete_verb()))
+                />
+            </Router>
+        }
+    })
+    .forget();
+    flush_effects().await;
+
+    set_checked(&query_one(&target, ".whole-asset-choice input"), true);
+    flush_effects().await;
+    click(&query_one(&target, ".modal-footer .btn-danger"), false);
+
+    let arrived = wait_until(|| current_path().ends_with("/runs/RUN-WHOLE")).await;
+    assert!(
+        arrived,
+        "expected redirect to /runs/RUN-WHOLE, got: {}",
+        current_path()
+    );
+    let bodies = request_bodies(&requests.borrow()).await;
+    assert_eq!(
+        bodies,
+        vec!["loc_ns=default&loc_name=demo&job_name=purge_events&whole_asset=true".to_string()]
+    );
+}
+
+#[wasm_bindgen_test]
+async fn materialize_whole_asset_choice_sends_whole_asset() {
+    nav_to("/locations/default/demo/assets");
+    let target = fresh_mount_target();
+    let (_mock, requests) = install_recording_fetch_mock(r#""RUN-DEL""#);
+
+    let show = RwSignal::new(true);
+    mount_to(target.clone(), move || {
+        view! {
+            <Router>
+                <MaterializeDialog
+                    show=show
+                    asset_keys=Signal::derive(|| vec!["events".to_string()])
+                    records=Signal::derive(HashMap::new)
+                    picker=Signal::derive(two_keys)
+                    action=Signal::derive(|| Some(delete_verb()))
+                    destructive=Signal::derive(|| true)
+                />
+            </Router>
+        }
+    })
+    .forget();
+    flush_effects().await;
+
+    set_checked(&query_one(&target, ".whole-asset-choice input"), true);
+    flush_effects().await;
+    click(&query_one(&target, ".modal-footer .btn-danger"), false);
+
+    let arrived = wait_until(|| current_path().ends_with("/runs/RUN-DEL")).await;
+    assert!(
+        arrived,
+        "expected redirect to /runs/RUN-DEL, got: {}",
+        current_path()
+    );
+    let bodies = request_bodies(&requests.borrow()).await;
+    assert_eq!(
+        bodies,
+        vec![
+            "loc_ns=default&loc_name=demo&action=delete&selection[0]=events&whole_asset=true"
+                .to_string()
+        ]
+    );
 }
 
 #[wasm_bindgen_test]

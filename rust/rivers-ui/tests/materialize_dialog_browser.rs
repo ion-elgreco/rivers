@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{click, flush_effects, fresh_mount_target, nav_to, query_all, query_one};
+use common::{click, flush_effects, fresh_mount_target, nav_to, query_all, query_one, set_checked};
 use std::collections::HashMap;
 
 use leptos::mount::mount_to;
@@ -524,6 +524,71 @@ async fn optional_key_verb_blocks_a_partial_multi_pick() {
             .unwrap(),
         "1 asset · select a partition"
     );
+}
+
+/// A live refresh on the Assets list rebuilds a paged picker and empties the
+/// pick. An emptied pick must leave the delete disabled, not turn it into an
+/// enabled whole-asset delete: only the explicit whole-asset choice does that.
+#[wasm_bindgen_test]
+async fn optional_key_verb_needs_a_partition_or_the_whole_asset() {
+    let show = RwSignal::new(true);
+    nav_to("/locations/default/demo");
+    let target = fresh_mount_target();
+    let host = target.clone();
+    mount_to(target, move || {
+        view! {
+            <Router>
+                <MaterializeDialog
+                    show=show
+                    asset_keys=Signal::derive(|| vec!["events".to_string()])
+                    records=Signal::derive(HashMap::new)
+                    picker=Signal::derive(|| JobPartitionPicker::SingleDim {
+                        keys: vec!["2026-09-01".into(), "2026-09-02".into()],
+                        truncated: false,
+                    })
+                    action=Signal::derive(|| {
+                        Some(AssetActionInfo {
+                            name: "delete".to_string(),
+                            outcome: "unmaterialize".to_string(),
+                            exclusive: true,
+                            partitioning: "optional".to_string(),
+                            description: None,
+                        })
+                    })
+                    destructive=Signal::derive(|| true)
+                />
+            </Router>
+        }
+    })
+    .forget();
+    flush_effects().await;
+
+    let summary = || {
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap()
+    };
+    let submit_disabled =
+        || query_one(&host, ".modal-footer .btn-danger").has_attribute("disabled");
+
+    // Pick a partition, then lose it.
+    let rows = query_all(&host, ".exec-dialog-partition-row");
+    click(&rows[0], false);
+    flush_effects().await;
+    assert_eq!(summary(), "1 asset · 1 partition · 1 run");
+    click(&rows[0], false);
+    flush_effects().await;
+    assert!(
+        submit_disabled(),
+        "an emptied pick would delete the whole asset"
+    );
+    assert_eq!(summary(), "1 asset · select a partition");
+
+    set_checked(&query_one(&host, ".whole-asset-choice input"), true);
+    flush_effects().await;
+    assert!(!submit_disabled());
+    assert_eq!(summary(), "1 asset · whole asset · 1 run");
+    assert_eq!(query_all(&host, ".exec-dialog-partition-row").len(), 0);
 }
 
 /// Nothing else in the product distinguishes an `Outcome.Unmaterialize` verb

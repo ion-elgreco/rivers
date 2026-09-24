@@ -128,7 +128,7 @@ pub fn JobDetailPage() -> impl IntoView {
         leptos::task::spawn_local(async move {
             let path_ns = ns.clone();
             let path_name = lname.clone();
-            match execute_job(ns, lname, job_name, None).await {
+            match execute_job(ns, lname, job_name, None, false).await {
                 Ok(result) if !result.run_id.is_empty() => {
                     let path = loc_path(&path_ns, &path_name, &format!("runs/{}", result.run_id));
                     navigate(&path, Default::default());

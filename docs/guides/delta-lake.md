@@ -322,7 +322,7 @@ repo.run_action("delete", partition_key=pk)
 |------|-------------|----------|
 | `optimize` | `Unchanged` + `Exclusive` + `Keyless` | Compacts small files; z-orders instead when `z_order_by` is configured. Table-wide — runs without a partition key, on partitioned assets too. |
 | `vacuum` | `Unchanged` + `Exclusive` + `Keyless` | Removes unreferenced files; `retention_hours` and `enforce_retention_duration` via config. Table-wide, same key rule. |
-| `delete` | `Unmaterialize` + `Exclusive` + `DownstreamFirst` + `Optional` key | Deletes the keyed partition's rows via `partition_predicate`, or every row without a key — both forms valid on partitioned assets. |
+| `delete` | `Unmaterialize` + `Exclusive` + `DownstreamFirst` + `Optional` key | Deletes the keyed partition's rows via `partition_predicate`, or every row without a key — both forms valid on partitioned assets. From the UI or gRPC, the keyless form needs an explicit whole-asset choice. |
 
 On a table that does not exist yet, `optimize` and `vacuum` report `unchanged`
 instead of failing, so a fleet-wide `repo.run_action("optimize")` skips

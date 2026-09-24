@@ -649,6 +649,145 @@ def test_run_action_allows_keyless_observe_on_partitioned_observable(
     assert response.run_id != ""
 
 
+@pytest.fixture
+def whole_asset_channel(grpc_stubs, storage):
+    """gRPC server (direct dispatch) over a partitioned `events` and an
+    unpartitioned `lookup`. Both define a `delete` with an Optional key whose
+    keyless run empties the table; `events` also has a Keyless `vacuum`. One
+    job per verb and asset. `rows` stands in for the tables' contents."""
+    rows = {"events": {"p1", "p2"}, "lookup": {"row"}}
+    vacuumed = []
+
+    def _delete(ctx):
+        if ctx.has_partition_key:
+            rows[ctx.asset_name].discard(ctx.partition_key)
+        else:
+            rows[ctx.asset_name].clear()
+
+    def _vacuum(ctx):
+        vacuumed.append(ctx.asset_name)
+
+    delete = rs.AssetAction(
+        name="delete",
+        outcome=rs.Outcome.Unmaterialize,
+        partitioning=rs.ActionPartitioning.Optional,
+    )(_delete)
+    vacuum = rs.AssetAction(
+        name="vacuum",
+        outcome=rs.Outcome.Unchanged,
+        partitioning=rs.ActionPartitioning.Keyless,
+    )(_vacuum)
+
+    @rs.Asset(
+        io_handler=rs.InMemoryIOHandler(),
+        actions=[delete, vacuum],
+        partitions_def=rs.PartitionsDefinition.static_(["p1", "p2"]),
+    )
+    def events():
+        return 1
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler(), actions=[delete])
+    def lookup():
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[events, lookup],
+        jobs=[
+            rs.Job(name="delete_events", assets=[events], action="delete"),
+            rs.Job(name="delete_lookup", assets=[lookup], action="delete"),
+            rs.Job(name="vacuum_events", assets=[events], action="vacuum"),
+        ],
+        default_executor=rs.Executor.in_process(),
+    )
+    repo.resolve(storage=storage)
+    port = repo._start_grpc_server("127.0.0.1", 0)
+
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+
+    pb2, pb2_grpc = grpc_stubs
+    yield pb2, pb2_grpc.CodeLocationServiceStub(channel), storage, rows, vacuumed
+    channel.close()
+    repo._stop_grpc_server()
+
+
+def _launch(pb2, stub, rpc, verb, asset, **fields):
+    """Run `verb` on `asset` through `rpc`: RunAction, or ExecuteJob of the
+    `<verb>_<asset>` job. Returns the run id."""
+    if rpc == "RunAction":
+        resp = stub.RunAction(
+            pb2.RunActionRequest(action=verb, selection=[asset], **fields)
+        )
+        assert resp.success, resp.error
+        return resp.run_id
+    return stub.ExecuteJob(
+        pb2.ExecuteJobRequest(job_name=f"{verb}_{asset}", **fields)
+    ).run_id
+
+
+@pytest.mark.parametrize("rpc", ["RunAction", "ExecuteJob"])
+def test_keyless_optional_verb_on_partitioned_asset_needs_whole_asset(
+    whole_asset_channel, rpc
+):
+    """A UI that could not build a key (a pick emptied by a live refresh, a
+    job whose key windows do not overlap, definitions still loading) sent the
+    run keyless, and an Optional `delete` read that as the whole asset: every
+    row went. The whole asset is now an explicit choice."""
+    pb2, stub, storage, rows, _ = whole_asset_channel
+
+    with pytest.raises(grpc.RpcError) as exc:
+        _launch(pb2, stub, rpc, "delete", "events")
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert exc.value.details() == (
+        "ExecutionError: Action 'delete' without partition_key runs on every "
+        'partition of assets ["events"]. Pick a partition, or choose the whole '
+        "asset (whole_asset)."
+    )
+    assert rows["events"] == {"p1", "p2"}
+    assert storage.get_runs(limit=100) == [], "a rejected run must leave no record"
+
+    # A key scopes the run, as before.
+    run_id = _launch(
+        pb2,
+        stub,
+        rpc,
+        "delete",
+        "events",
+        partition_key=_single_partition_key(pb2, "p1"),
+    )
+    record = wait_for_run_terminal(storage, run_id, timeout=15)
+    assert record is not None and record.status == "Success"
+    assert rows["events"] == {"p2"}
+
+    # The explicit choice runs it on the whole asset.
+    run_id = _launch(pb2, stub, rpc, "delete", "events", whole_asset=True)
+    record = wait_for_run_terminal(storage, run_id, timeout=15)
+    assert record is not None and record.status == "Success"
+    assert (record.action, record.partition_key) == ("delete", None)
+    assert rows["events"] == set()
+
+
+@pytest.mark.parametrize("rpc", ["RunAction", "ExecuteJob"])
+def test_keyless_run_needs_no_whole_asset_choice_without_partition_scope(
+    whole_asset_channel, rpc
+):
+    """Falsifier: the choice is asked only where a missing key widens the run.
+    An unpartitioned asset has one scope, and a Keyless verb is whole-asset by
+    declaration."""
+    pb2, stub, storage, rows, vacuumed = whole_asset_channel
+
+    run_id = _launch(pb2, stub, rpc, "delete", "lookup")
+    record = wait_for_run_terminal(storage, run_id, timeout=15)
+    assert record is not None and record.status == "Success"
+    assert rows["lookup"] == set()
+
+    run_id = _launch(pb2, stub, rpc, "vacuum", "events")
+    record = wait_for_run_terminal(storage, run_id, timeout=15)
+    assert record is not None and record.status == "Success"
+    assert vacuumed == ["events"]
+    assert rows["events"] == {"p1", "p2"}
+
+
 def test_execute_job_with_run_queue_creates_queued_run(queued_grpc_channel):
     """When run_queue is configured, ExecuteJob gRPC should queue the run, not execute it."""
     channel, pb2, pb2_grpc, _, storage = queued_grpc_channel

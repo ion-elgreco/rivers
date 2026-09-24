@@ -253,6 +253,7 @@ pub async fn observe_asset(
         vec![asset_key],
         None,
         None,
+        false,
     )
     .await?;
     Ok(true)

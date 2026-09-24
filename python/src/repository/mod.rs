@@ -210,6 +210,35 @@ pub(crate) fn validate_partition_in_map<'a>(
     Ok(())
 }
 
+/// Reject a keyless run of `verb` that acts on every partition of an asset —
+/// one where the verb's key is `Optional` — for callers that must choose the
+/// whole asset explicitly. The gRPC boundary is one: a UI that could not build
+/// a key sends none either. The built-in observe changes no data.
+fn ensure_whole_asset_chosen<'a>(
+    node_map: &'a HashMap<String, ResolvedNode>,
+    asset_names: impl IntoIterator<Item = &'a str>,
+    verb: &str,
+) -> PyResult<()> {
+    use crate::assets::action::{ActionOutcome, PyActionPartitioning};
+    let whole: Vec<&str> = iter_partitioned_assets(node_map, asset_names)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| {
+            node_map[*name].find_action(verb).is_some_and(|a| {
+                a.partitioning == PyActionPartitioning::Optional
+                    && a.outcome != ActionOutcome::Observe
+            })
+        })
+        .collect();
+    if whole.is_empty() {
+        return Ok(());
+    }
+    Err(ExecutionError::new_err(format!(
+        "Action '{verb}' without partition_key runs on every partition of assets \
+         {whole:?}. Pick a partition, or choose the whole asset (whole_asset)."
+    )))
+}
+
 /// Storage-side companion to [`validate_partition_for_selection`]: a Dynamic
 /// def can't validate membership statically (its keys live in storage), so
 /// collect the `(asset, namespace, keys)` triples to verify against
@@ -1556,6 +1585,44 @@ impl RepoHandle {
             ExecutionError::new_err("CodeRepository not resolved — call resolve() first")
         })?;
         ensure_assets_support_action(&state.node_map, selection, action)
+    }
+
+    /// A keyless gRPC `RunAction` that did not choose the whole asset: see
+    /// [`ensure_whole_asset_chosen`].
+    pub(crate) fn validate_keyless_action(
+        &self,
+        asset_names: &[String],
+        action: &str,
+    ) -> PyResult<()> {
+        let guard = self.state.read().unwrap();
+        let state = guard.as_ref().ok_or_else(|| {
+            ExecutionError::new_err("CodeRepository not resolved — call resolve() first")
+        })?;
+        ensure_whole_asset_chosen(
+            &state.node_map,
+            asset_names.iter().map(String::as_str),
+            action,
+        )
+    }
+
+    /// [`Self::validate_keyless_action`] for a keyless gRPC `ExecuteJob`: the
+    /// job's verb over its assets. A materialize job has no choice to make.
+    pub(crate) fn validate_keyless_job(&self, job_name: &str) -> PyResult<()> {
+        let guard = self.state.read().unwrap();
+        let state = guard.as_ref().ok_or_else(|| {
+            ExecutionError::new_err("CodeRepository not resolved — call resolve() first")
+        })?;
+        let Some(job) = state.jobs_info.get(job_name) else {
+            return Ok(());
+        };
+        let Some(verb) = job.action.as_deref() else {
+            return Ok(());
+        };
+        ensure_whole_asset_chosen(
+            &state.node_map,
+            job.asset_names.iter().map(String::as_str),
+            verb,
+        )
     }
 
     pub(crate) fn list_jobs(&self) -> Vec<JobSummary> {

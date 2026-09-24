@@ -115,7 +115,7 @@ class Orders(DeltaAsset):
 |------|-------------|----------|
 | `optimize` | `Unchanged` + `Exclusive` + `Keyless` | `optimize.compact()`, or `z_order` when `z_order_by` is configured. Table-wide: runs without a partition key on partitioned assets too; a supplied key is rejected. |
 | `vacuum` | `Unchanged` + `Exclusive` + `Keyless` | Removes files no longer referenced by the table. Table-wide, same key rule as `optimize`. |
-| `delete` | `Unmaterialize` + `Exclusive` + `DownstreamFirst` + `Optional` key | Deletes the keyed partition's rows via `partition_predicate`, or every row without a key — on partitioned assets both forms are valid. |
+| `delete` | `Unmaterialize` + `Exclusive` + `DownstreamFirst` + `Optional` key | Deletes the keyed partition's rows via `partition_predicate`, or every row without a key — on partitioned assets both forms are valid. From the UI or gRPC, the keyless form needs an explicit whole-asset choice. |
 
 A verb requires the asset to resolve a `DeltaIOHandler` — anything else fails the
 step with a `TypeError` naming the requirement. On a table that does not exist yet,

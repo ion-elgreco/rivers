@@ -14,7 +14,7 @@
 
 mod common;
 
-use common::{click, flush_effects, fresh_mount_target, nav_to, query_all, query_one};
+use common::{click, flush_effects, fresh_mount_target, nav_to, query_all, query_one, set_checked};
 use leptos::mount::mount_to;
 use leptos::prelude::*;
 use leptos_router::components::Router;
@@ -121,10 +121,10 @@ fn verb(name: &str, outcome: &str, partitioning: &str) -> AssetActionInfo {
     }
 }
 
-/// An `Optional` verb (delete) covers the whole asset without a key, so the
-/// dialog must not demand a partition the backend would accept without one.
+/// An `Optional` verb (delete) runs on every partition without a key, so an
+/// empty pick must not submit: only the explicit whole-asset choice does.
 #[wasm_bindgen_test]
-async fn optional_key_verb_may_submit_without_a_partition() {
+async fn optional_key_verb_needs_a_partition_or_the_whole_asset() {
     let host = mount_verb_dialog(verb("purge", "unchanged", "optional"));
     flush_effects().await;
 
@@ -135,10 +135,22 @@ async fn optional_key_verb_may_submit_without_a_partition() {
         .iter()
         .filter_map(|e| e.text_content())
         .collect();
-    assert!(
-        !errors.iter().any(|e| e == "Select at least one partition."),
-        "an optional-key verb was blocked on an empty selection: {errors:?}"
-    );
+    assert_eq!(errors, vec!["Select at least one partition.".to_string()]);
+
+    // Choosing the whole asset hides the key list: there is nothing to pick.
+    set_checked(&query_one(&host, ".whole-asset-choice input"), true);
+    flush_effects().await;
+    assert_eq!(query_all(&host, ".exec-dialog-partition-row").len(), 0);
+}
+
+/// A `Required` verb has no whole-asset form to offer.
+#[wasm_bindgen_test]
+async fn required_key_verb_offers_no_whole_asset_choice() {
+    let host = mount_verb_dialog(verb("purge", "unmaterialize", "required"));
+    flush_effects().await;
+
+    assert_eq!(query_all(&host, ".whole-asset-choice").len(), 0);
+    assert_eq!(query_all(&host, ".exec-dialog-partition-row").len(), 2);
 }
 
 /// Values in only some dimensions expand to no key, but that is not an empty

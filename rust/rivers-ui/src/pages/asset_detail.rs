@@ -207,7 +207,16 @@ pub fn AssetDetailPage() -> impl IntoView {
         let k = key();
         let (ns, lname) = loc.get();
         async move {
-            crate::server_fns::mutations::trigger_action(ns, lname, verb, vec![k], None, None).await
+            crate::server_fns::mutations::trigger_action(
+                ns,
+                lname,
+                verb,
+                vec![k],
+                None,
+                None,
+                false,
+            )
+            .await
         }
     });
     let action_pending = run_asset_action.pending();

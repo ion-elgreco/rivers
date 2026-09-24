@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use leptos::prelude::*;
 
-use crate::components::partition_picker::PartitionPicker;
+use crate::components::partition_picker::{PartitionPicker, WholeAssetChoice};
 use crate::helpers::{JobPartitionPicker, stale_status_kind};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::mutations::{launch_backfill, trigger_action, trigger_materialize};
@@ -29,7 +29,7 @@ fn launch_summary(
     n_assets: usize,
     n_partitions: usize,
     partitioned: bool,
-    key_optional: bool,
+    whole_asset: bool,
 ) -> String {
     if n_assets == 0 {
         return "Nothing selected".to_string();
@@ -42,11 +42,10 @@ fn launch_summary(
     if !partitioned {
         return format!("{assets} · 1 run");
     }
+    if whole_asset {
+        return format!("{assets} · whole asset · 1 run");
+    }
     if n_partitions == 0 {
-        // An Optional-key verb without a selection covers the whole asset.
-        if key_optional {
-            return format!("{assets} · whole asset · 1 run");
-        }
         return format!("{assets} · select a partition");
     }
     let parts = if n_partitions == 1 {
@@ -89,7 +88,7 @@ pub fn MaterializeDialog(
     /// Verb to run instead of materialize. Same partition selection, submitted
     /// as action runs (or an action backfill above the threshold). The verb's
     /// `partitioning` drives the key requirement: Keyless hides the picker,
-    /// Optional allows an empty selection (whole asset).
+    /// Optional also offers the explicit whole-asset choice.
     #[prop(optional, into)]
     action: Option<Signal<Option<AssetActionInfo>>>,
     /// The verb clears materialization state (`Outcome.Unmaterialize`). Says so
@@ -117,7 +116,8 @@ pub fn MaterializeDialog(
     let destructive: Signal<bool> = destructive.unwrap_or_else(|| Signal::derive(|| false));
     let (selected, set_selected) = signal(Vec::<String>::new());
     let partition_keys = RwSignal::new(Vec::<SubmitPartitionKey>::new());
-    let partial_pick = RwSignal::new(false);
+    let whole_asset = RwSignal::new(false);
+    let whole_asset_chosen = Memo::new(move |_| whole_asset.get() && key_optional.get());
     let (tag_key, set_tag_key) = signal(String::new());
     let (tag_val, set_tag_val) = signal(String::new());
     let (tags, set_tags) = signal(Vec::<(String, String)>::new());
@@ -130,7 +130,7 @@ pub fn MaterializeDialog(
             // partitioned selection — without this an unpartitioned open would
             // submit the previous open's keys.
             partition_keys.set(Vec::new());
-            partial_pick.set(false);
+            whole_asset.set(false);
             // Tags feed the submitted run (including `rivers/priority`), so a
             // tag typed for one open must not ride along on the next.
             set_tags.set(Vec::new());
@@ -144,6 +144,7 @@ pub fn MaterializeDialog(
     let materialize_action = Action::new(move |_: &()| {
         let sel = selected.get();
         let pks = partition_keys.get();
+        let whole = whole_asset_chosen.get();
         let t = tags.get();
         let (ns, name) = loc.get();
         let verb = verb.get();
@@ -153,8 +154,8 @@ pub fn MaterializeDialog(
                 let r = launch_backfill(ns, name, Some(sel), pks, tags_opt, None, verb).await?;
                 return Ok::<_, ServerFnError>(DialogOutcome::Backfill(r.backfill_id));
             }
-            // ≤2 keys → a run each; empty pks (unpartitioned / None picker) → one
-            // keyless run. Both are the same loop over `Option<key>`.
+            // ≤2 keys → a run each; empty pks (unpartitioned, or the whole asset
+            // chosen) → one keyless run. Both are the same loop over `Option<key>`.
             let keys = if pks.is_empty() {
                 vec![None]
             } else {
@@ -171,6 +172,7 @@ pub fn MaterializeDialog(
                             sel.clone(),
                             pk,
                             tags_opt.clone(),
+                            whole,
                         )
                         .await?
                     }
@@ -233,7 +235,7 @@ pub fn MaterializeDialog(
             selected.get().len(),
             partition_keys.get().len(),
             is_partitioned.get(),
-            key_optional.get() && !partial_pick.get(),
+            whole_asset_chosen.get(),
         )
     });
     let submit_label = Signal::derive(move || {
@@ -360,12 +362,16 @@ pub fn MaterializeDialog(
                                         </div>
                                     }
                                 >
-                                    <PartitionPicker
-                                        picker=picker_signal
-                                        selected=partition_keys
-                                        reset=show
-                                        partial=partial_pick
-                                    />
+                                    <Show when=move || key_optional.get()>
+                                        <WholeAssetChoice checked=whole_asset selected=partition_keys/>
+                                    </Show>
+                                    <Show when=move || !whole_asset_chosen.get()>
+                                        <PartitionPicker
+                                            picker=picker_signal
+                                            selected=partition_keys
+                                            reset=show
+                                        />
+                                    </Show>
                                 </Show>
 
                                 <div class="form-group">
@@ -429,7 +435,7 @@ pub fn MaterializeDialog(
                                     }
                                     is_partitioned.get()
                                         && partition_keys.get().is_empty()
-                                        && (!key_optional.get() || partial_pick.get())
+                                        && !whole_asset_chosen.get()
                                 }
                             >
                                 {move || submit_label.get()}
@@ -497,15 +503,15 @@ mod tests {
     }
 
     #[test]
-    fn optional_key_without_keys_covers_the_whole_asset() {
+    fn whole_asset_choice_covers_every_partition() {
         assert_eq!(
             launch_summary(2, 0, true, true),
             "2 assets · whole asset · 1 run"
         );
-        // A selected key still runs partition-scoped.
+        // An empty pick alone never reads as the whole asset.
         assert_eq!(
-            launch_summary(1, 1, true, true),
-            "1 asset · 1 partition · 1 run"
+            launch_summary(2, 0, true, false),
+            "2 assets · select a partition"
         );
     }
 

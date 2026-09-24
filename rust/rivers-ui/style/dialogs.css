@@ -601,6 +601,15 @@ th.sortable:hover { color: var(--text); }
     color: var(--text-muted);
     margin-bottom: 0.4rem;
 }
+/* Explicit whole-asset choice for a verb whose partition key is optional. */
+.whole-asset-choice {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+    font-size: 0.8125rem;
+    cursor: pointer;
+}
 .exec-dialog-partition-dim { margin-bottom: 0.75rem; }
 .exec-dialog-partition-dim:last-child { margin-bottom: 0; }
 .exec-dialog-partition-list {

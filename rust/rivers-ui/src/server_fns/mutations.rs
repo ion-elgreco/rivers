@@ -153,6 +153,8 @@ pub async fn trigger_materialize(
 }
 
 /// Run a named asset action over a selection. Returns the run id.
+/// `whole_asset` is the user's explicit choice to run an Optional-key verb on
+/// every partition; without it the backend rejects a keyless run of one.
 #[server]
 pub async fn trigger_action(
     loc_ns: String,
@@ -161,6 +163,7 @@ pub async fn trigger_action(
     selection: Vec<String>,
     partition_key: Option<SubmitPartitionKey>,
     tags: Option<Vec<(String, String)>>,
+    whole_asset: bool,
 ) -> Result<String, ServerFnError> {
     use rivers_api::rivers::RunActionRequest;
 
@@ -187,6 +190,7 @@ pub async fn trigger_action(
             tags: tags_to_proto(tags),
             user: current_user_ref().await,
             all_assets: false,
+            whole_asset,
         })
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -373,12 +377,14 @@ pub async fn launch_backfill(
 /// the `run_id` immediately; the caller polls the run-detail page for
 /// completion. The dispatcher mode (`"queued"` or `"direct"`) is not
 /// reported here — the UI navigates to the run page either way.
+/// `whole_asset` is as for [`trigger_action`], for the job's verb.
 #[server]
 pub async fn execute_job(
     loc_ns: String,
     loc_name: String,
     job_name: String,
     partition_key: Option<SubmitPartitionKey>,
+    whole_asset: bool,
 ) -> Result<MaterializeResult, ServerFnError> {
     use rivers_api::rivers::ExecuteJobRequest;
 
@@ -393,6 +399,7 @@ pub async fn execute_job(
             job_name,
             partition_key: partition_key.map(submit_to_proto),
             user: current_user_ref().await,
+            whole_asset,
         })
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;

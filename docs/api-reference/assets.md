@@ -509,7 +509,7 @@ never take one.
 |-------|---------|
 | `ActionPartitioning.Required` | A partitioned target needs a key, like materialize (the default when omitted). |
 | `ActionPartitioning.Keyless` | Whole-asset verb: never takes a key — `optimize`, `vacuum`. A backfill of it is rejected, since backfills always run keyed. |
-| `ActionPartitioning.Optional` | A key scopes the run to that partition; without one the run covers the whole asset — `delete`. |
+| `ActionPartitioning.Optional` | A key scopes the run to that partition; without one the run covers the whole asset — `delete`. Over gRPC and in the UI, the keyless form needs an explicit whole-asset choice (see [Running actions](../concepts/actions.md#running-actions)). |
 
 ## `ActionOrdering`
 
