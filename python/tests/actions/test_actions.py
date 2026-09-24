@@ -1185,6 +1185,61 @@ def test_multi_materialize_claims_every_output_pool():
     assert "__asset__:m_right" in claimed[0]
 
 
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize(
+    "resume", [pytest.param(False, id="retry-pod"), pytest.param(True, id="resume")]
+)
+def test_rerun_step_takes_over_its_killed_attempts_pool_slot(
+    storage, tmp_path, executor, resume
+):
+    """A materialize step killed mid-body (a pod OOM kill) never releases its
+    asset-pool slot. The Kubernetes retry pod, or a ``--resume``, runs the step
+    again under the same run and step key. Its claim collided with the leftover
+    row, so the step failed with "Failed to claim pool slots" and never ran."""
+    import obstore.store
+
+    handler = rs.PickleIOHandler(
+        store=obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    )
+
+    class Ledger(rs.Asset):
+        io_handler = handler
+
+        @classmethod
+        def materialize(cls):
+            return 1
+
+        @rs.action(
+            outcome=rs.Outcome.Unchanged, concurrency=rs.ActionConcurrency.Exclusive
+        )
+        @classmethod
+        def optimize(cls, ctx):
+            return None
+
+    repo = rs.CodeRepository(assets=[Ledger], default_executor=executor)
+    repo.resolve(storage=storage)
+    run_id = "killed-run"
+    pool = "__asset__:ledger"
+    # The killed attempt's claim, never released.
+    storage._claim_concurrency_slots([(pool, 1)], run_id, "ledger")
+
+    result = repo.materialize(
+        selection=["ledger"],
+        run_id_override=run_id,
+        resume=resume,
+        raise_on_error=False,
+    )
+
+    assert result.success, result.failed_assets
+    events = sorted(
+        (e.event_type, e.asset_key)
+        for e in storage.get_events_for_run(run_id)
+        if e.event_type in ("StepSlotClaimed", "Materialization")
+    )
+    assert events == [("Materialization", "ledger"), ("StepSlotClaimed", "ledger")]
+    assert storage.get_pool_slot_holders(pool) == []
+
+
 def test_resume_skips_completed_action_steps():
     """A crashed action run resumes instead of re-running its side effects.
 
