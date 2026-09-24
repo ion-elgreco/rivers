@@ -180,8 +180,11 @@ and `delete` built in, declared per the
 [conventional verbs](../concepts/actions.md#conventional-verbs) table.
 
 Reusable `AssetAction` objects can also be assigned as class attributes
-(`optimize = delta_optimize`). Shadowing an inherited action with a non-action
-attribute is a registration-time error, not a silent removal.
+(`optimize = delta_optimize`) or listed in `actions = [...]`. A list entry belongs to
+the class that holds the list, so the most derived class that declares a verb wins
+either way. A class that gives one verb two different definitions, one in its list and
+one as an attribute, is a registration-time error. Shadowing an inherited action with
+a non-action attribute is a registration-time error, not a silent removal.
 
 ## Jobs and selections
 

@@ -444,8 +444,8 @@ Can be combined with `context.add_output_metadata()` and `context.register_data_
 A verb that can be run against an asset besides materialize. Attach via
 `actions=[...]` on any asset constructor, or declare one inline in a class body
 with [`@action`](#action). A class body may also assign a prebuilt
-`AssetAction` to an attribute (the mixin pattern); listing the same verb in
-`actions = [...]` overrides that entry rather than double-registering it.
+`AssetAction` to an attribute (the mixin pattern); a subclass that lists the same
+verb in `actions = [...]` overrides that entry rather than double-registering it.
 See [Actions](../concepts/actions.md) for the model.
 
 ```python

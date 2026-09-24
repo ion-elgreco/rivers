@@ -306,50 +306,69 @@ enum ActionEntry<'py> {
     Ready(Bound<'py, PyAny>),
 }
 
-/// Actions across the MRO: @rs.action-marked classmethods and AssetAction
-/// attributes; a subclass override replaces the inherited entry, and
-/// shadowing an inherited action with a non-action attribute is an error.
+/// Actions across the MRO: @rs.action-marked classmethods, AssetAction
+/// attributes and `actions = [...]` entries. Per verb, the most-derived class
+/// that declares it wins; shadowing an inherited action with a non-action
+/// attribute is an error.
 fn collect_actions<'py>(cls: &Bound<'py, PyType>) -> PyResult<Vec<Bound<'py, PyAny>>> {
     let py = cls.py();
-    let mut entries: Vec<(String, ActionEntry<'py>)> = Vec::new();
-    let upsert = |entries: &mut Vec<(String, ActionEntry<'py>)>, attr: &str, e| match entries
-        .iter_mut()
-        .find(|(k, _)| k == attr)
-    {
-        Some(slot) => slot.1 = e,
-        None => entries.push((attr.to_string(), e)),
-    };
-    for klass in user_mro(cls)?.iter().rev() {
+    let mro = user_mro(cls)?;
+    // (attr, verb, index in `mro` of the class that defines attr, entry)
+    let mut entries: Vec<(String, String, usize, ActionEntry<'py>)> = Vec::new();
+    for (depth, klass) in mro.iter().enumerate().rev() {
         for item in klass
             .getattr("__dict__")?
             .call_method0("items")?
             .try_iter()?
         {
             let (attr, val): (String, Bound<PyAny>) = item?.extract()?;
-            if let Some(meta) = action_meta(&val)? {
+            let (verb, entry) = if let Some(meta) = action_meta(&val)? {
                 if !is_classmethod_or_static(&val)? {
                     return Err(definition_error(format!(
                         "{}.{attr}: @rs.action bodies must be defined with @classmethod",
                         type_name(cls)?
                     )));
                 }
-                upsert(&mut entries, &attr, ActionEntry::Marker(meta));
+                let name_v = meta.get_item("name")?;
+                let verb = if name_v.is_truthy()? {
+                    name_v.extract()?
+                } else {
+                    attr.clone()
+                };
+                (verb, ActionEntry::Marker(meta))
             } else if val.is_instance_of::<PyAssetAction>() {
-                upsert(&mut entries, &attr, ActionEntry::Ready(val));
-            } else if entries.iter().any(|(k, _)| k == &attr) && !attr.starts_with("__") {
-                return Err(definition_error(format!(
-                    "{}.{attr} shadows the inherited action '{attr}' with a non-action \
-                     attribute; override it with @rs.action or rename the attribute",
-                    type_name(cls)?
-                )));
+                (val.getattr("name")?.extract()?, ActionEntry::Ready(val))
+            } else {
+                if entries.iter().any(|(k, ..)| k == &attr) && !attr.starts_with("__") {
+                    return Err(definition_error(format!(
+                        "{}.{attr} shadows the inherited action '{attr}' with a non-action \
+                         attribute; override it with @rs.action or rename the attribute",
+                        type_name(cls)?
+                    )));
+                }
+                continue;
+            };
+            match entries.iter_mut().find(|(k, ..)| k == &attr) {
+                Some(slot) => *slot = (attr, verb, depth, entry),
+                None => entries.push((attr, verb, depth, entry)),
             }
         }
     }
 
     // `actions = [...]` mirrors the decorator's `actions=` argument; the
     // most-derived class that declares it wins, like any other config attr.
-    let mut listed: Vec<Bound<'py, PyAny>> = Vec::new();
-    if let Some(val) = class_attr(cls, "actions")?
+    let mut list_depth = 0;
+    let mut list_val = None;
+    for (depth, klass) in mro.iter().enumerate() {
+        let ns = klass.getattr("__dict__")?;
+        if ns.contains("actions")? {
+            list_depth = depth;
+            list_val = Some(ns.get_item("actions")?);
+            break;
+        }
+    }
+    let mut listed: Vec<(String, Bound<'py, PyAny>)> = Vec::new();
+    if let Some(val) = list_val
         && !val.is_none()
     {
         for item in val.try_iter().map_err(|_| {
@@ -366,40 +385,46 @@ fn collect_actions<'py>(cls: &Bound<'py, PyType>) -> PyResult<Vec<Bound<'py, PyA
                     item.repr()?
                 )));
             }
-            listed.push(item);
+            listed.push((item.getattr("name")?.extract()?, item));
         }
     }
 
-    // A verb in `actions` overrides an attribute-attached action of the same
-    // name — a mixin's `compact = <AssetAction>` repeated by a subclass's
-    // `actions = [compact]` is one action, not a duplicate-verb error.
-    let listed_names: std::collections::HashSet<String> = listed
-        .iter()
-        .filter_map(|a| a.getattr("name").ok()?.extract().ok())
-        .collect();
-
+    // Per verb, the most-derived class that declares it wins, in its
+    // `actions` list or as an attribute.
+    let nearest = |verb: &str| {
+        let in_list = listed.iter().filter(|(v, _)| v == verb).map(|_| list_depth);
+        let as_attr = entries
+            .iter()
+            .filter(|(_, v, ..)| v == verb)
+            .map(|(_, _, d, _)| *d);
+        in_list.chain(as_attr).min()
+    };
     let mut built = Vec::with_capacity(entries.len() + listed.len());
-    built.extend(listed);
-    for (attr, entry) in entries {
-        match entry {
-            ActionEntry::Ready(v) => {
-                let name: String = v.getattr("name")?.extract()?;
-                if !listed_names.contains(&name) {
-                    built.push(v);
-                }
+    for (verb, item) in &listed {
+        if nearest(verb) == Some(list_depth) {
+            built.push(item.clone());
+        }
+    }
+    for (attr, verb, depth, entry) in &entries {
+        if nearest(verb) != Some(*depth) {
+            continue;
+        }
+        if *depth == list_depth
+            && let Some((_, item)) = listed.iter().find(|(v, _)| v == verb)
+        {
+            if matches!(entry, ActionEntry::Ready(v) if v.is(item)) {
+                continue;
             }
+            return Err(definition_error(format!(
+                "{0}.{attr} and {0}.actions both declare the verb '{verb}'; keep one",
+                type_name(&mro[*depth])?
+            )));
+        }
+        match entry {
+            ActionEntry::Ready(v) => built.push(v.clone()),
             ActionEntry::Marker(meta) => {
                 let kwargs = PyDict::new(py);
-                let name_v = meta.get_item("name")?;
-                let name: String = if name_v.is_truthy()? {
-                    name_v.extract()?
-                } else {
-                    attr.clone()
-                };
-                if listed_names.contains(&name) {
-                    continue;
-                }
-                kwargs.set_item("name", &name)?;
+                kwargs.set_item("name", verb)?;
                 for key in [
                     "outcome",
                     "concurrency",

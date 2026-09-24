@@ -13,7 +13,7 @@ import pytest
 
 import rivers as rs
 from rivers._core.assets import desugar, is_asset_class, node_names
-from rivers.exceptions import AssetDefinitionError
+from rivers.exceptions import AssetDefinitionError, ExecutionError
 
 IP = rs.Executor.in_process()
 
@@ -675,6 +675,171 @@ def test_actions_list_overrides_attribute_attached_verb():
     repo = rs.CodeRepository(assets=[asset], default_executor=IP)
     repo.materialize()
     assert repo.run_action("compact").success
+
+
+@pytest.mark.parametrize("form", ["marker", "attribute"])
+def test_subclass_verb_overrides_a_base_actions_list_entry(form):
+    """A verb in a base's `actions = [...]` is inherited like any other, so a
+    subclass redefining it replaces it. The list used to win wherever it sat:
+    the subclass's partition-scoped delete was dropped for the base's
+    whole-table one, and a keyless run emptied every partition."""
+    calls = []
+
+    def _delete_all_rows(ctx):
+        calls.append("all rows")
+
+    wide = rs.AssetAction(
+        name="delete",
+        outcome=rs.Outcome.Unmaterialize,
+        concurrency=rs.ActionConcurrency.Exclusive,
+        partitioning=rs.ActionPartitioning.Optional,
+    )(_delete_all_rows)
+
+    class Warehouse(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+        actions = [wide]
+
+    if form == "marker":
+
+        class Events(Warehouse):
+            partitions_def = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+            @classmethod
+            def materialize(cls, context: rs.AssetExecutionContext):
+                return context.partition_key
+
+            @rs.action(
+                outcome=rs.Outcome.Unmaterialize,
+                concurrency=rs.ActionConcurrency.Exclusive,
+                partitioning=rs.ActionPartitioning.Required,
+            )
+            @classmethod
+            def delete(cls, ctx):
+                calls.append(f"partition {ctx.partition_key}")
+
+    else:
+
+        def _delete_partition(ctx):
+            calls.append(f"partition {ctx.partition_key}")
+
+        class Events(Warehouse):
+            partitions_def = rs.PartitionsDefinition.static_(["p1", "p2"])
+            delete = rs.AssetAction(
+                name="delete",
+                outcome=rs.Outcome.Unmaterialize,
+                concurrency=rs.ActionConcurrency.Exclusive,
+                partitioning=rs.ActionPartitioning.Required,
+            )(_delete_partition)
+
+            @classmethod
+            def materialize(cls, context: rs.AssetExecutionContext):
+                return context.partition_key
+
+    repo = rs.CodeRepository(assets=[Events], default_executor=IP)
+    for p in ("p1", "p2"):
+        repo.materialize(partition_key=rs.PartitionKey.single(p))
+
+    with pytest.raises(
+        ExecutionError, match="Cannot run 'delete' without partition_key"
+    ):
+        repo.run_action("delete")
+    assert repo.run_action("delete", partition_key=rs.PartitionKey.single("p1")).success
+
+    assert calls == ["partition p1"]
+    remaining = [str(k) for k in repo.storage.get_materialized_partitions("events")]
+    assert len(remaining) == 1 and "p2" in remaining[0], remaining
+
+
+def test_base_verb_wins_over_a_later_mixin_actions_list():
+    """Python resolves `Events.delete` to Table's verb: Table comes before the
+    mixin in the MRO. The mixin's `actions = [...]` used to replace it — with
+    `class Events(rs.DeltaAsset, Mixin)`, DeltaAsset's built-in delete."""
+    calls = []
+
+    class Table(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+
+        @rs.action(outcome=rs.Outcome.Unmaterialize)
+        @classmethod
+        def delete(cls, ctx):
+            calls.append("table delete")
+
+    def _mixin_delete(ctx):
+        calls.append("mixin delete")
+
+    def _audit(ctx):
+        calls.append("audit")
+
+    class AuditMixin:
+        actions = [
+            rs.AssetAction(name="delete", outcome=rs.Outcome.Unmaterialize)(
+                _mixin_delete
+            ),
+            rs.AssetAction(name="audit", outcome=rs.Outcome.Unchanged)(_audit),
+        ]
+
+    class Events(Table, AuditMixin):
+        @classmethod
+        def materialize(cls):
+            return 1
+
+    repo = rs.CodeRepository(assets=[Events], default_executor=IP)
+    repo.materialize()
+    assert repo.run_action("delete").success
+    assert repo.run_action("audit").success
+    assert calls == ["table delete", "audit"]
+
+
+@pytest.mark.parametrize("form", ["marker", "attribute"])
+def test_actions_list_and_attribute_verb_on_one_class_is_an_error(form):
+    """One class declaring a verb both in `actions = [...]` and as an attribute
+    is ambiguous; the list used to win silently. Re-listing the very same
+    AssetAction is one action, not a conflict."""
+    wide = rs.AssetAction(name="delete", outcome=rs.Outcome.Unmaterialize)(
+        lambda ctx: None
+    )
+
+    if form == "marker":
+
+        class Events(rs.Asset):
+            actions = [wide]
+
+            @classmethod
+            def materialize(cls):
+                return 1
+
+            @rs.action(outcome=rs.Outcome.Unmaterialize)
+            @classmethod
+            def delete(cls, ctx):
+                return None
+
+    else:
+
+        class Events(rs.Asset):
+            actions = [wide]
+            delete = rs.AssetAction(name="delete", outcome=rs.Outcome.Unmaterialize)(
+                lambda ctx: None
+            )
+
+            @classmethod
+            def materialize(cls):
+                return 1
+
+    with pytest.raises(
+        AssetDefinitionError,
+        match=r"Events\.delete and Events\.actions both declare the verb 'delete'",
+    ):
+        desugar(Events)
+
+    class Table(rs.Asset):
+        delete = wide
+        actions = [wide]
+
+        @classmethod
+        def materialize(cls):
+            return 1
+
+    assert [a.name for a in desugar(Table).actions] == ["delete"]
 
 
 def test_action_marker_without_classmethod_is_an_error():
