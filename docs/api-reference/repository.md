@@ -129,7 +129,7 @@ def backfill(
 ) -> BackfillResult
 ```
 
-Backfill partitions for the selected assets. `action` runs that verb on every partition instead of materializing (every selected asset must define it). See [Backfills](backfills.md) for the full reference.
+Backfill partitions for the selected assets. `action` runs that verb on every partition instead of materializing (every selected asset must define it). `config` needs `block=True`: the backfill record does not keep config, so `config` with `block=False` raises `ExecutionError`. See [Backfills](backfills.md) for the full reference.
 
 ### `cancel_backfill()`
 

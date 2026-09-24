@@ -154,13 +154,16 @@ Launch a backfill to reprocess partitions.
 | `failure_policy` | `str` | `"continue"` | `"continue"` to keep processing on failure, `"stop_on_failure"` to halt. |
 | `max_concurrency` | `int` | `4` | Maximum number of concurrent runs. |
 | `tags` | `list[tuple[str, str]] \| None` | `None` | Tags attached to the backfill and its runs. Use `("rivers/priority", "N")` to override default priority (-10). |
-| `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config overrides (keyed by asset name). |
-| `block` | `bool` | `True` | If `True`, wait for the backfill to complete before returning. |
+| `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config overrides (keyed by asset name). Needs `block=True`. |
+| `block` | `bool` | `True` | If `True`, wait for the backfill to complete before returning. If `False`, only record the backfill; a daemon runs it later. |
 | `dry_run` | `bool` | `False` | If `True`, compute the plan without executing. |
 | `action` | `str \| None` | `None` | Run this [action](../concepts/actions.md) on every partition instead of materializing. Every selected asset must define the verb; child runs and `rerun_backfill` inherit it. |
 
 !!! note
     Provide either `partition_keys` or `partition_range`, not both.
+
+!!! note "Config needs block=True"
+    The backfill record does not keep `config`, and a daemon runs a `block=False` backfill later from its record. Its runs would use the config defaults, so `config` with `block=False` raises `ExecutionError`, also for a dry run.
 
 !!! info "Priority"
     Backfill runs default to priority **-10** (lower than regular runs at priority 0), ensuring scheduled and manually triggered runs are dequeued first when a run queue is configured. Override with `tags=[("rivers/priority", "5")]`.

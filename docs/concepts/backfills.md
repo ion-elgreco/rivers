@@ -156,8 +156,8 @@ print(f"Completed: {result.completed}/{result.num_partitions}")
 | `failure_policy` | `str` | `"continue"` | `"continue"` or `"stop_on_failure"` |
 | `max_concurrency` | `int` | `4` | Max concurrent runs |
 | `tags` | `list[tuple[str, str]]` | None | Tags to attach to the backfill and its runs |
-| `config` | `dict` | None | Per-asset config overrides |
-| `block` | `bool` | `True` | Wait for completion |
+| `config` | `dict` | None | Per-asset config overrides. Needs `block=True` |
+| `block` | `bool` | `True` | Wait for completion. `False` only records the backfill for a daemon to run |
 | `dry_run` | `bool` | `False` | Preview without executing |
 
 ## Dry-run preview
@@ -201,6 +201,8 @@ repo.backfill(
     config={"daily_events": {"batch_size": 5000}},
 )
 ```
+
+Config needs `block=True` (the default). The backfill record does not keep config. A daemon runs a `block=False` backfill later from its record, so its runs would use the config defaults. For this reason, `config` with `block=False` raises `ExecutionError`.
 
 ## Asset-level backfill strategy
 

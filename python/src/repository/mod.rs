@@ -4150,6 +4150,14 @@ impl PyCodeRepository {
                  to target every asset that defines it"
             )));
         }
+        // The backfill record keeps no config, and a non-blocking backfill runs
+        // later from that record.
+        if config.is_some() && !block {
+            return Err(ExecutionError::new_err(
+                "backfill(block=False) got config: the config would be lost and the runs \
+                 would use the config defaults. Use block=True to run with this config",
+            ));
+        }
         py.detach(|| {
             self.backfill_inner(
                 crate::daemon::RunType::Materialization(selection.unwrap_or_default()),

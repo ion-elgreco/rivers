@@ -315,11 +315,18 @@ class CodeRepository:
             failure_policy: ``"continue"`` or ``"stop_on_failure"``.
             max_concurrency: Cap on concurrent partition runs.
             tags: Run tags applied to every spawned run.
-            config: Per-asset config, keyed by asset name.
-            block: Wait for the backfill to finish before returning.
+            config: Per-asset config, keyed by asset name. Needs ``block=True``.
+            block: Wait for the backfill to finish before returning. ``False``
+                only records the backfill for a daemon to run later, and
+                raises if ``config`` is given.
             dry_run: Plan only — return the would-be run shape without launching.
             action: Verb child runs execute; ``None`` means materialize.
                 Every selected asset must define the action.
+
+        Raises:
+            ExecutionError: ``config`` is given with ``block=False``, also for a
+                dry run. The backfill record does not keep config, so the runs
+                would use the config defaults.
         """
         ...
 

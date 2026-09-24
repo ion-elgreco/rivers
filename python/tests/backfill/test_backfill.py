@@ -9,10 +9,13 @@ from datetime import datetime
 
 import pytest
 import rivers as rs
+from pydantic import BaseModel
+from rivers._core import AutomationDaemon
 from rivers.exceptions import ExecutionError
 
 from _helpers import daily_pd as _daily_pd
 from _helpers import static_pd as _static_pd
+from _polling import wait_until
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +466,83 @@ class TestBackfillConfig:
         )
         assert result.completed == 1
         assert captured.get("mode") == "full_refresh"
+
+    @pytest.mark.parametrize("action", [None, "purge"], ids=["materialize", "action"])
+    def test_config_without_block_is_rejected(self, storage, action):
+        """A non-blocking backfill keeps no config, so a daemon ran its
+        children later with the config defaults: `dry_run=True` became a real
+        purge. The call must fail before it records the backfill."""
+        calls = []
+
+        class PurgeConfig(BaseModel):
+            dry_run: bool = False
+
+        def _purge(ctx: rs.ActionContext[PurgeConfig]) -> None:
+            calls.append(("purge", ctx.partition_key, ctx.config.dry_run))
+
+        purge = rs.AssetAction(name="purge", outcome=rs.Outcome.Unmaterialize)(_purge)
+
+        @rs.Asset(partitions_def=_static_pd(["p1", "p2"]), actions=[purge])
+        def events(context: rs.AssetExecutionContext[PurgeConfig]) -> int:
+            calls.append(("materialize", context.partition_key, context.config.dry_run))
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[events], default_executor=rs.Executor.in_process()
+        )
+        repo.resolve(storage=storage)
+        p1, p2 = rs.PartitionKey.single("p1"), rs.PartitionKey.single("p2")
+        for key in (p1, p2):
+            repo.materialize(partition_key=key)
+        calls.clear()
+        verb = action or "materialize"
+        config = {"events": {"dry_run": True}}
+
+        # A dry run rejects what the real call rejects.
+        for dry_run in (False, True):
+            with pytest.raises(
+                ExecutionError,
+                match=re.escape(
+                    "backfill(block=False) got config: the config would be lost "
+                    "and the runs would use the config defaults. Use block=True "
+                    "to run with this config"
+                ),
+            ):
+                repo.backfill(
+                    selection=["events"],
+                    partition_keys=[p1],
+                    action=action,
+                    config=config,
+                    block=False,
+                    dry_run=dry_run,
+                )
+
+        # No record was left for the daemon: it runs only this backfill, and
+        # stop() joins every backfill it picked up.
+        control = repo.backfill(
+            selection=["events"], partition_keys=[p2], action=action, block=False
+        )
+        daemon = AutomationDaemon(repo=repo, storage=storage)
+        daemon.start()
+        try:
+            wait_until(
+                lambda: (
+                    repo.get_backfill(control.backfill_id).status
+                    not in ("Requested", "InProgress")
+                ),
+                timeout=20,
+            )
+        finally:
+            daemon.stop()
+        assert repo.get_backfill(control.backfill_id).status == "CompletedSuccess"
+        assert calls == [(verb, "p2", False)]
+
+        calls.clear()
+        result = repo.backfill(
+            selection=["events"], partition_keys=[p1], action=action, config=config
+        )
+        assert result.status == "CompletedSuccess"
+        assert calls == [(verb, "p1", True)]
 
 
 # ---------------------------------------------------------------------------
