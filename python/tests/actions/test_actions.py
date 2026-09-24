@@ -1786,6 +1786,116 @@ def test_cancelled_action_waiting_on_its_asset_pool_never_runs(style):
     assert "StepStart" not in kinds and "StepFailure" not in kinds, kinds
 
 
+_CANCEL_TABLES = [f"table_{i}" for i in range(6)]
+
+
+def _asset_keys_by_event(repo, run_id):
+    by_kind = {}
+    for e in repo.storage.get_events_for_run(run_id):
+        by_kind.setdefault(str(e.event_type), []).append(e.asset_key)
+    return by_kind
+
+
+@pytest.mark.parametrize("style", ["sync", "async"])
+def test_cancelled_action_starts_no_more_targets(style):
+    """A cancel stops every target that has not started, not only those that
+    wait on a pool: a Shared verb claims none, so its other targets used to
+    run after the cancel. In-process runs a level's sync bodies before its
+    async ones, so in the async case one sync body cancels before the async
+    bodies can start."""
+    handler = rs.InMemoryIOHandler()
+    purged = []
+
+    def _purge(ctx):
+        purged.append(ctx.asset_name)
+        if len(purged) == 1:
+            repo.storage.request_cancellation(ctx.run_id)
+
+    async def _apurge(ctx):
+        _purge(ctx)
+
+    sync_purge = rs.AssetAction(name="purge", outcome=rs.Outcome.Unmaterialize)(_purge)
+    async_purge = rs.AssetAction(name="purge", outcome=rs.Outcome.Unmaterialize)(
+        _apurge
+    )
+
+    def table(name, action):
+        @rs.Asset(name=name, io_handler=handler, actions=[action])
+        def _table() -> int:
+            return 1
+
+        return _table
+
+    sync_count = len(_CANCEL_TABLES) if style == "sync" else 1
+    repo = rs.CodeRepository(
+        assets=[
+            table(name, sync_purge if i < sync_count else async_purge)
+            for i, name in enumerate(_CANCEL_TABLES)
+        ],
+        default_executor=IP,
+    )
+    repo.materialize()
+    result = repo.run_action("purge", raise_on_error=False)
+
+    assert len(purged) == 1, f"targets ran after the cancel: {purged[1:]}"
+    first = purged[0]
+    assert repo.storage.get_run(result.run_id).status == "Canceled"
+    by_kind = _asset_keys_by_event(repo, result.run_id)
+    assert by_kind.get("Deletion") == [first]
+    assert by_kind.get("StepStart") == [first]
+    assert "ActionCompleted" not in by_kind and "StepFailure" not in by_kind
+    assert repo.storage.get_asset_record(first).last_data_version is None
+    for name in _CANCEL_TABLES:
+        if name != first:
+            record = repo.storage.get_asset_record(name)
+            assert record.last_data_version is not None, name
+
+
+@pytest.mark.parametrize("style", ["sync", "async"])
+def test_cancelled_materialize_starts_no_more_steps(style):
+    """The same rule for a materialize run, set up like the action test above:
+    the level's other steps claim no pool, and they used to start after the
+    cancel."""
+    handler = rs.InMemoryIOHandler()
+    ran = []
+
+    def _body(context):
+        ran.append(context.asset_name)
+        if len(ran) == 1:
+            repo.storage.request_cancellation(context.run_id)
+        return 1
+
+    def table(name, is_async):
+        if is_async:
+
+            @rs.Asset(name=name, io_handler=handler)
+            async def _table(context: rs.AssetExecutionContext) -> int:
+                return _body(context)
+
+        else:
+
+            @rs.Asset(name=name, io_handler=handler)
+            def _table(context: rs.AssetExecutionContext) -> int:
+                return _body(context)
+
+        return _table
+
+    sync_count = len(_CANCEL_TABLES) if style == "sync" else 1
+    repo = rs.CodeRepository(
+        assets=[table(name, i >= sync_count) for i, name in enumerate(_CANCEL_TABLES)],
+        default_executor=IP,
+    )
+    result = repo.materialize(raise_on_error=False)
+
+    assert len(ran) == 1, f"steps ran after the cancel: {ran[1:]}"
+    first = ran[0]
+    assert repo.storage.get_run(result.run_id).status == "Canceled"
+    by_kind = _asset_keys_by_event(repo, result.run_id)
+    assert by_kind.get("Materialization") == [first]
+    assert by_kind.get("StepStart") == [first]
+    assert "StepFailure" not in by_kind
+
+
 def test_asset_pool_wait_outlives_the_claim_timeout():
     """A materialize waiting on its asset's exclusive-action pool must wait for
     the action, not fail at the claim timeout: the failure set a floor that

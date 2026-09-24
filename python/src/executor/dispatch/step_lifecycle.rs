@@ -94,9 +94,8 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
             }
         }
     };
-    if guard.is_some()
-        && failure::run_cancelled_blocking(py, ctx.sink.storage.backend(), ctx.scope.run_id)
-    {
+    // A cancelled run starts no more steps, pooled or not.
+    if failure::run_cancelled_blocking(py, ctx.sink.storage.backend(), ctx.scope.run_id) {
         if let Some(g) = guard {
             g.release_blocking(py);
         }
@@ -246,12 +245,11 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
             }
         }
     };
-    if guard.is_some()
-        && storage
-            .backend()
-            .is_cancelled(&run_id)
-            .await
-            .unwrap_or(false)
+    if storage
+        .backend()
+        .is_cancelled(&run_id)
+        .await
+        .unwrap_or(false)
     {
         if let Some(g) = guard {
             g.release().await;
