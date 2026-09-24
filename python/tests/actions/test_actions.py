@@ -1896,6 +1896,141 @@ def test_cancelled_materialize_starts_no_more_steps(style):
     assert "StepFailure" not in by_kind
 
 
+def _fanned(handler, items, echo, pooled):
+    """A graph asset that maps ``echo`` over ``items``. With ``pooled``, it
+    declares an Exclusive action, so its inner tasks claim the asset's pool."""
+
+    class Fanned(rs.GraphAsset):
+        io_handler = handler
+        node_io_handler = handler
+
+        @classmethod
+        def compose(cls):
+            return _fan_total(items().map(echo).collect())
+
+        if pooled:
+
+            @rs.action(
+                outcome=rs.Outcome.Unchanged,
+                concurrency=rs.ActionConcurrency.Exclusive,
+            )
+            @classmethod
+            def optimize(cls, ctx):
+                return None
+
+    return Fanned
+
+
+def _assert_fan_out_cut_short(repo, run_id, mapped, ran):
+    """Only the instances in ``ran`` have step events, and the mapped step has
+    neither a StepSuccess nor a StepFailure."""
+    assert repo.storage.get_run(run_id).status == "Canceled"
+    by_kind = _asset_keys_by_event(repo, run_id)
+    assert mapped not in by_kind.get("StepSuccess", []), by_kind
+    assert "StepFailure" not in by_kind, by_kind
+    for kind in ("StepStart", "Materialization", "StepSuccess"):
+        instances = [k for k in by_kind.get(kind, []) if k.startswith(f"{mapped}__")]
+        assert instances == ran, (kind, by_kind)
+
+
+@pytest.mark.parametrize("pooled", [False, True], ids=["no_pool", "asset_pool"])
+@pytest.mark.parametrize("style", ["sync", "async"])
+def test_cancelled_fan_out_does_not_succeed(style, pooled):
+    """A cancel skips the fan-out instances that have not started, so the
+    mapped step did not finish. It used to get a StepSuccess all the same.
+    Sync instances run one at a time, so the first one cancels the run. Async
+    ones start up to four at a time, so there a step of the same level cancels
+    first: a level runs its single steps before its mapped ones."""
+    handler = rs.InMemoryIOHandler()
+    run_ids = []
+    ran = []
+
+    def cancel():
+        repo.storage.request_cancellation(run_ids[0])
+
+    @rs.Asset(io_handler=handler)
+    def items(context: rs.AssetExecutionContext) -> list:
+        run_ids.append(context.run_id)
+        return [1, 2, 3, 4, 5, 6]
+
+    if style == "sync":
+
+        @rs.Task
+        def echo(x: int) -> int:
+            ran.append(x)
+            if len(ran) == 1:
+                cancel()
+            return x
+
+        siblings = []
+    else:
+
+        @rs.Task
+        async def echo(x: int) -> int:
+            ran.append(x)
+            return x
+
+        @rs.Asset(io_handler=handler)
+        def stopper(items: list) -> int:
+            cancel()
+            return 0
+
+        siblings = [stopper]
+
+    repo = rs.CodeRepository(
+        assets=[items, _fanned(handler, items, echo, pooled), *siblings],
+        tasks=[echo, _fan_total],
+        default_executor=IP,
+    )
+    result = repo.materialize(raise_on_error=False)
+
+    assert ran == ([1] if style == "sync" else [])
+    first = ["fanned/echo__0"] if style == "sync" else []
+    _assert_fan_out_cut_short(repo, result.run_id, "fanned/echo", first)
+
+
+@pytest.mark.parametrize(
+    ("style", "pooled"),
+    [("sync", True), ("async", False), ("async", True)],
+    ids=["sync-asset_pool", "async-no_pool", "async-asset_pool"],
+)
+def test_cancelled_fan_out_does_not_succeed_on_parallel(tmp_path, style, pooled):
+    """The same rule on the parallel executor. Sync instance bodies run in
+    worker processes, so a step of the same level cancels first. A sync
+    instance with no pool goes to a worker with no cancel check, so that case
+    is left out."""
+    import obstore.store
+
+    store = obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    handler = rs.PickleIOHandler(store=store)
+
+    @rs.Asset(io_handler=handler)
+    def items() -> list:
+        return [1, 2, 3, 4, 5, 6]
+
+    @rs.Asset(io_handler=handler)
+    def stopper(context: rs.AssetExecutionContext, items: list) -> int:
+        repo.storage.request_cancellation(context.run_id)
+        return 0
+
+    if style == "sync":
+        echo = _fan_echo
+    else:
+
+        @rs.Task
+        async def echo(x: int) -> int:
+            return x
+
+    repo = rs.CodeRepository(
+        assets=[items, _fanned(handler, items, echo, pooled), stopper],
+        tasks=[echo, _fan_total],
+        default_executor=MP,
+    )
+    result = repo.materialize(raise_on_error=False)
+
+    _assert_fan_out_cut_short(repo, result.run_id, f"fanned/{echo.name}", [])
+
+
 def test_asset_pool_wait_outlives_the_claim_timeout():
     """A materialize waiting on its asset's exclusive-action pool must wait for
     the action, not fail at the claim timeout: the failure set a floor that

@@ -295,6 +295,7 @@ impl Executor {
             let writer = EventWriter::new(storage.clone());
             let mut data_versions: HashMap<String, String> = HashMap::new();
             let mut failed_names: HashSet<String> = HashSet::new();
+            let mut cancelled_names: HashSet<String> = HashSet::new();
 
             let mut prior_attempts: HashMap<String, rivers_core::storage::StepAttempts> =
                 HashMap::new();
@@ -451,6 +452,7 @@ impl Executor {
                         state: dispatch::RunState {
                             data_versions: &mut data_versions,
                             failed_names: &mut failed_names,
+                            cancelled_names: &mut cancelled_names,
                             graph_started: &mut graph_started,
                             mapped_instance_keys: &mut mapped_instance_keys,
                             step_dynamic_keys: &mut step_dynamic_keys,

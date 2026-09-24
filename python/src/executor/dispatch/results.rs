@@ -526,7 +526,7 @@ pub(crate) fn process_outcome(
                 failures,
             );
         }
-        WorkOutcome::Cancelled => {}
+        WorkOutcome::Cancelled => ctx.state.mark_cancelled(step_name.to_string()),
     }
 }
 

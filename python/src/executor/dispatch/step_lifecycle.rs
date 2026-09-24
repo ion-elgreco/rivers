@@ -83,7 +83,10 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
             Ok(g) => Some(g),
             // Cancelled mid-wait: the step never starts, like the rest of a
             // cancelled level — no failure, no floor.
-            Err(e) if e.is::<ClaimCancelled>() => return,
+            Err(e) if e.is::<ClaimCancelled>() => {
+                ctx.state.mark_cancelled(step_name.to_string());
+                return;
+            }
             Err(e) => {
                 ctx.record_failure_no_hooks(
                     step_name,
@@ -99,6 +102,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
         if let Some(g) = guard {
             g.release_blocking(py);
         }
+        ctx.state.mark_cancelled(step_name.to_string());
         return;
     }
 

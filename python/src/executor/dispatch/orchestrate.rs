@@ -109,8 +109,8 @@ pub(crate) fn execute_level_batch(
 }
 
 /// One mapped step's roll-up record: which step + the mapping_keys we built
-/// instances for. We check `state.failed_names` for each instance after
-/// `run_instances` to decide success vs failure for the mapped step.
+/// instances for. We check `state.failed_names` and `state.cancelled_names`
+/// for each instance after `run_instances` to decide the mapped step's outcome.
 struct MappedStepRecord {
     idx: usize,
     keys: Vec<String>,
@@ -121,18 +121,23 @@ fn finalize_mapped_steps(ctx: &mut BatchContext, records: &[MappedStepRecord]) {
         let step = &ctx.scope.plan.steps[rec.idx];
         let mut successful = Vec::with_capacity(rec.keys.len());
         let mut any_failed = false;
+        let mut any_cancelled = false;
         for key in &rec.keys {
             let instance_name = format!("{}__{}", step.name, key);
             if ctx.state.was_failed(&instance_name) {
                 any_failed = true;
+            } else if ctx.state.was_cancelled(&instance_name) {
+                any_cancelled = true;
             } else {
                 successful.push(key.clone());
             }
         }
+        // A cancel that skipped instances before they started leaves the step
+        // unfinished: like a step the cancel skipped, it records nothing.
         if any_failed {
             ctx.emit_step_failure(&step.name, "One or more map instances failed", None);
             ctx.state.mark_failed(step.name.clone());
-        } else {
+        } else if !any_cancelled {
             ctx.emit_success(&step.name);
             ctx.state.record_mapped_keys(step.name.clone(), successful);
         }

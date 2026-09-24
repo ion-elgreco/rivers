@@ -41,6 +41,8 @@ pub(crate) struct RunScope<'a> {
 pub(crate) struct RunState<'a> {
     pub data_versions: &'a mut HashMap<String, String>,
     pub failed_names: &'a mut HashSet<String>,
+    /// Steps a cancel skipped before they started.
+    pub cancelled_names: &'a mut HashSet<String>,
     pub graph_started: &'a mut HashSet<String>,
     pub mapped_instance_keys: &'a mut HashMap<String, Vec<String>>,
     pub failed_partitions: &'a mut HashMap<String, Vec<(PyPartitionKey, String)>>,
@@ -65,6 +67,14 @@ impl<'a> RunState<'a> {
 
     pub fn was_failed(&self, name: &str) -> bool {
         self.failed_names.contains(name)
+    }
+
+    pub fn mark_cancelled(&mut self, name: String) {
+        self.cancelled_names.insert(name);
+    }
+
+    pub fn was_cancelled(&self, name: &str) -> bool {
+        self.cancelled_names.contains(name)
     }
 
     /// Mark a graph asset as started; returns true if this is the first time.
