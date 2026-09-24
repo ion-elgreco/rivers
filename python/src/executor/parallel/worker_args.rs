@@ -340,18 +340,25 @@ pub(crate) fn make_func_ref(py: Python, func: &Py<PyAny>) -> PyResult<Py<PyAny>>
     Ok(Py::new(py, super::worker::PyFuncRef::new(module, qualname))?.into_any())
 }
 
-/// A bound method ships as its function and owner: loky's own method reducer
-/// rebuilds it as `getattr(owner, func.__name__)`, which misses a verb stored
-/// under another name (`materialize = classmethod(_load)`).
+/// loky's own method reducer rebuilds a bound method as
+/// `getattr(owner, func.__name__)`, so a verb inherited from an importable
+/// base resolves through its owner. Only when that lookup misses the verb
+/// (`materialize = classmethod(_load)`) does it ship as its function and
+/// owner: a function from a class body pickles only by value, with the
+/// module globals it reads.
 fn func_by_value(py: Python, func: &Py<PyAny>) -> PyResult<Py<PyAny>> {
     let f = func.bind(py);
-    match (f.getattr("__func__"), f.getattr("__self__")) {
-        (Ok(inner), Ok(owner)) => {
-            let method = super::worker::PyBoundMethod::new(inner.unbind(), owner.unbind());
-            Ok(Py::new(py, method)?.into_any())
-        }
-        _ => Ok(func.clone_ref(py)),
+    let (Ok(inner), Ok(owner)) = (f.getattr("__func__"), f.getattr("__self__")) else {
+        return Ok(func.clone_ref(py));
+    };
+    let by_name = inner
+        .getattr("__name__")
+        .and_then(|name| owner.getattr(name.extract::<String>()?));
+    if by_name.is_ok_and(|found| same_callable(&found, f)) {
+        return Ok(func.clone_ref(py));
     }
+    let method = super::worker::PyBoundMethod::new(inner.unbind(), owner.unbind());
+    Ok(Py::new(py, method)?.into_any())
 }
 
 /// Each attribute access builds a new bound method, so two bound methods

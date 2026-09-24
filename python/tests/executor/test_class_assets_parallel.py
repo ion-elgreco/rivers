@@ -524,6 +524,114 @@ def test_script_class_assets_with_declarations_run_on_parallel(tmp_path):
     assert (tmp_path / "hook_ran").read_text() == "customers"
 
 
+# A template whose verb reads module globals that must stay in its module: a
+# lock cannot be pickled, and a large constant must not be copied per step.
+SNAPSHOT_TEMPLATE_MODULE = textwrap.dedent(
+    """
+    import pathlib
+    import sys
+    import threading
+
+    import obstore.store
+
+    import rivers as rs
+
+    _LOCK = threading.Lock()
+    _ROWS = {"users": ["ada", "bob"], "orders": [3, 4, 5]}
+    _PADDING = "x" * 5_000_000
+
+
+    class TableSnapshot(rs.Asset):
+        io_handler = rs.PickleIOHandler(
+            store=obstore.store.LocalStore(
+                str(pathlib.Path(__file__).parent / "store"), mkdir=True
+            )
+        )
+        table = ""
+
+        @classmethod
+        def materialize(cls) -> dict:
+            with _LOCK:
+                return {
+                    "rows": _ROWS[cls.table],
+                    "padding_from_module": _PADDING is sys.modules[__name__]._PADDING,
+                }
+    """
+)
+
+SNAPSHOT_PIPELINE_SCRIPT = textwrap.dedent(
+    """
+    import json
+
+    import rivers as rs
+    from snapshots import TableSnapshot
+
+
+    class UsersSnapshot(TableSnapshot):
+        table = "users"
+
+
+    class OrdersSnapshot(TableSnapshot):
+        table = "orders"
+
+
+    if __name__ == "__main__":
+        repo = rs.CodeRepository(
+            assets=[UsersSnapshot, OrdersSnapshot],
+            default_executor=rs.Executor.parallel(max_workers=2),
+        )
+        repo.materialize()
+        names = ["users_snapshot", "orders_snapshot"]
+        print(json.dumps({n: repo.load_node(n) for n in names}))
+    """
+)
+
+SNAPSHOTS = {
+    "users_snapshot": {"rows": ["ada", "bob"], "padding_from_module": True},
+    "orders_snapshot": {"rows": [3, 4, 5], "padding_from_module": True},
+}
+
+
+def test_script_subclasses_of_imported_template_run_on_parallel(tmp_path):
+    """`python pipeline.py` whose subclasses inherit `materialize` from a
+    template in an importable module. The worker finds the verb through the
+    subclass, so the template's function is not pickled with the globals it
+    reads: the lock would fail both steps, the constant would ship with each."""
+    (tmp_path / "snapshots.py").write_text(SNAPSHOT_TEMPLATE_MODULE)
+    script = tmp_path / "pipeline.py"
+    script.write_text(SNAPSHOT_PIPELINE_SCRIPT)
+    existing = os.environ.get("PYTHONPATH")
+    pythonpath = f"{tmp_path}{os.pathsep}{existing}" if existing else str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=50,
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": pythonpath},
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+    printed = [line for line in result.stdout.splitlines() if line.startswith("{")]
+    assert json.loads(printed[-1]) == SNAPSHOTS
+
+
+def test_loky_local_subclasses_of_imported_template(worker_module):
+    """The same template, subclassed inside a function."""
+    m = worker_module(SNAPSHOT_TEMPLATE_MODULE)
+
+    class UsersSnapshot(m.TableSnapshot):
+        table = "users"
+
+    class OrdersSnapshot(m.TableSnapshot):
+        table = "orders"
+
+    repo = rs.CodeRepository(
+        assets=[UsersSnapshot, OrdersSnapshot], default_executor=MP
+    )
+    repo.materialize()
+    assert {name: repo.load_node(name) for name in SNAPSHOTS} == SNAPSHOTS
+
+
 class _LabelHandler(rs.BaseIOHandler):
     """A picklable handler that compares by value."""
 
