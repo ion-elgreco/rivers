@@ -13,10 +13,13 @@ use crate::errors::AssetDefinitionError;
 ///
 /// - `Instance(Py<PyAny>)` — an object with `handle_output` and `load_input` methods
 /// - `ResourceRef(String)` — a key into the repository's resources dict, resolved at execution time
+/// - `Resource(Py<PyAny>)` — the handler `CodeRepository.resolve()` found for a `ResourceRef`.
+///   A fresh import of the defining module holds only the key.
 #[derive(Debug)]
 pub enum IOHandler {
     Instance(Py<PyAny>),
     ResourceRef(String),
+    Resource(Py<PyAny>),
 }
 
 impl<'py> FromPyObject<'py, '_> for IOHandler {
@@ -34,7 +37,7 @@ impl<'py> FromPyObject<'py, '_> for IOHandler {
 }
 
 impl IOHandler {
-    /// Resolve a ResourceRef to an Instance in-place.
+    /// Resolve a ResourceRef to a Resource in-place.
     /// `io_handler_keys` contains resource keys pre-validated as IOHandler at extraction time.
     pub fn resolve_in_place(
         &mut self,
@@ -57,7 +60,7 @@ impl IOHandler {
                     asset_name, key
                 ))
             })?;
-            *self = IOHandler::Instance(resource.clone_ref(py));
+            *self = IOHandler::Resource(resource.clone_ref(py));
         }
         Ok(())
     }
@@ -66,13 +69,22 @@ impl IOHandler {
         match self {
             IOHandler::Instance(h) => IOHandler::Instance(h.clone_ref(py)),
             IOHandler::ResourceRef(k) => IOHandler::ResourceRef(k.clone()),
+            IOHandler::Resource(h) => IOHandler::Resource(h.clone_ref(py)),
+        }
+    }
+
+    /// The handler instance, or None for an unresolved resource key.
+    pub fn handler(&self) -> Option<&Py<PyAny>> {
+        match self {
+            IOHandler::Instance(h) | IOHandler::Resource(h) => Some(h),
+            IOHandler::ResourceRef(_) => None,
         }
     }
 
     /// The handler instance, or the resource key string.
     pub fn to_object(&self, py: Python) -> Py<PyAny> {
         match self {
-            IOHandler::Instance(h) => h.clone_ref(py),
+            IOHandler::Instance(h) | IOHandler::Resource(h) => h.clone_ref(py),
             IOHandler::ResourceRef(k) => pyo3::types::PyString::new(py, k).unbind().into_any(),
         }
     }

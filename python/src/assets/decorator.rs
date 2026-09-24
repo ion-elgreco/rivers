@@ -346,9 +346,10 @@ fn io_handler_eq(py: Python, a: Option<&IOHandler>, b: Option<&IOHandler>) -> bo
     match (a, b) {
         (None, None) => true,
         (Some(IOHandler::ResourceRef(a)), Some(IOHandler::ResourceRef(b))) => a == b,
-        (Some(IOHandler::Instance(a)), Some(IOHandler::Instance(b))) => {
-            a.bind(py).eq(b.bind(py)).unwrap_or(false)
-        }
+        (
+            Some(IOHandler::Instance(a) | IOHandler::Resource(a)),
+            Some(IOHandler::Instance(b) | IOHandler::Resource(b)),
+        ) => a.bind(py).eq(b.bind(py)).unwrap_or(false),
         _ => false,
     }
 }
@@ -1665,19 +1666,13 @@ impl PyAsset {
 
     #[getter]
     fn io_handler(&self) -> Option<&Py<PyAny>> {
-        self.inner.io_handler().and_then(|h| match h {
-            IOHandler::Instance(obj) => Some(obj),
-            IOHandler::ResourceRef(_) => None,
-        })
+        self.inner.io_handler().and_then(IOHandler::handler)
     }
 
     /// Internal task IO handler for graph assets.
     #[getter]
     fn node_io_handler(&self) -> Option<&Py<PyAny>> {
-        self.inner.node_io_handler().and_then(|h| match h {
-            IOHandler::Instance(obj) => Some(obj),
-            IOHandler::ResourceRef(_) => None,
-        })
+        self.inner.node_io_handler().and_then(IOHandler::handler)
     }
 
     #[getter]

@@ -198,6 +198,235 @@ def test_loky_graph_asset_by_reference(class_mod):
     assert repo.load_node("g_seed_b") == 4
 
 
+@pytest.fixture
+def worker_module(tmp_path, monkeypatch):
+    """Import a module from a file under ``tmp_path`` that loky workers import too."""
+    from loky import get_reusable_executor
+
+    existing = os.environ.get("PYTHONPATH")
+    pythonpath = f"{tmp_path}{os.pathsep}{existing}" if existing else str(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", pythonpath)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    # Warm workers froze PYTHONPATH at spawn.
+    get_reusable_executor().shutdown(kill_workers=True)
+    names = []
+
+    def load(source: str):
+        name = f"worker_mod_{tmp_path.name}_{len(names)}"
+        (tmp_path / f"{name}.py").write_text(source)
+        names.append(name)
+        importlib.invalidate_caches()
+        return importlib.import_module(name)
+
+    yield load
+    get_reusable_executor().shutdown(kill_workers=True)
+    for name in names:
+        sys.modules.pop(name, None)
+
+
+def _pickle_handler(root: Path) -> rs.PickleIOHandler:
+    return rs.PickleIOHandler(store=obstore.store.LocalStore(str(root), mkdir=True))
+
+
+def _stored(root: Path) -> dict:
+    """What a PickleIOHandler holds under ``root``, by asset path."""
+    return {
+        p.relative_to(root).with_suffix("").as_posix(): pickle.loads(p.read_bytes())
+        for p in sorted(root.rglob("*.pkl"))
+    }
+
+
+# Module-level assets that name their io_handler by resource key. resolve()
+# swaps the key for the handler on these same objects in the parent, while a
+# loky worker imports the module fresh and holds only the key.
+KEY_HANDLER_MODULE = textwrap.dedent(
+    """
+    import rivers as rs
+
+
+    @rs.Asset(io_handler="warehouse")
+    def orders() -> list:
+        return [3, 4]
+
+
+    @rs.Asset(io_handler="warehouse")
+    def customers() -> list:
+        return ["ada", "bob"]
+
+
+    @rs.Asset(io_handler="warehouse")
+    def order_total(orders: list) -> int:
+        return sum(orders)
+
+
+    @rs.Asset(io_handler="warehouse")
+    def customer_count(customers: list) -> int:
+        return len(customers)
+
+
+    @rs.Asset.external(io_handler="warehouse")
+    def feed():
+        return rs.Observation(data_version="v1")
+
+
+    @rs.Asset(io_handler="warehouse")
+    def feed_total(feed: list) -> int:
+        return sum(feed)
+
+
+    @rs.Asset(io_handler="warehouse")
+    def feed_count(feed: list) -> int:
+        return len(feed)
+
+
+    @rs.Task
+    def left() -> int:
+        return 3
+
+
+    @rs.Task
+    def right() -> int:
+        return 4
+
+
+    @rs.Task
+    def add(a: int, b: int) -> int:
+        return a + b
+
+
+    @rs.Asset.from_graph(io_handler="warehouse", node_io_handler="scratch")
+    def total():
+        return add(left(), right())
+    """
+)
+
+
+@pytest.mark.parametrize(
+    ("selection", "seed", "expected"),
+    [
+        (
+            ["orders", "customers"],
+            {},
+            {"customers": ["ada", "bob"], "orders": [3, 4]},
+        ),
+        (
+            ["orders", "customers", "order_total", "customer_count"],
+            {},
+            {
+                "customer_count": 2,
+                "customers": ["ada", "bob"],
+                "order_total": 7,
+                "orders": [3, 4],
+            },
+        ),
+        (
+            ["feed_total", "feed_count"],
+            {"feed": [1, 2, 3]},
+            {"feed": [1, 2, 3], "feed_count": 3, "feed_total": 6},
+        ),
+    ],
+    ids=["one-level", "downstream-reads", "external-upstream"],
+)
+def test_loky_resource_key_io_handler_ships_resolved_handler(
+    worker_module, tmp_path, selection, seed, expected
+):
+    """An io_handler named by resource key crosses loky as the resolved handler.
+
+    The parent probe saw the resolved handler on the module-level asset and
+    shipped an IOHandlerRef, which the worker's fresh import rebuilt to None:
+    the write was skipped while the run succeeded, and a load hit None.
+    """
+    m = worker_module(KEY_HANDLER_MODULE)
+    warehouse = tmp_path / "warehouse"
+    handler = _pickle_handler(warehouse)
+    for name, value in seed.items():
+        (warehouse / f"{name}.pkl").write_bytes(pickle.dumps(value))
+    names = [
+        "orders",
+        "customers",
+        "order_total",
+        "customer_count",
+        "feed",
+        "feed_total",
+        "feed_count",
+    ]
+    repo = rs.CodeRepository(
+        assets=[getattr(m, n) for n in names],
+        resources={"warehouse": handler},
+        default_executor=MP,
+    )
+    repo.materialize(selection=selection)
+    assert _stored(warehouse) == expected
+
+
+def test_loky_resource_key_node_io_handler_ships_resolved_handler(
+    worker_module, tmp_path
+):
+    """A graph's node_io_handler named by resource key reaches its 2-wide inner
+    level; the worker's fresh import has no handler under either key."""
+    m = worker_module(KEY_HANDLER_MODULE)
+    warehouse, scratch = tmp_path / "warehouse", tmp_path / "scratch"
+    repo = rs.CodeRepository(
+        assets=[m.total],
+        tasks=[m.left, m.right, m.add],
+        resources={
+            "warehouse": _pickle_handler(warehouse),
+            "scratch": _pickle_handler(scratch),
+        },
+        default_executor=MP,
+    )
+    repo.materialize()
+    assert _stored(scratch) == {"total/add": 7, "total/left": 3, "total/right": 4}
+    assert _stored(warehouse) == {"total": 7}
+
+
+# Only the parent's import builds the handler, as a handler read from
+# process-local state would; the worker's fresh import has none.
+PARENT_ONLY_HANDLER_MODULE = """
+import os
+
+import obstore.store
+
+import rivers as rs
+
+_handler = (
+    rs.PickleIOHandler(store=obstore.store.LocalStore({store!r}, mkdir=True))
+    if os.getpid() == {pid}
+    else None
+)
+
+
+@rs.Asset(io_handler=_handler)
+def orders() -> list:
+    return [3, 4]
+
+
+@rs.Asset(io_handler=_handler)
+def customers() -> list:
+    return ["ada", "bob"]
+"""
+
+
+def test_loky_handler_ref_without_worker_handler_fails_step(worker_module, tmp_path):
+    """A shipped handler ref that finds no handler in the worker fails the step
+    and names the asset and the ref, instead of skipping the write."""
+    store = tmp_path / "store"
+    m = worker_module(
+        PARENT_ONLY_HANDLER_MODULE.format(store=str(store), pid=os.getpid())
+    )
+    repo = rs.CodeRepository(assets=[m.orders, m.customers], default_executor=MP)
+    result = repo.materialize(raise_on_error=False)
+    assert not result.success
+    errors = dict(result.failed_assets)
+    assert sorted(errors) == ["customers", "orders"]
+    for name, error in errors.items():
+        assert (
+            f"asset '{name}': io_handler reference {m.__name__}.{name} "
+            "found no handler in the worker"
+        ) in error
+    assert _stored(store) == {}
+
+
 # `__main__` is not importable in a loky worker, so every class below ships by
 # value with its whole class body, declarations included.
 PIPELINE_SCRIPT = textwrap.dedent(

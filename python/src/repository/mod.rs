@@ -3180,7 +3180,7 @@ impl PyCodeRepository {
         }
     }
 
-    /// Resolve `IOHandler::ResourceRef` → `Instance` on every asset and refresh
+    /// Resolve `IOHandler::ResourceRef` → `Resource` on every asset and refresh
     /// the per-input + node-level overrides on namespaced composition tasks.
     /// Mutates `node_map` in place (overrides on `ResolvedTask` are post-set).
     /// Also calls `resource.setup()` on every Resource that defines it.
@@ -3235,12 +3235,11 @@ impl PyCodeRepository {
             let asset = asset_py.borrow(py);
             if let Asset::Graph(graph_asset) = asset.inner() {
                 let graph_name = graph_asset.name.as_deref().unwrap_or_default();
-                let resolved = graph_asset.node_io_handler.as_ref().and_then(|h| match h {
-                    crate::assets::io_handler::IOHandler::Instance(handler) => Some(
-                        crate::assets::io_handler::IOHandler::Instance(handler.clone_ref(py)),
-                    ),
-                    crate::assets::io_handler::IOHandler::ResourceRef(_) => None,
-                });
+                let resolved = graph_asset
+                    .node_io_handler
+                    .as_ref()
+                    .filter(|h| h.handler().is_some())
+                    .map(|h| h.clone_ref(py));
                 if let Some(handler) = resolved
                     && let Some(task_names) = graph_task_names.get(graph_name)
                 {

@@ -9,6 +9,8 @@ use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+use crate::assets::decorator::PyAsset;
+use crate::assets::io_handler::IOHandler;
 use crate::context::io::{PyInputContext, PyOutputContext};
 use crate::result_types::{self, ResultKind};
 
@@ -126,7 +128,19 @@ impl PyIOHandlerRef {
 /// reconstruction and the parent-side shippability check. Requires the found
 /// object to expose `load_input`: on a class-form asset the attribute lookup
 /// reaches the `Asset` base's getset descriptors, which are not handlers.
+/// On an asset only a handler set at definition counts: a fresh import holds
+/// the key of a resource handler, not the handler.
 pub(super) fn handler_attr(py: Python, obj: &Py<PyAny>) -> Option<Py<PyAny>> {
+    if let Ok(asset) = obj.bind(py).cast::<PyAsset>() {
+        let asset = asset.borrow();
+        return [asset.inner.node_io_handler(), asset.inner.io_handler()]
+            .into_iter()
+            .flatten()
+            .find_map(|h| match h {
+                IOHandler::Instance(handler) => Some(handler.clone_ref(py)),
+                IOHandler::ResourceRef(_) | IOHandler::Resource(_) => None,
+            });
+    }
     for attr in ["node_io_handler", "io_handler"] {
         if let Ok(h) = obj.getattr(py, attr)
             && !h.is_none(py)
@@ -155,14 +169,49 @@ pub(super) fn resolve_handler_from_path(
     handler_attr(py, &parent_obj)
 }
 
-/// Follows node_io_handler → io_handler on the leaf, then its parent → None.
+/// Follows node_io_handler → io_handler on the leaf, then its parent. A path
+/// that reaches no handler rebuilds to a `MissingIOHandler`: raising here
+/// would fail every pending step of the pool, not only this one.
 #[pyfunction]
 pub fn _reconstruct_io_handler_ref(
     py: Python,
     module: String,
     qualname: String,
 ) -> PyResult<Py<PyAny>> {
-    Ok(resolve_handler_from_path(py, &module, &qualname).unwrap_or_else(|| py.None()))
+    match resolve_handler_from_path(py, &module, &qualname) {
+        Some(handler) => Ok(handler),
+        None => {
+            let reference = format!("{module}.{qualname}");
+            Ok(Py::new(py, PyMissingIOHandler { reference })?.into_any())
+        }
+    }
+}
+
+/// Stands in for an `IOHandlerRef` that found no handler in the worker, so
+/// the step fails instead of skipping the write.
+#[pyclass(name = "MissingIOHandler", module = "rivers._core")]
+struct PyMissingIOHandler {
+    reference: String,
+}
+
+impl PyMissingIOHandler {
+    fn error(&self, asset_name: &str) -> PyErr {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "asset '{asset_name}': io_handler reference {} found no handler in the worker",
+            self.reference
+        ))
+    }
+}
+
+#[pymethods]
+impl PyMissingIOHandler {
+    fn handle_output(&self, context: PyRef<'_, PyOutputContext>, _obj: Py<PyAny>) -> PyResult<()> {
+        Err(self.error(&context.asset_name))
+    }
+
+    fn load_input(&self, context: PyRef<'_, PyInputContext>) -> PyResult<Py<PyAny>> {
+        Err(self.error(&context.asset_name))
+    }
 }
 
 /// Describes how to load an upstream input from an IO handler in the worker.

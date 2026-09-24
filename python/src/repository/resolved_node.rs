@@ -714,7 +714,7 @@ impl ResolvedNode {
         }
     }
 
-    /// All ResourceRef variants must be resolved to Instance by resolve time.
+    /// All ResourceRef variants must be resolved to Resource by resolve time.
     /// Panics if an unresolved ResourceRef is encountered — this indicates a bug
     /// in the resolution pipeline.
     pub fn io_handler(&self, py: Python) -> Option<Py<PyAny>> {
@@ -950,10 +950,10 @@ impl ResolvedNode {
 
 /// Panics if the handler is still a `ResourceRef` — by the time ResolvedNode
 /// methods are called, `CodeRepository.resolve()` should have replaced every
-/// `ResourceRef` with its `Instance`.
+/// `ResourceRef` with its `Resource`.
 fn expect_resolved_handler(h: &IOHandler, py: Python) -> Py<PyAny> {
     match h {
-        IOHandler::Instance(handler) => handler.clone_ref(py),
+        IOHandler::Instance(handler) | IOHandler::Resource(handler) => handler.clone_ref(py),
         IOHandler::ResourceRef(key) => unreachable!(
             "BUG: unresolved ResourceRef('{}') after CodeRepository.resolve()",
             key
