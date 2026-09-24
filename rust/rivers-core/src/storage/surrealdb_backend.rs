@@ -1530,20 +1530,9 @@ impl SurrealStorage {
                 // caller's retry re-applies all of it. An unset time is NONE,
                 // which sorts below every number.
                 self.db
-                    .query(
-                        "BEGIN TRANSACTION; \
-                         UPDATE assets SET last_event_id = $event_id, last_run_id = NONE, \
-                         last_timestamp = NONE, last_data_version = NONE, \
-                         last_materialization_code_version = NONE, last_input_data_versions = [] \
-                         WHERE code_location_id = $cl AND asset_key = $asset_key \
-                         AND last_timestamp <= $ts AND last_deletion_timestamp <= $ts; \
-                         UPDATE assets SET last_deletion_timestamp = IF last_deletion_timestamp > $ts \
-                         THEN last_deletion_timestamp ELSE $ts END \
-                         WHERE code_location_id = $cl AND asset_key = $asset_key; \
-                         DELETE FROM asset_partitions WHERE code_location_id = $cl \
-                         AND asset_key = $asset_key AND last_timestamp <= $ts; \
-                         COMMIT TRANSACTION;",
-                    )
+                    .query(format!(
+                        "BEGIN TRANSACTION; {CLEAR_DELETED_ASSET} COMMIT TRANSACTION;"
+                    ))
                     .bind(("cl", cl.to_string()))
                     .bind(("asset_key", asset_key.to_string()))
                     .bind(("event_id", event_id.to_string()))
@@ -1848,6 +1837,19 @@ fn swallow_phantom_commit(result: Result<()>, op: &'static str, id: &str) -> Res
     }
 }
 
+/// A whole-asset deletion's clearing, one transaction in `consolidate_deletion`.
+const CLEAR_DELETED_ASSET: &str = "\
+     UPDATE assets SET last_event_id = $event_id, last_run_id = NONE, \
+     last_timestamp = NONE, last_data_version = NONE, \
+     last_materialization_code_version = NONE, last_input_data_versions = [] \
+     WHERE code_location_id = $cl AND asset_key = $asset_key \
+     AND last_timestamp <= $ts AND last_deletion_timestamp <= $ts; \
+     UPDATE assets SET last_deletion_timestamp = IF last_deletion_timestamp > $ts \
+     THEN last_deletion_timestamp ELSE $ts END \
+     WHERE code_location_id = $cl AND asset_key = $asset_key; \
+     DELETE FROM asset_partitions WHERE code_location_id = $cl \
+     AND asset_key = $asset_key AND last_timestamp <= $ts;";
+
 /// Roll an `assets` row forward to a materialization event.
 const MATERIALIZE_ASSET_UPDATE: &str = "UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv, last_input_data_versions = $idv WHERE code_location_id = $cl AND asset_key = $asset_key";
 
@@ -1888,19 +1890,26 @@ const RECORD_PARTITION_TOMBSTONES: &str = "\
 ///
 /// The `assets` row is read before its update: its `last_timestamp` bounds
 /// every partition row's, so a batch no older than it takes the plain upsert.
-/// Only an older batch pays for the per-row time check.
+/// Only an older batch pays for the per-row time check. Its row update may
+/// write nothing, so it writes the `assets` row and puts it back. A concurrent
+/// whole-asset deletion writes that row too: one of the two then fails to
+/// commit and retries, and the deletion cannot miss this batch's new rows.
 ///
 /// The keys' tombstones are read with an UPDATE that sets nothing, not a
 /// SELECT: only UPDATE and DELETE look up the object-valued `partition_key` on
 /// the UNIQUE index. A SELECT reads every tombstone of the asset. A DELETE
 /// gets that lookup only from a plain param, hence `$deleted_key`.
 const UPSERT_ASSET_PARTITIONS: &str = "\
-     LET $asset = (SELECT last_timestamp, last_deletion_timestamp FROM assets \
+     LET $asset = (SELECT last_timestamp, last_deletion_timestamp, last_event_id FROM assets \
          WHERE code_location_id = $cl AND asset_key = $asset_key)[0]; \
      LET $live = IF $asset.last_deletion_timestamp >= $oldest { \
          $rows[WHERE last_timestamp > $asset.last_deletion_timestamp] \
      } ELSE { $rows }; \
      IF $asset.last_timestamp > $oldest { \
+         UPDATE assets SET last_event_id = $event_id \
+             WHERE code_location_id = $cl AND asset_key = $asset_key; \
+         UPDATE assets SET last_event_id = $asset.last_event_id \
+             WHERE code_location_id = $cl AND asset_key = $asset_key; \
          INSERT INTO asset_partitions $live ON DUPLICATE KEY UPDATE \
          last_event_id = IF last_timestamp > $input.last_timestamp \
              THEN last_event_id ELSE $input.last_event_id END, \
@@ -5632,6 +5641,91 @@ mod tests {
                     pk.is_some()
                 );
             }
+        }
+    }
+
+    /// A whole-asset deletion and an older materialization of a new partition,
+    /// in flight together: neither snapshot holds the other's writes. They must
+    /// still serialize, so no partition row outlives the newer deletion. The
+    /// deletion's transaction stays open across the materialization to pin that
+    /// interleaving; a failed commit is retried as `with_retry` would.
+    #[tokio::test]
+    async fn a_concurrent_asset_deletion_leaves_no_older_partition_row() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let p0 = order_key();
+        let p3 = PartitionKey::Single {
+            keys: vec!["2024-01-04".to_string()],
+        };
+        for batched in [false, true] {
+            let key = format!("orders_{batched}");
+            register(&storage, &[&key]).await;
+            // The newer partition holds the asset row, so the older one's
+            // update of that row changes nothing.
+            let newer_event_id = storage
+                .store_event(&mat_at(&key, "r3", 120, Some(&p3)))
+                .await
+                .unwrap();
+
+            let deletion = del_at(&key, 200, None);
+            let tx = storage.db.clone().begin().await.unwrap();
+            tx.query(CLEAR_DELETED_ASSET)
+                .bind(("cl", DEFAULT_CODE_LOCATION_ID.to_string()))
+                .bind(("asset_key", key.clone()))
+                .bind(("event_id", "deletion".to_string()))
+                .bind(("ts", deletion.timestamp))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+
+            let older = mat_at(&key, "r0", 100, Some(&p0));
+            if batched {
+                storage
+                    .store_events(std::slice::from_ref(&older))
+                    .await
+                    .unwrap();
+            } else {
+                storage.store_event(&older).await.unwrap();
+            }
+            let record = storage
+                .get_asset_record(DEFAULT_CODE_LOCATION_ID, &key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (
+                    record.last_event_id,
+                    record.last_run_id,
+                    record.last_timestamp
+                ),
+                (Some(newer_event_id), Some("r3".to_string()), Some(120)),
+                "batched={batched}: the older materialization changed the asset row"
+            );
+
+            if let Err(e) = tx.commit().await {
+                assert!(
+                    super::super::retry::is_transient_surrealdb_error(&e),
+                    "batched={batched}: {e}"
+                );
+                storage.store_event(&deletion).await.unwrap();
+            }
+
+            assert_eq!(
+                read_writes(&storage, &key, &p0).await,
+                writes(None, None, None, Some(200)),
+                "batched={batched}"
+            );
+            assert_eq!(
+                storage
+                    .get_materialized_partitions(DEFAULT_CODE_LOCATION_ID, &key)
+                    .await
+                    .unwrap(),
+                Vec::<PartitionKey>::new(),
+                "batched={batched}: a partition row outlived the newer whole-asset deletion"
+            );
         }
     }
 
