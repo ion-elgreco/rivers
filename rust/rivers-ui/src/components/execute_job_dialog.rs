@@ -8,7 +8,7 @@
 use leptos::prelude::*;
 
 use crate::components::partition_picker::{PartitionPicker, WholeAssetChoice};
-use crate::helpers::JobPartitionPicker;
+use crate::helpers::{JobPartitionPicker, close_on_navigation};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::mutations::{execute_job, launch_backfill};
 use crate::types::{AssetActionInfo, SubmitPartitionKey};
@@ -50,6 +50,7 @@ pub fn ExecuteJobDialog(
     let nav_to = RwSignal::new(None::<String>);
 
     let loc = use_current_location();
+    close_on_navigation(show);
 
     let action = Action::new(move |input: &(Vec<SubmitPartitionKey>, bool)| {
         let (keys, whole_asset) = input.clone();

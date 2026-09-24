@@ -10,12 +10,17 @@
 
 mod common;
 
-use common::{click, flush_effects, fresh_mount_target, nav_to, query_all, query_one, set_checked};
+use common::{
+    Reply, click, flush_effects, fresh_mount_target, go_back, install_routing_fetch_mock, nav_to,
+    query_all, query_one, request_bodies, set_checked, wait_until, yield_macro,
+};
 use std::collections::HashMap;
 
 use leptos::mount::mount_to;
 use leptos::prelude::*;
-use leptos_router::components::Router;
+use leptos_router::components::{FlatRoutes, Route, Router};
+use leptos_router::hooks::use_location;
+use leptos_router::path;
 use rivers_ui::components::materialize_dialog::MaterializeDialog;
 use rivers_ui::helpers::JobPartitionPicker;
 use rivers_ui::types::{AssetActionInfo, PartitionDimensionInfo};
@@ -634,4 +639,102 @@ async fn destructive_verb_is_named_and_flagged() {
             .contains("Clears materialization state")
     );
     assert_eq!(query_all(&host, ".modal-footer .btn-danger").len(), 1);
+}
+
+/// A page outlives a change of its route params, and the dialog submits
+/// against the code location current at the click. After a Back from staging
+/// to prod, an open delete deleted prod's partition while it showed the same
+/// verb, asset and partition.
+#[wasm_bindgen_test]
+async fn back_to_another_code_location_closes_the_dialog() {
+    let (_mock, requests) = install_routing_fetch_mock(|_| Reply::Pending);
+    nav_to("/locations/prod/core/assets/events");
+    nav_to("/locations/staging/core/assets/events");
+    let show = RwSignal::new(true);
+    let target = fresh_mount_target();
+    let host = target.clone();
+    mount_to(target, move || {
+        view! {
+            <Router>
+                <FlatRoutes fallback=|| view! { <div class="no-route"></div> }>
+                    <Route
+                        path=path!("/locations/:loc_ns/:loc_name/assets/:key")
+                        view=move || {
+                            let pathname = use_location().pathname;
+                            view! {
+                                <span class="route-path">{move || pathname.get()}</span>
+                                <MaterializeDialog
+                                    show=show
+                                    asset_keys=Signal::derive(|| vec!["events".to_string()])
+                                    records=Signal::derive(HashMap::new)
+                                    picker=Signal::derive(|| JobPartitionPicker::SingleDim {
+                                        keys: vec!["2026-09-01".into(), "2026-09-02".into()],
+                                        truncated: false,
+                                    })
+                                    action=Signal::derive(|| {
+                                        Some(AssetActionInfo {
+                                            name: "delete".to_string(),
+                                            outcome: "unmaterialize".to_string(),
+                                            exclusive: true,
+                                            partitioning: "optional".to_string(),
+                                            description: None,
+                                        })
+                                    })
+                                    destructive=Signal::derive(|| true)
+                                />
+                            }
+                        }
+                    />
+                </FlatRoutes>
+            </Router>
+        }
+    })
+    .forget();
+    assert!(
+        wait_until(|| !query_all(&host, ".exec-dialog-partition-row").is_empty()).await,
+        "the dialog never rendered"
+    );
+    // The dialog's opening Effects reset the pick: let them run first.
+    yield_macro().await;
+
+    click(&query_all(&host, ".exec-dialog-partition-row")[0], false);
+    let summary = || {
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap_or_default()
+    };
+    assert!(
+        wait_until(|| summary() == "1 asset · 1 partition · 1 run").await,
+        "the pick never registered (at {})",
+        summary()
+    );
+
+    go_back();
+    let route_path = || {
+        query_one(&host, ".route-path")
+            .text_content()
+            .unwrap_or_default()
+    };
+    assert!(
+        wait_until(|| route_path() == "/locations/prod/core/assets/events").await,
+        "Back never reached prod (at {})",
+        route_path()
+    );
+    // Whatever is still on screen, a click must not reach prod.
+    if let Some(submit) = host.query_selector(".modal-footer .btn-danger").unwrap() {
+        click(&submit, false);
+    }
+    for _ in 0..5 {
+        yield_macro().await;
+    }
+
+    let sent: Vec<web_sys::Request> = requests
+        .borrow()
+        .iter()
+        .filter(|r| r.url().contains("trigger_action"))
+        .cloned()
+        .collect();
+    assert_eq!(request_bodies(&sent).await, Vec::<String>::new());
+    assert!(!show.get_untracked(), "the dialog stayed open on prod");
+    assert!(query_all(&host, ".modal-overlay").is_empty());
 }

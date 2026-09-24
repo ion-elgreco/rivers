@@ -58,6 +58,33 @@ pub async fn flush_effects() {
     let _ = JsFuture::from(p).await;
 }
 
+/// Yield once to the macrotask queue (`setTimeout(0)`). A history move and a
+/// server fn's reply land there, after a microtask flush has returned.
+pub async fn yield_macro() {
+    use wasm_bindgen::closure::Closure;
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let cb = Closure::once_into_js(move || {
+            let _ = js_sys::Function::from(resolve).call0(&JsValue::NULL);
+        });
+        web_sys::window()
+            .unwrap()
+            .set_timeout_with_callback(cb.as_ref().unchecked_ref())
+            .unwrap();
+    });
+    let _ = JsFuture::from(promise).await;
+}
+
+/// Wait up to ~2s in macrotask steps for `pred` to hold.
+pub async fn wait_until<F: Fn() -> bool>(pred: F) -> bool {
+    for _ in 0..200 {
+        if pred() {
+            return true;
+        }
+        yield_macro().await;
+    }
+    false
+}
+
 /// Collect every element matching `selector` under `host` as `Element`s.
 /// Both inputs and outputs use `Element` (not `HtmlElement`) so callers
 /// can chain queries through SVG / mount-target boundaries —
@@ -92,6 +119,17 @@ pub fn query_one<H: AsRef<Element>>(host: &H, selector: &str) -> Element {
 pub fn nav_to(path: &str) {
     let history = web_sys::window().unwrap().history().unwrap();
     let _ = history.push_state_with_url(&JsValue::NULL, "", Some(path));
+}
+
+/// Go one entry back in the browser history, as the Back button does. Every
+/// mounted `<Router>` hears the `popstate` on a later macrotask.
+pub fn go_back() {
+    web_sys::window()
+        .unwrap()
+        .history()
+        .unwrap()
+        .back()
+        .unwrap();
 }
 
 /// Replace `window.fetch` with a Rust handler. The handler receives the

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use leptos::prelude::*;
 
 use crate::components::partition_picker::{PartitionPicker, WholeAssetChoice};
-use crate::helpers::{JobPartitionPicker, stale_status_kind};
+use crate::helpers::{JobPartitionPicker, close_on_navigation, stale_status_kind};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::mutations::{launch_backfill, trigger_action, trigger_materialize};
 use crate::types::{AssetActionInfo, AssetRecord, StaleStatus, SubmitPartitionKey};
@@ -140,6 +140,7 @@ pub fn MaterializeDialog(
     });
 
     let loc = use_current_location();
+    close_on_navigation(show);
 
     let materialize_action = Action::new(move |_: &()| {
         let sel = selected.get();

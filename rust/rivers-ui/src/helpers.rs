@@ -666,6 +666,20 @@ pub fn use_confirm_armed(track: impl Fn() + Send + Sync + 'static) -> RwSignal<b
     armed
 }
 
+/// Close a dialog when the path changes under it. Pages outlive their route
+/// params, so an open dialog would otherwise run its verb on another code
+/// location, asset or job than the one it shows.
+pub fn close_on_navigation(show: RwSignal<bool>) {
+    let pathname = use_location().pathname;
+    Effect::new(move |prev: Option<String>| {
+        let path = pathname.get();
+        if prev.is_some_and(|p| p != path) {
+            show.set(false);
+        }
+        path
+    });
+}
+
 /// Text for a replay button: an action replay names the verb it re-applies.
 pub fn replay_button_text(
     action: Option<&str>,

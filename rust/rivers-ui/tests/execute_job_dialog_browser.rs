@@ -14,10 +14,15 @@
 
 mod common;
 
-use common::{click, flush_effects, fresh_mount_target, nav_to, query_all, query_one, set_checked};
+use common::{
+    Reply, click, flush_effects, fresh_mount_target, go_back, install_routing_fetch_mock, nav_to,
+    query_all, query_one, request_bodies, set_checked, wait_until, yield_macro,
+};
 use leptos::mount::mount_to;
 use leptos::prelude::*;
-use leptos_router::components::Router;
+use leptos_router::components::{FlatRoutes, Route, Router};
+use leptos_router::hooks::use_location;
+use leptos_router::path;
 use rivers_ui::components::execute_job_dialog::ExecuteJobDialog;
 use rivers_ui::helpers::JobPartitionPicker;
 use rivers_ui::types::{AssetActionInfo, PartitionDimensionInfo};
@@ -401,4 +406,93 @@ async fn reopen_clears_previous_error() {
     flush_effects().await;
 
     assert_eq!(query_all(&host, ".error-msg").len(), 0);
+}
+
+/// The jobs list keeps its page, and so its dialog, across a Back to another
+/// code location, and the dialog submits against the location current at the
+/// click: Execute ran prod's same-named job while the dialog showed staging's.
+#[wasm_bindgen_test]
+async fn back_to_another_code_location_closes_the_dialog() {
+    let (_mock, requests) = install_routing_fetch_mock(|_| Reply::Pending);
+    nav_to("/locations/prod/core/jobs");
+    nav_to("/locations/staging/core/jobs");
+    let show = RwSignal::new(true);
+    let target = fresh_mount_target();
+    let host = target.clone();
+    mount_to(target, move || {
+        view! {
+            <Router>
+                <FlatRoutes fallback=|| view! { <div class="no-route"></div> }>
+                    <Route
+                        path=path!("/locations/:loc_ns/:loc_name/jobs")
+                        view=move || {
+                            let pathname = use_location().pathname;
+                            view! {
+                                <span class="route-path">{move || pathname.get()}</span>
+                                <ExecuteJobDialog
+                                    show=show
+                                    job_name=Signal::derive(|| "purge_events".to_string())
+                                    picker=Signal::derive(|| JobPartitionPicker::SingleDim {
+                                        keys: vec!["p1".into(), "p2".into()],
+                                        truncated: false,
+                                    })
+                                    verb=Signal::derive(|| {
+                                        Some(verb("delete", "unmaterialize", "optional"))
+                                    })
+                                />
+                            }
+                        }
+                    />
+                </FlatRoutes>
+            </Router>
+        }
+    })
+    .forget();
+    assert!(
+        wait_until(|| !query_all(&host, ".exec-dialog-partition-row").is_empty()).await,
+        "the dialog never rendered"
+    );
+    // The dialog's opening Effects reset the pick: let them run first.
+    yield_macro().await;
+
+    click(&query_all(&host, ".exec-dialog-partition-row")[0], false);
+    let picked = || {
+        query_one(&host, ".exec-dialog-partition-count")
+            .text_content()
+            .unwrap_or_default()
+    };
+    assert!(
+        wait_until(|| picked() == "1 / 2 selected").await,
+        "the pick never registered (at {})",
+        picked()
+    );
+
+    go_back();
+    let route_path = || {
+        query_one(&host, ".route-path")
+            .text_content()
+            .unwrap_or_default()
+    };
+    assert!(
+        wait_until(|| route_path() == "/locations/prod/core/jobs").await,
+        "Back never reached prod (at {})",
+        route_path()
+    );
+    // Whatever is still on screen, a click must not reach prod.
+    if let Some(submit) = host.query_selector(".modal-footer .btn-danger").unwrap() {
+        click(&submit, false);
+    }
+    for _ in 0..5 {
+        yield_macro().await;
+    }
+
+    let sent: Vec<web_sys::Request> = requests
+        .borrow()
+        .iter()
+        .filter(|r| r.url().contains("execute_job"))
+        .cloned()
+        .collect();
+    assert_eq!(request_bodies(&sent).await, Vec::<String>::new());
+    assert!(!show.get_untracked(), "the dialog stayed open on prod");
+    assert!(query_all(&host, ".modal-overlay").is_empty());
 }
