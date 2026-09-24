@@ -484,6 +484,11 @@ impl PyJob {
                 ));
             }
         }
+        if node_names.is_empty() {
+            return Err(GraphValidationError::new_err(format!(
+                "Job '{name}' got an empty asset list: name at least one asset or task"
+            )));
+        }
 
         let mut job = Self::base(name, node_names, executor, allow_incomplete_deps);
         job.retry = crate::retry::extract_retry_ref(retry)?;

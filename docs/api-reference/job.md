@@ -21,7 +21,7 @@ repo.get_job("pipeline").execute()
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `name` | `str` | required | Unique name for the job within the repository. |
-| `assets` | `Sequence[SingleAsset \| MultiAsset \| GraphAsset \| Task \| BashTask \| type[Asset]]` | required | Nodes the job will materialize. Class-form assets are accepted as the class itself. |
+| `assets` | `Sequence[SingleAsset \| MultiAsset \| GraphAsset \| Task \| BashTask \| type[Asset]]` | required | Nodes the job will materialize. Class-form assets are accepted as the class itself. Must not be empty: an empty list raises `GraphValidationError` when the job is created. |
 | `executor` | `Executor \| None` | `None` | Override the repository default executor for this job. Not used by an action job: its steps run in the run's own process. |
 | `allow_incomplete_deps` | `bool` | `False` | Tolerate missing upstream deps (debug / partial graphs). Production jobs should leave this `False`. |
 | `retry` | `RetryPolicy \| str \| None` | `None` | Job-level retry default — a [`RetryPolicy`](retries.md) or a `retries` registry name. Fills every step of the job (assets, tasks, bash tasks); nodes with their own policy keep it. Rejected together with `action`: actions carry their own retry. |

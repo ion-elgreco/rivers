@@ -162,6 +162,28 @@ def test_job_non_asset_object_raises():
         rs.Job(name="bad", assets=["not_an_asset"])  # type: ignore
 
 
+@pytest.mark.parametrize("action", [None, "delete"], ids=["materialize", "delete"])
+def test_job_empty_asset_list_raises(action):
+    """An asset list computed from config can come out empty. Such a job passed
+    resolve, and under the run queue its runs covered every asset: a
+    `delete` job cleared every table that defines `delete`, on every tick."""
+    stale: set[str] = set()
+
+    @rs.Asset
+    def events() -> int:
+        return 1
+
+    with pytest.raises(GraphValidationError) as exc:
+        rs.Job(
+            name="purge",
+            assets=[a for a in [events] if a.name in stale],
+            action=action,
+        )
+    assert str(exc.value) == (
+        "Job 'purge' got an empty asset list: name at least one asset or task"
+    )
+
+
 def test_job_execute_before_validation_raises():
     """Executing a standalone job (not added to repo) raises ValueError."""
 

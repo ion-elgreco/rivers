@@ -322,6 +322,59 @@ class TestRunQueueFullFlow:
         finally:
             daemon.stop()
 
+    @pytest.mark.parametrize(
+        ("action", "status"),
+        [
+            pytest.param(None, "Success", id="materialize"),
+            pytest.param("delete", "Failure", id="delete"),
+        ],
+    )
+    def test_queued_run_listing_no_assets_runs_on_none(self, storage, action, status):
+        """A queued run runs on the assets its record lists. The local run
+        backend read an empty list as every asset, so the run an empty
+        `Job(assets=[], action="delete")` queued ran the Optional `delete` on
+        every table that defines it, while the run listed no assets."""
+        ran = []
+
+        def table(name):
+            delete = rs.AssetAction(
+                name="delete",
+                outcome=rs.Outcome.Unmaterialize,
+                partitioning=rs.ActionPartitioning.Optional,
+            )(lambda ctx: ran.append(("delete", name)))
+
+            @rs.Asset(name=name, io_handler=rs.InMemoryIOHandler(), actions=[delete])
+            def body() -> int:
+                ran.append(("materialize", name))
+                return 1
+
+            return body
+
+        repo = rs.CodeRepository(
+            assets=[table("events"), table("sessions")],
+            default_executor=rs.Executor.in_process(),
+            run_queue=rs.RunQueueConfig(dequeue_interval="100ms"),
+        )
+        repo.resolve(storage=storage)
+        storage._create_run(
+            "no-assets-run", "", "Queued", 1_000, node_names=[], action=action
+        )
+
+        daemon = AutomationDaemon(
+            repo=repo,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            record = _wait_for_run_terminal(storage, "no-assets-run", timeout=15)
+        finally:
+            daemon.stop()
+
+        assert ran == []
+        assert record is not None
+        assert (record.status, record.node_names) == (status, [])
+
 
 # ---------------------------------------------------------------------------
 # Regression: schedule/sensor runs must go through the queue

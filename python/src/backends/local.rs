@@ -49,19 +49,16 @@ impl RunBackend for LocalRunBackend {
         let done = Arc::new(AtomicBool::new(false));
         let done_for_thread = Arc::clone(&done);
         self.gil_threads.spawn(move || {
-            let selection = if node_names.is_empty() {
-                None
-            } else {
-                Some(node_names)
-            };
-            // `Some(run_id)` makes the launcher reuse the existing queued
-            // record, so `LaunchedBy::Manual` is ignored.
+            // The run covers exactly the assets its record lists: `None` would
+            // turn an empty list into every asset. `Some(run_id)` makes the
+            // launcher reuse the existing queued record, so
+            // `LaunchedBy::Manual` is ignored.
             let result = match action {
                 Some(action) => repo
                     .get()
                     .run_action_with_launcher(
                         action,
-                        selection,
+                        Some(node_names),
                         partition_key,
                         None,
                         false,
@@ -74,7 +71,7 @@ impl RunBackend for LocalRunBackend {
                 None => repo
                     .get()
                     .materialize_with_launcher(
-                        selection,
+                        Some(node_names),
                         partition_key,
                         None,
                         false,

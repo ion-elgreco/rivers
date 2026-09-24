@@ -435,7 +435,7 @@ class Job:
         Args:
             name: Unique job name within the repository.
             assets: Assets and tasks the job will materialize (or run the
-                action against, when ``action`` is set).
+                action against, when ``action`` is set). Must not be empty.
             action: Asset action this job runs instead of materialize
                 — schedules the verb through the existing
                 Schedule machinery. Every targeted asset must define it.
@@ -445,6 +445,10 @@ class Job:
             retry: Job-level retry default — a :class:`RetryPolicy` or the name of
                 a policy registered in ``CodeRepository(retries=...)``. Assets with
                 their own policy keep it.
+
+        Raises:
+            GraphValidationError: ``assets`` is empty, or holds an object that
+                is not an asset or task.
         """
         ...
 
