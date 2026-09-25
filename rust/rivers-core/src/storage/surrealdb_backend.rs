@@ -1615,25 +1615,38 @@ impl SurrealStorage {
         Ok(rows.into_iter().collect())
     }
 
+    /// `claiming_step` (run id, step key) leaves that step's own row out of
+    /// the count: its claim takes the row over.
     async fn query_pool_usage(
         &self,
         code_location_id: &str,
         pool_key: &str,
         now_ns: i64,
+        claiming_step: Option<(&str, &str)>,
     ) -> Result<(PoolLimit, u32)> {
-        let mut result = self
+        let not_own_row = if claiming_step.is_some() {
+            "AND (run_id != $run_id OR step_key != $step_key) "
+        } else {
+            ""
+        };
+        let mut query = self
             .db
-            .query(
+            .query(format!(
                 "SELECT * FROM concurrency_pools \
                      WHERE code_location_id = $cl AND pool_key = $pool_key LIMIT 1; \
                  SELECT math::sum(slots_consumed) AS total FROM concurrency_slots \
                      WHERE code_location_id = $cl AND pool_key = $pool_key \
-                     AND lease_expires_at > $now GROUP ALL",
-            )
+                     AND lease_expires_at > $now {not_own_row}GROUP ALL",
+            ))
             .bind(("cl", code_location_id.to_string()))
             .bind(("pool_key", pool_key.to_string()))
-            .bind(("now", now_ns))
-            .await?;
+            .bind(("now", now_ns));
+        if let Some((run_id, step_key)) = claiming_step {
+            query = query
+                .bind(("run_id", run_id.to_string()))
+                .bind(("step_key", step_key.to_string()));
+        }
+        let mut result = query.await?;
 
         let pools: Vec<PoolLimit> = result.take(0)?;
         let pool = pools
@@ -1703,7 +1716,8 @@ impl SurrealStorage {
 
         // Asset pools are admitted by overlap, not capacity — their `$lim`/
         // `$used` would be computed (a full slot aggregate inside the write
-        // transaction) and referenced by nothing.
+        // transaction) and referenced by nothing. `$used` leaves out the
+        // step's own row, which the UPSERT below takes over.
         for (i, (_, _slots)) in pools.iter().enumerate() {
             if asset_pools.contains(&i) {
                 continue;
@@ -1716,6 +1730,7 @@ impl SurrealStorage {
                      FROM concurrency_slots \
                      WHERE code_location_id = $cl AND pool_key = $p{i} \
                      AND lease_expires_at > $now \
+                     AND (run_id != $run_id OR step_key != $step_key) \
                      GROUP ALL)[0] ?? 0;\n"
             );
         }
@@ -1780,8 +1795,11 @@ impl SurrealStorage {
                   WHERE run_id = $run_id AND step_key = $step_key;\n";
         q += "};\n";
         q += "COMMIT TRANSACTION;\n";
+        // Only the rows this claim wrote: when the `IF` is false, the rows an
+        // earlier attempt of the step left behind are still there.
         q += "SELECT count() AS total FROM concurrency_slots \
-                  WHERE run_id = $run_id AND step_key = $step_key GROUP ALL;\n";
+                  WHERE run_id = $run_id AND step_key = $step_key \
+                  AND claimed_at = $now GROUP ALL;\n";
         q
     }
 
@@ -4431,7 +4449,7 @@ impl PerCodeLocationStorage for SurrealStorage {
     async fn get_pool_info(&self, code_location_id: &str, pool_key: &str) -> Result<PoolInfo> {
         let now_ns = now_nanos();
         let (pool, claimed_count) = self
-            .query_pool_usage(code_location_id, pool_key, now_ns)
+            .query_pool_usage(code_location_id, pool_key, now_ns, None)
             .await?;
 
         let mut result = self
@@ -4789,7 +4807,7 @@ impl SurrealStorage {
                 continue;
             }
             let (pool, current_used) = self
-                .query_pool_usage(code_location_id, pool_key, now_ns)
+                .query_pool_usage(code_location_id, pool_key, now_ns, Some((run_id, step_key)))
                 .await?;
             if pool.slot_limit < 0 {
                 continue;
@@ -12992,7 +13010,7 @@ mod tests {
     }
 
     /// One `concurrency_slots` row, read back to check what a claim wrote.
-    #[derive(Debug, SurrealValue)]
+    #[derive(Debug, PartialEq, SurrealValue)]
     struct HeldSlot {
         pool_key: String,
         slots_consumed: u32,
@@ -13217,6 +13235,323 @@ mod tests {
             storage.get_pool_info(cl, "db").await.unwrap().claimed_count,
             1
         );
+    }
+
+    /// The count a claim reads from its claim-result statement, for the claim
+    /// transaction run the way a claim runs it once its pre-check has passed.
+    /// A claim by another step that commits between the two leaves the
+    /// transaction's `IF` false.
+    async fn claim_transaction_count(
+        storage: &SurrealStorage,
+        pools: &[(String, u32)],
+        asset_pools: &[usize],
+        run: &str,
+        step: &str,
+        scope: Option<&AssetScope>,
+    ) -> u32 {
+        let now_ns = now_nanos();
+        let query = SurrealStorage::build_claim_transaction(pools, asset_pools, scope);
+        let mut q = storage.db.query(&query);
+        for (i, (pool_key, _)) in pools.iter().enumerate() {
+            q = q.bind((format!("p{i}"), pool_key.clone()));
+        }
+        if let Some(parts) = scope.and_then(|s| s.partitions.as_ref()) {
+            for &i in asset_pools {
+                q = q.bind((format!("parts{i}"), parts.clone()));
+            }
+        }
+        let mut response = q
+            .bind(("cl", crate::storage::DEFAULT_CODE_LOCATION_ID.to_string()))
+            .bind(("run_id", run.to_string()))
+            .bind(("step_key", step.to_string()))
+            .bind(("now", now_ns))
+            .bind(("lease_exp", now_ns + 300_000_000_000))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let idx = SurrealStorage::claim_check_statement_index(pools.len(), asset_pools.len());
+        let count: Option<u32> = response.take((idx, "total")).unwrap();
+        count.unwrap_or(0)
+    }
+
+    /// A step run again under its run and step key after its killed attempt's
+    /// lease ran out, while another run holds the asset in a way that blocks
+    /// it, must wait. That run can claim between the re-claim's pre-check and
+    /// its transaction: the step's leftover row then still exists, but the
+    /// transaction did not write it, so the claim must not report Claimed.
+    #[tokio::test]
+    async fn test_asset_pool_reclaim_by_same_step_waits_for_another_runs_claim() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let scope = |partitions: Option<&[&str]>, exclusive| AssetScope {
+            partitions: partitions.map(|p| p.iter().map(|s| s.to_string()).collect()),
+            exclusive,
+        };
+        // (the re-run step's scope, the other run's scope)
+        let cases = [
+            // A materialize, blocked by a delete of the whole asset.
+            (scope(None, false), scope(None, true)),
+            // Both on one partition.
+            (scope(Some(&["p1"]), false), scope(Some(&["p1"]), true)),
+            // The re-run step is the action; the other run materializes.
+            (scope(Some(&["p1"]), true), scope(Some(&["p1"]), false)),
+        ];
+        for (i, (mine, theirs)) in cases.iter().enumerate() {
+            let pool = format!("__asset__:orders_{i}");
+            let pools = [(pool.clone(), 1)];
+            let run = format!("run_{i}");
+            storage.set_pool_limit(cl, &pool, -1, 300).await.unwrap();
+            let claim = async |run: &str, lease: u32, scope: &AssetScope| {
+                storage
+                    .claim_concurrency_slots(cl, &pools, run, "orders", 0, lease, Some(scope))
+                    .await
+                    .unwrap_or_else(|e| panic!("case {i}: claim by {run} failed: {e:#}"))
+            };
+
+            // The killed attempt never released its slot, and its lease ran out.
+            assert_eq!(
+                claim(&run, 0, mine).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}"
+            );
+            let killed = held_slots(&storage, &run, "orders").await;
+            assert_eq!(
+                claim("other_run", 300, theirs).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}"
+            );
+
+            let status = claim(&run, 300, mine).await;
+            assert!(
+                matches!(status, ConcurrencyClaimStatus::Pending { .. }),
+                "case {i}: {status:?}"
+            );
+            assert_eq!(
+                claim_transaction_count(&storage, &pools, &[0], &run, "orders", Some(mine)).await,
+                0,
+                "case {i}: the transaction claimed nothing; the leftover row is not its claim"
+            );
+            assert_eq!(
+                held_slots(&storage, &run, "orders").await,
+                killed,
+                "case {i}"
+            );
+            let holders: Vec<(String, String)> = storage
+                .get_pool_slot_holders(cl, &pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|h| (h.run_id, h.step_key))
+                .collect();
+            assert_eq!(
+                holders,
+                [("other_run".to_string(), "orders".to_string())],
+                "case {i}"
+            );
+
+            storage
+                .free_concurrency_slots("other_run", "orders")
+                .await
+                .unwrap();
+            assert_eq!(
+                claim(&run, 300, mine).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}"
+            );
+            let held = held_slots(&storage, &run, "orders").await;
+            assert_eq!(held.len(), 1, "case {i}: {held:?}");
+            assert!(
+                held[0].claimed_at > killed[0].claimed_at
+                    && held[0].lease_expires_at > killed[0].lease_expires_at,
+                "case {i}: the re-claim must take the row over: {held:?} vs {killed:?}"
+            );
+        }
+    }
+
+    /// A re-run step whose own leftover row is all that fills a counted pool
+    /// takes that row over at once: the row does not count toward the limit
+    /// its re-claim is checked against, so the step does not wait out its
+    /// killed attempt's lease.
+    #[tokio::test]
+    async fn test_user_pool_reclaim_by_same_step_does_not_wait_for_its_old_lease() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let scope = AssetScope {
+            partitions: Some(vec!["p1".to_string()]),
+            exclusive: false,
+        };
+        // (the counted pool's limit, the pools the step claims)
+        let cases = [
+            (1, vec![("db_0".to_string(), 1)]),
+            // Two slots of a pool of two.
+            (2, vec![("db_1".to_string(), 2)]),
+            // Beside its asset's pool.
+            (
+                1,
+                vec![("db_2".to_string(), 1), ("__asset__:orders".to_string(), 1)],
+            ),
+        ];
+        for (i, (limit, pools)) in cases.iter().enumerate() {
+            let run = format!("run_{i}");
+            let (db, slots) = &pools[0];
+            storage.set_pool_limit(cl, db, *limit, 300).await.unwrap();
+            let scope = if pools.len() > 1 {
+                storage
+                    .set_pool_limit(cl, "__asset__:orders", -1, 300)
+                    .await
+                    .unwrap();
+                Some(&scope)
+            } else {
+                None
+            };
+            let claim = async |run: &str| {
+                storage
+                    .claim_concurrency_slots(cl, pools, run, "load", 0, 300, scope)
+                    .await
+                    .unwrap_or_else(|e| panic!("case {i}: claim by {run} failed: {e:#}"))
+            };
+
+            assert_eq!(
+                claim(&run).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}"
+            );
+            let killed = held_slots(&storage, &run, "load").await;
+            // The killed attempt never released its slot; its lease is live.
+            assert_eq!(
+                claim(&run).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}: the re-claim must not wait for its own old lease"
+            );
+
+            let held = held_slots(&storage, &run, "load").await;
+            assert_eq!(held.len(), pools.len(), "case {i}: {held:?}");
+            for (row, old) in held.iter().zip(&killed) {
+                assert_eq!(
+                    (&row.pool_key, row.slots_consumed),
+                    (&old.pool_key, old.slots_consumed),
+                    "case {i}"
+                );
+                assert!(
+                    row.claimed_at > old.claimed_at && row.lease_expires_at > old.lease_expires_at,
+                    "case {i}: the re-claim must take the row over: {row:?} vs {old:?}"
+                );
+            }
+            assert_eq!(
+                storage.get_pool_info(cl, db).await.unwrap().claimed_count,
+                *slots,
+                "case {i}"
+            );
+            match claim("other_run").await {
+                ConcurrencyClaimStatus::Pending {
+                    reason:
+                        BlockReason::PoolFull {
+                            pool_key,
+                            claimed,
+                            limit: pool_limit,
+                        },
+                    ..
+                } => assert_eq!(
+                    (pool_key.as_str(), claimed, pool_limit),
+                    (db.as_str(), *slots, *limit),
+                    "case {i}"
+                ),
+                other => panic!("case {i}: the taken-over row must fill the pool: {other:?}"),
+            }
+        }
+    }
+
+    /// A re-run step must still wait for a counted pool's slot that another
+    /// step holds, whether its own leftover row's lease ran out or not, also
+    /// when that step claims between the re-claim's pre-check and its
+    /// transaction. Only the step's own row, by run and step key, is left out
+    /// of the count.
+    #[tokio::test]
+    async fn test_user_pool_reclaim_by_same_step_waits_for_another_steps_slot() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        // (the killed attempt's lease, the re-run step, the other holder)
+        let cases = [
+            // The lease ran out, and another run's step of the same name took
+            // the slot.
+            (0, ("run_0", "load"), ("other_run", "load")),
+            // The lease is live, and a sibling step of the same run holds the
+            // only slot left after the limit was lowered.
+            (300, ("run_1", "load"), ("run_1", "sibling")),
+        ];
+        for (i, (lease, (run, step), (holder_run, holder_step))) in cases.into_iter().enumerate() {
+            let pool = format!("db_{i}");
+            let pools = [(pool.clone(), 1)];
+            let claim = async |run: &str, step: &str, lease: u32| {
+                storage
+                    .claim_concurrency_slots(cl, &pools, run, step, 0, lease, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("case {i}: claim by {run}/{step} failed: {e:#}"))
+            };
+            storage.set_pool_limit(cl, &pool, 2, 300).await.unwrap();
+            assert_eq!(
+                claim(run, step, lease).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}"
+            );
+            let killed = held_slots(&storage, run, step).await;
+            assert_eq!(
+                claim(holder_run, holder_step, 300).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}"
+            );
+            storage.set_pool_limit(cl, &pool, 1, 300).await.unwrap();
+
+            match claim(run, step, 300).await {
+                ConcurrencyClaimStatus::Pending {
+                    reason:
+                        BlockReason::PoolFull {
+                            pool_key,
+                            claimed,
+                            limit,
+                        },
+                    ..
+                } => assert_eq!(
+                    (pool_key.as_str(), claimed, limit),
+                    (pool.as_str(), 1, 1),
+                    "case {i}"
+                ),
+                other => panic!("case {i}: expected Pending on the full pool, got {other:?}"),
+            }
+            assert_eq!(
+                claim_transaction_count(&storage, &pools, &[], run, step, None).await,
+                0,
+                "case {i}: the transaction claimed nothing; the leftover row is not its claim"
+            );
+            assert_eq!(held_slots(&storage, run, step).await, killed, "case {i}");
+
+            storage
+                .free_concurrency_slots(holder_run, holder_step)
+                .await
+                .unwrap();
+            assert_eq!(
+                claim(run, step, 300).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}"
+            );
+            let held = held_slots(&storage, run, step).await;
+            assert_eq!(held.len(), 1, "case {i}: {held:?}");
+            assert!(
+                held[0].claimed_at > killed[0].claimed_at
+                    && held[0].lease_expires_at > killed[0].lease_expires_at,
+                "case {i}: the re-claim must take the row over: {held:?} vs {killed:?}"
+            );
+        }
     }
 
     #[tokio::test]
