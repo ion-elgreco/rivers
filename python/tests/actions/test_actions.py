@@ -1896,13 +1896,18 @@ def test_cancelled_materialize_starts_no_more_steps(style):
     assert "StepFailure" not in by_kind
 
 
-def _fanned(handler, items, echo, pooled):
+_CUT_SHORT = "Cancelled before every map instance ran"
+
+
+def _fanned(handler, items, echo, pooled, pdef=None):
     """A graph asset that maps ``echo`` over ``items``. With ``pooled``, it
     declares an Exclusive action, so its inner tasks claim the asset's pool."""
 
     class Fanned(rs.GraphAsset):
         io_handler = handler
         node_io_handler = handler
+        if pdef is not None:
+            partitions_def = pdef
 
         @classmethod
         def compose(cls):
@@ -1921,34 +1926,52 @@ def _fanned(handler, items, echo, pooled):
     return Fanned
 
 
-def _assert_fan_out_cut_short(repo, run_id, mapped, ran):
-    """Only the instances in ``ran`` have step events, and the mapped step has
-    neither a StepSuccess nor a StepFailure."""
-    assert repo.storage.get_run(run_id).status == "Canceled"
-    by_kind = _asset_keys_by_event(repo, run_id)
+def _assert_fan_out_cut_short(repo, result, mapped, ran):
+    """Only the instances in ``ran`` have step events. The mapped step started,
+    so a StepFailure that names the cancel closes it. The run stays Canceled
+    and fails nothing: no failed asset, and no keyed failure to floor a
+    partition."""
+    assert repo.storage.get_run(result.run_id).status == "Canceled"
+    assert result.failed_assets == []
+    by_kind = _asset_keys_by_event(repo, result.run_id)
+    assert mapped in by_kind.get("StepStart", []), by_kind
     assert mapped not in by_kind.get("StepSuccess", []), by_kind
-    assert "StepFailure" not in by_kind, by_kind
+    failures = [
+        (e.asset_key, e.metadata, e.partition_key)
+        for e in repo.storage.get_events_for_run(result.run_id)
+        if str(e.event_type) == "StepFailure"
+    ]
+    assert failures == [(mapped, [("error", _CUT_SHORT)], None)], by_kind
+    completed, started = repo.storage.get_run_progress(result.run_id)
+    assert completed == started, by_kind
     for kind in ("StepStart", "Materialization", "StepSuccess"):
         instances = [k for k in by_kind.get(kind, []) if k.startswith(f"{mapped}__")]
         assert instances == ran, (kind, by_kind)
 
 
+@pytest.mark.parametrize(
+    "partitioned", [False, True], ids=["unpartitioned", "partitioned"]
+)
 @pytest.mark.parametrize("pooled", [False, True], ids=["no_pool", "asset_pool"])
 @pytest.mark.parametrize("style", ["sync", "async"])
-def test_cancelled_fan_out_does_not_succeed(style, pooled):
+def test_cancelled_fan_out_does_not_succeed(style, pooled, partitioned):
     """A cancel skips the fan-out instances that have not started, so the
-    mapped step did not finish. It used to get a StepSuccess all the same.
-    Sync instances run one at a time, so the first one cancels the run. Async
-    ones start up to four at a time, so there a step of the same level cancels
-    first: a level runs its single steps before its mapped ones."""
+    mapped step did not finish. It used to get a StepSuccess all the same,
+    and then no end event at all, so it stayed Running in the Canceled run.
+    Now a StepFailure that names the cancel closes it. Sync instances run one
+    at a time, so the first one cancels the run. Async ones start up to four
+    at a time, so there a step of the same level cancels first: a level runs
+    its single steps before its mapped ones."""
     handler = rs.InMemoryIOHandler()
+    pdef = rs.PartitionsDefinition.static_(["p1", "p2"]) if partitioned else None
+    part = {"partitions_def": pdef} if partitioned else {}
     run_ids = []
     ran = []
 
     def cancel():
         repo.storage.request_cancellation(run_ids[0])
 
-    @rs.Asset(io_handler=handler)
+    @rs.Asset(io_handler=handler, **part)
     def items(context: rs.AssetExecutionContext) -> list:
         run_ids.append(context.run_id)
         return [1, 2, 3, 4, 5, 6]
@@ -1970,7 +1993,7 @@ def test_cancelled_fan_out_does_not_succeed(style, pooled):
             ran.append(x)
             return x
 
-        @rs.Asset(io_handler=handler)
+        @rs.Asset(io_handler=handler, **part)
         def stopper(items: list) -> int:
             cancel()
             return 0
@@ -1978,15 +2001,16 @@ def test_cancelled_fan_out_does_not_succeed(style, pooled):
         siblings = [stopper]
 
     repo = rs.CodeRepository(
-        assets=[items, _fanned(handler, items, echo, pooled), *siblings],
+        assets=[items, _fanned(handler, items, echo, pooled, pdef), *siblings],
         tasks=[echo, _fan_total],
         default_executor=IP,
     )
-    result = repo.materialize(raise_on_error=False)
+    pk = rs.PartitionKey.single("p1") if partitioned else None
+    result = repo.materialize(partition_key=pk, raise_on_error=False)
 
     assert ran == ([1] if style == "sync" else [])
     first = ["fanned/echo__0"] if style == "sync" else []
-    _assert_fan_out_cut_short(repo, result.run_id, "fanned/echo", first)
+    _assert_fan_out_cut_short(repo, result, "fanned/echo", first)
 
 
 @pytest.mark.parametrize(
@@ -2028,7 +2052,7 @@ def test_cancelled_fan_out_does_not_succeed_on_parallel(tmp_path, style, pooled)
     )
     result = repo.materialize(raise_on_error=False)
 
-    _assert_fan_out_cut_short(repo, result.run_id, f"fanned/{echo.name}", [])
+    _assert_fan_out_cut_short(repo, result, f"fanned/{echo.name}", [])
 
 
 def test_asset_pool_wait_outlives_the_claim_timeout():
