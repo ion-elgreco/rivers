@@ -3180,8 +3180,8 @@ impl PyCodeRepository {
         }
     }
 
-    /// Resolve `IOHandler::ResourceRef` → `Resource` on every asset and refresh
-    /// the per-input + node-level overrides on namespaced composition tasks.
+    /// Resolve `IOHandler::ResourceRef` → `Resource` on every asset and task and
+    /// refresh the per-input + node-level overrides on namespaced composition tasks.
     /// Mutates `node_map` in place (overrides on `ResolvedTask` are post-set).
     /// Also calls `resource.setup()` on every Resource that defines it.
     /// Returns the shared default `InMemoryIOHandler` instance.
@@ -3265,6 +3265,23 @@ impl PyCodeRepository {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        let others = &resource_keys_excluding_io_handlers;
+        for task_py in &self.raw_tasks {
+            if let Ok(task) = task_py.cast_bound::<PyTask>(py) {
+                let mut task = task.borrow_mut();
+                let name = task.inner.name.clone().unwrap_or_default();
+                if let Some(handler) = task.inner.io_handler.as_mut() {
+                    handler.resolve_in_place(py, &handlers, others, "Task", &name)?;
+                }
+            } else if let Ok(bash) = task_py.cast_bound::<PyBashTask>(py) {
+                let mut bash = bash.borrow_mut();
+                let name = bash.name.clone();
+                if let Some(handler) = bash.io_handler.as_mut() {
+                    handler.resolve_in_place(py, &handlers, others, "Task", &name)?;
                 }
             }
         }

@@ -5,11 +5,19 @@ Checks the same chain the executor walks at materialize time, but without
 running any steps. The corresponding parallel-mode regression
 (per-input override honored under loky) lives at
 ``tests/executor/test_parallel_worker.py::test_mp_input_io_handler_override_honored``.
+The task section at the end does materialize: tasks that name their
+io_handler by resource key, on both executors.
 """
 
+import pickle
+import re
+from pathlib import Path
+
+import obstore.store
 import pytest
 
 import rivers as rs
+from rivers.exceptions import AssetDefinitionError
 
 
 # ---------------------------------------------------------------------------
@@ -168,3 +176,162 @@ def test_graph_node_io_handler_propagates_to_internal_tasks():
     pipe_handler = repo.io_handler_for_output("pipe")
     assert isinstance(pipe_handler, _NamedHandler)
     assert pipe_handler.name == "graph_output"
+
+
+# ---------------------------------------------------------------------------
+# Tasks — io_handler named by resource key
+# ---------------------------------------------------------------------------
+
+IN_PROCESS = rs.Executor.in_process()
+PARALLEL = rs.Executor.parallel(max_workers=2)
+
+KINDS_AND_EXECUTORS = pytest.mark.parametrize(
+    ("kind", "executor"),
+    [
+        pytest.param("sync", IN_PROCESS, id="sync-in_process"),
+        pytest.param("sync", PARALLEL, id="sync-parallel"),
+        pytest.param("async", IN_PROCESS, id="async-in_process"),
+        pytest.param("async", PARALLEL, id="async-parallel"),
+        pytest.param("bash", IN_PROCESS, id="bash-in_process"),
+        pytest.param(
+            "bash",
+            PARALLEL,
+            id="bash-parallel",
+            marks=pytest.mark.xfail(
+                raises=AttributeError,
+                strict=True,
+                reason="a BashTask that shares a level fails on the parallel "
+                "executor before any IO: it has no __annotations__",
+            ),
+        ),
+    ],
+)
+
+
+def _pickle_handler(root: Path) -> rs.PickleIOHandler:
+    return rs.PickleIOHandler(store=obstore.store.LocalStore(str(root), mkdir=True))
+
+
+def _stored(root: Path) -> dict:
+    """What a PickleIOHandler holds under ``root``, by node path."""
+    return {
+        p.relative_to(root).with_suffix("").as_posix(): pickle.loads(p.read_bytes())
+        for p in sorted(root.rglob("*.pkl"))
+    }
+
+
+def _warehouse_task(kind: str, name: str, value: str):
+    """A task of ``kind`` that returns ``value`` and names its io_handler by the
+    resource key "warehouse"."""
+    if kind == "bash":
+        return rs.BashTask(name=name, command=f"echo {value}", io_handler="warehouse")
+    if kind == "async":
+
+        async def run() -> str:
+            return value
+
+    else:
+
+        def run() -> str:
+            return value
+
+    return rs.Task(run, name=name, io_handler="warehouse")
+
+
+@KINDS_AND_EXECUTORS
+def test_task_resource_key_io_handler_writes_and_reads_back(kind, executor, tmp_path):
+    """A task's ``io_handler="key"`` writes through the resource handler, and
+    downstream assets read the values back through it."""
+    warehouse = tmp_path / "warehouse"
+
+    @rs.Asset(io_handler="warehouse")
+    def order_total(orders: str) -> int:
+        return int(orders) + 1
+
+    @rs.Asset(io_handler="warehouse")
+    def greeting(customers: str) -> str:
+        return f"hi {customers}"
+
+    repo = rs.CodeRepository(
+        assets=[order_total, greeting],
+        tasks=[
+            _warehouse_task(kind, "orders", "7"),
+            _warehouse_task(kind, "customers", "ada"),
+        ],
+        resources={"warehouse": _pickle_handler(warehouse)},
+        default_executor=executor,
+    )
+    repo.materialize()
+    assert _stored(warehouse) == {
+        "customers": "ada",
+        "greeting": "hi ada",
+        "order_total": 8,
+        "orders": "7",
+    }
+
+
+@KINDS_AND_EXECUTORS
+def test_graph_inner_task_resource_key_io_handler(kind, executor, tmp_path):
+    """Inner tasks of a graph without ``node_io_handler`` write through their
+    own ``io_handler="key"``, and the next inner task reads them back."""
+    warehouse = tmp_path / "warehouse"
+
+    @rs.Task(io_handler="warehouse")
+    def left() -> int:
+        return 3
+
+    right = _warehouse_task(kind, "right", "4")
+
+    @rs.Task(io_handler="warehouse")
+    def add(a: int, b: str) -> int:
+        return a + int(b)
+
+    @rs.Asset.from_graph(io_handler="warehouse")
+    def total():
+        return add(left(), right())
+
+    repo = rs.CodeRepository(
+        assets=[total],
+        tasks=[left, right, add],
+        resources={"warehouse": _pickle_handler(warehouse)},
+        default_executor=executor,
+    )
+    repo.materialize()
+    assert _stored(warehouse) == {
+        "total": 7,
+        "total/add": 7,
+        "total/left": 3,
+        "total/right": "4",
+    }
+
+
+class _Settings(rs.Resource):
+    """A resource that is not an IOHandler."""
+
+    value: str = "oops"
+
+
+@pytest.mark.parametrize("kind", ["sync", "bash"])
+@pytest.mark.parametrize(
+    ("resources", "reason"),
+    [
+        ({}, "which is not in resources"),
+        (
+            {"warehouse": _Settings()},
+            "which does not implement the IOHandler protocol "
+            "(handle_output + load_input)",
+        ),
+    ],
+    ids=["unknown-key", "not-an-io-handler"],
+)
+def test_task_resource_key_io_handler_errors_at_resolve(kind, resources, reason):
+    """A task's ``io_handler="key"`` that names no IOHandler resource fails
+    resolve, as on an asset, instead of panicking when the task runs."""
+    repo = rs.CodeRepository(
+        assets=[],
+        tasks=[_warehouse_task(kind, "orders", "7")],
+        resources=resources,
+    )
+    message = f"Task 'orders': io_handler references resource 'warehouse' {reason}"
+    with pytest.raises(AssetDefinitionError, match=re.escape(message)):
+        repo.resolve()

@@ -1017,12 +1017,24 @@ impl Asset {
                         )
                     })?;
                     if let Some(ref mut handler) = inner_asset.io_handler {
-                        handler.resolve_in_place(py, handlers, other_resource_keys, name)?;
+                        handler.resolve_in_place(
+                            py,
+                            handlers,
+                            other_resource_keys,
+                            "Asset",
+                            name,
+                        )?;
                     }
                 }
                 let multi_name = multi.name.as_deref().unwrap_or("multi_asset");
                 for handler in multi.input_io_handlers.values_mut() {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, multi_name)?;
+                    handler.resolve_in_place(
+                        py,
+                        handlers,
+                        other_resource_keys,
+                        "Asset",
+                        multi_name,
+                    )?;
                 }
             }
             Asset::Graph(graph) => {
@@ -1032,13 +1044,13 @@ impl Asset {
                     )
                 })?;
                 if let Some(ref mut handler) = graph.io_handler {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, name)?;
+                    handler.resolve_in_place(py, handlers, other_resource_keys, "Asset", name)?;
                 }
                 if let Some(ref mut handler) = graph.node_io_handler {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, name)?;
+                    handler.resolve_in_place(py, handlers, other_resource_keys, "Asset", name)?;
                 }
                 for handler in graph.input_io_handlers.values_mut() {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, name)?;
+                    handler.resolve_in_place(py, handlers, other_resource_keys, "Asset", name)?;
                 }
             }
             Asset::Single(single) => {
@@ -1048,10 +1060,10 @@ impl Asset {
                     )
                 })?;
                 if let Some(ref mut handler) = single.io_handler {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, name)?;
+                    handler.resolve_in_place(py, handlers, other_resource_keys, "Asset", name)?;
                 }
                 for handler in single.input_io_handlers.values_mut() {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, name)?;
+                    handler.resolve_in_place(py, handlers, other_resource_keys, "Asset", name)?;
                 }
             }
             Asset::External(ext) => {
@@ -1060,8 +1072,13 @@ impl Asset {
                         "Asset name must be set before resolving io_handler refs",
                     )
                 })?;
-                ext.io_handler
-                    .resolve_in_place(py, handlers, other_resource_keys, name)?;
+                ext.io_handler.resolve_in_place(
+                    py,
+                    handlers,
+                    other_resource_keys,
+                    "Asset",
+                    name,
+                )?;
             }
         }
         Ok(())

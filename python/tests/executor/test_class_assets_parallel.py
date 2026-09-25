@@ -297,6 +297,26 @@ KEY_HANDLER_MODULE = textwrap.dedent(
     @rs.Asset.from_graph(io_handler="warehouse", node_io_handler="scratch")
     def total():
         return add(left(), right())
+
+
+    @rs.Task(io_handler="warehouse")
+    def tally() -> list:
+        return [5, 6]
+
+
+    @rs.Task(io_handler="warehouse")
+    def roster() -> list:
+        return ["cy", "di"]
+
+
+    @rs.Asset(io_handler="warehouse")
+    def tally_total(tally: list) -> int:
+        return sum(tally)
+
+
+    @rs.Asset(io_handler="warehouse")
+    def roster_count(roster: list) -> int:
+        return len(roster)
     """
 )
 
@@ -378,6 +398,28 @@ def test_loky_resource_key_node_io_handler_ships_resolved_handler(
     repo.materialize()
     assert _stored(scratch) == {"total/add": 7, "total/left": 3, "total/right": 4}
     assert _stored(warehouse) == {"total": 7}
+
+
+def test_loky_resource_key_task_io_handler_ships_resolved_handler(
+    worker_module, tmp_path
+):
+    """A module-level task's io_handler named by resource key crosses loky as
+    the resolved handler, for the task's write and for the downstream load."""
+    m = worker_module(KEY_HANDLER_MODULE)
+    warehouse = tmp_path / "warehouse"
+    repo = rs.CodeRepository(
+        assets=[m.tally_total, m.roster_count],
+        tasks=[m.tally, m.roster],
+        resources={"warehouse": _pickle_handler(warehouse)},
+        default_executor=MP,
+    )
+    repo.materialize()
+    assert _stored(warehouse) == {
+        "roster": ["cy", "di"],
+        "roster_count": 2,
+        "tally": [5, 6],
+        "tally_total": 11,
+    }
 
 
 # Only the parent's import builds the handler, as a handler read from

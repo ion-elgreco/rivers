@@ -39,25 +39,27 @@ impl<'py> FromPyObject<'py, '_> for IOHandler {
 impl IOHandler {
     /// Resolve a ResourceRef to a Resource in-place.
     /// `io_handler_keys` contains resource keys pre-validated as IOHandler at extraction time.
+    /// `kind` and `name` name the owner in errors, e.g. `Asset 'orders'`.
     pub fn resolve_in_place(
         &mut self,
         py: Python,
         io_handlers: &HashMap<String, &Py<PyAny>>,
         other_resource_keys: &HashSet<&String>,
-        asset_name: &str,
+        kind: &str,
+        name: &str,
     ) -> PyResult<()> {
         if let IOHandler::ResourceRef(key) = self {
             if other_resource_keys.contains(key) {
                 return Err(AssetDefinitionError::new_err(format!(
-                    "Asset '{}': io_handler references resource '{}' which does not implement \
+                    "{} '{}': io_handler references resource '{}' which does not implement \
                      the IOHandler protocol (handle_output + load_input)",
-                    asset_name, key
+                    kind, name, key
                 )));
             }
             let resource = io_handlers.get(key.as_str()).ok_or_else(|| {
                 AssetDefinitionError::new_err(format!(
-                    "Asset '{}': io_handler references resource '{}' which is not in resources",
-                    asset_name, key
+                    "{} '{}': io_handler references resource '{}' which is not in resources",
+                    kind, name, key
                 ))
             })?;
             *self = IOHandler::Resource(resource.clone_ref(py));

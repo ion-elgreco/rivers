@@ -13,6 +13,7 @@ use crate::assets::decorator::PyAsset;
 use crate::assets::io_handler::IOHandler;
 use crate::context::io::{PyInputContext, PyOutputContext};
 use crate::result_types::{self, ResultKind};
+use crate::task::PyTask;
 
 fn resolve_module_attr(py: Python, module: &str, qualname: &str) -> PyResult<Py<PyAny>> {
     let importlib = py.import("importlib")?;
@@ -128,18 +129,27 @@ impl PyIOHandlerRef {
 /// reconstruction and the parent-side shippability check. Requires the found
 /// object to expose `load_input`: on a class-form asset the attribute lookup
 /// reaches the `Asset` base's getset descriptors, which are not handlers.
-/// On an asset only a handler set at definition counts: a fresh import holds
-/// the key of a resource handler, not the handler.
+/// On an asset or a task only a handler set at definition counts: a fresh
+/// import holds the key of a resource handler, not the handler.
 pub(super) fn handler_attr(py: Python, obj: &Py<PyAny>) -> Option<Py<PyAny>> {
+    let definition_handler = |h: &IOHandler| match h {
+        IOHandler::Instance(handler) => Some(handler.clone_ref(py)),
+        IOHandler::ResourceRef(_) | IOHandler::Resource(_) => None,
+    };
     if let Ok(asset) = obj.bind(py).cast::<PyAsset>() {
         let asset = asset.borrow();
         return [asset.inner.node_io_handler(), asset.inner.io_handler()]
             .into_iter()
             .flatten()
-            .find_map(|h| match h {
-                IOHandler::Instance(handler) => Some(handler.clone_ref(py)),
-                IOHandler::ResourceRef(_) | IOHandler::Resource(_) => None,
-            });
+            .find_map(definition_handler);
+    }
+    if let Ok(task) = obj.bind(py).cast::<PyTask>() {
+        return task
+            .borrow()
+            .inner
+            .io_handler
+            .as_ref()
+            .and_then(definition_handler);
     }
     for attr in ["node_io_handler", "io_handler"] {
         if let Ok(h) = obj.getattr(py, attr)
