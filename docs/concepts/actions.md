@@ -167,7 +167,10 @@ the run pod on Kubernetes — whatever executor the repository or job sets. So
 apply to them: size the run pod (`run_cpu` / `run_memory`) for heavy maintenance verbs
 like `optimize`. The steps of one run execute one at a time; an exclusive verb whose
 asset is busy steps aside, so the free targets go first and it runs when its asset is
-free.
+free. A materialize step still holds its asset while its
+[hooks](../api-reference/hooks.md#behavior) run, so a hook must not start an exclusive
+verb on that asset: the verb would wait forever. Run it from a sensor, schedule, or job
+instead.
 
 ### Action config
 

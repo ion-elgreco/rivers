@@ -103,7 +103,7 @@ repo = rs.CodeRepository(
 )
 ```
 
-Steps wait until the pool has space, then claim their slots, run, and release them once the step's output is written and its events are recorded. If a step crashes, its slots are released by the lease GC after `lease_duration` so a dead pod can't permanently hold capacity. Multiple pools per asset are supported (pass a list to `pool=`); the step waits for *all* its pools to have space before running.
+Steps wait until the pool has space, then claim their slots, run, and release them once the step's output is written and its events are recorded. The step's [hooks](../api-reference/hooks.md#behavior) run before that release, so a hook must not start a run that needs the same pool or asset; use a sensor, schedule, or job instead. If a step crashes, its slots are released by the lease GC after `lease_duration` so a dead pod can't permanently hold capacity. Multiple pools per asset are supported (pass a list to `pool=`); the step waits for *all* its pools to have space before running.
 
 Pools also expose a CLI (`rivers pools list/info/set`) and are inspectable through the storage backend (`storage.get_all_pool_infos()`, `storage.get_pool_slot_holders(...)`).
 
