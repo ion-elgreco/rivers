@@ -359,6 +359,26 @@ impl AssetConditionCache {
             }
         }
 
+        // A failed run did not fail an asset it materialized itself. Its own
+        // events say so: the asset row loses the run to a delete or a newer
+        // run, which can land in this same refresh.
+        if !delta.failed_adds.is_empty() {
+            let assets: Vec<String> = delta.failed_adds.keys().cloned().collect();
+            let mut runs: Vec<String> = delta
+                .failed_adds
+                .values()
+                .map(|f| f.run_id.clone())
+                .collect();
+            runs.sort_unstable();
+            runs.dedup();
+            let built = storage.materialized_by_runs(&assets, &runs).await?;
+            for (asset, failed) in &mut delta.failed_adds {
+                failed.materialized = built
+                    .get(asset)
+                    .is_some_and(|runs| runs.contains(&failed.run_id));
+            }
+        }
+
         // Deletion supersedes failure — the steady-state half of the rule
         // initial_load applies at restart. A whole-asset deletion behaves
         // like a successful materialize at its timestamp: it clears any
@@ -573,6 +593,7 @@ impl AssetConditionCache {
                         .or_insert_with(|| FailedRun {
                             ts: run_ts,
                             run_id: run.run_id.clone(),
+                            materialized: false,
                         });
                 } else {
                     delta
@@ -884,9 +905,17 @@ impl AssetConditionCache {
             }
         }
 
-        for (asset, FailedRun { ts, run_id }) in failed_adds {
-            let materialized_here =
-                self.run_materialized_asset(&asset, &run_id, &materialized_overrides);
+        for (
+            asset,
+            FailedRun {
+                ts,
+                run_id,
+                materialized,
+            },
+        ) in failed_adds
+        {
+            let materialized_here = materialized
+                || self.run_materialized_asset(&asset, &run_id, &materialized_overrides);
             if materialized_here {
                 if self
                     .failed_asset_timestamps

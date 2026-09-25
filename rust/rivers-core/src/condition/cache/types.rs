@@ -106,6 +106,8 @@ pub(super) enum InProgressChange {
 pub(super) struct FailedRun {
     pub(super) ts: i64,
     pub(super) run_id: String,
+    /// The run's own events show it materialized the asset.
+    pub(super) materialized: bool,
 }
 
 /// The `(asset, partition)` slots a run's effects write to: a partitioned

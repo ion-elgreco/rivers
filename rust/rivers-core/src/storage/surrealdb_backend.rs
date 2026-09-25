@@ -2359,6 +2359,48 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
+    /// The index hint makes `run_id IN $run_ids` a union of index scans, one
+    /// per run; left to itself the planner scans every Materialization event
+    /// on `idx_events_type`. `asset_key` is matched here, as in `step_outcomes`.
+    async fn materialized_by_runs(
+        &self,
+        asset_keys: &[String],
+        run_ids: &[String],
+    ) -> Result<HashMap<String, HashSet<String>>> {
+        if asset_keys.is_empty() || run_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let wanted: HashSet<&str> = asset_keys.iter().map(String::as_str).collect();
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(
+                    "SELECT asset_key, run_id FROM events WITH INDEX idx_events_run_type \
+                     WHERE run_id IN $run_ids AND event_type = 'Materialization' \
+                     GROUP BY asset_key, run_id",
+                )
+                .bind(("run_ids", run_ids.to_vec()))
+                .await?;
+
+            #[derive(SurrealValue)]
+            struct Row {
+                asset_key: Option<String>,
+                run_id: String,
+            }
+            let rows: Vec<Row> = result.take(0)?;
+            let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+            for row in rows {
+                if let Some(asset_key) = row.asset_key
+                    && wanted.contains(asset_key.as_str())
+                {
+                    out.entry(asset_key).or_default().insert(row.run_id);
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(run_id = %run.run_id))]
     async fn create_run(&self, run: &RunRecord) -> Result<()> {
         let result = super::retry::with_retry(&self.retry_config, || async {
@@ -4149,38 +4191,44 @@ impl PerCodeLocationStorage for SurrealStorage {
 
         // A run that materialized one of this asset's partitions and then failed
         // on another asset did not fail that partition — the unpartitioned
-        // path's `materialized_here` rule, read off the partition rows.
+        // path's `materialized_here` rule. Read off the run's own events, not
+        // the partition row, which a delete or a newer run moves off the run.
+        // The index hint anchors the scan on the runs, as in
+        // `materialized_by_runs`.
         let failed_keyed_runs: Vec<String> = scan
             .iter()
             .filter(|r| r.status == "Failure" && r.action.is_none() && r.partition_key.is_some())
             .map(|r| r.run_id.clone())
             .collect();
-        let mut materialized_by: std::collections::HashMap<PartitionKey, String> =
+        let mut materialized_by: std::collections::HashMap<PartitionKey, HashSet<String>> =
             std::collections::HashMap::new();
         if !failed_keyed_runs.is_empty() {
             let mut result = self
                 .db
                 .query(
-                    "SELECT partition_key, last_run_id FROM asset_partitions \
-                     WHERE code_location_id = $cl AND asset_key = $asset_key \
-                     AND last_run_id IN $runs",
+                    "SELECT partition_key, run_id FROM events WITH INDEX idx_events_run_type \
+                     WHERE run_id IN $runs AND event_type = 'Materialization' \
+                     AND asset_key = $asset_key AND partition_key IS NOT NONE",
                 )
-                .bind(("cl", code_location_id.to_string()))
                 .bind(("asset_key", asset_key.to_string()))
                 .bind(("runs", failed_keyed_runs))
                 .await?;
 
             #[derive(Debug, SurrealValue)]
-            struct OwnRow {
+            struct BuiltRow {
                 partition_key: PartitionKey,
-                last_run_id: String,
+                run_id: String,
             }
 
-            let own_rows: Vec<OwnRow> = result.take(0)?;
-            materialized_by = own_rows
-                .into_iter()
-                .map(|r| (r.partition_key, r.last_run_id))
-                .collect();
+            let built: Vec<BuiltRow> = result.take(0)?;
+            for row in built {
+                for member in row.partition_key.members() {
+                    materialized_by
+                        .entry(member)
+                        .or_default()
+                        .insert(row.run_id.clone());
+                }
+            }
         }
 
         for row in &scan {
@@ -4195,7 +4243,10 @@ impl PerCodeLocationStorage for SurrealStorage {
             // during the run must not outrank it.
             let ts = row.end_time.unwrap_or(row.start_time);
             for member in pk.members() {
-                if materialized_by.get(&member) == Some(&row.run_id) {
+                if materialized_by
+                    .get(&member)
+                    .is_some_and(|runs| runs.contains(&row.run_id))
+                {
                     continue;
                 }
                 latest_failure
@@ -5115,6 +5166,70 @@ mod tests {
             !plan.contains("SortTopKByKey") && !plan.contains("\"operator\":\"Sort\""),
             "asset page should not sort: {plan}"
         );
+    }
+
+    /// Which assets and keys the failed runs materialized is read one run at a
+    /// time off `idx_events_run_type`, not by scanning every Materialization.
+    #[tokio::test]
+    async fn failed_run_materializations_scan_only_those_runs() {
+        let temp = test_temp_dir::test_temp_dir!();
+        let s = SurrealStorage::new_embedded(temp.as_path_untracked().to_str().unwrap())
+            .await
+            .unwrap();
+        let rows: Vec<DbEventWrite> = (0..2000i64)
+            .map(|i| DbEventWrite {
+                id: new_event_record_id(),
+                code_location_id: "default".into(),
+                event_type: if i % 2 == 0 {
+                    "Materialization"
+                } else {
+                    "StepSuccess"
+                }
+                .into(),
+                asset_key: Some("a".into()),
+                run_id: format!("r{}", i % 100),
+                partition_key: Some(PartitionKey::Single {
+                    keys: vec![format!("p{i}")],
+                }),
+                timestamp: i,
+                sort_order: 0,
+                metadata: vec![],
+                data_version: None,
+                code_version: None,
+                input_data_versions: vec![],
+            })
+            .collect();
+        s.db.query("INSERT INTO events $rows RETURN NONE")
+            .bind(("rows", rows))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        for query in [
+            "SELECT asset_key, run_id FROM events WITH INDEX idx_events_run_type \
+             WHERE run_id IN $runs AND event_type = 'Materialization' \
+             GROUP BY asset_key, run_id EXPLAIN",
+            "SELECT partition_key, run_id FROM events WITH INDEX idx_events_run_type \
+             WHERE run_id IN $runs AND event_type = 'Materialization' \
+             AND asset_key = $asset_key AND partition_key IS NOT NONE EXPLAIN",
+        ] {
+            let plan: Vec<serde_json::Value> =
+                s.db.query(query)
+                    .bind(("runs", vec!["r1".to_string(), "r2".to_string()]))
+                    .bind(("asset_key", "a".to_string()))
+                    .await
+                    .unwrap()
+                    .take(0)
+                    .unwrap();
+            let plan = serde_json::to_string(&plan).unwrap();
+            assert!(
+                plan.contains("UnionIndexScan")
+                    && plan.contains("idx_events_run_type")
+                    && !plan.contains("\"idx_events_type\""),
+                "one index scan per run, not every Materialization: {plan}"
+            );
+        }
     }
 
     /// The UNIQUE index compares the SERIALIZED partition_key, so a reordered-dims Multi key canonicalizes to one row.
@@ -9098,6 +9213,44 @@ mod tests {
         );
     }
 
+    /// Only the runs' own Materialization events count, for the assets asked
+    /// about, and a later delete of the asset does not erase them.
+    #[tokio::test]
+    async fn materialized_by_runs_reads_the_runs_own_materializations() {
+        let storage = make_storage().await;
+        register(&storage, &["a", "b", "c"]).await;
+        let mut deletion = make_event("a", "delete", 400);
+        deletion.event_type = EventType::Deletion;
+        storage
+            .store_events(&[
+                make_event("a", "r1", 100),
+                make_event("b", "r1", 100),
+                EventRecord {
+                    event_type: EventType::StepSuccess,
+                    ..make_event("b", "r2", 200)
+                },
+                make_event("c", "r3", 300),
+                deletion,
+            ])
+            .await
+            .unwrap();
+
+        let built = storage
+            .materialized_by_runs(
+                &["a".to_string(), "b".to_string()],
+                &["r1".to_string(), "r2".to_string(), "r3".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            built,
+            HashMap::from([
+                ("a".to_string(), HashSet::from(["r1".to_string()])),
+                ("b".to_string(), HashSet::from(["r1".to_string()])),
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn test_get_asset_records_by_keys() {
         let storage = make_storage().await;
@@ -10256,6 +10409,119 @@ mod tests {
             .await
             .unwrap();
         assert!(clean_failed.contains_key(&p1), "clean really failed");
+    }
+
+    /// The failed run's own events say which keys it built, not the key's
+    /// row: a delete, or another run's newer materialization, of `raw/p1`
+    /// after the run built it must not bring the run's floor back. `raw/p2`,
+    /// which the run did not build, keeps its floor.
+    #[tokio::test]
+    async fn a_failed_run_does_not_fail_the_partitions_it_materialized_after_they_moved() {
+        let single = |k: &str| PartitionKey::Single {
+            keys: vec![k.to_string()],
+        };
+        let run = |run_id: &str, status, start, end, nodes: &[&str], pk: Option<PartitionKey>| {
+            RunRecord {
+                run_id: run_id.to_string(),
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                job_name: None,
+                status,
+                start_time: start,
+                end_time: Some(end),
+                tags: vec![],
+                node_names: nodes.iter().map(|n| n.to_string()).collect(),
+                priority: 0,
+                partition_key: pk,
+                block_reason: None,
+                launched_by: LaunchedBy::Manual { user: None },
+                action: None,
+            }
+        };
+        for case in [
+            "keyed delete",
+            "whole-asset delete",
+            "rebuilt by another run",
+        ] {
+            let temp = test_temp_dir::test_temp_dir!();
+            let storage = SurrealStorage::new_embedded(temp.as_path_untracked().to_str().unwrap())
+                .await
+                .unwrap();
+            register(&storage, &["raw", "clean"]).await;
+
+            let joint = PartitionKey::Single {
+                keys: vec!["p1".to_string(), "p2".to_string()],
+            };
+            storage
+                .create_run(&run(
+                    "joint",
+                    RunStatus::Failure,
+                    50,
+                    200,
+                    &["raw", "clean"],
+                    Some(joint),
+                ))
+                .await
+                .unwrap();
+            let mut built = make_event("raw", "joint", 100);
+            built.partition_key = Some(single("p1"));
+            storage.store_event(&built).await.unwrap();
+
+            if case == "rebuilt by another run" {
+                storage
+                    .create_run(&run(
+                        "other",
+                        RunStatus::Success,
+                        140,
+                        150,
+                        &["raw"],
+                        Some(single("p1")),
+                    ))
+                    .await
+                    .unwrap();
+                let mut rebuilt = make_event("raw", "other", 150);
+                rebuilt.partition_key = Some(single("p1"));
+                storage.store_event(&rebuilt).await.unwrap();
+            } else {
+                let pk = (case == "keyed delete").then(|| single("p1"));
+                let mut delete = run("delete", RunStatus::Success, 140, 150, &["raw"], pk.clone());
+                delete.action = Some("delete".to_string());
+                storage.create_run(&delete).await.unwrap();
+                let mut deletion = make_event("raw", "delete", 150);
+                deletion.event_type = EventType::Deletion;
+                deletion.partition_key = pk;
+                storage.store_event(&deletion).await.unwrap();
+            }
+
+            let materialized: std::collections::HashMap<PartitionKey, i64> = storage
+                .get_partition_timestamps(DEFAULT_CODE_LOCATION_ID, "raw")
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+            let raw_failed = storage
+                .get_failed_partitions(DEFAULT_CODE_LOCATION_ID, "raw", &materialized)
+                .await
+                .unwrap();
+            assert_eq!(
+                raw_failed,
+                std::collections::HashMap::from([(single("p2"), 200)]),
+                "{case}: the failed run built raw/p1, not raw/p2"
+            );
+
+            let clean_failed = storage
+                .get_failed_partitions(
+                    DEFAULT_CODE_LOCATION_ID,
+                    "clean",
+                    &std::collections::HashMap::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                clean_failed,
+                std::collections::HashMap::from([(single("p1"), 200), (single("p2"), 200)]),
+                "{case}: clean really failed"
+            );
+        }
     }
 
     #[tokio::test]

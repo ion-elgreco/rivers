@@ -2298,6 +2298,16 @@ pub trait StorageBackend: PerCodeLocationStorage {
         run_ids: &[String],
     ) -> impl Future<Output = Result<Vec<StepOutcome>>> + Send;
 
+    /// Which of `run_ids` materialized each of `asset_keys`: asset → runs.
+    ///
+    /// Read off the runs' own Materialization events: an asset row names only
+    /// its newest run, and a delete clears it.
+    fn materialized_by_runs(
+        &self,
+        asset_keys: &[String],
+        run_ids: &[String],
+    ) -> impl Future<Output = Result<HashMap<String, HashSet<String>>>> + Send;
+
     // Runs
     fn create_run(&self, run: &RunRecord) -> impl Future<Output = Result<()>> + Send;
     fn create_runs(&self, runs: &[RunRecord]) -> impl Future<Output = Result<()>> + Send;

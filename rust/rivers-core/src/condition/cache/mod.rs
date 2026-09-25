@@ -372,6 +372,7 @@ impl AssetConditionCache {
         // `outranked` would otherwise read, so without this every restart
         // resurrects a deleted asset's long-superseded floors.
         let deletion_ts = scoped.get_asset_deletion_timestamps().await?;
+        let mut floors: Vec<(&str, &str, i64)> = Vec::new();
         for run in &failed_runs {
             if run.is_action() {
                 continue;
@@ -393,12 +394,27 @@ impl AssetConditionCache {
                 if materialized_here || outranked || deleted_after {
                     continue;
                 }
-                self.failed_assets.insert(asset.clone());
-                self.failed_asset_timestamps
-                    .entry(asset.clone())
-                    .and_modify(|t| *t = (*t).max(run_ts))
-                    .or_insert(run_ts);
+                floors.push((asset.as_str(), run.run_id.as_str(), run_ts));
             }
+        }
+        // The record no longer names a run that materialized the asset before
+        // a delete or a newer run moved it on. The run's own events still do.
+        if !floors.is_empty() {
+            let assets: Vec<String> = floors.iter().map(|(a, ..)| a.to_string()).collect();
+            let mut runs: Vec<String> = floors.iter().map(|(_, r, _)| r.to_string()).collect();
+            runs.sort_unstable();
+            runs.dedup();
+            let built = storage.materialized_by_runs(&assets, &runs).await?;
+            floors.retain(|(asset, run_id, _)| {
+                !built.get(*asset).is_some_and(|runs| runs.contains(*run_id))
+            });
+        }
+        for (asset, _, run_ts) in floors {
+            self.failed_assets.insert(asset.to_string());
+            self.failed_asset_timestamps
+                .entry(asset.to_string())
+                .and_modify(|t| *t = (*t).max(run_ts))
+                .or_insert(run_ts);
         }
         // Floors rehydrated from persisted eval-state predate this load; drop
         // any outranked by a newer materialization or deletion (the asset

@@ -1686,3 +1686,107 @@ async fn completed_delete_clears_failure_floor_in_steady_state() {
     );
     assert!(cache.failed_assets.contains("events"));
 }
+
+/// A failed joint run did not fail an asset it materialized itself, even
+/// when a whole-asset delete or another run's newer materialization moved the
+/// asset row off the run before the run ended: in steady state, when that
+/// move and the failure land in one refresh, and after a restart. The asset
+/// the run failed on keeps its floor.
+#[tokio::test]
+async fn a_failed_run_does_not_floor_an_asset_it_materialized_after_it_moved() {
+    use crate::storage::EventType;
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let cl = crate::storage::default_code_location_id();
+    let event = |event_type, asset: &str, run_id: &str, ts| crate::storage::EventRecord {
+        code_location_id: cl.clone(),
+        event_type,
+        asset_key: Some(asset.to_string()),
+        run_id: run_id.to_string(),
+        partition_key: None,
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+    let mat = |asset: &str, run_id: &str, ts| {
+        let data_version = Some(format!("dv_{run_id}"));
+        event(
+            EventType::Materialization { data_version },
+            asset,
+            run_id,
+            ts,
+        )
+    };
+    for case in ["whole-asset delete", "rebuilt by another run"] {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        register_blank(&storage, &["X", "Y"]).await;
+        storage
+            .create_run(&mk_run("r0", RunStatus::Success, &["X", "Y"], 10))
+            .await
+            .unwrap();
+        storage
+            .store_events(&[mat("X", "r0", 10), mat("Y", "r0", 10)])
+            .await
+            .unwrap();
+        let mut cache = AssetConditionCache::new(cl.clone());
+        cache.refresh(&storage, 0).await.unwrap();
+
+        let mut joint = mk_run("R", RunStatus::Started, &["X", "Y"], 50);
+        joint.end_time = None;
+        storage.create_run(&joint).await.unwrap();
+        cache.refresh(&storage, 1).await.unwrap();
+
+        // R builds X, X moves off R, then R fails on Y.
+        storage
+            .store_events(&[
+                mat("X", "R", 100),
+                event(EventType::StepSuccess, "X", "R", 100),
+            ])
+            .await
+            .unwrap();
+        if case == "whole-asset delete" {
+            let mut delete = mk_run("D", RunStatus::Started, &["X"], 140);
+            delete.end_time = None;
+            delete.action = Some("delete".to_string());
+            storage.create_run(&delete).await.unwrap();
+            storage
+                .store_events(&[event(EventType::Deletion, "X", "D", 150)])
+                .await
+                .unwrap();
+            storage
+                .update_run_status("D", RunStatus::Success, Some(150))
+                .await
+                .unwrap();
+        } else {
+            storage
+                .create_run(&mk_run("S", RunStatus::Success, &["X"], 150))
+                .await
+                .unwrap();
+            storage.store_events(&[mat("X", "S", 150)]).await.unwrap();
+        }
+        storage
+            .store_events(&[event(EventType::StepFailure, "Y", "R", 190)])
+            .await
+            .unwrap();
+        storage
+            .update_run_status("R", RunStatus::Failure, Some(200))
+            .await
+            .unwrap();
+
+        cache.refresh(&storage, 2).await.unwrap();
+        let mut restarted = AssetConditionCache::new(cl.clone());
+        restarted.refresh(&storage, 0).await.unwrap();
+        for (when, cache) in [("steady state", &cache), ("restart", &restarted)] {
+            assert_eq!(
+                cache.failed_asset_timestamps,
+                HashMap::from([("Y".to_string(), 200)]),
+                "{case}, {when}: R built X and failed on Y"
+            );
+            assert_eq!(
+                cache.failed_assets,
+                HashSet::from(["Y".to_string()]),
+                "{case}, {when}"
+            );
+        }
+    }
+}
