@@ -59,6 +59,7 @@ The reader/writer split lets a write-breaking migration for newer writers run **
 |---------|--------|----------------------------------------------|
 | 5 | Exclusive-action pool claims record the partitions they touch | 2, 5 |
 | 6 | Deletions leave tombstones on asset and partition rows | 2, 6 |
+| 7 | An asset's code version and inputs keep the time of the materialization that recorded them | 2, 7 |
 
 An **uninitialized** store (no stamp) is bootstrapped by whichever process opens it first — the UI included — so a fresh deployment shows an empty UI without waiting for a code location.
 

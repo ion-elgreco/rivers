@@ -1838,40 +1838,50 @@ fn swallow_phantom_commit(result: Result<()>, op: &'static str, id: &str) -> Res
 }
 
 /// A whole-asset deletion's clearing, one transaction in `consolidate_deletion`.
+/// The data and the provenance each clear by their own time.
 const CLEAR_DELETED_ASSET: &str = "\
      UPDATE assets SET last_event_id = $event_id, last_run_id = NONE, \
-     last_timestamp = NONE, last_data_version = NONE, \
-     last_materialization_code_version = NONE, last_input_data_versions = [] \
+     last_timestamp = NONE, last_data_version = NONE \
      WHERE code_location_id = $cl AND asset_key = $asset_key \
      AND last_timestamp <= $ts AND last_deletion_timestamp <= $ts; \
+     UPDATE assets SET last_materialization_code_version = NONE, \
+     last_input_data_versions = [], last_provenance_timestamp = NONE \
+     WHERE code_location_id = $cl AND asset_key = $asset_key \
+     AND last_provenance_timestamp <= $ts; \
      UPDATE assets SET last_deletion_timestamp = IF last_deletion_timestamp > $ts \
      THEN last_deletion_timestamp ELSE $ts END \
      WHERE code_location_id = $cl AND asset_key = $asset_key; \
      DELETE FROM asset_partitions WHERE code_location_id = $cl \
      AND asset_key = $asset_key AND last_timestamp <= $ts;";
 
-/// Roll an `assets` row forward to a materialization event.
-const MATERIALIZE_ASSET_UPDATE: &str = "UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv, last_input_data_versions = $idv WHERE code_location_id = $cl AND asset_key = $asset_key";
+/// Roll an `assets` row's data forward to a materialization event.
+const MATERIALIZE_ASSET_DATA: &str = "UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version WHERE code_location_id = $cl AND asset_key = $asset_key";
 
-/// Same, minus provenance. An event that consumed no inputs — an action's
+/// Roll the row's provenance, the code version and inputs its data was built
+/// from, forward to the materialization that recorded them. An action run's
+/// `materialized()` writes none: it executed the verb body, not the asset's
+/// materialize function, so the pending code-version comparison
+/// (`code_version_changed()`, the Stale(Code) badge) must survive it.
+const MATERIALIZE_ASSET_PROVENANCE: &str = "UPDATE assets SET last_materialization_code_version = $mcv, last_input_data_versions = $idv, last_provenance_timestamp = $provenance_timestamp WHERE code_location_id = $cl AND asset_key = $asset_key";
+
+/// Same, keeping the inputs. An event that consumed no inputs — an action's
 /// `ActionResult.materialized()`, a mapped fan-out instance — reports an empty
 /// list because it never read upstream, not because upstream is gone. Writing
 /// it through would erase the real provenance and leave the asset permanently
 /// Stale against every dependency.
-const MATERIALIZE_ASSET_UPDATE_KEEP_IDV: &str = "UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv WHERE code_location_id = $cl AND asset_key = $asset_key";
+const MATERIALIZE_ASSET_PROVENANCE_KEEP_IDV: &str = "UPDATE assets SET last_materialization_code_version = $mcv, last_provenance_timestamp = $provenance_timestamp WHERE code_location_id = $cl AND asset_key = $asset_key";
 
-/// Same, minus provenance and code version. An action run's `materialized()`
-/// executed the verb body, not the asset's materialize function, so the
-/// pending code-version comparison (`code_version_changed()`, the Stale(Code)
-/// badge) must survive it.
-const MATERIALIZE_ASSET_UPDATE_ACTION: &str = "UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version WHERE code_location_id = $cl AND asset_key = $asset_key";
-
-/// Added to each update above: the `assets` row takes the materialization only
+/// Added to the data update: the `assets` row takes the materialization only
 /// when it holds no newer materialization and no newer whole-asset deletion.
 /// NONE sorts below every number. An `OR` in a WHERE drops the index, so the
 /// unset case is not spelled out.
 const MATERIALIZATION_IS_NEWER: &str =
     "AND last_timestamp <= $timestamp AND last_deletion_timestamp < $timestamp";
+
+/// Added to each provenance update: the same rule by the provenance's own
+/// time. A newer action's `materialized()` moves the data only, so an older
+/// real materialization landing after it still records its provenance.
+const PROVENANCE_IS_NEWER: &str = "AND last_provenance_timestamp <= $provenance_timestamp AND last_deletion_timestamp < $provenance_timestamp";
 
 /// Ends `delete_partitions`' transaction: record the tombstones at each
 /// key's newest deletion time. The tombstone outlives the Deletion event:
@@ -1939,10 +1949,13 @@ const UPSERT_ASSET_PARTITIONS: &str = "\
 impl SurrealStorage {
     /// Roll the `assets` row (and any partition rows, in one transaction)
     /// forward to a materialization event — the single consolidation shared
-    /// by `store_event` and `store_events`. `from_action`: the event's run
-    /// is an action run AND no co-drained event supplied real provenance
-    /// (`idv`) — the ACTION variant then preserves the code-version stamp
-    /// and provenance so a pending Stale(Code) badge survives the verb.
+    /// by `store_event` and `store_events`. The data comes from the event at
+    /// `timestamp`, the provenance (`code_version`, `idv`) from the one at
+    /// `provenance_timestamp`: in a drain, the newest event that read inputs
+    /// can be older than the newest event. `from_action`: the event's run is
+    /// an action run AND no co-drained event supplied real provenance
+    /// (`idv`) — then no provenance is written, so a pending Stale(Code)
+    /// badge survives the verb.
     #[allow(clippy::too_many_arguments)]
     async fn apply_materialization(
         &self,
@@ -1952,30 +1965,36 @@ impl SurrealStorage {
         run_id: &str,
         timestamp: i64,
         data_version: Option<String>,
+        provenance_timestamp: i64,
         code_version: Option<String>,
         idv: Option<Vec<(String, String)>>,
         from_action: bool,
         parts: Vec<DbAssetPartitionWrite>,
     ) -> Result<()> {
+        let update_sql = format!("{MATERIALIZE_ASSET_DATA} {MATERIALIZATION_IS_NEWER}");
         let update_sql = if from_action {
-            MATERIALIZE_ASSET_UPDATE_ACTION
-        } else if idv.is_some() {
-            MATERIALIZE_ASSET_UPDATE
+            update_sql
         } else {
-            MATERIALIZE_ASSET_UPDATE_KEEP_IDV
+            let provenance_sql = if idv.is_some() {
+                MATERIALIZE_ASSET_PROVENANCE
+            } else {
+                MATERIALIZE_ASSET_PROVENANCE_KEEP_IDV
+            };
+            format!("{update_sql}; {provenance_sql} {PROVENANCE_IS_NEWER}")
         };
-        let update_sql = format!("{update_sql} {MATERIALIZATION_IS_NEWER}");
         // The asset row and its partition rows commit together — a concurrent
         // whole-asset deletion lands wholly before or wholly after this
         // materialization, never between the two. The partition upsert reads
-        // the asset row first, so it runs before the row's update.
+        // the asset row first, so it runs before the row's update. The data
+        // and provenance updates commit together too: no reader sees new data
+        // with the provenance of the materialization it replaced.
         let has_parts = !parts.is_empty();
         let sql = if has_parts {
             format!(
                 "BEGIN TRANSACTION; {UPSERT_ASSET_PARTITIONS}; {update_sql}; COMMIT TRANSACTION;"
             )
         } else {
-            update_sql
+            format!("BEGIN TRANSACTION; {update_sql}; COMMIT TRANSACTION;")
         };
         let mut query = self
             .db
@@ -1987,7 +2006,9 @@ impl SurrealStorage {
             .bind(("timestamp", timestamp))
             .bind(("data_version", data_version));
         if !from_action {
-            query = query.bind(("mcv", code_version));
+            query = query
+                .bind(("provenance_timestamp", provenance_timestamp))
+                .bind(("mcv", code_version));
             if let Some(idv) = idv {
                 query = query.bind(("idv", idv));
             }
@@ -2062,6 +2083,7 @@ impl StorageBackend for SurrealStorage {
                     &event.run_id,
                     event.timestamp,
                     event.event_type.data_version().map(|s| s.to_string()),
+                    event.timestamp,
                     materialization_code_version,
                     idv,
                     is_action,
@@ -2190,9 +2212,9 @@ impl StorageBackend for SurrealStorage {
         for (&(cl, asset_key), &idx) in &latest_mat {
             let event = &events[idx];
             let event_id = &event_ids[idx];
-            let idv = latest_idv
-                .get(&(cl, asset_key))
-                .map(|&i| events[i].input_data_versions.clone());
+            let idv_event = latest_idv.get(&(cl, asset_key)).map(|&i| &events[i]);
+            let idv = idv_event.map(|e| e.input_data_versions.clone());
+            let provenance_timestamp = idv_event.map_or(event.timestamp, |e| e.timestamp);
             // A co-drained real materialize (the `idv` entry) legitimately
             // owns provenance and the code-version stamp even when the
             // action's event is the newer one.
@@ -2210,6 +2232,7 @@ impl StorageBackend for SurrealStorage {
                 &event.run_id,
                 event.timestamp,
                 event.event_type.data_version().map(|s| s.to_string()),
+                provenance_timestamp,
                 code_version,
                 idv,
                 action_only,
@@ -5901,6 +5924,282 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `mat_at` for a materialization that read upstream `u` at `u_version`.
+    fn mat_reading(
+        asset_key: &str,
+        run_id: &str,
+        ts: i64,
+        u_version: Option<&str>,
+        pk: Option<&PartitionKey>,
+    ) -> EventRecord {
+        let mut event = mat_at(asset_key, run_id, ts, pk);
+        event.input_data_versions = u_version
+            .map(|v| vec![("u".to_string(), v.to_string())])
+            .unwrap_or_default();
+        event
+    }
+
+    /// One write-back step of an asset: a deploy that registers its code
+    /// version, or one drain of events.
+    enum Step {
+        Deploy(&'static str),
+        Drain(Vec<EventRecord>),
+    }
+
+    /// What an `assets` row holds: the materialization its data comes from,
+    /// and its provenance — the code version and inputs the data was built
+    /// from, and the time of the materialization that recorded them.
+    #[derive(Debug, PartialEq)]
+    struct RowProvenance {
+        last_run_id: Option<String>,
+        last_timestamp: Option<i64>,
+        last_data_version: Option<String>,
+        code_version: Option<String>,
+        inputs: Vec<(String, String)>,
+        provenance_at: Option<i64>,
+    }
+
+    /// `data`: the run and time of the materialization the data comes from.
+    /// `built`: the code version, the version of `u` read, and the time of
+    /// the materialization the provenance comes from.
+    fn row(data: Option<(&str, i64)>, built: Option<(&str, Option<&str>, i64)>) -> RowProvenance {
+        RowProvenance {
+            last_run_id: data.map(|(run, _)| run.to_string()),
+            last_timestamp: data.map(|(_, ts)| ts),
+            last_data_version: data.map(|(_, ts)| format!("dv_{ts}")),
+            code_version: built.map(|(cv, ..)| cv.to_string()),
+            inputs: built
+                .and_then(|(_, u, _)| u)
+                .map(|u| vec![("u".to_string(), u.to_string())])
+                .unwrap_or_default(),
+            provenance_at: built.map(|(.., ts)| ts),
+        }
+    }
+
+    /// Apply `steps` in order. `batched`: each drain is one `store_events`
+    /// call; otherwise its events are stored one `store_event` call at a time.
+    async fn apply_steps(
+        storage: &SurrealStorage,
+        asset_key: &str,
+        batched: bool,
+        steps: Vec<Step>,
+    ) -> RowProvenance {
+        let cl = DEFAULT_CODE_LOCATION_ID;
+        for step in steps {
+            match step {
+                Step::Deploy(code_version) => storage
+                    .register_assets(
+                        cl,
+                        &[AssetRecord {
+                            code_version: Some(code_version.to_string()),
+                            ..make_asset_record(asset_key)
+                        }],
+                    )
+                    .await
+                    .unwrap(),
+                Step::Drain(events) if batched => {
+                    storage.store_events(&events).await.unwrap();
+                }
+                Step::Drain(events) => {
+                    for event in &events {
+                        storage.store_event(event).await.unwrap();
+                    }
+                }
+            }
+        }
+        let record = storage
+            .get_asset_record(cl, asset_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut result = storage
+            .db
+            .query(
+                "SELECT VALUE last_provenance_timestamp FROM assets \
+                 WHERE code_location_id = $cl AND asset_key = $asset_key",
+            )
+            .bind(("cl", cl.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .await
+            .unwrap();
+        let provenance_at: Vec<Option<i64>> = result.take(0).unwrap();
+        RowProvenance {
+            last_run_id: record.last_run_id,
+            last_timestamp: record.last_timestamp,
+            last_data_version: record.last_data_version,
+            code_version: record.last_materialization_code_version,
+            inputs: record.last_input_data_versions,
+            provenance_at: provenance_at.into_iter().flatten().next(),
+        }
+    }
+
+    /// An action's `materialized()` moves an asset's data but writes no
+    /// provenance. A real materialization that lands after a newer action must
+    /// still record the code version and inputs it was built from, unless a
+    /// newer real materialization or whole-asset deletion holds them. Each
+    /// case must end as its events would applied in time order, however they
+    /// drain. `a*` runs are action runs.
+    #[tokio::test]
+    async fn provenance_applies_in_event_order_apart_from_the_data() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        for run_id in ["a2", "a4"] {
+            let run = RunRecord {
+                action: Some("merge".to_string()),
+                ..minimal_run(run_id, RunStatus::Success)
+            };
+            storage.create_run(&run).await.unwrap();
+        }
+        use Step::{Deploy, Drain};
+        type Steps = fn(&str, Option<&PartitionKey>) -> Vec<Step>;
+        let cases: [(&str, Steps, RowProvenance); 9] = [
+            (
+                "real_lands_after_newer_action",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, Some("u1"), p)]),
+                        Deploy("v2"),
+                        Drain(vec![mat_reading(k, "a2", 200, None, p)]),
+                        Drain(vec![mat_reading(k, "r1", 100, Some("u2"), p)]),
+                    ]
+                },
+                row(Some(("a2", 200)), Some(("v2", Some("u2"), 100))),
+            ),
+            (
+                "real_without_inputs_lands_after_newer_action",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, None, p)]),
+                        Deploy("v2"),
+                        Drain(vec![mat_reading(k, "a2", 200, None, p)]),
+                        Drain(vec![mat_reading(k, "r1", 100, None, p)]),
+                    ]
+                },
+                row(Some(("a2", 200)), Some(("v2", None, 100))),
+            ),
+            (
+                "real_lands_after_newer_real",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, Some("u1"), p)]),
+                        Deploy("v2"),
+                        Drain(vec![mat_reading(k, "r3", 300, Some("u3"), p)]),
+                        Deploy("v3"),
+                        Drain(vec![mat_reading(k, "r1", 100, Some("u2"), p)]),
+                    ]
+                },
+                row(Some(("r3", 300)), Some(("v2", Some("u3"), 300))),
+            ),
+            (
+                "action_and_older_real_drain_together",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, Some("u1"), p)]),
+                        Deploy("v2"),
+                        Drain(vec![
+                            mat_reading(k, "a2", 200, None, p),
+                            mat_reading(k, "r1", 100, Some("u2"), p),
+                        ]),
+                    ]
+                },
+                row(Some(("a2", 200)), Some(("v2", Some("u2"), 100))),
+            ),
+            (
+                "drain_older_than_the_rows_data",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, Some("u1"), p)]),
+                        Deploy("v2"),
+                        Drain(vec![mat_reading(k, "a2", 200, None, p)]),
+                        Drain(vec![
+                            mat_reading(k, "r1", 100, Some("u2"), p),
+                            mat_reading(k, "a4", 150, None, p),
+                        ]),
+                    ]
+                },
+                row(Some(("a2", 200)), Some(("v2", Some("u2"), 100))),
+            ),
+            (
+                "drain_inputs_older_than_the_rows_provenance",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, Some("u1"), p)]),
+                        Deploy("v2"),
+                        Drain(vec![mat_reading(k, "r3", 300, Some("u3"), p)]),
+                        Deploy("v3"),
+                        Drain(vec![
+                            mat_reading(k, "r1", 100, Some("u2"), p),
+                            mat_reading(k, "a4", 400, None, p),
+                        ]),
+                    ]
+                },
+                row(Some(("a4", 400)), Some(("v2", Some("u3"), 300))),
+            ),
+            (
+                "late_deletion_clears_older_provenance",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, Some("u1"), p)]),
+                        Deploy("v2"),
+                        Drain(vec![mat_reading(k, "a2", 300, None, p)]),
+                        Drain(vec![del_at(k, 200, None)]),
+                        Drain(vec![mat_reading(k, "r1", 100, Some("u2"), p)]),
+                    ]
+                },
+                row(Some(("a2", 300)), None),
+            ),
+            (
+                "late_deletion_keeps_newer_provenance",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r3", 300, Some("u3"), p)]),
+                        Drain(vec![del_at(k, 200, None)]),
+                    ]
+                },
+                row(Some(("r3", 300)), Some(("v1", Some("u3"), 300))),
+            ),
+            (
+                "older_real_after_deletion_stays_deleted",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, Some("u1"), p)]),
+                        Drain(vec![del_at(k, 200, None)]),
+                        Deploy("v2"),
+                        Drain(vec![mat_reading(k, "r1", 100, Some("u2"), p)]),
+                    ]
+                },
+                row(None, None),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for batched in [false, true] {
+            for pk in [None, Some(order_key())] {
+                for (case, steps, expected) in &cases {
+                    let key = format!("{case}_{batched}_{}", pk.is_some());
+                    let got = apply_steps(&storage, &key, batched, steps(&key, pk.as_ref())).await;
+                    if &got != expected {
+                        wrong.push(format!(
+                            "{case} batched={batched} partitioned={}:\n  got  {got:?}\n  want {expected:?}",
+                            pk.is_some()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// Concurrent unpartitioned materializations of one asset conflict on the
