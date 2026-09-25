@@ -3180,9 +3180,10 @@ impl PyCodeRepository {
         }
     }
 
-    /// Resolve `IOHandler::ResourceRef` → `Resource` on every asset and task and
-    /// refresh the per-input + node-level overrides on namespaced composition tasks.
-    /// Mutates `node_map` in place (overrides on `ResolvedTask` are post-set).
+    /// Resolve the resource keys in every node's IO handlers against this
+    /// repository's resources, and set each graph's `node_io_handler` as the
+    /// override on its namespaced composition tasks. Only `node_map` changes:
+    /// the definitions keep their keys for other repositories built from them.
     /// Also calls `resource.setup()` on every Resource that defines it.
     /// Returns the shared default `InMemoryIOHandler` instance.
     fn resolve_resources_and_handlers(
@@ -3218,72 +3219,31 @@ impl PyCodeRepository {
         }
 
         let io_handler_keys = &handlers.keys().collect::<HashSet<_>>();
-        let resource_keys_excluding_io_handlers = resource_keys
+        let others = &resource_keys
             .difference(io_handler_keys)
             .copied()
             .collect::<HashSet<_>>();
         for asset_py in &self.raw_assets {
-            {
-                let mut asset = asset_py.borrow_mut(py);
-                asset.inner_mut().resolve_io_handler_refs(
-                    py,
-                    &handlers,
-                    &resource_keys_excluding_io_handlers,
-                )?;
-                asset.inner_mut().resolve_retry_refs(&self.raw_retries)?;
-            }
+            asset_py
+                .borrow_mut(py)
+                .inner_mut()
+                .resolve_retry_refs(&self.raw_retries)?;
             let asset = asset_py.borrow(py);
-            if let Asset::Graph(graph_asset) = asset.inner() {
+            if let Asset::Graph(graph_asset) = asset.inner()
+                && let Some(node_io_handler) = &graph_asset.node_io_handler
+            {
                 let graph_name = graph_asset.name.as_deref().unwrap_or_default();
-                let resolved = graph_asset
-                    .node_io_handler
-                    .as_ref()
-                    .filter(|h| h.handler().is_some())
-                    .map(|h| h.clone_ref(py));
-                if let Some(handler) = resolved
-                    && let Some(task_names) = graph_task_names.get(graph_name)
-                {
-                    for ns_name in task_names {
-                        if let Some(ResolvedNode::Task(task)) = node_map.get_mut(ns_name) {
-                            task.io_handler_override = Some(handler.clone_ref(py));
-                        }
-                    }
-                }
-                // Refresh per-input handler overrides on namespaced composition tasks
-                // with the now-resolved values. ResolvedTask was constructed inside
-                // build_unresolved_graph (before resolve_io_handler_refs ran), so any
-                // ResourceRef entries in input_io_handler_override are still unresolved.
-                if let Some(task_names) = graph_task_names.get(graph_name) {
-                    for ns_name in task_names {
-                        if let Some(ResolvedNode::Task(task)) = node_map.get_mut(ns_name)
-                            && let Some(ref mut override_map) = task.input_io_handler_override
-                        {
-                            for (dep, handler) in override_map.iter_mut() {
-                                if let Some(resolved) = graph_asset.input_io_handlers.get(dep) {
-                                    *handler = resolved.clone_ref(py);
-                                }
-                            }
-                        }
+                let mut handler = node_io_handler.clone_ref(py);
+                handler.resolve_in_place(py, &handlers, others, "Asset", graph_name)?;
+                for ns_name in graph_task_names.get(graph_name).into_iter().flatten() {
+                    if let Some(ResolvedNode::Task(task)) = node_map.get_mut(ns_name) {
+                        task.io_handler_override = Some(handler.clone_ref(py));
                     }
                 }
             }
         }
-
-        let others = &resource_keys_excluding_io_handlers;
-        for task_py in &self.raw_tasks {
-            if let Ok(task) = task_py.cast_bound::<PyTask>(py) {
-                let mut task = task.borrow_mut();
-                let name = task.inner.name.clone().unwrap_or_default();
-                if let Some(handler) = task.inner.io_handler.as_mut() {
-                    handler.resolve_in_place(py, &handlers, others, "Task", &name)?;
-                }
-            } else if let Ok(bash) = task_py.cast_bound::<PyBashTask>(py) {
-                let mut bash = bash.borrow_mut();
-                let name = bash.name.clone();
-                if let Some(handler) = bash.io_handler.as_mut() {
-                    handler.resolve_in_place(py, &handlers, others, "Task", &name)?;
-                }
-            }
+        for node in node_map.values_mut() {
+            node.resolve_io_handlers(py, &handlers, others)?;
         }
 
         // ResolvedAssets were constructed inside build_unresolved_graph (before

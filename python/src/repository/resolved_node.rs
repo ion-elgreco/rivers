@@ -7,11 +7,11 @@
 //!
 //! Invariant fields are pre-flattened at construction — including the
 //! per-output action table (`find_action`/`list_actions`), which is
-//! declarative and never live-read. Mutable / late-resolved values
-//! (io_handler, input_io_handler, input_metadata, callable) are still read
-//! through `inner` so they reflect any post-construction mutation in the
-//! underlying Python object.
-use std::collections::HashMap;
+//! declarative and never live-read. IO handlers are copied at construction
+//! too: `resolve()` resolves resource keys in these copies, so repositories
+//! built from the same definitions each use their own resources. Other late
+//! values (input_metadata, callable) are still read through `inner`.
+use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -82,6 +82,9 @@ pub(crate) struct ResolvedAsset {
     /// place the external `observe` synthetic exists; executors, planners,
     /// and the gRPC projection all read it.
     pub actions: Vec<crate::assets::action::ResolvedAction>,
+    /// This output's IO handler and per-input handlers.
+    pub io_handler: Option<IOHandler>,
+    pub input_io_handlers: HashMap<String, IOHandler>,
 }
 
 /// Composition tasks carry override fields propagated from their parent
@@ -120,6 +123,8 @@ pub(crate) struct ResolvedTask {
     pub input_metadata_override: Option<HashMap<String, HashMap<String, String>>>,
     /// Resolved retry policy (registry names collapsed to concrete at resolve()).
     pub retry: Option<RetryPolicy>,
+    /// The task's own IO handler.
+    pub io_handler: Option<IOHandler>,
 }
 
 pub(crate) struct ResolvedBashTask {
@@ -134,6 +139,7 @@ pub(crate) struct ResolvedBashTask {
     pub partition_mapping: Option<HashMap<String, PartitionMapping>>,
     /// Resolved retry policy (registry names collapsed to concrete at resolve()).
     pub retry: Option<RetryPolicy>,
+    pub io_handler: Option<IOHandler>,
 }
 
 /// A node in the dependency graph — Asset, Task, or BashTask.
@@ -327,6 +333,16 @@ impl ResolvedAsset {
             }
         };
 
+        let io_handler = asset_output_io_handler(asset, &output_name).map(|h| h.clone_ref(py));
+        let input_io_handlers = asset
+            .input_io_handlers()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, h)| (k.clone(), h.clone_ref(py)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         drop(asset_ref);
 
         Ok(Self {
@@ -358,6 +374,8 @@ impl ResolvedAsset {
             observe_fn,
             automation_condition,
             actions,
+            io_handler,
+            input_io_handlers,
         })
     }
 
@@ -389,6 +407,12 @@ impl ResolvedAsset {
             observe_fn: self.observe_fn.as_ref().map(|f| f.clone_ref(py)),
             automation_condition: self.automation_condition.clone(),
             actions: self.actions.iter().map(|a| a.clone_ref(py)).collect(),
+            io_handler: self.io_handler.as_ref().map(|h| h.clone_ref(py)),
+            input_io_handlers: self
+                .input_io_handlers
+                .iter()
+                .map(|(k, h)| (k.clone(), h.clone_ref(py)))
+                .collect(),
         }
     }
 }
@@ -428,6 +452,7 @@ impl ResolvedTask {
 
         let partition_mapping = partition_mapping_override
             .or_else(|| task.partition_mapping.as_ref().map(|m| m.0.clone()));
+        let io_handler = task.io_handler.as_ref().map(|h| h.clone_ref(py));
 
         drop(task_ref);
 
@@ -445,6 +470,7 @@ impl ResolvedTask {
             input_metadata_override,
             // Set by resolve_resources_and_handlers once retry refs collapse.
             retry: None,
+            io_handler,
         })
     }
 
@@ -466,6 +492,7 @@ impl ResolvedTask {
             }),
             input_metadata_override: self.input_metadata_override.clone(),
             retry: self.retry.clone(),
+            io_handler: self.io_handler.as_ref().map(|h| h.clone_ref(py)),
         }
     }
 }
@@ -482,6 +509,7 @@ impl ResolvedBashTask {
         let tags = bash_ref.tags.clone();
         let partition_mapping = partition_mapping_override
             .or_else(|| bash_ref.partition_mapping.as_ref().map(|m| m.0.clone()));
+        let io_handler = bash_ref.io_handler.as_ref().map(|h| h.clone_ref(py));
         drop(bash_ref);
 
         Self {
@@ -492,6 +520,7 @@ impl ResolvedBashTask {
             partition_mapping,
             // Set by resolve_resources_and_handlers once retry refs collapse.
             retry: None,
+            io_handler,
         }
     }
 
@@ -503,6 +532,7 @@ impl ResolvedBashTask {
             partitions_def: self.partitions_def.clone(),
             partition_mapping: self.partition_mapping.clone(),
             retry: self.retry.clone(),
+            io_handler: self.io_handler.as_ref().map(|h| h.clone_ref(py)),
         }
     }
 }
@@ -718,30 +748,57 @@ impl ResolvedNode {
     /// Panics if an unresolved ResourceRef is encountered — this indicates a bug
     /// in the resolution pipeline.
     pub fn io_handler(&self, py: Python) -> Option<Py<PyAny>> {
+        let handler = match self {
+            ResolvedNode::Asset(node) => node.io_handler.as_ref(),
+            ResolvedNode::Task(node) => node
+                .io_handler_override
+                .as_ref()
+                .or(node.io_handler.as_ref()),
+            ResolvedNode::BashTask(node) => node.io_handler.as_ref(),
+        };
+        handler.map(|h| expect_resolved_handler(h, py))
+    }
+
+    /// Resolve the resource keys in this node's IO handlers against one
+    /// repository's resources. The definition keeps its keys.
+    pub fn resolve_io_handlers(
+        &mut self,
+        py: Python,
+        handlers: &HashMap<String, &Py<PyAny>>,
+        other_resource_keys: &HashSet<&String>,
+    ) -> PyResult<()> {
+        let resolve = |h: &mut IOHandler, kind: &str, name: &str| {
+            h.resolve_in_place(py, handlers, other_resource_keys, kind, name)
+        };
         match self {
             ResolvedNode::Asset(node) => {
-                let asset = node.inner.borrow(py);
-                asset_output_io_handler(asset.inner(), &node.output_name)
-                    .map(|h| expect_resolved_handler(h, py))
+                let owner = node.output_name.as_deref().unwrap_or(&node.name);
+                if let Some(h) = &mut node.io_handler {
+                    resolve(h, "Asset", owner)?;
+                }
+                for h in node.input_io_handlers.values_mut() {
+                    resolve(h, "Asset", &node.name)?;
+                }
             }
             ResolvedNode::Task(node) => {
-                if let Some(ref override_h) = node.io_handler_override {
-                    return Some(expect_resolved_handler(override_h, py));
+                if let Some(h) = &mut node.io_handler {
+                    resolve(h, "Task", &node.name)?;
                 }
-                node.inner
-                    .borrow(py)
-                    .inner
-                    .io_handler
-                    .as_ref()
-                    .map(|h| expect_resolved_handler(h, py))
+                // Copied from the parent graph's input handlers.
+                let graph = node.parent_graph_name.as_deref().unwrap_or_default();
+                if let Some(overrides) = &mut node.input_io_handler_override {
+                    for h in overrides.values_mut() {
+                        resolve(h, "Asset", graph)?;
+                    }
+                }
             }
-            ResolvedNode::BashTask(node) => node
-                .inner
-                .borrow(py)
-                .io_handler
-                .as_ref()
-                .map(|h| expect_resolved_handler(h, py)),
+            ResolvedNode::BashTask(node) => {
+                if let Some(h) = &mut node.io_handler {
+                    resolve(h, "Task", &node.name)?;
+                }
+            }
         }
+        Ok(())
     }
 
     /// Name of the parent graph asset for namespaced composition tasks.
@@ -758,13 +815,10 @@ impl ResolvedNode {
 
     pub fn input_io_handler(&self, py: Python, param_name: &str) -> Option<Py<PyAny>> {
         match self {
-            ResolvedNode::Asset(node) => {
-                let asset = node.inner.borrow(py);
-                asset
-                    .inner()
-                    .input_io_handler(param_name)
-                    .map(|h| expect_resolved_handler(h, py))
-            }
+            ResolvedNode::Asset(node) => node
+                .input_io_handlers
+                .get(param_name)
+                .map(|h| expect_resolved_handler(h, py)),
             ResolvedNode::Task(node) => {
                 // For composition tasks, resolve the param name through param_remap
                 // to find the upstream name, then check overrides.

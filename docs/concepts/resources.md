@@ -111,7 +111,7 @@ repo = rs.CodeRepository(
 )
 ```
 
-String references are resolved to the actual handler at `resolve()` time.
+String references are resolved to the actual handler at `resolve()` time, against that repository's resources. Two repositories built from the same assets each use their own handler.
 
 ## Testing
 

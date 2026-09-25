@@ -846,11 +846,11 @@ impl Asset {
         }
     }
 
-    pub fn input_io_handler(&self, param_name: &str) -> Option<&IOHandler> {
+    pub fn input_io_handlers(&self) -> Option<&HashMap<String, IOHandler>> {
         match self {
-            Asset::Single(a) => a.input_io_handlers.get(param_name),
-            Asset::Multi(a) => a.input_io_handlers.get(param_name),
-            Asset::Graph(a) => a.input_io_handlers.get(param_name),
+            Asset::Single(a) => Some(&a.input_io_handlers),
+            Asset::Multi(a) => Some(&a.input_io_handlers),
+            Asset::Graph(a) => Some(&a.input_io_handlers),
             Asset::External(_) => None,
         }
     }
@@ -997,89 +997,6 @@ impl Asset {
                 resolve_one(&mut g.retry, retries, &owner)?;
             }
             Asset::External(_) => {}
-        }
-        Ok(())
-    }
-
-    pub fn resolve_io_handler_refs(
-        &mut self,
-        py: Python,
-        handlers: &HashMap<String, &Py<PyAny>>,
-        other_resource_keys: &HashSet<&String>,
-    ) -> PyResult<()> {
-        match self {
-            Asset::Multi(multi) => {
-                for inner_asset in &mut multi.assets {
-                    let name = inner_asset.name.as_deref().ok_or_else(|| {
-                        AssetDefinitionError::new_err(
-                            "Asset name must be set before resolving io_handler refs \
-                             (AssetDef already defines name)",
-                        )
-                    })?;
-                    if let Some(ref mut handler) = inner_asset.io_handler {
-                        handler.resolve_in_place(
-                            py,
-                            handlers,
-                            other_resource_keys,
-                            "Asset",
-                            name,
-                        )?;
-                    }
-                }
-                let multi_name = multi.name.as_deref().unwrap_or("multi_asset");
-                for handler in multi.input_io_handlers.values_mut() {
-                    handler.resolve_in_place(
-                        py,
-                        handlers,
-                        other_resource_keys,
-                        "Asset",
-                        multi_name,
-                    )?;
-                }
-            }
-            Asset::Graph(graph) => {
-                let name = graph.name.as_deref().ok_or_else(|| {
-                    AssetDefinitionError::new_err(
-                        "Asset name must be set before resolving io_handler refs",
-                    )
-                })?;
-                if let Some(ref mut handler) = graph.io_handler {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, "Asset", name)?;
-                }
-                if let Some(ref mut handler) = graph.node_io_handler {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, "Asset", name)?;
-                }
-                for handler in graph.input_io_handlers.values_mut() {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, "Asset", name)?;
-                }
-            }
-            Asset::Single(single) => {
-                let name = single.name.as_deref().ok_or_else(|| {
-                    AssetDefinitionError::new_err(
-                        "Asset name must be set before resolving io_handler refs",
-                    )
-                })?;
-                if let Some(ref mut handler) = single.io_handler {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, "Asset", name)?;
-                }
-                for handler in single.input_io_handlers.values_mut() {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, "Asset", name)?;
-                }
-            }
-            Asset::External(ext) => {
-                let name = ext.name.as_deref().ok_or_else(|| {
-                    AssetDefinitionError::new_err(
-                        "Asset name must be set before resolving io_handler refs",
-                    )
-                })?;
-                ext.io_handler.resolve_in_place(
-                    py,
-                    handlers,
-                    other_resource_keys,
-                    "Asset",
-                    name,
-                )?;
-            }
         }
         Ok(())
     }

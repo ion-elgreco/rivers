@@ -179,6 +179,76 @@ def test_graph_node_io_handler_propagates_to_internal_tasks():
 
 
 # ---------------------------------------------------------------------------
+# Two repositories from the same definitions
+# ---------------------------------------------------------------------------
+
+
+def test_repositories_sharing_definitions_resolve_keys_to_own_handlers():
+    """Each repository resolves a resource key on shared definitions against
+    its own resources, for every node kind, and resolving does not change the
+    definitions."""
+
+    @rs.Asset(io_handler="warehouse")
+    def orders() -> int:
+        return 1
+
+    @rs.Asset.from_multi(
+        output_defs=[
+            rs.AssetDef("left", io_handler="warehouse"),
+            rs.AssetDef("right", io_handler="warehouse"),
+        ]
+    )
+    def split():
+        yield rs.Output(value=1, output_name="left")
+        yield rs.Output(value=2, output_name="right")
+
+    @rs.Asset.external(io_handler="warehouse")
+    def feed():
+        return rs.Observation(data_version="v1")
+
+    @rs.Task
+    def step() -> int:
+        return 1
+
+    @rs.Asset.from_graph(io_handler="warehouse", node_io_handler="warehouse")
+    def pipe():
+        return step()
+
+    @rs.Task(io_handler="warehouse")
+    def tally() -> int:
+        return 1
+
+    shout = rs.BashTask(name="shout", command="echo hi", io_handler="warehouse")
+
+    def definitions_view():
+        return (
+            orders.io_handler,
+            feed.io_handler,
+            pipe.io_handler,
+            pipe.node_io_handler,
+            tally.io_handler,
+        )
+
+    before = definitions_view()
+    repos = {
+        name: rs.CodeRepository(
+            assets=[orders, split, feed, pipe],
+            tasks=[step, tally, shout],
+            resources={"warehouse": _NamedHandler(name=name)},
+        )
+        for name in ("first", "second")
+    }
+    for repo in repos.values():
+        repo.resolve()
+    nodes = ["orders", "left", "right", "feed", "pipe", "pipe/step", "tally", "shout"]
+    assert {
+        name: {node: repo.io_handler_for_output(node).name for node in nodes}
+        for name, repo in repos.items()
+    } == {name: dict.fromkeys(nodes, name) for name in repos}
+    assert definitions_view() == before
+
+
+# ---------------------------------------------------------------------------
 # Tasks — io_handler named by resource key
 # ---------------------------------------------------------------------------
 

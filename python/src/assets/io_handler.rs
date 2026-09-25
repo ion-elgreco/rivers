@@ -14,7 +14,7 @@ use crate::errors::AssetDefinitionError;
 /// - `Instance(Py<PyAny>)` — an object with `handle_output` and `load_input` methods
 /// - `ResourceRef(String)` — a key into the repository's resources dict, resolved at execution time
 /// - `Resource(Py<PyAny>)` — the handler `CodeRepository.resolve()` found for a `ResourceRef`.
-///   A fresh import of the defining module holds only the key.
+///   Only that repository's resolved nodes hold it; the definition keeps the key.
 #[derive(Debug)]
 pub enum IOHandler {
     Instance(Py<PyAny>),

@@ -236,9 +236,8 @@ def _stored(root: Path) -> dict:
     }
 
 
-# Module-level assets that name their io_handler by resource key. resolve()
-# swaps the key for the handler on these same objects in the parent, while a
-# loky worker imports the module fresh and holds only the key.
+# Module-level assets that name their io_handler by resource key. The objects
+# keep the key after resolve(), and so does a loky worker's fresh import.
 KEY_HANDLER_MODULE = textwrap.dedent(
     """
     import rivers as rs
@@ -317,6 +316,14 @@ KEY_HANDLER_MODULE = textwrap.dedent(
     @rs.Asset(io_handler="warehouse")
     def roster_count(roster: list) -> int:
         return len(roster)
+
+
+    @rs.Asset(
+        io_handler="warehouse",
+        deps=[rs.AssetDef.input("orders", io_handler="archive")],
+    )
+    def archived_total(orders: list) -> int:
+        return sum(orders)
     """
 )
 
@@ -420,6 +427,103 @@ def test_loky_resource_key_task_io_handler_ships_resolved_handler(
         "tally": [5, 6],
         "tally_total": 11,
     }
+
+
+EXECUTORS = pytest.mark.parametrize(
+    "executor", [rs.Executor.in_process(), MP], ids=["in_process", "parallel"]
+)
+
+
+def _materialize_into(repo: rs.CodeRepository, roots: list[Path]) -> dict:
+    """Run ``repo`` over emptied stores; return what each root holds."""
+    for path in [p for root in roots for p in root.rglob("*.pkl")]:
+        path.unlink()
+    repo.materialize()
+    return {root.name: _stored(root) for root in roots}
+
+
+@EXECUTORS
+def test_repositories_sharing_definitions_use_own_resources(
+    worker_module, tmp_path, executor
+):
+    """Two repositories built from the same module-level assets and tasks
+    write and load only through the resources each was given under the shared
+    keys, and resolving the second does not redirect the first."""
+    m = worker_module(KEY_HANDLER_MODULE)
+    roots = [tmp_path / "a", tmp_path / "b"]
+
+    def repository(root: Path, archived_orders: list) -> rs.CodeRepository:
+        archive = tmp_path / f"{root.name}_archive"
+        resources = {
+            "warehouse": _pickle_handler(root),
+            "archive": _pickle_handler(archive),
+        }
+        (archive / "orders.pkl").write_bytes(pickle.dumps(archived_orders))
+        return rs.CodeRepository(
+            assets=[
+                m.orders,
+                m.customers,
+                m.order_total,
+                m.customer_count,
+                m.archived_total,
+                m.tally_total,
+                m.roster_count,
+            ],
+            tasks=[m.tally, m.roster],
+            resources=resources,
+            default_executor=executor,
+        )
+
+    written = {
+        "customer_count": 2,
+        "customers": ["ada", "bob"],
+        "order_total": 7,
+        "orders": [3, 4],
+        "roster": ["cy", "di"],
+        "roster_count": 2,
+        "tally": [5, 6],
+        "tally_total": 11,
+    }
+    first = repository(roots[0], archived_orders=[1, 2])
+    second = repository(roots[1], archived_orders=[10, 20])
+    first_run = {"a": {**written, "archived_total": 3}, "b": {}}
+    assert _materialize_into(first, roots) == first_run
+    assert _materialize_into(second, roots) == {
+        "a": {},
+        "b": {**written, "archived_total": 30},
+    }
+    assert _materialize_into(first, roots) == first_run
+
+
+@EXECUTORS
+def test_repositories_sharing_a_graph_use_own_resources(
+    worker_module, tmp_path, executor
+):
+    """Two repositories built from the same module-level graph write its inner
+    tasks and its output only through the resources each was given."""
+    m = worker_module(KEY_HANDLER_MODULE)
+    roots = [tmp_path / "a", tmp_path / "b"]
+    first, second = (
+        rs.CodeRepository(
+            assets=[m.total],
+            tasks=[m.left, m.right, m.add],
+            resources={
+                "warehouse": _pickle_handler(root / "warehouse"),
+                "scratch": _pickle_handler(root / "scratch"),
+            },
+            default_executor=executor,
+        )
+        for root in roots
+    )
+    written = {
+        "scratch/total/add": 7,
+        "scratch/total/left": 3,
+        "scratch/total/right": 4,
+        "warehouse/total": 7,
+    }
+    assert _materialize_into(first, roots) == {"a": written, "b": {}}
+    assert _materialize_into(second, roots) == {"a": {}, "b": written}
+    assert _materialize_into(first, roots) == {"a": written, "b": {}}
 
 
 # Only the parent's import builds the handler, as a handler read from
