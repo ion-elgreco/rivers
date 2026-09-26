@@ -365,6 +365,77 @@ def test_graph_inner_task_resource_key_io_handler(kind, executor, tmp_path):
     }
 
 
+class _RecordingHandler(rs.BaseIOHandler):
+    """Pickles each output under ``root`` and logs every write and read to
+    ``root/log.txt``, so the record survives a worker process."""
+
+    root: str
+
+    def _path(self, name: str) -> Path:
+        return Path(self.root) / f"{name.replace('/', '__')}.pkl"
+
+    def _log(self, line: str) -> None:
+        with open(Path(self.root) / "log.txt", "a") as f:
+            f.write(line + "\n")
+
+    def handle_output(self, context, obj):
+        self._path(context.asset_name).write_bytes(pickle.dumps(obj))
+        self._log(f"write {context.asset_name}")
+
+    def load_input(self, context):
+        self._log(f"read {context.asset_name} -> {context.downstream_asset}")
+        return pickle.loads(self._path(context.asset_name).read_bytes())  # noqa: S301
+
+    def records(self) -> set[str]:
+        return set((Path(self.root) / "log.txt").read_text().splitlines())
+
+
+@pytest.mark.parametrize(
+    "executor",
+    [pytest.param(IN_PROCESS, id="in_process"), pytest.param(PARALLEL, id="parallel")],
+)
+@pytest.mark.parametrize("by_key", [False, True], ids=["instance", "resource-key"])
+def test_graph_inner_bash_task_uses_node_io_handler(executor, by_key, tmp_path):
+    """A graph's inner BashTask writes through the graph's ``node_io_handler``,
+    as its Python sibling does, and the next inner task reads it back from it."""
+    (tmp_path / "nodes").mkdir()
+    (tmp_path / "graph").mkdir()
+    nodes = _RecordingHandler(root=str(tmp_path / "nodes"))
+    graph = _RecordingHandler(root=str(tmp_path / "graph"))
+
+    @rs.Task
+    def left() -> int:
+        return 3
+
+    right = rs.BashTask(name="right", command="echo 4")
+
+    @rs.Task
+    def add(a: int, b: str) -> int:
+        return a + int(b)
+
+    @rs.Asset.from_graph(io_handler=graph, node_io_handler="nodes" if by_key else nodes)
+    def total():
+        return add(left(), right())
+
+    repo = rs.CodeRepository(
+        assets=[total],
+        tasks=[left, right, add],
+        resources={"nodes": nodes} if by_key else None,
+        default_executor=executor,
+    )
+    repo.materialize()
+    assert nodes.records() == {
+        "write total/left",
+        "write total/right",
+        "write total/add",
+        "read total/left -> total/add",
+        "read total/right -> total/add",
+    }
+    assert graph.records() == {"write total"}
+    assert pickle.loads((tmp_path / "graph" / "total.pkl").read_bytes()) == 7  # noqa: S301
+    assert pickle.loads((tmp_path / "nodes" / "total__right.pkl").read_bytes()) == "4"  # noqa: S301
+
+
 class _Settings(rs.Resource):
     """A resource that is not an IOHandler."""
 

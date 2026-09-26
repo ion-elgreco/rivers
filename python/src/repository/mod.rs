@@ -1385,6 +1385,7 @@ pub(crate) fn build_unresolved_graph(
                             ResolvedNode::BashTask(ResolvedBashTask::new(
                                 py,
                                 bash_ref.clone_ref(py),
+                                Some(graph_name.to_string()),
                                 pd_override,
                                 pm_override,
                             )),
@@ -1399,7 +1400,7 @@ pub(crate) fn build_unresolved_graph(
                 unresolved_graph.insert(task_name.clone(), Vec::new());
                 node_map.insert(
                     task_name,
-                    ResolvedNode::BashTask(ResolvedBashTask::new(py, bash_ref, None, None)),
+                    ResolvedNode::BashTask(ResolvedBashTask::new(py, bash_ref, None, None, None)),
                 );
             }
         } else {
@@ -3236,8 +3237,14 @@ impl PyCodeRepository {
                 let mut handler = node_io_handler.clone_ref(py);
                 handler.resolve_in_place(py, &handlers, others, "Asset", graph_name)?;
                 for ns_name in graph_task_names.get(graph_name).into_iter().flatten() {
-                    if let Some(ResolvedNode::Task(task)) = node_map.get_mut(ns_name) {
-                        task.io_handler_override = Some(handler.clone_ref(py));
+                    match node_map.get_mut(ns_name) {
+                        Some(ResolvedNode::Task(task)) => {
+                            task.io_handler_override = Some(handler.clone_ref(py));
+                        }
+                        Some(ResolvedNode::BashTask(task)) => {
+                            task.io_handler_override = Some(handler.clone_ref(py));
+                        }
+                        _ => {}
                     }
                 }
             }

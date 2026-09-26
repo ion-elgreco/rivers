@@ -137,6 +137,10 @@ pub(crate) struct ResolvedBashTask {
     pub partitions_def: Option<PartitionsDefinition>,
     /// Pre-merged partition_mapping: override OR bash task's own.
     pub partition_mapping: Option<HashMap<String, PartitionMapping>>,
+    /// Name of the parent graph asset for namespaced composition bash tasks.
+    pub parent_graph_name: Option<String>,
+    /// IO handler override from graph asset's `node_io_handler`.
+    pub io_handler_override: Option<IOHandler>,
     /// Resolved retry policy (registry names collapsed to concrete at resolve()).
     pub retry: Option<RetryPolicy>,
     pub io_handler: Option<IOHandler>,
@@ -501,6 +505,7 @@ impl ResolvedBashTask {
     pub fn new(
         py: Python,
         inner: Py<PyBashTask>,
+        parent_graph_name: Option<String>,
         partitions_def: Option<PartitionsDefinition>,
         partition_mapping_override: Option<HashMap<String, PartitionMapping>>,
     ) -> Self {
@@ -518,6 +523,8 @@ impl ResolvedBashTask {
             tags,
             partitions_def,
             partition_mapping,
+            parent_graph_name,
+            io_handler_override: None,
             // Set by resolve_resources_and_handlers once retry refs collapse.
             retry: None,
             io_handler,
@@ -531,6 +538,8 @@ impl ResolvedBashTask {
             tags: self.tags.clone(),
             partitions_def: self.partitions_def.clone(),
             partition_mapping: self.partition_mapping.clone(),
+            parent_graph_name: self.parent_graph_name.clone(),
+            io_handler_override: self.io_handler_override.as_ref().map(|h| h.clone_ref(py)),
             retry: self.retry.clone(),
             io_handler: self.io_handler.as_ref().map(|h| h.clone_ref(py)),
         }
@@ -754,7 +763,10 @@ impl ResolvedNode {
                 .io_handler_override
                 .as_ref()
                 .or(node.io_handler.as_ref()),
-            ResolvedNode::BashTask(node) => node.io_handler.as_ref(),
+            ResolvedNode::BashTask(node) => node
+                .io_handler_override
+                .as_ref()
+                .or(node.io_handler.as_ref()),
         };
         handler.map(|h| expect_resolved_handler(h, py))
     }
@@ -802,14 +814,15 @@ impl ResolvedNode {
     }
 
     /// Name of the parent graph asset for namespaced composition tasks.
-    /// Returns `Some` only for `Task` nodes constructed inside a graph
-    /// composition (set at construction time in `build_unresolved_graph`).
+    /// Returns `Some` only for `Task` and `BashTask` nodes constructed inside a
+    /// graph composition (set at construction time in `build_unresolved_graph`).
     /// Lets callers find the parent graph asset without splitting the
     /// namespaced step name on `/`.
     pub fn parent_graph_name(&self) -> Option<&str> {
         match self {
             ResolvedNode::Task(node) => node.parent_graph_name.as_deref(),
-            ResolvedNode::Asset(_) | ResolvedNode::BashTask(_) => None,
+            ResolvedNode::BashTask(node) => node.parent_graph_name.as_deref(),
+            ResolvedNode::Asset(_) => None,
         }
     }
 
@@ -871,7 +884,9 @@ impl ResolvedNode {
                 node.io_handler_override.is_some()
                     || node.inner.borrow(py).inner.io_handler.is_some()
             }
-            ResolvedNode::BashTask(node) => node.inner.borrow(py).io_handler.is_some(),
+            ResolvedNode::BashTask(node) => {
+                node.io_handler_override.is_some() || node.inner.borrow(py).io_handler.is_some()
+            }
         }
     }
 
