@@ -486,7 +486,8 @@ def test_bash_tasks_share_a_level(level, executor_env, tmp_path):
     def bash(name: str, value: str) -> rs.BashTask:
         return rs.BashTask(
             name=name,
-            command=f"echo {value} > {marks / name}; echo {value}",
+            command=f"echo {value} > {name}; echo {value}",
+            cwd=str(marks),
             io_handler=handler,
         )
 
