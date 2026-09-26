@@ -135,6 +135,8 @@ registered names listed — never silently at execution time.
 When executing a partitioned job, provide a key:
 
 ```python
+job = repo.get_job("daily")
+
 # Single partition
 job.execute(partition_key=rs.PartitionKey.single("2024-01-15"))
 

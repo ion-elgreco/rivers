@@ -467,6 +467,10 @@ class Job:
                 ``rivers/priority`` is honored for run-queue priority.
             config: Per-asset config, keyed by asset name.
             raise_on_error: Raise on first failure instead of returning a failed result.
+
+        Raises:
+            ExecutionError: The job was not obtained from
+                :meth:`CodeRepository.get_job`.
         """
         ...
 

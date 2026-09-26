@@ -227,7 +227,12 @@ class CodeRepository:
         ...
 
     def get_job(self, name: str) -> Job:
-        """Look up a registered :class:`Job` by name."""
+        """Look up a registered :class:`Job` by name.
+
+        Returns this repository's resolved copy of the job. The ``Job`` passed
+        to ``CodeRepository(jobs=...)`` keeps only its declaration, so several
+        repositories can share it.
+        """
         ...
 
     def get_schedule(self, name: str) -> Schedule:

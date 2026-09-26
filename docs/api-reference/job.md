@@ -50,7 +50,7 @@ Run the job synchronously, optionally targeting a single partition. Returns a [`
 | `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config, keyed by asset name. |
 | `raise_on_error` | `bool` | `True` | Raise on first failure instead of returning a failed result. |
 
-**Raises:** `ValueError` if the job has not been added to a `CodeRepository`.
+**Raises:** `ExecutionError` if the job was not obtained from `CodeRepository.get_job()`. The `Job` you construct is only a declaration; each repository runs its own resolved copy.
 
 ---
 

@@ -140,6 +140,20 @@ impl PyJob {
         }
     }
 
+    /// An unresolved copy of this job's declaration. Each repository resolves
+    /// its own copy, so the user's `Job` can be shared between repositories.
+    pub(crate) fn declaration(&self) -> Self {
+        let mut job = Self::base(
+            self.name.clone(),
+            self.node_names.clone(),
+            self.executor.clone(),
+            self.allow_incomplete_deps,
+        );
+        job.retry = self.retry.clone();
+        job.action = self.action.clone();
+        job
+    }
+
     /// Create the synthetic job used by `repo.materialize()` over an ad-hoc
     /// asset selection. The resulting `RunRecord.job_name` is `None`.
     pub(crate) fn new_synthetic(
@@ -634,7 +648,13 @@ impl PyJob {
             .plan
             .as_ref()
             .zip(self.node_map.as_ref())
-            .ok_or_else(|| ExecutionError::new_err("Job has not been validated."))?;
+            .ok_or_else(|| {
+                ExecutionError::new_err(format!(
+                    "Job '{}' has not been validated: run it through \
+                     CodeRepository.get_job('{}')",
+                    self.name, self.name
+                ))
+            })?;
         let executor = self
             .executor
             .as_ref()

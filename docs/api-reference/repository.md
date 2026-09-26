@@ -75,6 +75,8 @@ def get_job(self, name: str) -> Job
 
 Retrieve a validated job by name. Raises `ValueError` if no job with that name exists.
 
+The returned job is this repository's own resolved copy: its plan, IO handlers, resources, executor, and retry policy come from this repository. The `Job` passed to `CodeRepository(jobs=...)` keeps only its declaration, so several repositories can share one `Job`. Run jobs through `get_job()`.
+
 ### `materialize()`
 
 ```python

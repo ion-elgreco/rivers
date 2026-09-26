@@ -2992,10 +2992,9 @@ impl PyCodeRepository {
     /// static checks, resolves topology, validates resource references, and
     /// computes plan-build inputs (`multi_asset_groups`, `composition_order`).
     ///
-    /// Does **not** mutate user `PyJob`s — that happens in
-    /// [`Self::validate_and_build_job_plans`], which must run after
-    /// [`Self::resolve_resources_and_handlers`] so the per-job cloned
-    /// `node_map` subset captures the resolved IO handler overrides.
+    /// Job plans are built in [`Self::validate_and_build_job_plans`], which
+    /// must run after [`Self::resolve_resources_and_handlers`] so the per-job
+    /// cloned `node_map` subset captures the resolved IO handler overrides.
     fn build_and_validate<'py>(&self, py: Python<'py>) -> PyResult<BuiltGraph> {
         let resource_keys: &HashSet<&String> = &self.raw_resources.keys().collect();
         let UnresolvedGraph {
@@ -3107,10 +3106,12 @@ impl PyCodeRepository {
         })
     }
 
-    /// Mutates each `PyJob` (extends `node_names` with namespaced internal
-    /// tasks + collect steps; sets `plan` and the cloned `node_map` subset).
+    /// Builds this repository's own copy of each user `Job` (`node_names`
+    /// extended with namespaced internal tasks + collect steps, `plan`, the
+    /// cloned `node_map` subset, executor and retry). The user's `Job` keeps
+    /// only its declaration, so several repositories can share it.
     ///
-    /// The cloned `node_map` subset on each `PyJob` snapshots the *current*
+    /// The cloned `node_map` subset on each copy snapshots the *current*
     /// state of `node_map` — including any `io_handler_override` populated by
     /// [`Self::resolve_resources_and_handlers`]. Callers that want overrides
     /// reflected in execution must run `resolve_resources_and_handlers` first.
@@ -3122,14 +3123,15 @@ impl PyCodeRepository {
         step_kinds: &HashMap<String, rivers_core::execution::plan::StepKind>,
         multi_asset_groups: &HashMap<String, String>,
         composition_order: &HashMap<String, usize>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Vec<PyJob>> {
         let default_executor = self.effective_executor();
         let default_retry = self.resolved_default_retry()?;
 
+        let mut jobs = Vec::new();
         if let Some(ref job_list) = self.raw_jobs {
             let mut seen_names: HashSet<String> = HashSet::new();
             for job_py in job_list {
-                let mut job = job_py.borrow_mut(py);
+                let mut job = job_py.borrow(py).declaration();
                 let name = job.name().to_string();
                 if !seen_names.insert(name.clone()) {
                     return Err(GraphValidationError::new_err(format!(
@@ -3154,10 +3156,11 @@ impl PyCodeRepository {
                     node_map,
                     job.action.as_deref(),
                 )?;
+                jobs.push(job);
             }
         }
 
-        Ok(())
+        Ok(jobs)
     }
 
     /// Resolve a node's `retry` ref against the repository `retries`
@@ -3490,7 +3493,7 @@ impl PyCodeRepository {
             self.persist_topology(py, &node_map, resolved_graph, &storage_handle)?;
         }
 
-        self.validate_and_build_job_plans(
+        let jobs = self.validate_and_build_job_plans(
             py,
             resolved_graph,
             &node_map,
@@ -3502,21 +3505,16 @@ impl PyCodeRepository {
         // Plans were built in validate_and_build_job_plans; this pass only wires
         // the storage-dependent state needed at run time.
         let mut job_map: HashMap<String, Py<PyJob>> = HashMap::new();
-        if let Some(ref job_list) = self.raw_jobs {
-            for job_py in job_list {
-                let mut job = job_py.borrow_mut(py);
-                let name = job.name().to_string();
-                job.configure_for_repo(
-                    py,
-                    &storage_arc,
-                    &code_location_id,
-                    &self.raw_resources,
-                    &io_handler_registry,
-                    &self.raw_retries,
-                );
-                drop(job);
-                job_map.insert(name, job_py.clone_ref(py));
-            }
+        for mut job in jobs {
+            job.configure_for_repo(
+                py,
+                &storage_arc,
+                &code_location_id,
+                &self.raw_resources,
+                &io_handler_registry,
+                &self.raw_retries,
+            );
+            job_map.insert(job.name().to_string(), Py::new(py, job)?);
         }
 
         if register_catalog {
