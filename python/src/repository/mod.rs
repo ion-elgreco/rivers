@@ -4352,6 +4352,17 @@ impl PyCodeRepository {
         self.teardown_resources(py);
     }
 
+    /// Drop the resolved state and the storage it holds; the next call
+    /// resolves again. The CLI removes its scratch store after this.
+    fn _release_storage(&self, py: Python) {
+        let Some(state) = self.state.write().unwrap().take() else {
+            return;
+        };
+        let storage = Arc::clone(&state.storage);
+        drop(state);
+        py.detach(move || drop(storage));
+    }
+
     /// Test helper. Only works when run_queue is configured. `job_name`
     /// submits the way the queued dispatcher does: the job's assets and verb.
     #[pyo3(signature = (selection=None, partition_key=None, job_name=None))]

@@ -462,6 +462,15 @@ impl Drop for SurrealStorage {
             if tokio::runtime::Handle::try_current().is_ok() {
                 runtime.shutdown_background();
             } else {
+                // The router closes the datastore only when it exits on its
+                // own; shutting the runtime down first cancels it and leaves
+                // the RocksDB files open until the process exits.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while runtime.metrics().num_alive_tasks() > 0
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
                 runtime.shutdown_timeout(std::time::Duration::from_secs(5));
             }
         }

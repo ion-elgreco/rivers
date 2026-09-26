@@ -69,12 +69,12 @@ def _create_storage(
     storage_path: str | None,
     surreal_endpoint: str | None,
     code_location_id: str | None = None,
-) -> Storage:
+) -> tuple[Storage, str | None]:
     """Create storage backend based on CLI flags.
 
     The storage and ``resolve()`` read the code location from the
-    environment. Only the scratch store picked here is removed at exit, never
-    a path the user passed.
+    environment. Also returns the scratch store's directory, which the caller
+    removes at exit; a path the user passed is never removed.
     """
     if code_location_id is not None:
         os.environ["RIVERS_CODE_LOCATION_ID"] = code_location_id
@@ -86,14 +86,20 @@ def _create_storage(
                 "location does not read.",
                 err=True,
             )
-        return Storage.connect(surreal_endpoint)
+        return Storage.connect(surreal_endpoint), None
     if memory:
-        return Storage.memory()
+        return Storage.memory(), None
     if storage_path is not None:
-        return Storage.embedded(storage_path)
+        return Storage.embedded(storage_path), None
     scratch = tempfile.mkdtemp(prefix="rivers-scratch-")
-    atexit.register(shutil.rmtree, scratch, ignore_errors=True)
-    return Storage.embedded(scratch)
+    return Storage._scratch(scratch), scratch  # type: ignore[attr-defined]
+
+
+def _remove_scratch(repo_obj, scratch: str) -> None:
+    """Windows cannot remove open files: the repository lets go of the store
+    first, which closes it."""
+    repo_obj._release_storage()
+    shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _open_or_prompt_migrate(open_fn, migrate_fn) -> Storage:
@@ -629,8 +635,12 @@ def _load_repo(
         typer.echo(f"Error: '{repo_var}' is not a CodeRepository", err=True)
         raise typer.Exit(1)
 
-    storage = _create_storage(memory, storage_path, surreal_endpoint, code_location_id)
+    storage, scratch = _create_storage(
+        memory, storage_path, surreal_endpoint, code_location_id
+    )
     repo_obj.resolve(storage=storage)
+    if scratch is not None:
+        atexit.register(_remove_scratch, repo_obj, scratch)
     return repo_obj
 
 
