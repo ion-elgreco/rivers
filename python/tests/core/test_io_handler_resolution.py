@@ -263,17 +263,7 @@ KINDS_AND_EXECUTORS = pytest.mark.parametrize(
         pytest.param("async", IN_PROCESS, id="async-in_process"),
         pytest.param("async", PARALLEL, id="async-parallel"),
         pytest.param("bash", IN_PROCESS, id="bash-in_process"),
-        pytest.param(
-            "bash",
-            PARALLEL,
-            id="bash-parallel",
-            marks=pytest.mark.xfail(
-                raises=AttributeError,
-                strict=True,
-                reason="a BashTask that shares a level fails on the parallel "
-                "executor before any IO: it has no __annotations__",
-            ),
-        ),
+        pytest.param("bash", PARALLEL, id="bash-parallel"),
     ],
 )
 

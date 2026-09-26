@@ -138,6 +138,9 @@ pub(crate) fn enumerate_params<'py>(
 }
 
 pub(crate) fn extract_return_hint(py: Python, func: &Py<PyAny>) -> PyResult<Option<Py<PyAny>>> {
+    if func.bind(py).is_instance_of::<crate::task::PyBashTask>() {
+        return Ok(None);
+    }
     let annotations = get_annotations(py, func)?;
     Ok(annotations.get_item("return")?.map(|v| v.unbind()))
 }

@@ -1,5 +1,7 @@
 """Tests for tasks integrated into the dependency graph via CodeRepository and Job."""
 
+import pytest
+
 import rivers as rs
 
 
@@ -464,3 +466,62 @@ def test_task_context_repr():
     """TaskExecutionContext repr includes task_name."""
     ctx = rs.TaskExecutionContext("my_task")
     assert repr(ctx) == "TaskExecutionContext(task_name='my_task')"
+
+
+@pytest.mark.parametrize(
+    "level",
+    [
+        pytest.param(("first", "second"), id="bash+bash"),
+        pytest.param(("first", "third"), id="bash+python"),
+    ],
+)
+def test_bash_tasks_share_a_level(level, executor_env, tmp_path):
+    """A BashTask that shares a level with another BashTask or a Python task
+    runs, and a downstream asset reads the outputs of the level."""
+    executor, make_handler = executor_env
+    handler = make_handler()
+    marks = tmp_path / "marks"
+    marks.mkdir()
+
+    def bash(name: str, value: str) -> rs.BashTask:
+        return rs.BashTask(
+            name=name,
+            command=f"echo {value} > {marks / name}; echo {value}",
+            io_handler=handler,
+        )
+
+    @rs.Task(io_handler=handler)
+    def third() -> str:
+        (marks / "third").write_text("three\n")
+        return "three"
+
+    tasks = {
+        "first": bash("first", "one"),
+        "second": bash("second", "two"),
+        "third": third,
+    }
+    values = {"first": "one", "second": "two", "third": "three"}
+    left, right = level
+
+    def join_two_bash(first: str, second: str) -> str:
+        return f"{first}+{second}"
+
+    def join_bash_and_python(first: str, third: str) -> str:
+        return f"{first}+{third}"
+
+    join = join_two_bash if right == "second" else join_bash_and_python
+    joined = rs.Asset(join, name="joined", io_handler=handler)
+
+    repo = rs.CodeRepository(
+        assets=[joined],
+        tasks=[tasks[name] for name in level],
+        default_executor=executor,
+    )
+    repo.materialize()
+    assert {p.name: p.read_text() for p in marks.iterdir()} == {
+        name: f"{values[name]}\n" for name in level
+    }
+    assert {name: repo.load_node(name) for name in (*level, "joined")} == {
+        **{name: values[name] for name in level},
+        "joined": f"{values[left]}+{values[right]}",
+    }
