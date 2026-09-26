@@ -38,6 +38,10 @@ rs.CodeRepository(..., default_retry_policy=...)    # 3. repo-wide default
 repo.materialize([...], retry=...)                  # acts at the job level for that run
 ```
 
+An [action](actions.md) step is outside this chain: it retries only by its action's
+own `retry=` (none by default), because re-running a half-applied merge or delete
+is a different risk from re-running a materialize.
+
 ## Backoff
 
 `Backoff` is built from named constructors — one per wait shape. Every shape takes a relative `jitter` (a fraction of the computed wait, so it scales with the delay) and most take a `max_delay` ceiling so growth can't run away:
@@ -101,7 +105,7 @@ repo = rs.CodeRepository(
 def skewed_join(): ...
 ```
 
-An unknown name fails at `resolve()` with the registered names listed — never silently at execution time.
+An unknown name fails at `resolve()` with the registered names listed — never silently at execution time. Each repository resolves the name against its own `retries`, so two repositories built from the same assets can give the name different policies.
 
 ## OOM escalation on Kubernetes
 

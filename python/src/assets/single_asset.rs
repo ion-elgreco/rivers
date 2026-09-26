@@ -40,6 +40,8 @@ pub struct SingleAsset {
     pub retry: Option<rivers_core::execution::retry::RetryRef>,
     /// Per-asset compute request; axes left unset inherit the executor default.
     pub compute: Option<rivers_core::execution::compute::Compute>,
+    /// Named actions this asset supports beyond materialize.
+    pub actions: Vec<Py<super::action::PyAssetAction>>,
 }
 
 /// Python-exposed marker subclass created by the `Asset(...)` decorator.

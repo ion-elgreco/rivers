@@ -53,6 +53,8 @@ class BackfillRequest:
     failure_policy: str | None
     max_concurrency: int
     tags: dict[str, str] | None
+    action: str | None
+    """Verb the child runs execute. ``None`` means materialize."""
 
     def __init__(
         self,
@@ -63,6 +65,7 @@ class BackfillRequest:
         failure_policy: str | None = None,
         max_concurrency: int = 4,
         tags: dict[str, str] | None = None,
+        action: str | None = None,
     ) -> None:
         """Mirror of :meth:`CodeRepository.backfill` arguments."""
         ...

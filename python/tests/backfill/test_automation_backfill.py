@@ -1,5 +1,7 @@
 """Integration tests for BackfillRequest from sensors/schedules."""
 
+import pickle
+
 import pytest
 import rivers as rs
 
@@ -64,6 +66,56 @@ class TestBackfillRequestType:
         assert "BackfillRequest" in r
         assert '["a", "b"]' in r
         assert "max_concurrency=2" in r
+
+    def test_pickle_roundtrip_preserves_every_field(self):
+        """``__reduce__`` is the transport for subprocess schedule/sensor evals.
+
+        A field missing from the reduce tuple is silently replaced by its
+        default, so the daemon launches something other than what was asked
+        for — here, a materialize backfill instead of a ``delete``.
+        """
+        req = rs.BackfillRequest(
+            selection=["a"],
+            partition_keys=[rs.PartitionKey.single("x")],
+            failure_policy="stop_on_failure",
+            max_concurrency=7,
+            tags={"team": "data"},
+            action="delete",
+        )
+        restored = pickle.loads(pickle.dumps(req))
+        assert restored.selection == ["a"]
+        assert restored.partition_keys == [rs.PartitionKey.single("x")]
+        assert restored.failure_policy == "stop_on_failure"
+        assert restored.max_concurrency == 7
+        assert restored.tags == {"team": "data"}
+        assert restored.action == "delete"
+
+    def test_pickle_roundtrip_preserves_strategy(self):
+        """A ``strategy`` is in the reduce tuple, so it must itself pickle.
+
+        Without ``__reduce__`` on the strategy variants the whole round-trip
+        raises, so a subprocess-evaluated schedule that sets one fails instead
+        of launching.
+        """
+        req = rs.BackfillRequest(
+            selection=["a"],
+            partition_keys=[rs.PartitionKey.single("x")],
+            strategy=rs.BackfillStrategy.single_run(),
+        )
+        restored = pickle.loads(pickle.dumps(req))
+        assert restored.strategy == rs.BackfillStrategy.single_run()
+
+    def test_pickle_roundtrip_preserves_per_dimension_strategy(self):
+        """The data-carrying strategy variant must keep its dimensions."""
+        strategy = rs.BackfillStrategy.per_dimension(
+            multi_run=["date"], single_run=["region"]
+        )
+        req = rs.BackfillRequest(selection=["a"], strategy=strategy)
+        restored = pickle.loads(pickle.dumps(req))
+        assert restored.strategy == strategy
+        assert restored.strategy == rs.BackfillStrategy.per_dimension(
+            multi_run=["date"], single_run=["region"]
+        )
 
 
 class TestSensorResultWithBackfills:

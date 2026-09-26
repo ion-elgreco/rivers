@@ -240,3 +240,6 @@ rust/rivers-ui/pkg/rivers_ui_bg.wasm.br
 rfc/**
 TODO.md
 benchmarks/**
+
+# Code-review checkpoints (session-local)
+.review*

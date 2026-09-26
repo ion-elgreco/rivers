@@ -7,12 +7,11 @@ use std::collections::HashMap;
 
 use leptos::prelude::*;
 
-use crate::components::partition_picker::PartitionPicker;
-use crate::helpers::JobPartitionPicker;
+use crate::components::partition_picker::{PartitionPicker, WholeAssetChoice};
+use crate::helpers::{JobPartitionPicker, close_on_navigation, stale_status_kind};
 use crate::loc::{loc_path, use_current_location};
-use crate::server_fns::actions::{launch_backfill, trigger_materialize};
-use crate::server_fns::assets::get_assets;
-use crate::types::{AssetRecord, StaleStatus, SubmitPartitionKey};
+use crate::server_fns::mutations::{launch_backfill, trigger_action, trigger_materialize};
+use crate::types::{AssetActionInfo, AssetRecord, StaleStatus, SubmitPartitionKey};
 
 /// Above this many selected partitions, submit one backfill instead of a run each.
 const BACKFILL_THRESHOLD: usize = 2;
@@ -26,7 +25,12 @@ enum DialogOutcome {
 
 /// One-line description of exactly what a submit will launch. Mirrors the
 /// branching in `materialize_action` — if that changes, this must too.
-fn launch_summary(n_assets: usize, n_partitions: usize, partitioned: bool) -> String {
+fn launch_summary(
+    n_assets: usize,
+    n_partitions: usize,
+    partitioned: bool,
+    whole_asset: bool,
+) -> String {
     if n_assets == 0 {
         return "Nothing selected".to_string();
     }
@@ -37,6 +41,9 @@ fn launch_summary(n_assets: usize, n_partitions: usize, partitioned: bool) -> St
     };
     if !partitioned {
         return format!("{assets} · 1 run");
+    }
+    if whole_asset {
+        return format!("{assets} · whole asset · 1 run");
     }
     if n_partitions == 0 {
         return format!("{assets} · select a partition");
@@ -57,11 +64,13 @@ fn launch_summary(n_assets: usize, n_partitions: usize, partitioned: bool) -> St
 
 /// Status dot class + word for an asset's staleness. `None` = the record
 /// hasn't loaded (or the key isn't an asset), which reads as unknown.
+/// Words come from the shared chip vocabulary; only the dot class stays
+/// local (dialogs.css names the up-to-date rule `--ok`).
 fn status_bits(record: Option<&AssetRecord>) -> (&'static str, &'static str) {
     match record.map(|r| &r.stale_status) {
-        Some(StaleStatus::UpToDate) => ("mat-dialog-dot--ok", "up to date"),
-        Some(StaleStatus::Stale) => ("mat-dialog-dot--stale", "stale"),
-        Some(StaleStatus::Missing) => ("mat-dialog-dot--missing", "missing"),
+        Some(s @ StaleStatus::UpToDate) => ("mat-dialog-dot--ok", stale_status_kind(s)),
+        Some(s @ StaleStatus::Stale) => ("mat-dialog-dot--stale", stale_status_kind(s)),
+        Some(s @ StaleStatus::Missing) => ("mat-dialog-dot--missing", stale_status_kind(s)),
         None => ("mat-dialog-dot--missing", ""),
     }
 }
@@ -76,9 +85,39 @@ pub fn MaterializeDialog(
     /// backfill (more).
     #[prop(optional, into)]
     picker: Option<Signal<JobPartitionPicker>>,
+    /// Verb to run instead of materialize. Same partition selection, submitted
+    /// as action runs (or an action backfill above the threshold). The verb's
+    /// `partitioning` drives the key requirement: Keyless hides the picker,
+    /// Optional also offers the explicit whole-asset choice.
+    #[prop(optional, into)]
+    action: Option<Signal<Option<AssetActionInfo>>>,
+    /// The verb clears materialization state (`Outcome.Unmaterialize`). Says so
+    /// on the dialog — nothing else in the product distinguishes a destructive
+    /// verb from a benign one.
+    #[prop(optional, into)]
+    destructive: Option<Signal<bool>>,
+    /// Asset records decorating the rows (staleness / group / last
+    /// materialized), from the host page's live resource — the dialog used to
+    /// re-fetch every asset per open.
+    #[prop(into)]
+    records: Signal<HashMap<String, AssetRecord>>,
+    /// The host's records fetch failed: rows keep the last good data, and the
+    /// dialog says so — silently unlabeled rows read as healthy in a dialog
+    /// that may be confirming a destructive verb.
+    #[prop(optional, into)]
+    records_failed: Option<Signal<bool>>,
 ) -> impl IntoView {
+    let records_failed: Signal<bool> = records_failed.unwrap_or_else(|| Signal::derive(|| false));
+    let verb_info: Signal<Option<AssetActionInfo>> =
+        action.unwrap_or_else(|| Signal::derive(|| None));
+    let verb: Signal<Option<String>> = Signal::derive(move || verb_info.get().map(|a| a.name));
+    let keyless_verb = Memo::new(move |_| verb_info.get().is_some_and(|a| a.is_keyless()));
+    let key_optional = Memo::new(move |_| verb_info.get().is_some_and(|a| a.key_optional()));
+    let destructive: Signal<bool> = destructive.unwrap_or_else(|| Signal::derive(|| false));
     let (selected, set_selected) = signal(Vec::<String>::new());
     let partition_keys = RwSignal::new(Vec::<SubmitPartitionKey>::new());
+    let whole_asset = RwSignal::new(false);
+    let whole_asset_chosen = Memo::new(move |_| whole_asset.get() && key_optional.get());
     let (tag_key, set_tag_key) = signal(String::new());
     let (tag_val, set_tag_val) = signal(String::new());
     let (tags, set_tags) = signal(Vec::<(String, String)>::new());
@@ -87,45 +126,37 @@ pub fn MaterializeDialog(
     Effect::new(move || {
         if show.get() {
             set_selected.set(asset_keys.get());
+            // `PartitionPicker` clears this too, but it is only mounted for a
+            // partitioned selection — without this an unpartitioned open would
+            // submit the previous open's keys.
+            partition_keys.set(Vec::new());
+            whole_asset.set(false);
+            // Tags feed the submitted run (including `rivers/priority`), so a
+            // tag typed for one open must not ride along on the next.
+            set_tags.set(Vec::new());
+            set_tag_key.set(String::new());
+            set_tag_val.set(String::new());
         }
     });
 
     let loc = use_current_location();
-
-    // Staleness / group / last-materialized decorate the rows. Kept in a plain
-    // signal rather than a Resource so a slow (or failed) fetch never withholds
-    // the asset list itself; fetched per open so the staleness is current.
-    let asset_meta = RwSignal::new(HashMap::<String, AssetRecord>::new());
-    Effect::new(move || {
-        if !show.get() {
-            return;
-        }
-        let (ns, name) = loc.get();
-        leptos::task::spawn_local(async move {
-            if let Ok(records) = get_assets(ns, name, None, None, None).await {
-                asset_meta.set(
-                    records
-                        .into_iter()
-                        .map(|r| (r.asset_key.clone(), r))
-                        .collect(),
-                );
-            }
-        });
-    });
+    close_on_navigation(show);
 
     let materialize_action = Action::new(move |_: &()| {
         let sel = selected.get();
         let pks = partition_keys.get();
+        let whole = whole_asset_chosen.get();
         let t = tags.get();
         let (ns, name) = loc.get();
+        let verb = verb.get();
         async move {
             let tags_opt = if t.is_empty() { None } else { Some(t) };
             if pks.len() > BACKFILL_THRESHOLD {
-                let r = launch_backfill(ns, name, Some(sel), pks, tags_opt, None).await?;
+                let r = launch_backfill(ns, name, Some(sel), pks, tags_opt, None, verb).await?;
                 return Ok::<_, ServerFnError>(DialogOutcome::Backfill(r.backfill_id));
             }
-            // ≤2 keys → a run each; empty pks (unpartitioned / None picker) → one
-            // keyless run. Both are the same loop over `Option<key>`.
+            // ≤2 keys → a run each; empty pks (unpartitioned, or the whole asset
+            // chosen) → one keyless run. Both are the same loop over `Option<key>`.
             let keys = if pks.is_empty() {
                 vec![None]
             } else {
@@ -133,15 +164,31 @@ pub fn MaterializeDialog(
             };
             let mut run_id = String::new();
             for pk in keys {
-                run_id = trigger_materialize(
-                    ns.clone(),
-                    name.clone(),
-                    Some(sel.clone()),
-                    pk,
-                    tags_opt.clone(),
-                )
-                .await?
-                .run_id;
+                run_id = match &verb {
+                    Some(verb) => {
+                        trigger_action(
+                            ns.clone(),
+                            name.clone(),
+                            verb.clone(),
+                            sel.clone(),
+                            pk,
+                            tags_opt.clone(),
+                            whole,
+                        )
+                        .await?
+                    }
+                    None => {
+                        trigger_materialize(
+                            ns.clone(),
+                            name.clone(),
+                            Some(sel.clone()),
+                            pk,
+                            tags_opt.clone(),
+                        )
+                        .await?
+                        .run_id
+                    }
+                };
             }
             Ok(DialogOutcome::Run(run_id))
         }
@@ -178,22 +225,27 @@ pub fn MaterializeDialog(
     let picker_signal: Signal<JobPartitionPicker> =
         picker.unwrap_or_else(|| Signal::derive(|| JobPartitionPicker::None));
 
-    let is_partitioned =
-        Signal::derive(move || !matches!(picker_signal.get(), JobPartitionPicker::None));
+    // Memo, not Signal::derive — read from six places per render, and the
+    // sibling execute_job_dialog already memoizes the same predicate.
+    // A Keyless verb reads as unpartitioned: no picker, one whole-asset run.
+    let is_partitioned = Memo::new(move |_| {
+        !keyless_verb.get() && !matches!(picker_signal.get(), JobPartitionPicker::None)
+    });
     let summary = Signal::derive(move || {
         launch_summary(
             selected.get().len(),
             partition_keys.get().len(),
             is_partitioned.get(),
+            whole_asset_chosen.get(),
         )
     });
     let submit_label = Signal::derive(move || {
         if pending.get() {
-            "Submitting…"
+            "Submitting…".to_string()
         } else if is_partitioned.get() && partition_keys.get().len() > BACKFILL_THRESHOLD {
-            "Launch backfill"
+            "Launch backfill".to_string()
         } else {
-            "Materialize"
+            verb.get().unwrap_or_else(|| "Materialize".to_string())
         }
     });
 
@@ -211,9 +263,21 @@ pub fn MaterializeDialog(
                     on:click=move |ev| ev.stop_propagation()
                 >
                     <div class="modal-header">
-                        <h2>"Materialize"</h2>
+                        <h2>{move || verb.get().unwrap_or_else(|| "Materialize".to_string())}</h2>
                         <button class="btn btn-small" on:click=move |_| show.set(false)>"x"</button>
                     </div>
+
+                    <Show when=move || destructive.get()>
+                        <p class="text-error mat-dialog-warning">
+                            "Clears materialization state for the selected assets."
+                        </p>
+                    </Show>
+
+                    <Show when=move || records_failed.get()>
+                        <p class="mat-dialog-meta-warning">
+                            "Couldn't load asset status — staleness not shown."
+                        </p>
+                    </Show>
 
                     <div class="modal-body mat-dialog-body">
                         <div class=move || if is_partitioned.get() {
@@ -239,7 +303,7 @@ pub fn MaterializeDialog(
                                 <div class="mat-dialog-asset-list">
                                     {
                                         {move || {
-                                            let meta = asset_meta.get();
+                                            let meta = records.get();
                                             asset_keys.get().into_iter().map(|key| {
                                                 let k_checked = key.clone();
                                                 let k_toggle = key.clone();
@@ -299,7 +363,16 @@ pub fn MaterializeDialog(
                                         </div>
                                     }
                                 >
-                                    <PartitionPicker picker=picker_signal selected=partition_keys reset=show/>
+                                    <Show when=move || key_optional.get()>
+                                        <WholeAssetChoice checked=whole_asset selected=partition_keys/>
+                                    </Show>
+                                    <Show when=move || !whole_asset_chosen.get()>
+                                        <PartitionPicker
+                                            picker=picker_signal
+                                            selected=partition_keys
+                                            reset=show
+                                        />
+                                    </Show>
                                 </Show>
 
                                 <div class="form-group">
@@ -351,13 +424,19 @@ pub fn MaterializeDialog(
                         <div class="mat-dialog-actions">
                             <button class="btn" on:click=move |_| show.set(false)>"Cancel"</button>
                             <button
-                                class="btn btn-primary"
+                                class=move || if destructive.get() {
+                                    "btn btn-danger"
+                                } else {
+                                    "btn btn-primary"
+                                }
                                 on:click=move |_| { materialize_action.dispatch(()); }
                                 disabled=move || {
                                     if pending.get() || selected.get().is_empty() {
                                         return true;
                                     }
-                                    is_partitioned.get() && partition_keys.get().is_empty()
+                                    is_partitioned.get()
+                                        && partition_keys.get().is_empty()
+                                        && !whole_asset_chosen.get()
                                 }
                             >
                                 {move || submit_label.get()}
@@ -376,30 +455,75 @@ pub fn MaterializeDialog(
 
 #[cfg(test)]
 mod tests {
-    use super::launch_summary;
+    use super::{launch_summary, status_bits};
+
+    #[test]
+    fn status_bits_covers_every_arm() {
+        use crate::types::{AssetRecord, StaleStatus};
+        let record = |s: StaleStatus| AssetRecord {
+            asset_key: "a".into(),
+            tags: vec![],
+            kinds: vec![],
+            asset_group: None,
+            code_version: None,
+            last_event_id: None,
+            last_run_id: None,
+            last_timestamp: None,
+            last_data_version: None,
+            pool: vec![],
+            stale_status: s,
+        };
+        let word = |r: Option<&AssetRecord>| status_bits(r).1;
+        // The words come from the shared chip vocabulary — every other status
+        // surface renders "up-to-date"; a local spelling drifts user-visibly.
+        assert_eq!(word(Some(&record(StaleStatus::UpToDate))), "up-to-date");
+        assert_eq!(word(Some(&record(StaleStatus::Stale))), "stale");
+        assert_eq!(word(Some(&record(StaleStatus::Missing))), "missing");
+        // Unlabeled ≠ missing: an unloaded record shows no status word.
+        assert_eq!(word(None), "");
+    }
 
     #[test]
     fn empty_selection_reads_as_nothing() {
-        assert_eq!(launch_summary(0, 0, false), "Nothing selected");
-        assert_eq!(launch_summary(0, 5, true), "Nothing selected");
+        assert_eq!(launch_summary(0, 0, false, false), "Nothing selected");
+        assert_eq!(launch_summary(0, 5, true, false), "Nothing selected");
     }
 
     #[test]
     fn unpartitioned_is_always_one_run() {
-        assert_eq!(launch_summary(1, 0, false), "1 asset · 1 run");
-        assert_eq!(launch_summary(3, 0, false), "3 assets · 1 run");
+        assert_eq!(launch_summary(1, 0, false, false), "1 asset · 1 run");
+        assert_eq!(launch_summary(3, 0, false, false), "3 assets · 1 run");
     }
 
     #[test]
     fn partitioned_without_keys_asks_for_one() {
-        assert_eq!(launch_summary(2, 0, true), "2 assets · select a partition");
+        assert_eq!(
+            launch_summary(2, 0, true, false),
+            "2 assets · select a partition"
+        );
+    }
+
+    #[test]
+    fn whole_asset_choice_covers_every_partition() {
+        assert_eq!(
+            launch_summary(2, 0, true, true),
+            "2 assets · whole asset · 1 run"
+        );
+        // An empty pick alone never reads as the whole asset.
+        assert_eq!(
+            launch_summary(2, 0, true, false),
+            "2 assets · select a partition"
+        );
     }
 
     #[test]
     fn one_run_per_partition_up_to_the_threshold() {
-        assert_eq!(launch_summary(1, 1, true), "1 asset · 1 partition · 1 run");
         assert_eq!(
-            launch_summary(3, 2, true),
+            launch_summary(1, 1, true, false),
+            "1 asset · 1 partition · 1 run"
+        );
+        assert_eq!(
+            launch_summary(3, 2, true, false),
             "3 assets · 2 partitions · 2 runs"
         );
     }
@@ -407,11 +531,11 @@ mod tests {
     #[test]
     fn past_the_threshold_it_is_a_backfill() {
         assert_eq!(
-            launch_summary(3, 3, true),
+            launch_summary(3, 3, true, false),
             "3 assets · 3 partitions · 1 backfill"
         );
         assert_eq!(
-            launch_summary(1, 400, true),
+            launch_summary(1, 400, true, false),
             "1 asset · 400 partitions · 1 backfill"
         );
     }

@@ -15,8 +15,9 @@ ENV VIRTUAL_ENV=/app/.venv \
 COPY *.whl /tmp/wheels/
 COPY pyproject.toml /tmp/pyproject.toml
 
+# [delta-pyarrow]: the demo pipeline imports pyarrow + deltalake at module top.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install /tmp/wheels/*.whl \
+    for w in /tmp/wheels/*.whl; do uv pip install "${w}[delta-pyarrow]"; done \
     && cd /tmp && uv pip install --requirement pyproject.toml \
     && rm -rf /tmp/wheels /tmp/pyproject.toml
 

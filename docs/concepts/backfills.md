@@ -156,8 +156,8 @@ print(f"Completed: {result.completed}/{result.num_partitions}")
 | `failure_policy` | `str` | `"continue"` | `"continue"` or `"stop_on_failure"` |
 | `max_concurrency` | `int` | `4` | Max concurrent runs |
 | `tags` | `list[tuple[str, str]]` | None | Tags to attach to the backfill and its runs |
-| `config` | `dict` | None | Per-asset config overrides |
-| `block` | `bool` | `True` | Wait for completion |
+| `config` | `dict` | None | Per-asset config overrides. Needs `block=True` |
+| `block` | `bool` | `True` | Wait for completion. `False` only records the backfill for a daemon to run |
 | `dry_run` | `bool` | `False` | Preview without executing |
 
 ## Dry-run preview
@@ -202,6 +202,8 @@ repo.backfill(
 )
 ```
 
+Config needs `block=True` (the default). The backfill record does not keep config. A daemon runs a `block=False` backfill later from its record, so its runs would use the config defaults. For this reason, `config` with `block=False` raises `ExecutionError`.
+
 ## Asset-level backfill strategy
 
 You can set a default backfill strategy on an asset using the `backfill_strategy` parameter on `@Asset`. This strategy is used when no explicit strategy is passed to `repo.backfill()`.
@@ -234,15 +236,38 @@ print(f"Failed: {status.failed_partitions}, canceled: {status.canceled_partition
 
 # Cancel a running backfill
 repo.cancel_backfill(result.backfill_id)
-
-# Re-launch failed/canceled partitions of a previous backfill
-result = repo.rerun_backfill(result.backfill_id, block=True)
 ```
 
 ### Web UI
 
 The rivers web UI provides a dedicated **Backfills** page at `/backfills` that shows all backfills with their status, progress, and associated runs.
 
+## Rerunning a backfill
+
+`repo.rerun_backfill()` launches a previous backfill again as a new backfill, with the same selection, strategy and [verb](actions.md). The rerun replays every partition of the original backfill, not only the failed or canceled ones. Keys that are no longer valid for the current definitions are dropped. A rerun from the backfill's page in the web UI also replays every partition with the same verb.
+
+A backfill of a job keeps the verb that it recorded. If the job now runs a different verb, for example after a redeploy, the rerun is rejected with an error that names both verbs. To run the job's new verb, launch a new backfill of the job.
+
+```python
+result = repo.rerun_backfill(result.backfill_id, block=True)
+```
+
+!!! warning "A rerun applies the verb to every partition again"
+    A rerun of a `delete` backfill deletes every partition again, including partitions materialized again after the first run.
+
+To retry only some partitions, start a new backfill with those keys and the original `action`. Without `action`, the new backfill materializes. The backfill's page in the web UI shows the status of each partition.
+
+```python
+repo.backfill(
+    selection=["daily_events"],
+    partition_keys=[
+        rs.PartitionKey.single("2024-01-03"),
+        rs.PartitionKey.single("2024-01-09"),
+    ],
+    action="delete",  # the original verb; omit it for a materialize backfill
+)
+```
+
 ## Launch recovery
 
-A daemon-executed backfill commits `Requested → InProgress` before submitting its runs. If run submission fails, the backfill is marked `CompletedFailed` with the error recorded on the record. If the daemon dies in between instead (no runs were ever submitted), the backfill monitor notices the zero-run `InProgress` record after a grace period (180s) and flips it back to `Requested`, so the pickup loop re-executes it from scratch. Run submission is atomic — either all of a backfill's runs and their `run_ids` link land, or none do — which is what makes the automatic re-execution safe.
+A daemon-executed backfill commits `Requested → InProgress` before submitting its runs. If run submission fails, the backfill is marked `CompletedFailed` with the error recorded on the record. A backfill of a job whose verb changed after the backfill was requested is marked `CompletedFailed` before any of its runs start. If the daemon dies in between instead (no runs were ever submitted), the backfill monitor notices the zero-run `InProgress` record after a grace period (180s) and flips it back to `Requested`, so the pickup loop re-executes it from scratch. Run submission is atomic — either all of a backfill's runs and their `run_ids` link land, or none do — which is what makes the automatic re-execution safe.

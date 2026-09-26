@@ -254,8 +254,13 @@ fn BackfillRow(record: BackfillInfo, code_location_label: String) -> impl IntoVi
             <span class=rail></span>
             <span class="grid-cell-mono">{short_id}</span>
             <StatusChip kind=st_kind small=true/>
+            // A destructive sweep must be identifiable while scanning the list,
+            // not only from the detail page.
             <span class="grid-cell-muted grid-cell-code">
-                {format_call_multiline(&record.strategy)}
+                {match &record.action {
+                    Some(verb) => format!("{verb} · {}", format_call_multiline(&record.strategy)),
+                    None => format_call_multiline(&record.strategy),
+                }}
             </span>
             <AssetStack assets=record.asset_selection/>
             <div style="display:flex; flex-direction:column; gap:4px; min-width:0">

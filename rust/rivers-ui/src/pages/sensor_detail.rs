@@ -6,10 +6,10 @@ use leptos_router::hooks::use_params_map;
 
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::ui_kit::{Crumb, TickRunChips, Topbar};
-use crate::helpers::{short_id, tick_counts_summary, tick_status_class};
+use crate::helpers::{job_actions_by_name, short_id, tick_counts_summary, tick_status_class};
 use crate::loc::{loc_path, use_current_location};
 use crate::now::RelTime;
-use crate::server_fns::automation::{evaluate_sensor, get_sensors, get_ticks};
+use crate::server_fns::automation::{evaluate_sensor, get_jobs, get_sensors, get_ticks};
 
 #[component]
 pub fn SensorDetailPage() -> impl IntoView {
@@ -26,6 +26,10 @@ pub fn SensorDetailPage() -> impl IntoView {
             (name(), refresh_tick.get(), loc.get())
         },
         |(_n, _t, (ns, lname))| async move { get_sensors(ns, lname).await },
+    );
+    let jobs = Resource::new(
+        move || loc.get(),
+        |(ns, lname)| async move { get_jobs(ns, lname).await },
     );
     let ticks = Resource::new(
         move || {
@@ -119,6 +123,14 @@ pub fn SensorDetailPage() -> impl IntoView {
                                                 Some(h) => view! { <A href=h>{job_value}</A> }.into_any(),
                                                 None => view! { <span>{job_value}</span> }.into_any(),
                                             }}
+                                            {move || job_name.clone()
+                                                .and_then(|jn| {
+                                                    jobs.get().and_then(|r| r.ok())
+                                                        .and_then(|js| job_actions_by_name(&js).remove(&jn))
+                                                })
+                                                .map(|v| view! {
+                                                    <span class="grid-cell-muted" title="asset action">{format!(" · {v}")}</span>
+                                                })}
                                         </div>
                                     </div>
                                     <div class="meta-tile">

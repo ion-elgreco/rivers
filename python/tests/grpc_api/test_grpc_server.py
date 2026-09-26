@@ -1,11 +1,15 @@
 """Integration tests for the gRPC CodeLocation server."""
 
+import contextlib
+import re
+
 import grpc
 import pytest
 
 import rivers as rs
 from _polling import wait_for_asset_materialized as _wait_for_asset_materialized
-from _polling import wait_until
+from _polling import wait_for_run_terminal, wait_until
+from rivers.exceptions import ExecutionError
 
 
 # ── Test helpers ──
@@ -178,7 +182,9 @@ def test_materialize_nonexistent_returns_error(grpc_channel):
     stub = pb2_grpc.CodeLocationServiceStub(channel)
     with pytest.raises(grpc.RpcError) as exc_info:
         stub.Materialize(pb2.MaterializeRequest(selection=["nonexistent"]))
-    assert exc_info.value.code() == grpc.StatusCode.INTERNAL
+    # A caller error, not a server fault — the boundary validates and says so.
+    assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "nonexistent" in exc_info.value.details()
 
 
 @pytest.fixture
@@ -337,12 +343,21 @@ def test_evaluate_sensor_nonexistent(full_grpc_channel):
     assert exc_info.value.code() == grpc.StatusCode.INTERNAL
 
 
-def test_observe_asset(full_grpc_channel):
-    channel, pb2, pb2_grpc, _ = full_grpc_channel
+def test_run_action_observe(full_grpc_channel):
+    """Observe is the built-in action — triggered via RunAction."""
+    channel, pb2, pb2_grpc, repo = full_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)
-    response = stub.ObserveAsset(pb2.ObserveAssetRequest(asset_key="observed"))
+    response = stub.RunAction(
+        pb2.RunActionRequest(action="observe", selection=["observed"])
+    )
     assert response.success is True
+    assert response.run_id != ""
     assert response.error == ""
+    # Fire-and-forget response — still prove the observation itself landed.
+    record = wait_for_run_terminal(repo.storage, response.run_id, timeout=15)
+    assert record is not None and record.status == "Success"
+    assert record.action == "observe"
+    assert repo.storage.get_asset_record("observed").last_timestamp is not None
 
 
 # ── Tests: Run queue via gRPC ──
@@ -353,7 +368,12 @@ def queued_grpc_channel(grpc_stubs, storage):
     """gRPC server with run_queue configured — runs should be queued, not executed."""
     handler = DictIOHandler()
 
-    @rs.Asset(io_handler=handler)
+    def _compact(ctx):
+        return None
+
+    compact = rs.AssetAction(name="compact", outcome=rs.Outcome.Unchanged)(_compact)
+
+    @rs.Asset(io_handler=handler, actions=[compact])
     def alpha():
         return 1
 
@@ -381,6 +401,24 @@ def queued_grpc_channel(grpc_stubs, storage):
     repo._stop_grpc_server()
 
 
+def test_launch_backfill_action_with_job_target_must_be_the_jobs_verb(
+    queued_grpc_channel,
+):
+    """A Job target runs its own verb: `action` names the verb the caller
+    showed for it, and a different one is refused rather than picked."""
+    channel, pb2, pb2_grpc, _, _ = queued_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.LaunchBackfill(
+            pb2.LaunchBackfillRequest(job_name="test_job", action="compact")
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert exc.value.details() == (
+        "ExecutionError: job 'test_job' now runs 'materialize', not 'compact'; "
+        "reload the page"
+    )
+
+
 def test_materialize_with_run_queue_creates_queued_run(queued_grpc_channel):
     """When run_queue is configured, Materialize gRPC should queue the run, not execute it."""
     channel, pb2, pb2_grpc, _, storage = queued_grpc_channel
@@ -395,6 +433,369 @@ def test_materialize_with_run_queue_creates_queued_run(queued_grpc_channel):
     matching = [r for r in runs if r.run_id == response.run_id]
     assert len(matching) == 1
     assert matching[0].status == "Queued"
+
+
+def test_run_action_with_run_queue_creates_queued_run(queued_grpc_channel):
+    """RunAction goes through the dispatcher like every other mutating RPC.
+
+    Running the verb inline skipped the queue entirely — no concurrency limit,
+    no tag limits, no priority, and under Kubernetes the verb executed in the
+    code-location server pod instead of a Run CR.
+    """
+    channel, pb2, pb2_grpc, _, storage = queued_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    response = stub.RunAction(
+        pb2.RunActionRequest(
+            action="compact",
+            selection=["alpha"],
+            tags=[pb2.Tag(key="team", value="data")],
+        )
+    )
+    assert response.success is True
+    assert response.run_id != ""
+
+    runs = storage.get_runs(limit=10)
+    matching = [r for r in runs if r.run_id == response.run_id]
+    assert len(matching) == 1
+    assert matching[0].status == "Queued"
+    assert matching[0].action == "compact"
+    # Tags reach the record, so tag-based queue limits and filters apply.
+    assert dict(matching[0].tags or {})["team"] == "data"
+
+
+@pytest.fixture
+def action_validation_channel(grpc_stubs, storage):
+    """gRPC server with a partitioned actionable asset and a partitioned
+    observable, for exercising the RunAction validation boundary."""
+    handler = DictIOHandler()
+
+    def _purge(ctx):
+        return None
+
+    purge = rs.AssetAction(name="purge", outcome=rs.Outcome.Unmaterialize)(_purge)
+
+    @rs.Asset(
+        io_handler=handler,
+        actions=[purge],
+        partitions_def=rs.PartitionsDefinition.static_(["p1", "p2"]),
+    )
+    def events():
+        return 1
+
+    class Feed(rs.ExternalAsset):
+        io_handler = rs.InMemoryIOHandler()
+        partitions_def = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+        @classmethod
+        def observe(cls) -> rs.Observation:
+            return rs.Observation(data_version="dv-1")
+
+    repo = rs.CodeRepository(
+        assets=[events, Feed],
+        default_executor=rs.Executor.in_process(),
+        run_queue=rs.RunQueueConfig(max_concurrent_runs=2, dequeue_interval="50ms"),
+    )
+    repo.resolve(storage=storage)
+    port = repo._start_grpc_server("127.0.0.1", 0)
+
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+
+    pb2, pb2_grpc = grpc_stubs
+    yield channel, pb2, pb2_grpc, repo, storage
+    channel.close()
+    repo._stop_grpc_server()
+
+
+def test_run_action_rejects_unknown_asset(action_validation_channel):
+    """gRPC is the system boundary: the dispatcher hands the request to the run
+    queue and swallows the error, so a typo'd asset would otherwise come back as
+    success plus a run_id for a run that never starts."""
+    channel, pb2, pb2_grpc, _, storage = action_validation_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    before = {r.run_id for r in storage.get_runs(limit=100)}
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.RunAction(pb2.RunActionRequest(action="purge", selection=["typo"]))
+    assert "typo" in exc.value.details()
+    assert {r.run_id for r in storage.get_runs(limit=100)} == before, (
+        "a rejected action must not leave a run record behind"
+    )
+
+
+def test_run_action_rejects_empty_selection(action_validation_channel):
+    """`repeated` has no presence, so an empty selection read as "every asset
+    declaring the verb". A caller that computed an empty list would silently fan
+    a destructive verb across the whole code location; fan-out is now opt-in.
+    """
+    channel, pb2, pb2_grpc, _, storage = action_validation_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    before = {r.run_id for r in storage.get_runs(limit=100)}
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.RunAction(pb2.RunActionRequest(action="purge", selection=[]))
+    assert "all_assets" in exc.value.details()
+    assert {r.run_id for r in storage.get_runs(limit=100)} == before, (
+        "a rejected action must not leave a run record behind"
+    )
+
+
+def test_run_action_all_assets_fans_out(action_validation_channel):
+    """Falsifier for the guard above: with `all_assets` the verb still reaches
+    every asset declaring it (here the one partitioned `purge` target).
+    """
+    channel, pb2, pb2_grpc, _, storage = action_validation_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    response = stub.RunAction(
+        pb2.RunActionRequest(
+            action="purge",
+            all_assets=True,
+            partition_key=pb2.ProtoPartitionKey(
+                single=pb2.SinglePartitionKey(keys=["p1"])
+            ),
+        )
+    )
+    assert response.success is True
+    assert response.run_id != ""
+    record = storage.get_run(response.run_id)
+    assert record is not None and record.action == "purge"
+
+
+def test_run_action_rejects_unsupported_verb_on_selection(action_validation_channel):
+    """gRPC is the validation boundary: an asset that exists but does not
+    define the verb must be rejected synchronously — otherwise the caller
+    gets success plus a run_id for a run that can only fail at plan build,
+    minutes later, with no synchronous error."""
+    channel, pb2, pb2_grpc, _, storage = action_validation_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    before = {r.run_id for r in storage.get_runs(limit=100)}
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.RunAction(
+            pb2.RunActionRequest(
+                action="purge",
+                selection=["feed"],
+                partition_key=pb2.ProtoPartitionKey(
+                    single=pb2.SinglePartitionKey(keys=["p1"])
+                ),
+            )
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "purge" in exc.value.details() and "feed" in exc.value.details()
+    assert {r.run_id for r in storage.get_runs(limit=100)} == before, (
+        "a rejected action must not leave a run record behind"
+    )
+
+
+def test_launch_backfill_action_rejects_empty_selection(action_validation_channel):
+    """Same opt-in rule as RunAction: an empty selection with a verb must not
+    read as "every asset declaring it" — a caller that computed an empty list
+    would fan a destructive verb across the whole code location, one child run
+    per partition."""
+    channel, pb2, pb2_grpc, _, storage = action_validation_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    before = {r.run_id for r in storage.get_runs(limit=100)}
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.LaunchBackfill(
+            pb2.LaunchBackfillRequest(
+                action="purge",
+                selection=[],
+                partition_keys=[
+                    pb2.ProtoPartitionKey(single=pb2.SinglePartitionKey(keys=["p1"]))
+                ],
+                failure_policy="continue",
+                max_concurrency=1,
+            )
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "selection" in exc.value.details()
+    assert {r.run_id for r in storage.get_runs(limit=100)} == before, (
+        "a rejected action backfill must not leave runs behind"
+    )
+
+
+def test_run_action_rejects_bad_partition_key(action_validation_channel):
+    """Same boundary, partition side: a key outside the asset's definition."""
+    channel, pb2, pb2_grpc, _, storage = action_validation_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    before = {r.run_id for r in storage.get_runs(limit=100)}
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.RunAction(
+            pb2.RunActionRequest(
+                action="purge",
+                selection=["events"],
+                partition_key=pb2.ProtoPartitionKey(
+                    single=pb2.SinglePartitionKey(keys=["nope"])
+                ),
+            )
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "nope" in exc.value.details()
+    assert {r.run_id for r in storage.get_runs(limit=100)} == before
+
+    # And a missing key on a partitioned selection is equally invalid.
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.RunAction(pb2.RunActionRequest(action="purge", selection=["events"]))
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "partition" in exc.value.details()
+
+
+def test_run_action_allows_keyless_observe_on_partitioned_observable(
+    action_validation_channel,
+):
+    """observe() is whole-asset, so the partition gate must not apply to it —
+    the carve-out the inline path had and the validation must preserve."""
+    channel, pb2, pb2_grpc, _, storage = action_validation_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    response = stub.RunAction(
+        pb2.RunActionRequest(action="observe", selection=["feed"])
+    )
+    assert response.success is True
+    assert response.run_id != ""
+
+
+@pytest.fixture
+def whole_asset_channel(grpc_stubs, storage):
+    """gRPC server (direct dispatch) over a partitioned `events` and an
+    unpartitioned `lookup`. Both define a `delete` with an Optional key whose
+    keyless run empties the table; `events` also has a Keyless `vacuum`. One
+    job per verb and asset. `rows` stands in for the tables' contents."""
+    rows = {"events": {"p1", "p2"}, "lookup": {"row"}}
+    vacuumed = []
+
+    def _delete(ctx):
+        if ctx.has_partition_key:
+            rows[ctx.asset_name].discard(ctx.partition_key)
+        else:
+            rows[ctx.asset_name].clear()
+
+    def _vacuum(ctx):
+        vacuumed.append(ctx.asset_name)
+
+    delete = rs.AssetAction(
+        name="delete",
+        outcome=rs.Outcome.Unmaterialize,
+        partitioning=rs.ActionPartitioning.Optional,
+    )(_delete)
+    vacuum = rs.AssetAction(
+        name="vacuum",
+        outcome=rs.Outcome.Unchanged,
+        partitioning=rs.ActionPartitioning.Keyless,
+    )(_vacuum)
+
+    @rs.Asset(
+        io_handler=rs.InMemoryIOHandler(),
+        actions=[delete, vacuum],
+        partitions_def=rs.PartitionsDefinition.static_(["p1", "p2"]),
+    )
+    def events():
+        return 1
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler(), actions=[delete])
+    def lookup():
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[events, lookup],
+        jobs=[
+            rs.Job(name="delete_events", assets=[events], action="delete"),
+            rs.Job(name="delete_lookup", assets=[lookup], action="delete"),
+            rs.Job(name="vacuum_events", assets=[events], action="vacuum"),
+        ],
+        default_executor=rs.Executor.in_process(),
+    )
+    repo.resolve(storage=storage)
+    port = repo._start_grpc_server("127.0.0.1", 0)
+
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+
+    pb2, pb2_grpc = grpc_stubs
+    yield pb2, pb2_grpc.CodeLocationServiceStub(channel), storage, rows, vacuumed
+    channel.close()
+    repo._stop_grpc_server()
+
+
+def _launch(pb2, stub, rpc, verb, asset, **fields):
+    """Run `verb` on `asset` through `rpc`: RunAction, or ExecuteJob of the
+    `<verb>_<asset>` job. Returns the run id."""
+    if rpc == "RunAction":
+        resp = stub.RunAction(
+            pb2.RunActionRequest(action=verb, selection=[asset], **fields)
+        )
+        assert resp.success, resp.error
+        return resp.run_id
+    return stub.ExecuteJob(
+        pb2.ExecuteJobRequest(job_name=f"{verb}_{asset}", action=verb, **fields)
+    ).run_id
+
+
+@pytest.mark.parametrize("rpc", ["RunAction", "ExecuteJob"])
+def test_keyless_optional_verb_on_partitioned_asset_needs_whole_asset(
+    whole_asset_channel, rpc
+):
+    """A UI that could not build a key (a pick emptied by a live refresh, a
+    job whose key windows do not overlap, definitions still loading) sent the
+    run keyless, and an Optional `delete` read that as the whole asset: every
+    row went. The whole asset is now an explicit choice."""
+    pb2, stub, storage, rows, _ = whole_asset_channel
+
+    with pytest.raises(grpc.RpcError) as exc:
+        _launch(pb2, stub, rpc, "delete", "events")
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert exc.value.details() == (
+        "ExecutionError: Action 'delete' without partition_key runs on every "
+        'partition of assets ["events"]. Pick a partition, or choose the whole '
+        "asset (whole_asset)."
+    )
+    assert rows["events"] == {"p1", "p2"}
+    assert storage.get_runs(limit=100) == [], "a rejected run must leave no record"
+
+    # A key scopes the run, as before.
+    run_id = _launch(
+        pb2,
+        stub,
+        rpc,
+        "delete",
+        "events",
+        partition_key=_single_partition_key(pb2, "p1"),
+    )
+    record = wait_for_run_terminal(storage, run_id, timeout=15)
+    assert record is not None and record.status == "Success"
+    assert rows["events"] == {"p2"}
+
+    # The explicit choice runs it on the whole asset.
+    run_id = _launch(pb2, stub, rpc, "delete", "events", whole_asset=True)
+    record = wait_for_run_terminal(storage, run_id, timeout=15)
+    assert record is not None and record.status == "Success"
+    assert (record.action, record.partition_key) == ("delete", None)
+    assert rows["events"] == set()
+
+
+@pytest.mark.parametrize("rpc", ["RunAction", "ExecuteJob"])
+def test_keyless_run_needs_no_whole_asset_choice_without_partition_scope(
+    whole_asset_channel, rpc
+):
+    """Falsifier: the choice is asked only where a missing key widens the run.
+    An unpartitioned asset has one scope, and a Keyless verb is whole-asset by
+    declaration."""
+    pb2, stub, storage, rows, vacuumed = whole_asset_channel
+
+    run_id = _launch(pb2, stub, rpc, "delete", "lookup")
+    record = wait_for_run_terminal(storage, run_id, timeout=15)
+    assert record is not None and record.status == "Success"
+    assert rows["lookup"] == set()
+
+    run_id = _launch(pb2, stub, rpc, "vacuum", "events")
+    record = wait_for_run_terminal(storage, run_id, timeout=15)
+    assert record is not None and record.status == "Success"
+    assert vacuumed == ["events"]
+    assert rows["events"] == {"p1", "p2"}
 
 
 def test_execute_job_with_run_queue_creates_queued_run(queued_grpc_channel):
@@ -650,13 +1051,17 @@ def backfill_grpc_channel(grpc_stubs, storage):
     """gRPC server with a partitioned asset for backfill tests."""
     handler = DictIOHandler()
     pd = rs.PartitionsDefinition.static_(["p1", "p2", "p3"])
+    compact = rs.AssetAction(name="compact", outcome=rs.Outcome.Unchanged)(
+        lambda ctx: None
+    )
 
-    @rs.Asset(io_handler=handler, partitions_def=pd)
+    @rs.Asset(io_handler=handler, partitions_def=pd, actions=[compact])
     def partitioned_asset(context: rs.AssetExecutionContext):
         return context.partition_key
 
     repo = rs.CodeRepository(
         assets=[partitioned_asset],
+        jobs=[rs.Job(name="compact_job", assets=[partitioned_asset], action="compact")],
         default_executor=rs.Executor.in_process(),
     )
     repo.resolve(storage=storage)
@@ -820,6 +1225,64 @@ def test_get_backfill_status(backfill_grpc_channel):
     )
     assert status.backfill_id == launch.backfill_id
     assert status.total_partitions == 2
+
+
+def test_get_backfill_status_carries_the_verb(backfill_grpc_channel):
+    """A client polling a purge must be able to tell it from a rebuild."""
+    channel, pb2, pb2_grpc, _, _ = backfill_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    def launch(**kw):
+        resp = stub.LaunchBackfill(
+            pb2.LaunchBackfillRequest(
+                selection=["partitioned_asset"],
+                partition_keys=[_single_partition_key(pb2, "p1")],
+                failure_policy="continue",
+                max_concurrency=1,
+                **kw,
+            )
+        )
+        return stub.GetBackfillStatus(
+            pb2.GetBackfillStatusRequest(backfill_id=resp.backfill_id)
+        )
+
+    assert launch(action="compact").action == "compact"
+    assert not launch().HasField("action")
+
+
+def test_job_backfill_records_the_jobs_verb(backfill_grpc_channel):
+    """The children of an action job's backfill run the job's verb, so the
+    record must name it: the condition cache's in-flight rule, the UI's
+    two-click replay and GetBackfillStatus all read it."""
+    channel, pb2, pb2_grpc, repo, _ = backfill_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    def status(backfill_id):
+        return stub.GetBackfillStatus(
+            pb2.GetBackfillStatusRequest(backfill_id=backfill_id)
+        )
+
+    launch = stub.LaunchBackfill(
+        pb2.LaunchBackfillRequest(
+            job_name="compact_job",
+            partition_keys=[
+                _single_partition_key(pb2, "p1"),
+                _single_partition_key(pb2, "p2"),
+            ],
+            failure_policy="continue",
+            max_concurrency=1,
+            action="compact",
+        )
+    )
+    assert status(launch.backfill_id).action == "compact"
+    assert repo.get_backfill(launch.backfill_id).action == "compact"
+
+    # A rerun replays the recorded verb, which the job still runs.
+    rerun = stub.RerunBackfill(
+        pb2.RerunBackfillRequest(backfill_id=launch.backfill_id, dry_run=False)
+    )
+    assert status(rerun.backfill_id).action == "compact"
+    assert repo.rerun_backfill(launch.backfill_id).num_partitions == 2
 
 
 def test_get_backfill_status_carries_launched_by(backfill_grpc_channel):
@@ -1113,6 +1576,97 @@ def test_rerun_run_job_reuses_partition(rerun_grpc_channel):
     # (`RunRequestData.tags` is unused), so the marker only lands on materialization reruns.
 
 
+def test_execute_job_action_records_the_verb(grpc_stubs, storage):
+    """A dispatched run of an action job records its verb — regression: the
+    record was written verbless, so the condition cache treated the run as a
+    materialization attempt and the UI showed no verb."""
+    calls = []
+    materialized = []
+
+    class Events(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+
+        @classmethod
+        def materialize(cls):
+            materialized.append("m")
+            return 1
+
+        @rs.action(outcome=rs.Outcome.Unchanged)
+        @classmethod
+        def compact(cls, ctx):
+            calls.append("c")
+
+    job = rs.Job(name="compact_job", assets=[Events], action="compact")
+    repo = rs.CodeRepository(
+        assets=[Events], jobs=[job], default_executor=rs.Executor.in_process()
+    )
+    repo.resolve(storage=storage)
+    port = repo._start_grpc_server("127.0.0.1", 0)
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+    pb2, pb2_grpc = grpc_stubs
+    try:
+        stub = pb2_grpc.CodeLocationServiceStub(channel)
+        resp = stub.ExecuteJob(
+            pb2.ExecuteJobRequest(job_name="compact_job", action="compact")
+        )
+        assert resp.run_id
+
+        record = wait_for_run_terminal(storage, resp.run_id, timeout=15)
+        assert record is not None and record.status == "Success"
+        assert record.action == "compact"
+        assert calls == ["c"]
+        assert materialized == [], "an action job must not run materialize"
+    finally:
+        channel.close()
+        repo._stop_grpc_server()
+
+
+def test_rerun_run_action_replays_the_action(grpc_stubs, storage):
+    """Rerunning an action run replays the ACTION — regression: the verb was
+    dropped from the rerun request and a rerun of e.g. `delete` silently
+    re-materialized the asset."""
+    calls = []
+    materialized = []
+
+    class Events(rs.Asset):
+        io_handler = rs.InMemoryIOHandler()
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext):
+            materialized.append("m")
+            return 1
+
+        @rs.action(outcome=rs.Outcome.Unchanged)
+        @classmethod
+        def compact(cls, ctx):
+            calls.append("c")
+
+    repo = rs.CodeRepository(assets=[Events], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+    port = repo._start_grpc_server("127.0.0.1", 0)
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+    pb2, pb2_grpc = grpc_stubs
+    try:
+        stub = pb2_grpc.CodeLocationServiceStub(channel)
+        original = repo.run_action("compact")
+        assert original.success
+        assert calls == ["c"]
+
+        rerun = stub.RerunRun(pb2.RerunRunRequest(run_id=original.run_id))
+        assert rerun.run_id != original.run_id
+
+        record = wait_for_run_terminal(storage, rerun.run_id, timeout=15)
+        assert record is not None and record.status == "Success"
+        assert record.action == "compact"
+        assert calls == ["c", "c"]
+        assert materialized == []
+    finally:
+        channel.close()
+        repo._stop_grpc_server()
+
+
 def test_rerun_run_not_found(rerun_grpc_channel):
     channel, pb2, pb2_grpc, _, _ = rerun_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)
@@ -1120,6 +1674,243 @@ def test_rerun_run_not_found(rerun_grpc_channel):
     with pytest.raises(grpc.RpcError) as exc_info:
         stub.RerunRun(pb2.RerunRunRequest(run_id="missing-id"))
     assert exc_info.value.code() == grpc.StatusCode.INTERNAL
+
+
+# ── A job's verb: launches name the one shown, reruns and pickups the recorded one ──
+
+
+def _nightly_repo(storage, rows, action, **repo_kwargs):
+    """A code location whose `nightly` job runs `action` (`None` materializes)
+    on a partitioned `events`. `rows` stands in for the table: materialize
+    adds the partition, the Optional-key `delete` removes it."""
+
+    def _delete(ctx):
+        rows.discard(ctx.partition_key)
+
+    delete = rs.AssetAction(
+        name="delete",
+        outcome=rs.Outcome.Unmaterialize,
+        partitioning=rs.ActionPartitioning.Optional,
+    )(_delete)
+
+    @rs.Asset(
+        io_handler=rs.InMemoryIOHandler(),
+        actions=[delete],
+        partitions_def=rs.PartitionsDefinition.static_(["p1", "p2"]),
+    )
+    def events(context: rs.AssetExecutionContext):
+        rows.add(context.partition_key)
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[events],
+        jobs=[rs.Job(name="nightly", assets=[events], action=action)],
+        default_executor=rs.Executor.in_process(),
+        **repo_kwargs,
+    )
+    repo.resolve(storage=storage)
+    return repo
+
+
+@contextlib.contextmanager
+def _serving(repo, grpc_stubs):
+    """`repo`'s gRPC server and a stub for it. Stopping the server waits for
+    the runs it launched."""
+    port = repo._start_grpc_server("127.0.0.1", 0)
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+    pb2, pb2_grpc = grpc_stubs
+    try:
+        yield pb2, pb2_grpc.CodeLocationServiceStub(channel)
+    finally:
+        channel.close()
+        repo._stop_grpc_server()
+
+
+def _shown(verb):
+    """Request fields naming `verb` as the one the caller showed."""
+    return {} if verb is None else {"action": verb}
+
+
+def _nightly_backfill(pb2, **fields):
+    return pb2.LaunchBackfillRequest(
+        job_name="nightly",
+        partition_keys=[
+            _single_partition_key(pb2, "p1"),
+            _single_partition_key(pb2, "p2"),
+        ],
+        failure_policy="continue",
+        max_concurrency=1,
+        **fields,
+    )
+
+
+@pytest.mark.parametrize("queued", [False, True], ids=["direct", "queued"])
+@pytest.mark.parametrize(
+    "shown, verb",
+    [(None, "delete"), ("delete", None)],
+    ids=["not-loaded", "redeployed"],
+)
+def test_execute_job_refuses_a_verb_the_caller_did_not_show(
+    grpc_stubs, storage, queued, shown, verb
+):
+    """The job pages chose the dialog, warning and confirm from the UI's copy
+    of the job's verb, but ExecuteJob named only the job and the server ran
+    the job's current verb. A page still loading the job, or loaded before a
+    redeploy, deleted with one click and no confirm. The request now names the
+    verb the caller showed, and another verb is refused before a run exists."""
+    rows = {"p1", "p2"}
+    queue = (
+        {"run_queue": rs.RunQueueConfig(max_concurrent_runs=2, dequeue_interval="50ms")}
+        if queued
+        else {}
+    )
+    repo = _nightly_repo(storage, rows, verb, **queue)
+    with _serving(repo, grpc_stubs) as (pb2, stub):
+        key = _single_partition_key(pb2, "p1")
+        with pytest.raises(grpc.RpcError) as exc:
+            stub.ExecuteJob(
+                pb2.ExecuteJobRequest(
+                    job_name="nightly", partition_key=key, **_shown(shown)
+                )
+            )
+        assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert exc.value.details() == (
+            f"ExecutionError: job 'nightly' now runs '{verb or 'materialize'}', "
+            f"not '{shown or 'materialize'}'; reload the page"
+        )
+        assert storage.get_runs(limit=100) == []
+        assert rows == {"p1", "p2"}
+
+        run_id = stub.ExecuteJob(
+            pb2.ExecuteJobRequest(job_name="nightly", partition_key=key, **_shown(verb))
+        ).run_id
+        if not queued:
+            wait_for_run_terminal(storage, run_id, timeout=15)
+
+    record = storage.get_run(run_id)
+    assert (record.action, record.status) == (verb, "Queued" if queued else "Success")
+    assert rows == ({"p2"} if verb == "delete" and not queued else {"p1", "p2"})
+
+
+@pytest.mark.parametrize(
+    "shown, verb",
+    [(None, "delete"), ("delete", None)],
+    ids=["not-loaded", "redeployed"],
+)
+def test_job_backfill_refuses_a_verb_the_caller_did_not_show(
+    grpc_stubs, storage, shown, verb
+):
+    """The job dialog backfills more than two keys. Like ExecuteJob, the
+    backfill named only the job, and its children ran the job's current verb."""
+    rows = {"p1", "p2"}
+    repo = _nightly_repo(storage, rows, verb)
+    with _serving(repo, grpc_stubs) as (pb2, stub):
+        with pytest.raises(grpc.RpcError) as exc:
+            stub.LaunchBackfill(_nightly_backfill(pb2, **_shown(shown)))
+        assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert exc.value.details() == (
+            f"ExecutionError: job 'nightly' now runs '{verb or 'materialize'}', "
+            f"not '{shown or 'materialize'}'; reload the page"
+        )
+
+        launch = stub.LaunchBackfill(_nightly_backfill(pb2, **_shown(verb)))
+
+    repo.execute_backfill(launch.backfill_id)
+    status = repo.get_backfill(launch.backfill_id)
+    assert (status.status, status.action) == ("CompletedSuccess", verb)
+    assert [r.action for r in storage.get_runs(limit=100)] == [verb, verb]
+    assert rows == (set() if verb == "delete" else {"p1", "p2"})
+
+
+@pytest.mark.parametrize("rerun", ["RerunBackfill", "rerun_backfill"])
+def test_backfill_rerun_refuses_a_job_whose_verb_changed(grpc_stubs, storage, rerun):
+    """A rerun replayed a job backfill by the job's name, so it ran the job's
+    verb as it is now, while the backfill page confirmed (or did not confirm)
+    the recorded one. After a redeploy turned `nightly` into a delete, one
+    click on a materialize backfill's "Re-execute" deleted every partition.
+    A rerun runs the recorded verb or nothing."""
+    rows = set()
+    original = _nightly_repo(storage, rows, None)
+    with _serving(original, grpc_stubs) as (pb2, stub):
+        launch = stub.LaunchBackfill(_nightly_backfill(pb2))
+    original.execute_backfill(launch.backfill_id)
+    assert rows == {"p1", "p2"}
+
+    redeployed = _nightly_repo(storage, rows, "delete")
+    if rerun == "RerunBackfill":
+        with _serving(redeployed, grpc_stubs) as (pb2, stub):
+            with pytest.raises(grpc.RpcError) as exc:
+                stub.RerunBackfill(
+                    pb2.RerunBackfillRequest(backfill_id=launch.backfill_id)
+                )
+        message = exc.value.details()
+    else:
+        with pytest.raises(ExecutionError) as exc:
+            redeployed.rerun_backfill(launch.backfill_id)
+        message = str(exc.value)
+    assert "job 'nightly' now runs 'delete', not 'materialize'" in message
+    assert rows == {"p1", "p2"}
+    assert len(storage.get_runs(limit=100)) == 2, "only the original backfill's runs"
+
+
+def test_run_rerun_refuses_a_job_whose_verb_changed(grpc_stubs, storage):
+    """ "Retry from" replayed a job run by the job's name. A run of a
+    materialize job, retried after a redeploy to `action="delete"`, deleted
+    its partition on the first click. The rerun runs the recorded verb or
+    nothing."""
+    rows = set()
+    original = _nightly_repo(storage, rows, None)
+    with _serving(original, grpc_stubs) as (pb2, stub):
+        run_id = stub.ExecuteJob(
+            pb2.ExecuteJobRequest(
+                job_name="nightly", partition_key=_single_partition_key(pb2, "p1")
+            )
+        ).run_id
+        record = wait_for_run_terminal(storage, run_id, timeout=15)
+        assert record is not None and record.status == "Success"
+    assert rows == {"p1"}
+
+    redeployed = _nightly_repo(storage, rows, "delete")
+    with _serving(redeployed, grpc_stubs) as (pb2, stub):
+        with pytest.raises(grpc.RpcError) as exc:
+            stub.RerunRun(pb2.RerunRunRequest(run_id=run_id))
+    assert "job 'nightly' now runs 'delete', not 'materialize'" in exc.value.details()
+    assert rows == {"p1"}
+    assert [r.run_id for r in storage.get_runs(limit=100)] == [run_id]
+
+
+@pytest.mark.parametrize("pickup", ["execute_backfill", "execute_backfill_queued"])
+def test_job_backfill_pickup_refuses_a_job_whose_verb_changed(
+    grpc_stubs, storage, pickup
+):
+    """A job backfill still Requested at a redeploy was picked up by the new
+    code, and its children ran the job's new verb while the record, the UI
+    and the condition cache read a materialize backfill. The pickup fails the
+    backfill instead."""
+    rows = {"p1", "p2"}
+    original = _nightly_repo(storage, rows, None)
+    with _serving(original, grpc_stubs) as (pb2, stub):
+        launch = stub.LaunchBackfill(_nightly_backfill(pb2))
+
+    queue = (
+        {"run_queue": rs.RunQueueConfig(max_concurrent_runs=2, dequeue_interval="50ms")}
+        if pickup == "execute_backfill_queued"
+        else {}
+    )
+    redeployed = _nightly_repo(storage, rows, "delete", **queue)
+    message = "job 'nightly' now runs 'delete', not 'materialize'"
+    with pytest.raises(ExecutionError, match=re.escape(message)):
+        getattr(redeployed, pickup)(launch.backfill_id)
+
+    status = redeployed.get_backfill(launch.backfill_id)
+    assert (status.status, status.error, status.run_ids) == (
+        "CompletedFailed",
+        f"ExecutionError: {message}",
+        [],
+    )
+    assert storage.get_runs(limit=100) == []
+    assert rows == {"p1", "p2"}
 
 
 # ── materialize_missing ──

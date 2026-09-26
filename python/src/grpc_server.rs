@@ -124,7 +124,7 @@ impl CodeLocationService for CodeLocationImpl {
             let sel = req.selection;
             self.handle
                 .validate_assets_exist(&sel)
-                .map_err(|e| Status::internal(e.to_string()))?;
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
             sel
         };
 
@@ -137,7 +137,7 @@ impl CodeLocationService for CodeLocationImpl {
         self.handle
             .validate_partition_for_selection(&asset_selection, pk.as_ref())
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         let mat_request = crate::daemon::MaterializationRequestData {
             run_id: uuid::Uuid::new_v4().to_string(),
@@ -145,6 +145,7 @@ impl CodeLocationService for CodeLocationImpl {
             partition_key: pk_core,
             tags,
             launched_by,
+            action: None,
         };
         let run_id = mat_request.run_id.clone();
         let status = self.run_dispatcher.mode_label().to_string();
@@ -176,13 +177,23 @@ impl CodeLocationService for CodeLocationImpl {
                 req.job_name
             )));
         }
+        let shown = req.action.filter(|a| !a.is_empty());
+        self.handle
+            .validate_job_verb(&req.job_name, shown.as_deref())
+            .map_err(|e| Status::invalid_argument(format!("{e}; reload the page")))?;
+        let partition_key = req
+            .partition_key
+            .map(proto_partition_key_to_py)
+            .transpose()?;
+        if partition_key.is_none() && !req.whole_asset {
+            self.handle
+                .validate_keyless_job(&req.job_name)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        }
         let run_request = crate::daemon::RunRequestData {
             run_key: None,
             tags: None,
-            partition_key: req
-                .partition_key
-                .map(proto_partition_key_to_py)
-                .transpose()?,
+            partition_key,
             job_name: Some(req.job_name),
             launched_by,
         };
@@ -364,6 +375,20 @@ impl CodeLocationService for CodeLocationImpl {
                             None
                         };
 
+                    let actions = node
+                        .list_actions()
+                        .into_iter()
+                        .map(
+                            |(name, outcome, exclusive, partitioning, description)| ActionInfo {
+                                name,
+                                outcome,
+                                exclusive,
+                                partitioning,
+                                description,
+                            },
+                        )
+                        .collect();
+
                     assets.push(AssetDefinitionInfo {
                         asset_key: name.clone(),
                         description: None,
@@ -378,6 +403,7 @@ impl CodeLocationService for CodeLocationImpl {
                         group: node.group(),
                         code_version: node.code_version(),
                         asset_type: node.asset_type().to_string(),
+                        actions,
                     });
                 }
 
@@ -471,6 +497,7 @@ impl CodeLocationService for CodeLocationImpl {
                     name: j.name,
                     asset_selection: j.node_names,
                     executor_type,
+                    action: j.action,
                 }
             })
             .collect();
@@ -524,24 +551,96 @@ impl CodeLocationService for CodeLocationImpl {
         Ok(Response::new(resp))
     }
 
-    #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.observe_asset")]
-    async fn observe_asset(
+    #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.run_action")]
+    async fn run_action(
         &self,
-        request: Request<ObserveAssetRequest>,
-    ) -> Result<Response<ObserveAssetResponse>, Status> {
+        request: Request<RunActionRequest>,
+    ) -> Result<Response<RunActionResponse>, Status> {
         let req = request.into_inner();
-        let resp = self
-            .run_on_python(move |py, repo| {
-                repo.get()
-                    .observe(py, Some(vec![req.asset_key]))
-                    .map_err(|e| e.to_string())?;
-                Ok(ObserveAssetResponse {
-                    success: true,
-                    error: None,
-                })
-            })
-            .await?;
-        Ok(Response::new(resp))
+        let pk = req
+            .partition_key
+            .map(proto_partition_key_to_py)
+            .transpose()?;
+        let tags = proto_tags_to_pairs(req.tags).unwrap_or_default();
+        let launched_by = manual_launch(req.user);
+
+        // An action selection is resolved here rather than left empty: the
+        // dispatcher hands the request to the run queue (and, on Kubernetes, to
+        // a Run CR), which needs the asset list up front. Fanning out is opt-in:
+        // `repeated` has no presence, so a bare empty list is a caller bug, not
+        // a request to run a destructive verb across the code location.
+        if !req.all_assets && req.selection.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "RunAction '{}' needs a non-empty selection, or all_assets to \
+                 target every asset declaring it",
+                req.action
+            )));
+        }
+        let asset_selection = if req.selection.is_empty() {
+            // Reads the action table cached at resolve.
+            self.handle
+                .assets_supporting_action(&req.action)
+                .map_err(|e| Status::internal(e.to_string()))?
+        } else {
+            let sel = req.selection;
+            // Resolves the selection too — unknown assets fail here with the
+            // same message a bare existence check produced. Without the verb
+            // check an existing asset came back as success plus a run_id for
+            // a run that can only fail at plan build.
+            self.handle
+                .validate_assets_support_action(&sel, &req.action)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            sel
+        };
+        if asset_selection.is_empty() {
+            return Err(Status::not_found(format!(
+                "no assets define action '{}'",
+                req.action
+            )));
+        }
+
+        // Same boundary rule as `materialize`: the dispatcher trusts its caller,
+        // so an unknown asset or a bad partition key has to be rejected here or
+        // it surfaces asynchronously against a run_id the caller already holds.
+        self.handle
+            .validate_partition_for_action(&asset_selection, pk.as_ref(), &req.action)
+            .await
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        if pk.is_none() && !req.whole_asset {
+            self.handle
+                .validate_keyless_action(&asset_selection, &req.action)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        }
+
+        let action_request = crate::daemon::MaterializationRequestData {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            asset_selection,
+            partition_key: pk.as_ref().map(|k| k.into()),
+            tags,
+            launched_by,
+            action: Some(req.action),
+        };
+        let run_id = action_request.run_id.clone();
+
+        let mut outcome = self
+            .run_dispatcher
+            .dispatch_materialization(&[action_request])
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        if let Some(err) = outcome.errors.pop() {
+            return Ok(Response::new(RunActionResponse {
+                run_id: String::new(),
+                success: false,
+                error: Some(err.to_string()),
+            }));
+        }
+
+        Ok(Response::new(RunActionResponse {
+            run_id,
+            success: true,
+            error: None,
+        }))
     }
 
     #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.launch_backfill")]
@@ -550,6 +649,16 @@ impl CodeLocationService for CodeLocationImpl {
         request: Request<LaunchBackfillRequest>,
     ) -> Result<Response<LaunchBackfillResponse>, Status> {
         let req = request.into_inner();
+        // Same opt-in rule as `run_action`: `repeated` has no presence, so an
+        // empty selection with a verb is a caller bug, not a request to fan a
+        // destructive action across the code location.
+        if let Some(verb) = &req.action {
+            if req.job_name.is_none() && req.selection.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "backfill with action '{verb}' needs a non-empty selection"
+                )));
+            }
+        }
         let partition_keys = match empty_to_none(req.partition_keys) {
             Some(ks) => Some(
                 ks.into_iter()
@@ -571,6 +680,17 @@ impl CodeLocationService for CodeLocationImpl {
         let tags = proto_tags_to_pairs(req.tags)
             .map(|pairs| pairs.into_iter().collect::<HashMap<String, String>>());
 
+        // For a Job target, `action` is the verb the caller showed for the job.
+        let action = match &req.job_name {
+            Some(name) => {
+                let shown = req.action.filter(|a| !a.is_empty());
+                self.handle
+                    .validate_job_verb(name, shown.as_deref())
+                    .map_err(|e| Status::invalid_argument(format!("{e}; reload the page")))?;
+                shown
+            }
+            None => req.action,
+        };
         let target = match req.job_name {
             Some(name) => crate::daemon::RunType::Job(name),
             None => crate::daemon::RunType::Materialization(req.selection),
@@ -586,6 +706,7 @@ impl CodeLocationService for CodeLocationImpl {
             dry_run: req.dry_run,
             backfill_id: None,
             launched_by: manual_launch(req.user),
+            action,
         };
 
         let mut outcome = self
@@ -713,6 +834,7 @@ impl CodeLocationService for CodeLocationImpl {
                     launched_by_kind,
                     launched_by_name,
                     launched_by_user,
+                    action: s.action,
                 }))
             }
             None => Err(Status::not_found(format!(

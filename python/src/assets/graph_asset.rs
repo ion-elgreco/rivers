@@ -48,8 +48,11 @@ pub struct GraphAsset {
     /// The final task whose output becomes the graph asset's output.
     /// Derived from the graph function's return value during composition.
     pub final_node: Option<String>,
+    /// Named actions on the graph's persisted output. Actions never
+    /// re-run the composition; internal task intermediates are not targets.
+    pub actions: Vec<Py<super::action::PyAssetAction>>,
 }
 
 /// Python-exposed marker subclass created via `Asset.from_graph(...)`.
-#[pyclass(name = "GraphAsset", extends=PyAsset, module = "rivers._core")]
+#[pyclass(name = "GraphAsset", extends=PyAsset, subclass, module = "rivers._core")]
 pub struct PyGraphAsset;

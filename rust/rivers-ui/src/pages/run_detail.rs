@@ -13,8 +13,8 @@ use crate::helpers::{
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::now::use_now;
-use crate::server_fns::actions::{cancel_run, delete_run, rerun_run};
 use crate::server_fns::locations::list_code_locations;
+use crate::server_fns::mutations::{cancel_run, delete_run, rerun_run};
 use crate::server_fns::runs::{
     get_run, get_run_asset_events_page, get_run_logs, get_run_step_events,
     get_run_structured_events_page,
@@ -158,11 +158,15 @@ pub fn RunDetailPage() -> impl IntoView {
     // reset it. Reset only when the selected asset or the run changes.
     let (mat_page, set_mat_page) = signal(0u64);
     let (obs_page, set_obs_page) = signal(0u64);
+    let (act_page, set_act_page) = signal(0u64);
+    let (del_page, set_del_page) = signal(0u64);
     Effect::new(move |_| {
         selected_step.track();
         run_id_memo.track();
         set_mat_page.set(0);
         set_obs_page.set(0);
+        set_act_page.set(0);
+        set_del_page.set(0);
     });
     let (log_tab, set_log_tab) = signal("events".to_string());
     let (log_level, set_log_level) = signal("all".to_string());
@@ -176,6 +180,7 @@ pub fn RunDetailPage() -> impl IntoView {
         async move { rerun_run(run_id).await }
     });
     let reexecute_pending = reexecute.pending();
+    let reexecute_armed = RwSignal::new(false);
 
     let cancel = Action::new(move |id: &String| {
         let id = id.clone();
@@ -193,6 +198,7 @@ pub fn RunDetailPage() -> impl IntoView {
     Effect::new(move |_| {
         run_id_memo.track();
         delete_armed.set(false);
+        reexecute_armed.set(false);
     });
     // A deleted run has no page to stay on — back to the list. Ok(false)
     // means the run was already gone, which lands in the same place.
@@ -218,6 +224,8 @@ pub fn RunDetailPage() -> impl IntoView {
                 run.get().map(|result| match result {
                     Ok(Some(record)) => {
                         let rerun_run_id = record.run_id.clone();
+                        let rerun_verb = record.action.clone();
+                        let rerun_verb_text = rerun_verb.clone();
                         let status_kind = run_status_kind(&record.status);
                         let sid = short_id(&record.run_id, 8);
                         let is_active_status = crate::helpers::run_is_active(&record.status);
@@ -258,13 +266,28 @@ pub fn RunDetailPage() -> impl IntoView {
                                 </button>
                                 <button
                                     class="btn btn-tertiary"
-                                    on:click=move |_| { reexecute.dispatch(rerun_run_id.clone()); }
+                                    on:click=move |_| {
+                                        let (dispatch, armed) = crate::helpers::replay_click(
+                                            rerun_verb.is_some(),
+                                            reexecute_armed.get(),
+                                        );
+                                        reexecute_armed.set(armed);
+                                        if dispatch {
+                                            reexecute.dispatch(rerun_run_id.clone());
+                                        }
+                                    }
                                     disabled=move || reexecute_pending.get()
                                 >
                                     <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
                                         <path d="M12 7a5 5 0 11-1.5-3.5M12 1.5V4H9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
                                     </svg>
-                                    {move || if reexecute_pending.get() { "Retrying..." } else { "Retry from" }}
+                                    {move || crate::helpers::replay_button_text(
+                                        rerun_verb_text.as_deref(),
+                                        "Retry from",
+                                        reexecute_armed.get(),
+                                        reexecute_pending.get(),
+                                        "Retrying...",
+                                    )}
                                 </button>
                                 {is_active_status.then(|| {
                                     let cancel_id = record.run_id.clone();
@@ -326,6 +349,11 @@ pub fn RunDetailPage() -> impl IntoView {
                                 }</div>
                                 <div class="run-trigger-meta">
                                     <StatusChip kind=status_kind.to_string()/>
+                                    {record.action.clone().map(|verb| view! {
+                                        <span class="run-trigger-meta-item" title="asset action">
+                                            "action "<span class="run-trigger-meta-value">{verb}</span>
+                                        </span>
+                                    })}
                                     <span class="run-trigger-meta-item" title=format_relative_time(record.start_time, jiff::Timestamp::now().as_second())>{format_timestamp(Some(record.start_time))}</span>
                                     <span class="run-trigger-meta-sep">"·"</span>
                                     <span class="run-trigger-meta-item">"elapsed "<span class="run-trigger-meta-value">{elapsed_label}</span></span>
@@ -434,6 +462,10 @@ pub fn RunDetailPage() -> impl IntoView {
                             set_mat_page=set_mat_page
                             obs_page=obs_page
                             set_obs_page=set_obs_page
+                            act_page=act_page
+                            set_act_page=set_act_page
+                            del_page=del_page
+                            set_del_page=set_del_page
                             on_close=set_selected_step
                         />
                     })
@@ -531,7 +563,7 @@ fn asset_chip_status(asset_events: &[StoredEvent]) -> (&'static str, &'static st
 /// Event log lives in the main LogPanel below — selection filters it, so we
 /// don't duplicate here.
 #[component]
-fn RunAssetDrawer(
+pub fn RunAssetDrawer(
     asset_key: String,
     run_id: String,
     step_events: Vec<StoredEvent>,
@@ -540,6 +572,10 @@ fn RunAssetDrawer(
     set_mat_page: WriteSignal<u64>,
     obs_page: ReadSignal<u64>,
     set_obs_page: WriteSignal<u64>,
+    act_page: ReadSignal<u64>,
+    set_act_page: WriteSignal<u64>,
+    del_page: ReadSignal<u64>,
+    set_del_page: WriteSignal<u64>,
     on_close: WriteSignal<Option<String>>,
 ) -> impl IntoView {
     // Status/timing from this asset's step events; materializations paginated below.
@@ -637,6 +673,54 @@ fn RunAssetDrawer(
             },
         )
     };
+    // Action runs report through ActionCompleted events — without this third
+    // card the metadata an action attaches is unreachable from the run page.
+    let (act_page_size, set_act_page_size) = signal(25u64);
+    let actions_page = {
+        let run_id = run_id.clone();
+        let asset_key = asset_key.clone();
+        Resource::new(
+            move || (act_page.get(), act_page_size.get()),
+            move |(p, ps)| {
+                let run_id = run_id.clone();
+                let asset_key = asset_key.clone();
+                async move {
+                    get_run_asset_events_page(
+                        run_id,
+                        asset_key,
+                        "ActionCompleted".to_string(),
+                        p * ps,
+                        ps,
+                    )
+                    .await
+                }
+            },
+        )
+    };
+    // A delete run's only asset event is its Deletion.
+    let (del_page_size, set_del_page_size) = signal(25u64);
+    let deletions_page = {
+        let run_id = run_id.clone();
+        let asset_key = asset_key.clone();
+        Resource::new(
+            move || (del_page.get(), del_page_size.get()),
+            move |(p, ps)| {
+                let run_id = run_id.clone();
+                let asset_key = asset_key.clone();
+                async move {
+                    get_run_asset_events_page(run_id, asset_key, "Deletion".to_string(), p * ps, ps)
+                        .await
+                }
+            },
+        )
+    };
+    let del_total = Signal::derive(move || {
+        deletions_page
+            .get()
+            .and_then(|r| r.ok())
+            .map(|p| p.total)
+            .unwrap_or(0)
+    });
     let mat_total = Signal::derive(move || {
         materializations_page
             .get()
@@ -646,6 +730,13 @@ fn RunAssetDrawer(
     });
     let obs_total = Signal::derive(move || {
         observations_page
+            .get()
+            .and_then(|r| r.ok())
+            .map(|p| p.total)
+            .unwrap_or(0)
+    });
+    let act_total = Signal::derive(move || {
+        actions_page
             .get()
             .and_then(|r| r.ok())
             .map(|p| p.total)
@@ -688,7 +779,7 @@ fn RunAssetDrawer(
                     </div>
                     <div class="run-asset-drawer-kv">
                         <div class="run-asset-drawer-kv-label">"EVENTS"</div>
-                        <div class="run-asset-drawer-kv-value">{move || (mat_total.get() + obs_total.get() + step_count).to_string()}</div>
+                        <div class="run-asset-drawer-kv-value">{move || (mat_total.get() + obs_total.get() + act_total.get() + del_total.get() + step_count).to_string()}</div>
                     </div>
                     <div class="run-asset-drawer-kv">
                         <div class="run-asset-drawer-kv-label">"UPSTREAM"</div>
@@ -702,6 +793,18 @@ fn RunAssetDrawer(
                         <div class="run-asset-drawer-kv-label">"OBSERVATIONS"</div>
                         <div class="run-asset-drawer-kv-value">{move || obs_total.get().to_string()}</div>
                     </div>
+                    <Show when={move || act_total.get() > 0}>
+                        <div class="run-asset-drawer-kv">
+                            <div class="run-asset-drawer-kv-label">"ACTIONS"</div>
+                            <div class="run-asset-drawer-kv-value">{move || act_total.get().to_string()}</div>
+                        </div>
+                    </Show>
+                    <Show when={move || del_total.get() > 0}>
+                        <div class="run-asset-drawer-kv">
+                            <div class="run-asset-drawer-kv-label">"DELETIONS"</div>
+                            <div class="run-asset-drawer-kv-value">{move || del_total.get().to_string()}</div>
+                        </div>
+                    </Show>
                 </div>
             </div>
 
@@ -748,6 +851,38 @@ fn RunAssetDrawer(
                         set_page_size=set_obs_page_size
                         render={move |rows: Vec<crate::types::StoredEvent>| view! {
                             <div class="run-asset-drawer-materializations">{render_event_cards(rows, "observation")}</div>
+                        }.into_any()}
+                    />
+                </div>
+            </Show>
+
+            <Show when={move || act_total.get() > 0}>
+                <div class="run-asset-drawer-section">
+                    <div class="section-header-label" style="margin-bottom:8px">"ACTION"</div>
+                    <PaginatedView
+                        data=actions_page
+                        page=act_page
+                        set_page=set_act_page
+                        page_size=act_page_size
+                        set_page_size=set_act_page_size
+                        render={move |rows: Vec<crate::types::StoredEvent>| view! {
+                            <div class="run-asset-drawer-materializations">{render_event_cards(rows, "action")}</div>
+                        }.into_any()}
+                    />
+                </div>
+            </Show>
+
+            <Show when={move || del_total.get() > 0}>
+                <div class="run-asset-drawer-section">
+                    <div class="section-header-label" style="margin-bottom:8px">"DELETION"</div>
+                    <PaginatedView
+                        data=deletions_page
+                        page=del_page
+                        set_page=set_del_page
+                        page_size=del_page_size
+                        set_page_size=set_del_page_size
+                        render={move |rows: Vec<crate::types::StoredEvent>| view! {
+                            <div class="run-asset-drawer-materializations">{render_event_cards(rows, "deletion")}</div>
                         }.into_any()}
                     />
                 </div>
@@ -1068,6 +1203,8 @@ fn event_type_label(evt: &StoredEvent) -> &'static str {
         EventType::StepSlotWaiting => "SLOT_WAITING",
         EventType::StepSlotRenewed => "SLOT_RENEWED",
         EventType::StepSlotReleased => "SLOT_RELEASED",
+        EventType::ActionCompleted => "ACTION_COMPLETED",
+        EventType::Deletion => "DELETION",
     }
 }
 
@@ -1084,6 +1221,8 @@ fn event_row_class(evt: &StoredEvent) -> &'static str {
         EventType::StepSlotClaimed | EventType::StepSlotReleased => "log-row--info",
         EventType::StepSlotWaiting => "log-row--warn",
         EventType::StepSlotRenewed => "log-row--muted",
+        EventType::ActionCompleted => "log-row--success",
+        EventType::Deletion => "log-row--warn",
     }
 }
 
@@ -1153,6 +1292,20 @@ fn event_info(evt: &StoredEvent) -> String {
         }
         EventType::StepSlotRenewed => "Lease renewed".to_string(),
         EventType::StepSlotReleased => "Released pool slots".to_string(),
+        EventType::ActionCompleted => {
+            let action = metadata_value(evt, "action");
+            format!(
+                "Action completed{}",
+                action.map(|a| format!(" ({a})")).unwrap_or_default()
+            )
+        }
+        EventType::Deletion => {
+            let action = metadata_value(evt, "action");
+            format!(
+                "Materialization state cleared{}",
+                action.map(|a| format!(" ({a})")).unwrap_or_default()
+            )
+        }
     }
 }
 

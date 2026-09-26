@@ -1,11 +1,11 @@
 //! Leptos server functions for data fetching and write actions.
 
-pub mod actions;
 pub mod assets;
 pub mod automation;
 pub mod backfills;
 pub mod graph;
 pub mod locations;
+pub mod mutations;
 pub mod overview;
 pub mod pools;
 pub mod runs;

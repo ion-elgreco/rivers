@@ -2,7 +2,7 @@
 
 import rivers as rs
 
-from _helpers import DictIOHandler
+from _helpers import DictIOHandler, observation_metadata
 
 
 # ── Output basics ──────────────────────────────────────────────────────
@@ -210,8 +210,9 @@ def test_observation_from_observe_fn():
     repo = rs.CodeRepository(assets=[source])
     result = repo.observe()
 
-    assert "source" in result
-    assert result["source"]["row_count"].raw_value() == 42
+    assert result.success
+    meta = observation_metadata(repo)
+    assert meta["source"]["row_count"] == 42
 
 
 def test_observation_metadata_merges_with_context():
@@ -228,10 +229,10 @@ def test_observation_metadata_merges_with_context():
     repo = rs.CodeRepository(assets=[source])
     result = repo.observe()
 
-    assert "source" in result
-    meta = result["source"]
-    assert meta["from_ctx"].raw_value() == "ctx"
-    assert meta["from_obs"].raw_value() == "obs"
+    assert result.success
+    meta = observation_metadata(repo)["source"]
+    assert meta["from_ctx"] == "ctx"
+    assert meta["from_obs"] == "obs"
 
 
 def test_observation_emits_storage_event(storage):

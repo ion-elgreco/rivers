@@ -127,13 +127,14 @@ fn collect_output_deps(
     py: Python,
     pd: &mut ProcessedDeps,
     asset_def: &AssetDef,
+    output_name: &str,
 ) -> PyResult<(Vec<String>, Option<PartitionMappingDict>)> {
     let mut dep_only_names: Vec<String> = Vec::new();
     let mut dep_pms: HashMap<String, PartitionMapping> = HashMap::new();
     for raw_dep in &asset_def.deps {
         let d = raw_dep.get();
         if d.is_input {
-            merge_input_dep(py, pd, d, &asset_def.name)?;
+            merge_input_dep(py, pd, d, output_name)?;
             continue;
         }
         if !dep_only_names.contains(&d.name) {
@@ -146,13 +147,13 @@ fn collect_output_deps(
                 return Err(AssetDefinitionError::new_err(format!(
                     "Multi-asset output '{}': dep '{}' declared with \
                      conflicting partition_mappings on the same AssetDef.",
-                    asset_def.name, d.name,
+                    output_name, d.name,
                 )));
             }
             dep_pms.insert(d.name.clone(), pm.clone());
         }
     }
-    let partition_mapping = merge_partition_mappings(asset_def, &dep_pms)?;
+    let partition_mapping = merge_partition_mappings(asset_def, &dep_pms, output_name)?;
     Ok((dep_only_names, partition_mapping))
 }
 
@@ -163,6 +164,7 @@ fn collect_output_deps(
 fn merge_partition_mappings(
     asset_def: &AssetDef,
     dep_pms: &HashMap<String, PartitionMapping>,
+    output_name: &str,
 ) -> PyResult<Option<PartitionMappingDict>> {
     if dep_pms.is_empty() {
         return Ok(asset_def.partition_mapping.clone());
@@ -180,12 +182,55 @@ fn merge_partition_mappings(
                 "Multi-asset output '{}': dep '{}' has a partition_mapping \
                  from `deps=` that conflicts with the entry in \
                  `partition_mapping=`.",
-                asset_def.name, k,
+                output_name, k,
             )));
         }
         merged.insert(k.clone(), v.clone());
     }
     Ok(Some(PartitionMappingDict(merged)))
+}
+
+/// Every listed action must be bound to a function and names must be unique.
+fn validate_actions(
+    py: Python,
+    actions: &[Py<super::action::PyAssetAction>],
+    asset_desc: &str,
+) -> PyResult<()> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for a in actions {
+        let a = a.borrow(py);
+        if a.func.is_none() {
+            return Err(AssetDefinitionError::new_err(format!(
+                "asset '{asset_desc}': action '{}' has no function — apply the \
+                 AssetAction as a decorator to its body first",
+                a.name
+            )));
+        }
+        if !seen.insert(a.name.clone()) {
+            return Err(AssetDefinitionError::new_err(format!(
+                "asset '{asset_desc}': duplicate action '{}'",
+                a.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Per-output actions for one multi-asset output: top-level actions plus the
+/// output's own, the latter overriding same-name entries.
+fn merge_output_actions(
+    py: Python,
+    top_level: &[Py<super::action::PyAssetAction>],
+    per_def: &[Py<super::action::PyAssetAction>],
+) -> Vec<Py<super::action::PyAssetAction>> {
+    let def_names: std::collections::HashSet<String> =
+        per_def.iter().map(|a| a.borrow(py).name.clone()).collect();
+    top_level
+        .iter()
+        .filter(|a| !def_names.contains(&a.borrow(py).name))
+        .chain(per_def.iter())
+        .map(|a| a.clone_ref(py))
+        .collect()
 }
 
 fn validate_input_dep_names(
@@ -301,9 +346,10 @@ fn io_handler_eq(py: Python, a: Option<&IOHandler>, b: Option<&IOHandler>) -> bo
     match (a, b) {
         (None, None) => true,
         (Some(IOHandler::ResourceRef(a)), Some(IOHandler::ResourceRef(b))) => a == b,
-        (Some(IOHandler::Instance(a)), Some(IOHandler::Instance(b))) => {
-            a.bind(py).eq(b.bind(py)).unwrap_or(false)
-        }
+        (
+            Some(IOHandler::Instance(a) | IOHandler::Resource(a)),
+            Some(IOHandler::Instance(b) | IOHandler::Resource(b)),
+        ) => a.bind(py).eq(b.bind(py)).unwrap_or(false),
         _ => false,
     }
 }
@@ -388,6 +434,14 @@ pub fn normalize_pool(
                 "pool key must be a non-empty string",
             ));
         }
+        // The implicit per-asset pools: a user pool with the prefix would
+        // acquire exclusive whole-asset semantics on another asset's pool.
+        if key.starts_with(rivers_core::storage::ASSET_POOL_PREFIX) {
+            return Err(AssetDefinitionError::new_err(format!(
+                "pool '{key}': the '__asset__:' prefix is reserved for the \
+                 implicit per-asset pools"
+            )));
+        }
     }
 
     let slots_map: HashMap<String, u32> = match pool_slots {
@@ -434,13 +488,14 @@ pub fn normalize_pool(
 }
 
 /// Describes a single output within a multi-asset.
-#[pyclass(
-    str = "AssetDef(name={name}, tags={tags:?}, kinds={kinds:?}, group={group:?}, code_version={code_version:?})",
-    module = "rivers._core"
-)]
+// `__str__` is hand-written rather than the `str = "..."` pyclass attribute:
+// `name` is an `Option`, and a format string can only render it as `Some("x")`.
+#[pyclass(module = "rivers._core")]
 pub struct AssetDef {
+    /// `None` only in class-form multi assets, where the adapter injects the
+    /// attribute name at registration. `from_multi` rejects unnamed defs.
     #[pyo3(get, set)]
-    pub name: String,
+    pub name: Option<String>,
     #[pyo3(get, set)]
     pub tags: Option<Vec<String>>,
     #[pyo3(get, set)]
@@ -462,10 +517,25 @@ pub struct AssetDef {
     /// `deps=` at build time: input deps merge into the function's input set
     /// (de-duplicated by name), lineage-only deps become edges to this output.
     pub deps: Vec<Py<DepDef>>,
+    /// Per-output actions. Merged with the multi-asset's top-level
+    /// `actions=` at build time; a per-output action overrides a top-level
+    /// one with the same name.
+    pub actions: Vec<Py<super::action::PyAssetAction>>,
 }
 
 #[pymethods]
 impl AssetDef {
+    fn __str__(&self) -> String {
+        format!(
+            "AssetDef(name={}, tags={:?}, kinds={:?}, group={:?}, code_version={:?})",
+            self.name.as_deref().unwrap_or("<unnamed>"),
+            self.tags,
+            self.kinds,
+            self.group,
+            self.code_version,
+        )
+    }
+
     fn __eq__(&self, py: Python, other: &AssetDef) -> bool {
         self.name == other.name
             && self.tags == other.tags
@@ -485,10 +555,56 @@ impl AssetDef {
         hasher.finish()
     }
 
+    /// A class-form multi asset defined in a script ships to loky workers by
+    /// value, and its outputs are `AssetDef` attributes.
+    fn __getnewargs_ex__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyTuple>, Bound<'py, PyDict>)> {
+        let Self {
+            name,
+            tags,
+            kinds,
+            group,
+            code_version,
+            io_handler,
+            metadata,
+            partitions_def,
+            partition_mapping,
+            pool,
+            deps,
+            actions,
+        } = self;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("name", name)?;
+        kwargs.set_item("tags", tags)?;
+        kwargs.set_item("kinds", &kinds.0)?;
+        kwargs.set_item("group", group)?;
+        kwargs.set_item("code_version", code_version)?;
+        kwargs.set_item("io_handler", io_handler.as_ref().map(|h| h.to_object(py)))?;
+        kwargs.set_item("metadata", metadata)?;
+        kwargs.set_item(
+            "partitions_def",
+            partitions_def.as_ref().map(|p| p.to_object(py)),
+        )?;
+        kwargs.set_item("partition_mapping", partition_mapping)?;
+        kwargs.set_item("pool", pool.iter().map(|(key, _)| key).collect::<Vec<_>>())?;
+        kwargs.set_item(
+            "pool_slots",
+            pool.iter().cloned().collect::<HashMap<_, _>>(),
+        )?;
+        kwargs.set_item("deps", deps)?;
+        kwargs.set_item("actions", actions)?;
+        Ok((PyTuple::empty(py), kwargs))
+    }
+
     /// Create a new output definition for use with `Asset.from_multi()`.
+    ///
+    /// `name` may be omitted only when the def is assigned as a class attribute
+    /// of a class-form multi asset — the attribute name is injected then.
     #[new]
     #[pyo3(signature = (
-        name,
+        name = None,
         tags = None,
         kinds = None,
         group = None,
@@ -500,11 +616,12 @@ impl AssetDef {
         pool = None,
         pool_slots = None,
         deps = vec![],
+        actions = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new<'py>(
         _py: Python<'py>,
-        name: String,
+        name: Option<String>,
         tags: Option<Vec<String>>,
         kinds: Option<Kinds>,
         group: Option<String>,
@@ -516,7 +633,9 @@ impl AssetDef {
         pool: Option<&Bound<'py, PyAny>>,
         pool_slots: Option<&Bound<'py, PyAny>>,
         deps: Vec<Py<DepDef>>,
+        actions: Option<Vec<Py<super::action::PyAssetAction>>>,
     ) -> PyResult<Self> {
+        let actions = actions.unwrap_or_default();
         let pool = normalize_pool(pool, pool_slots)?;
         Ok(Self {
             name,
@@ -530,6 +649,7 @@ impl AssetDef {
             partition_mapping,
             pool,
             deps,
+            actions,
         })
     }
 
@@ -537,6 +657,13 @@ impl AssetDef {
     #[getter]
     fn deps(&self, py: Python) -> Vec<Py<DepDef>> {
         self.deps.iter().map(|d| d.clone_ref(py)).collect()
+    }
+
+    /// Per-output actions (the `actions=` argument) — the introspection route
+    /// for a multi-asset's verbs, which live on its outputs.
+    #[getter]
+    fn actions(&self, py: Python) -> Vec<Py<super::action::PyAssetAction>> {
+        self.actions.iter().map(|a| a.clone_ref(py)).collect()
     }
 
     /// The definition object, or the `partition_defs` registry name string.
@@ -719,11 +846,11 @@ impl Asset {
         }
     }
 
-    pub fn input_io_handler(&self, param_name: &str) -> Option<&IOHandler> {
+    pub fn input_io_handlers(&self) -> Option<&HashMap<String, IOHandler>> {
         match self {
-            Asset::Single(a) => a.input_io_handlers.get(param_name),
-            Asset::Multi(a) => a.input_io_handlers.get(param_name),
-            Asset::Graph(a) => a.input_io_handlers.get(param_name),
+            Asset::Single(a) => Some(&a.input_io_handlers),
+            Asset::Multi(a) => Some(&a.input_io_handlers),
+            Asset::Graph(a) => Some(&a.input_io_handlers),
             Asset::External(_) => None,
         }
     }
@@ -734,6 +861,30 @@ impl Asset {
             Asset::Multi(a) => a.input_metadata.get(param_name),
             Asset::Graph(a) => a.input_metadata.get(param_name),
             Asset::External(_) => None,
+        }
+    }
+
+    /// Actions on the asset itself. Multi-assets carry them per output — use
+    /// [`Asset::output_actions`]. External assets accept no user actions.
+    pub fn actions(&self) -> &[Py<super::action::PyAssetAction>] {
+        match self {
+            Asset::Single(a) => &a.actions,
+            Asset::Graph(a) => &a.actions,
+            Asset::Multi(_) | Asset::External(_) => &[],
+        }
+    }
+
+    /// Actions for one graph node: the named output's for multi-assets, the
+    /// asset's own otherwise.
+    pub fn output_actions(&self, output: &str) -> &[Py<super::action::PyAssetAction>] {
+        match self {
+            Asset::Multi(m) => m
+                .assets
+                .iter()
+                .find(|a| a.name.as_deref() == Some(output))
+                .map(|a| a.actions.as_slice())
+                .unwrap_or(&[]),
+            _ => self.actions(),
         }
     }
 
@@ -801,119 +952,6 @@ impl Asset {
             Asset::External(a) => a.observe_fn.as_ref(),
             _ => None,
         }
-    }
-
-    /// Resolve all ResourceRef io_handlers to Instance variants using the resources dict.
-    /// `io_handler_keys` contains resource keys that are validated IOHandler instances.
-    /// Resolve `retry="name"` references against the repository `retries`
-    /// registry, replacing `Named` with the concrete `Inline` policy. Errors
-    /// on an unknown name.
-    pub fn resolve_retry_refs(
-        &mut self,
-        retries: &HashMap<String, rivers_core::execution::retry::RetryPolicy>,
-    ) -> PyResult<()> {
-        use rivers_core::execution::retry::{RetryPolicy, RetryRef};
-
-        fn resolve_one(
-            slot: &mut Option<RetryRef>,
-            retries: &HashMap<String, RetryPolicy>,
-            owner: &str,
-        ) -> PyResult<()> {
-            if let Some(RetryRef::Named(key)) = slot {
-                let policy = retries.get(key.as_str()).ok_or_else(|| {
-                    crate::errors::ConfigurationError::new_err(format!(
-                        "unknown retry policy '{key}' referenced by asset '{owner}'; \
-                         registered: {:?}",
-                        retries.keys().collect::<Vec<_>>()
-                    ))
-                })?;
-                *slot = Some(RetryRef::Inline(policy.clone()));
-            }
-            Ok(())
-        }
-
-        match self {
-            Asset::Single(a) => {
-                let owner = a.name.clone().unwrap_or_default();
-                resolve_one(&mut a.retry, retries, &owner)?;
-            }
-            Asset::Multi(m) => {
-                let owner = m.name.clone().unwrap_or_default();
-                resolve_one(&mut m.retry, retries, &owner)?;
-            }
-            Asset::Graph(g) => {
-                let owner = g.name.clone().unwrap_or_default();
-                resolve_one(&mut g.retry, retries, &owner)?;
-            }
-            Asset::External(_) => {}
-        }
-        Ok(())
-    }
-
-    pub fn resolve_io_handler_refs(
-        &mut self,
-        py: Python,
-        handlers: &HashMap<String, &Py<PyAny>>,
-        other_resource_keys: &HashSet<&String>,
-    ) -> PyResult<()> {
-        match self {
-            Asset::Multi(multi) => {
-                for inner_asset in &mut multi.assets {
-                    let name = inner_asset.name.as_deref().ok_or_else(|| {
-                        AssetDefinitionError::new_err(
-                            "Asset name must be set before resolving io_handler refs \
-                             (AssetDef already defines name)",
-                        )
-                    })?;
-                    if let Some(ref mut handler) = inner_asset.io_handler {
-                        handler.resolve_in_place(py, handlers, other_resource_keys, name)?;
-                    }
-                }
-                let multi_name = multi.name.as_deref().unwrap_or("multi_asset");
-                for handler in multi.input_io_handlers.values_mut() {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, multi_name)?;
-                }
-            }
-            Asset::Graph(graph) => {
-                let name = graph.name.as_deref().ok_or_else(|| {
-                    AssetDefinitionError::new_err(
-                        "Asset name must be set before resolving io_handler refs",
-                    )
-                })?;
-                if let Some(ref mut handler) = graph.io_handler {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, name)?;
-                }
-                if let Some(ref mut handler) = graph.node_io_handler {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, name)?;
-                }
-                for handler in graph.input_io_handlers.values_mut() {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, name)?;
-                }
-            }
-            Asset::Single(single) => {
-                let name = single.name.as_deref().ok_or_else(|| {
-                    AssetDefinitionError::new_err(
-                        "Asset name must be set before resolving io_handler refs",
-                    )
-                })?;
-                if let Some(ref mut handler) = single.io_handler {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, name)?;
-                }
-                for handler in single.input_io_handlers.values_mut() {
-                    handler.resolve_in_place(py, handlers, other_resource_keys, name)?;
-                }
-            }
-            Asset::External(ext) => {
-                let name = ext.name.as_deref().ok_or_else(|| {
-                    AssetDefinitionError::new_err(
-                        "Asset name must be set before resolving io_handler refs",
-                    )
-                })?;
-                ext.io_handler
-                    .resolve_in_place(py, handlers, other_resource_keys, name)?;
-            }
-        }
-        Ok(())
     }
 
     pub fn _asset_fn(&self) -> PyResult<&Py<PyAny>> {
@@ -1029,10 +1067,6 @@ impl PyAsset {
     pub(crate) fn inner(&self) -> &Asset {
         &self.inner
     }
-
-    pub(crate) fn inner_mut(&mut self) -> &mut Asset {
-        &mut self.inner
-    }
 }
 
 #[pymethods]
@@ -1062,6 +1096,7 @@ impl PyAsset {
         pool_slots = None,
         retry = None,
         compute = None,
+        actions = None,
     ))]
     #[allow(clippy::too_many_arguments, clippy::new_ret_no_self)]
     fn new<'py>(
@@ -1083,7 +1118,9 @@ impl PyAsset {
         pool_slots: Option<&Bound<'py, PyAny>>,
         retry: Option<Bound<'py, PyAny>>,
         compute: Option<crate::compute::PyCompute>,
+        actions: Option<Vec<Py<super::action::PyAssetAction>>>,
     ) -> PyResult<Py<PyAny>> {
+        let actions = actions.unwrap_or_default();
         let py = cls.py();
 
         ensure_callable(cls.py(), &wraps)?;
@@ -1091,6 +1128,7 @@ impl PyAsset {
         let handler = io_handler;
 
         name = name_or_fn_name(py, name, &wraps);
+        validate_actions(py, &actions, name.as_deref().unwrap_or("<asset>"))?;
 
         let pool = normalize_pool(pool, pool_slots)?;
         let retry = crate::retry::extract_retry_ref(retry)?;
@@ -1121,6 +1159,7 @@ impl PyAsset {
             pool,
             retry,
             compute: compute.map(|c| c.inner),
+            actions,
         });
 
         let base = PyAsset { inner: py_asset };
@@ -1156,6 +1195,7 @@ impl PyAsset {
         automation_condition = None,
         compute = None,
         retry = None,
+        actions = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn from_multi(
@@ -1174,7 +1214,9 @@ impl PyAsset {
         automation_condition: Option<PyAutomationCondition>,
         compute: Option<crate::compute::PyCompute>,
         retry: Option<Bound<'_, PyAny>>,
+        actions: Option<Vec<Py<super::action::PyAssetAction>>>,
     ) -> PyResult<Py<PyAny>> {
+        let actions = actions.unwrap_or_default();
         let py = cls.py();
         let handler = io_handler;
         let top_level_deps: Vec<&DepDef> = deps.iter().map(|d| d.get()).collect();
@@ -1183,12 +1225,19 @@ impl PyAsset {
         ensure_callable(py, &wraps)?;
 
         name = name_or_fn_name(py, name, &wraps);
+        validate_actions(py, &actions, name.as_deref().unwrap_or("<multi asset>"))?;
 
         let mut pd = process_deps(py, &top_level_deps);
 
         let mut py_assets = Vec::with_capacity(output_defs.len());
         for asset in output_defs {
             let borrow_asset_def = asset.borrow(py);
+            let def_name = borrow_asset_def.name.clone().ok_or_else(|| {
+                AssetDefinitionError::new_err(
+                    "AssetDef requires name= when passed to Asset.from_multi; only class-form \
+                     multi assets may omit it (the attribute name is used)",
+                )
+            })?;
             let io_handler = borrow_asset_def
                 .io_handler
                 .as_ref()
@@ -1205,12 +1254,15 @@ impl PyAsset {
             // AssetDef merge into the top-level input set; lineage-only
             // deps stay scoped to this output.
             let (dep_only_names, partition_mapping) =
-                collect_output_deps(py, &mut pd, &borrow_asset_def)?;
+                collect_output_deps(py, &mut pd, &borrow_asset_def, &def_name)?;
+
+            validate_actions(py, &borrow_asset_def.actions, &def_name)?;
+            let output_actions = merge_output_actions(py, &actions, &borrow_asset_def.actions);
 
             py_assets.push(SingleAsset {
                 wraps: None,
                 is_async: false,
-                name: Some(borrow_asset_def.name.clone()),
+                name: Some(def_name),
                 tags: borrow_asset_def.tags.clone().or_else(|| tags.clone()),
                 kinds: def_kinds.clone(),
                 group: borrow_asset_def.group.clone().or_else(|| group.clone()),
@@ -1219,7 +1271,9 @@ impl PyAsset {
                     .clone()
                     .or_else(|| code_version.clone()),
                 io_handler,
-                metadata: None,
+                // `from_multi` has no `metadata=`, so the per-output AssetDef is
+                // the only source — and `ActionContext.asset_metadata` reads it.
+                metadata: borrow_asset_def.metadata.clone(),
                 backfill_strategy: None,
                 partitions_def: partitions_def
                     .as_ref()
@@ -1235,6 +1289,7 @@ impl PyAsset {
                 pool: borrow_asset_def.pool.clone(),
                 retry: None,
                 compute: None,
+                actions: output_actions,
             });
         }
 
@@ -1301,6 +1356,7 @@ impl PyAsset {
         hooks = None,
         automation_condition = None,
         retry = None,
+        actions = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn from_graph(
@@ -1319,11 +1375,14 @@ impl PyAsset {
         hooks: Option<Vec<Py<PyHook>>>,
         automation_condition: Option<PyAutomationCondition>,
         retry: Option<Bound<'_, PyAny>>,
+        actions: Option<Vec<Py<super::action::PyAssetAction>>>,
     ) -> PyResult<Py<PyAny>> {
+        let actions = actions.unwrap_or_default();
         let py = cls.py();
         let handler = io_handler;
 
         name = name_or_fn_name(py, name, &wraps);
+        validate_actions(py, &actions, name.as_deref().unwrap_or("<graph asset>"))?;
 
         let deps: Vec<&DepDef> = deps.iter().map(|d| d.get()).collect();
         let pd = process_deps(py, &deps);
@@ -1331,6 +1390,7 @@ impl PyAsset {
         let mut graph_asset = GraphAsset {
             name,
             wraps: None,
+            actions,
             kinds: kinds.unwrap_or_default(),
             group,
             code_version,
@@ -1489,19 +1549,13 @@ impl PyAsset {
 
     #[getter]
     fn io_handler(&self) -> Option<&Py<PyAny>> {
-        self.inner.io_handler().and_then(|h| match h {
-            IOHandler::Instance(obj) => Some(obj),
-            IOHandler::ResourceRef(_) => None,
-        })
+        self.inner.io_handler().and_then(IOHandler::handler)
     }
 
     /// Internal task IO handler for graph assets.
     #[getter]
     fn node_io_handler(&self) -> Option<&Py<PyAny>> {
-        self.inner.node_io_handler().and_then(|h| match h {
-            IOHandler::Instance(obj) => Some(obj),
-            IOHandler::ResourceRef(_) => None,
-        })
+        self.inner.node_io_handler().and_then(IOHandler::handler)
     }
 
     #[getter]
@@ -1563,6 +1617,17 @@ impl PyAsset {
             .map(|h| h.iter().map(|hook| hook.clone_ref(py)).collect())
     }
 
+    /// Actions declared on this asset; `None` when it declares none.
+    #[getter]
+    fn actions(&self, py: Python) -> Option<Vec<Py<super::action::PyAssetAction>>> {
+        let actions = self.inner.actions();
+        if actions.is_empty() {
+            None
+        } else {
+            Some(actions.iter().map(|a| a.clone_ref(py)).collect())
+        }
+    }
+
     #[getter]
     fn automation_condition(&self) -> Option<PyAutomationCondition> {
         self.inner.automation_condition().cloned()
@@ -1577,6 +1642,72 @@ impl PyAsset {
     #[getter]
     fn pool(&self) -> Vec<(String, u32)> {
         self.inner.pool().clone()
+    }
+
+    /// Slots claimed per pool, the normalized form of the `pool_slots=`
+    /// declaration. Declared as an `int` or a per-pool dict; reads back as the
+    /// dict so the stub's attribute is not a promise that raises.
+    #[getter]
+    fn pool_slots(&self) -> HashMap<String, u32> {
+        self.inner.pool().iter().cloned().collect()
+    }
+
+    /// Lineage-only dependencies declared via `deps=`. Input deps become
+    /// function parameters and are not repeated here.
+    #[getter]
+    fn deps(&self, py: Python) -> PyResult<Vec<Py<DepDef>>> {
+        let Asset::Single(a) = &self.inner else {
+            return Ok(Vec::new());
+        };
+        a.dep_only_names
+            .iter()
+            .map(|name| {
+                Py::new(
+                    py,
+                    DepDef {
+                        name: name.clone(),
+                        is_input: false,
+                        partition_mapping: a
+                            .partition_mapping
+                            .as_ref()
+                            .and_then(|pm| pm.0.get(name).cloned()),
+                        io_handler: None,
+                        metadata: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Retry policy governing this asset's step. A `retry="name"` reference
+    /// reads back as the name: each repository resolves it in its own nodes.
+    #[getter]
+    fn retry(&self, py: Python) -> Option<Py<PyAny>> {
+        use rivers_core::execution::retry::RetryRef;
+        match self.inner.retry_for_output(None)? {
+            RetryRef::Inline(p) => Py::new(py, crate::retry::PyRetryPolicy { inner: p.clone() })
+                .ok()
+                .map(|v| v.into_any()),
+            RetryRef::Named(key) => key
+                .clone()
+                .into_pyobject(py)
+                .ok()
+                .map(|v| v.unbind().into_any()),
+        }
+    }
+
+    /// Compute environment for this asset's steps.
+    #[getter]
+    fn compute(&self) -> Option<crate::compute::PyCompute> {
+        self.inner
+            .compute_for_output(None)
+            .map(|c| crate::compute::PyCompute { inner: c.clone() })
+    }
+
+    /// How backfills chunk this asset's partitions.
+    #[getter]
+    fn backfill_strategy(&self) -> Option<PyBackfillStrategy> {
+        self.inner.backfill_strategy().cloned()
     }
 
     #[getter]

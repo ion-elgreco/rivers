@@ -83,19 +83,17 @@ pub fn PoolsPage() -> impl IntoView {
         <Transition>
             {move || {
                 let list = pools.get().and_then(|r| r.ok()).unwrap_or_default();
-                let n = list.len();
-                let claimed: u32 = list.iter().map(|p| p.claimed_count).sum();
+                let (n, claimed, slots_suffix) = crate::helpers::user_pool_totals(&list);
+                let asset_pools = list.len() - n;
                 let pending: u32 = list.iter().map(|p| p.pending_count).sum();
-                let slot_sum: i32 = list.iter().filter(|p| p.slot_limit > 0).map(|p| p.slot_limit).sum();
-                let has_unlimited = list.iter().any(|p| p.slot_limit < 0);
-                let slots_suffix = if has_unlimited || slot_sum == 0 {
-                    "claimed".to_string()
+                let pools_suffix = if asset_pools > 0 {
+                    format!("active · {asset_pools} asset")
                 } else {
-                    format!("of {slot_sum}")
+                    "active".to_string()
                 };
                 view! {
                     <div class="stats-grid" style="grid-template-columns:repeat(3, 1fr); margin-bottom:24px">
-                        <StatTile label="POOLS" value=n.to_string() suffix="active"/>
+                        <StatTile label="POOLS" value=n.to_string() suffix=pools_suffix/>
                         <StatTile label="SLOTS CLAIMED" value=claimed.to_string() suffix=slots_suffix/>
                         <StatTile label="STEPS PENDING" value=pending.to_string() suffix="across all pools"/>
                     </div>
@@ -191,11 +189,21 @@ fn PoolRow(
         "var(--success)"
     };
 
-    let util_label = if limit < 0 {
+    // An asset's implicit pool admits exclusive actions by partition overlap;
+    // slots and a percentage mean nothing there, so it shows its holders.
+    let asset = crate::helpers::asset_pool_asset(&pool_key).map(str::to_string);
+    let util_label = if asset.is_some() {
+        format!("{used} holding")
+    } else if limit < 0 {
         format!("{used}/∞")
     } else {
         format!("{used}/{limit}")
     };
+    let display_name = match &asset {
+        Some(a) => format!("{a} · asset pool"),
+        None => pool_key.clone(),
+    };
+    let is_asset_pool = asset.is_some();
 
     let is_expanded =
         Signal::derive(move || expanded_pool.get().as_deref() == Some(pool_key_check.as_str()));
@@ -206,9 +214,9 @@ fn PoolRow(
         <div class="pool-row">
             <div class="pool-row-header">
                 <div class="pool-row-left">
-                    <div class="pool-row-name">{pool_key.clone()}</div>
+                    <div class="pool-row-name" title=pool_key.clone()>{display_name}</div>
                     <div class="pool-row-util" style=format!("color:{util_color}")>
-                        {format!("{:.0}% · {util_label}", pct)}
+                        {if is_asset_pool { util_label } else { format!("{:.0}% · {util_label}", pct) }}
                     </div>
                 </div>
 

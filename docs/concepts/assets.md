@@ -4,6 +4,10 @@ An **asset** is a function that produces a data artifact. Assets form a directed
 
 rivers supports four asset types:
 
+Every type can also be defined as a class — configuration as class attributes, verbs
+as classmethods, shared pieces inherited through base classes. Both forms desugar to
+the same objects; see [Class-Based Assets](../guides/class-assets.md).
+
 ## Single assets
 
 The most common type. A function decorated with `@Asset` that produces one output:
@@ -194,8 +198,11 @@ Trigger observations manually via `CodeRepository.observe()`:
 repo = rs.CodeRepository(assets=[source_table, enriched])
 
 # Observe all external assets (or filter with asset_names=["source_table"])
-observations = repo.observe()
-print(observations["source_table"]["row_count"].raw_value())  # 150000
+result = repo.observe()
+assert result.success
+
+# The metadata lands on the run's Observation events.
+events = repo.storage.get_events_for_run(result.run_id)
 ```
 
 In production, attach an `AutomationCondition.on_cron()` to run observations on a schedule. When the observation records a new `data_version`, downstream assets with `AutomationCondition.eager()` will automatically materialize:

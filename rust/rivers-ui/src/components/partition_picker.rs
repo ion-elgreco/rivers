@@ -255,6 +255,33 @@ pub fn PartitionPicker(
     }
 }
 
+/// The explicit choice to run a verb whose partition key is optional on every
+/// partition. An empty pick never means that: a pick emptied by a live refresh
+/// would otherwise run the verb on the whole asset. Choosing it clears `selected`;
+/// the host hides the picker while it is set.
+#[component]
+pub fn WholeAssetChoice(
+    checked: RwSignal<bool>,
+    selected: RwSignal<Vec<SubmitPartitionKey>>,
+) -> impl IntoView {
+    view! {
+        <label class="whole-asset-choice">
+            <input
+                type="checkbox"
+                prop:checked=move || checked.get()
+                on:change=move |ev| {
+                    let on = event_target_checked(&ev);
+                    if on {
+                        selected.set(Vec::new());
+                    }
+                    checked.set(on);
+                }
+            />
+            "Whole asset (every partition)"
+        </label>
+    }
+}
+
 /// Compute the structured partition keys to submit for a given picker
 /// and per-shape state. `SingleDim` wraps each selected key in `Single`;
 /// `Multi` returns the cartesian product of per-dim selections as

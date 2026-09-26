@@ -27,7 +27,7 @@ def fill_gaps() -> int:
 |--------|-------------|
 | `AutomationCondition.eager()` | Materialize whenever any dependency is updated. Skips anything already in flight (a run *or* an active backfill). Excludes failed partitions/assets, so they aren't auto-retried until re-run. |
 | `AutomationCondition.on_cron(cron_schedule, timezone=None)` | Materialize on a cron schedule. Won't start a new run while the previous one is still in flight. |
-| `AutomationCondition.on_missing()` | Materialize only when the asset has never been materialized; leaves failed partitions alone. |
+| `AutomationCondition.on_missing()` | Materialize only when the asset is missing — never materialized, or [deleted](../concepts/actions.md#delete) since; leaves failed partitions alone. |
 
 !!! note "Conditions are the only dispatch gate"
     The daemon dispatches whatever a condition fires — there's no separate
@@ -43,8 +43,8 @@ Fine-grained conditions for building custom rules. All are static methods on `Au
 
 | Method | Description |
 |--------|-------------|
-| `.missing()` | Asset has never been materialized. |
-| `.in_progress()` | Asset is part of an in-progress run. |
+| `.missing()` | Asset has never been materialized, or a delete action cleared it since. |
+| `.in_progress()` | Asset is part of an in-progress materialize run. An [action](../concepts/actions.md) run does not count. |
 | `.execution_failed()` | Latest execution of this asset failed. |
 | `.newly_updated()` | Asset's materialization timestamp changed since the previous tick. |
 | `.newly_requested()` | Asset was requested for materialization on the previous tick. |
@@ -53,10 +53,10 @@ Fine-grained conditions for building custom rules. All are static methods on `Au
 | `.cron_tick_passed(cron_schedule, timezone=None)` | A cron tick has passed since the last evaluation. `cron_schedule` accepts 5 or 6 fields (seconds optional). |
 | `.in_latest_time_window(lookback_delta=None)` | Partition falls within the latest time window (`lookback_delta` in seconds, measured back from the latest window's start; must be positive and finite or `ValueError` is raised). |
 | `.initial_evaluation()` | The asset's very first evaluation tick (fresh evaluation state) or a condition tree change; a normal daemon restart with intact persisted state does not re-fire it. |
-| `.backfill_in_progress()` | Asset is part of an active backfill. |
+| `.backfill_in_progress()` | Asset is part of an active materialize backfill. An action backfill does not count. |
 | `.in_flight()` | Asset is being materialized by anything — a run (`in_progress()`) **or** an active backfill (`backfill_in_progress()`). Negate it as a re-dispatch guard. |
 | `.will_be_requested()` | Asset's condition already fired earlier this tick (same-tick cascading). |
-| `.last_run_includes_target()` | The dep's latest run also included the root asset being evaluated. |
+| `.last_run_includes_target()` | The dep's latest run also included the root asset being evaluated. An [action](../concepts/actions.md) run includes the root only if it materialized the root after the dep. |
 | `.last_executed_with_tags(tag_keys=None, tag_values=None)` | Latest run that materialized this asset had matching tags. |
 | `.has_run_with_tags(tag_keys=None, tag_values=None)` | Any new materialization this tick came from a run with matching tags. |
 | `.all_runs_have_tags(tag_keys=None, tag_values=None)` | All new materializations this tick came from runs with matching tags (vacuously true with no materializations). |

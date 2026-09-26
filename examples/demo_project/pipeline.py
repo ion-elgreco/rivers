@@ -16,9 +16,14 @@ import time
 from datetime import datetime
 
 import obstore.store
+import pyarrow as pa
+from deltalake import write_deltalake
 from pydantic import BaseModel
 from rivers import (
+    ActionContext,
+    ActionResult,
     Asset,
+    AssetAction,
     AssetDef,
     AssetExecutionContext,
     AutomationCondition,
@@ -26,12 +31,15 @@ from rivers import (
     BackfillStrategy,
     BashTask,
     CodeRepository,
+    DeltaAsset,
+    DeltaIOHandler,
     Executor,
     Hook,
     HookContext,
     Job,
     MetadataValue,
     Observation,
+    Outcome,
     OutputContext,
     PartitionKey,
     PartitionMapping,
@@ -50,6 +58,7 @@ from rivers import (
     SkipReason,
     TagConcurrencyLimit,
     Task,
+    action,
 )
 
 # =============================================================================
@@ -100,6 +109,19 @@ if _deployment == "cloud":
     raw_io = VersionedPickleIOHandler(store=_s3_store, prefix="raw")
     processed_io = VersionedPickleIOHandler(store=_s3_store, prefix="processed")
     output_io = VersionedPickleIOHandler(store=_s3_store, prefix="output")
+    delta_io = DeltaIOHandler(
+        table_uri=f"s3://{os.environ.get('RIVERS_S3_BUCKET', 'rivers-io')}/delta",
+        mode="append",
+        storage_options={
+            "AWS_ENDPOINT_URL": os.environ.get(
+                "RIVERS_S3_ENDPOINT", "http://rustfs.rivers.svc:9000"
+            ),
+            "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", ""),
+            "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+            "AWS_REGION": os.environ.get("AWS_REGION", "us-east-1"),
+            "AWS_ALLOW_HTTP": "true",
+        },
+    )
 else:
     _io_root = os.path.join(os.getcwd(), ".rivers", "demo-io")
     os.makedirs(_io_root, exist_ok=True)
@@ -107,6 +129,9 @@ else:
     raw_io = VersionedPickleIOHandler(store=_local_store, prefix="raw")
     processed_io = VersionedPickleIOHandler(store=_local_store, prefix="processed")
     output_io = VersionedPickleIOHandler(store=_local_store, prefix="output")
+    delta_io = DeltaIOHandler(
+        table_uri=os.path.join(_io_root, "delta"), mode="append"
+    )
 
 
 # =============================================================================
@@ -328,12 +353,26 @@ def active_users(context: AssetExecutionContext, raw_users: dict) -> dict:
     return {"users": active}
 
 
+# Decorator-form assets attach actions as AssetAction objects;
+# `profile` shows up as a button on the enriched_orders asset page.
+def _profile_orders(ctx: ActionContext) -> None:
+    ctx.log.info("[profile] sampling join quality for %s", ctx.asset_name)
+
+
+profile_orders = AssetAction(
+    name="profile",
+    outcome=Outcome.Unchanged,
+    description="Sample the join output and log quality stats",
+)(_profile_orders)
+
+
 @Asset(
     io_handler=processed_io,
     tags=["processing"],
     kinds="transform",
     group="data_processing",
     code_version="1.0",
+    actions=[profile_orders],
 )
 def enriched_orders(
     context: AssetExecutionContext, raw_orders: dict, raw_products: dict
@@ -1133,6 +1172,56 @@ def metadata_showcase(context: AssetExecutionContext) -> dict:
 
 
 # =============================================================================
+# Asset Actions — native DeltaAsset with built-in maintenance verbs
+# =============================================================================
+# `event_log` is a real Delta table. `optimize`, `vacuum`, and `delete` come
+# from the DeltaAsset base — each a button on the asset page doing the real
+# Delta operation (compaction, file cleanup, row deletion + state clear).
+# `optimize` is exclusive: it serializes against materialize and other
+# exclusive verbs via the implicit __asset__:event_log pool. On this tiny
+# table the verbs finish in milliseconds, so the serialization won't be
+# visible on the Gantt — the pool page shows the exclusive claim instead.
+# `refresh` shows a custom verb on top of the base.
+
+
+class EventLog(DeltaAsset):
+    """Append-only event log stored as a Delta table."""
+
+    name = "event_log"
+    io_handler = delta_io
+    tags = ["maintenance", "actions-demo"]
+    group = "maintenance_demo"
+
+    @classmethod
+    def materialize(cls, context: AssetExecutionContext) -> pa.Table:
+        events = pa.table(
+            {"id": list(range(100)), "event": [f"evt-{i:03d}" for i in range(100)]}
+        )
+        context.add_output_metadata({"rows": MetadataValue.int(events.num_rows)})
+        return events
+
+    @action(
+        outcome=Outcome.MayMaterialize,
+        description="Pull late-arriving events; materializes only when data changed",
+    )
+    @classmethod
+    def refresh(cls, ctx: ActionContext) -> ActionResult:
+        if int(time.time()) % 2:
+            ctx.log.info("[refresh] no late events for %s", ctx.asset_name)
+            return ActionResult.unchanged()
+        handler = ctx.io_handler
+        late = pa.table({"id": [int(time.time())], "event": ["evt-late"]})
+        write_deltalake(
+            handler.asset_table_uri(ctx.asset_name, ctx.asset_metadata),
+            late,
+            mode="append",
+            storage_options=handler.storage_options,
+        )
+        ctx.log.info("[refresh] appended late events to %s", ctx.asset_name)
+        return ActionResult.materialized(metadata={"late_rows": 1})
+
+
+# =============================================================================
 # Jobs
 # =============================================================================
 
@@ -1627,6 +1716,8 @@ all_assets = [
     slow_step_d,
     # Metadata showcase
     metadata_showcase,
+    # Actions demo (class form)
+    EventLog,
     # Backfill showcase
     daily_events,
     daily_aggregates,

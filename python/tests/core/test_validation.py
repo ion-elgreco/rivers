@@ -105,9 +105,18 @@ def test_asset_invalid_io_handler_raises():
 def test_external_asset_observe_no_fn_skipped():
     """External asset without observe_fn is skipped by repo.observe()."""
     ext = rs.Asset.external(name="x", io_handler=DummyHandler())
-    repo = rs.CodeRepository(assets=[ext])
+
+    @rs.Asset.external(io_handler=DummyHandler())
+    def watched(context: rs.AssetExecutionContext):
+        return rs.Observation(data_version="v1")
+
+    repo = rs.CodeRepository(assets=[ext, watched])
     result = repo.observe()
-    assert "x" not in result
+    assert result.success
+    # The observable sibling proves a real run happened — without it the
+    # empty-targets early return also yields "x not in []", vacuously.
+    assert "watched" in result.materialized_assets
+    assert "x" not in result.materialized_assets
 
 
 def test_in_latest_time_window_requires_time_partitioning():
@@ -153,6 +162,28 @@ def test_job_non_asset_object_raises():
         rs.Job(name="bad", assets=["not_an_asset"])  # type: ignore
 
 
+@pytest.mark.parametrize("action", [None, "delete"], ids=["materialize", "delete"])
+def test_job_empty_asset_list_raises(action):
+    """An asset list computed from config can come out empty. Such a job passed
+    resolve, and under the run queue its runs covered every asset: a
+    `delete` job cleared every table that defines `delete`, on every tick."""
+    stale: set[str] = set()
+
+    @rs.Asset
+    def events() -> int:
+        return 1
+
+    with pytest.raises(GraphValidationError) as exc:
+        rs.Job(
+            name="purge",
+            assets=[a for a in [events] if a.name in stale],
+            action=action,
+        )
+    assert str(exc.value) == (
+        "Job 'purge' got an empty asset list: name at least one asset or task"
+    )
+
+
 def test_job_execute_before_validation_raises():
     """Executing a standalone job (not added to repo) raises ValueError."""
 
@@ -178,14 +209,17 @@ def test_repo_empty_assets():
 
 
 def test_repo_observe_no_externals():
-    """repo.observe() returns empty dict when no external assets exist."""
+    """repo.observe() is a successful no-op when no external assets exist."""
 
     @rs.Asset
     def a():
         return 1
 
     repo = rs.CodeRepository(assets=[a])
-    assert repo.observe() == {}
+    result = repo.observe()
+    assert result.success
+    assert result.run_id == ""
+    assert result.materialized_assets == []
 
 
 # ---------------------------------------------------------------------------

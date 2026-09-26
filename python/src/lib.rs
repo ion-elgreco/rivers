@@ -168,6 +168,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         executor::parallel::worker::worker_execute_step,
         m
     )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(retry::_reconstruct_retry_policy, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(retry::_reconstruct_backoff, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(
         executor::parallel::worker::_reconstruct_func_ref,
         m
@@ -190,6 +192,18 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(
         executor::parallel::worker::_reconstruct_partition_context,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        assets::action::_reconstruct_asset_action,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        assets::dep_def::_reconstruct_dep_def,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        automation::condition::_reconstruct_automation_condition,
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(runtime::runtime_info, m)?)?;

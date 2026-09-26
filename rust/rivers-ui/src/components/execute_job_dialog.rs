@@ -7,11 +7,11 @@
 
 use leptos::prelude::*;
 
-use crate::components::partition_picker::PartitionPicker;
-use crate::helpers::JobPartitionPicker;
+use crate::components::partition_picker::{PartitionPicker, WholeAssetChoice};
+use crate::helpers::{JobPartitionPicker, close_on_navigation};
 use crate::loc::{loc_path, use_current_location};
-use crate::server_fns::actions::{execute_job, launch_backfill};
-use crate::types::SubmitPartitionKey;
+use crate::server_fns::mutations::{execute_job, launch_backfill};
+use crate::types::{AssetActionInfo, SubmitPartitionKey};
 
 /// Above this many selected partitions, submit one job-aware backfill instead of
 /// a run each (mirrors `MaterializeDialog`).
@@ -32,25 +32,37 @@ pub fn ExecuteJobDialog(
     #[prop(into)] show: RwSignal<bool>,
     #[prop(into)] job_name: Signal<String>,
     #[prop(into)] picker: Signal<JobPartitionPicker>,
+    /// The verb an action job runs. An optional-key verb also offers the
+    /// explicit whole-asset choice (one keyless run); a destructive one says so.
+    #[prop(optional, into)]
+    verb: Option<Signal<Option<AssetActionInfo>>>,
 ) -> impl IntoView {
+    let verb: Signal<Option<AssetActionInfo>> = verb.unwrap_or_else(|| Signal::derive(|| None));
+    let destructive = Memo::new(move |_| verb.get().is_some_and(|v| v.is_destructive()));
+    let key_optional = Memo::new(move |_| verb.get().is_some_and(|v| v.key_optional()));
     // Cartesian-expanded selection — owned by us, written by
     // PartitionPicker on every toggle. Read at submit and to drive the
     // run-count label.
     let selected = RwSignal::new(Vec::<SubmitPartitionKey>::new());
+    let whole_asset = RwSignal::new(false);
+    let whole_asset_chosen = Memo::new(move |_| whole_asset.get() && key_optional.get());
     let error = RwSignal::new(None::<String>);
     let nav_to = RwSignal::new(None::<String>);
 
     let loc = use_current_location();
+    close_on_navigation(show);
 
-    let action = Action::new(move |keys: &Vec<SubmitPartitionKey>| {
-        let keys = keys.clone();
+    let action = Action::new(move |input: &(Vec<SubmitPartitionKey>, bool)| {
+        let (keys, whole_asset) = input.clone();
         let job = job_name.get_untracked();
+        // The server refuses a job that no longer runs the verb shown here.
+        let shown = verb.get_untracked().map(|v| v.name);
         let (ns, name) = loc.get_untracked();
         async move {
             if keys.len() > BACKFILL_THRESHOLD {
                 // >2 partitions → one job-aware backfill. `None` selection: the
                 // server resolves the job's assets.
-                let r = launch_backfill(ns, name, None, keys, None, Some(job))
+                let r = launch_backfill(ns, name, None, keys, None, Some(job), shown)
                     .await
                     .map_err(|e| format!("{e}"))?;
                 return Ok::<ExecOutcome, String>(ExecOutcome::Backfill(r.backfill_id));
@@ -62,20 +74,28 @@ pub fn ExecuteJobDialog(
             };
             let mut last_run_id = String::new();
             for pk in key_opts {
-                last_run_id = execute_job(ns.clone(), name.clone(), job.clone(), pk)
-                    .await
-                    .map_err(|e| format!("{e}"))?
-                    .run_id;
+                last_run_id = execute_job(
+                    ns.clone(),
+                    name.clone(),
+                    job.clone(),
+                    shown.clone(),
+                    pk,
+                    whole_asset,
+                )
+                .await
+                .map_err(|e| format!("{e}"))?
+                .run_id;
             }
             Ok(ExecOutcome::Run(last_run_id))
         }
     });
 
-    // Clear leftover error on reopen — selection state is reset by
-    // PartitionPicker via its own `reset` prop.
+    // Clear leftover error and choice on reopen — selection state is reset
+    // by PartitionPicker via its own `reset` prop.
     Effect::new(move |_| {
         if show.get() {
             error.set(None);
+            whole_asset.set(false);
         }
     });
 
@@ -134,7 +154,25 @@ pub fn ExecuteJobDialog(
                             <label>"Job"</label>
                             <div class="grid-cell-mono">{move || job_name.get()}</div>
                         </div>
-                        <PartitionPicker picker=picker selected=selected reset=show/>
+                        {move || verb.get().map(|v| view! {
+                            <div class="form-group">
+                                <label>"Action"</label>
+                                <div class="grid-cell-mono">{v.name}</div>
+                            </div>
+                        })}
+                        <Show when=move || destructive.get()>
+                            <p class="text-error mat-dialog-warning">
+                                "Clears materialization state for the job's assets."
+                            </p>
+                        </Show>
+                        <Show when=move || {
+                            key_optional.get() && !matches!(picker.get(), JobPartitionPicker::None)
+                        }>
+                            <WholeAssetChoice checked=whole_asset selected=selected/>
+                        </Show>
+                        <Show when=move || !whole_asset_chosen.get()>
+                            <PartitionPicker picker=picker selected=selected reset=show/>
+                        </Show>
                         {move || error.get().map(|msg| view! {
                             <div class="error-msg">{msg}</div>
                         })}
@@ -142,12 +180,12 @@ pub fn ExecuteJobDialog(
                     <div class="modal-footer">
                         <button class="btn" on:click=move |_| show.set(false)>"Cancel"</button>
                         <button
-                            class="btn btn-primary"
+                            class=move || if destructive.get() { "btn btn-danger" } else { "btn btn-primary" }
                             on:click=move |_| {
                                 let p = picker.get_untracked();
                                 let keys = selected.get_untracked();
-                                let needs_partition = !matches!(p, JobPartitionPicker::None);
-                                if needs_partition && keys.is_empty() {
+                                let whole = whole_asset_chosen.get_untracked();
+                                if keys.is_empty() && !whole && !matches!(p, JobPartitionPicker::None) {
                                     let msg = if matches!(p, JobPartitionPicker::Multi { .. }) {
                                         "Select at least one value for every dimension."
                                     } else {
@@ -156,7 +194,7 @@ pub fn ExecuteJobDialog(
                                     error.set(Some(msg.to_string()));
                                     return;
                                 }
-                                action.dispatch(keys);
+                                action.dispatch((keys, whole));
                             }
                             disabled=move || pending.get()
                         >

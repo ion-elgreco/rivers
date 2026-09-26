@@ -463,4 +463,33 @@ impl PyAutomationCondition {
             format!("AutomationCondition({})", name)
         }
     }
+
+    /// A class-form asset defined in a script ships to loky workers by value,
+    /// `automation_condition` included. No constructor rebuilds a composed
+    /// tree, so the core serde form is the transport.
+    fn __reduce__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyAny>, (String, Option<String>))> {
+        let Self { node, label } = self;
+        let json = serde_json::to_string(node).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("condition is not serializable: {e}"))
+        })?;
+        let ctor = py
+            .import("rivers._core")?
+            .getattr("_reconstruct_automation_condition")?;
+        Ok((ctor, (json, label.clone())))
+    }
+}
+
+/// Rebuild an `AutomationCondition` from `__reduce__`'s serde payload.
+#[pyfunction]
+pub fn _reconstruct_automation_condition(
+    node: &str,
+    label: Option<String>,
+) -> PyResult<PyAutomationCondition> {
+    let node = serde_json::from_str(node).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("unreadable automation condition: {e}"))
+    })?;
+    Ok(PyAutomationCondition { node, label })
 }

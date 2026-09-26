@@ -409,25 +409,46 @@ class Compute:
 class Job:
     """A named bundle of assets/tasks executed together as one run."""
 
+    @property
+    def name(self) -> str:
+        """The job's registered name."""
+        ...
+
+    @property
+    def action(self) -> str | None:
+        """The verb this job's runs execute; ``None`` means materialize."""
+        ...
+
     def __init__(
         self,
         name: str,
-        assets: Sequence[Union[SingleAsset, MultiAsset, GraphAsset, Task, BashTask]],
+        assets: Sequence[
+            Union[SingleAsset, MultiAsset, GraphAsset, Task, BashTask, type[Asset]]
+        ],
         executor: "Executor | None" = None,
         allow_incomplete_deps: bool = False,
         retry: "RetryPolicy | str | None" = None,
+        action: str | None = None,
     ) -> None:
         """Construct a job.
 
         Args:
             name: Unique job name within the repository.
-            assets: Assets and tasks the job will materialize.
+            assets: Assets and tasks the job will materialize (or run the
+                action against, when ``action`` is set). Must not be empty.
+            action: Asset action this job runs instead of materialize
+                — schedules the verb through the existing
+                Schedule machinery. Every targeted asset must define it.
             executor: Override the repository default executor for this job.
             allow_incomplete_deps: Tolerate missing upstream deps (debug / partial
                 graphs); production jobs should leave this ``False``.
             retry: Job-level retry default — a :class:`RetryPolicy` or the name of
                 a policy registered in ``CodeRepository(retries=...)``. Assets with
                 their own policy keep it.
+
+        Raises:
+            GraphValidationError: ``assets`` is empty, or holds an object that
+                is not an asset or task.
         """
         ...
 
@@ -446,6 +467,10 @@ class Job:
                 ``rivers/priority`` is honored for run-queue priority.
             config: Per-asset config, keyed by asset name.
             raise_on_error: Raise on first failure instead of returning a failed result.
+
+        Raises:
+            ExecutionError: The job was not obtained from
+                :meth:`CodeRepository.get_job`.
         """
         ...
 

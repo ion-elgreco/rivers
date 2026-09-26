@@ -15,7 +15,9 @@ from deltalake import CommitProperties, WriterProperties
 from pydantic_settings import SettingsConfigDict
 
 from rivers._core import InputContext, OutputContext
+from rivers._core.partitions import PartitionContext
 from rivers.io_handlers.base import BaseIOHandler
+from rivers.io_handlers.delta.asset import DeltaAsset, OptimizeConfig, VacuumConfig
 from rivers.io_handlers.delta.base import (
     DeltaSchemaMode,
     DeltaTypeHandler,
@@ -37,9 +39,12 @@ from rivers.io_handlers.delta.config import (
 from rivers.io_handlers.delta.predicate import _build_predicate, _resolve_partition_expr
 
 __all__: list[str] = [
+    "DeltaAsset",
     "DeltaIOHandler",
     "DeltaTypeHandler",
     "MergeConfig",
+    "OptimizeConfig",
+    "VacuumConfig",
     "MergeOperationsConfig",
     "PartitionExpr",
     "WhenMatchedDelete",
@@ -167,6 +172,80 @@ class DeltaIOHandler(BaseIOHandler):
         """Compose the table URI used for ``asset_name``."""
         return f"{self.table_uri}/{asset_name}"
 
+    def asset_table_uri(
+        self, asset_name: str, asset_metadata: dict[str, str] | None = None
+    ) -> str:
+        """``{table_uri}/{leaf}``, honoring the ``delta/root_name`` override.
+
+        The same per-asset URI resolution the write path uses — an action body
+        resolves its ``DeltaTable`` from this plus ``storage_options``:
+
+        Args:
+            asset_name: The asset name (``ctx.asset_name`` in an action).
+            asset_metadata: Per-asset metadata (``ctx.asset_metadata``); the
+                ``delta/root_name`` entry overrides the leaf name.
+        """
+        meta = asset_metadata or {}
+        return self._asset_uri(meta.get("delta/root_name", asset_name))
+
+    def resolved_properties(
+        self, asset_metadata: dict[str, str] | None
+    ) -> "tuple[WriterProperties | None, CommitProperties | None]":
+        """Writer/commit properties the write path would use for this asset.
+
+        Per-asset ``delta/writer_properties`` / ``delta/commit_properties``
+        metadata overrides win over the handler defaults — the same resolution
+        ``handle_output`` applies, for action bodies.
+
+        Args:
+            asset_metadata: Per-asset metadata (``ctx.asset_metadata``).
+
+        Returns:
+            The ``(writer_properties, commit_properties)`` pair.
+        """
+        meta = asset_metadata or {}
+        writer_properties = self.writer_properties
+        if "delta/writer_properties" in meta:
+            writer_properties = WriterProperties(
+                **json.loads(meta["delta/writer_properties"])
+            )
+        commit_properties = self.commit_properties
+        if "delta/commit_properties" in meta:
+            commit_properties = CommitProperties(
+                **json.loads(meta["delta/commit_properties"])
+            )
+        return writer_properties, commit_properties
+
+    def partition_predicate(
+        self,
+        asset_metadata: dict[str, str] | None,
+        partition: PartitionContext | None,
+    ) -> str:
+        """SQL predicate covering the partition(s), honoring ``delta/partition_expr``.
+
+        The same partition-to-predicate translation the overwrite path uses,
+        for action bodies (``delete``, targeted ``optimize``):
+
+        Args:
+            asset_metadata: Per-asset metadata (``ctx.asset_metadata``); the
+                ``delta/partition_expr`` entry names the predicate column(s).
+            partition: The partition context (``ctx.partition``). Typed as
+                optional because that is what an ``ActionContext`` exposes, but a
+                predicate needs a key — ``None`` raises rather than reaching
+                ``_build_predicate`` and failing on a missing attribute.
+
+        Raises:
+            ValueError: If ``partition`` is ``None``.
+        """
+        if partition is None:
+            raise ValueError(
+                "partition_predicate needs a partition context; this action run "
+                "has no partition key, so there is no predicate to build — "
+                "operate on the whole table instead"
+            )
+        partition_expr = _resolve_partition_expr(asset_metadata or {})
+        return _build_predicate(partition, partition_expr)
+
     def _resolve_write_request(self, context: OutputContext) -> DeltaWriteRequest:
         """Resolves the write request to be used for writing to the Delta table."""
 
@@ -195,16 +274,7 @@ class DeltaIOHandler(BaseIOHandler):
         table_configuration = table_cfg or None
 
         # Resolve writer/commit properties (per-asset override > handler default)
-        writer_properties = self.writer_properties
-        if "delta/writer_properties" in meta:
-            writer_properties = WriterProperties(
-                **json.loads(meta["delta/writer_properties"])
-            )
-        commit_properties = self.commit_properties
-        if "delta/commit_properties" in meta:
-            commit_properties = CommitProperties(
-                **json.loads(meta["delta/commit_properties"])
-            )
+        writer_properties, commit_properties = self.resolved_properties(meta)
 
         return DeltaWriteRequest(
             table_uri=table_uri,

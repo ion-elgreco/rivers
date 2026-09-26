@@ -174,6 +174,7 @@ mod tests {
     fn test_run() -> Run {
         let spec = RunSpec {
             job_name: None,
+            action: None,
             code_location_ref: CodeLocationRef {
                 name: "demo".to_string(),
                 identity: "demo-id".to_string(),

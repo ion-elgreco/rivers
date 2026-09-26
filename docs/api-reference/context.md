@@ -30,6 +30,7 @@ Context is optional — assets without it continue to work as before.
 | Property | Type | Description |
 |----------|------|-------------|
 | `asset_name` | `str` | Name of the current asset. |
+| `run_id` | `str \| None` | Run this materialization belongs to (`None` only for a directly-constructed context). |
 | `tags` | `list[str] \| None` | Tags from the asset definition. |
 | `kinds` | `list[str]` | Kinds/types from the asset definition. |
 | `group` | `str \| None` | Group from the asset definition. |
@@ -39,7 +40,7 @@ Context is optional — assets without it continue to work as before.
 | `output_selection` | `list[str]` | Output names being materialized (multi-asset only). |
 | `partition` | `PartitionContext \| None` | Partition context (if partitioned). |
 | `has_partition_key` | `bool` | Whether a partition key is available. |
-| `partition_key` | `str` | Single partition key string (raises `ValueError` if not partitioned). |
+| `partition_key` | `str` | Single partition key string (raises `PartitionValidationError` if not partitioned). |
 | `partition_time_window` | `tuple[datetime, datetime] \| None` | Time window for time-partitioned assets. |
 | `config` | `ConfigT` | Config instance (if the asset function uses a config type hint). |
 | `log` | `logging.Logger` | Logger named `rivers.assets.<asset_name>`. |
@@ -118,7 +119,7 @@ def my_task(context: TaskExecutionContext, source: int) -> str:
 | `tags` | `list[str] \| None` | Tags from the task definition. |
 | `partition` | `PartitionContext \| None` | Partition context (if partitioned). |
 | `has_partition_key` | `bool` | Whether a partition key is available. |
-| `partition_key` | `str` | Single partition key string (raises `ValueError` if not partitioned). |
+| `partition_key` | `str` | Single partition key string (raises `PartitionValidationError` if not partitioned). |
 | `partition_time_window` | `tuple[datetime, datetime] \| None` | Time window for time-partitioned tasks. |
 | `config` | `ConfigT` | Config instance (if the task function uses a config type hint). |
 | `log` | `logging.Logger` | Logger named `rivers.tasks.<task_name>`. |
@@ -133,6 +134,65 @@ def partitioned_task(context: rs.TaskExecutionContext) -> str:
 
 ---
 
+## `ActionContext`
+
+The context an [asset action](../concepts/actions.md) receives. An action acts on data
+that already exists, so this context carries no upstream inputs and no output metadata —
+it identifies the target and hands over the asset's resolved IO handler.
+
+### Usage
+
+The **first parameter is always the context** (no annotation required); parameters after
+it are resources injected by name. Annotate it as `ActionContext[Config]` to receive
+typed config.
+
+To unit-test an action body, build a context by hand and call the body with it:
+`rs.ActionContext(asset_name="events", action="purge", partition=..., io_handler=...)`
+(`run_id` defaults to `""`; everything else to `None`).
+
+```python
+@rs.action(outcome=rs.Outcome.Unchanged)
+@classmethod
+def compact(cls, ctx: rs.ActionContext, warehouse: DuckDB) -> None:
+    warehouse.execute(f"VACUUM {ctx.asset_name}")
+```
+
+### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `asset_name` | `str` | Asset the action is running on. |
+| `action` | `str` | The verb being run. |
+| `run_id` | `str` | Run this action belongs to. |
+| `partition` | `PartitionContext \| None` | Partition context (if partitioned). |
+| `has_partition_key` | `bool` | Whether a partition key is available. |
+| `partition_key` | `str` | Partition being acted on (raises `PartitionValidationError` if not partitioned). |
+| `io_handler` | `Any` | The asset's resolved IO handler — the action's config bag for locating the data. |
+| `asset_metadata` | `dict[str, str]` | Per-asset metadata that IO resolution honors. |
+| `config` | `ConfigT \| None` | Typed config from an `ActionContext[Config]` annotation; `None` without one. |
+| `log` | `logging.Logger` | Logger for the action. |
+
+### Methods
+
+#### `mark_partition_failed(partition_key, error)`
+
+Mirrors [`AssetExecutionContext.mark_partition_failed`](#mark_partition_failedpartition_key-error) for batched action runs: record that one key of the batch failed while the rest count as succeeded, so a `compact` over a range can skip a corrupt partition without failing — or silently completing — the whole batch.
+
+```python
+@rs.action(outcome=rs.Outcome.Unmaterialize)
+@classmethod
+def delete(cls, ctx: rs.ActionContext) -> None:
+    for key in ctx.partition.keys:
+        try:
+            drop_partition(key)
+        except Exception as exc:
+            ctx.mark_partition_failed(key, str(exc))
+```
+
+The key must be in `ctx.partition.keys`. Marked keys are peeled out of the `Deletion` / `ActionCompleted` event the run emits and roll up into the backfill's failed counters — but unlike a materialization failure they do **not** floor the partition for automation, since a failed action is not a failed materialization attempt.
+
+---
+
 ## Detection rules
 
 Both context types follow the same injection rules:
@@ -142,6 +202,10 @@ Both context types follow the same injection rules:
 3. Context as a non-first parameter raises `ExecutionError` (`"Context must be the first parameter of '<step>'"`)
 
 Tasks can use either `TaskExecutionContext` (recommended) or `AssetExecutionContext` (backward compatible).
+
+Actions differ: their **first parameter is always the `ActionContext`**, annotated or not
+(a zero-parameter action is allowed). Naming that parameter after a resource is an error
+rather than a silent context binding.
 
 ## Executor support
 

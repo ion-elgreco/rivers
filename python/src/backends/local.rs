@@ -43,36 +43,60 @@ impl RunBackend for LocalRunBackend {
         let run_id = run_info.run_id.clone();
         let node_names = run_info.node_names.clone();
         let partition_key = run_info.partition_key.as_ref().map(PyPartitionKey::from);
+        let action = run_info.action.clone();
 
         let run_id_for_key = run_id.clone();
         let done = Arc::new(AtomicBool::new(false));
         let done_for_thread = Arc::clone(&done);
         self.gil_threads.spawn(move || {
-            let selection = if node_names.is_empty() {
-                None
-            } else {
-                Some(node_names)
+            // The run covers exactly the assets its record lists: `None` would
+            // turn an empty list into every asset. `Some(run_id)` makes the
+            // launcher reuse the existing queued record, so
+            // `LaunchedBy::Manual` is ignored.
+            let result = match action {
+                Some(action) => repo
+                    .get()
+                    .run_action_with_launcher(
+                        action,
+                        Some(node_names),
+                        partition_key,
+                        None,
+                        false,
+                        None,
+                        Some(run_id.clone()),
+                        false,
+                        LaunchedBy::Manual { user: None },
+                    )
+                    .map(|_| ()),
+                None => repo
+                    .get()
+                    .materialize_with_launcher(
+                        Some(node_names),
+                        partition_key,
+                        None,
+                        false,
+                        None,
+                        Some(run_id.clone()),
+                        false,
+                        false,
+                        None,
+                        LaunchedBy::Manual { user: None },
+                    )
+                    .map(|_| ()),
             };
-            // `Some(run_id)` makes `materialize_with_launcher` reuse the existing
-            // queued record, so `LaunchedBy::Manual` is ignored.
-            if let Err(e) = repo.get().materialize_with_launcher(
-                selection,
-                partition_key,
-                None,
-                false,
-                None,
-                Some(run_id.clone()),
-                false,
-                false,
-                None,
-                LaunchedBy::Manual { user: None },
-            ) {
+            if let Err(e) = result {
                 tracing::error!(
                     target: "rivers::coordinator",
                     run_id = %run_id,
                     error = %e,
                     "dequeued run execution failed"
                 );
+                // Mark the dequeued record Failed with the real reason, else it
+                // pins a queue slot as NotStarted until the start-timeout sweep
+                // writes a fabricated one. Mirrors the direct dispatcher's arm.
+                let handle = repo.get().handle();
+                crate::runtime::rt()
+                    .block_on(handle.mark_run_launch_failed(&run_id, &e.to_string()));
             }
             done_for_thread.store(true, Ordering::Release);
         });

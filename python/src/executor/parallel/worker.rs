@@ -9,8 +9,11 @@ use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+use crate::assets::decorator::PyAsset;
+use crate::assets::io_handler::IOHandler;
 use crate::context::io::{PyInputContext, PyOutputContext};
 use crate::result_types::{self, ResultKind};
+use crate::task::PyTask;
 
 fn resolve_module_attr(py: Python, module: &str, qualname: &str) -> PyResult<Py<PyAny>> {
     let importlib = py.import("importlib")?;
@@ -72,6 +75,31 @@ pub fn _reconstruct_func_ref(py: Python, module: String, qualname: String) -> Py
     Ok(unwrap_callable(py, &obj))
 }
 
+/// A bound method that pickles as its function and owner, and unpickles as
+/// the same bound method.
+#[pyclass(name = "BoundMethod", module = "rivers._core")]
+pub struct PyBoundMethod {
+    func: Py<PyAny>,
+    owner: Py<PyAny>,
+}
+
+impl PyBoundMethod {
+    pub fn new(func: Py<PyAny>, owner: Py<PyAny>) -> Self {
+        Self { func, owner }
+    }
+}
+
+#[pymethods]
+impl PyBoundMethod {
+    fn __reduce__(&self, py: Python) -> PyResult<(Py<PyAny>, (Py<PyAny>, Py<PyAny>))> {
+        let method_type = py.import("types")?.getattr("MethodType")?;
+        Ok((
+            method_type.unbind(),
+            (self.func.clone_ref(py), self.owner.clone_ref(py)),
+        ))
+    }
+}
+
 /// Lightweight IO handler reference that reconstructs from the asset definition.
 #[pyclass(name = "IOHandlerRef", module = "rivers._core")]
 pub struct PyIOHandlerRef {
@@ -97,25 +125,103 @@ impl PyIOHandlerRef {
     }
 }
 
-/// Follows node_io_handler → io_handler → None.
+/// node_io_handler → io_handler → None, the one probe order for both child
+/// reconstruction and the parent-side shippability check. Requires the found
+/// object to expose `load_input`: on a class-form asset the attribute lookup
+/// reaches the `Asset` base's getset descriptors, which are not handlers.
+/// On an asset or a task only a handler set at definition counts: a fresh
+/// import holds the key of a resource handler, not the handler.
+pub(super) fn handler_attr(py: Python, obj: &Py<PyAny>) -> Option<Py<PyAny>> {
+    let definition_handler = |h: &IOHandler| match h {
+        IOHandler::Instance(handler) => Some(handler.clone_ref(py)),
+        IOHandler::ResourceRef(_) | IOHandler::Resource(_) => None,
+    };
+    if let Ok(asset) = obj.bind(py).cast::<PyAsset>() {
+        let asset = asset.borrow();
+        return [asset.inner.node_io_handler(), asset.inner.io_handler()]
+            .into_iter()
+            .flatten()
+            .find_map(definition_handler);
+    }
+    if let Ok(task) = obj.bind(py).cast::<PyTask>() {
+        return task
+            .borrow()
+            .inner
+            .io_handler
+            .as_ref()
+            .and_then(definition_handler);
+    }
+    for attr in ["node_io_handler", "io_handler"] {
+        if let Ok(h) = obj.getattr(py, attr)
+            && !h.is_none(py)
+            && h.bind(py).hasattr("load_input").unwrap_or(false)
+        {
+            return Some(h);
+        }
+    }
+    None
+}
+
+/// Resolve `module.qualname` and find its handler, walking up one qualname
+/// segment if the leaf has none — a class-form asset's callable is
+/// `Class.method`, and the handler lives on the class.
+pub(super) fn resolve_handler_from_path(
+    py: Python,
+    module: &str,
+    qualname: &str,
+) -> Option<Py<PyAny>> {
+    let obj = resolve_module_attr(py, module, qualname).ok()?;
+    if let Some(h) = handler_attr(py, &obj) {
+        return Some(h);
+    }
+    let (parent, _) = qualname.rsplit_once('.')?;
+    let parent_obj = resolve_module_attr(py, module, parent).ok()?;
+    handler_attr(py, &parent_obj)
+}
+
+/// Follows node_io_handler → io_handler on the leaf, then its parent. A path
+/// that reaches no handler rebuilds to a `MissingIOHandler`: raising here
+/// would fail every pending step of the pool, not only this one.
 #[pyfunction]
 pub fn _reconstruct_io_handler_ref(
     py: Python,
     module: String,
     qualname: String,
 ) -> PyResult<Py<PyAny>> {
-    let obj = resolve_module_attr(py, &module, &qualname)?;
-    if let Ok(nio) = obj.getattr(py, "node_io_handler")
-        && !nio.is_none(py)
-    {
-        return Ok(nio);
+    match resolve_handler_from_path(py, &module, &qualname) {
+        Some(handler) => Ok(handler),
+        None => {
+            let reference = format!("{module}.{qualname}");
+            Ok(Py::new(py, PyMissingIOHandler { reference })?.into_any())
+        }
     }
-    if let Ok(io) = obj.getattr(py, "io_handler")
-        && !io.is_none(py)
-    {
-        return Ok(io);
+}
+
+/// Stands in for an `IOHandlerRef` that found no handler in the worker, so
+/// the step fails instead of skipping the write.
+#[pyclass(name = "MissingIOHandler", module = "rivers._core")]
+struct PyMissingIOHandler {
+    reference: String,
+}
+
+impl PyMissingIOHandler {
+    fn error(&self, asset_name: &str) -> PyErr {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "asset '{asset_name}': io_handler reference {} found no handler in the worker",
+            self.reference
+        ))
     }
-    Ok(py.None())
+}
+
+#[pymethods]
+impl PyMissingIOHandler {
+    fn handle_output(&self, context: PyRef<'_, PyOutputContext>, _obj: Py<PyAny>) -> PyResult<()> {
+        Err(self.error(&context.asset_name))
+    }
+
+    fn load_input(&self, context: PyRef<'_, PyInputContext>) -> PyResult<Py<PyAny>> {
+        Err(self.error(&context.asset_name))
+    }
 }
 
 /// Describes how to load an upstream input from an IO handler in the worker.
@@ -222,23 +328,33 @@ pub struct PyWorkerResult {
     /// drained from the worker context and carried back to the orchestrator.
     #[pyo3(get)]
     pub failed_partitions: Vec<(String, String)>,
+    /// The final task of a graph asset also wrote the graph's output.
+    #[pyo3(get)]
+    pub graph_written: bool,
+    /// The exception the graph's io_handler raised on that write.
+    #[pyo3(get)]
+    pub graph_error: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl PyWorkerResult {
     #[new]
-    #[pyo3(signature = (outputs, captured_logs=None, dynamic_keys=None, failed_partitions=vec![]))]
+    #[pyo3(signature = (outputs, captured_logs=None, dynamic_keys=None, failed_partitions=vec![], graph_written=false, graph_error=None))]
     fn new(
         outputs: Py<PyAny>,
         captured_logs: Option<(String, String, String)>,
         dynamic_keys: Option<Vec<String>>,
         failed_partitions: Vec<(String, String)>,
+        graph_written: bool,
+        graph_error: Option<Py<PyAny>>,
     ) -> Self {
         Self {
             outputs,
             captured_logs,
             dynamic_keys,
             failed_partitions,
+            graph_written,
+            graph_error,
         }
     }
 
@@ -252,6 +368,8 @@ impl PyWorkerResult {
             Option<(String, String, String)>,
             Option<Vec<String>>,
             Vec<(String, String)>,
+            bool,
+            Option<Py<PyAny>>,
         ),
     )> {
         let cls = py.import("rivers._core")?.getattr("WorkerResult")?;
@@ -262,6 +380,8 @@ impl PyWorkerResult {
                 self.captured_logs.clone(),
                 self.dynamic_keys.clone(),
                 self.failed_partitions.clone(),
+                self.graph_written,
+                self.graph_error.as_ref().map(|e| e.clone_ref(py)),
             ),
         ))
     }
@@ -436,7 +556,7 @@ fn metadata_vec_to_pickle_safe(
 /// Replaces Python `_worker_execute_step`. Reuses Rust functions for
 /// result type extraction, DynamicOutput unwrapping, and IO handling.
 #[pyfunction]
-#[pyo3(signature = (func, args, context_kwargs, resource_specs, io_handler, output_context_kwargs, multi_output_specs=None))]
+#[pyo3(signature = (func, args, context_kwargs, resource_specs, io_handler, output_context_kwargs, multi_output_specs=None, graph_output=None))]
 pub fn worker_execute_step(
     py: Python,
     func: Py<PyAny>,
@@ -446,6 +566,7 @@ pub fn worker_execute_step(
     io_handler: Option<Py<PyAny>>,
     output_context_kwargs: Option<Py<PyAny>>,
     multi_output_specs: Option<Bound<'_, PyList>>,
+    graph_output: Option<(Py<PyAny>, Py<PyAny>)>,
 ) -> PyResult<Py<PyAny>> {
     // Per-step capture: install the proxy writers (idempotent, child-process
     // local) and start a fresh StepCapture / Rust log capture pair around the
@@ -514,6 +635,11 @@ pub fn worker_execute_step(
     } else {
         None
     };
+
+    // A graph's final task writes its value as the graph's output too; a
+    // failed write fails only the graph, so it does not fail this step.
+    let mut graph_written = false;
+    let mut graph_error: Option<Py<PyAny>> = None;
 
     // Execute with resource teardown guarantee. Closure returns the outputs
     // list plus any single-output `dynamic_keys` (multi-asset can't carry
@@ -696,6 +822,15 @@ pub fn worker_execute_step(
                             } else {
                                 data_version
                             };
+                            if let Some((graph_handler, graph_kwargs)) = &graph_output {
+                                let graph_dict: &Bound<PyDict> = graph_kwargs.bind(py).cast()?;
+                                let graph_ctx =
+                                    Py::new(py, PyOutputContext::from_kwargs(py, graph_dict)?)?;
+                                match write_output(py, graph_handler, &graph_ctx, &value) {
+                                    Ok(_) => graph_written = true,
+                                    Err(e) => graph_error = Some(e.into_value(py).into_any()),
+                                }
+                            }
                             (final_dv, ResultKind::Output)
                         } else {
                             (data_version, ResultKind::Materialization)
@@ -743,6 +878,8 @@ pub fn worker_execute_step(
                 captured_logs,
                 dynamic_keys,
                 failed_partitions,
+                graph_written,
+                graph_error,
             };
             Ok(Py::new(py, wr)?.into_any())
         }

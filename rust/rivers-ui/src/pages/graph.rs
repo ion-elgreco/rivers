@@ -8,7 +8,7 @@ use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::materialize_dialog::MaterializeDialog;
 use crate::components::multi_select::{MultiSelect, SelectOption};
 use crate::components::ui_kit::{Crumb, DagMinimap, KindBadge, MinimapNode, Tag, Topbar};
-use crate::helpers::{partition_picker_for_assets, use_query_param_list};
+use crate::helpers::{common_actions, partition_picker_for_assets, use_query_param_list};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::{get_asset, get_assets};
 use crate::server_fns::graph::{get_graph_layout, get_graph_topology, get_node_lineage};
@@ -134,7 +134,10 @@ pub fn GraphPage() -> impl IntoView {
     let (filter_kind, set_filter_kind) = use_query_param_list("kind");
     let (filter_group, set_filter_group) = use_query_param_list("group");
 
-    let graph_asset_names = Signal::derive(move || {
+    // Memos, not derives: a derive re-walks the whole topology on every read
+    // (each selection change reads these several times); a memo recomputes
+    // only when the topology itself changes.
+    let graph_asset_names = Memo::new(move |_| {
         topology
             .get()
             .and_then(|r| r.ok())
@@ -149,7 +152,7 @@ pub fn GraphPage() -> impl IntoView {
     });
 
     // Task nodes can be selected for lineage tracing but never materialized.
-    let task_node_names = Signal::derive(move || {
+    let task_node_names = Memo::new(move |_| {
         topology
             .get()
             .and_then(|r| r.ok())
@@ -258,7 +261,7 @@ pub fn GraphPage() -> impl IntoView {
 
     // Materialize always routes through the dialog so the user previews the
     // asset list (and partition keys) before anything launches.
-    let asset_info_by_key = Signal::derive(move || {
+    let asset_info_by_key = Memo::new(move |_| {
         assets_info
             .get()
             .and_then(|r| r.ok())
@@ -267,21 +270,40 @@ pub fn GraphPage() -> impl IntoView {
             .map(|i| (i.asset_key.clone(), i))
             .collect::<std::collections::HashMap<String, crate::types::AssetDefinitionInfo>>()
     });
+    // The dialog's row decoration, from the page's own live resource.
+    let (records_by_key, records_failed) = crate::helpers::records_by_key(all_assets);
     let (mat_targets, set_mat_targets) = signal(Vec::<String>::new());
     let show_dialog = RwSignal::new(false);
+    let dialog_verb = RwSignal::new(Option::<crate::types::AssetActionInfo>::None);
+    let dialog_destructive = RwSignal::new(false);
     let materialize_picker = Signal::derive(move || {
         partition_picker_for_assets(&mat_targets.get(), &asset_info_by_key.get())
     });
     let dialog_asset_keys = Signal::derive(move || mat_targets.get());
-    let start_materialize: Callback<Vec<String>> = Callback::new(move |keys: Vec<String>| {
-        let tasks = task_node_names.get_untracked();
-        let keys: Vec<String> = keys.into_iter().filter(|k| !tasks.contains(k)).collect();
-        if keys.is_empty() {
-            return;
-        }
-        set_mat_targets.set(keys);
-        show_dialog.set(true);
-    });
+    // One opener for both flows — `None` verb materializes. The task-node
+    // filter lives here once: task nodes can be selected for lineage tracing
+    // but never executed.
+    type DialogVerb = Option<crate::types::AssetActionInfo>;
+    let open_dialog: Callback<(Vec<String>, DialogVerb, bool)> = Callback::new(
+        move |(keys, verb, destructive): (Vec<String>, DialogVerb, bool)| {
+            let tasks = task_node_names.get_untracked();
+            let keys: Vec<String> = keys.into_iter().filter(|k| !tasks.contains(k)).collect();
+            if keys.is_empty() {
+                return;
+            }
+            dialog_verb.set(verb);
+            dialog_destructive.set(destructive);
+            set_mat_targets.set(keys);
+            show_dialog.set(true);
+        },
+    );
+    let start_materialize: Callback<Vec<String>> =
+        Callback::new(move |keys: Vec<String>| open_dialog.run((keys, None, false)));
+    let start_action: Callback<(Vec<String>, crate::types::AssetActionInfo, bool)> = Callback::new(
+        move |(keys, act, destructive): (Vec<String>, crate::types::AssetActionInfo, bool)| {
+            open_dialog.run((keys, Some(act), destructive))
+        },
+    );
 
     let all_kinds = Signal::derive(move || {
         layout
@@ -802,13 +824,29 @@ pub fn GraphPage() -> impl IntoView {
                                 <button
                                     class="btn btn-primary dag-sidebar-action"
                                     disabled=n_mat == 0
-                                    on:click=move |_| { start_materialize.run(mat_keys.clone()); }
+                                    on:click={
+                                        let keys = mat_keys.clone();
+                                        move |_| { start_materialize.run(keys.clone()); }
+                                    }
                                 >
                                     <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
                                         <path d="M3 2l7 4-7 4V2z"/>
                                     </svg>
                                     {format!("Materialize {n_mat} assets…")}
                                 </button>
+                                {common_actions(&mat_keys, &asset_info_by_key.get()).into_iter().map(|act| {
+                                    let destructive = act.is_destructive();
+                                    let label = act.name.clone();
+                                    let keys = mat_keys.clone();
+                                    let title = crate::helpers::action_title(&act, true);
+                                    view! {
+                                        <button
+                                            class=if destructive { "btn btn-danger dag-sidebar-action" } else { "btn dag-sidebar-action" }
+                                            title=title
+                                            on:click=move |_| { start_action.run((keys.clone(), act.clone(), destructive)); }
+                                        >{label}</button>
+                                    }
+                                }).collect::<Vec<_>>()}
                             </div>
                         </div>
                     }.into_any());
@@ -847,6 +885,11 @@ pub fn GraphPage() -> impl IntoView {
                                             let tags = record.tags.clone();
                                             let ups = upstream.clone();
                                             let downs = downstream.clone();
+                                            let node_verbs = common_actions(
+                                                std::slice::from_ref(&record.asset_key),
+                                                &asset_info_by_key.get(),
+                                            );
+                                            let key_for_actions = record.asset_key.clone();
                                             view! {
                                                 <div class="dag-sidebar-header">
                                                     <div class=format!("dag-sidebar-status {status_cls}")>
@@ -936,6 +979,19 @@ pub fn GraphPage() -> impl IntoView {
                                                         </svg>
                                                         "Materialize…"
                                                     </button>
+                                                    {node_verbs.into_iter().map(|act| {
+                                                        let destructive = act.is_destructive();
+                                                        let label = act.name.clone();
+                                                        let k = key_for_actions.clone();
+                                                        let title = crate::helpers::action_title(&act, false);
+                                                        view! {
+                                                            <button
+                                                                class=if destructive { "btn btn-danger dag-sidebar-action" } else { "btn dag-sidebar-action" }
+                                                                title=title
+                                                                on:click=move |_| { start_action.run((vec![k.clone()], act.clone(), destructive)); }
+                                                            >{label}</button>
+                                                        }
+                                                    }).collect::<Vec<_>>()}
                                                 </div>
                                             }.into_any()
                                         }
@@ -955,6 +1011,10 @@ pub fn GraphPage() -> impl IntoView {
             show=show_dialog
             asset_keys=dialog_asset_keys
             picker=materialize_picker
+            action=dialog_verb
+            destructive=dialog_destructive
+            records=records_by_key
+            records_failed=records_failed
         />
     }
 }

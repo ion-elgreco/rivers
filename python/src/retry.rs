@@ -149,6 +149,15 @@ impl PyBackoff {
     fn __repr__(&self) -> String {
         format!("Backoff({:?})", self.inner.shape)
     }
+
+    /// See `RetryPolicy.__reduce__`: the named constructors can't round-trip a
+    /// shape, so the core serde form is the transport.
+    fn __reduce__<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyAny>, (String,))> {
+        let json = serde_json::to_string(&self.inner)
+            .map_err(|e| PyValueError::new_err(format!("backoff is not serializable: {e}")))?;
+        let ctor = py.import("rivers._core")?.getattr("_reconstruct_backoff")?;
+        Ok((ctor, (json,)))
+    }
 }
 
 // ── RetryOn preset ──────────────────────────────────────────────────────────
@@ -162,6 +171,22 @@ pub enum PyRetryOn {
     All,
     #[pyo3(name = "TRANSIENT")]
     Transient,
+}
+
+#[pymethods]
+impl PyRetryOn {
+    /// Fieldless pyclass enums don't pickle by default.
+    fn __reduce__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyAny>, &'static str))> {
+        let variant = match self {
+            Self::All => "ALL",
+            Self::Transient => "TRANSIENT",
+        };
+        let getattr = py.import("builtins")?.getattr("getattr")?;
+        Ok((getattr, (py.get_type::<Self>().into_any(), variant)))
+    }
 }
 
 /// Normalize the `retry_on` argument (a preset, or a sequence mixing exception
@@ -321,6 +346,35 @@ impl PyRetryPolicy {
     fn __repr__(&self) -> String {
         format!("RetryPolicy(max_retries={})", self.inner.max_retries)
     }
+
+    /// Round-trip through the core type's serde form: the constructor re-runs
+    /// normalization and cannot rebuild `retry_on`/`escalate` faithfully. Needed
+    /// because an inline policy rides `@rs.action` marker metadata through
+    /// cloudpickle when a locally-defined class asset ships to a worker.
+    fn __reduce__<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyAny>, (String,))> {
+        let json = serde_json::to_string(&self.inner)
+            .map_err(|e| PyValueError::new_err(format!("retry policy is not serializable: {e}")))?;
+        let ctor = py
+            .import("rivers._core")?
+            .getattr("_reconstruct_retry_policy")?;
+        Ok((ctor, (json,)))
+    }
+}
+
+/// Rebuild a `RetryPolicy` from `__reduce__`'s serde payload.
+#[pyfunction]
+pub fn _reconstruct_retry_policy(json: &str) -> PyResult<PyRetryPolicy> {
+    let inner: RetryPolicy = serde_json::from_str(json)
+        .map_err(|e| PyValueError::new_err(format!("unreadable retry policy: {e}")))?;
+    Ok(PyRetryPolicy { inner })
+}
+
+/// Rebuild a `Backoff` from `__reduce__`'s serde payload.
+#[pyfunction]
+pub fn _reconstruct_backoff(json: &str) -> PyResult<PyBackoff> {
+    let inner: Backoff = serde_json::from_str(json)
+        .map_err(|e| PyValueError::new_err(format!("unreadable backoff: {e}")))?;
+    Ok(PyBackoff { inner })
 }
 
 /// Extract a `retry=RetryPolicy | str | None` argument into a [`RetryRef`]. A

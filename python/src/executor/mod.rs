@@ -176,6 +176,19 @@ impl Executor {
         ctx: &mut dispatch::BatchContext,
         step_indices: &[usize],
     ) -> Vec<(String, PyErr)> {
+        // Action steps run in the orchestrator process regardless of executor:
+        // they carry no dep inputs to ship, and their by-ref transport (action
+        // fn + handler) is neither loky- nor pod-shippable yet. Decided here,
+        // once — before the K8s arm's in-cluster environment detection, and
+        // covering per-asset executor overrides too.
+        if ctx.scope.plan.is_action() {
+            return dispatch::execute_level_batch(
+                &in_process::InProcessBackend,
+                py,
+                ctx,
+                step_indices,
+            );
+        }
         match self {
             Executor::InProcess {} => {
                 dispatch::execute_level_batch(&in_process::InProcessBackend, py, ctx, step_indices)
@@ -232,6 +245,7 @@ impl Executor {
         storage: StorageHandle,
         run_id: &str,
         resources: &HashMap<String, ResourceVariant>,
+        retries: &HashMap<String, rivers_core::execution::retry::RetryPolicy>,
         config_overrides: &Option<HashMap<String, Py<PyAny>>>,
         io_handler_registry: &IOHandlerRegistry,
         resume: bool,
@@ -251,10 +265,19 @@ impl Executor {
             }
         }
 
-        let needs_bridge = plan
-            .steps
-            .iter()
-            .any(|s| node_map.get(&s.name).map(|n| n.is_async()).unwrap_or(false));
+        let needs_bridge = match plan.verb() {
+            // The bridge requirement follows the executed verb, not the
+            // asset's materialize function.
+            Some(verb) => plan.steps.iter().any(|s| {
+                node_map
+                    .get(&s.name)
+                    .is_some_and(|n| n.action_is_async(verb))
+            }),
+            None => plan
+                .steps
+                .iter()
+                .any(|s| node_map.get(&s.name).map(|n| n.is_async()).unwrap_or(false)),
+        };
 
         let bridge = if needs_bridge {
             match async_exec::AsyncBridge::new(py) {
@@ -272,7 +295,10 @@ impl Executor {
             let writer = EventWriter::new(storage.clone());
             let mut data_versions: HashMap<String, String> = HashMap::new();
             let mut failed_names: HashSet<String> = HashSet::new();
+            let mut cancelled_names: HashSet<String> = HashSet::new();
 
+            let mut prior_attempts: HashMap<String, rivers_core::storage::StepAttempts> =
+                HashMap::new();
             let completed_steps: HashSet<String> = if resume {
                 match rt().block_on(rivers_k8s::resume::build_resume_state(
                     storage.backend().as_ref(),
@@ -280,6 +306,7 @@ impl Executor {
                 )) {
                     Ok(state) => {
                         data_versions.extend(state.data_versions);
+                        prior_attempts = state.step_attempts;
                         state.completed_steps
                     }
                     Err(e) => {
@@ -291,6 +318,7 @@ impl Executor {
                 HashSet::new()
             };
             let mut graph_started: HashSet<String> = HashSet::new();
+            let mut graph_written_at: HashMap<String, i64> = HashMap::new();
             let mut failures: Vec<(String, PyErr)> = Vec::new();
             // Persistent across levels: fan-out mapping keys and collect results
             let mut mapped_instance_keys: HashMap<String, Vec<String>> = HashMap::new();
@@ -301,6 +329,20 @@ impl Executor {
             let mut step_dynamic_keys: HashMap<String, Vec<String>> = HashMap::new();
             let mut step_failed_partitions: HashMap<String, Vec<(PyPartitionKey, String)>> =
                 HashMap::new();
+            // A finished step's per-key failures lived only in memory; without
+            // them ordering would hand its dependents those keys again.
+            for (name, attempts) in &prior_attempts {
+                if completed_steps.contains(name) && !attempts.failed_keys.is_empty() {
+                    step_failed_partitions.insert(
+                        name.clone(),
+                        attempts
+                            .failed_keys
+                            .iter()
+                            .map(|k| (PyPartitionKey::from(k), "failed before a restart".into()))
+                            .collect(),
+                    );
+                }
+            }
 
             prefill_external_dep_versions(plan, storage, &mut data_versions);
 
@@ -406,11 +448,14 @@ impl Executor {
                             plan,
                             completed_steps: &completed_steps,
                             resume,
+                            prior_attempts: &prior_attempts,
                         },
                         state: dispatch::RunState {
                             data_versions: &mut data_versions,
                             failed_names: &mut failed_names,
+                            cancelled_names: &mut cancelled_names,
                             graph_started: &mut graph_started,
+                            graph_written_at: &mut graph_written_at,
                             mapped_instance_keys: &mut mapped_instance_keys,
                             step_dynamic_keys: &mut step_dynamic_keys,
                             failed_partitions: &mut step_failed_partitions,
@@ -424,6 +469,7 @@ impl Executor {
                             graph_nodes: &graph_nodes,
                             io_handler_registry,
                             resources,
+                            retries,
                             config_overrides,
                             bridge: bridge.as_ref(),
                         },
@@ -438,11 +484,15 @@ impl Executor {
                 Python::attach(|py| b.shutdown(py));
             }
 
-            // Defense-in-depth: catch leaked slots from crashed steps.
-            if let Err(e) =
-                io_rt().block_on(storage.backend().free_concurrency_slots_for_run(run_id))
-            {
-                tracing::warn!(run_id = %run_id, error = %e, "failed to free run-level concurrency slots");
+            // Defense-in-depth: catch leaked slots from crashed steps. Not in
+            // a step pod — there the run isn't over, and the run-scoped delete
+            // would take sibling pods' live claims with it.
+            if !in_step_pod() {
+                if let Err(e) =
+                    io_rt().block_on(storage.backend().free_concurrency_slots_for_run(run_id))
+                {
+                    tracing::warn!(run_id = %run_id, error = %e, "failed to free run-level concurrency slots");
+                }
             }
 
             writer.flush();

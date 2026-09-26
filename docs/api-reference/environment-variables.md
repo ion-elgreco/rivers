@@ -2,13 +2,14 @@
 
 rivers reads a number of environment variables to configure the daemon, the operator, and the standalone UI binary. Most have sensible defaults.
 
-This page lists user-settable env vars that rivers itself reads. Variables consumed by user code (e.g. `pydantic_settings.BaseSettings`) are out of scope — see [Configuration](../concepts/configuration.md) for that pattern. Operator- and CLI-injected variables (code-location identity, run context, step-pod plumbing) are also omitted — they are managed by rivers itself.
+This page lists user-settable env vars that rivers itself reads. Variables consumed by user code (e.g. `pydantic_settings.BaseSettings`) are out of scope — see [Configuration](../concepts/configuration.md) for that pattern. Operator- and CLI-injected variables (run context, step-pod plumbing) are also omitted — they are managed by rivers itself.
 
 ## Deployment
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RIVERS_DEPLOYMENT` | unset (treated as `dev`) | Either `dev` or `cloud`. `cloud` activates strict checks — most importantly, code-location identity becomes mandatory and rivers panics rather than silently writing under a default identity. Set automatically by `rivers serve` / `execute` / `execute-step`. |
+| `RIVERS_CODE_LOCATION_ID` | unset (code location `default`) | The code location that runs, asset state and pool claims are recorded under. The operator sets it on rivers pods to the `spec.identity` of the `CodeLocation`. Outside those pods, set it (or pass `--code-location-id`) when a [CLI](cli.md#storage-flags) command acts on a deployed code location. |
 
 ## Daemon and automation
 
@@ -25,7 +26,7 @@ Tunes how step workers wait for available slots in a concurrency pool. Durations
 |----------|---------|-------------|
 | `RIVERS_CLAIM_POLL_INTERVAL` | `1s` | How often to re-check storage for an available slot. Shorter = faster pickup, more storage load. |
 | `RIVERS_CLAIM_POLL_JITTER` | `500ms` | Maximum random jitter added to the poll interval to break up correlated retries. |
-| `RIVERS_CLAIM_TIMEOUT` | `600s` (~10 min) | Total time a step waits for a slot before failing with a claim timeout. |
+| `RIVERS_CLAIM_TIMEOUT` | `600s` (~10 min) | Total time a step waits for a slot before failing with a claim timeout. Time spent waiting on an asset's own pool (behind an exclusive [action](../concepts/actions.md)) does not count. |
 
 ## Operator
 

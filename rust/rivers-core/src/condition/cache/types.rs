@@ -12,11 +12,13 @@ pub type RunTags = Arc<[(String, String)]>;
 /// unpartitioned assets alike.
 pub type SlotMap<V> = HashMap<String, HashMap<Option<PartitionKey>, V>>;
 
-/// Tag-update entry: `(asset_key, optional partition, tags)`.
-type RunTagUpdate = (String, Option<PartitionKey>, String, bool, RunTags);
+/// Tick tag update: `(asset_key, optional partition, run_id, tags)`.
+/// Applied only when the run actually materialized the asset.
+type RunTagUpdate = (String, Option<PartitionKey>, String, RunTags);
 
-/// Latest-run map update: `(asset_key, optional partition, run_id, run_ts, tags, asset_names)`.
-/// Applied only when the run actually materialized the asset, newest run last.
+/// Latest-run map update: `(asset_key, optional partition, run_id, run_ts, tags,
+/// asset_names, is_verb_run)`. Applied only when the run actually materialized
+/// the asset, newest run last.
 type LastRunUpdate = (
     String,
     Option<PartitionKey>,
@@ -24,6 +26,7 @@ type LastRunUpdate = (
     i64,
     RunTags,
     Arc<[String]>,
+    bool,
 );
 
 /// Per-asset partition status, loaded from storage and refreshed incrementally.
@@ -45,6 +48,13 @@ pub(super) struct PartitionStatusPatch {
     pub(super) fresh_timestamps: Vec<(PartitionKey, i64)>,
     pub(super) in_progress: HashSet<PartitionKey>,
     pub(super) failed: HashMap<PartitionKey, i64>,
+    /// Keys whose `asset_partitions` row no longer exists (deleted by an
+    /// action) — evicted from the cached timestamps at apply. A set: the
+    /// apply loop probes it per failed partition.
+    pub(super) deleted: HashSet<PartitionKey>,
+    /// The run each re-read key's row names (`None`: no row). It decides which
+    /// run materialized that key, where the asset row speaks for all keys.
+    pub(super) last_runs: HashMap<PartitionKey, Option<String>>,
 }
 
 /// Backfill tracking state — which assets are in active backfills and which partitions they target.
@@ -68,6 +78,17 @@ pub struct PendingRun {
 /// Default grace period before an unconfirmed dispatched run_id is evicted as a phantom: 60s in nanos.
 pub const DEFAULT_PENDING_GRACE_NANOS: i64 = 60 * 1_000_000_000;
 
+/// A live action run watched for its terminal transition. Action runs never
+/// enter `in_progress_assets` (they are not materialization attempts), so
+/// once the run cursor passes their start_time this watch is the only way
+/// their completion — and the deleted-partition eviction it drives — is
+/// still observed. Node names and key are kept for the vanished-row case.
+#[derive(Clone, Debug)]
+pub struct LiveActionRun {
+    pub node_names: Vec<String>,
+    pub partition_key: Option<PartitionKey>,
+}
+
 /// One mutation to `in_progress_assets`, applied in order.
 pub(super) enum InProgressChange {
     Push {
@@ -85,6 +106,8 @@ pub(super) enum InProgressChange {
 pub(super) struct FailedRun {
     pub(super) ts: i64,
     pub(super) run_id: String,
+    /// The run's own events show it materialized the asset.
+    pub(super) materialized: bool,
 }
 
 /// The `(asset, partition)` slots a run's effects write to: a partitioned
@@ -118,6 +141,10 @@ pub(super) struct RefreshDelta {
     pub(super) failed_adds: HashMap<String, FailedRun>,
     /// Asset keys whose success clears `failed_assets`, with the success run's timestamp.
     pub(super) failed_removes: HashMap<String, i64>,
+    /// Whole-asset deletion timestamps from completed action runs: last-run
+    /// map slots at or before the deletion are dropped at apply (the floors
+    /// ride `failed_removes`).
+    pub(super) deletion_supersessions: Vec<(String, i64)>,
     /// `asset → run_ids` where the asset's step succeeded but its record write lags.
     pub(super) materialized_overrides: HashMap<String, HashSet<String>>,
     /// Latest-run tag/asset-name updates, gated on materialization at apply.
@@ -126,11 +153,22 @@ pub(super) struct RefreshDelta {
     pub(super) tick_tag_updates: Vec<RunTagUpdate>,
     /// Incremental partition-status patches (asset_key → patch).
     pub(super) partition_status: HashMap<String, PartitionStatusPatch>,
+    /// Partition keys touched by completed action runs this refresh — the
+    /// incremental timestamp fetch can't see row deletions, so these keys
+    /// are re-checked for existence and evicted when gone.
+    pub(super) action_partition_checks: HashMap<String, HashSet<PartitionKey>>,
+    /// Partitioned assets with a new whole-asset deletion: every row was
+    /// dropped, so their partition status is re-fetched in full.
+    pub(super) partition_reloads: HashSet<String>,
     /// Replacement `BackfillState`, if any backfill query happened.
     pub(super) backfill: Option<BackfillState>,
     /// New cursor values; `None` means don't advance.
     pub(super) new_last_seen_run_ts: Option<i64>,
     pub(super) new_last_observation_ts: Option<i64>,
+    /// Live action runs to start watching: `(run_id, details)`.
+    pub(super) track_action_runs: Vec<(String, LiveActionRun)>,
+    /// Watched action runs observed terminal (or deleted) this refresh.
+    pub(super) untrack_action_runs: Vec<String>,
     /// Run_ids confirmed by storage (remove from `pending_runs`).
     pub(super) confirmed_pending: Vec<String>,
     /// Phantom run_ids past grace to evict; `(run_id, asset_keys)`.

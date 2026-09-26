@@ -1,6 +1,11 @@
 //! Step classification — determines which executor backend handles each step.
+use std::collections::HashSet;
+
 use pyo3::prelude::*;
 use rivers_core::execution::plan::StepKind;
+use rivers_core::execution::retry::{FailureReason, should_retry};
+
+use crate::partitions::PyPartitionKey;
 
 use crate::errors::ExecutionError;
 
@@ -32,12 +37,54 @@ pub(crate) fn classify_step(
         return StepAction::Handled;
     }
 
+    // An action step runs at most once per retry budget: a resume after a
+    // crash must not re-apply a half-done merge or delete on its own. A
+    // recorded step failure ends the ladder. A cut-off attempt (begun, never
+    // ended) used a try, and its crash is an infrastructure failure: the step
+    // runs again only if the policy retries one with budget left. A crash in
+    // the backoff after a StepRetry cut nothing off — that retry was granted.
+    if ctx.scope.resume && ctx.scope.plan.is_action() {
+        let prior = step
+            .event_names()
+            .iter()
+            .find_map(|n| ctx.scope.prior_attempts.get(n))
+            .cloned();
+        if let Some(prior) = prior {
+            if prior.failed {
+                let msg = "Failed before the restart; an action step is not run again";
+                for name in step.event_names() {
+                    ctx.state.mark_failed(name.clone());
+                    failures.push((name.clone(), ExecutionError::new_err(msg)));
+                }
+                return StepAction::Handled;
+            }
+            let cut_off = prior.starts > prior.retries;
+            let may_rerun = ctx.retry_policy_for(step).is_some_and(|p| {
+                should_retry(&p, FailureReason::Infrastructure, &[], prior.starts)
+            });
+            if cut_off && !may_rerun {
+                let msg = "Interrupted by a restart; an action with no retry budget left \
+                           is not run again";
+                for name in step.event_names() {
+                    ctx.record_failure_no_hooks(name, ExecutionError::new_err(msg), failures);
+                }
+                return StepAction::Handled;
+            }
+        }
+    }
+
     let dep_failed = step
         .plan_dependencies
         .iter()
         .any(|d| ctx.state.was_failed(d));
     if dep_failed {
-        let msg = "Skipped: upstream dependency failed";
+        // An action plan's dependencies are ordering, not data: under
+        // DownstreamFirst the failed step is the downstream one.
+        let msg = if ctx.scope.plan.is_action() {
+            "Skipped: ordering dependency failed"
+        } else {
+            "Skipped: upstream dependency failed"
+        };
         for name in step.event_names() {
             ctx.record_failure_no_hooks(name, ExecutionError::new_err(msg.to_string()), failures);
         }
@@ -45,8 +92,9 @@ pub(crate) fn classify_step(
         // pure composition (no code runs for them), so the dep-fail path is
         // their only failure surface — without this, hooks defined via
         // `Asset.from_graph(hooks=[…])` would never fire on internal-task
-        // failures.
-        if let Some(node) = ctx.repo.node_map.get(&step.name)
+        // failures. Action runs don't fire hooks at all, so they skip this too.
+        if ctx.scope.plan.is_materialize()
+            && let Some(node) = ctx.repo.node_map.get(&step.name)
             && node.is_graph_asset()
             && node.has_failure_hooks()
         {
@@ -63,6 +111,32 @@ pub(crate) fn classify_step(
             });
         }
         return StepAction::Handled;
+    }
+
+    // Ordering bounds partial failure per key too: in a batched action run a
+    // dependency can fail single keys, and this step must leave them alone
+    // (DownstreamFirst: a missing rollup, never one built from deleted data).
+    if ctx.scope.plan.is_action()
+        && let Some(pk) = ctx.scope.partition_key
+    {
+        let blocked = ctx.dependency_failed_members(step);
+        if !blocked.is_empty() {
+            let blocked_keys: HashSet<&PyPartitionKey> = blocked.iter().map(|(k, _)| k).collect();
+            if pk.members().iter().all(|m| blocked_keys.contains(m)) {
+                let msg = "Skipped: ordering dependency failed on every key";
+                for name in step.event_names() {
+                    ctx.record_failure_no_hooks(name, ExecutionError::new_err(msg), failures);
+                }
+                return StepAction::Handled;
+            }
+            for name in step.event_names() {
+                ctx.state
+                    .failed_partitions
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(blocked.iter().cloned());
+            }
+        }
     }
 
     if let StepKind::Mapped {
@@ -90,15 +164,25 @@ pub(crate) fn classify_step(
         .get(&step.name)
         .expect("step must be in node_map — invalid plan");
 
-    // Graph assets are composition-only
-    if node.is_graph_asset() {
+    // Graph assets are composition-only in materialize plans. An action plan
+    // targets the graph's persisted output like any other step — fall through
+    // to Execute.
+    if node.is_graph_asset() && ctx.scope.plan.is_materialize() {
         if !ctx.state.was_failed(&step.name) {
+            // The final task wrote the data inside its claim on the asset's
+            // pool. A later stamp would undo a delete admitted since then.
+            let written_at = ctx
+                .state
+                .graph_written_at
+                .get(&step.name)
+                .copied()
+                .unwrap_or(ts);
             ctx.emit_materialization(
                 &step.name,
                 &[],
                 None,
                 ops::collect_input_data_versions(ctx.state.data_versions, &step.graph_dependencies),
-                ts,
+                written_at,
             );
             ctx.emit_success(&step.name);
             // Graph asset success hooks: fire here since there's no per-step

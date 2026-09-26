@@ -5,11 +5,19 @@ Checks the same chain the executor walks at materialize time, but without
 running any steps. The corresponding parallel-mode regression
 (per-input override honored under loky) lives at
 ``tests/executor/test_parallel_worker.py::test_mp_input_io_handler_override_honored``.
+The task section at the end does materialize: tasks that name their
+io_handler by resource key, on both executors.
 """
 
+import pickle
+import re
+from pathlib import Path
+
+import obstore.store
 import pytest
 
 import rivers as rs
+from rivers.exceptions import AssetDefinitionError
 
 
 # ---------------------------------------------------------------------------
@@ -168,3 +176,293 @@ def test_graph_node_io_handler_propagates_to_internal_tasks():
     pipe_handler = repo.io_handler_for_output("pipe")
     assert isinstance(pipe_handler, _NamedHandler)
     assert pipe_handler.name == "graph_output"
+
+
+# ---------------------------------------------------------------------------
+# Two repositories from the same definitions
+# ---------------------------------------------------------------------------
+
+
+def test_repositories_sharing_definitions_resolve_keys_to_own_handlers():
+    """Each repository resolves a resource key on shared definitions against
+    its own resources, for every node kind, and resolving does not change the
+    definitions."""
+
+    @rs.Asset(io_handler="warehouse")
+    def orders() -> int:
+        return 1
+
+    @rs.Asset.from_multi(
+        output_defs=[
+            rs.AssetDef("left", io_handler="warehouse"),
+            rs.AssetDef("right", io_handler="warehouse"),
+        ]
+    )
+    def split():
+        yield rs.Output(value=1, output_name="left")
+        yield rs.Output(value=2, output_name="right")
+
+    @rs.Asset.external(io_handler="warehouse")
+    def feed():
+        return rs.Observation(data_version="v1")
+
+    @rs.Task
+    def step() -> int:
+        return 1
+
+    @rs.Asset.from_graph(io_handler="warehouse", node_io_handler="warehouse")
+    def pipe():
+        return step()
+
+    @rs.Task(io_handler="warehouse")
+    def tally() -> int:
+        return 1
+
+    shout = rs.BashTask(name="shout", command="echo hi", io_handler="warehouse")
+
+    def definitions_view():
+        return (
+            orders.io_handler,
+            feed.io_handler,
+            pipe.io_handler,
+            pipe.node_io_handler,
+            tally.io_handler,
+        )
+
+    before = definitions_view()
+    repos = {
+        name: rs.CodeRepository(
+            assets=[orders, split, feed, pipe],
+            tasks=[step, tally, shout],
+            resources={"warehouse": _NamedHandler(name=name)},
+        )
+        for name in ("first", "second")
+    }
+    for repo in repos.values():
+        repo.resolve()
+    nodes = ["orders", "left", "right", "feed", "pipe", "pipe/step", "tally", "shout"]
+    assert {
+        name: {node: repo.io_handler_for_output(node).name for node in nodes}
+        for name, repo in repos.items()
+    } == {name: dict.fromkeys(nodes, name) for name in repos}
+    assert definitions_view() == before
+
+
+# ---------------------------------------------------------------------------
+# Tasks — io_handler named by resource key
+# ---------------------------------------------------------------------------
+
+IN_PROCESS = rs.Executor.in_process()
+PARALLEL = rs.Executor.parallel(max_workers=2)
+
+KINDS_AND_EXECUTORS = pytest.mark.parametrize(
+    ("kind", "executor"),
+    [
+        pytest.param("sync", IN_PROCESS, id="sync-in_process"),
+        pytest.param("sync", PARALLEL, id="sync-parallel"),
+        pytest.param("async", IN_PROCESS, id="async-in_process"),
+        pytest.param("async", PARALLEL, id="async-parallel"),
+        pytest.param("bash", IN_PROCESS, id="bash-in_process"),
+        pytest.param("bash", PARALLEL, id="bash-parallel"),
+    ],
+)
+
+
+def _pickle_handler(root: Path) -> rs.PickleIOHandler:
+    return rs.PickleIOHandler(store=obstore.store.LocalStore(str(root), mkdir=True))
+
+
+def _stored(root: Path) -> dict:
+    """What a PickleIOHandler holds under ``root``, by node path."""
+    return {
+        p.relative_to(root).with_suffix("").as_posix(): pickle.loads(p.read_bytes())
+        for p in sorted(root.rglob("*.pkl"))
+    }
+
+
+def _warehouse_task(kind: str, name: str, value: str):
+    """A task of ``kind`` that returns ``value`` and names its io_handler by the
+    resource key "warehouse"."""
+    if kind == "bash":
+        return rs.BashTask(name=name, command=f"echo {value}", io_handler="warehouse")
+    if kind == "async":
+
+        async def run() -> str:
+            return value
+
+    else:
+
+        def run() -> str:
+            return value
+
+    return rs.Task(run, name=name, io_handler="warehouse")
+
+
+@KINDS_AND_EXECUTORS
+def test_task_resource_key_io_handler_writes_and_reads_back(kind, executor, tmp_path):
+    """A task's ``io_handler="key"`` writes through the resource handler, and
+    downstream assets read the values back through it."""
+    warehouse = tmp_path / "warehouse"
+
+    @rs.Asset(io_handler="warehouse")
+    def order_total(orders: str) -> int:
+        return int(orders) + 1
+
+    @rs.Asset(io_handler="warehouse")
+    def greeting(customers: str) -> str:
+        return f"hi {customers}"
+
+    repo = rs.CodeRepository(
+        assets=[order_total, greeting],
+        tasks=[
+            _warehouse_task(kind, "orders", "7"),
+            _warehouse_task(kind, "customers", "ada"),
+        ],
+        resources={"warehouse": _pickle_handler(warehouse)},
+        default_executor=executor,
+    )
+    repo.materialize()
+    assert _stored(warehouse) == {
+        "customers": "ada",
+        "greeting": "hi ada",
+        "order_total": 8,
+        "orders": "7",
+    }
+
+
+@KINDS_AND_EXECUTORS
+def test_graph_inner_task_resource_key_io_handler(kind, executor, tmp_path):
+    """Inner tasks of a graph without ``node_io_handler`` write through their
+    own ``io_handler="key"``, and the next inner task reads them back."""
+    warehouse = tmp_path / "warehouse"
+
+    @rs.Task(io_handler="warehouse")
+    def left() -> int:
+        return 3
+
+    right = _warehouse_task(kind, "right", "4")
+
+    @rs.Task(io_handler="warehouse")
+    def add(a: int, b: str) -> int:
+        return a + int(b)
+
+    @rs.Asset.from_graph(io_handler="warehouse")
+    def total():
+        return add(left(), right())
+
+    repo = rs.CodeRepository(
+        assets=[total],
+        tasks=[left, right, add],
+        resources={"warehouse": _pickle_handler(warehouse)},
+        default_executor=executor,
+    )
+    repo.materialize()
+    assert _stored(warehouse) == {
+        "total": 7,
+        "total/add": 7,
+        "total/left": 3,
+        "total/right": "4",
+    }
+
+
+class _RecordingHandler(rs.BaseIOHandler):
+    """Pickles each output under ``root`` and logs every write and read to
+    ``root/log.txt``, so the record survives a worker process."""
+
+    root: str
+
+    def _path(self, name: str) -> Path:
+        return Path(self.root) / f"{name.replace('/', '__')}.pkl"
+
+    def _log(self, line: str) -> None:
+        with open(Path(self.root) / "log.txt", "a") as f:
+            f.write(line + "\n")
+
+    def handle_output(self, context, obj):
+        self._path(context.asset_name).write_bytes(pickle.dumps(obj))
+        self._log(f"write {context.asset_name}")
+
+    def load_input(self, context):
+        self._log(f"read {context.asset_name} -> {context.downstream_asset}")
+        return pickle.loads(self._path(context.asset_name).read_bytes())  # noqa: S301
+
+    def records(self) -> set[str]:
+        return set((Path(self.root) / "log.txt").read_text().splitlines())
+
+
+@pytest.mark.parametrize(
+    "executor",
+    [pytest.param(IN_PROCESS, id="in_process"), pytest.param(PARALLEL, id="parallel")],
+)
+@pytest.mark.parametrize("by_key", [False, True], ids=["instance", "resource-key"])
+def test_graph_inner_bash_task_uses_node_io_handler(executor, by_key, tmp_path):
+    """A graph's inner BashTask writes through the graph's ``node_io_handler``,
+    as its Python sibling does, and the next inner task reads it back from it."""
+    (tmp_path / "nodes").mkdir()
+    (tmp_path / "graph").mkdir()
+    nodes = _RecordingHandler(root=str(tmp_path / "nodes"))
+    graph = _RecordingHandler(root=str(tmp_path / "graph"))
+
+    @rs.Task
+    def left() -> int:
+        return 3
+
+    right = rs.BashTask(name="right", command="echo 4")
+
+    @rs.Task
+    def add(a: int, b: str) -> int:
+        return a + int(b)
+
+    @rs.Asset.from_graph(io_handler=graph, node_io_handler="nodes" if by_key else nodes)
+    def total():
+        return add(left(), right())
+
+    repo = rs.CodeRepository(
+        assets=[total],
+        tasks=[left, right, add],
+        resources={"nodes": nodes} if by_key else None,
+        default_executor=executor,
+    )
+    repo.materialize()
+    assert nodes.records() == {
+        "write total/left",
+        "write total/right",
+        "write total/add",
+        "read total/left -> total/add",
+        "read total/right -> total/add",
+    }
+    assert graph.records() == {"write total"}
+    assert pickle.loads((tmp_path / "graph" / "total.pkl").read_bytes()) == 7  # noqa: S301
+    assert pickle.loads((tmp_path / "nodes" / "total__right.pkl").read_bytes()) == "4"  # noqa: S301
+
+
+class _Settings(rs.Resource):
+    """A resource that is not an IOHandler."""
+
+    value: str = "oops"
+
+
+@pytest.mark.parametrize("kind", ["sync", "bash"])
+@pytest.mark.parametrize(
+    ("resources", "reason"),
+    [
+        ({}, "which is not in resources"),
+        (
+            {"warehouse": _Settings()},
+            "which does not implement the IOHandler protocol "
+            "(handle_output + load_input)",
+        ),
+    ],
+    ids=["unknown-key", "not-an-io-handler"],
+)
+def test_task_resource_key_io_handler_errors_at_resolve(kind, resources, reason):
+    """A task's ``io_handler="key"`` that names no IOHandler resource fails
+    resolve, as on an asset, instead of panicking when the task runs."""
+    repo = rs.CodeRepository(
+        assets=[],
+        tasks=[_warehouse_task(kind, "orders", "7")],
+        resources=resources,
+    )
+    message = f"Task 'orders': io_handler references resource 'warehouse' {reason}"
+    with pytest.raises(AssetDefinitionError, match=re.escape(message)):
+        repo.resolve()

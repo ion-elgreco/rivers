@@ -1,4 +1,5 @@
 //! Execution contexts passed to asset functions, tasks, hooks, schedules, and sensors.
+pub mod action;
 pub mod asset;
 pub mod hook;
 pub mod io;

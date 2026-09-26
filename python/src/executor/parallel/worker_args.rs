@@ -49,6 +49,7 @@ pub(super) fn resolve_worker_args(
     output_selection: &[String],
     registry: &IOHandlerRegistry,
     config_overrides_for_step: Option<&Bound<'_, PyDict>>,
+    run_id: &str,
 ) -> PyResult<WorkerArgs> {
     let node = node_map.get(step_name).expect("step must be in node_map");
 
@@ -90,6 +91,7 @@ pub(super) fn resolve_worker_args(
                     step_name.to_string()
                 };
                 kwargs.set_item("asset_name", context_name)?;
+                kwargs.set_item("run_id", run_id)?;
                 kwargs.set_item("tags", node.tags())?;
                 kwargs.set_item("kinds", node.kinds())?;
                 kwargs.set_item("group", node.group())?;
@@ -241,7 +243,7 @@ fn build_io_load_spec(
     let pickled_handler = match source {
         IOHandlerSource::Definition | IOHandlerSource::GraphOverride => {
             let upstream_func = upstream_node.callable(py)?;
-            make_io_handler_ref(py, &upstream_func).unwrap_or(handler)
+            make_io_handler_ref(py, &upstream_func, &handler).unwrap_or(handler)
         }
         IOHandlerSource::InputOverride | IOHandlerSource::Default => handler,
     };
@@ -289,29 +291,111 @@ fn build_io_load_spec(
 
 /// Extract (module, qualname) from a callable for pickle-safe ref construction.
 /// Returns Err for closures/local functions (qualname contains `<locals>`).
+///
+/// A bound classmethod's `__qualname__` names the class that *defined* the
+/// function, not the class it is bound to — an inherited verb on a class-form
+/// asset would re-import bound to the base. Resolve through `__self__` so the
+/// child rebinds to the subclass the parent actually invoked.
 pub(crate) fn extract_module_qualname(py: Python, func: &Py<PyAny>) -> PyResult<(String, String)> {
-    let module: String = func.getattr(py, "__module__")?.extract(py)?;
-    let qualname: String = func.getattr(py, "__qualname__")?.extract(py)?;
+    let (module, qualname) = match func.getattr(py, "__self__") {
+        Ok(owner) if owner.bind(py).is_instance_of::<pyo3::types::PyType>() => {
+            let module: String = owner.getattr(py, "__module__")?.extract(py)?;
+            let owner_qualname: String = owner.getattr(py, "__qualname__")?.extract(py)?;
+            let name: String = func.getattr(py, "__name__")?.extract(py)?;
+            (module, format!("{owner_qualname}.{name}"))
+        }
+        _ => (
+            func.getattr(py, "__module__")?.extract(py)?,
+            func.getattr(py, "__qualname__")?.extract(py)?,
+        ),
+    };
     if qualname.contains("<") {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "qualname contains <locals>",
+        ));
+    }
+    // A spawned worker's __main__ is the loky bootstrap, not the user's
+    // script — such a ref can never resolve; fall back to pickling by value.
+    if module == "__main__" {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "__main__ is not importable in workers",
         ));
     }
     Ok((module, qualname))
 }
 
 /// Wrap a callable in a `FuncRef` for pickle-safe transport to loky workers.
-/// Falls back to direct pickling for closures/local functions.
+/// Falls back to direct pickling for closures/local functions, and whenever
+/// the path would not rebuild `func` (probed parent-side, as in
+/// `make_io_handler_ref`). The worker rebuilds the ref while it unpickles the
+/// call, and loky fails every pending step when that raises, not only this one.
 pub(crate) fn make_func_ref(py: Python, func: &Py<PyAny>) -> PyResult<Py<PyAny>> {
     let (module, qualname) = extract_module_qualname(py, func)?;
+    let found = super::worker::_reconstruct_func_ref(py, module.clone(), qualname.clone())?;
+    if !same_callable(found.bind(py), func.bind(py)) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "module path does not reach this callable; ship it by value",
+        ));
+    }
     Ok(Py::new(py, super::worker::PyFuncRef::new(module, qualname))?.into_any())
 }
 
+/// loky's own method reducer rebuilds a bound method as
+/// `getattr(owner, func.__name__)`, so a verb inherited from an importable
+/// base resolves through its owner. Only when that lookup misses the verb
+/// (`materialize = classmethod(_load)`) does it ship as its function and
+/// owner: a function from a class body pickles only by value, with the
+/// module globals it reads.
+fn func_by_value(py: Python, func: &Py<PyAny>) -> PyResult<Py<PyAny>> {
+    let f = func.bind(py);
+    let (Ok(inner), Ok(owner)) = (f.getattr("__func__"), f.getattr("__self__")) else {
+        return Ok(func.clone_ref(py));
+    };
+    let by_name = inner
+        .getattr("__name__")
+        .and_then(|name| owner.getattr(name.extract::<String>()?));
+    if by_name.is_ok_and(|found| same_callable(&found, f)) {
+        return Ok(func.clone_ref(py));
+    }
+    let method = super::worker::PyBoundMethod::new(inner.unbind(), owner.unbind());
+    Ok(Py::new(py, method)?.into_any())
+}
+
+/// Each attribute access builds a new bound method, so two bound methods
+/// match when they bind the same function to the same owner.
+fn same_callable(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> bool {
+    if a.is(b) {
+        return true;
+    }
+    let same = |attr: &str| match (a.getattr(attr), b.getattr(attr)) {
+        (Ok(x), Ok(y)) => x.is(&y),
+        _ => false,
+    };
+    same("__func__") && same("__self__")
+}
+
 /// Wrap an IO handler in an `IOHandlerRef` for pickle-safe transport.
-/// Falls back to raw handler for closures/local functions.
-pub(super) fn make_io_handler_ref(py: Python, func: &Py<PyAny>) -> PyResult<Py<PyAny>> {
+/// Falls back to raw handler for closures/local functions, and whenever the
+/// path would not reconstruct to `expected` (probed parent-side; the module is
+/// already imported here, so the probe is cheap). Identity matters because one
+/// callable can back several handlers: every output of a class-form multi-asset
+/// ships the same `Class.materialize`, and the child's walk up to the class
+/// answers with the class-level handler for all of them, which would silently
+/// discard a per-output `AssetDef(io_handler=...)`.
+pub(super) fn make_io_handler_ref(
+    py: Python,
+    func: &Py<PyAny>,
+    expected: &Py<PyAny>,
+) -> PyResult<Py<PyAny>> {
     let (module, qualname) = extract_module_qualname(py, func)?;
-    Ok(Py::new(py, super::worker::PyIOHandlerRef::new(module, qualname))?.into_any())
+    match super::worker::resolve_handler_from_path(py, &module, &qualname) {
+        Some(found) if found.bind(py).is(expected.bind(py)) => {
+            Ok(Py::new(py, super::worker::PyIOHandlerRef::new(module, qualname))?.into_any())
+        }
+        _ => Err(pyo3::exceptions::PyValueError::new_err(
+            "module path does not reach this node's io_handler; ship raw handler",
+        )),
+    }
 }
 
 /// Resolve a node's *output* IO handler for pickle-safe transport to a loky
@@ -347,10 +431,12 @@ pub(super) fn resolve_io_handler_ref(
                 .and_then(|name| node_map.get(name))
                 .and_then(|gn| gn.callable(py).ok());
             parent_func
-                .and_then(|gf| make_io_handler_ref(py, &gf).ok())
+                .and_then(|gf| make_io_handler_ref(py, &gf, &handler).ok())
                 .unwrap_or(handler)
         }
-        IOHandlerSource::Definition => make_io_handler_ref(py, task_func).unwrap_or(handler),
+        IOHandlerSource::Definition => {
+            make_io_handler_ref(py, task_func, &handler).unwrap_or(handler)
+        }
         IOHandlerSource::Default | IOHandlerSource::InputOverride => handler,
     }
 }
@@ -359,6 +445,8 @@ pub(super) fn resolve_io_handler_ref(
 /// Always wraps with the worker function for consistent resource/context/output handling.
 /// `instance_name`: overrides `step_name` for IO output context (e.g. "double__0" for map instances).
 /// `fan_out_item`: if set, replaces the placeholder at `worker_args.fan_out_arg_index`.
+/// `graph`: the graph asset this step is the final task of; the worker writes
+/// the step's value as the graph's output too.
 pub(super) fn build_worker_submit_args(
     py: Python,
     func: Py<PyAny>,
@@ -371,6 +459,7 @@ pub(super) fn build_worker_submit_args(
     node_map: &HashMap<String, ResolvedNode>,
     registry: &IOHandlerRegistry,
     multi_outputs: &[String],
+    graph: Option<(&str, &ResolvedNode)>,
 ) -> PyResult<Vec<Py<PyAny>>> {
     let output_name = instance_name.unwrap_or(step_name);
     let is_multi = !multi_outputs.is_empty();
@@ -395,9 +484,9 @@ pub(super) fn build_worker_submit_args(
         py_resource_specs.append(tuple)?;
     }
 
-    // Wrap func in _FuncRef for pickle-safe transport. Falls back to raw
-    // func if __module__/__qualname__ are unavailable (e.g. lambdas in tests).
-    let pickled_func = make_func_ref(py, &func).unwrap_or_else(|_| func.clone_ref(py));
+    // Wrap func in _FuncRef for pickle-safe transport. Falls back to shipping
+    // func by value when no module path reaches it (lambdas, locals, aliased verbs).
+    let pickled_func = make_func_ref(py, &func).or_else(|_| func_by_value(py, &func))?;
 
     let io_spec = if is_multi {
         build_multi_output_specs(py, multi_outputs, &func, node_map, partition_key, registry)?
@@ -414,6 +503,19 @@ pub(super) fn build_worker_submit_args(
         )?
     };
 
+    let graph_output = match graph {
+        Some((graph_name, graph_node)) => build_graph_output_spec(
+            py,
+            graph_name,
+            graph_node,
+            &func,
+            partition_key,
+            node_map,
+            registry,
+        )?,
+        None => py.None(),
+    };
+
     let submit_args = vec![
         worker_fn.unbind(),
         pickled_func,
@@ -427,6 +529,7 @@ pub(super) fn build_worker_submit_args(
         io_spec.io_handler(py),
         io_spec.output_context_kwargs(py),
         io_spec.multi_output_specs(py),
+        graph_output,
     ];
 
     Ok(submit_args)
@@ -499,6 +602,34 @@ fn build_single_output_spec(
         io_handler: handler,
         output_context_kwargs,
     })
+}
+
+/// `(handler, output_context_kwargs)` for the graph's output. The type hint is
+/// the final task's, as on the in-process write.
+fn build_graph_output_spec(
+    py: Python,
+    graph_name: &str,
+    graph_node: &ResolvedNode,
+    task_func: &Py<PyAny>,
+    partition_key: &Option<PyPartitionKey>,
+    node_map: &HashMap<String, ResolvedNode>,
+    registry: &IOHandlerRegistry,
+) -> PyResult<Py<PyAny>> {
+    let graph_func = graph_node
+        .callable(py)
+        .unwrap_or_else(|_| task_func.clone_ref(py));
+    let handler = resolve_io_handler_ref(py, graph_name, &graph_func, node_map, registry);
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("asset_name", graph_name)?;
+    kwargs.set_item("asset_metadata", graph_node.metadata())?;
+    kwargs.set_item(
+        "partition",
+        ops::build_partition_context(graph_node, partition_key)?,
+    )?;
+    kwargs.set_item("type_hint", ops::extract_return_hint(py, task_func)?)?;
+    Ok(PyTuple::new(py, [handler, kwargs.unbind().into_any()])?
+        .unbind()
+        .into_any())
 }
 
 fn build_multi_output_specs(

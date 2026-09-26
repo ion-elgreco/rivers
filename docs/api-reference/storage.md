@@ -55,6 +55,12 @@ Each persistent database carries a **schema stamp** — the schema version it wa
 
 The reader/writer split lets a write-breaking migration for newer writers run **without locking out an older read-only UI**: a `Read` open is gated by `min_reader`, a read/write open by `min_writer` (and `min_writer ≥ min_reader` always holds).
 
+| Version | Change | Floors after it (`min_reader`, `min_writer`) |
+|---------|--------|----------------------------------------------|
+| 5 | Exclusive-action pool claims record the partitions they touch | 2, 5 |
+| 6 | Deletions leave tombstones on asset and partition rows | 2, 6 |
+| 7 | An asset's code version and inputs keep the time of the materialization that recorded them | 2, 7 |
+
 An **uninitialized** store (no stamp) is bootstrapped by whichever process opens it first — the UI included — so a fresh deployment shows an empty UI without waiting for a code location.
 
 ### `rivers db migrate`
@@ -232,6 +238,7 @@ table (not the events stream); streams the step didn't produce are `None`.
 | `partition_key` | `PartitionKey \| None` |
 | `block_reason` | `str \| None` |
 | `launched_by` | `LaunchedBy` |
+| `action` | `str \| None` |
 
 ### `LaunchedBy`
 

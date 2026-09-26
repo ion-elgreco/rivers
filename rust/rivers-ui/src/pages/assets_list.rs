@@ -33,6 +33,8 @@ pub fn AssetsListPage() -> impl IntoView {
     let sort_asc = Signal::derive(move || sort_asc_str.get() != "false");
     let (selected, set_selected) = signal(Vec::<String>::new());
     let show_dialog = RwSignal::new(false);
+    let dialog_verb = RwSignal::new(Option::<crate::types::AssetActionInfo>::None);
+    let dialog_destructive = RwSignal::new(false);
     let (attention_collapsed, set_attention_collapsed) = signal(true);
     // Wrap the setter in a Callback so it's Copy and can be freely captured by
     // the rendering closures.
@@ -48,6 +50,8 @@ pub fn AssetsListPage() -> impl IntoView {
         move || (loc.get(), refresh_tick.get()),
         |((ns, name), _)| get_assets(ns, name, None, None, None),
     );
+    // The materialize dialog's row decoration, from this page's live resource.
+    let (records_by_key, records_failed) = crate::helpers::records_by_key(all_assets);
     let assets_info = Resource::new(
         move || (refresh_tick.get(), loc.get()),
         |(_tick, (ns, name))| async move { get_assets_info(ns, name).await },
@@ -279,6 +283,16 @@ pub fn AssetsListPage() -> impl IntoView {
             .collect();
         crate::helpers::partition_picker_for_assets(&selected.get(), &by_key)
     });
+    // Verbs every selected asset declares — the selection submits as one
+    // action run, so anything less than the full intersection can fail.
+    let selection_verbs = Signal::derive(move || {
+        let infos = assets_info.get().and_then(|r| r.ok()).unwrap_or_default();
+        let by_key: std::collections::HashMap<String, crate::types::AssetDefinitionInfo> = infos
+            .into_iter()
+            .map(|i| (i.asset_key.clone(), i))
+            .collect();
+        crate::helpers::common_actions(&selected.get(), &by_key)
+    });
 
     let select_all = move |_| {
         let records = sorted_filtered();
@@ -346,9 +360,29 @@ pub fn AssetsListPage() -> impl IntoView {
                 </Transition>
             </div>
             <Show when=move || !selected.get().is_empty()>
-                <button class="btn btn-primary" on:click=move |_| show_dialog.set(true)>
+                <button class="btn btn-primary" on:click=move |_| {
+                    dialog_verb.set(None);
+                    dialog_destructive.set(false);
+                    show_dialog.set(true);
+                }>
                     {move || format!("Materialize ({})", selected.get().len())}
                 </button>
+                {move || selection_verbs.get().into_iter().map(|act| {
+                    let destructive = act.is_destructive();
+                    let label = act.name.clone();
+                    let title = crate::helpers::action_title(&act, true);
+                    view! {
+                        <button
+                            class=if destructive { "btn btn-danger" } else { "btn" }
+                            title=title
+                            on:click=move |_| {
+                                dialog_verb.set(Some(act.clone()));
+                                dialog_destructive.set(destructive);
+                                show_dialog.set(true);
+                            }
+                        >{label}</button>
+                    }
+                }).collect::<Vec<_>>()}
             </Show>
         </div>
 
@@ -689,6 +723,10 @@ pub fn AssetsListPage() -> impl IntoView {
             show=show_dialog
             asset_keys=selected_signal
             picker=materialize_picker
+            action=dialog_verb
+            destructive=dialog_destructive
+            records=records_by_key
+            records_failed=records_failed
         />
     }
 }

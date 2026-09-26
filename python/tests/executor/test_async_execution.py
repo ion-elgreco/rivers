@@ -8,6 +8,8 @@ import pytest
 
 import rivers as rs
 
+from _helpers import observation_metadata
+
 # ── Async detection at decoration time ──
 
 
@@ -821,8 +823,8 @@ def test_async_external_observe_with_metadata():
 
     repo = rs.CodeRepository(assets=[async_feed])
     result = repo.observe()
-    assert "async_feed" in result
-    assert result["async_feed"]["freshness"].raw_value() == "live"
+    assert result.success
+    assert observation_metadata(repo)["async_feed"]["freshness"] == "live"
 
 
 def test_async_external_observe_with_observation_return():
@@ -846,7 +848,13 @@ def test_async_external_observe_with_observation_return():
 
     repo = rs.CodeRepository(assets=[versioned_feed])
     result = repo.observe()
-    assert "versioned_feed" in result
+    assert result.success
+    evs = [
+        e
+        for e in repo.storage.get_events_for_run(result.run_id)
+        if "Observation" in str(e.event_type)
+    ]
+    assert evs and evs[0].data_version == "v42"
 
 
 def test_async_external_as_dependency():
@@ -881,7 +889,8 @@ def test_async_external_as_dependency():
     )
     # Observe the external asset
     obs_result = repo.observe(asset_names=["ext_source"])
-    assert "ext_source" in obs_result
+    assert obs_result.success
+    assert observation_metadata(repo)["ext_source"]["status"] == "ok"
 
     # Materialize downstream
     repo.materialize(selection=["consumer"])

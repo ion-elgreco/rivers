@@ -24,6 +24,8 @@ repo = rs.CodeRepository(
 repo.get_job("my_pipeline").execute()
 ```
 
+`repo.get_job()` returns the repository's own resolved copy of the job. The `Job` you construct stays a declaration, so one `Job` can be shared by several repositories, and each runs it with its own resources, IO handlers, executor, and retry policies.
+
 `Job.execute()` returns a [`RunResult`](../api-reference/repository.md#runresult) — check `result.success`, `result.run_id`, `result.materialized_assets`, `result.failed_assets`. Read materialized values back via `repo.load_node("asset_b")` (which goes through the asset's IO handler).
 
 ### Subgraph validation
@@ -64,7 +66,7 @@ repo.get_job("my_pipeline").execute(
 
 ## Executors
 
-An `Executor` picks how a job's steps are dispatched. Construct one through the static factories on `Executor`:
+An `Executor` picks how a job's steps are dispatched — for materialize runs; an [action](actions.md#where-actions-run) job's steps always run in the run's own process. Construct one through the static factories on `Executor`:
 
 ### InProcess
 

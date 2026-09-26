@@ -28,6 +28,16 @@ pub fn fresh_mount_target() -> HtmlElement {
     div.dyn_into::<HtmlElement>().unwrap()
 }
 
+/// Set the checkbox `el` and fire the `change` event its handler listens for.
+pub fn set_checked(el: &Element, checked: bool) {
+    let input: web_sys::HtmlInputElement = el.clone().dyn_into().unwrap();
+    input.set_checked(checked);
+    let init = web_sys::EventInit::new();
+    init.set_bubbles(true);
+    let ev = web_sys::Event::new_with_event_init_dict("change", &init).unwrap();
+    input.dispatch_event(&ev).unwrap();
+}
+
 /// Synthesize a click on `el`, optionally with the shift modifier set.
 /// Takes `&Element` (not `&HtmlElement`) so SVG nodes can also be
 /// click-targeted; `dispatch_event` lives on `EventTarget`, a base of
@@ -46,6 +56,33 @@ pub fn click(el: &Element, shift: bool) {
 pub async fn flush_effects() {
     let p = js_sys::Promise::resolve(&JsValue::NULL);
     let _ = JsFuture::from(p).await;
+}
+
+/// Yield once to the macrotask queue (`setTimeout(0)`). A history move and a
+/// server fn's reply land there, after a microtask flush has returned.
+pub async fn yield_macro() {
+    use wasm_bindgen::closure::Closure;
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let cb = Closure::once_into_js(move || {
+            let _ = js_sys::Function::from(resolve).call0(&JsValue::NULL);
+        });
+        web_sys::window()
+            .unwrap()
+            .set_timeout_with_callback(cb.as_ref().unchecked_ref())
+            .unwrap();
+    });
+    let _ = JsFuture::from(promise).await;
+}
+
+/// Wait up to ~2s in macrotask steps for `pred` to hold.
+pub async fn wait_until<F: Fn() -> bool>(pred: F) -> bool {
+    for _ in 0..200 {
+        if pred() {
+            return true;
+        }
+        yield_macro().await;
+    }
+    false
 }
 
 /// Collect every element matching `selector` under `host` as `Element`s.
@@ -82,6 +119,17 @@ pub fn query_one<H: AsRef<Element>>(host: &H, selector: &str) -> Element {
 pub fn nav_to(path: &str) {
     let history = web_sys::window().unwrap().history().unwrap();
     let _ = history.push_state_with_url(&JsValue::NULL, "", Some(path));
+}
+
+/// Go one entry back in the browser history, as the Back button does. Every
+/// mounted `<Router>` hears the `popstate` on a later macrotask.
+pub fn go_back() {
+    web_sys::window()
+        .unwrap()
+        .history()
+        .unwrap()
+        .back()
+        .unwrap();
 }
 
 /// Replace `window.fetch` with a Rust handler. The handler receives the
@@ -124,6 +172,84 @@ pub fn install_fetch_mock<F>(responder: F) -> FetchMock
 where
     F: Fn(&str) -> Option<String> + 'static,
 {
+    install_fetch_handler(move |input| {
+        // `input` is either a string URL or a `Request` object. Pull the URL
+        // out of either shape.
+        let url = if let Some(s) = input.as_string() {
+            s
+        } else if let Ok(req) = input.dyn_into::<web_sys::Request>() {
+            req.url()
+        } else {
+            String::new()
+        };
+        match responder(&url) {
+            Some(json) => Reply::Json(json),
+            None => Reply::Error,
+        }
+    })
+}
+
+/// [`install_fetch_mock`] that answers every call with `json` and keeps each
+/// `Request`, so a test can read what a server fn sent ([`request_bodies`]).
+pub fn install_recording_fetch_mock(json: &'static str) -> (FetchMock, Requests) {
+    install_routing_fetch_mock(move |_| Reply::Json(json.to_string()))
+}
+
+/// What a mocked `fetch` answers.
+#[derive(Clone)]
+pub enum Reply {
+    /// HTTP 200 with this JSON body.
+    Json(String),
+    /// HTTP 500.
+    Error,
+    /// No answer: the server fn stays pending.
+    Pending,
+}
+
+/// The `Request`s a recording mock kept, in call order.
+pub type Requests = std::rc::Rc<std::cell::RefCell<Vec<web_sys::Request>>>;
+
+/// A `window.fetch` mock that answers each call by its URL and keeps each
+/// `Request`, so a test can read what a server fn sent ([`request_bodies`]).
+pub fn install_routing_fetch_mock<F>(route: F) -> (FetchMock, Requests)
+where
+    F: Fn(&str) -> Reply + 'static,
+{
+    let requests = Requests::default();
+    let sink = requests.clone();
+    let mock = install_fetch_handler(move |input| {
+        if let Some(url) = input.as_string() {
+            return route(&url);
+        }
+        match input.dyn_into::<web_sys::Request>() {
+            Ok(req) => {
+                let reply = route(&req.url());
+                sink.borrow_mut().push(req);
+                reply
+            }
+            Err(_) => Reply::Error,
+        }
+    });
+    (mock, requests)
+}
+
+/// The bodies of `requests`, in order. A server fn posts its arguments
+/// form-encoded (`name=value&...`).
+pub async fn request_bodies(requests: &[web_sys::Request]) -> Vec<String> {
+    let mut bodies = Vec::with_capacity(requests.len());
+    for req in requests {
+        let text = JsFuture::from(req.text().unwrap()).await.unwrap();
+        bodies.push(text.as_string().unwrap_or_default());
+    }
+    bodies
+}
+
+/// Replace `window.fetch` with `responder`, which gets the raw `input`
+/// argument and says what to answer.
+fn install_fetch_handler<F>(responder: F) -> FetchMock
+where
+    F: Fn(JsValue) -> Reply + 'static,
+{
     use wasm_bindgen::JsCast;
     use wasm_bindgen::closure::Closure;
 
@@ -141,19 +267,10 @@ where
 
     let closure: Closure<dyn FnMut(JsValue, JsValue) -> js_sys::Promise> =
         Closure::new(move |input: JsValue, _init: JsValue| {
-            // `input` is either a string URL or a `Request` object. Pull
-            // the URL out of either shape.
-            let url = if let Some(s) = input.as_string() {
-                s
-            } else if let Ok(req) = input.dyn_into::<web_sys::Request>() {
-                req.url()
-            } else {
-                String::new()
-            };
-            let body = responder(&url);
-            let (body_str, status) = match body {
-                Some(json) => (json, 200),
-                None => (String::new(), 500),
+            let (body_str, status) = match responder(input) {
+                Reply::Json(json) => (json, 200),
+                Reply::Error => (String::new(), 500),
+                Reply::Pending => return js_sys::Promise::new(&mut |_, _| {}),
             };
             let response_jsv = factory
                 .call2(
