@@ -232,6 +232,9 @@ class CodeRepository:
         Returns this repository's resolved copy of the job. The ``Job`` passed
         to ``CodeRepository(jobs=...)`` keeps only its declaration, so several
         repositories can share it.
+
+        Raises:
+            NodeNotFoundError: If no job with that name exists.
         """
         ...
 

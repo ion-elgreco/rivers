@@ -134,4 +134,4 @@ rivers validates all resource references at resolve time:
 
 - Asset/task function parameters that don't match an upstream asset or resource key raise `ConfigurationError`
 - Schedule/sensor evaluation function parameters that don't match a resource key raise `ConfigurationError`
-- IOHandler string references that don't match a resource key raise `ConfigurationError`
+- IOHandler string references that don't match a resource key, or that name a resource which does not implement the IOHandler protocol, raise `AssetDefinitionError`. It is not a subclass of `ConfigurationError`, so catch it separately
