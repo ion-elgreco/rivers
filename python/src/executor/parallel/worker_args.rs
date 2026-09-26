@@ -445,6 +445,8 @@ pub(super) fn resolve_io_handler_ref(
 /// Always wraps with the worker function for consistent resource/context/output handling.
 /// `instance_name`: overrides `step_name` for IO output context (e.g. "double__0" for map instances).
 /// `fan_out_item`: if set, replaces the placeholder at `worker_args.fan_out_arg_index`.
+/// `graph`: the graph asset this step is the final task of; the worker writes
+/// the step's value as the graph's output too.
 pub(super) fn build_worker_submit_args(
     py: Python,
     func: Py<PyAny>,
@@ -457,6 +459,7 @@ pub(super) fn build_worker_submit_args(
     node_map: &HashMap<String, ResolvedNode>,
     registry: &IOHandlerRegistry,
     multi_outputs: &[String],
+    graph: Option<(&str, &ResolvedNode)>,
 ) -> PyResult<Vec<Py<PyAny>>> {
     let output_name = instance_name.unwrap_or(step_name);
     let is_multi = !multi_outputs.is_empty();
@@ -500,6 +503,19 @@ pub(super) fn build_worker_submit_args(
         )?
     };
 
+    let graph_output = match graph {
+        Some((graph_name, graph_node)) => build_graph_output_spec(
+            py,
+            graph_name,
+            graph_node,
+            &func,
+            partition_key,
+            node_map,
+            registry,
+        )?,
+        None => py.None(),
+    };
+
     let submit_args = vec![
         worker_fn.unbind(),
         pickled_func,
@@ -513,6 +529,7 @@ pub(super) fn build_worker_submit_args(
         io_spec.io_handler(py),
         io_spec.output_context_kwargs(py),
         io_spec.multi_output_specs(py),
+        graph_output,
     ];
 
     Ok(submit_args)
@@ -585,6 +602,34 @@ fn build_single_output_spec(
         io_handler: handler,
         output_context_kwargs,
     })
+}
+
+/// `(handler, output_context_kwargs)` for the graph's output. The type hint is
+/// the final task's, as on the in-process write.
+fn build_graph_output_spec(
+    py: Python,
+    graph_name: &str,
+    graph_node: &ResolvedNode,
+    task_func: &Py<PyAny>,
+    partition_key: &Option<PyPartitionKey>,
+    node_map: &HashMap<String, ResolvedNode>,
+    registry: &IOHandlerRegistry,
+) -> PyResult<Py<PyAny>> {
+    let graph_func = graph_node
+        .callable(py)
+        .unwrap_or_else(|_| task_func.clone_ref(py));
+    let handler = resolve_io_handler_ref(py, graph_name, &graph_func, node_map, registry);
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("asset_name", graph_name)?;
+    kwargs.set_item("asset_metadata", graph_node.metadata())?;
+    kwargs.set_item(
+        "partition",
+        ops::build_partition_context(graph_node, partition_key)?,
+    )?;
+    kwargs.set_item("type_hint", ops::extract_return_hint(py, task_func)?)?;
+    Ok(PyTuple::new(py, [handler, kwargs.unbind().into_any()])?
+        .unbind()
+        .into_any())
 }
 
 fn build_multi_output_specs(

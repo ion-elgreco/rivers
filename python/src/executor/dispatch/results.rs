@@ -676,6 +676,19 @@ pub(crate) fn process_worker_result(
         .collect();
     stash_failed_partitions(ctx, step, marks);
 
+    // A graph's final task's value is the graph's output too, as in
+    // `process_step_result`.
+    let graph_name = (step_name == step.name)
+        .then(|| ctx.repo.graph_nodes.final_nodes.get(&step.name).cloned())
+        .flatten();
+    let mut graph_written = false;
+    if let Some(graph_name) = &graph_name {
+        match write_graph_after_worker(py, ctx, step, graph_name, &worker_result, outputs_list) {
+            Ok(written) => graph_written = written,
+            Err(e) => ctx.record_failure_no_hooks(graph_name, e, failures),
+        }
+    }
+
     for item_any in outputs_list.iter() {
         if let Err(e) = process_one_worker_item(
             py,
@@ -691,6 +704,71 @@ pub(crate) fn process_worker_result(
             ctx.record_failure_no_hooks(step_name, e, failures);
         }
     }
+
+    // Same stamp as `process_step_result`: after this task's own events.
+    if let Some(graph_name) = graph_name
+        && graph_written
+    {
+        ctx.state.graph_written_at.insert(graph_name, now_ts());
+    }
+}
+
+/// Whether the graph's output was written for its final task's worker
+/// result. The worker writes it; a graph kept in memory is written here from
+/// the task's output loaded back, since the worker's memory is not this one.
+fn write_graph_after_worker(
+    py: Python,
+    ctx: &BatchContext,
+    step: &ExecutionStep,
+    graph_name: &str,
+    worker_result: &Py<PyAny>,
+    outputs: &Bound<PyList>,
+) -> PyResult<bool> {
+    let err = worker_result.getattr(py, "graph_error")?;
+    if !err.is_none(py) {
+        return Err(PyErr::from_value(err.into_bound(py)));
+    }
+    if worker_result
+        .getattr(py, "graph_written")?
+        .extract::<bool>(py)?
+    {
+        return Ok(true);
+    }
+    let task_output = match outputs.iter().next() {
+        Some(item) => {
+            let kind: u8 = item.get_item(1)?.extract()?;
+            matches!(ResultKind::from_u8(kind)?, ResultKind::Output)
+        }
+        None => false,
+    };
+    let (true, Some(task_node), Some(graph_node)) = (
+        task_output,
+        ctx.repo.node_map.get(&step.name),
+        ctx.repo.node_map.get(graph_name),
+    ) else {
+        return Ok(false);
+    };
+    let hint = ops::extract_return_hint(py, &task_node.callable(py)?)?;
+    let value = ops::load_step_output(
+        py,
+        &step.name,
+        task_node,
+        graph_name,
+        ctx.scope.partition_key,
+        hint.as_ref(),
+        ctx.repo.io_handler_registry,
+    )?;
+    ops::handle_step_output(
+        py,
+        graph_name,
+        graph_node,
+        &value,
+        ctx.scope.partition_key,
+        hint.as_ref(),
+        Vec::new(),
+        ctx.repo.io_handler_registry,
+    )?;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]

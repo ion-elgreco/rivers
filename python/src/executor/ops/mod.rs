@@ -103,7 +103,7 @@ pub(crate) use invoke::{
 };
 pub(crate) use io::{
     build_mapped_partition_context, build_partition_context, handle_step_output,
-    load_self_dependency, map_partition_key_for_upstream, metadata_to_pickle_safe_dict,
-    write_output,
+    load_self_dependency, load_step_output, map_partition_key_for_upstream,
+    metadata_to_pickle_safe_dict, write_output,
 };
 pub(crate) use outputs::{OutputItem, for_each_output};

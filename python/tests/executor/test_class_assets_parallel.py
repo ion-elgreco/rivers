@@ -526,6 +526,167 @@ def test_repositories_sharing_a_graph_use_own_resources(
     assert _materialize_into(first, roots) == {"a": written, "b": {}}
 
 
+# Graphs whose final task `add` shares its level with `order_total`, so the
+# parallel executor runs that task on loky. Handlers are instances.
+GRAPH_SHARED_LEVEL_MODULE = """
+import obstore.store
+
+import rivers as rs
+
+
+def _handler(name):
+    return rs.PickleIOHandler(
+        store=obstore.store.LocalStore({root!r} + "/" + name, mkdir=True)
+    )
+
+
+class RefusingHandler(rs.BaseIOHandler):
+    def handle_output(self, context, obj):
+        raise ValueError("refused " + context.asset_name)
+
+    def load_input(self, context):
+        raise ValueError("nothing stored for " + context.asset_name)
+
+
+@rs.Asset(io_handler=_handler("warehouse"))
+def orders() -> list:
+    return [3, 4]
+
+
+@rs.Asset(io_handler=_handler("warehouse"))
+def order_total(orders: list) -> int:
+    return sum(orders)
+
+
+@rs.Task
+def left() -> int:
+    return 3
+
+
+@rs.Task
+def right() -> int:
+    return 4
+
+
+@rs.Task
+def add(a: int, b: int) -> int:
+    return a + b
+
+
+@rs.Asset.from_graph(io_handler=_handler("warehouse"), node_io_handler=_handler("scratch"))
+def total():
+    return add(left(), right())
+
+
+class Guarded(rs.GraphAsset):
+    io_handler = _handler("warehouse")
+    node_io_handler = _handler("scratch")
+
+    @classmethod
+    def compose(cls):
+        return add(left(), right())
+
+    @rs.action(
+        outcome=rs.Outcome.Unmaterialize,
+        concurrency=rs.ActionConcurrency.Exclusive,
+    )
+    @classmethod
+    def delete(cls, ctx):
+        return None
+
+
+@rs.Asset.from_graph(io_handler=RefusingHandler(), node_io_handler=_handler("scratch"))
+def refused():
+    return add(left(), right())
+
+
+@rs.Asset.from_graph(io_handler=rs.InMemoryIOHandler(), node_io_handler=_handler("scratch"))
+def in_memory():
+    return add(left(), right())
+"""
+
+
+def _events(repo, run_id, kind, asset_key):
+    return [
+        e
+        for e in repo.storage.get_events_for_run(run_id)
+        if e.event_type == kind and e.asset_key == asset_key
+    ]
+
+
+@EXECUTORS
+@pytest.mark.parametrize(
+    ("graph", "name"),
+    [("total", "total"), ("Guarded", "guarded")],
+    ids=["batch", "pool"],
+)
+def test_graph_output_written_when_final_task_shares_its_level(
+    worker_module, tmp_path, executor, graph, name
+):
+    """The final task's value is also the graph's output, on every executor
+    path. A 2-wide level sends the task to loky, where only its own output was
+    written: the run succeeded and loading the graph failed. The `Guarded`
+    graph's Exclusive action gives its inner tasks a pool claim."""
+    m = worker_module(GRAPH_SHARED_LEVEL_MODULE.format(root=str(tmp_path)))
+    repo = rs.CodeRepository(
+        assets=[m.orders, m.order_total, getattr(m, graph)],
+        tasks=[m.left, m.right, m.add],
+        default_executor=executor,
+    )
+    result = repo.materialize()
+    assert result.success
+    assert _stored(tmp_path / "warehouse") == {
+        "order_total": 7,
+        "orders": [3, 4],
+        name: 7,
+    }
+    assert _stored(tmp_path / "scratch") == {
+        f"{name}/add": 7,
+        f"{name}/left": 3,
+        f"{name}/right": 4,
+    }
+    assert repo.load_node(name) == 7
+    [mat] = _events(repo, result.run_id, "Materialization", name)
+    assert mat.asset_key == name
+
+
+@EXECUTORS
+def test_graph_output_write_failure_fails_graph(worker_module, tmp_path, executor):
+    """A graph io_handler that refuses the final task's value fails the graph
+    asset, with no Materialization, while the task's own output stands."""
+    m = worker_module(GRAPH_SHARED_LEVEL_MODULE.format(root=str(tmp_path)))
+    repo = rs.CodeRepository(
+        assets=[m.orders, m.order_total, m.refused],
+        tasks=[m.left, m.right, m.add],
+        default_executor=executor,
+    )
+    result = repo.materialize(raise_on_error=False)
+    assert not result.success
+    [(failed, message)] = result.failed_assets
+    assert failed == "refused"
+    assert "refused refused" in message
+    assert _stored(tmp_path / "scratch")["refused/add"] == 7
+    assert _events(repo, result.run_id, "Materialization", "refused") == []
+    assert len(_events(repo, result.run_id, "StepFailure", "refused")) == 1
+
+
+def test_loky_graph_in_memory_io_handler_holds_graph_output(worker_module, tmp_path):
+    """A worker cannot write into the parent's memory: a graph kept in an
+    InMemoryIOHandler gets its final task's value loaded back in the parent,
+    as the in-process path holds it."""
+    m = worker_module(GRAPH_SHARED_LEVEL_MODULE.format(root=str(tmp_path)))
+    repo = rs.CodeRepository(
+        assets=[m.orders, m.order_total, m.in_memory],
+        tasks=[m.left, m.right, m.add],
+        default_executor=MP,
+    )
+    result = repo.materialize()
+    assert result.success
+    assert _stored(tmp_path / "scratch")["in_memory/add"] == 7
+    assert repo.load_node("in_memory") == 7
+    assert len(_events(repo, result.run_id, "Materialization", "in_memory")) == 1
+
+
 # Only the parent's import builds the handler, as a handler read from
 # process-local state would; the worker's fresh import has none.
 PARENT_ONLY_HANDLER_MODULE = """

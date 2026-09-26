@@ -328,23 +328,33 @@ pub struct PyWorkerResult {
     /// drained from the worker context and carried back to the orchestrator.
     #[pyo3(get)]
     pub failed_partitions: Vec<(String, String)>,
+    /// The final task of a graph asset also wrote the graph's output.
+    #[pyo3(get)]
+    pub graph_written: bool,
+    /// The exception the graph's io_handler raised on that write.
+    #[pyo3(get)]
+    pub graph_error: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl PyWorkerResult {
     #[new]
-    #[pyo3(signature = (outputs, captured_logs=None, dynamic_keys=None, failed_partitions=vec![]))]
+    #[pyo3(signature = (outputs, captured_logs=None, dynamic_keys=None, failed_partitions=vec![], graph_written=false, graph_error=None))]
     fn new(
         outputs: Py<PyAny>,
         captured_logs: Option<(String, String, String)>,
         dynamic_keys: Option<Vec<String>>,
         failed_partitions: Vec<(String, String)>,
+        graph_written: bool,
+        graph_error: Option<Py<PyAny>>,
     ) -> Self {
         Self {
             outputs,
             captured_logs,
             dynamic_keys,
             failed_partitions,
+            graph_written,
+            graph_error,
         }
     }
 
@@ -358,6 +368,8 @@ impl PyWorkerResult {
             Option<(String, String, String)>,
             Option<Vec<String>>,
             Vec<(String, String)>,
+            bool,
+            Option<Py<PyAny>>,
         ),
     )> {
         let cls = py.import("rivers._core")?.getattr("WorkerResult")?;
@@ -368,6 +380,8 @@ impl PyWorkerResult {
                 self.captured_logs.clone(),
                 self.dynamic_keys.clone(),
                 self.failed_partitions.clone(),
+                self.graph_written,
+                self.graph_error.as_ref().map(|e| e.clone_ref(py)),
             ),
         ))
     }
@@ -542,7 +556,7 @@ fn metadata_vec_to_pickle_safe(
 /// Replaces Python `_worker_execute_step`. Reuses Rust functions for
 /// result type extraction, DynamicOutput unwrapping, and IO handling.
 #[pyfunction]
-#[pyo3(signature = (func, args, context_kwargs, resource_specs, io_handler, output_context_kwargs, multi_output_specs=None))]
+#[pyo3(signature = (func, args, context_kwargs, resource_specs, io_handler, output_context_kwargs, multi_output_specs=None, graph_output=None))]
 pub fn worker_execute_step(
     py: Python,
     func: Py<PyAny>,
@@ -552,6 +566,7 @@ pub fn worker_execute_step(
     io_handler: Option<Py<PyAny>>,
     output_context_kwargs: Option<Py<PyAny>>,
     multi_output_specs: Option<Bound<'_, PyList>>,
+    graph_output: Option<(Py<PyAny>, Py<PyAny>)>,
 ) -> PyResult<Py<PyAny>> {
     // Per-step capture: install the proxy writers (idempotent, child-process
     // local) and start a fresh StepCapture / Rust log capture pair around the
@@ -620,6 +635,11 @@ pub fn worker_execute_step(
     } else {
         None
     };
+
+    // A graph's final task writes its value as the graph's output too; a
+    // failed write fails only the graph, so it does not fail this step.
+    let mut graph_written = false;
+    let mut graph_error: Option<Py<PyAny>> = None;
 
     // Execute with resource teardown guarantee. Closure returns the outputs
     // list plus any single-output `dynamic_keys` (multi-asset can't carry
@@ -802,6 +822,15 @@ pub fn worker_execute_step(
                             } else {
                                 data_version
                             };
+                            if let Some((graph_handler, graph_kwargs)) = &graph_output {
+                                let graph_dict: &Bound<PyDict> = graph_kwargs.bind(py).cast()?;
+                                let graph_ctx =
+                                    Py::new(py, PyOutputContext::from_kwargs(py, graph_dict)?)?;
+                                match write_output(py, graph_handler, &graph_ctx, &value) {
+                                    Ok(_) => graph_written = true,
+                                    Err(e) => graph_error = Some(e.into_value(py).into_any()),
+                                }
+                            }
                             (final_dv, ResultKind::Output)
                         } else {
                             (data_version, ResultKind::Materialization)
@@ -849,6 +878,8 @@ pub fn worker_execute_step(
                 captured_logs,
                 dynamic_keys,
                 failed_partitions,
+                graph_written,
+                graph_error,
             };
             Ok(Py::new(py, wr)?.into_any())
         }

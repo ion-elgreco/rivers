@@ -312,6 +312,20 @@ impl ParallelBackend {
             }
         };
 
+        // The worker writes a graph's output with its final task's. A graph
+        // kept in memory is written here instead, after the task's output
+        // is loaded back (`process_worker_result`).
+        let graph = if instance.fan_out.is_none()
+            && step.outputs.is_empty()
+            && let Some(graph_name) = ctx.repo.graph_nodes.final_nodes.get(&step_name)
+            && let Some(graph_node) = ctx.repo.node_map.get(graph_name)
+            && validate_not_in_memory_io(py, graph_name, graph_node).is_ok()
+        {
+            Some((graph_name.as_str(), graph_node))
+        } else {
+            None
+        };
+
         let submit_args = match build_worker_submit_args(
             py,
             func,
@@ -324,6 +338,7 @@ impl ParallelBackend {
             ctx.repo.node_map,
             ctx.repo.io_handler_registry,
             outputs_for_meta,
+            graph,
         ) {
             Ok(a) => a,
             Err(e) => {
