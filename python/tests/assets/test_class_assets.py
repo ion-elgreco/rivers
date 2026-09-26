@@ -961,8 +961,8 @@ def test_declared_config_reads_back_off_the_asset():
 
 
 def test_named_retry_reads_back_as_the_name():
-    """A `retry="name"` reference reads back as the name until the repository
-    resolves it against its registry."""
+    """A `retry="name"` reference reads back as the name; each repository
+    resolves it against its own registry."""
 
     class Orders(rs.Asset):
         io_handler = rs.InMemoryIOHandler()

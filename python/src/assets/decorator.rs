@@ -954,53 +954,6 @@ impl Asset {
         }
     }
 
-    /// Resolve all ResourceRef io_handlers to Instance variants using the resources dict.
-    /// `io_handler_keys` contains resource keys that are validated IOHandler instances.
-    /// Resolve `retry="name"` references against the repository `retries`
-    /// registry, replacing `Named` with the concrete `Inline` policy. Errors
-    /// on an unknown name.
-    pub fn resolve_retry_refs(
-        &mut self,
-        retries: &HashMap<String, rivers_core::execution::retry::RetryPolicy>,
-    ) -> PyResult<()> {
-        use rivers_core::execution::retry::{RetryPolicy, RetryRef};
-
-        fn resolve_one(
-            slot: &mut Option<RetryRef>,
-            retries: &HashMap<String, RetryPolicy>,
-            owner: &str,
-        ) -> PyResult<()> {
-            if let Some(RetryRef::Named(key)) = slot {
-                let policy = retries.get(key.as_str()).ok_or_else(|| {
-                    crate::errors::ConfigurationError::new_err(format!(
-                        "unknown retry policy '{key}' referenced by asset '{owner}'; \
-                         registered: {:?}",
-                        retries.keys().collect::<Vec<_>>()
-                    ))
-                })?;
-                *slot = Some(RetryRef::Inline(policy.clone()));
-            }
-            Ok(())
-        }
-
-        match self {
-            Asset::Single(a) => {
-                let owner = a.name.clone().unwrap_or_default();
-                resolve_one(&mut a.retry, retries, &owner)?;
-            }
-            Asset::Multi(m) => {
-                let owner = m.name.clone().unwrap_or_default();
-                resolve_one(&mut m.retry, retries, &owner)?;
-            }
-            Asset::Graph(g) => {
-                let owner = g.name.clone().unwrap_or_default();
-                resolve_one(&mut g.retry, retries, &owner)?;
-            }
-            Asset::External(_) => {}
-        }
-        Ok(())
-    }
-
     pub fn _asset_fn(&self) -> PyResult<&Py<PyAny>> {
         match self {
             Asset::Single(asset) => asset
@@ -1113,10 +1066,6 @@ fn call_graph_fn_in_composition(
 impl PyAsset {
     pub(crate) fn inner(&self) -> &Asset {
         &self.inner
-    }
-
-    pub(crate) fn inner_mut(&mut self) -> &mut Asset {
-        &mut self.inner
     }
 }
 
@@ -1731,7 +1680,7 @@ impl PyAsset {
     }
 
     /// Retry policy governing this asset's step. A `retry="name"` reference
-    /// reads back as the name until the repository resolves it.
+    /// reads back as the name: each repository resolves it in its own nodes.
     #[getter]
     fn retry(&self, py: Python) -> Option<Py<PyAny>> {
         use rivers_core::execution::retry::RetryRef;

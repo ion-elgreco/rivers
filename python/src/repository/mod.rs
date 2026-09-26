@@ -3160,11 +3160,12 @@ impl PyCodeRepository {
         Ok(())
     }
 
-    /// Resolve a task-level `retry` ref against the repository `retries`
+    /// Resolve a node's `retry` ref against the repository `retries`
     /// registry; errors on an unknown name.
-    fn resolve_task_retry_ref(
+    fn resolve_retry_ref(
         r: Option<rivers_core::execution::retry::RetryRef>,
         retries: &HashMap<String, rivers_core::execution::retry::RetryPolicy>,
+        kind: &str,
         owner: &str,
     ) -> PyResult<Option<rivers_core::execution::retry::RetryPolicy>> {
         use rivers_core::execution::retry::RetryRef;
@@ -3174,7 +3175,7 @@ impl PyCodeRepository {
             Some(RetryRef::Named(key)) => match retries.get(&key) {
                 Some(p) => Ok(Some(p.clone())),
                 None => Err(ConfigurationError::new_err(format!(
-                    "unknown retry policy '{key}' referenced by task '{owner}'; registered: {:?}",
+                    "unknown retry policy '{key}' referenced by {kind} '{owner}'; registered: {:?}",
                     retries.keys().collect::<Vec<_>>()
                 ))),
             },
@@ -3225,10 +3226,6 @@ impl PyCodeRepository {
             .copied()
             .collect::<HashSet<_>>();
         for asset_py in &self.raw_assets {
-            asset_py
-                .borrow_mut(py)
-                .inner_mut()
-                .resolve_retry_refs(&self.raw_retries)?;
             let asset = asset_py.borrow(py);
             if let Asset::Graph(graph_asset) = asset.inner()
                 && let Some(node_io_handler) = &graph_asset.node_io_handler
@@ -3253,28 +3250,24 @@ impl PyCodeRepository {
             node.resolve_io_handlers(py, &handlers, others)?;
         }
 
-        // ResolvedAssets were constructed inside build_unresolved_graph (before
-        // resolve_retry_refs ran), so re-pull the now-concrete policy per node.
-        // Task defs aren't covered by the asset pass; resolve their refs here.
         for node in node_map.values_mut() {
             match node {
                 ResolvedNode::Asset(a) => {
-                    let resolved = {
-                        let asset = a.inner.borrow(py);
-                        asset
-                            .inner()
-                            .retry_for_output(a.output_name.as_deref())
-                            .and_then(|r| r.as_inline().cloned())
-                    };
-                    a.retry = resolved;
+                    let r = a
+                        .inner
+                        .borrow(py)
+                        .inner()
+                        .retry_for_output(a.output_name.as_deref())
+                        .cloned();
+                    a.retry = Self::resolve_retry_ref(r, &self.raw_retries, "asset", &a.name)?;
                 }
                 ResolvedNode::Task(t) => {
                     let r = t.inner.borrow(py).inner.retry.clone();
-                    t.retry = Self::resolve_task_retry_ref(r, &self.raw_retries, &t.name)?;
+                    t.retry = Self::resolve_retry_ref(r, &self.raw_retries, "task", &t.name)?;
                 }
                 ResolvedNode::BashTask(b) => {
                     let r = b.inner.borrow(py).retry.clone();
-                    b.retry = Self::resolve_task_retry_ref(r, &self.raw_retries, &b.name)?;
+                    b.retry = Self::resolve_retry_ref(r, &self.raw_retries, "task", &b.name)?;
                 }
             }
         }

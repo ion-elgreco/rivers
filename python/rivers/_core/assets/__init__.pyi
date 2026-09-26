@@ -248,8 +248,8 @@ class Asset:
     retry: "RetryPolicy | str | None"
     """Retry policy, or the name of a policy registered on the repository.
 
-    Reads back as the :class:`RetryPolicy`, or as the registry name until the
-    repository resolves it.
+    Reads back as the :class:`RetryPolicy`, or as the registry name. Each
+    repository resolves the name against its own ``retries``.
     """
     compute: Compute | None
     """Compute environment/escalation for this asset's steps."""

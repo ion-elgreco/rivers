@@ -361,8 +361,8 @@ impl ResolvedAsset {
             group,
             code_version,
             pool,
-            // Named refs aren't collapsed yet here; resolve_resources_and_handlers
-            // populates node.retry once resolve_retry_refs has run.
+            // resolve_resources_and_handlers resolves this against the
+            // repository's `retries`.
             retry: None,
             compute,
             metadata,

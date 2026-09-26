@@ -6,6 +6,7 @@ import pickle
 import pytest
 
 import rivers as rs
+from rivers.testing import memory_storage
 
 
 class TestRetryPickling:
@@ -175,6 +176,75 @@ def test_named_policy_from_registry(storage):
     assert calls["n"] == 2
     types = [e.event_type for e in storage.get_events_for_asset("named")]
     assert types.count("StepRetry") == 1
+
+
+@pytest.mark.parametrize("executor_kind", ["in_process", "parallel"])
+@pytest.mark.parametrize("kind", ["asset", "multi_asset", "task"])
+def test_repositories_sharing_definitions_use_own_named_retry_policy(
+    tmp_path, kind, executor_kind
+):
+    """Two repositories built from the same definitions retry a
+    ``retry="standard"`` step by the policy each registered under that name,
+    and resolving the second does not change the first's."""
+    import obstore.store
+
+    handler = rs.PickleIOHandler(
+        store=obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    )
+
+    @rs.Asset(io_handler=handler, retry="standard")
+    def broken() -> int:
+        raise ValueError("always")
+
+    @rs.Asset.from_multi(
+        output_defs=[rs.AssetDef("broken", io_handler=handler)], retry="standard"
+    )
+    def broken_multi():
+        raise ValueError("always")
+
+    @rs.Task(io_handler=handler, retry="standard")
+    def broken_task() -> int:
+        raise ValueError("always")
+
+    # A sibling keeps the loky path engaged (a lone sync step runs in-process).
+    @rs.Asset(io_handler=handler)
+    def steady() -> int:
+        return 1
+
+    node, tasks, step = {
+        "asset": (broken, [], "broken"),
+        "multi_asset": (broken_multi, [], "broken"),
+        "task": (broken_task, [broken_task], "broken_task"),
+    }[kind]
+    executor = (
+        rs.Executor.in_process()
+        if executor_kind == "in_process"
+        else rs.Executor.parallel(max_workers=2)
+    )
+
+    def repository(max_retries: int) -> tuple[rs.CodeRepository, rs.Storage]:
+        repo = rs.CodeRepository(
+            assets=[steady] + ([] if kind == "task" else [node]),
+            tasks=tasks,
+            jobs=[rs.Job(name="run", assets=[steady, node], executor=executor)],
+            retries={"standard": rs.RetryPolicy(max_retries=max_retries)},
+        )
+        storage = memory_storage()
+        repo.resolve(storage=storage)
+        return repo, storage
+
+    def retries_after_run(repo: rs.CodeRepository, storage: rs.Storage) -> int:
+        assert not repo.get_job("run").execute(raise_on_error=False).success
+        events = [e.event_type for e in storage.get_events_for_asset(step)]
+        return events.count("StepRetry")
+
+    first = repository(max_retries=1)
+    second = repository(max_retries=3)
+    assert retries_after_run(*first) == 1
+    assert retries_after_run(*second) == 3
+    assert retries_after_run(*first) == 2
+    if kind != "task":
+        assert node.retry == "standard"
 
 
 def test_unknown_retry_name_errors_at_resolve(storage):

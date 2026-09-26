@@ -105,7 +105,7 @@ repo = rs.CodeRepository(
 def skewed_join(): ...
 ```
 
-An unknown name fails at `resolve()` with the registered names listed — never silently at execution time.
+An unknown name fails at `resolve()` with the registered names listed — never silently at execution time. Each repository resolves the name against its own `retries`, so two repositories built from the same assets can give the name different policies.
 
 ## OOM escalation on Kubernetes
 
