@@ -91,11 +91,11 @@ fn jittered(backoff: Duration) -> Duration {
 
 /// Classify a SurrealDB error as transient (worth retrying) or permanent.
 ///
-/// `Internal` errors are matched by substring because the structured-error API
-/// folds RocksDB/TiKV transient conflicts (`"onflict"`, `"Busy"`, `"Try again"`)
-/// onto `Internal` with no dedicated variant. `NotFound(Session)` covers a
-/// startup race in the local engine's `router_loop` where the first route
-/// request can land before `SessionId::Initial` is registered.
+/// Conflicts arrive as `QueryError::TransactionConflict`. `Internal` errors are
+/// still matched by substring for transient RocksDB/TiKV messages (`"onflict"`,
+/// `"Busy"`, `"Try again"`) that carry no dedicated variant. `NotFound(Session)`
+/// covers a startup race in the local engine's `router_loop` where the first
+/// route request can land before `SessionId::Initial` is registered.
 ///
 /// The RocksDB `LOCK` file is also transient: dropping an embedded handle frees
 /// the lock asynchronously (~tens of ms), so an immediate reopen of the same path
@@ -103,7 +103,11 @@ fn jittered(backoff: Duration) -> Duration {
 pub fn is_transient_surrealdb_error(e: &surrealdb::Error) -> bool {
     use surrealdb::types::{ErrorDetails, NotFoundError, QueryError};
     match e.details() {
-        ErrorDetails::Query(Some(QueryError::TimedOut { .. } | QueryError::NotExecuted)) => true,
+        ErrorDetails::Query(Some(
+            QueryError::TimedOut { .. }
+            | QueryError::NotExecuted
+            | QueryError::TransactionConflict,
+        )) => true,
         ErrorDetails::NotFound(Some(NotFoundError::Session { .. })) => true,
         ErrorDetails::Internal => {
             let s = e.message();
@@ -394,6 +398,16 @@ mod tests {
         let err = surrealdb::Error::query(
             "statement not executed due to a failed transaction".to_string(),
             QueryError::NotExecuted,
+        );
+        assert!(is_transient_surrealdb_error(&err));
+    }
+
+    #[test]
+    fn classifies_query_transaction_conflict_as_transient() {
+        use surrealdb::types::QueryError;
+        let err = surrealdb::Error::query(
+            "Transaction conflict: Resource busy. This transaction can be retried".to_string(),
+            QueryError::TransactionConflict,
         );
         assert!(is_transient_surrealdb_error(&err));
     }

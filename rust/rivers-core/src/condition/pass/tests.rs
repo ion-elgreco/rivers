@@ -749,7 +749,7 @@ fn dynamic_universe_mirrors_storage_including_retirement() {
     .into_iter()
     .collect();
     refresh_universe(&mut universe, &mut all_keys, now, &registered);
-    assert_eq!(all_keys, [spk("red"), spk("blue")].into_iter().collect());
+    assert_eq!(all_keys, [spk("red"), spk("blue")].into_iter().collect::<HashSet<_>>());
     let shrunk: HashMap<String, HashSet<String>> = [(
         "colors".to_string(),
         ["blue".to_string()].into_iter().collect(),
@@ -757,9 +757,9 @@ fn dynamic_universe_mirrors_storage_including_retirement() {
     .into_iter()
     .collect();
     refresh_universe(&mut universe, &mut all_keys, now, &shrunk);
-    assert_eq!(all_keys, [spk("blue")].into_iter().collect());
+    assert_eq!(all_keys, [spk("blue")].into_iter().collect::<HashSet<_>>());
     refresh_universe(&mut universe, &mut all_keys, now, &HashMap::new());
-    assert_eq!(all_keys, [spk("blue")].into_iter().collect());
+    assert_eq!(all_keys, [spk("blue")].into_iter().collect::<HashSet<_>>());
 }
 
 #[test]
