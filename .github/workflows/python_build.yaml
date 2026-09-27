@@ -81,7 +81,18 @@ jobs:
 
       - name: Run Rust tests
         working-directory: .
-        run: just test-rust
+        env:
+          HANG_TIMEOUT_SECS: "600"
+        run: .github/scripts/hang-watchdog.sh just test-rust
+
+      - name: Upload hung test stacks
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rust-hang-dumps
+          path: hang-dumps/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Run rivers-ui WASM browser tests
         working-directory: .
