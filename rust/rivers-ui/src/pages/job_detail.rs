@@ -98,14 +98,19 @@ pub fn JobDetailPage() -> impl IntoView {
     // The job, resolved against its assets' declarations: the verb it runs
     // (if any) and the partition picker that verb allows. `None` until the
     // job's definition has loaded: with no verb to show, Execute waits.
+    let jobs_value = crate::helpers::resource_value(jobs);
+    let assets_info_value = crate::helpers::resource_value(assets_info);
     let job_launch = Memo::new(
         move |_| -> Option<(Option<AssetActionInfo>, JobPartitionPicker)> {
             let current = name();
-            let Some(Ok(jobs_list)) = jobs.get() else {
+            let Some(Ok(jobs_list)) = jobs_value.get() else {
                 return None;
             };
             let job = jobs_list.into_iter().find(|j| j.name == current)?;
-            let infos = assets_info.get().and_then(|r| r.ok()).unwrap_or_default();
+            let infos = assets_info_value
+                .get()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
             let by_key: std::collections::HashMap<String, AssetDefinitionInfo> = infos
                 .into_iter()
                 .map(|i| (i.asset_key.clone(), i))
@@ -123,11 +128,7 @@ pub fn JobDetailPage() -> impl IntoView {
             .map_or(JobPartitionPicker::None, |(_, picker)| picker)
     });
     let job_verb_signal = Signal::derive(move || job_launch.get().and_then(|(verb, _)| verb));
-    // Set from an Effect, which runs only in the browser: the server renders
-    // Execute disabled, and hydration keeps a server-rendered boolean
-    // attribute as it is.
-    let job_loaded = RwSignal::new(false);
-    Effect::new(move |_| job_loaded.set(job_launch.get().is_some()));
+    let job_loaded = Signal::derive(move || job_launch.get().is_some());
     let exec_armed = use_confirm_armed(move || params.track());
 
     let dialog_job_name: Signal<String> = Signal::derive(name);

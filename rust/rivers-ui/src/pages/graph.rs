@@ -140,8 +140,9 @@ pub fn GraphPage() -> impl IntoView {
     // Memos, not derives: a derive re-walks the whole topology on every read
     // (each selection change reads these several times); a memo recomputes
     // only when the topology itself changes.
+    let topology_value = crate::helpers::resource_value(topology);
     let graph_asset_names = Memo::new(move |_| {
-        topology
+        topology_value
             .get()
             .and_then(|r| r.ok())
             .map(|t| {
@@ -156,7 +157,7 @@ pub fn GraphPage() -> impl IntoView {
 
     // Task nodes can be selected for lineage tracing but never materialized.
     let task_node_names = Memo::new(move |_| {
-        topology
+        topology_value
             .get()
             .and_then(|r| r.ok())
             .map(|t| {
@@ -264,8 +265,9 @@ pub fn GraphPage() -> impl IntoView {
 
     // Materialize always routes through the dialog so the user previews the
     // asset list (and partition keys) before anything launches.
+    let assets_info_value = crate::helpers::resource_value(assets_info);
     let asset_info_by_key = Memo::new(move |_| {
-        assets_info
+        assets_info_value
             .get()
             .and_then(|r| r.ok())
             .unwrap_or_default()

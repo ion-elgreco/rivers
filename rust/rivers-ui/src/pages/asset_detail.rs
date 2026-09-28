@@ -174,11 +174,12 @@ pub fn AssetDetailPage() -> impl IntoView {
 
     // Picker for this asset: drives dialog-vs-one-click below. Tracks params so
     // it follows navigation between assets.
+    let assets_info_value = crate::helpers::resource_value(assets_info);
     let materialize_picker = Signal::derive(move || {
         params.track();
         let current = key();
         let by_key: std::collections::HashMap<String, crate::types::AssetDefinitionInfo> =
-            assets_info
+            assets_info_value
                 .get()
                 .and_then(|r| r.ok())
                 .unwrap_or_default()

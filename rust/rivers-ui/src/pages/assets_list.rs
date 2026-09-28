@@ -267,8 +267,13 @@ pub fn AssetsListPage() -> impl IntoView {
 
     let selected_signal = Signal::derive(move || selected.get());
 
+    // The selection controls live outside the table's <Transition>.
+    let assets_info_value = crate::helpers::resource_value(assets_info);
     let materialize_picker = Signal::derive(move || {
-        let infos = assets_info.get().and_then(|r| r.ok()).unwrap_or_default();
+        let infos = assets_info_value
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
         let by_key: std::collections::HashMap<String, crate::types::AssetDefinitionInfo> = infos
             .into_iter()
             .map(|i| (i.asset_key.clone(), i))
@@ -278,7 +283,10 @@ pub fn AssetsListPage() -> impl IntoView {
     // Verbs every selected asset declares — the selection submits as one
     // action run, so anything less than the full intersection can fail.
     let selection_verbs = Signal::derive(move || {
-        let infos = assets_info.get().and_then(|r| r.ok()).unwrap_or_default();
+        let infos = assets_info_value
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
         let by_key: std::collections::HashMap<String, crate::types::AssetDefinitionInfo> = infos
             .into_iter()
             .map(|i| (i.asset_key.clone(), i))
@@ -286,10 +294,18 @@ pub fn AssetsListPage() -> impl IntoView {
         crate::helpers::common_actions(&selected.get(), &by_key)
     });
 
-    let select_all = move |_| {
-        let records = sorted_filtered();
-        set_selected.set(records.iter().map(|r| r.asset_key.clone()).collect());
-    };
+    // A click handler can't read the resources, so an effect keeps the
+    // filtered keys in a signal for it.
+    let visible_keys = RwSignal::new(Vec::<String>::new());
+    Effect::new(move |_| {
+        visible_keys.set(
+            sorted_filtered()
+                .iter()
+                .map(|r| r.asset_key.clone())
+                .collect(),
+        );
+    });
+    let select_all = move |_| set_selected.set(visible_keys.get_untracked());
 
     let select_none = move |_| {
         set_selected.set(Vec::new());
