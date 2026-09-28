@@ -269,6 +269,8 @@ Each instance now runs as `lengths/path_length[report_q1]`, `lengths/path_length
 
 When a single mapped instance fails, downstream steps that consume the collect output are skipped (under `Executor.parallel()`); other instances continue running. The collect step itself ends in failure, propagating to the graph asset's status. This matches normal asset-step failure semantics — fan-out doesn't introduce a new failure mode.
 
+If you cancel the run and some instances do not start, the mapped step also ends in failure. The run ends as `Canceled`.
+
 ## Sharing tasks across graph assets
 
 Two graph assets can use the same task — each gets its own namespaced copy with independent wiring and IO:

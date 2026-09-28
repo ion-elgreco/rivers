@@ -4,6 +4,7 @@
 //! parameterized `@Hook.success(name="x")` forms via `__call__` rebinding. Hooks receive
 //! a `HookContext` with asset name, run ID, and materialization metadata.
 use pyo3::prelude::*;
+use pyo3::types::PyType;
 
 use crate::context::hook::PyHookContext;
 use crate::errors::AssetDefinitionError;
@@ -92,6 +93,16 @@ impl PyHook {
             Self::Failure { .. } => "Failure",
         };
         format!("Hook.{}(name='{}')", kind, self.resolve_name())
+    }
+
+    /// A class-form asset defined in a script ships to loky workers by value,
+    /// `hooks` included. Each variant's own constructor rebuilds it.
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> (Bound<'py, PyType>, (Option<Py<PyAny>>, String)) {
+        let (Self::Success { _func, _name } | Self::Failure { _func, _name }) = slf.get();
+        let func = _func.as_ref().map(|f| f.clone_ref(slf.py()));
+        (slf.as_any().get_type(), (func, _name.clone()))
     }
 
     /// When used as a decorator with arguments (e.g. `@Hook.success(name="x")`),

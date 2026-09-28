@@ -13,10 +13,13 @@ use crate::errors::AssetDefinitionError;
 ///
 /// - `Instance(Py<PyAny>)` — an object with `handle_output` and `load_input` methods
 /// - `ResourceRef(String)` — a key into the repository's resources dict, resolved at execution time
+/// - `Resource(Py<PyAny>)` — the handler `CodeRepository.resolve()` found for a `ResourceRef`.
+///   Only that repository's resolved nodes hold it; the definition keeps the key.
 #[derive(Debug)]
 pub enum IOHandler {
     Instance(Py<PyAny>),
     ResourceRef(String),
+    Resource(Py<PyAny>),
 }
 
 impl<'py> FromPyObject<'py, '_> for IOHandler {
@@ -34,30 +37,32 @@ impl<'py> FromPyObject<'py, '_> for IOHandler {
 }
 
 impl IOHandler {
-    /// Resolve a ResourceRef to an Instance in-place.
+    /// Resolve a ResourceRef to a Resource in-place.
     /// `io_handler_keys` contains resource keys pre-validated as IOHandler at extraction time.
+    /// `kind` and `name` name the owner in errors, e.g. `Asset 'orders'`.
     pub fn resolve_in_place(
         &mut self,
         py: Python,
         io_handlers: &HashMap<String, &Py<PyAny>>,
         other_resource_keys: &HashSet<&String>,
-        asset_name: &str,
+        kind: &str,
+        name: &str,
     ) -> PyResult<()> {
         if let IOHandler::ResourceRef(key) = self {
             if other_resource_keys.contains(key) {
                 return Err(AssetDefinitionError::new_err(format!(
-                    "Asset '{}': io_handler references resource '{}' which does not implement \
+                    "{} '{}': io_handler references resource '{}' which does not implement \
                      the IOHandler protocol (handle_output + load_input)",
-                    asset_name, key
+                    kind, name, key
                 )));
             }
             let resource = io_handlers.get(key.as_str()).ok_or_else(|| {
                 AssetDefinitionError::new_err(format!(
-                    "Asset '{}': io_handler references resource '{}' which is not in resources",
-                    asset_name, key
+                    "{} '{}': io_handler references resource '{}' which is not in resources",
+                    kind, name, key
                 ))
             })?;
-            *self = IOHandler::Instance(resource.clone_ref(py));
+            *self = IOHandler::Resource(resource.clone_ref(py));
         }
         Ok(())
     }
@@ -66,6 +71,23 @@ impl IOHandler {
         match self {
             IOHandler::Instance(h) => IOHandler::Instance(h.clone_ref(py)),
             IOHandler::ResourceRef(k) => IOHandler::ResourceRef(k.clone()),
+            IOHandler::Resource(h) => IOHandler::Resource(h.clone_ref(py)),
+        }
+    }
+
+    /// The handler instance, or None for an unresolved resource key.
+    pub fn handler(&self) -> Option<&Py<PyAny>> {
+        match self {
+            IOHandler::Instance(h) | IOHandler::Resource(h) => Some(h),
+            IOHandler::ResourceRef(_) => None,
+        }
+    }
+
+    /// The handler instance, or the resource key string.
+    pub fn to_object(&self, py: Python) -> Py<PyAny> {
+        match self {
+            IOHandler::Instance(h) | IOHandler::Resource(h) => h.clone_ref(py),
+            IOHandler::ResourceRef(k) => pyo3::types::PyString::new(py, k).unbind().into_any(),
         }
     }
 }

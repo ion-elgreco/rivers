@@ -11,10 +11,13 @@ pub(crate) mod step_lifecycle;
 mod types;
 
 pub(crate) use backend::ExecutorBackend;
-pub(crate) use context::{BatchContext, EventSink, Repo, RunScope, RunState};
+pub(crate) use context::{
+    BatchContext, EXCLUSIVE_POOL_CAPACITY, EventSink, Repo, RunScope, RunState, implicit_asset_pool,
+};
 pub(crate) use orchestrate::{build_step_by_name, execute_level_batch, resolve_collect_overrides};
 pub(crate) use results::process_outcome;
 pub(crate) use step_lifecycle::{
-    AsyncWorker, SyncWorker, run_step_async_lifecycle, run_step_sync_lifecycle,
+    AsyncWorker, FinishedStep, SyncWorker, process_finished_steps, run_step_async_lifecycle,
+    run_step_sync_lifecycle,
 };
 pub(crate) use types::{StepInstance, WorkOutcome};

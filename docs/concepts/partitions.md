@@ -101,6 +101,8 @@ Keys must be registered **before** they can be materialized or backfilled —
 submitting a key that isn't in storage (a typo, or one deleted via
 `delete_dynamic_partition`) is rejected at the boundary with a precise error
 instead of recording a materialization for a partition that doesn't exist.
+To purge a key's data, run the [delete action](actions.md#delete) before you
+remove the key.
 
 ## Named partition definitions
 
@@ -133,6 +135,8 @@ registered names listed — never silently at execution time.
 When executing a partitioned job, provide a key:
 
 ```python
+job = repo.get_job("daily")
+
 # Single partition
 job.execute(partition_key=rs.PartitionKey.single("2024-01-15"))
 

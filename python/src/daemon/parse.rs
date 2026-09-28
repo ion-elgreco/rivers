@@ -113,6 +113,7 @@ fn split_run_requests(
                     .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                     .unwrap_or_default(),
                 launched_by: launched_by.clone(),
+                action: None,
             });
         }
         // else: dropped — resolve-time validation should keep this state out
@@ -161,6 +162,7 @@ pub(crate) fn extract_backfill_request_data(
                 dry_run: false,
                 backfill_id: None,
                 launched_by: launched_by.clone(),
+                action: br.action.clone(),
             }
         })
         .collect()

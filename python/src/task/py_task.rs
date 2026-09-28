@@ -126,10 +126,11 @@ impl PyTask {
 
     #[getter]
     fn io_handler(&self, py: Python) -> Option<Py<PyAny>> {
-        self.inner.io_handler.as_ref().and_then(|h| match h {
-            crate::assets::io_handler::IOHandler::Instance(obj) => Some(obj.clone_ref(py)),
-            crate::assets::io_handler::IOHandler::ResourceRef(_) => None,
-        })
+        self.inner
+            .io_handler
+            .as_ref()
+            .and_then(|h| h.handler())
+            .map(|obj| obj.clone_ref(py))
     }
 
     #[getter]

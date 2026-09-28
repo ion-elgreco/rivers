@@ -88,14 +88,14 @@ fn stash_failed_partitions(
     if marks.is_empty() {
         return;
     }
-    if step.outputs.is_empty() {
-        ctx.state.failed_partitions.insert(step.name.clone(), marks);
-    } else {
-        for out in &step.outputs {
-            ctx.state
-                .failed_partitions
-                .insert(out.clone(), marks.clone());
-        }
+    // Merge: keys an ordering dependency failed are pre-marked before the
+    // step runs, and the step's own marks must not drop them.
+    for name in step.event_names() {
+        ctx.state
+            .failed_partitions
+            .entry(name.clone())
+            .or_default()
+            .extend(marks.iter().cloned());
     }
 }
 
@@ -107,6 +107,13 @@ pub(crate) fn process_step_result(
     step_result: ops::StepResult,
     failures: &mut Vec<(String, PyErr)>,
 ) {
+    // Action runs: the verb ran against existing data — no output iteration,
+    // no hooks. The runtime report decides what lands on the timeline.
+    if let Some(verb) = ctx.scope.plan.action.clone() {
+        handle_action_result(py, ctx, step, step_name, &verb, step_result, failures);
+        return;
+    }
+
     stash_failed_partitions(ctx, step, step_result.failed_partitions.clone());
     let node = ctx.repo.node_map.get(&step.name).unwrap();
 
@@ -124,6 +131,7 @@ pub(crate) fn process_step_result(
     //      stale on-disk `__keys`. Empty Vec = ran with plain values.
     //   2. dual IO write for final graph asset node — only non-mapped (a
     //      mapped instance is a per-key write, not the step's "final" output).
+    let mut wrote_graph: Option<String> = None;
     if is_single && is_non_mapped {
         ctx.state.record_dynamic_keys(
             step.name.clone(),
@@ -132,7 +140,8 @@ pub(crate) fn process_step_result(
 
         if let Some(graph_name) = ctx.repo.graph_nodes.final_nodes.get(&step.name)
             && let Some(graph_node) = ctx.repo.node_map.get(graph_name)
-            && let Err(e) = ops::handle_step_output(
+        {
+            match ops::handle_step_output(
                 py,
                 graph_name,
                 graph_node,
@@ -141,10 +150,13 @@ pub(crate) fn process_step_result(
                 step_result.return_hint.as_ref(),
                 Vec::new(),
                 ctx.repo.io_handler_registry,
-            )
-        {
-            let gn = graph_name.clone();
-            ctx.record_failure_no_hooks(&gn, e, failures);
+            ) {
+                Ok(_) => wrote_graph = Some(graph_name.clone()),
+                Err(e) => {
+                    let gn = graph_name.clone();
+                    ctx.record_failure_no_hooks(&gn, e, failures);
+                }
+            }
         }
     }
 
@@ -315,6 +327,133 @@ pub(crate) fn process_step_result(
             }
         });
     }
+
+    // The graph's Materialization takes this time: after this task's own
+    // events, and before its claim on the graph's pool ends.
+    if let Some(graph_name) = wrote_graph {
+        ctx.state.graph_written_at.insert(graph_name, now_ts());
+    }
+}
+
+/// Consume one action step's result. The declared outcome is the
+/// planning upper bound; the returned `ActionResult` is what actually
+/// happened: `materialized()` emits a real `Materialization` event (downstream
+/// goes stale exactly as after a materialize — the point of the dynamic
+/// report is that a no-op merge does NOT), anything else completes quietly.
+fn handle_action_result(
+    py: Python,
+    ctx: &mut BatchContext,
+    step: &ExecutionStep,
+    step_name: &str,
+    verb: &str,
+    step_result: ops::StepResult,
+    failures: &mut Vec<(String, PyErr)>,
+) {
+    use crate::assets::action::{ActionOutcome, PyActionResult};
+
+    // Keys the action marked failed are peeled out of whichever event the
+    // report produces, so a batched run can complete the keys it handled.
+    stash_failed_partitions(ctx, step, step_result.failed_partitions.clone());
+
+    let outcome = ctx
+        .repo
+        .node_map
+        .get(&step.name)
+        .and_then(|n| n.find_action(verb))
+        .map(|a| a.outcome);
+
+    if outcome == Some(ActionOutcome::Observe) {
+        py.detach(|| handle_observation_result(ctx, step_name, &step_result));
+        return;
+    }
+
+    enum Report {
+        /// Body returned None — the declared outcome is presumed done.
+        Completed,
+        /// Explicit `ActionResult.unchanged()` — a no-op report.
+        Unchanged(Vec<(String, MetadataValue)>),
+        Materialized(Vec<(String, MetadataValue)>, Option<String>),
+    }
+
+    let report = if step_result.result.is_none(py) {
+        Report::Completed
+    } else if let Ok(r) = step_result.result.bind(py).cast::<PyActionResult>() {
+        let r = r.get();
+        if r.materialized {
+            Report::Materialized(r.metadata.clone(), r.data_version.clone())
+        } else {
+            Report::Unchanged(r.metadata.clone())
+        }
+    } else {
+        let type_name = step_result.result.bind(py).get_type().to_string();
+        let event_names = vec![step_name.to_string()];
+        handle_failure(
+            py,
+            ctx,
+            step,
+            step_name,
+            &event_names,
+            ExecutionError::new_err(format!(
+                "action '{verb}' on '{step_name}' returned {type_name}; \
+                 actions return rs.ActionResult or None"
+            )),
+            None,
+            failures,
+        );
+        return;
+    };
+
+    match report {
+        Report::Materialized(metadata, data_version) => {
+            if outcome != Some(ActionOutcome::MayMaterialize) {
+                let declared = match outcome {
+                    Some(ActionOutcome::Unmaterialize) => "Outcome.Unmaterialize",
+                    _ => "Outcome.Unchanged",
+                };
+                let event_names = vec![step_name.to_string()];
+                handle_failure(
+                    py,
+                    ctx,
+                    step,
+                    step_name,
+                    &event_names,
+                    ExecutionError::new_err(format!(
+                        "action '{verb}' on '{step_name}' declared {declared} \
+                         but reported ActionResult.materialized()"
+                    )),
+                    None,
+                    failures,
+                );
+                return;
+            }
+            let final_dv = data_version.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            ctx.emit_materialization(
+                step_name,
+                &metadata,
+                Some(final_dv.clone()),
+                Vec::new(),
+                now_ts(),
+            );
+            ctx.state
+                .record_data_version(step_name.to_string(), final_dv);
+            ctx.emit_success(step_name);
+        }
+        // An explicit `unchanged()` return is a no-op report — even for an
+        // Unmaterialize action ("nothing to delete"): state is preserved.
+        Report::Unchanged(metadata) => {
+            ctx.emit_action_completed(step_name, verb, &metadata, now_ts());
+            ctx.emit_success(step_name);
+        }
+        Report::Completed => {
+            if outcome == Some(ActionOutcome::Unmaterialize) {
+                // The declared outcome happened: clear materialization state.
+                ctx.emit_deletion(step_name, verb, now_ts());
+            } else {
+                ctx.emit_action_completed(step_name, verb, &[], now_ts());
+            }
+            ctx.emit_success(step_name);
+        }
+    }
 }
 
 /// External asset observation: emit Observation event (no IO write), record
@@ -398,6 +537,7 @@ pub(crate) fn process_outcome(
                 failures,
             );
         }
+        WorkOutcome::Cancelled => ctx.state.mark_cancelled(step_name.to_string()),
     }
 }
 
@@ -436,7 +576,10 @@ pub(crate) fn handle_failure(
         ctx.emit_partition_failures(name, &err_msg, ts);
         ctx.state.mark_failed(name.clone());
     }
-    if let Some(node) = ctx.repo.node_map.get(&step.name) {
+    // Asset hooks carry materialize semantics; action runs don't fire them.
+    if ctx.scope.plan.is_materialize()
+        && let Some(node) = ctx.repo.node_map.get(&step.name)
+    {
         ops::run_failure_hooks(
             py,
             node,
@@ -533,6 +676,19 @@ pub(crate) fn process_worker_result(
         .collect();
     stash_failed_partitions(ctx, step, marks);
 
+    // A graph's final task's value is the graph's output too, as in
+    // `process_step_result`.
+    let graph_name = (step_name == step.name)
+        .then(|| ctx.repo.graph_nodes.final_nodes.get(&step.name).cloned())
+        .flatten();
+    let mut graph_written = false;
+    if let Some(graph_name) = &graph_name {
+        match write_graph_after_worker(py, ctx, step, graph_name, &worker_result, outputs_list) {
+            Ok(written) => graph_written = written,
+            Err(e) => ctx.record_failure_no_hooks(graph_name, e, failures),
+        }
+    }
+
     for item_any in outputs_list.iter() {
         if let Err(e) = process_one_worker_item(
             py,
@@ -548,6 +704,71 @@ pub(crate) fn process_worker_result(
             ctx.record_failure_no_hooks(step_name, e, failures);
         }
     }
+
+    // Same stamp as `process_step_result`: after this task's own events.
+    if let Some(graph_name) = graph_name
+        && graph_written
+    {
+        ctx.state.graph_written_at.insert(graph_name, now_ts());
+    }
+}
+
+/// Whether the graph's output was written for its final task's worker
+/// result. The worker writes it; a graph kept in memory is written here from
+/// the task's output loaded back, since the worker's memory is not this one.
+fn write_graph_after_worker(
+    py: Python,
+    ctx: &BatchContext,
+    step: &ExecutionStep,
+    graph_name: &str,
+    worker_result: &Py<PyAny>,
+    outputs: &Bound<PyList>,
+) -> PyResult<bool> {
+    let err = worker_result.getattr(py, "graph_error")?;
+    if !err.is_none(py) {
+        return Err(PyErr::from_value(err.into_bound(py)));
+    }
+    if worker_result
+        .getattr(py, "graph_written")?
+        .extract::<bool>(py)?
+    {
+        return Ok(true);
+    }
+    let task_output = match outputs.iter().next() {
+        Some(item) => {
+            let kind: u8 = item.get_item(1)?.extract()?;
+            matches!(ResultKind::from_u8(kind)?, ResultKind::Output)
+        }
+        None => false,
+    };
+    let (true, Some(task_node), Some(graph_node)) = (
+        task_output,
+        ctx.repo.node_map.get(&step.name),
+        ctx.repo.node_map.get(graph_name),
+    ) else {
+        return Ok(false);
+    };
+    let hint = ops::extract_return_hint(py, &task_node.callable(py)?)?;
+    let value = ops::load_step_output(
+        py,
+        &step.name,
+        task_node,
+        graph_name,
+        ctx.scope.partition_key,
+        hint.as_ref(),
+        ctx.repo.io_handler_registry,
+    )?;
+    ops::handle_step_output(
+        py,
+        graph_name,
+        graph_node,
+        &value,
+        ctx.scope.partition_key,
+        hint.as_ref(),
+        Vec::new(),
+        ctx.repo.io_handler_registry,
+    )?;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]

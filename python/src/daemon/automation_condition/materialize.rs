@@ -47,6 +47,7 @@ impl ConditionTickEngine {
                 partition_key: None,
                 tags: vec![],
                 launched_by: LaunchedBy::Condition,
+                action: None,
             });
         }
 
@@ -67,6 +68,7 @@ impl ConditionTickEngine {
                 partition_key: Some(pk.clone()),
                 tags: vec![],
                 launched_by: LaunchedBy::Condition,
+                action: None,
             });
         }
         run_requests
@@ -171,6 +173,7 @@ impl ConditionTickEngine {
                 dry_run: false,
                 backfill_id,
                 launched_by: LaunchedBy::Condition,
+                action: None,
             });
         }
 

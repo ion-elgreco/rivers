@@ -2,6 +2,8 @@
 
 Hooks run after an asset step succeeds or fails. Hook errors are logged but never fail the step.
 
+Hooks belong to materialize runs: an [action](../concepts/actions.md) run never fires them, even one that reports `ActionResult.materialized()`. To act on a failed action run, read its run record — it carries the verb in `action`.
+
 ## `Hook.success`
 
 Runs after an asset step completes successfully. Can be used as a bare decorator or with a custom name.
@@ -92,3 +94,4 @@ Context object passed to hook functions.
 - If a hook itself raises an exception, the error is printed to stderr but does **not** fail the asset step
 - Hooks run in the order they are listed in the `hooks` parameter
 - Only `Asset` nodes support hooks; `Task` and `BashTask` do not
+- Hooks run while the step still holds its asset and its [pool](../concepts/concurrency.md#concurrency-pools) slots. A hook must not start a run that needs the same asset or pool: that run waits on the step itself. An exclusive verb on the same asset (for example `repo.run_action("optimize")` in a success hook) waits forever; a run on a full pool that the step holds waits until the [claim timeout](environment-variables.md). Start such runs from a sensor, schedule, or job instead

@@ -624,8 +624,8 @@ def test_input_dep_io_handler_resource_ref_on_graph_asset():
 
     Regression: ``input_io_handler_override`` is propagated from the parent
     graph asset to its namespaced ``ResolvedTask`` nodes during
-    ``build_unresolved_graph``, *before* ``resolve_io_handler_refs`` runs.
-    Without a re-resolution pass, the override stays as
+    ``build_unresolved_graph``, *before* resource keys are resolved. Unless
+    ``resolve()`` resolves these copies too, the override stays as
     ``IOHandler::ResourceRef("override_handler")`` and tripping
     ``expect_resolved_handler`` panics with ``unreachable!``.
     """

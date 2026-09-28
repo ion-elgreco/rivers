@@ -22,7 +22,7 @@ from rivers.testing import embedded_storage as _embedded_storage_factory
 # `to_string()` which prefixes with the exception class name. ──
 
 MISSING_KEY_MSG = (
-    'Cannot materialize without partition_key: assets ["part"] have '
+    "Cannot run 'materialize' without partition_key: assets [\"part\"] have "
     "partition definitions. Provide a partition_key or exclude them from "
     "selection."
 )
@@ -209,7 +209,7 @@ def test_submit_run_valid_partition_key_creates_queued_run(storage):
 # Asset name in the gRPC fixture is `part_alpha`; rebuild expected strings
 # with that asset name.
 GRPC_MISSING_KEY_MSG = _grpc_msg(
-    'Cannot materialize without partition_key: assets ["part_alpha", '
+    "Cannot run 'materialize' without partition_key: assets [\"part_alpha\", "
     '"part_beta"] have partition definitions. Provide a partition_key or '
     "exclude them from selection."
 )

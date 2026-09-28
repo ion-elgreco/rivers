@@ -145,6 +145,7 @@ impl CodeLocationService for CodeLocationImpl {
             partition_key: pk_core,
             tags,
             launched_by,
+            action: None,
         };
         let run_id = mat_request.run_id.clone();
         let status = self.run_dispatcher.mode_label().to_string();
@@ -586,6 +587,7 @@ impl CodeLocationService for CodeLocationImpl {
             dry_run: req.dry_run,
             backfill_id: None,
             launched_by: manual_launch(req.user),
+            action: None,
         };
 
         let mut outcome = self

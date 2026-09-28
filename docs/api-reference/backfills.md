@@ -35,6 +35,7 @@ Returned by `CodeRepository.get_backfill()`.
 | `error` | `str \| None` | Error message if the backfill failed |
 | `tags` | `list[tuple[str, str]]` | Tags attached to every run launched by the backfill |
 | `launched_by` | `LaunchedBy` | Origin of the backfill; manual launches from the authenticated UI carry the acting `user` |
+| `action` | `str \| None` | The verb the child runs execute. `None` means materialize |
 
 ---
 
@@ -138,6 +139,7 @@ CodeRepository.backfill(
     config: dict[str, dict[str, Any]] | None = None,
     block: bool = True,
     dry_run: bool = False,
+    action: str | None = None,
 ) -> BackfillResult
 ```
 
@@ -145,19 +147,23 @@ Launch a backfill to reprocess partitions.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `selection` | `list[str] \| None` | `None` | Asset keys to backfill. `None` selects all partitioned assets. |
+| `selection` | `list[str] \| None` | `None` | Asset keys to backfill. `None` selects all partitioned assets — or, with `action`, every asset that defines the verb. With `action`, an empty list is an error. |
 | `partition_keys` | `list[PartitionKey] \| None` | `None` | Explicit list of partition keys to process. |
 | `partition_range` | `PartitionKeyRange \| None` | `None` | Range of partition keys. Mutually exclusive with `partition_keys`. |
 | `strategy` | `BackfillStrategy \| None` | `None` | How to group partitions into runs. Falls back to asset-level strategy, then `MultiRun`. |
 | `failure_policy` | `str` | `"continue"` | `"continue"` to keep processing on failure, `"stop_on_failure"` to halt. |
 | `max_concurrency` | `int` | `4` | Maximum number of concurrent runs. |
 | `tags` | `list[tuple[str, str]] \| None` | `None` | Tags attached to the backfill and its runs. Use `("rivers/priority", "N")` to override default priority (-10). |
-| `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config overrides (keyed by asset name). |
-| `block` | `bool` | `True` | If `True`, wait for the backfill to complete before returning. |
+| `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config overrides (keyed by asset name). Needs `block=True`. |
+| `block` | `bool` | `True` | If `True`, wait for the backfill to complete before returning. If `False`, only record the backfill; a daemon runs it later. |
 | `dry_run` | `bool` | `False` | If `True`, compute the plan without executing. |
+| `action` | `str \| None` | `None` | Run this [action](../concepts/actions.md) on every partition instead of materializing. Every selected asset must define the verb; child runs and `rerun_backfill` inherit it. |
 
 !!! note
     Provide either `partition_keys` or `partition_range`, not both.
+
+!!! note "Config needs block=True"
+    The backfill record does not keep `config`, and a daemon runs a `block=False` backfill later from its record. Its runs would use the config defaults, so `config` with `block=False` raises `ExecutionError`, also for a dry run.
 
 !!! info "Priority"
     Backfill runs default to priority **-10** (lower than regular runs at priority 0), ensuring scheduled and manually triggered runs are dequeued first when a run queue is configured. Override with `tags=[("rivers/priority", "5")]`.
@@ -194,10 +200,13 @@ CodeRepository.rerun_backfill(
 ) -> BackfillResult
 ```
 
-Re-launch the failed and canceled partitions of a previous backfill.
+Launch a previous backfill again as a new backfill, with the same selection, strategy, failure policy, concurrency, tags and verb. The rerun replays every partition of the original backfill, not only the failed or canceled ones. Keys that are no longer valid for the current definitions are dropped. For a backfill of a job, the rerun raises `ExecutionError` if the job now runs a different verb than the recorded one.
+
+!!! warning
+    A rerun of a `delete` backfill deletes every partition again, including partitions materialized again after the first run. To retry only some partitions, call `backfill()` with those `partition_keys` and the original `action`.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `backfill_id` | `str` | required | ID of the backfill to retry. |
+| `backfill_id` | `str` | required | ID of the backfill to rerun. |
 | `block` | `bool` | `True` | If `True`, wait for the rerun to complete before returning. |
 | `dry_run` | `bool` | `False` | If `True`, compute the plan without executing. |

@@ -5,6 +5,8 @@ if sys.version_info >= (3, 11):
 else:
     from typing_extensions import reveal_type
 
+from pydantic import BaseModel
+
 import rivers as rs
 
 
@@ -104,6 +106,75 @@ reveal_type(sens_decorated)
 # Sensor direct construction (no func)
 sens_plain = rs.Sensor(name="my_sensor")
 reveal_type(sens_plain)
+
+
+class TuneConfig(BaseModel):
+    target_size_mb: int = 128
+
+
+# Class form: every declarable attribute is typed on the bases, so subclass
+# bodies get completion and value checking.
+class Orders(rs.Asset):
+    name = "orders_v2"
+    tags = ["core"]
+    kinds = "table"
+    group = "sales"
+    code_version = "v3"
+    io_handler = DuckHandler()
+    metadata = {"owner": "data"}
+    partitions_def = "daily"
+    deps = None
+    hooks = None
+    automation_condition = None
+    backfill_strategy = None
+    pool = "heavy"
+    pool_slots = 2
+    retry = "default"
+    compute = None
+
+    @classmethod
+    def materialize(cls, ctx: rs.AssetExecutionContext) -> int:
+        return 1
+
+    @rs.action(outcome=rs.Outcome.Unchanged)
+    @classmethod
+    def optimize(cls, ctx: rs.ActionContext) -> None: ...
+
+    @rs.action(outcome=rs.Outcome.Unchanged)
+    @classmethod
+    def tune(cls, ctx: rs.ActionContext[TuneConfig]) -> None:
+        reveal_type(ctx.config)
+
+
+class Ingest(rs.MultiAsset):
+    io_handler = DuckHandler()
+    customers = rs.AssetDef()
+    orders = rs.AssetDef()
+
+    @classmethod
+    def materialize(cls) -> dict[str, int]:
+        return {"customers": 1, "orders": 2}
+
+
+class Report(rs.GraphAsset):
+    group = "reports"
+    node_io_handler = DuckHandler()
+
+    @classmethod
+    def compose(cls) -> None:
+        return None
+
+
+class Upstream(rs.ExternalAsset):
+    io_handler = DuckHandler()
+
+    @classmethod
+    def observe(cls) -> None:
+        return None
+
+
+class_repo = rs.CodeRepository(assets=[Orders, Ingest, Report, Upstream])
+reveal_type(class_repo)
 
 
 # load_node with type_hint returns T

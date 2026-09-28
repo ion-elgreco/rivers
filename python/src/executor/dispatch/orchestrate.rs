@@ -68,7 +68,13 @@ pub(crate) fn execute_level_batch(
                 StepAction::Execute => {
                     let step = &ctx.scope.plan.steps[idx];
                     let node = ctx.repo.node_map.get(&step.name).unwrap();
-                    let pools = ctx.step_pools(&step.name);
+                    let (pools, asset_scope) = ctx.step_pools(step);
+                    // Async-ness of an action step is the action's, not the
+                    // asset materialize function's.
+                    let is_async = match ctx.scope.plan.verb() {
+                        Some(verb) => node.action_is_async(verb),
+                        None => node.is_async(),
+                    };
                     singles.push(StepInstance {
                         idx,
                         instance_name: step.name.clone(),
@@ -79,8 +85,9 @@ pub(crate) fn execute_level_batch(
                         // build their own serializable specs).
                         input_overrides: HashMap::new(),
                         fan_out: None,
-                        is_async: node.is_async(),
+                        is_async,
                         pools,
+                        asset_scope,
                     });
                 }
             }
@@ -102,8 +109,8 @@ pub(crate) fn execute_level_batch(
 }
 
 /// One mapped step's roll-up record: which step + the mapping_keys we built
-/// instances for. We check `state.failed_names` for each instance after
-/// `run_instances` to decide success vs failure for the mapped step.
+/// instances for. We check `state.failed_names` and `state.cancelled_names`
+/// for each instance after `run_instances` to decide the mapped step's outcome.
 struct MappedStepRecord {
     idx: usize,
     keys: Vec<String>,
@@ -114,16 +121,25 @@ fn finalize_mapped_steps(ctx: &mut BatchContext, records: &[MappedStepRecord]) {
         let step = &ctx.scope.plan.steps[rec.idx];
         let mut successful = Vec::with_capacity(rec.keys.len());
         let mut any_failed = false;
+        let mut any_cancelled = false;
         for key in &rec.keys {
             let instance_name = format!("{}__{}", step.name, key);
             if ctx.state.was_failed(&instance_name) {
                 any_failed = true;
+            } else if ctx.state.was_cancelled(&instance_name) {
+                any_cancelled = true;
             } else {
                 successful.push(key.clone());
             }
         }
         if any_failed {
             ctx.emit_step_failure(&step.name, "One or more map instances failed", None);
+            ctx.state.mark_failed(step.name.clone());
+        } else if any_cancelled {
+            // Its StepStart is out, so the step must end. Unkeyed and kept
+            // out of `failures`: the Canceled run fails no asset and floors
+            // no partition.
+            ctx.emit_step_failure(&step.name, "Cancelled before every map instance ran", None);
             ctx.state.mark_failed(step.name.clone());
         } else {
             ctx.emit_success(&step.name);
@@ -154,7 +170,7 @@ fn build_mapped_instances(
         .get(fan_out_source)
         .expect("fan-out source must be in node_map");
 
-    let pools = ctx.step_pools(&step.name);
+    let (pools, asset_scope) = ctx.step_pools(step);
     let is_async = node.is_async();
 
     let source_output = match ops::load_fan_out_source(
@@ -221,6 +237,7 @@ fn build_mapped_instances(
                 fan_out: Some((fan_out_source.to_string(), value)),
                 is_async,
                 pools: pools.clone(),
+                asset_scope: asset_scope.clone(),
             }
         };
 

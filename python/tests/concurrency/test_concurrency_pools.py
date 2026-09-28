@@ -136,6 +136,20 @@ def test_asset_def_no_pool():
     assert defn.pool == []
 
 
+def test_reserved_asset_pool_prefix_rejected():
+    """`__asset__:` names the implicit per-asset pools — a user pool with the
+    prefix would silently impose exclusive whole-asset semantics on another
+    asset, so it is rejected at declaration."""
+    with pytest.raises(Exception, match="__asset__"):
+
+        @Asset(pool="__asset__:orders")
+        def bad():
+            return 1
+
+    with pytest.raises(Exception, match="__asset__"):
+        AssetDef("out", pool="__asset__:orders")
+
+
 def test_asset_decorator_pool_invalid_type():
     """pool must be str or list[str]."""
     with pytest.raises(Exception, match="pool must be"):
@@ -170,3 +184,31 @@ def test_asset_decorator_pool_slots_unknown_key():
         @Asset(pool="database", pool_slots={"typo_db": 3})
         def bad():
             pass
+
+
+def test_exclusive_action_pool_registers_unlimited(storage):
+    """The implicit asset pool admits by partition overlap, not capacity —
+    its limit must read as unlimited (-1), not a 1000000 sentinel the UI
+    renders as "0/1000000" while the graph badge says "1/1 full"."""
+    import rivers as rs
+
+    def _opt(ctx):
+        return None
+
+    opt = rs.AssetAction(
+        name="optimize",
+        outcome=rs.Outcome.Unchanged,
+        concurrency=rs.ActionConcurrency.Exclusive,
+    )(_opt)
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler(), actions=[opt])
+    def guarded():
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[guarded], default_executor=rs.Executor.in_process()
+    )
+    repo.resolve(storage=storage)
+
+    limits = {p.pool_key: p.slot_limit for p in storage.get_pool_limits()}
+    assert limits.get("__asset__:guarded") == -1
