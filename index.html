@@ -109,10 +109,10 @@ repo.materialize()</code></pre>
   <section class="marquee-wrap" aria-label="Capabilities">
     <div class="marquee">
       <ul class="marquee-track">
-        <li>Assets</li><li>Tasks</li><li>Graph assets</li><li>Partitions</li><li>Backfills</li><li>Schedules</li><li>Sensors</li>
+        <li>Assets</li><li>Tasks</li><li>Graph assets</li><li>Asset actions</li><li>Partitions</li><li>Backfills</li><li>Schedules</li><li>Sensors</li>
         <li>Automation conditions</li><li>Retries</li><li>Concurrency pools</li><li>Kubernetes</li>
         <li>Delta Lake</li><li>Polars</li><li>PyArrow</li><li>SurrealDB</li><li>Lineage</li>
-        <li aria-hidden="true">Assets</li><li aria-hidden="true">Tasks</li><li aria-hidden="true">Graph assets</li><li aria-hidden="true">Partitions</li><li aria-hidden="true">Backfills</li>
+        <li aria-hidden="true">Assets</li><li aria-hidden="true">Tasks</li><li aria-hidden="true">Graph assets</li><li aria-hidden="true">Asset actions</li><li aria-hidden="true">Partitions</li><li aria-hidden="true">Backfills</li>
         <li aria-hidden="true">Schedules</li><li aria-hidden="true">Sensors</li>
         <li aria-hidden="true">Automation conditions</li><li aria-hidden="true">Retries</li>
         <li aria-hidden="true">Concurrency pools</li><li aria-hidden="true">Kubernetes</li>
@@ -409,6 +409,32 @@ repo.materialize()</code></pre>
           </div>
         </article>
 
+      </div>
+    </div>
+  </section>
+
+  <!-- Asset actions -->
+  <section class="split reveal">
+    <div class="wrap split-inner">
+      <div>
+        <h2>Maintenance lives <span class="grad">on the asset</span>.</h2>
+        <p>Actions are the other verbs on an asset: optimize, vacuum, delete, or your own. Each one is a normal run, with logs, retries, and a run page. You can schedule it, backfill it, or start it from the UI.</p>
+        <p>Each verb declares what it does to the asset's state. An optimize run never triggers downstream, and a delete marks the asset as missing. <code>rs.DeltaAsset</code> has optimize, vacuum, and delete built in.</p>
+        <a class="btn glass" href="/docs/latest/concepts/actions/">Asset actions</a>
+      </div>
+      <div class="code-card glow">
+        <div class="code-head"><span class="dot red"></span><span class="dot amber"></span><span class="dot green"></span><span class="fname">orders.py</span></div>
+<pre><code><span class="k">class</span> <span class="t">Orders</span>(rs.<span class="t">DeltaAsset</span>):
+    <span class="d">@classmethod</span>
+    <span class="k">def</span> <span class="f">materialize</span>(cls) -> pl.<span class="t">DataFrame</span>:
+        <span class="k">return</span> load_orders()
+
+    <span class="d">@rs.action</span>(outcome=rs.<span class="t">Outcome</span>.Unchanged)
+    <span class="d">@classmethod</span>
+    <span class="k">def</span> <span class="f">analyze</span>(cls, ctx):
+        compute_stats(ctx.asset_name)
+
+repo.run_action(<span class="s">"optimize"</span>)</code></pre>
       </div>
     </div>
   </section>
