@@ -191,8 +191,22 @@ __all__ = [
 ]
 
 try:
-    from rivers.io_handlers.delta import DeltaIOHandler
+    from rivers.io_handlers.delta import DeltaAsset, DeltaIOHandler
 
-    __all__ = [*__all__, "DeltaIOHandler"]
-except ImportError:
-    pass
+    __all__ = [*__all__, "DeltaAsset", "DeltaIOHandler"]
+except ImportError as e:
+    _delta_import_error = e
+
+    def __getattr__(name: str):
+        """Point at the missing extra instead of a bare "cannot import name".
+
+        Raises:
+            ImportError: For the Delta names, naming the extra to install.
+            AttributeError: For everything else, as usual.
+        """
+        if name in ("DeltaAsset", "DeltaIOHandler"):
+            raise ImportError(
+                f"{name} requires the Delta extras — install "
+                f"'rivers[delta-pyarrow]' ({_delta_import_error})"
+            ) from _delta_import_error
+        raise AttributeError(f"module 'rivers' has no attribute '{name}'")
