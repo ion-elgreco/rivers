@@ -1,4 +1,4 @@
-"""SQL predicate construction from rivers partition keys for Delta IO."""
+"""SQL predicates and delta-rs partition filters from rivers partition keys."""
 
 from __future__ import annotations
 
@@ -32,28 +32,52 @@ def _sql_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _time_window_predicate(col: str, tw: tuple, fmt: str) -> str:
-    """Build a half-open ``col >= start AND col < end`` SQL predicate from a time window."""
-    return (
-        f"{col} >= {_sql_quote(tw[0].strftime(fmt))} AND "
-        f"{col} < {_sql_quote(tw[1].strftime(fmt))}"
+Filter = tuple[str, str, Any]
+"""One delta-rs partition filter: ``(column, op, value)``."""
+
+
+def _time_window_filters(col: str, tw: tuple, fmt: str) -> list[Filter]:
+    """Half-open ``col >= start AND col < end`` filters for a time window."""
+    return [(col, ">=", tw[0].strftime(fmt)), (col, "<", tw[1].strftime(fmt))]
+
+
+def _col_filters(col: str, values: list[str]) -> list[Filter]:
+    """An equality or IN filter on a single column."""
+    if len(values) == 1:
+        return [(col, "=", values[0])]
+    return [(col, "in", list(values))]
+
+
+def _dim_filters(
+    col: str, vals: list[str], dim_def: PartitionsDefinition | None
+) -> list[Filter]:
+    """Filters for one dimension: a range for a single time-window value."""
+    if len(vals) == 1 and isinstance(dim_def, PartitionsDefinition.TimeWindow):
+        dim_ctx = PartitionContext(
+            keys=[PartitionKey.single(vals[0])], definition=dim_def
+        )
+        tw = dim_ctx.time_window()
+        if tw is not None:
+            return _time_window_filters(col, tw, dim_def.fmt)
+    return _col_filters(col, vals)
+
+
+def _render(filters: list[Filter]) -> str:
+    """The SQL predicate for a conjunction of filters."""
+    return " AND ".join(
+        f"{col} IN ({', '.join(_sql_quote(v) for v in value)})"
+        if op == "in"
+        else f"{col} {op} {_sql_quote(value)}"
+        for col, op, value in filters
     )
 
 
-def _col_predicate(col: str, values: list[str]) -> str:
-    """Build an equality or IN predicate for a single column."""
-    if len(values) == 1:
-        return f"{col} = {_sql_quote(values[0])}"
-    in_clause = ", ".join(_sql_quote(v) for v in values)
-    return f"{col} IN ({in_clause})"
-
-
-def _build_predicate_for_key(
+def _filters_for_key(
     key: PartitionKey,
     definition: PartitionsDefinition,
     partition_expr: PartitionExpr,
-) -> str:
-    """Build a SQL predicate for a single partition key."""
+) -> list[Filter]:
+    """The conjunction of filters that selects a single partition key."""
     if isinstance(key, PartitionKey.Single):
         if not isinstance(partition_expr.expr, str):
             raise ValueError(
@@ -65,8 +89,8 @@ def _build_predicate_for_key(
             ctx = PartitionContext(keys=[key], definition=definition)
             tw = ctx.time_window()
             if tw is not None:
-                return _time_window_predicate(col, tw, definition.fmt)
-        return _col_predicate(col, key.key)
+                return _time_window_filters(col, tw, definition.fmt)
+        return _col_filters(col, key.key)
     elif isinstance(key, PartitionKey.Multi):
         if not isinstance(partition_expr.expr, dict):
             raise ValueError(
@@ -76,23 +100,40 @@ def _build_predicate_for_key(
         dim_defs: dict[str, PartitionsDefinition] = {}
         if isinstance(definition, PartitionsDefinition.Multi):
             dim_defs = {name: defn for name, defn in definition.dimensions}
-
-        parts: list[str] = []
-        for dim, vals in sorted(key.keys.items()):
-            col = partition_expr.expr[dim]
-            dim_def = dim_defs.get(dim)
-            if len(vals) == 1 and isinstance(dim_def, PartitionsDefinition.TimeWindow):
-                dim_ctx = PartitionContext(
-                    keys=[PartitionKey.single(vals[0])], definition=dim_def
-                )
-                tw = dim_ctx.time_window()
-                if tw is not None:
-                    parts.append(_time_window_predicate(col, tw, dim_def.fmt))
-                    continue
-            parts.append(_col_predicate(col, vals))
-        return " AND ".join(parts)
+        return [
+            f
+            for dim, vals in sorted(key.keys.items())
+            for f in _dim_filters(partition_expr.expr[dim], vals, dim_defs.get(dim))
+        ]
     else:
         raise NotImplementedError(type(key))
+
+
+def _build_predicate_for_key(
+    key: PartitionKey,
+    definition: PartitionsDefinition,
+    partition_expr: PartitionExpr,
+) -> str:
+    """Build a SQL predicate for a single partition key."""
+    return _render(_filters_for_key(key, definition, partition_expr))
+
+
+def _build_partition_filters(
+    partition: PartitionContext, partition_expr: PartitionExpr | None
+) -> list[list[Filter]]:
+    """delta-rs ``partition_filters`` covering the context, one conjunction per key.
+
+    ``optimize`` takes a single conjunction (no OR), so a multi-key context
+    yields one filter list per key.
+    """
+    if partition_expr is None:
+        raise ValueError(
+            "PartitionExpr is required if a partition definition is defined."
+        )
+    return [
+        _filters_for_key(k, partition.definition, partition_expr)
+        for k in partition.keys
+    ]
 
 
 def _build_predicate(
@@ -131,7 +172,7 @@ def _build_predicate(
         for k in keys:
             assert isinstance(k, PartitionKey.Single)
             all_vals.extend(k.key)
-        return _col_predicate(col, all_vals)
+        return _render(_col_filters(col, all_vals))
 
     # Multi-dimension keys: factor out shared dimension values into AND + IN
     # e.g. keys [(region=us, tier=free), (region=us, tier=pro)]
@@ -202,23 +243,12 @@ def _build_factored_multi_predicate(
         ]
         return " OR ".join(f"({p})" for p in predicates)
 
-    # Build factored AND predicate
-    parts: list[str] = []
-    for dim in sorted(dim_values.keys()):
-        col = partition_expr.expr[dim]
-        vals = dim_values[dim]
-        dim_def = dim_defs.get(dim)
-
-        # For time-window dimensions with a single value, use range predicate
-        if len(vals) == 1 and isinstance(dim_def, PartitionsDefinition.TimeWindow):
-            dim_ctx = PartitionContext(
-                keys=[PartitionKey.single(vals[0])], definition=dim_def
+    return _render(
+        [
+            f
+            for dim in sorted(dim_values)
+            for f in _dim_filters(
+                partition_expr.expr[dim], dim_values[dim], dim_defs.get(dim)
             )
-            tw = dim_ctx.time_window()
-            if tw is not None:
-                parts.append(_time_window_predicate(col, tw, dim_def.fmt))
-                continue
-
-        parts.append(_col_predicate(col, vals))
-
-    return " AND ".join(parts)
+        ]
+    )

@@ -548,12 +548,12 @@ impl AssetActionInfo {
         self.outcome == "unmaterialize"
     }
 
-    /// Whole-asset verb: never takes a partition key (optimize, vacuum).
+    /// Whole-asset verb: never takes a partition key (vacuum).
     pub fn is_keyless(&self) -> bool {
         self.partitioning == "keyless"
     }
 
-    /// A key is accepted but not required (delete, observe): keyless runs
+    /// A key is accepted but not required (delete, optimize, observe): keyless runs
     /// cover the whole asset.
     pub fn key_optional(&self) -> bool {
         self.partitioning == "optional"

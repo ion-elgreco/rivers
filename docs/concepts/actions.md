@@ -245,7 +245,8 @@ verbs, use these declarations so a verb behaves the way its name promises:
 
 | Verb | Declaration |
 |------|-------------|
-| `optimize`, `vacuum` | `Outcome.Unchanged` + `ActionConcurrency.Exclusive` + `ActionPartitioning.Keyless` — rewrites bytes table-wide, never state |
+| `optimize` | `Outcome.Unchanged` + `ActionConcurrency.Exclusive` + `ActionPartitioning.Optional` — rewrites bytes, never state; a key limits it to one partition |
+| `vacuum` | `Outcome.Unchanged` + `ActionConcurrency.Exclusive` + `ActionPartitioning.Keyless` — removes unreferenced files table-wide, never state |
 | `merge`, `refresh` | `Outcome.MayMaterialize` — report an `ActionResult` |
 | `delete`, `purge` | `Outcome.Unmaterialize` + `ActionConcurrency.Exclusive` + `ActionOrdering.DownstreamFirst` + `ActionPartitioning.Optional` |
 

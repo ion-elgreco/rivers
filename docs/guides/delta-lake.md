@@ -314,14 +314,15 @@ class Orders(DeltaAsset):
 
 repo = rs.CodeRepository(assets=[Orders])
 repo.run_action("optimize")
+repo.run_action("optimize", partition_key=pk)  # only that partition's files
 repo.run_action("vacuum", config={"orders": {"retention_hours": 24}})
 repo.run_action("delete", partition_key=pk)
 ```
 
 | Verb | Declaration | Behavior |
 |------|-------------|----------|
-| `optimize` | `Unchanged` + `Exclusive` + `Keyless` | Compacts small files; z-orders instead when `z_order_by` is configured. Table-wide — runs without a partition key, on partitioned assets too. |
-| `vacuum` | `Unchanged` + `Exclusive` + `Keyless` | Removes unreferenced files; `retention_hours` and `enforce_retention_duration` via config. Table-wide, same key rule. |
+| `optimize` | `Unchanged` + `Exclusive` + `Optional` key | Compacts small files; z-orders instead when `z_order_by` is configured. With a key, only that partition's files; without one, the whole table. From the UI or gRPC, the keyless form needs an explicit whole-asset choice. |
+| `vacuum` | `Unchanged` + `Exclusive` + `Keyless` | Removes unreferenced files; `retention_hours` and `enforce_retention_duration` via config. Table-wide — runs without a partition key, on partitioned assets too. |
 | `delete` | `Unmaterialize` + `Exclusive` + `DownstreamFirst` + `Optional` key | Deletes the keyed partition's rows via `partition_predicate`, or every row without a key — both forms valid on partitioned assets. From the UI or gRPC, the keyless form needs an explicit whole-asset choice. |
 
 On a table that does not exist yet, `optimize` and `vacuum` report `unchanged`
@@ -363,9 +364,11 @@ class Events(DeltaAsset):
   `delta/root_name` override.
 - `partition_predicate(asset_metadata, ctx.partition)` — the SQL predicate for the
   partition(s) being acted on, honoring `delta/partition_expr`.
+- `partition_filters(asset_metadata, ctx.partition)` — the same partitions as
+  delta-rs `partition_filters`, one conjunction per key, for `optimize`.
 
-Because `optimize` declares `Exclusive` and runs keyless, it claims the asset's
-implicit pool for the whole asset: it never overlaps a materialize of the same asset,
-and contention shows up in the UI as `StepSlotWaiting`. A keyed `delete` claims only
-its partition. Materialize steps never exclude each other, so declaring an exclusive
+Because `optimize` declares `Exclusive`, a keyless run claims the asset's implicit
+pool for the whole asset: it never overlaps a materialize of the same asset, and
+contention shows up in the UI as `StepSlotWaiting`. A keyed `optimize` or `delete`
+claims only its partition. Materialize steps never exclude each other, so declaring an exclusive
 action does not serialize ordinary runs.

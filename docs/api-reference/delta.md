@@ -58,7 +58,7 @@ These metadata keys override handler defaults per-asset:
 ### Methods for action bodies
 
 An [action](../concepts/actions.md) receives the asset's resolved handler as
-`ctx.io_handler`. These two methods expose the same URI and partition resolution
+`ctx.io_handler`. These methods expose the same URI and partition resolution
 the write path uses, so a `delete`/`optimize` body targets exactly the rows the
 materialize path would have written.
 
@@ -89,6 +89,23 @@ def delete(cls, ctx: rs.ActionContext) -> None:
     DeltaTable(uri, storage_options=ctx.io_handler.storage_options).delete(predicate)
 ```
 
+#### `partition_filters(asset_metadata, partition)`
+
+Returns delta-rs `partition_filters` for the partition(s), honoring
+`delta/partition_expr`: a list of `(column, op, value)` conjunctions, one per
+partition key. `optimize.compact` and `optimize.z_order` take one conjunction per
+call.
+
+```python
+@rs.action(outcome=rs.Outcome.Unchanged)
+@classmethod
+def compact(cls, ctx: rs.ActionContext) -> None:
+    uri = ctx.io_handler.asset_table_uri(ctx.asset_name, ctx.asset_metadata)
+    table = DeltaTable(uri, storage_options=ctx.io_handler.storage_options)
+    for filters in ctx.io_handler.partition_filters(ctx.asset_metadata, ctx.partition):
+        table.optimize.compact(partition_filters=filters)
+```
+
 `partition` is required: reach these only from a keyed action run. On a
 non-partitioned asset, delete the whole table instead of building a predicate.
 
@@ -113,8 +130,8 @@ class Orders(DeltaAsset):
 
 | Verb | Declaration | Behavior |
 |------|-------------|----------|
-| `optimize` | `Unchanged` + `Exclusive` + `Keyless` | `optimize.compact()`, or `z_order` when `z_order_by` is configured. Table-wide: runs without a partition key on partitioned assets too; a supplied key is rejected. |
-| `vacuum` | `Unchanged` + `Exclusive` + `Keyless` | Removes files no longer referenced by the table. Table-wide, same key rule as `optimize`. |
+| `optimize` | `Unchanged` + `Exclusive` + `Optional` key | `optimize.compact()`, or `z_order` when `z_order_by` is configured. With a key, rewrites only that partition's files via `partition_filters`; without one, the whole table. From the UI or gRPC, the keyless form needs an explicit whole-asset choice. |
+| `vacuum` | `Unchanged` + `Exclusive` + `Keyless` | Removes files no longer referenced by the table. Table-wide: runs without a partition key on partitioned assets too; a supplied key is rejected. |
 | `delete` | `Unmaterialize` + `Exclusive` + `DownstreamFirst` + `Optional` key | Deletes the keyed partition's rows via `partition_predicate`, or every row without a key — on partitioned assets both forms are valid. From the UI or gRPC, the keyless form needs an explicit whole-asset choice. |
 
 A verb requires the asset to resolve a `DeltaIOHandler` — anything else fails the

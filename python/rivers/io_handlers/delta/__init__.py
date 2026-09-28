@@ -36,7 +36,12 @@ from rivers.io_handlers.delta.config import (
     WhenNotMatchedInsert,
     WhenNotMatchedInsertAll,
 )
-from rivers.io_handlers.delta.predicate import _build_predicate, _resolve_partition_expr
+from rivers.io_handlers.delta.predicate import (
+    Filter,
+    _build_partition_filters,
+    _build_predicate,
+    _resolve_partition_expr,
+)
 
 __all__: list[str] = [
     "DeltaAsset",
@@ -224,7 +229,8 @@ class DeltaIOHandler(BaseIOHandler):
         """SQL predicate covering the partition(s), honoring ``delta/partition_expr``.
 
         The same partition-to-predicate translation the overwrite path uses,
-        for action bodies (``delete``, targeted ``optimize``):
+        for action bodies (``delete``). ``optimize`` takes
+        :meth:`partition_filters` instead.
 
         Args:
             asset_metadata: Per-asset metadata (``ctx.asset_metadata``); the
@@ -245,6 +251,35 @@ class DeltaIOHandler(BaseIOHandler):
             )
         partition_expr = _resolve_partition_expr(asset_metadata or {})
         return _build_predicate(partition, partition_expr)
+
+    def partition_filters(
+        self,
+        asset_metadata: dict[str, str] | None,
+        partition: PartitionContext | None,
+    ) -> list[list[Filter]]:
+        """delta-rs ``partition_filters`` for the partition(s), one list per key.
+
+        The mapping :meth:`partition_predicate` uses, in the ``(column, op,
+        value)`` form that ``DeltaTable.optimize.compact`` and ``z_order`` take.
+        Those accept a single conjunction, so a context with several keys
+        yields one filter list per key.
+
+        Args:
+            asset_metadata: Per-asset metadata (``ctx.asset_metadata``); the
+                ``delta/partition_expr`` entry names the partition column(s).
+            partition: The partition context (``ctx.partition``).
+
+        Raises:
+            ValueError: If ``partition`` is ``None``, or ``asset_metadata``
+                has no ``delta/partition_expr`` entry.
+        """
+        if partition is None:
+            raise ValueError(
+                "partition_filters needs a partition context; this action run "
+                "has no partition key — operate on the whole table instead"
+            )
+        partition_expr = _resolve_partition_expr(asset_metadata or {})
+        return _build_partition_filters(partition, partition_expr)
 
     def _resolve_write_request(self, context: OutputContext) -> DeltaWriteRequest:
         """Resolves the write request to be used for writing to the Delta table."""

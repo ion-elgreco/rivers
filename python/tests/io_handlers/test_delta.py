@@ -1,4 +1,7 @@
 import json
+import re
+from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 import polars as pl
@@ -19,6 +22,16 @@ from .helpers import (
 def _make_handler(tmp_path, **kwargs):
     uri = str(tmp_path)
     return rs.DeltaIOHandler(table_uri=uri, **kwargs), uri
+
+
+def _files_per_partition(uri: str, col: str) -> dict[str, int]:
+    """Active data files per value of a hive-style partition column."""
+    return dict(
+        Counter(
+            re.search(rf"{col}=([^/]+)/", u).group(1)
+            for u in DeltaTable(uri).file_uris()
+        )
+    )
 
 
 def test_round_trip_pyarrow(tmp_path):
@@ -1534,6 +1547,53 @@ def test_partition_predicate_matches_write_path(tmp_path):
     assert remaining["day"].unique().to_list() == ["b"]
 
 
+def test_partition_filters_static_keys(tmp_path):
+    """One conjunction per key; a key holding several values is an IN."""
+    handler, _ = _make_handler(tmp_path)
+    meta = {"delta/partition_expr": "day"}
+    two_keys = rs.PartitionContext(
+        keys=[rs.PartitionKey.single("a"), rs.PartitionKey.single("b")],
+        definition=rs.PartitionsDefinition.static_(["a", "b"]),
+    )
+    assert handler.partition_filters(meta, make_partition("a")) == [[("day", "=", "a")]]
+    assert handler.partition_filters(meta, make_partition(["a", "b"])) == [
+        [("day", "in", ["a", "b"])]
+    ]
+    assert handler.partition_filters(meta, two_keys) == [
+        [("day", "=", "a")],
+        [("day", "=", "b")],
+    ]
+
+
+def test_partition_filters_time_window_is_a_half_open_range(tmp_path):
+    handler, _ = _make_handler(tmp_path)
+    meta = {"delta/partition_expr": "date"}
+    assert handler.partition_filters(meta, make_daily_partition("2024-01-01")) == [
+        [("date", ">=", "2024-01-01"), ("date", "<", "2024-01-02")]
+    ]
+
+
+def test_partition_filters_multi_dim(tmp_path):
+    handler, _ = _make_handler(tmp_path)
+    meta = {"delta/partition_expr": json.dumps({"date": "date", "region": "region"})}
+    partition = make_multi_partition_with_daily(
+        {"date": "2024-01-01", "region": "eu"}, daily_dims={"date"}
+    )
+    assert handler.partition_filters(meta, partition) == [
+        [
+            ("date", ">=", "2024-01-01"),
+            ("date", "<", "2024-01-02"),
+            ("region", "=", "eu"),
+        ]
+    ]
+
+
+def test_partition_filters_rejects_missing_partition(tmp_path):
+    handler, _ = _make_handler(tmp_path)
+    with pytest.raises(ValueError, match="needs a partition context"):
+        handler.partition_filters({"delta/partition_expr": "date"}, None)
+
+
 def test_action_body_helpers_through_run_action(tmp_path):
     """The two action-body helpers work with real ActionContext fields — an
     actual `run_action` wires asset_key/asset_metadata/partition through."""
@@ -1657,16 +1717,15 @@ def test_delta_asset_delete_partition_scoped(tmp_path, storage):
     assert len(deletions) == 1
 
 
-def test_partitioned_delta_asset_runs_table_wide_verbs_keyless(tmp_path, storage):
-    """optimize is a whole-asset verb: on a partitioned DeltaAsset it runs
-    without a partition key, and supplying one is rejected up front."""
+def _two_day_events(tmp_path, storage, pdef, days, meta=None):
+    """An append-mode partitioned DeltaAsset with two files in each of `days`."""
     handler, uri = _make_handler(tmp_path, mode="append")
 
     class Events(rs.DeltaAsset):
         name = "events"
         io_handler = handler
-        partitions_def = rs.PartitionsDefinition.static_(["a", "b"])
-        metadata = {"delta/partition_expr": "day"}
+        partitions_def = pdef
+        metadata = {"delta/partition_expr": "day"} if meta is None else meta
 
         @classmethod
         def materialize(cls, context: rs.AssetExecutionContext) -> pa.Table:
@@ -1674,19 +1733,88 @@ def test_partitioned_delta_asset_runs_table_wide_verbs_keyless(tmp_path, storage
 
     repo = rs.CodeRepository(assets=[Events], default_executor=rs.Executor.in_process())
     repo.resolve(storage=storage)
-    repo.materialize(partition_key=rs.PartitionKey.single("a"))
-    repo.materialize(partition_key=rs.PartitionKey.single("a"))
-    repo.materialize(partition_key=rs.PartitionKey.single("b"))
-    assert len(DeltaTable(f"{uri}/events").file_uris()) == 3
+    for day in days:
+        for _ in range(2):
+            repo.materialize(partition_key=rs.PartitionKey.single(day))
+    return repo, f"{uri}/events"
 
-    assert repo.run_action("optimize").success
-    # Compaction is per delta partition: day=a's two files become one.
-    assert len(DeltaTable(f"{uri}/events").file_uris()) == 2
 
+@pytest.mark.parametrize(
+    ("key", "z_order_by", "files_per_day"),
+    [
+        (None, None, {"a": 1, "b": 1}),
+        ("a", None, {"a": 1, "b": 2}),
+        ("a", ["v"], {"a": 1, "b": 2}),
+    ],
+    ids=["keyless-compact", "keyed-compact", "keyed-z-order"],
+)
+def test_partitioned_delta_asset_optimize_scope(
+    tmp_path, storage, key, z_order_by, files_per_day
+):
+    """A keyed optimize rewrites only that partition's files, compacting or
+    z-ordering; a keyless one covers every partition. Rows never change."""
+    repo, table_uri = _two_day_events(
+        tmp_path, storage, rs.PartitionsDefinition.static_(["a", "b"]), ["a", "b"]
+    )
+
+    assert repo.run_action(
+        "optimize",
+        partition_key=rs.PartitionKey.single(key) if key else None,
+        config={"events": {"z_order_by": z_order_by}} if z_order_by else None,
+    ).success
+
+    assert _files_per_partition(table_uri, "day") == files_per_day
+    assert sorted(pl.read_delta(table_uri)["day"].to_list()) == ["a", "a", "b", "b"]
+
+
+def test_daily_delta_asset_optimize_keyed_rewrites_only_that_day(tmp_path, storage):
+    """A time-window key reaches delta-rs as a half-open range on the
+    partition column, so only that day's files are rewritten."""
+    repo, table_uri = _two_day_events(
+        tmp_path,
+        storage,
+        rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1)),
+        ["2024-01-01", "2024-01-02"],
+    )
+
+    assert repo.run_action(
+        "optimize", partition_key=rs.PartitionKey.single("2024-01-01")
+    ).success
+
+    assert _files_per_partition(table_uri, "day") == {
+        "2024-01-01": 1,
+        "2024-01-02": 2,
+    }
+
+
+@pytest.mark.parametrize("verb", ["optimize", "delete"])
+def test_keyed_delta_verb_without_partition_expr_names_the_metadata_key(
+    tmp_path, storage, verb
+):
+    """Without `delta/partition_expr` nothing maps a key to the table's
+    partitions; the keyed verb fails and says which metadata key is missing."""
+    repo, _ = _two_day_events(
+        tmp_path, storage, rs.PartitionsDefinition.static_(["a"]), ["a"], meta={}
+    )
+
+    result = repo.run_action(
+        verb, partition_key=rs.PartitionKey.single("a"), raise_on_error=False
+    )
+
+    assert not result.success
+    assert "needs the 'delta/partition_expr' metadata key" in result.failed_assets[0][1]
+
+
+def test_partitioned_delta_asset_vacuum_rejects_a_key(tmp_path, storage):
+    """vacuum stays whole-asset: a partition key is rejected up front."""
     from rivers.exceptions import ExecutionError
 
+    repo, _ = _two_day_events(
+        tmp_path, storage, rs.PartitionsDefinition.static_(["a"]), ["a"]
+    )
+
     with pytest.raises(ExecutionError, match="whole-asset"):
-        repo.run_action("optimize", partition_key=rs.PartitionKey.single("a"))
+        repo.run_action("vacuum", partition_key=rs.PartitionKey.single("a"))
 
 
 def test_partitioned_delta_asset_delete_whole_table_keyless(tmp_path, storage):

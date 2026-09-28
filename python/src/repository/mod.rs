@@ -218,9 +218,9 @@ pub(crate) fn validate_partition_in_map<'a>(
 
     let Some(pk) = partition_key else {
         // Keyless is only an error where the verb actually requires a key:
-        // a `Keyless` verb (optimize, vacuum, observe) is whole-asset by
-        // declaration, an `Optional` one (delete) covers the whole asset
-        // when unkeyed.
+        // a `Keyless` verb (vacuum, observe) is whole-asset by declaration,
+        // an `Optional` one (delete, optimize) covers the whole asset when
+        // unkeyed.
         let requiring: Vec<&str> = partitioned
             .iter()
             .filter(|(n, _)| {

@@ -6,7 +6,8 @@ Subclass :class:`DeltaAsset`, define ``materialize``, and the asset carries
 options the write path uses. Override any verb in the subclass to replace it.
 """
 
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, TypeVar
 
 from deltalake import DeltaTable
 from deltalake.exceptions import TableNotFoundError
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
     from rivers.io_handlers.delta import DeltaIOHandler
 
 __all__ = ["DeltaAsset", "OptimizeConfig", "VacuumConfig"]
+
+_T = TypeVar("_T")
 
 
 class OptimizeConfig(BaseModel):
@@ -92,18 +95,32 @@ class DeltaAsset(Asset):
         )
         return handler, table
 
+    @classmethod
+    def _keyed(cls, ctx: ActionContext, verb: str, build: Callable[..., _T]) -> _T:
+        """``build(asset_metadata, partition)``, naming the missing metadata key."""
+        try:
+            return build(ctx.asset_metadata, ctx.partition)
+        except ValueError as e:
+            raise ValueError(
+                f"keyed {verb} on '{ctx.asset_name}' needs the "
+                f"'delta/partition_expr' metadata key to map the partition "
+                f"to the table's partition columns"
+            ) from e
+
     @action(
         outcome=Outcome.Unchanged,
         concurrency=ActionConcurrency.Exclusive,
-        partitioning=ActionPartitioning.Keyless,
+        partitioning=ActionPartitioning.Optional,
         description="Compact small files (z-order when configured)",
     )
     @classmethod
     def optimize(cls, ctx: ActionContext[OptimizeConfig]) -> ActionResult:
         """Compact small files, or z-order when ``z_order_by`` is configured.
 
-        Table-wide (``ActionPartitioning.Keyless``): runs without a partition
-        key, on partitioned assets too. Uses the writer/commit properties the
+        The partition key is optional (``ActionPartitioning.Optional``): keyed
+        runs rewrite only that partition's files (via
+        :meth:`~rivers.io_handlers.delta.DeltaIOHandler.partition_filters`),
+        keyless runs the whole table. Uses the writer/commit properties the
         write path resolves for this asset.
 
         Args:
@@ -113,9 +130,11 @@ class DeltaAsset(Asset):
             ``ActionResult.unchanged()`` with file metrics — also when the
             table does not exist yet, so fleet-wide runs skip
             never-materialized assets.
+
+        Raises:
+            ValueError: For a keyed optimize on an asset without the
+                ``delta/partition_expr`` metadata key.
         """
-        if ctx.partition is not None:
-            raise ValueError("optimize is table-wide; run it without a partition key")
         cfg = ctx.config or OptimizeConfig()
         try:
             handler, table = cls._delta(ctx)
@@ -125,25 +144,33 @@ class DeltaAsset(Asset):
         writer_properties, commit_properties = handler.resolved_properties(
             ctx.asset_metadata
         )
-        if cfg.z_order_by:
-            metrics = table.optimize.z_order(
-                cfg.z_order_by,
-                target_size=cfg.target_size,
-                writer_properties=writer_properties,
-                commit_properties=commit_properties,
-            )
-        else:
-            metrics = table.optimize.compact(
-                target_size=cfg.target_size,
-                writer_properties=writer_properties,
-                commit_properties=commit_properties,
-            )
-        ctx.log.info("[optimize] %s: %s", ctx.asset_name, metrics)
+        filter_sets = (
+            [None]
+            if ctx.partition is None
+            else cls._keyed(ctx, "optimize", handler.partition_filters)
+        )
+        files_added = files_removed = 0
+        for filters in filter_sets:
+            if cfg.z_order_by:
+                metrics = table.optimize.z_order(
+                    cfg.z_order_by,
+                    partition_filters=filters,
+                    target_size=cfg.target_size,
+                    writer_properties=writer_properties,
+                    commit_properties=commit_properties,
+                )
+            else:
+                metrics = table.optimize.compact(
+                    partition_filters=filters,
+                    target_size=cfg.target_size,
+                    writer_properties=writer_properties,
+                    commit_properties=commit_properties,
+                )
+            ctx.log.info("[optimize] %s %s: %s", ctx.asset_name, filters or "", metrics)
+            files_added += int(metrics.get("numFilesAdded", 0))
+            files_removed += int(metrics.get("numFilesRemoved", 0))
         return ActionResult.unchanged(
-            metadata={
-                "files_added": int(metrics.get("numFilesAdded", 0)),
-                "files_removed": int(metrics.get("numFilesRemoved", 0)),
-            }
+            metadata={"files_added": files_added, "files_removed": files_removed}
         )
 
     @action(
@@ -156,9 +183,9 @@ class DeltaAsset(Asset):
     def vacuum(cls, ctx: ActionContext[VacuumConfig]) -> ActionResult:
         """Remove files no longer referenced by the table.
 
-        Table-wide (``ActionPartitioning.Keyless``), same key rule as
-        ``optimize``. Vacuum commits carry the asset's resolved commit
-        properties.
+        Table-wide (``ActionPartitioning.Keyless``): runs without a partition
+        key, on partitioned assets too. Vacuum commits carry the asset's
+        resolved commit properties.
 
         Args:
             ctx: Action context; config via :class:`VacuumConfig`.
@@ -221,16 +248,7 @@ class DeltaAsset(Asset):
             ctx.asset_metadata
         )
         if ctx.partition is not None:
-            try:
-                predicate = handler.partition_predicate(
-                    ctx.asset_metadata, ctx.partition
-                )
-            except ValueError as e:
-                raise ValueError(
-                    f"keyed delete on '{ctx.asset_name}' needs the "
-                    f"'delta/partition_expr' metadata key to map the partition "
-                    f"to rows"
-                ) from e
+            predicate = cls._keyed(ctx, "delete", handler.partition_predicate)
             table.delete(
                 predicate,
                 writer_properties=writer_properties,
