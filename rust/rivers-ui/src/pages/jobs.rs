@@ -13,6 +13,7 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 
 use crate::components::execute_job_dialog::ExecuteJobDialog;
+use crate::components::icons::IconPlay;
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::ui_kit::{AssetStack, Crumb, EmptyState, KindBadge, StatusChip, Topbar};
 use crate::helpers::{
@@ -150,6 +151,7 @@ pub fn JobsListPage() -> impl IntoView {
                                     let row_picker =
                                         job_partition_picker(verb.as_ref(), &asset_selection, &asset_info_by_key);
                                     let destructive = verb.as_ref().is_some_and(|v| v.is_destructive());
+                                    let opens_dialog = !matches!(row_picker, JobPartitionPicker::None);
                                     let verb_name = verb.as_ref().map(|v| v.name.clone());
                                     let armed_label = verb_name.clone().unwrap_or_default();
 
@@ -255,19 +257,18 @@ pub fn JobsListPage() -> impl IntoView {
                                             {status_cell}
                                             {last_run_cell}
                                             <button
-                                                class="btn btn-tertiary"
+                                                class=if destructive { "btn btn-danger" } else { "btn" }
                                                 on:click=on_execute
                                                 disabled=move || exec_pending.get()
-                                                style="justify-content:center"
                                                 title="Execute job"
                                             >
-                                                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
-                                                    <path d="M3 2l7 4-7 4V2z"/>
-                                                </svg>
+                                                <IconPlay/>
                                                 {move || if exec_pending.get() {
-                                                    "...".to_string()
+                                                    "Executing…".to_string()
                                                 } else if armed.get() {
                                                     format!("Confirm {armed_label}?")
+                                                } else if opens_dialog {
+                                                    "Execute…".to_string()
                                                 } else {
                                                     "Execute".to_string()
                                                 }}

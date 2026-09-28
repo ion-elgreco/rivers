@@ -4,6 +4,7 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 
+use crate::components::icons::{IconRetry, IconStop, IconTrash};
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::pagination::{InfiniteEventList, PaginatedView};
 use crate::components::ui_kit::{Crumb, StatusChip, Topbar};
@@ -195,9 +196,11 @@ pub fn RunDetailPage() -> impl IntoView {
     let delete_pending = delete.pending();
     // Two-click confirm; disarm when navigating to a different run.
     let delete_armed = RwSignal::new(false);
+    let cancel_armed = RwSignal::new(false);
     Effect::new(move |_| {
         run_id_memo.track();
         delete_armed.set(false);
+        cancel_armed.set(false);
         reexecute_armed.set(false);
     });
     // A deleted run has no page to stay on — back to the list. Ok(false)
@@ -291,48 +294,31 @@ pub fn RunDetailPage() -> impl IntoView {
                                     status=live_status
                                     on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
                                 />
-                                <button
-                                    class="btn btn-tertiary"
-                                    on:click=move |_| {
-                                        let (dispatch, armed) = crate::helpers::replay_click(
-                                            rerun_verb.is_some(),
-                                            reexecute_armed.get(),
-                                        );
-                                        reexecute_armed.set(armed);
-                                        if dispatch {
-                                            action_error.set(None);
-                                            reexecute.dispatch(rerun_run_id.clone());
-                                        }
-                                    }
-                                    disabled=move || reexecute_pending.get()
-                                >
-                                    <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
-                                        <path d="M12 7a5 5 0 11-1.5-3.5M12 1.5V4H9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
-                                    </svg>
-                                    {move || crate::helpers::replay_button_text(
-                                        rerun_verb_text.as_deref(),
-                                        "Retry from",
-                                        reexecute_armed.get(),
-                                        reexecute_pending.get(),
-                                        "Retrying...",
-                                    )}
-                                </button>
+                                {move || action_error.get().map(|msg| view! { <span class="text-error">{msg}</span> })}
                                 {is_active_status.then(|| {
                                     let cancel_id = record.run_id.clone();
                                     view! {
                                         <button
                                             class="btn btn-danger"
                                             on:click=move |_| {
-                                                action_error.set(None);
-                                                cancel.dispatch(cancel_id.clone());
+                                                if cancel_armed.get() {
+                                                    cancel_armed.set(false);
+                                                    action_error.set(None);
+                                                    cancel.dispatch(cancel_id.clone());
+                                                } else {
+                                                    cancel_armed.set(true);
+                                                }
                                             }
                                             disabled=move || cancel_pending.get()
                                         >
-                                            <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
-                                                <rect x="3" y="2" width="2.5" height="8"/>
-                                                <rect x="6.5" y="2" width="2.5" height="8"/>
-                                            </svg>
-                                            {move || if cancel_pending.get() { "Canceling..." } else { "Cancel run" }}
+                                            <IconStop/>
+                                            {move || if cancel_pending.get() {
+                                                "Canceling…"
+                                            } else if cancel_armed.get() {
+                                                "Confirm cancel?"
+                                            } else {
+                                                "Cancel run"
+                                            }}
                                         </button>
                                     }
                                 })}
@@ -352,16 +338,9 @@ pub fn RunDetailPage() -> impl IntoView {
                                             }
                                             disabled=move || delete_pending.get()
                                         >
-                                            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-                                                <path
-                                                    d="M2 3h8M4.5 3V1.8h3V3M3 3l.6 7.2h4.8L9 3M4.9 5v3.5M7.1 5v3.5"
-                                                    stroke="currentColor"
-                                                    stroke-width="1.1"
-                                                    stroke-linecap="round"
-                                                />
-                                            </svg>
+                                            <IconTrash/>
                                             {move || if delete_pending.get() {
-                                                "Deleting..."
+                                                "Deleting…"
                                             } else if delete_armed.get() {
                                                 "Confirm delete?"
                                             } else {
@@ -370,7 +349,30 @@ pub fn RunDetailPage() -> impl IntoView {
                                         </button>
                                     }
                                 })}
-                                {move || action_error.get().map(|msg| view! { <span class="text-error">{msg}</span> })}
+                                {(!is_active_status).then(move || view! {
+                                    <button
+                                        class="btn btn-primary"
+                                        on:click=move |_| {
+                                            let (dispatch, armed) = crate::helpers::replay_click(
+                                                rerun_verb.is_some(),
+                                                reexecute_armed.get(),
+                                            );
+                                            reexecute_armed.set(armed);
+                                            if dispatch {
+                                                action_error.set(None);
+                                                reexecute.dispatch(rerun_run_id.clone());
+                                            }
+                                        }
+                                        disabled=move || reexecute_pending.get()
+                                    >
+                                        <IconRetry/>
+                                        {move || crate::helpers::replay_button_text(
+                                            rerun_verb_text.as_deref(),
+                                            reexecute_armed.get(),
+                                            reexecute_pending.get(),
+                                        )}
+                                    </button>
+                                })}
                             </Topbar>
 
                             <div class="run-header-block">
@@ -790,8 +792,9 @@ pub fn RunAssetDrawer(
                     </div>
                 </div>
                 <button
-                    class="run-asset-drawer-close"
+                    class="icon-btn"
                     title="Close"
+                    aria-label="Close"
                     on:click=move |_| on_close.set(None)
                 >"×"</button>
             </div>
@@ -1087,15 +1090,17 @@ fn RunTimelinePanel(
             <div class="run-view-panel-header">
                 <span class="section-header-label">{move || header_label.get()}</span>
                 <div class="run-view-panel-actions">
-                    <div class="view-pill-group">
-                        {["dag", "gantt"].into_iter().map(|v| {
+                    <div class="filter-pill-group">
+                        {[("dag", "DAG"), ("gantt", "Gantt")].into_iter().map(|(v, label)| {
                             let vs = v.to_string();
                             let vs_for_cls = vs.clone();
+                            let vs_for_aria = vs.clone();
                             view! {
                                 <button
-                                    class=move || if view_mode.get() == vs_for_cls { "view-pill view-pill--active" } else { "view-pill" }
+                                    class=move || if view_mode.get() == vs_for_cls { "filter-pill filter-pill--active" } else { "filter-pill" }
+                                    aria-pressed=move || (view_mode.get() == vs_for_aria).to_string()
                                     on:click=move |_| set_view_mode.set(vs.clone())
-                                >{v}</button>
+                                >{label}</button>
                             }
                         }).collect::<Vec<_>>()}
                     </div>
@@ -1597,74 +1602,65 @@ fn RunLogPanel(
         <div class="log-panel">
             <div class="log-panel-header">
                 <span class="log-panel-label">"LOGS"</span>
-                <div class="log-panel-tabs">
-                    <button
-                        class=move || if log_tab.get() == "events" { "log-tab log-tab--active" } else { "log-tab" }
-                        on:click=move |_| set_log_tab.set("events".to_string())
-                    >"events"</button>
-                    <button
-                        class=move || if log_tab.get() == "logs" { "log-tab log-tab--active" } else { "log-tab" }
-                        on:click=move |_| set_log_tab.set("logs".to_string())
-                        disabled=move || all_logs.get().is_empty()
-                    >
-                        "logs"
-                        {move || (!all_logs.get().is_empty()).then(|| view! {
-                            <span class="log-tab-badge">{all_logs.get().len()}</span>
-                        })}
-                    </button>
-                    <button
-                        class=move || if log_tab.get() == "stdout" { "log-tab log-tab--active" } else { "log-tab" }
-                        on:click=move |_| set_log_tab.set("stdout".to_string())
-                        disabled=move || all_stdout.get().is_empty()
-                    >
-                        "stdout"
-                        {move || (!all_stdout.get().is_empty()).then(|| view! {
-                            <span class="log-tab-badge">{all_stdout.get().len()}</span>
-                        })}
-                    </button>
-                    <button
-                        class=move || if log_tab.get() == "stderr" { "log-tab log-tab--active" } else { "log-tab" }
-                        on:click=move |_| set_log_tab.set("stderr".to_string())
-                        disabled=move || all_stderr.get().is_empty()
-                    >
-                        "stderr"
-                        {move || (!all_stderr.get().is_empty()).then(|| view! {
-                            <span class="log-tab-badge log-tab-badge--error">{all_stderr.get().len()}</span>
-                        })}
-                    </button>
+                <div class="filter-pill-group">
+                    {[("events", "Events"), ("logs", "Logs"), ("stdout", "Stdout"), ("stderr", "Stderr")]
+                        .into_iter()
+                        .map(|(tab, label)| {
+                            let lines = move || match tab {
+                                "logs" => all_logs.get().len(),
+                                "stdout" => all_stdout.get().len(),
+                                "stderr" => all_stderr.get().len(),
+                                _ => 0,
+                            };
+                            let count_cls = if tab == "stderr" { "count count--error" } else { "count" };
+                            view! {
+                                <button
+                                    class=move || if log_tab.get() == tab { "filter-pill filter-pill--active" } else { "filter-pill" }
+                                    aria-pressed=move || (log_tab.get() == tab).to_string()
+                                    on:click=move |_| set_log_tab.set(tab.to_string())
+                                    disabled=move || tab != "events" && lines() == 0
+                                >
+                                    {label}
+                                    {move || (lines() > 0).then(|| view! { <span class=count_cls>{lines()}</span> })}
+                                </button>
+                            }
+                        })
+                        .collect::<Vec<_>>()}
                 </div>
                 <Show when=move || selected_step.get().is_some()>
                     <button
                         class="log-filter-chip"
+                        title="Clear the asset filter"
                         on:click=move |_| on_clear.set(None)
                     >
                         {move || format!("Filtered: {}", selected_step.get().unwrap_or_default())}
-                        <span class="log-filter-chip-x">" x"</span>
+                        <span class="log-filter-chip-x" aria-hidden="true">" ×"</span>
                     </button>
                 </Show>
                 <Show when=move || matches!(log_tab.get().as_str(), "logs" | "stdout" | "stderr")>
-                    <div class="log-panel-tabs log-level-pills" style="margin-left:auto">
-                        {["all", "info", "debug", "warn", "error"].into_iter().map(|lvl| {
-                            let lvl_s = lvl.to_string();
-                            let lvl_for_cls = lvl_s.clone();
-                            let level_cls = move || {
-                                let active = log_level.get() == lvl_for_cls;
-                                let base = if active { "log-tab log-tab--active" } else { "log-tab" };
-                                match lvl_for_cls.as_str() {
-                                    "info" => format!("{base} log-tab--info"),
-                                    "debug" => format!("{base} log-tab--debug"),
-                                    "warn" => format!("{base} log-tab--warn"),
-                                    "error" => format!("{base} log-tab--error"),
-                                    _ => base.to_string(),
+                    <div class="filter-pill-group" style="margin-left:auto">
+                        {[("all", "All"), ("info", "Info"), ("debug", "Debug"), ("warn", "Warn"), ("error", "Error")]
+                            .into_iter()
+                            .map(|(lvl, label)| {
+                                let tint = match lvl {
+                                    "info" => " filter-pill--info",
+                                    "warn" => " filter-pill--warn",
+                                    "error" => " filter-pill--error",
+                                    _ => "",
+                                };
+                                view! {
+                                    <button
+                                        class=move || if log_level.get() == lvl {
+                                            format!("filter-pill filter-pill--active{tint}")
+                                        } else {
+                                            format!("filter-pill{tint}")
+                                        }
+                                        aria-pressed=move || (log_level.get() == lvl).to_string()
+                                        on:click=move |_| set_log_level.set(lvl.to_string())
+                                    >{label}</button>
                                 }
-                            };
-                            view! {
-                                <button
-                                    class=level_cls
-                                    on:click=move |_| set_log_level.set(lvl_s.clone())
-                                >{lvl}</button>
-                            }
-                        }).collect::<Vec<_>>()}
+                            })
+                            .collect::<Vec<_>>()}
                     </div>
                 </Show>
                 <div

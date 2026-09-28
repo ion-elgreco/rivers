@@ -15,6 +15,7 @@
 use leptos::prelude::*;
 use leptos_router::components::A;
 
+use crate::components::icons::{IconStop, IconTrash};
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::GridRowSkeleton;
 use crate::components::pagination::PaginatedView;
@@ -34,6 +35,22 @@ use crate::server_fns::runs::{get_runs_page, get_runs_summary};
 use crate::types::{CodeLocationEntry, RunFilter, RunRecord, RunStatus, RunsSummary};
 
 const GRID: &str = "grid-template-columns: 32px 80px 1.2fr 0.7fr 1.4fr 0.6fr 0.9fr 0.8fr 1fr";
+
+/// Status pills as `(id, label, count)`. Ids are URL values; labels use the
+/// status-chip words.
+fn run_status_pills(counts: [Option<u64>; 5]) -> Vec<(String, String, Option<usize>)> {
+    [
+        ("All", "All"),
+        ("In Progress", "Running"),
+        ("Queued", "Queued"),
+        ("Failure", "Failed"),
+        ("Success", "Success"),
+    ]
+    .into_iter()
+    .zip(counts)
+    .map(|((id, label), n)| (id.to_string(), label.to_string(), n.map(|n| n as usize)))
+    .collect()
+}
 
 fn status_from_tab(tab: &str) -> Option<RunStatus> {
     match tab {
@@ -233,13 +250,13 @@ pub fn RunsListPage() -> impl IntoView {
                 None => ().into_any(),
                 Some(Ok(s)) => {
                     let RunsSummary { total, in_progress, queued, failure, success, last_24h } = s;
-                    let status_items: Vec<(String, Option<usize>)> = vec![
-                        ("All".into(), Some(total as usize)),
-                        ("In Progress".into(), Some(in_progress as usize)),
-                        ("Queued".into(), Some(queued as usize)),
-                        ("Failure".into(), Some(failure as usize)),
-                        ("Success".into(), Some(success as usize)),
-                    ];
+                    let status_items = run_status_pills([
+                        Some(total),
+                        Some(in_progress),
+                        Some(queued),
+                        Some(failure),
+                        Some(success),
+                    ]);
                     view! {
                         <div class="page-header-row" style="align-items: flex-end">
                             <div class="page-header">
@@ -268,13 +285,7 @@ pub fn RunsListPage() -> impl IntoView {
                     }.into_any()
                 }
                 Some(Err(e)) => {
-                    let status_items: Vec<(String, Option<usize>)> = vec![
-                        ("All".into(), None),
-                        ("In Progress".into(), None),
-                        ("Queued".into(), None),
-                        ("Failure".into(), None),
-                        ("Success".into(), None),
-                    ];
+                    let status_items = run_status_pills([None; 5]);
                     view! {
                         <div class="page-header-row" style="align-items: flex-end">
                             <div class="page-header">
@@ -397,12 +408,14 @@ fn RunsTable(
         })
     };
 
-    // Two-click confirm for delete; any selection change disarms. Local to
-    // the table on purpose: a live-kick re-render also resets to unarmed,
-    // which errs on the safe side.
+    // Two-click confirm for cancel and delete; any selection change disarms.
+    // Local to the table on purpose: a live-kick re-render also resets to
+    // unarmed, which errs on the safe side.
+    let cancel_armed = RwSignal::new(false);
     let delete_armed = RwSignal::new(false);
     Effect::new(move |_| {
         selected.track();
+        cancel_armed.set(false);
         delete_armed.set(false);
     });
 
@@ -410,38 +423,44 @@ fn RunsTable(
         {(n_rows > 0).then(|| view! {
             <div class="bulk-actions">
                 <button
-                    class="bulk-link-btn"
+                    class="link-btn"
                     on:click=move |_| set_selected.set(all_ids.get_value())
                 >
                     {format!("Select all ({n_rows})")}
                 </button>
                 <span class="bulk-sep">"·"</span>
-                <button class="bulk-link-btn" on:click=move |_| set_selected.set(Vec::new())>
+                <button class="link-btn" on:click=move |_| set_selected.set(Vec::new())>
                     "Clear"
                 </button>
                 <Show when=move || !selected_active().is_empty()>
                     <button
-                        class="btn btn-danger"
-                        on:click=move |_| { cancel_action.dispatch(selected_active()); }
+                        class="btn btn-small btn-danger"
+                        on:click=move |_| {
+                            if cancel_armed.get() {
+                                cancel_armed.set(false);
+                                cancel_action.dispatch(selected_active());
+                            } else {
+                                cancel_armed.set(true);
+                            }
+                        }
                         disabled=any_pending
                     >
-                        <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
-                            <rect x="3" y="2" width="2.5" height="8"/>
-                            <rect x="6.5" y="2" width="2.5" height="8"/>
-                        </svg>
+                        <IconStop/>
                         {move || {
+                            let runs = crate::helpers::plural(selected_active().len() as u64, "run", "runs");
                             if cancel_pending.get() {
-                                "Canceling...".to_string()
+                                "Canceling…".to_string()
+                            } else if cancel_armed.get() {
+                                format!("Confirm cancel {runs}?")
                             } else {
-                                let n = selected_active().len();
-                                format!("Cancel {n} run{}", if n == 1 { "" } else { "s" })
+                                format!("Cancel {runs}")
                             }
                         }}
                     </button>
                 </Show>
                 <Show when=move || !selected_finished().is_empty()>
                     <button
-                        class="btn btn-danger"
+                        class="btn btn-small btn-danger"
                         on:click=move |_| {
                             if delete_armed.get() {
                                 delete_armed.set(false);
@@ -452,23 +471,15 @@ fn RunsTable(
                         }
                         disabled=any_pending
                     >
-                        <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-                            <path
-                                d="M2 3h8M4.5 3V1.8h3V3M3 3l.6 7.2h4.8L9 3M4.9 5v3.5M7.1 5v3.5"
-                                stroke="currentColor"
-                                stroke-width="1.1"
-                                stroke-linecap="round"
-                            />
-                        </svg>
+                        <IconTrash/>
                         {move || {
-                            let n = selected_finished().len();
-                            let noun = if n == 1 { "run" } else { "runs" };
+                            let runs = crate::helpers::plural(selected_finished().len() as u64, "run", "runs");
                             if delete_pending.get() {
-                                "Deleting...".to_string()
+                                "Deleting…".to_string()
                             } else if delete_armed.get() {
-                                format!("Confirm delete {n} {noun}?")
+                                format!("Confirm delete {runs}?")
                             } else {
-                                format!("Delete {n} {noun}")
+                                format!("Delete {runs}")
                             }
                         }}
                     </button>

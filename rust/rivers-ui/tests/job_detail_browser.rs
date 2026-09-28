@@ -90,15 +90,17 @@ fn mount_purge_page(jobs: Reply) -> (web_sys::HtmlElement, common::FetchMock, co
     (target, mock, requests)
 }
 
+/// Execute is the only direct button child of the top-bar actions; its class
+/// switches to `btn-danger` once a destructive verb has loaded.
 fn execute_button(host: &web_sys::HtmlElement) -> web_sys::HtmlButtonElement {
-    query_one(host, ".topbar-actions .btn-primary")
+    query_one(host, ".topbar-actions > button")
         .dyn_into()
         .unwrap()
 }
 
 /// The routes render asynchronously: `false` until the page is there.
 fn page_rendered(host: &web_sys::HtmlElement) -> bool {
-    !query_all(host, ".topbar-actions .btn-primary").is_empty()
+    !query_all(host, ".topbar-actions > button").is_empty()
 }
 
 async fn execute_job_bodies(requests: &common::Requests) -> Vec<String> {

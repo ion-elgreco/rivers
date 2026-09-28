@@ -352,29 +352,35 @@ pub fn AssetsListPage() -> impl IntoView {
                 </Transition>
             </div>
             <Show when=move || !selected.get().is_empty()>
-                <button class="btn btn-primary" on:click=move |_| {
-                    dialog_verb.set(None);
-                    dialog_destructive.set(false);
-                    show_dialog.set(true);
-                }>
-                    {move || format!("Materialize ({})", selected.get().len())}
-                </button>
-                {move || selection_verbs.get().into_iter().map(|act| {
-                    let destructive = act.is_destructive();
-                    let label = act.name.clone();
-                    let title = crate::helpers::action_title(&act, true);
-                    view! {
-                        <button
-                            class=if destructive { "btn btn-danger" } else { "btn" }
-                            title=title
-                            on:click=move |_| {
-                                dialog_verb.set(Some(act.clone()));
-                                dialog_destructive.set(destructive);
-                                show_dialog.set(true);
-                            }
-                        >{label}</button>
-                    }
-                }).collect::<Vec<_>>()}
+                <div class="page-header-actions">
+                    {move || crate::helpers::sorted_verbs(selection_verbs.get()).into_iter().map(|act| {
+                        let destructive = act.is_destructive();
+                        let label = format!("{}…", crate::helpers::verb_label(&act.name));
+                        let title = crate::helpers::action_title(&act, true);
+                        view! {
+                            <button
+                                class=if destructive { "btn btn-danger" } else { "btn" }
+                                title=title
+                                on:click=move |_| {
+                                    dialog_verb.set(Some(act.clone()));
+                                    dialog_destructive.set(destructive);
+                                    show_dialog.set(true);
+                                }
+                            >{label}</button>
+                        }
+                    }).collect::<Vec<_>>()}
+                    <button class="btn btn-primary" on:click=move |_| {
+                        dialog_verb.set(None);
+                        dialog_destructive.set(false);
+                        show_dialog.set(true);
+                    }>
+                        <crate::components::icons::IconPlay/>
+                        {move || format!(
+                            "Materialize {}…",
+                            crate::helpers::plural(selected.get().len() as u64, "asset", "assets"),
+                        )}
+                    </button>
+                </div>
             </Show>
         </div>
 
@@ -418,12 +424,12 @@ pub fn AssetsListPage() -> impl IntoView {
                     let rg = reset_groups.clone();
                     let rs = reset_search.clone();
                     view! {
-                        <button class="btn btn-small" on:click=move |_| {
+                        <button class="link-btn" on:click=move |_| {
                             rt(Vec::new());
                             rk(Vec::new());
                             rg(Vec::new());
                             rs(String::new());
-                        }>"Reset"</button>
+                        }>"Reset filters"</button>
                     }.into_any()
                 } else {
                     view! { <span></span> }.into_any()
@@ -432,14 +438,14 @@ pub fn AssetsListPage() -> impl IntoView {
         </div>
 
         <div class="bulk-actions">
-            <button class="bulk-link-btn" on:click=select_all>
+            <button class="link-btn" on:click=select_all>
                 "Select all "
                 <Transition>
                     {move || format!("({})", sorted_filtered().len())}
                 </Transition>
             </button>
             <span class="bulk-sep">"·"</span>
-            <button class="bulk-link-btn" on:click=select_none>"Clear"</button>
+            <button class="link-btn" on:click=select_none>"Clear"</button>
             <span class="bulk-count">{move || format!("{} selected", selected.get().len())}</span>
         </div>
 

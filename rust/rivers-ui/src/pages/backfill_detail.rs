@@ -4,6 +4,7 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 
+use crate::components::icons::{IconRetry, IconStop};
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::TableSkeleton;
 use crate::components::pagination::PaginatedView;
@@ -94,6 +95,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
         async move { cancel_backfill(id).await }
     });
     let cancel_pending = cancel.pending();
+    let cancel_armed = crate::helpers::use_confirm_armed(move || params.track());
     let action_error = RwSignal::new(Option::<String>::None);
     Effect::new(move |_| {
         if let Some(Err(e)) = cancel.value().get() {
@@ -148,18 +150,31 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                     status=live_status
                                     on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
                                 />
+                                {move || action_error.get().map(|msg| view! { <span class="text-error">{msg}</span> })}
                                 {cancelable.then(|| {
                                     let cancel_id = cancel_id.clone();
                                     view! {
                                         <button
                                             class="btn btn-danger"
                                             on:click=move |_| {
-                                                action_error.set(None);
-                                                cancel.dispatch(cancel_id.clone());
+                                                if cancel_armed.get() {
+                                                    cancel_armed.set(false);
+                                                    action_error.set(None);
+                                                    cancel.dispatch(cancel_id.clone());
+                                                } else {
+                                                    cancel_armed.set(true);
+                                                }
                                             }
                                             disabled=move || cancel_pending.get()
                                         >
-                                            {move || if cancel_pending.get() { "Canceling..." } else { "Cancel" }}
+                                            <IconStop/>
+                                            {move || if cancel_pending.get() {
+                                                "Canceling…"
+                                            } else if cancel_armed.get() {
+                                                "Confirm cancel?"
+                                            } else {
+                                                "Cancel backfill"
+                                            }}
                                         </button>
                                     }
                                 })}
@@ -206,17 +221,15 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                                 });
                                             }
                                         >
+                                            <IconRetry/>
                                             {move || crate::helpers::replay_button_text(
                                                 verb_text.as_deref(),
-                                                "Re-execute",
                                                 armed.get(),
                                                 pending.get(),
-                                                "Re-executing…",
                                             )}
                                         </button>
                                     }
                                 })}
-                                {move || action_error.get().map(|msg| view! { <span class="text-error">{msg}</span> })}
                             </Topbar>
 
                             <div class="backfill-meta-grid">

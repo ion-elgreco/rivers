@@ -192,24 +192,8 @@
 .metadata-schema td { padding: 0.25rem 0.5rem; font-size: 0.8rem; }
 
 /* Rivers asset-events filter pills (All events / Materializations / Failures & retries) */
-.asset-event-filter-bar {
-    display: flex;
-    gap: 6px;
-    margin-bottom: 10px;
-}
-.asset-event-filter-pill {
-    padding: 6px 12px;
-    border: 0;
-    border-radius: 3px;
-    font-family: var(--font-mono);
-    font-size: 11px;
-    background: var(--bg-surface-low);
-    color: var(--text-muted);
-    cursor: pointer;
-    transition: background 120ms ease, color 120ms ease;
-}
-.asset-event-filter-pill:hover { color: var(--text); }
-.asset-event-filter-pill--active { background: var(--bg-hover); color: var(--text); }
+
+.asset-event-filters { margin-bottom: 10px; }
 
 /* Rivers asset-events tab: flat grid rows with glyph · TYPE · time · message · run */
 .events-list {

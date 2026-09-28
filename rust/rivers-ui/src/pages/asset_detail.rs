@@ -4,11 +4,13 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 
+use crate::components::icons::IconPlay;
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::materialize_dialog::MaterializeDialog;
 use crate::components::pagination::PaginatedView;
 use crate::components::ui_kit::{
-    Crumb, EventGlyphTimeline, GlyphEvent, RecentRunsStrip, StripRun, Topbar,
+    Crumb, EventGlyphTimeline, GlyphEvent, RecentRunsStrip, RunLaunched, StripRun, Topbar,
+    UnderlineTabs,
 };
 use crate::helpers::{
     JobPartitionPicker, format_duration, format_relative_time, format_timestamp,
@@ -234,6 +236,59 @@ pub fn AssetDetailPage() -> impl IntoView {
                 status=live_status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
+            {move || observe_action.value().get().map(|result| match result {
+                // RunAction returns once the run is dispatched, not once the
+                // verb has run — don't claim the observation already happened.
+                Ok(_) => view! { <span class="text-success">"Observation requested"</span> }.into_any(),
+                Err(e) => view! { <span class="text-error">{crate::helpers::err_text(&e)}</span> }.into_any(),
+            })}
+            {move || run_asset_action.value().get().map(|result| match result {
+                Ok(run_id) => view! { <RunLaunched run_id/> }.into_any(),
+                Err(e) => view! { <span class="text-error">{crate::helpers::err_text(&e)}</span> }.into_any(),
+            })}
+            {move || materialize_action.value().get().map(|result| match result {
+                Ok(r) => {
+                    let queued = r.status == "queued";
+                    view! { <RunLaunched run_id=r.run_id queued=queued/> }.into_any()
+                }
+                Err(e) => view! { <span class="text-error">{crate::helpers::err_text(&e)}</span> }.into_any(),
+            })}
+            {move || {
+                let partitioned = !matches!(materialize_picker.get(), JobPartitionPicker::None);
+                crate::helpers::sorted_verbs(asset_actions.get()).into_iter().map(|act| {
+                    let verb = act.name.clone();
+                    // An Unmaterialize verb throws the asset's materialization
+                    // state away — it never fires on a bare click, and the
+                    // dialog it opens says what it does. A keyed verb on a
+                    // partitioned asset needs the dialog's partition picker.
+                    let destructive = act.is_destructive();
+                    let one_click = !destructive && (!partitioned || act.is_keyless());
+                    let label = if one_click {
+                        crate::helpers::verb_label(&verb)
+                    } else {
+                        format!("{}…", crate::helpers::verb_label(&verb))
+                    };
+                    let title = crate::helpers::action_title(&act, false);
+                    view! {
+                        <button
+                            class=if destructive { "btn btn-danger" } else { "btn" }
+                            title=title
+                            on:click=move |_| {
+                                if one_click {
+                                    run_asset_action.dispatch(verb.clone());
+                                } else {
+                                    dialog_verb.set(Some(act.clone()));
+                                    dialog_destructive.set(destructive);
+                                    show_dialog.set(true);
+                                }
+                            }
+                            disabled=move || action_pending.get()
+                        >
+                            {label}
+                        </button>
+                    }
+                }).collect_view()
+            }}
             {move || {
                 // External assets are read-only at this layer — we can only record
                 // an observation, and only when they define an observe fn.
@@ -248,7 +303,8 @@ pub fn AssetDetailPage() -> impl IntoView {
                             on:click=move |_| { observe_action.dispatch(()); }
                             disabled=move || observe_pending.get()
                         >
-                            {move || if observe_pending.get() { "Observing..." } else { "Observe" }}
+                            <IconPlay/>
+                            {move || if observe_pending.get() { "Observing…" } else { "Observe" }}
                         </button>
                     }.into_any()
                 } else {
@@ -266,100 +322,44 @@ pub fn AssetDetailPage() -> impl IntoView {
                             }
                             disabled=move || materialize_pending.get()
                         >
-                            {move || if materialize_pending.get() { "Materializing..." } else { "Materialize" }}
+                            <IconPlay/>
+                            {move || if materialize_pending.get() {
+                                "Materializing…"
+                            } else if matches!(materialize_picker.get(), JobPartitionPicker::None) {
+                                "Materialize"
+                            } else {
+                                "Materialize…"
+                            }}
                         </button>
                     }.into_any()
                 }
             }}
-            {move || {
-                asset_actions.get().into_iter().map(|act| {
-                    let verb = act.name.clone();
-                    let label = act.name.clone();
-                    // An Unmaterialize verb throws the asset's materialization
-                    // state away — it never fires on a bare click, and the
-                    // dialog it opens says what it does.
-                    let destructive = act.is_destructive();
-                    let title = crate::helpers::action_title(&act, false);
-                    view! {
-                        <button
-                            class=if destructive { "btn btn-danger" } else { "btn" }
-                            title=title
-                            on:click=move |_| {
-                                if !destructive
-                                    && matches!(materialize_picker.get(), JobPartitionPicker::None)
-                                {
-                                    run_asset_action.dispatch(verb.clone());
-                                } else {
-                                    dialog_verb.set(Some(act.clone()));
-                                    dialog_destructive.set(destructive);
-                                    show_dialog.set(true);
-                                }
-                            }
-                            disabled=move || action_pending.get()
-                        >
-                            {label}
-                        </button>
-                    }
-                }).collect_view()
-            }}
-            {move || observe_action.value().get().map(|result| match result {
-                // RunAction returns once the run is dispatched, not once the
-                // verb has run — don't claim the observation already happened.
-                Ok(_) => view! { <span class="text-success" style="margin-left: 0.5rem">"Observe submitted"</span> }.into_any(),
-                Err(e) => view! { <span class="text-error" style="margin-left: 0.5rem">{crate::helpers::err_text(&e)}</span> }.into_any(),
-            })}
-            {move || run_asset_action.value().get().map(|result| match result {
-                Ok(run_id) => view! { <span class="text-success" style="margin-left: 0.5rem">{format!("Action run {}", crate::helpers::short_id(&run_id, 8))}</span> }.into_any(),
-                Err(e) => view! { <span class="text-error" style="margin-left: 0.5rem">{crate::helpers::err_text(&e)}</span> }.into_any(),
-            })}
-            {move || materialize_action.value().get().map(|result| match result {
-                Ok(ref r) if r.status == "queued" => view! { <span class="text-warning" style="margin-left: 0.5rem">"Queued"</span> }.into_any(),
-                Ok(_) => view! { <span class="text-success" style="margin-left: 0.5rem">"Materialized"</span> }.into_any(),
-                Err(e) => view! { <span class="text-error" style="margin-left: 0.5rem">{crate::helpers::err_text(&e)}</span> }.into_any(),
-            })}
         </Topbar>
 
 
         // Wrapped in a Transition so the SSR-rendered count survives hydration
         // instead of flashing to 0 while the client resource re-resolves.
-        <div class="tab-bar">
-            <Transition>
-                {move || {
-                    // `None` while the resource is pending — badge hides rather
-                    // than showing a misleading 0. Only count TERMINAL events
-                    // (same filter as the events table body) so the badge matches
-                    // what users see when they click in.
-                    // Full count for the active filter (from the paged total), not
-                    // a windowed count of the first 100 events.
-                    let event_count: Option<usize> =
-                        events_page.get().and_then(|r| r.ok()).map(|p| p.total as usize);
-                    let mut tabs: Vec<(&str, &str, Option<usize>)> = vec![
-                        ("overview", "Overview", None),
-                        ("events", "Events", event_count),
-                    ];
-                    if has_partitions.get() {
-                        tabs.push(("partitions", "Partitions", None));
-                    }
-                    tabs.push(("automation", "Automation", None));
-                    tabs.push(("lineage", "Lineage", None));
-
-                    tabs.into_iter().map(|(tab, label, count)| {
-                        let set_tab = set_active_tab.clone();
-                        let tab_str = tab.to_string();
-                        let tab_str2 = tab_str.clone();
-                        view! {
-                            <button
-                                class=move || if active_tab.get() == tab_str { "tab active" } else { "tab" }
-                                on:click=move |_| set_tab(tab_str2.clone())
-                            >
-                                {label}
-                                {count.map(|n| view! { <span class="tab-count">{n}</span> })}
-                            </button>
-                        }
-                    }).collect::<Vec<_>>()
-                }}
-            </Transition>
-        </div>
+        <Transition>
+            {move || {
+                // `None` while the resource is pending — badge hides rather
+                // than showing a misleading 0. Full count for the active filter
+                // (from the paged total), not a windowed count.
+                let event_count: Option<usize> =
+                    events_page.get().and_then(|r| r.ok()).map(|p| p.total as usize);
+                let mut tabs: Vec<(String, String, Option<usize>)> = vec![
+                    ("overview".into(), "Overview".into(), None),
+                    ("events".into(), "Events".into(), event_count),
+                ];
+                if has_partitions.get() {
+                    tabs.push(("partitions".into(), "Partitions".into(), None));
+                }
+                tabs.push(("automation".into(), "Automation".into(), None));
+                tabs.push(("lineage".into(), "Lineage".into(), None));
+                let set_tab = set_active_tab.clone();
+                let on_tab = Callback::new(move |v: String| set_tab(v));
+                view! { <UnderlineTabs tabs=tabs active=active_tab on_select=on_tab/> }
+            }}
+        </Transition>
 
         <div class="tab-content" style=move || if active_tab.get() == "overview" { "" } else { "display:none" }>
             <Transition fallback=move || view! { <div class="loading">"Loading..."</div> }>
@@ -444,6 +444,7 @@ pub fn AssetDetailPage() -> impl IntoView {
 
                         <button
                             class="meta-toggle-btn"
+                            aria-expanded=move || meta_expanded.get().to_string()
                             on:click=move |_| set_meta_expanded.update(|v| *v = !*v)
                         >
                             <span
@@ -619,24 +620,22 @@ pub fn AssetDetailPage() -> impl IntoView {
                     })
                 }}
             </Transition>
-            <div class="asset-event-filter-bar">
-                {
-                    let set_ef_all = set_event_filter.clone();
-                    let set_ef_mat = set_event_filter.clone();
-                    let set_ef_fail = set_event_filter.clone();
-                    let cls = move |k: &str| {
-                        if event_filter.get() == k { "asset-event-filter-pill asset-event-filter-pill--active".to_string() }
-                        else { "asset-event-filter-pill".to_string() }
-                    };
-                    let cls_all = move || cls("All");
-                    let cls_mat = move || cls("mat");
-                    let cls_fail = move || cls("fail");
-                    view! {
-                        <button class=cls_all on:click=move |_| set_ef_all("All".to_string())>"All events"</button>
-                        <button class=cls_mat on:click=move |_| set_ef_mat("mat".to_string())>"Materializations"</button>
-                        <button class=cls_fail on:click=move |_| set_ef_fail("fail".to_string())>"Failures & retries"</button>
-                    }
-                }
+            <div class="asset-event-filters">
+                <div class="filter-pill-group">
+                    {[("All", "All events"), ("mat", "Materializations"), ("fail", "Failures and retries")]
+                        .into_iter()
+                        .map(|(id, label)| {
+                            let set_filter = set_event_filter.clone();
+                            view! {
+                                <button
+                                    class=move || if event_filter.get() == id { "filter-pill filter-pill--active" } else { "filter-pill" }
+                                    aria-pressed=move || (event_filter.get() == id).to_string()
+                                    on:click=move |_| set_filter(id.to_string())
+                                >{label}</button>
+                            }
+                        })
+                        .collect::<Vec<_>>()}
+                </div>
             </div>
             <PaginatedView
                 data=events_page
@@ -883,14 +882,14 @@ fn PartitionsTab(
                                                 {format!("showing {}–{} of {}", off + 1, off + shown, total_n)}
                                             </span>
                                             <button
-                                                class="btn btn-tertiary btn-small"
+                                                class="btn btn-small"
                                                 disabled={move || offset.get() == 0}
                                                 on:click=move |_| offset.update(|o| *o = o.saturating_sub(PAGE))
                                             >
                                                 "Prev"
                                             </button>
                                             <button
-                                                class="btn btn-tertiary btn-small"
+                                                class="btn btn-small"
                                                 // Braced: the `>=` would otherwise read as a tag close in `view!`.
                                                 disabled={move || offset.get() as usize + shown >= total_n}
                                                 on:click=move |_| offset.update(|o| *o += PAGE)
@@ -906,7 +905,8 @@ fn PartitionsTab(
                                         on:click=move |_| { materialize_missing.dispatch(()); }
                                         disabled=move || mat_pending.get()
                                     >
-                                        {move || if mat_pending.get() { "Materializing..." } else { "Materialize Missing" }}
+                                        <IconPlay/>
+                                        {move || if mat_pending.get() { "Materializing…" } else { "Materialize missing" }}
                                     </button>
                                 })}
                                 {move || match materialize_missing.value().get() {

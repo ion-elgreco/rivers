@@ -71,7 +71,7 @@ pub fn ScheduleDetailPage() -> impl IntoView {
                 on:click=move |_| { eval_action.dispatch(()); }
                 disabled=move || eval_pending.get()
             >
-                {move || if eval_pending.get() { "Evaluating..." } else { "Evaluate now" }}
+                {move || if eval_pending.get() { "Evaluating…" } else { "Evaluate now" }}
             </button>
         </Topbar>
 
@@ -143,12 +143,10 @@ pub fn ScheduleDetailPage() -> impl IntoView {
                                     <button
                                         class="icon-btn copyable"
                                         title="Copy cron expression"
+                                        aria-label="Copy cron expression"
                                         data-copy=cron_copy_text
                                     >
-                                        <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.2">
-                                            <rect x="4" y="4" width="8" height="8" rx="1"/>
-                                            <path d="M10 4V3a1 1 0 00-1-1H3a1 1 0 00-1 1v6a1 1 0 001 1h1"/>
-                                        </svg>
+                                        <crate::components::icons::IconCopy/>
                                     </button>
                                 </div>
 

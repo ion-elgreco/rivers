@@ -617,10 +617,10 @@ fn VirtualPartitionList(
                     }
                 }
             />
-            <button class="btn btn-tertiary btn-small" on:click=move |_| apply_search()>
+            <button class="btn btn-small" on:click=move |_| apply_search()>
                 "Search"
             </button>
-            <button class="btn btn-tertiary btn-small" on:click=move |_| do_jump()>
+            <button class="btn btn-small" on:click=move |_| do_jump()>
                 "Jump"
             </button>
         </div>
@@ -641,7 +641,7 @@ fn VirtualPartitionList(
             </span>
             <span class="exec-dialog-partition-actions">
                 <button
-                    class="btn btn-tertiary btn-small"
+                    class="link-btn"
                     on:click=move |_| {
                         let next = !show_selected.get_untracked();
                         show_selected.set(next);
@@ -654,13 +654,14 @@ fn VirtualPartitionList(
                 >
                     {move || {
                         if show_selected.get() {
-                            "Browse".to_string()
+                            "Show all".to_string()
                         } else {
-                            format!("Selected ({})", selected.get().len())
+                            format!("Show selected ({})", selected.get().len())
                         }
                     }}
                 </button>
-                <button class="btn btn-tertiary btn-small" on:click=move |_| selected.set(Vec::new())>
+                <span class="bulk-sep">"·"</span>
+                <button class="link-btn" on:click=move |_| selected.set(Vec::new())>
                     "Clear"
                 </button>
             </span>
@@ -845,16 +846,11 @@ fn PartitionList(
                 {move || format!("{} / {} selected", selected_signal.get().len(), total)}
             </span>
             <span class="exec-dialog-partition-actions">
-                <button
-                    class="btn btn-tertiary btn-small"
-                    on:click=move |_| select_all.run(())
-                >
+                <button class="link-btn" on:click=move |_| select_all.run(())>
                     "Select all"
                 </button>
-                <button
-                    class="btn btn-tertiary btn-small"
-                    on:click=move |_| clear.run(())
-                >
+                <span class="bulk-sep">"·"</span>
+                <button class="link-btn" on:click=move |_| clear.run(())>
                     "Clear"
                 </button>
             </span>

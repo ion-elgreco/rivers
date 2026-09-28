@@ -45,6 +45,22 @@ fn status_from_tab(tab: &str) -> Option<String> {
     }
 }
 
+/// Status pills as `(id, label, count)`. Ids are URL values; labels use the
+/// status-chip words.
+fn backfill_status_pills(counts: [Option<u64>; 5]) -> Vec<(String, String, Option<usize>)> {
+    [
+        ("All", "All"),
+        ("In Progress", "Running"),
+        ("Completed", "Success"),
+        ("Failed", "Failed"),
+        ("Canceled", "Canceled"),
+    ]
+    .into_iter()
+    .zip(counts)
+    .map(|((id, label), n)| (id.to_string(), label.to_string(), n.map(|n| n as usize)))
+    .collect()
+}
+
 #[component]
 pub fn BackfillsListPage() -> impl IntoView {
     let (active_tab, set_active_tab) = signal("All".to_string());
@@ -112,32 +128,25 @@ pub fn BackfillsListPage() -> impl IntoView {
         // back to zero counts, which would falsely claim "no backfills exist".
         <Transition fallback=move || view! { <GridRowSkeleton rows=1 cols=5/> }>
             {move || {
-                let (status_items, error_title): (Vec<(String, Option<usize>)>, Option<String>) =
-                    match summary.get() {
-                        Some(Ok(BackfillsSummary {
-                            total, in_progress, completed_success, completed_failed, canceled,
-                        })) => (
-                            vec![
-                                ("All".into(), Some(total as usize)),
-                                ("In Progress".into(), Some(in_progress as usize)),
-                                ("Completed".into(), Some(completed_success as usize)),
-                                ("Failed".into(), Some(completed_failed as usize)),
-                                ("Canceled".into(), Some(canceled as usize)),
-                            ],
-                            None,
-                        ),
-                        Some(Err(e)) => (
-                            vec![
-                                ("All".into(), None),
-                                ("In Progress".into(), None),
-                                ("Completed".into(), None),
-                                ("Failed".into(), None),
-                                ("Canceled".into(), None),
-                            ],
-                            Some(format!("Summary fetch failed: {}", crate::helpers::err_text(&e))),
-                        ),
-                        None => return ().into_any(),
-                    };
+                let (status_items, error_title) = match summary.get() {
+                    Some(Ok(BackfillsSummary {
+                        total, in_progress, completed_success, completed_failed, canceled,
+                    })) => (
+                        backfill_status_pills([
+                            Some(total),
+                            Some(in_progress),
+                            Some(completed_success),
+                            Some(completed_failed),
+                            Some(canceled),
+                        ]),
+                        None,
+                    ),
+                    Some(Err(e)) => (
+                        backfill_status_pills([None; 5]),
+                        Some(format!("Summary fetch failed: {}", crate::helpers::err_text(&e))),
+                    ),
+                    None => return ().into_any(),
+                };
                 view! {
                     <div class="rv-toolbar" title=error_title.unwrap_or_default()>
                         <FilterPillGroup

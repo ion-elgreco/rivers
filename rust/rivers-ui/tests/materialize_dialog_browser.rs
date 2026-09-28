@@ -135,7 +135,7 @@ async fn clear_deselects_every_asset_and_select_all_restores_them() {
     flush_effects().await;
 
     let link_named = |name: &str| {
-        query_all(&host, ".mat-dialog-col-actions .bulk-link-btn")
+        query_all(&host, ".mat-dialog-col-actions .link-btn")
             .into_iter()
             .find(|el| el.text_content().unwrap_or_default() == name)
             .unwrap()
@@ -284,7 +284,7 @@ async fn removing_a_tag_drops_it_from_the_list() {
     assert_eq!(query_all(&host, ".tag-list .tag").len(), 1);
 
     // Click the per-tag remove button.
-    click(&query_one(&host, ".tag-list .tag-remove"), false);
+    click(&query_one(&host, ".tag-list .icon-btn"), false);
     flush_effects().await;
     assert_eq!(query_all(&host, ".tag-list .tag").len(), 0);
 }
@@ -391,7 +391,7 @@ async fn crossing_the_backfill_threshold_switches_the_rail_and_button() {
         query_one(&host, ".modal-footer .btn-primary")
             .text_content()
             .unwrap(),
-        "Launch backfill"
+        "Backfill 3 partitions"
     );
 }
 
@@ -630,7 +630,7 @@ async fn destructive_verb_is_named_and_flagged() {
 
     assert_eq!(
         query_one(&host, ".modal-header h2").text_content().unwrap(),
-        "purge"
+        "Purge"
     );
     assert!(
         query_one(&host, ".mat-dialog-warning")

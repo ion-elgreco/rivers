@@ -5,6 +5,7 @@ pub mod eval_tree;
 pub mod event_timeline;
 pub mod execute_job_dialog;
 pub mod global_search;
+pub mod icons;
 pub mod layout;
 pub mod live;
 pub mod loading_skeleton;

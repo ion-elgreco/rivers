@@ -334,7 +334,7 @@ async fn close_button_in_header_hides_dialog() {
     let host = mount_dialog(show, "demo_job", JobPartitionPicker::None);
     flush_effects().await;
 
-    click(&query_one(&host, ".modal-header .btn"), false);
+    click(&query_one(&host, ".modal-header .icon-btn"), false);
     flush_effects().await;
 
     assert!(!show.get_untracked());

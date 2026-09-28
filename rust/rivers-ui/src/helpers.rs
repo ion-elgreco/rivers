@@ -325,6 +325,17 @@ pub fn partition_kind_label(kind: &str) -> String {
     }
 }
 
+/// Button text for an action verb: "optimize" → "Optimize",
+/// "rebuild_index" → "Rebuild index". Tooltips keep the declared name.
+pub fn verb_label(verb: &str) -> String {
+    let spaced = verb.replace('_', " ");
+    let mut chars = spaced.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// "1 run", "3 runs".
 pub fn plural(n: u64, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
@@ -680,19 +691,14 @@ pub fn close_on_navigation(show: RwSignal<bool>) {
     });
 }
 
-/// Text for a replay button: an action replay names the verb it re-applies.
-pub fn replay_button_text(
-    action: Option<&str>,
-    idle: &str,
-    armed: bool,
-    pending: bool,
-    busy: &str,
-) -> String {
+/// Text for a Re-execute button: an action replay names the verb it
+/// re-applies.
+pub fn replay_button_text(action: Option<&str>, armed: bool, pending: bool) -> String {
     match action {
-        _ if pending => busy.to_string(),
-        Some(verb) if armed => format!("Confirm re-run {verb}?"),
-        Some(verb) => format!("Re-run {verb}"),
-        None => idle.to_string(),
+        _ if pending => "Re-executing…".to_string(),
+        Some(verb) if armed => format!("Confirm re-execute {verb}?"),
+        Some(verb) => format!("Re-execute {verb}"),
+        None => "Re-execute".to_string(),
     }
 }
 
@@ -720,6 +726,15 @@ pub fn action_title(act: &crate::types::AssetActionInfo, on_selection: bool) -> 
             (true, false) => format!("Run '{}' — clears materialization state", act.name),
             (false, false) => format!("Run action '{}'", act.name),
         })
+}
+
+/// Verb buttons in row order: plain verbs first, destructive verbs last.
+/// The sort is stable, so declaration order holds within each group.
+pub fn sorted_verbs(
+    mut verbs: Vec<crate::types::AssetActionInfo>,
+) -> Vec<crate::types::AssetActionInfo> {
+    verbs.sort_by_key(|v| v.is_destructive());
+    verbs
 }
 
 /// Actions every asset in `assets` declares, in the first asset's declaration
@@ -1061,13 +1076,19 @@ mod tests {
 
     #[test]
     fn replay_button_names_the_verb_it_reapplies() {
-        let text = |action, armed, pending| {
-            replay_button_text(action, "Retry from", armed, pending, "Retrying...")
-        };
-        assert_eq!(text(None, false, false), "Retry from");
-        assert_eq!(text(Some("delete"), false, false), "Re-run delete");
-        assert_eq!(text(Some("delete"), true, false), "Confirm re-run delete?");
-        assert_eq!(text(Some("delete"), true, true), "Retrying...");
+        assert_eq!(replay_button_text(None, false, false), "Re-execute");
+        assert_eq!(
+            replay_button_text(Some("delete"), false, false),
+            "Re-execute delete"
+        );
+        assert_eq!(
+            replay_button_text(Some("delete"), true, false),
+            "Confirm re-execute delete?"
+        );
+        assert_eq!(
+            replay_button_text(Some("delete"), true, true),
+            "Re-executing…"
+        );
     }
 
     #[test]

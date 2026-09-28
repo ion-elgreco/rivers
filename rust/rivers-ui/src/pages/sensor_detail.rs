@@ -68,7 +68,7 @@ pub fn SensorDetailPage() -> impl IntoView {
                 on:click=move |_| { eval_action.dispatch(()); }
                 disabled=move || eval_pending.get()
             >
-                {move || if eval_pending.get() { "Evaluating..." } else { "Evaluate now" }}
+                {move || if eval_pending.get() { "Evaluating…" } else { "Evaluate now" }}
             </button>
         </Topbar>
 

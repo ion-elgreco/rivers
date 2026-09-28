@@ -987,6 +987,7 @@
 }
 
 /* ── Rivers: FilterPillGroup — segmented filter bar ── */
+/* Segmented control: every pill group (status filters, view toggles, log tabs). */
 .filter-pill-group {
     display: inline-flex;
     gap: 2px;
@@ -994,7 +995,31 @@
     padding: 3px;
     border-radius: 4px;
     align-items: center;
+    flex-shrink: 0;
 }
+.filter-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 22px;
+    padding: 0 10px;
+    border-radius: 3px;
+    font-size: 11px;
+    background: transparent;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    border: none;
+    cursor: pointer;
+    transition: color 120ms ease, background 120ms ease;
+}
+.filter-pill:hover:not(:disabled) { color: var(--text); }
+.filter-pill.filter-pill--active { background: var(--bg-hover); color: var(--text); }
+.filter-pill:disabled { opacity: 0.35; cursor: not-allowed; }
+.filter-pill .count { color: var(--text-comment); }
+.filter-pill .count--error { color: var(--error); }
+.filter-pill--info.filter-pill--active { color: var(--secondary); }
+.filter-pill--warn.filter-pill--active { color: var(--warning); }
+.filter-pill--error.filter-pill--active { color: var(--error); }
 .filter-pill-group + .filter-pill-group { margin-left: 10px; }
 .filter-pill-group-label {
     font-family: var(--font-sans);
@@ -1291,7 +1316,6 @@
 .runs-strip-bar { transition: width 240ms ease, opacity 160ms ease, background 160ms ease; }
 
 /* Chevrons + toggles — rotate smoothly */
-.btn[aria-expanded],
 [class*="chevron"],
 .sidebar-toggle-icon { transition: transform 160ms ease, color 140ms ease; }
 
@@ -1328,7 +1352,6 @@
 .grid-row:focus-visible,
 .summary-card:focus-visible,
 .stat-tile:focus-visible,
-.filter-pill:focus-visible,
 .btn:focus-visible,
 .rv-search:focus-within { outline: 2px solid var(--secondary); outline-offset: 2px; }
 
@@ -1628,6 +1651,8 @@ code[title],
     font-size: 13px;
     font-weight: 400;
     color: var(--text-muted);
+    cursor: pointer;
+    transition: color 120ms ease;
 }
 .tabs-underline .tab:hover { background: transparent; color: var(--text); }
 .tabs-underline .tab.active {
@@ -1661,22 +1686,6 @@ code[title],
     border-radius: 4px;
     width: fit-content;
 }
-.filter-pill {
-    padding: 4px 10px;
-    border-radius: 3px;
-    font-size: 11px;
-    background: transparent;
-    color: var(--text-muted);
-    font-family: var(--font-mono);
-    border: none;
-    cursor: pointer;
-    transition: color 120ms ease, background 120ms ease;
-}
-.filter-pill:hover:not(:disabled) { color: var(--text); }
-.filter-pill.filter-pill--active { background: var(--bg-hover); color: var(--text); }
-.filter-pill.filter-pill--disabled,
-.filter-pill:disabled { opacity: 0.35; cursor: not-allowed; }
-.filter-pill .count { color: var(--text-comment); margin-left: 4px; }
 
 /* ── Rivers: chevron toggle inside grid rows (schedules/sensors/conditions) ── */
 .chev-btn {
@@ -1995,19 +2004,6 @@ code[title],
 .schedule-name-link:hover { color: var(--accent); }
 
 /* Bare icon-only button (copy icon next to cron pill, etc.) */
-.icon-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 2px;
-    color: var(--text-muted);
-    background: transparent;
-    border: none;
-    border-radius: 2px;
-    cursor: pointer;
-    transition: color 120ms ease, background 120ms ease;
-}
-.icon-btn:hover { color: var(--text); background: var(--bg-hover); }
 
 /* Sortable header cells in grid-table */
 .grid-table-head .sortable { cursor: pointer; user-select: none; }

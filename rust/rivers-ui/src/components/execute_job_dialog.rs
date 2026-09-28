@@ -147,7 +147,12 @@ pub fn ExecuteJobDialog(
                 <div class="modal-content" on:click=move |ev| ev.stop_propagation()>
                     <div class="modal-header">
                         <h2>"Execute job"</h2>
-                        <button class="btn btn-small" on:click=move |_| show.set(false)>"x"</button>
+                        <button
+                            class="icon-btn"
+                            on:click=move |_| show.set(false)
+                            title="Close"
+                            aria-label="Close"
+                        >"×"</button>
                     </div>
                     <div class="modal-body">
                         <div class="form-group">
@@ -200,7 +205,7 @@ pub fn ExecuteJobDialog(
                         >
                             {move || {
                                 if pending.get() {
-                                    "Submitting...".to_string()
+                                    "Submitting…".to_string()
                                 } else {
                                     let n = run_count.get();
                                     if n > BACKFILL_THRESHOLD {

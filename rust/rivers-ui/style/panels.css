@@ -24,51 +24,6 @@
     color: var(--text-muted);
 }
 
-.log-panel-tabs {
-    display: flex;
-    background: var(--bg-surface-low);
-    padding: 2px;
-    border-radius: 3px;
-    gap: 2px;
-}
-
-.log-tab {
-    padding: 3px 10px;
-    border: 0;
-    border-radius: 2px;
-    font-family: var(--font-mono);
-    font-size: 10.5px;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    background: transparent;
-    color: var(--text-muted);
-    cursor: pointer;
-    line-height: 1.4;
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    transition: background 120ms ease, color 120ms ease;
-}
-
-.log-tab:hover:not(:disabled) { color: var(--text); }
-
-.log-tab:disabled { opacity: 0.35; cursor: default; }
-
-.log-tab--active { background: var(--bg-hover); color: var(--text); }
-
-.log-tab-badge {
-    font-family: var(--font-mono);
-    font-size: 9px;
-    padding: 0 4px;
-    border-radius: 2px;
-    background: var(--bg-highest);
-    color: var(--text-muted);
-    line-height: 1.5;
-}
-
-.log-tab--active .log-tab-badge { background: var(--bg); }
-
-.log-tab-badge--error { background: color-mix(in srgb, var(--error) 20%, transparent); color: var(--error); }
 
 .log-filter-chip {
     padding: 3px 8px;
@@ -87,13 +42,6 @@
 .log-filter-chip:hover { background: color-mix(in srgb, var(--accent) 22%, transparent); }
 
 .log-filter-chip-x { opacity: 0.6; }
-
-/* Level filter pill tints: colored text on the active pill so you can tell at a glance */
-.log-tab--info.log-tab--active { color: var(--secondary); }
-.log-tab--debug.log-tab--active { color: var(--text); }
-.log-tab--warn.log-tab--active  { color: var(--warning); }
-.log-tab--error.log-tab--active { color: var(--error); }
-.log-level-pills { flex-shrink: 0; }
 
 /* Rivers-style per-line log rows: mono, asset source on the left, raw line on the right */
 .log-rows { padding: 10px 18px; }

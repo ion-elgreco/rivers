@@ -9,6 +9,7 @@ use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 
 use crate::components::execute_job_dialog::ExecuteJobDialog;
+use crate::components::icons::IconPlay;
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::pagination::Pagination;
 use crate::components::ui_kit::{
@@ -195,28 +196,30 @@ pub fn JobDetailPage() -> impl IntoView {
                 status=live_status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
+            {move || exec_error.get().map(|msg| view! { <span class="text-error">{msg}</span> })}
             <button
-                class="btn btn-primary"
+                class=move || if job_verb_signal.get().is_some_and(|v| v.is_destructive()) {
+                    "btn btn-danger"
+                } else {
+                    "btn btn-primary"
+                }
                 on:click=on_execute
                 disabled=move || exec_pending.get() || !job_loaded.get()
             >
-                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
-                    <path d="M3 2l7 4-7 4V2z"/>
-                </svg>
+                <IconPlay/>
                 {move || if exec_pending.get() {
-                    "Executing...".to_string()
+                    "Executing…".to_string()
                 } else if exec_armed.get() {
                     format!(
                         "Confirm {}?",
                         job_verb_signal.get().map(|v| v.name).unwrap_or_default()
                     )
-                } else {
+                } else if matches!(job_picker.get(), JobPartitionPicker::None) {
                     "Execute".to_string()
+                } else {
+                    "Execute…".to_string()
                 }}
             </button>
-            {move || exec_error.get().map(|msg| view! {
-                <span class="text-error" style="margin-left: 0.5rem">{msg}</span>
-            })}
         </Topbar>
 
         <ExecuteJobDialog

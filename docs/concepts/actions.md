@@ -282,7 +282,7 @@ repo.run_action("delete", selection=["events", "event_rollups"], partition_key=p
 !!! warning "Automation rebuilds deleted data"
     A deleted asset or partition is *missing* again, and it has no failure left
     to hold it back. `eager()` and `on_missing()` therefore rebuild it on the next
-    tick from whatever upstream still holds, and **Materialize Missing** in the UI
+    tick from whatever upstream still holds, and **Materialize missing** in the UI
     offers it too. To keep deleted data gone, delete the upstream as well (see the
     ordering below), or remove the condition before you delete.
 
@@ -295,7 +295,7 @@ Ordering bounds partial failure; it cannot make a multi-asset delete atomic.
 the key first, then remove the key with `delete_dynamic_partition`. The other order
 fails: `run_action` refuses a key that is no longer a dynamic partition. A delete does
 not remove the key, and a key left behind reads as missing, so automation and
-**Materialize Missing** would rebuild it.
+**Materialize missing** would rebuild it.
 
 **Delete acts on exactly what you name.** There is no implicit lineage expansion in
 v1 — downstream left out of the selection keeps its data. Returning

@@ -243,9 +243,18 @@ pub fn MaterializeDialog(
         if pending.get() {
             "Submitting…".to_string()
         } else if is_partitioned.get() && partition_keys.get().len() > BACKFILL_THRESHOLD {
-            "Launch backfill".to_string()
+            format!(
+                "Backfill {}",
+                crate::helpers::plural(
+                    partition_keys.get().len() as u64,
+                    "partition",
+                    "partitions"
+                ),
+            )
         } else {
-            verb.get().unwrap_or_else(|| "Materialize".to_string())
+            verb.get()
+                .map(|v| crate::helpers::verb_label(&v))
+                .unwrap_or_else(|| "Materialize".to_string())
         }
     });
 
@@ -263,8 +272,17 @@ pub fn MaterializeDialog(
                     on:click=move |ev| ev.stop_propagation()
                 >
                     <div class="modal-header">
-                        <h2>{move || verb.get().unwrap_or_else(|| "Materialize".to_string())}</h2>
-                        <button class="btn btn-small" on:click=move |_| show.set(false)>"x"</button>
+                        <h2>{move || {
+                            verb.get()
+                                .map(|v| crate::helpers::verb_label(&v))
+                                .unwrap_or_else(|| "Materialize".to_string())
+                        }}</h2>
+                        <button
+                            class="icon-btn"
+                            on:click=move |_| show.set(false)
+                            title="Close"
+                            aria-label="Close"
+                        >"×"</button>
                     </div>
 
                     <Show when=move || destructive.get()>
@@ -290,12 +308,12 @@ pub fn MaterializeDialog(
                                     <label>"Assets"</label>
                                     <span class="mat-dialog-col-actions">
                                         <button
-                                            class="bulk-link-btn"
+                                            class="link-btn"
                                             on:click=move |_| set_selected.set(asset_keys.get())
                                         >"Select all"</button>
                                         <span class="bulk-sep">"·"</span>
                                         <button
-                                            class="bulk-link-btn"
+                                            class="link-btn"
                                             on:click=move |_| set_selected.set(Vec::new())
                                         >"Clear"</button>
                                     </span>
@@ -396,16 +414,20 @@ pub fn MaterializeDialog(
                                                 set_tag_val.set(event_target_value(&ev));
                                             }
                                         />
-                                        <button class="btn btn-small" on:click=add_tag>"Add"</button>
+                                        <button class="btn" on:click=add_tag>"Add"</button>
                                     </div>
                                     <div class="tag-list">
                                         {move || tags.get().into_iter().enumerate().map(|(i, (k, v))| {
                                             view! {
                                                 <span class="tag">
                                                     {format!("{k}={v}")}
-                                                    <button class="tag-remove" on:click=move |_| {
-                                                        set_tags.update(|t| { t.remove(i); });
-                                                    }>"x"</button>
+                                                    <button
+                                                        class="icon-btn icon-btn--sm"
+                                                        aria-label=format!("Remove tag {k}")
+                                                        on:click=move |_| {
+                                                            set_tags.update(|t| { t.remove(i); });
+                                                        }
+                                                    >"×"</button>
                                                 </span>
                                             }
                                         }).collect::<Vec<_>>()}

@@ -36,6 +36,8 @@ pub fn MultiSelect(
             <button
                 class="multi-select-trigger"
                 class:multi-select-trigger--active=has_selection
+                aria-haspopup="listbox"
+                aria-expanded=move || open.get().to_string()
                 on:click=move |_| open.update(|o| *o = !*o)
             >
                 <span class="multi-select-label">{trigger_label}</span>

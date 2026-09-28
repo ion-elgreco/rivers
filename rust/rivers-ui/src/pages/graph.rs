@@ -4,11 +4,14 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 
 use crate::components::dag::render::DagGraph;
+use crate::components::icons::{IconMinus, IconPlay, IconPlus};
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::materialize_dialog::MaterializeDialog;
 use crate::components::multi_select::{MultiSelect, SelectOption};
 use crate::components::ui_kit::{Crumb, DagMinimap, KindBadge, MinimapNode, Tag, Topbar};
-use crate::helpers::{common_actions, partition_picker_for_assets, use_query_param_list};
+use crate::helpers::{
+    common_actions, partition_picker_for_assets, sorted_verbs, use_query_param_list,
+};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::{get_asset, get_assets};
 use crate::server_fns::graph::{get_graph_layout, get_graph_topology, get_node_lineage};
@@ -716,7 +719,7 @@ pub fn GraphPage() -> impl IntoView {
                                 <button class="context-menu-item" on:click=move |_| {
                                     set_selected_nodes.set(vec![name_for_detail.clone()]);
                                     set_ctx_menu.set(None);
-                                }>"View Details"</button>
+                                }>"View details"</button>
                             </div>
                         }
                     })
@@ -724,38 +727,29 @@ pub fn GraphPage() -> impl IntoView {
 
                 <div class="dag-zoom-controls">
                     <button
-                        class="btn btn-tertiary dag-zoom-btn"
+                        class="btn btn-small btn-square"
                         on:click=zoom_in
                         title="Zoom in"
+                        aria-label="Zoom in"
                     >
-                        <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-                            <path d="M6 2v8M2 6h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
-                        </svg>
+                        <IconPlus/>
                     </button>
                     <button
-                        class="btn btn-tertiary dag-zoom-btn"
+                        class="btn btn-small btn-square"
                         on:click=zoom_out
                         title="Zoom out"
+                        aria-label="Zoom out"
                     >
-                        <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-                            <path d="M2 6h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
-                        </svg>
+                        <IconMinus/>
                     </button>
-                    <button
-                        class="btn btn-tertiary dag-zoom-text-btn"
-                        on:click=fit_to_view
-                        title="Fit to view"
-                    >"Fit"</button>
+                    <button class="btn btn-small" on:click=fit_to_view title="Fit to view">"Fit"</button>
                     <div class="dag-zoom-divider"></div>
                     <button
-                        class=move || if center_layers.get() {
-                            "btn btn-tertiary dag-zoom-text-btn dag-zoom-text-btn--active"
-                        } else {
-                            "btn btn-tertiary dag-zoom-text-btn"
-                        }
+                        class="btn btn-small"
+                        aria-pressed=move || center_layers.get().to_string()
                         on:click=move |_| set_center_layers.update(|v| *v = !*v)
                         title="Center layers vertically"
-                    >"center"</button>
+                    >"Center"</button>
                 </div>
             </div>
 
@@ -782,9 +776,10 @@ pub fn GraphPage() -> impl IntoView {
                                     <span>{format!("{} SELECTED", sel.len())}</span>
                                 </div>
                                 <button
-                                    class="dag-sidebar-close"
+                                    class="icon-btn"
                                     on:click=move |_| set_selected_nodes.set(Vec::new())
                                     title="Clear selection"
+                                    aria-label="Clear selection"
                                 >"×"</button>
                             </div>
 
@@ -802,8 +797,9 @@ pub fn GraphPage() -> impl IntoView {
                                                     on:click=move |_| set_selected_nodes.set(vec![k_for_focus.clone()])
                                                 >{k}</button>
                                                 <button
-                                                    class="dag-sidebar-sel-drop"
+                                                    class="icon-btn icon-btn--sm"
                                                     title="Remove from selection"
+                                                    aria-label="Remove from selection"
                                                     on:click=move |_| set_selected_nodes.update(|s| {
                                                         *s = apply_node_click(s, &k_for_drop, true);
                                                     })
@@ -821,22 +817,9 @@ pub fn GraphPage() -> impl IntoView {
                             })}
 
                             <div class="dag-sidebar-footer">
-                                <button
-                                    class="btn btn-primary dag-sidebar-action"
-                                    disabled=n_mat == 0
-                                    on:click={
-                                        let keys = mat_keys.clone();
-                                        move |_| { start_materialize.run(keys.clone()); }
-                                    }
-                                >
-                                    <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
-                                        <path d="M3 2l7 4-7 4V2z"/>
-                                    </svg>
-                                    {format!("Materialize {}…", crate::helpers::plural(n_mat as u64, "asset", "assets"))}
-                                </button>
-                                {common_actions(&mat_keys, &asset_info_by_key.get()).into_iter().map(|act| {
+                                {sorted_verbs(common_actions(&mat_keys, &asset_info_by_key.get())).into_iter().map(|act| {
                                     let destructive = act.is_destructive();
-                                    let label = act.name.clone();
+                                    let label = format!("{}…", crate::helpers::verb_label(&act.name));
                                     let keys = mat_keys.clone();
                                     let title = crate::helpers::action_title(&act, true);
                                     view! {
@@ -847,6 +830,17 @@ pub fn GraphPage() -> impl IntoView {
                                         >{label}</button>
                                     }
                                 }).collect::<Vec<_>>()}
+                                <button
+                                    class="btn btn-primary dag-sidebar-action"
+                                    disabled=n_mat == 0
+                                    on:click={
+                                        let keys = mat_keys.clone();
+                                        move |_| { start_materialize.run(keys.clone()); }
+                                    }
+                                >
+                                    <IconPlay/>
+                                    {format!("Materialize {}…", crate::helpers::plural(n_mat as u64, "asset", "assets"))}
+                                </button>
                             </div>
                         </div>
                     }.into_any());
@@ -897,9 +891,10 @@ pub fn GraphPage() -> impl IntoView {
                                                         <span>{status_word}</span>
                                                     </div>
                                                     <button
-                                                        class="dag-sidebar-close"
+                                                        class="icon-btn"
                                                         on:click=move |_| set_selected_nodes.set(Vec::new())
                                                         title="Close"
+                                                        aria-label="Close"
                                                     >"×"</button>
                                                 </div>
 
@@ -967,21 +962,10 @@ pub fn GraphPage() -> impl IntoView {
                                                 </div>
 
                                                 <div class="dag-sidebar-footer">
-                                                    <A href={href} attr:class="btn btn-tertiary dag-sidebar-action">"Details"</A>
-                                                    <button
-                                                        class="btn btn-primary dag-sidebar-action"
-                                                        disabled=is_task
-                                                        title=if is_task { "Task nodes materialize with their parent graph asset" } else { "Preview and materialize this asset" }
-                                                        on:click=move |_| { start_materialize.run(vec![mat_key.clone()]); }
-                                                    >
-                                                        <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
-                                                            <path d="M3 2l7 4-7 4V2z"/>
-                                                        </svg>
-                                                        "Materialize…"
-                                                    </button>
-                                                    {node_verbs.into_iter().map(|act| {
+                                                    <A href={href} attr:class="btn dag-sidebar-action">"Details"</A>
+                                                    {sorted_verbs(node_verbs).into_iter().map(|act| {
                                                         let destructive = act.is_destructive();
-                                                        let label = act.name.clone();
+                                                        let label = format!("{}…", crate::helpers::verb_label(&act.name));
                                                         let k = key_for_actions.clone();
                                                         let title = crate::helpers::action_title(&act, false);
                                                         view! {
@@ -992,6 +976,15 @@ pub fn GraphPage() -> impl IntoView {
                                                             >{label}</button>
                                                         }
                                                     }).collect::<Vec<_>>()}
+                                                    <button
+                                                        class="btn btn-primary dag-sidebar-action"
+                                                        disabled=is_task
+                                                        title=if is_task { "Task nodes materialize with their parent graph asset" } else { "Preview and materialize this asset" }
+                                                        on:click=move |_| { start_materialize.run(vec![mat_key.clone()]); }
+                                                    >
+                                                        <IconPlay/>
+                                                        "Materialize…"
+                                                    </button>
                                                 </div>
                                             }.into_any()
                                         }

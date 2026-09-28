@@ -20,28 +20,6 @@
     gap: 8px;
 }
 /* DAG / GANTT pill toggle */
-.view-pill-group {
-    display: flex;
-    background: var(--bg-surface);
-    border-radius: 3px;
-    padding: 2px;
-    gap: 2px;
-}
-.view-pill {
-    padding: 4px 10px;
-    border: 0;
-    border-radius: 2px;
-    font-family: var(--font-mono);
-    font-size: 10px;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    background: transparent;
-    color: var(--text-muted);
-    cursor: pointer;
-    line-height: 1;
-    transition: background 120ms ease, color 120ms ease;
-}
-.view-pill--active { background: var(--bg-highest); color: var(--text); }
 
 /* Gantt body */
 .gantt-body { position: relative; padding: 0; }
@@ -205,18 +183,6 @@
     word-break: break-word;
 }
 .run-asset-drawer-name:hover { color: var(--secondary); }
-.run-asset-drawer-close {
-    background: transparent;
-    border: 0;
-    color: var(--text-muted);
-    cursor: pointer;
-    font-size: 22px;
-    line-height: 1;
-    padding: 4px 8px;
-    border-radius: 3px;
-    transition: background 120ms ease, color 120ms ease;
-}
-.run-asset-drawer-close:hover { background: var(--bg-hover); color: var(--text); }
 .run-asset-drawer-section { padding: 16px 24px; border-bottom: 1px solid var(--border-subtle); }
 .run-asset-drawer-section:last-child { border-bottom: 0; }
 .run-asset-drawer-stats {

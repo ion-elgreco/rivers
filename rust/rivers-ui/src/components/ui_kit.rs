@@ -1409,18 +1409,21 @@ pub fn RiversSearch(
     }
 }
 
+/// Segmented control. Items are `(id, label, optional count)`; `on_select`
+/// receives the id.
 #[component]
 pub fn FilterPillGroup(
-    #[prop(into)] label: String,
-    #[prop(into)] items: Vec<(String, Option<usize>)>,
+    #[prop(optional, into)] label: Option<String>,
+    #[prop(into)] items: Vec<(String, String, Option<usize>)>,
     #[prop(into)] active: Signal<String>,
     #[prop(into)] on_select: Callback<String>,
 ) -> impl IntoView {
     view! {
         <div class="filter-pill-group">
-            <span class="filter-pill-group-label">{label}</span>
-            {items.into_iter().map(|(id, count)| {
+            {label.map(|l| view! { <span class="filter-pill-group-label">{l}</span> })}
+            {items.into_iter().map(|(id, text, count)| {
                 let id_for_cls = id.clone();
+                let id_for_aria = id.clone();
                 let id_for_cb = id.clone();
                 let cb = on_select;
                 let cls = move || {
@@ -1431,8 +1434,12 @@ pub fn FilterPillGroup(
                     }
                 };
                 view! {
-                    <button class=cls on:click=move |_| cb.run(id_for_cb.clone())>
-                        {id.clone()}
+                    <button
+                        class=cls
+                        aria-pressed=move || (active.get() == id_for_aria).to_string()
+                        on:click=move |_| cb.run(id_for_cb.clone())
+                    >
+                        {text}
                         {count.map(|n| view! { <span class="count">{n}</span> })}
                     </button>
                 }
@@ -1441,8 +1448,8 @@ pub fn FilterPillGroup(
     }
 }
 
-/// Underline-style tab bar (replaces the Material-style `.tab-bar`).
-/// Items are `(id, label, optional count)`.
+/// Underline tab bar for switching page content. Items are
+/// `(id, label, optional count)`.
 #[component]
 pub fn UnderlineTabs(
     #[prop(into)] tabs: Vec<(String, String, Option<usize>)>,
@@ -1450,9 +1457,10 @@ pub fn UnderlineTabs(
     #[prop(into)] on_select: Callback<String>,
 ) -> impl IntoView {
     view! {
-        <div class="tabs-underline">
+        <div class="tabs-underline" role="tablist">
             {tabs.into_iter().map(|(id, label, count)| {
                 let id_for_cls = id.clone();
+                let id_for_aria = id.clone();
                 let id_for_cb = id.clone();
                 let cb = on_select;
                 let cls = move || {
@@ -1463,7 +1471,12 @@ pub fn UnderlineTabs(
                     }
                 };
                 view! {
-                    <button class=cls on:click=move |_| cb.run(id_for_cb.clone())>
+                    <button
+                        class=cls
+                        role="tab"
+                        aria-selected=move || (active.get() == id_for_aria).to_string()
+                        on:click=move |_| cb.run(id_for_cb.clone())
+                    >
                         {label}
                         {count.map(|n| view! { <span class="tab-count">{n}</span> })}
                     </button>
@@ -2040,6 +2053,7 @@ pub fn AttentionBanner(
         (Some(c), Some(cb)) => Some(view! {
             <button
                 class="attention-banner-toggle"
+                aria-expanded=move || (!c.get()).to_string()
                 on:click=move |_| cb.run(())
             >
                 <span class="attention-banner-toggle-label">{move || if c.get() { "Expand" } else { "Collapse" }}</span>
@@ -2573,4 +2587,17 @@ pub fn EvaluateOutcomeShort(result: EvaluateOutcomeResult) -> impl IntoView {
         ),
     };
     view! { <span class=cls style="font-size:11px" title=tip>{text}</span> }
+}
+
+/// Top-bar feedback after a launch: a link to the new run.
+#[component]
+pub fn RunLaunched(#[prop(into)] run_id: String, #[prop(optional)] queued: bool) -> impl IntoView {
+    let (ns, name) = crate::loc::use_current_location().get();
+    let href = crate::loc::loc_path(&ns, &name, &format!("runs/{run_id}"));
+    let text = format!(
+        "Run {} {}",
+        crate::helpers::short_id(&run_id, 8),
+        if queued { "queued" } else { "started" },
+    );
+    view! { <A href=href attr:class="launch-result">{text}</A> }
 }

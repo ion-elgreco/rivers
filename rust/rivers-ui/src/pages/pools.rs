@@ -268,7 +268,8 @@ fn PoolRow(
                         </span>
                     })}
                     <button
-                        class="btn btn-tertiary"
+                        class="btn"
+                        aria-expanded=move || is_expanded.get().to_string()
                         on:click=move |_| {
                             if expanded_pool.get_untracked().as_deref() == Some(pool_key_click.as_str()) {
                                 set_expanded_pool.set(None);
@@ -276,17 +277,10 @@ fn PoolRow(
                                 set_expanded_pool.set(Some(pool_key_click.clone()));
                             }
                         }
-                        style="justify-content:center"
                     >
                         {move || if is_expanded.get() { "Hide holders" } else { "Show holders" }}
-                        <span
-                            class="chev-btn"
-                            class:chev-btn--open=move || is_expanded.get()
-                            style="margin-left:6px"
-                        >
-                            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M3 2l3 3-3 3"/>
-                            </svg>
+                        <span class="chev-btn" class:chev-btn--open=move || is_expanded.get()>
+                            <crate::components::icons::IconChevronRight/>
                         </span>
                     </button>
                 </div>

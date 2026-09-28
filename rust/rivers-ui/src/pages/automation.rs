@@ -416,12 +416,10 @@ fn render_schedules_table(
                             <button
                                 class="icon-btn copyable"
                                 title="Copy cron expression"
+                                aria-label="Copy cron expression"
                                 data-copy={cron_copy}
                             >
-                                <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.2">
-                                    <rect x="4" y="4" width="8" height="8" rx="1"/>
-                                    <path d="M10 4V3a1 1 0 00-1-1H3a1 1 0 00-1 1v6a1 1 0 001 1h1"/>
-                                </svg>
+                                <crate::components::icons::IconCopy/>
                             </button>
                         </span>
                         <span class="grid-cell-mono" style="color:var(--secondary); font-size:11.5px">
@@ -439,12 +437,11 @@ fn render_schedules_table(
                         </span>
                         <span style="display:flex; align-items:center; gap:6px; justify-content:flex-end">
                             <button
-                                class="btn btn-tertiary"
+                                class="btn"
                                 on:click=move |_| { eval_action.dispatch(()); }
                                 disabled=move || eval_pending.get()
-                                style="justify-content:center"
                             >
-                                {move || if eval_pending.get() { "..." } else { "Evaluate" }}
+                                {move || if eval_pending.get() { "Evaluating…" } else { "Evaluate" }}
                             </button>
                             {move || eval_action.value().get().map(|result| view! { <EvaluateOutcomeShort result/> })}
                         </span>
@@ -543,12 +540,11 @@ fn render_sensors_table(
                         <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0">{asset_selection_str}</span>
                         <span style="display:flex; align-items:center; gap:6px; justify-content:flex-end">
                             <button
-                                class="btn btn-tertiary"
+                                class="btn"
                                 on:click=move |_| { eval_action.dispatch(()); }
                                 disabled=move || eval_pending.get()
-                                style="justify-content:center"
                             >
-                                {move || if eval_pending.get() { "..." } else { "Evaluate" }}
+                                {move || if eval_pending.get() { "Evaluating…" } else { "Evaluate" }}
                             </button>
                             {move || eval_action.value().get().map(|result| view! { <EvaluateOutcomeShort result/> })}
                         </span>
@@ -671,9 +667,7 @@ fn render_conditions_tab(
                             class="chev-btn"
                             class:chev-btn--open=move || is_expanded.get()
                         >
-                            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M3 2l3 3-3 3"/>
-                            </svg>
+                            <crate::components::icons::IconChevronRight/>
                         </span>
                         <A
                             href=href
@@ -844,9 +838,7 @@ fn render_conditions_tab(
                                     class="chev-btn"
                                     class:chev-btn--open=move || is_expanded.get()
                                 >
-                                    <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                                        <path d="M3 2l3 3-3 3"/>
-                                    </svg>
+                                    <crate::components::icons::IconChevronRight/>
                                 </span>
                                 <span class="grid-cell-mono" style="color:var(--text); font-size:11.5px">
                                     <crate::now::RelTime ts=ts_now/>
