@@ -80,6 +80,7 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
                     partition_key: args.partition_key.as_ref().map(|pk| pk.into()),
                     block_reason: None,
                     launched_by,
+                    action: args.plan.action.clone(),
                 };
                 io_rt()
                     .block_on(args.storage.backend().create_run(&record))

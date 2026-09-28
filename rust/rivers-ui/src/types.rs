@@ -271,6 +271,8 @@ pub enum EventType {
     StepSlotWaiting,
     StepSlotRenewed,
     StepSlotReleased,
+    ActionCompleted,
+    Deletion,
 }
 
 /// One row from the events table — drives the run-detail / asset-detail
@@ -1069,6 +1071,7 @@ mod conversions {
                 job_substring: f.job_substring.filter(|s| !s.is_empty()),
                 asset_substring: f.asset_substring.filter(|s| !s.is_empty()),
                 partition_substring: f.partition_substring.filter(|s| !s.is_empty()),
+                action: None,
             }
         }
     }
@@ -1089,6 +1092,8 @@ mod conversions {
                 rivers_core::storage::EventType::StepSlotWaiting => Self::StepSlotWaiting,
                 rivers_core::storage::EventType::StepSlotRenewed => Self::StepSlotRenewed,
                 rivers_core::storage::EventType::StepSlotReleased => Self::StepSlotReleased,
+                rivers_core::storage::EventType::ActionCompleted => Self::ActionCompleted,
+                rivers_core::storage::EventType::Deletion => Self::Deletion,
             }
         }
     }
@@ -1392,6 +1397,7 @@ mod conversions {
                 }),
                 block_reason: None,
                 launched_by: rivers_core::storage::LaunchedBy::Manual { user: None },
+                action: None,
             };
             let ui: RunRecord = core.into();
             let preview = ui

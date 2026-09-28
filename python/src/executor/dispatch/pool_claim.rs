@@ -196,7 +196,7 @@ async fn claim_async_poll(
     loop {
         match storage
             .scoped()
-            .claim_concurrency_slots(pools, run_id, step_key, 0, DEFAULT_LEASE_DURATION_SECS)
+            .claim_concurrency_slots(pools, run_id, step_key, 0, DEFAULT_LEASE_DURATION_SECS, None)
             .await?
         {
             ConcurrencyClaimStatus::Claimed => {

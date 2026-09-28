@@ -102,7 +102,7 @@ impl AsyncMigrate for SurrealMigrate {
 
 /// Highest embedded migration version. Bump by adding a `Vn__*.surql` + an
 /// [`embedded_migrations`] entry; a test pins this to that max.
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 7;
 
 /// One compat row per migration (the floors it set), folded by the open guard.
 const MIGRATION_META_TABLE: &str = "migration_meta";
@@ -122,6 +122,26 @@ fn embedded_migrations() -> Vec<Migration> {
             include_str!("migrations/V3__backfill_launched_by.surql"),
         )
         .expect("V3__backfill_launched_by migration name is well-formed"),
+        Migration::unapplied(
+            "V4__run_action",
+            include_str!("migrations/V4__run_action.surql"),
+        )
+        .expect("V4__run_action migration name is well-formed"),
+        Migration::unapplied(
+            "V5__slot_partition_scope",
+            include_str!("migrations/V5__slot_partition_scope.surql"),
+        )
+        .expect("V5__slot_partition_scope migration name is well-formed"),
+        Migration::unapplied(
+            "V6__deletion_tombstones",
+            include_str!("migrations/V6__deletion_tombstones.surql"),
+        )
+        .expect("V6__deletion_tombstones migration name is well-formed"),
+        Migration::unapplied(
+            "V7__provenance_timestamp",
+            include_str!("migrations/V7__provenance_timestamp.surql"),
+        )
+        .expect("V7__provenance_timestamp migration name is well-formed"),
     ]
 }
 
@@ -630,8 +650,9 @@ mod tests {
         let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
         assert_eq!(
             (stamps.version, stamps.min_reader, stamps.min_writer),
-            (3, 2, 2),
-            "v2 raised both floors; v3 is additive and leaves them at 2"
+            (SCHEMA_VERSION, 2, 7),
+            "v2 raised the read floor to 2; v7 raised the write floor to 7, because a \
+             pre-v7 writer records provenance without the time a v7 writer compares"
         );
     }
 
@@ -696,6 +717,258 @@ mod tests {
             .unwrap()
             .check()
             .expect("legacy backfill row must be writable after V3");
+    }
+
+    /// V6 moves deletion times onto storage rows. Deletions recorded before it
+    /// exist only as events and must carry over, or they stop superseding
+    /// the failures they cleared.
+    #[tokio::test]
+    async fn test_v6_backfills_deletion_tombstones_from_events() {
+        let db = any::connect("mem://").await.unwrap();
+        db.use_ns(DEFAULT_NAMESPACE)
+            .use_db(DEFAULT_DATABASE)
+            .await
+            .unwrap();
+        let pre_v6: Vec<Migration> = embedded_migrations().into_iter().take(5).collect();
+        let mut backend = SurrealMigrate { db: db.clone() };
+        backend
+            .migrate(
+                &pre_v6,
+                true,
+                false,
+                false,
+                Target::Latest,
+                REFINERY_HISTORY_TABLE,
+            )
+            .await
+            .expect("apply V1..V5");
+
+        db.query(
+            "INSERT INTO assets { code_location_id: 'default', asset_key: 'report', tags: [], kinds: [] }; \
+             INSERT INTO assets { code_location_id: 'default', asset_key: 'kept', tags: [], kinds: [] }; \
+             INSERT INTO events [ \
+               { code_location_id: 'default', event_type: 'Deletion', asset_key: 'report', \
+                 run_id: 'r1', timestamp: 2000, metadata: [] }, \
+               { code_location_id: 'default', event_type: 'Deletion', asset_key: 'report', \
+                 run_id: 'r2', timestamp: 3000, metadata: [] }, \
+               { code_location_id: 'default', event_type: 'Deletion', asset_key: 'events', \
+                 run_id: 'r3', partition_key: { Single: { keys: ['p1'] } }, timestamp: 4000, metadata: [] } \
+             ];",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        apply_migrations(&db).await.expect("apply V6");
+
+        #[derive(Debug, SurrealValue)]
+        struct AssetRow {
+            asset_key: String,
+            last_deletion_timestamp: Option<i64>,
+        }
+        #[derive(Debug, SurrealValue)]
+        struct TombRow {
+            asset_key: String,
+            timestamp: i64,
+        }
+        let mut result = db
+            .query(
+                "SELECT asset_key, last_deletion_timestamp FROM assets ORDER BY asset_key; \
+                 SELECT asset_key, timestamp FROM asset_partition_deletions;",
+            )
+            .await
+            .unwrap();
+        let assets: Vec<AssetRow> = result.take(0).unwrap();
+        let tombs: Vec<TombRow> = result.take(1).unwrap();
+        let by_key: std::collections::HashMap<String, Option<i64>> = assets
+            .into_iter()
+            .map(|r| (r.asset_key, r.last_deletion_timestamp))
+            .collect();
+        assert_eq!(
+            by_key["report"],
+            Some(3000),
+            "the newest whole-asset deletion"
+        );
+        assert_eq!(
+            by_key["kept"], None,
+            "an asset never deleted has no tombstone"
+        );
+        assert_eq!(tombs.len(), 1);
+        assert_eq!(
+            (tombs[0].asset_key.as_str(), tombs[0].timestamp),
+            ("events", 4000)
+        );
+    }
+
+    /// V7 gives an asset row's code version and inputs a time of their own.
+    /// A row that already holds them got them with the materialization it
+    /// holds, so their time starts at that one's.
+    #[tokio::test]
+    async fn test_v7_backfills_provenance_timestamp() {
+        let db = any::connect("mem://").await.unwrap();
+        db.use_ns(DEFAULT_NAMESPACE)
+            .use_db(DEFAULT_DATABASE)
+            .await
+            .unwrap();
+        let pre_v7: Vec<Migration> = embedded_migrations().into_iter().take(6).collect();
+        let mut backend = SurrealMigrate { db: db.clone() };
+        backend
+            .migrate(
+                &pre_v7,
+                true,
+                false,
+                false,
+                Target::Latest,
+                REFINERY_HISTORY_TABLE,
+            )
+            .await
+            .expect("apply V1..V6");
+
+        db.query(
+            "INSERT INTO assets [ \
+               { code_location_id: 'default', asset_key: 'built', tags: [], kinds: [], \
+                 last_timestamp: 300, last_data_version: 'dv', \
+                 last_materialization_code_version: 'v1', last_input_data_versions: [['u', 'dv_u']] }, \
+               { code_location_id: 'default', asset_key: 'root', tags: [], kinds: [], \
+                 last_timestamp: 200, last_data_version: 'dv', \
+                 last_materialization_code_version: 'v1' }, \
+               { code_location_id: 'default', asset_key: 'unversioned', tags: [], kinds: [], \
+                 last_timestamp: 250, last_data_version: 'dv', \
+                 last_input_data_versions: [['u', 'dv_u']] }, \
+               { code_location_id: 'default', asset_key: 'by_action', tags: [], kinds: [], \
+                 last_timestamp: 100, last_data_version: 'dv' }, \
+               { code_location_id: 'default', asset_key: 'never', tags: [], kinds: [] } \
+             ] RETURN NONE",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        apply_migrations(&db).await.expect("apply V7");
+
+        let provenance_times = async || -> Vec<(String, Option<i64>)> {
+            db.query("SELECT VALUE [asset_key, last_provenance_timestamp] FROM assets ORDER BY asset_key")
+                .await
+                .unwrap()
+                .take(0)
+                .unwrap()
+        };
+        let expected = vec![
+            ("built".to_string(), Some(300)),
+            ("by_action".to_string(), None),
+            ("never".to_string(), None),
+            ("root".to_string(), Some(200)),
+            ("unversioned".to_string(), Some(250)),
+        ];
+        assert_eq!(provenance_times().await, expected);
+
+        let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
+        assert_eq!(
+            (stamps.version, stamps.min_reader, stamps.min_writer),
+            (7, 2, 7),
+            "a pre-v7 writer records a code version without its time, which a \
+             v7 writer then lets an older materialization overwrite"
+        );
+        assert!(check_compatibility(stamps, Capability::Read, 6).is_ok());
+        assert!(check_compatibility(stamps, Capability::ReadWrite, 6).is_err());
+
+        // A re-run applies nothing, and the backfill leaves times already set.
+        db.query("UPDATE assets SET last_provenance_timestamp = 150 WHERE asset_key = 'built'")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        apply_migrations(&db).await.expect("re-run");
+        let v7 = embedded_migrations()
+            .into_iter()
+            .nth(6)
+            .expect("V7 is embedded");
+        db.query(v7.sql().expect("V7 has a body"))
+            .await
+            .unwrap()
+            .check()
+            .expect("the V7 body runs again");
+        let mut expected = expected;
+        expected[0].1 = Some(150);
+        assert_eq!(provenance_times().await, expected);
+        assert_eq!(count_rows(&db, REFINERY_HISTORY_TABLE).await, 7);
+    }
+
+    /// V5 adds `exclusive`/`partitions` to a SCHEMAFULL table. `DEFAULT` only
+    /// fills at create time, so live pre-V5 slot rows must be backfilled: the
+    /// conflict clause reads a missing `exclusive` as NONE (falsy), which would
+    /// let a materialize run straight past an in-flight exclusive action, and
+    /// lease renewal would trip field coercion on the next UPDATE.
+    #[tokio::test]
+    async fn test_v5_backfills_exclusive_on_legacy_slot_rows() {
+        let db = any::connect("mem://").await.unwrap();
+        db.use_ns(DEFAULT_NAMESPACE)
+            .use_db(DEFAULT_DATABASE)
+            .await
+            .unwrap();
+
+        let pre_v5: Vec<Migration> = embedded_migrations().into_iter().take(4).collect();
+        let mut backend = SurrealMigrate { db: db.clone() };
+        backend
+            .migrate(
+                &pre_v5,
+                true,
+                false,
+                false,
+                Target::Latest,
+                REFINERY_HISTORY_TABLE,
+            )
+            .await
+            .expect("apply V1..V4");
+
+        // Two legacy holders of one asset pool: an exclusive action (which took
+        // the whole pool under the old rule) and an ordinary materialize.
+        for (step, slots) in [("action", 1_000_000), ("mat", 1)] {
+            db.query(format!(
+                "INSERT INTO concurrency_slots {{ code_location_id: 'default', \
+                 pool_key: '__asset__:orders', run_id: 'legacy', step_key: '{step}', \
+                 slots_consumed: {slots}, claimed_at: 1, lease_expires_at: 9223372036854775807, \
+                 last_heartbeat: 1 }} RETURN NONE"
+            ))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        }
+
+        apply_migrations(&db).await.expect("apply V5");
+
+        let exclusive_of = async |step: &str| -> Vec<bool> {
+            db.query(format!(
+                "SELECT VALUE exclusive FROM concurrency_slots WHERE step_key = '{step}'"
+            ))
+            .await
+            .unwrap()
+            .take(0)
+            .expect("legacy slot rows must read back after V5")
+        };
+        assert_eq!(
+            exclusive_of("action").await,
+            vec![true],
+            "the whole-pool holder is recovered as an exclusive action"
+        );
+        assert_eq!(
+            exclusive_of("mat").await,
+            vec![false],
+            "a one-slot holder is a materialize"
+        );
+
+        // Lease renewal is an UPDATE — it must not trip coercion on these rows.
+        db.query(
+            "UPDATE concurrency_slots SET lease_expires_at = 99, last_heartbeat = 99 \
+             WHERE run_id = 'legacy'",
+        )
+        .await
+        .unwrap()
+        .check()
+        .expect("legacy slot rows must stay writable after V5");
     }
 
     /// Editing an already-applied migration is caught by refinery's checksum

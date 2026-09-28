@@ -293,6 +293,7 @@ impl QueuedRunDispatcher {
                 partition_key: req.partition_key.clone(),
                 block_reason: None,
                 launched_by: req.launched_by.clone(),
+                action: None,
             };
             if let Err(e) = self.storage.enqueue_run(&run_record).await {
                 errors.push(anyhow!(

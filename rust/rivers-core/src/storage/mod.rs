@@ -145,6 +145,13 @@ pub enum EventType {
     StepSlotRenewed,
     /// Step released pool slots.
     StepSlotReleased,
+    /// An asset action ran to completion without changing materialization
+    /// state. The action name rides in the event metadata (`action` key) and
+    /// on the run's `RunRecord::action`.
+    ActionCompleted,
+    /// An `Unmaterialize` action cleared the asset's (or partition's)
+    /// materialization state. The action name rides in the event metadata.
+    Deletion,
 }
 
 impl EventType {
@@ -174,6 +181,8 @@ impl EventType {
             Self::StepSlotWaiting => "StepSlotWaiting",
             Self::StepSlotRenewed => "StepSlotRenewed",
             Self::StepSlotReleased => "StepSlotReleased",
+            Self::ActionCompleted => "ActionCompleted",
+            Self::Deletion => "Deletion",
         }
     }
 
@@ -196,6 +205,8 @@ impl EventType {
             "StepSlotWaiting" => Ok(Self::StepSlotWaiting),
             "StepSlotRenewed" => Ok(Self::StepSlotRenewed),
             "StepSlotReleased" => Ok(Self::StepSlotReleased),
+            "ActionCompleted" => Ok(Self::ActionCompleted),
+            "Deletion" => Ok(Self::Deletion),
             _ => Err(format!("unknown EventType: {name}")),
         }
     }
@@ -208,12 +219,16 @@ impl EventType {
         matches!(self, Self::Observation { .. })
     }
 
+    pub fn is_deletion(&self) -> bool {
+        matches!(self, Self::Deletion)
+    }
+
     /// Sort priority within the same timestamp.
     pub fn sort_order(&self) -> i64 {
         match self {
             Self::StepStart => 0,
             Self::Observation { .. } => 2,
-            Self::Materialization { .. } => 3,
+            Self::Materialization { .. } | Self::ActionCompleted | Self::Deletion => 3,
             Self::StepSuccess | Self::StepFailure | Self::StepRetry => 4,
             Self::RunQueued | Self::RunDequeued | Self::RunLaunchFailed => 5,
             Self::StepSlotClaimed
@@ -776,6 +791,17 @@ pub struct RunRecord {
     pub block_reason: Option<String>,
     #[serde(default)]
     pub launched_by: LaunchedBy,
+    /// The verb this run executes. `None` means materialize (rows predate actions).
+    #[serde(default)]
+    pub action: Option<String>,
+}
+
+impl RunRecord {
+    /// True when this run executes a named action rather than materializing.
+    /// Mirrors [`crate::execution::plan::ExecutionPlan::is_action`].
+    pub fn is_action(&self) -> bool {
+        self.action.is_some()
+    }
 }
 
 pub fn default_code_location_id() -> String {
@@ -808,6 +834,9 @@ pub struct CoordinatorRunInfo {
     pub partition_key: Option<PartitionKey>,
     #[serde(default)]
     pub start_time: i64,
+    /// See [`RunRecord::action`] — the backend must execute this verb, not materialize.
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
 impl crate::concurrency::Tagged for CoordinatorRunInfo {
@@ -825,6 +854,9 @@ pub struct RunFilter {
     pub job_substring: Option<String>,
     pub asset_substring: Option<String>,
     pub partition_substring: Option<String>,
+    /// Which verb the run executes. `Some(None)` selects materialize runs
+    /// (rows with no action), `Some(Some(verb))` that verb.
+    pub action: Option<Option<String>>,
 }
 
 /// One page of run records plus the total number of rows matching the filter.
@@ -1037,6 +1069,9 @@ pub struct BackfillRecord {
     #[serde(default)]
     #[surreal(default)]
     pub launched_by: LaunchedBy,
+    /// The verb child runs execute. `None` means materialize.
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
 // ── Concurrency pool records ──
@@ -1058,6 +1093,26 @@ pub const DEFAULT_LEASE_DURATION_SECS: u32 = 300;
 
 fn default_lease_duration() -> u32 {
     DEFAULT_LEASE_DURATION_SECS
+}
+
+/// Prefix of the pool every asset with an exclusive action implicitly gets.
+/// Claims on such a pool are admitted by [`AssetScope`] overlap rather than by
+/// slot count, so the storage layer has to recognise the key.
+pub const ASSET_POOL_PREFIX: &str = "__asset__:";
+
+/// What a step touches on an asset's implicit pool, and whether it needs the
+/// touched partitions to itself.
+///
+/// Admission is set overlap, not counting: two non-exclusive holders never
+/// conflict, and an exclusive one conflicts only where the partitions actually
+/// intersect. That is what lets `delete(p1)` run beside a materialize of `p2`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AssetScope {
+    /// Rendered partition keys the step touches. `None` = the whole asset,
+    /// which conflicts with every other scope.
+    pub partitions: Option<Vec<String>>,
+    /// True for an action step — the side that demands exclusivity.
+    pub exclusive: bool,
 }
 
 /// Runtime pool info: configuration + current usage.
@@ -1083,6 +1138,20 @@ pub struct SlotHolder {
     pub lease_expires_at: i64,
 }
 
+/// A step's recorded attempts in one run (see `get_step_attempts`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepAttempts {
+    /// `StepStart` events recorded: one per attempt begun, crashed ones too.
+    pub starts: u32,
+    /// A step-level `StepFailure` was recorded: the retry ladder is over.
+    pub failed: bool,
+    /// `StepRetry` events recorded.
+    pub retries: u32,
+    /// Keys the step failed one by one (keyed `StepFailure`), which ordering
+    /// keeps its dependents off.
+    pub failed_keys: Vec<PartitionKey>,
+}
+
 /// Why a step is blocked from claiming concurrency slots.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum BlockReason {
@@ -1094,6 +1163,19 @@ pub enum BlockReason {
     },
     /// Multiple pools are at capacity (multi-pool claim).
     PoolsFull { pools: Vec<PoolBlockDetail> },
+}
+
+impl BlockReason {
+    /// Every blocking pool is an asset's implicit pool — held by a live step
+    /// that renews its lease, so the wait ends when that step does.
+    pub fn only_asset_pools(&self) -> bool {
+        match self {
+            BlockReason::PoolFull { pool_key, .. } => pool_key.starts_with(ASSET_POOL_PREFIX),
+            BlockReason::PoolsFull { pools } => pools
+                .iter()
+                .all(|p| p.pool_key.starts_with(ASSET_POOL_PREFIX)),
+        }
+    }
 }
 
 impl std::fmt::Display for BlockReason {
@@ -1541,19 +1623,34 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         since_timestamp: i64,
     ) -> impl Future<Output = Result<Vec<(PartitionKey, i64)>>> + Send;
 
+    /// Timestamp and last run of exactly `keys` — keys with no row (e.g.
+    /// deleted partitions) are simply absent from the result.
+    fn get_partition_timestamps_for_keys(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        keys: &[PartitionKey],
+    ) -> impl Future<Output = Result<Vec<(PartitionKey, i64, Option<String>)>>> + Send;
+
     fn get_in_progress_partitions(
         &self,
         code_location_id: &str,
         asset_key: &str,
     ) -> impl Future<Output = Result<Vec<PartitionKey>>> + Send;
 
-    /// Partitions whose latest failure isn't superseded by a later materialization, with that failure's timestamp.
+    /// Partitions whose latest failure isn't superseded by a later materialization or deletion, with that failure's timestamp.
     fn get_failed_partitions(
         &self,
         code_location_id: &str,
         asset_key: &str,
         materialized: &HashMap<PartitionKey, i64>,
     ) -> impl Future<Output = Result<HashMap<PartitionKey, i64>>> + Send;
+
+    /// Latest whole-asset Deletion event timestamp per asset (partition-scoped deletions excluded).
+    fn get_asset_deletion_timestamps(
+        &self,
+        code_location_id: &str,
+    ) -> impl Future<Output = Result<HashMap<String, i64>>> + Send;
 
     fn get_backfills(
         &self,
@@ -1586,6 +1683,9 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         code_location_id: &str,
     ) -> impl Future<Output = Result<Vec<PoolInfo>>> + Send;
 
+    /// `scope` applies to every `__asset__:`-prefixed pool in `pools`; a step
+    /// carries one partition key and one exclusivity, so one scope covers all
+    /// of them. `None` on a non-implicit claim.
     fn claim_concurrency_slots(
         &self,
         code_location_id: &str,
@@ -1594,6 +1694,7 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         step_key: &str,
         priority: i32,
         lease_duration_secs: u32,
+        scope: Option<&AssetScope>,
     ) -> impl Future<Output = Result<ConcurrencyClaimStatus>> + Send;
 
     fn get_pool_slot_holders(
@@ -1921,6 +2022,16 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
             .await
     }
 
+    pub async fn get_partition_timestamps_for_keys(
+        &self,
+        asset_key: &str,
+        keys: &[PartitionKey],
+    ) -> Result<Vec<(PartitionKey, i64, Option<String>)>> {
+        self.backend
+            .get_partition_timestamps_for_keys(self.code_location_id, asset_key, keys)
+            .await
+    }
+
     pub async fn get_in_progress_partitions(&self, asset_key: &str) -> Result<Vec<PartitionKey>> {
         self.backend
             .get_in_progress_partitions(self.code_location_id, asset_key)
@@ -1934,6 +2045,12 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
     ) -> Result<HashMap<PartitionKey, i64>> {
         self.backend
             .get_failed_partitions(self.code_location_id, asset_key, materialized)
+            .await
+    }
+
+    pub async fn get_asset_deletion_timestamps(&self) -> Result<HashMap<String, i64>> {
+        self.backend
+            .get_asset_deletion_timestamps(self.code_location_id)
             .await
     }
 
@@ -1979,6 +2096,7 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
         step_key: &str,
         priority: i32,
         lease_duration_secs: u32,
+        scope: Option<&AssetScope>,
     ) -> Result<ConcurrencyClaimStatus> {
         self.backend
             .claim_concurrency_slots(
@@ -1988,6 +2106,7 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
                 step_key,
                 priority,
                 lease_duration_secs,
+                scope,
             )
             .await
     }
@@ -2178,6 +2297,16 @@ pub trait StorageBackend: PerCodeLocationStorage {
         asset_keys: &[String],
         run_ids: &[String],
     ) -> impl Future<Output = Result<Vec<StepOutcome>>> + Send;
+
+    /// Which of `run_ids` materialized each of `asset_keys`: asset → runs.
+    ///
+    /// Read off the runs' own Materialization events: an asset row names only
+    /// its newest run, and a delete clears it.
+    fn materialized_by_runs(
+        &self,
+        asset_keys: &[String],
+        run_ids: &[String],
+    ) -> impl Future<Output = Result<HashMap<String, HashSet<String>>>> + Send;
 
     // Runs
     fn create_run(&self, run: &RunRecord) -> impl Future<Output = Result<()>> + Send;
@@ -2377,6 +2506,13 @@ pub trait StorageBackend: PerCodeLocationStorage {
         run_id: &str,
     ) -> impl Future<Output = Result<HashSet<String>>> + Send;
 
+    /// What each step of a run already did, for resuming it: started, failed
+    /// at step level, and how many retries it recorded.
+    fn get_step_attempts(
+        &self,
+        run_id: &str,
+    ) -> impl Future<Output = Result<HashMap<String, StepAttempts>>> + Send;
+
     /// Get data versions produced by materialization events in a run.
     fn get_step_data_versions(
         &self,
@@ -2405,6 +2541,8 @@ mod event_type_tests {
             EventType::StepSlotWaiting,
             EventType::StepSlotRenewed,
             EventType::StepSlotReleased,
+            EventType::ActionCompleted,
+            EventType::Deletion,
         ];
         for ev in variants {
             let name = ev.type_name();

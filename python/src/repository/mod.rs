@@ -1485,6 +1485,7 @@ impl RepoHandle {
                 partition_key: core_pk,
                 block_reason: None,
                 launched_by,
+                action: None,
             };
             (record, state.storage.clone(), dyn_checks)
         };
@@ -1564,6 +1565,7 @@ impl RepoHandle {
                     partition_key: core_pk,
                     block_reason: None,
                     launched_by: launched_by.clone(),
+                    action: None,
                 });
             }
             (records, state.storage.clone(), dyn_checks)
@@ -1671,6 +1673,7 @@ impl RepoHandle {
                 partition_key: core_pk,
                 block_reason: None,
                 launched_by,
+                action: None,
             };
             (record, state.storage.clone(), dyn_checks)
         };
@@ -1734,6 +1737,7 @@ impl RepoHandle {
                 partition_key,
                 block_reason: None,
                 launched_by,
+                action: None,
             };
             (record, state.storage.clone())
         };
@@ -4222,6 +4226,7 @@ impl PyCodeRepository {
             end_time: None,
             error: None,
             launched_by,
+            action: None,
         };
 
         io_rt()

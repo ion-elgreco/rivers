@@ -345,6 +345,21 @@ helm upgrade rivers \
 Existing `CodeLocation` resources are re-reconciled against the new
 operator without re-creation.
 
+Then migrate the storage schema once, before the upgraded UI and code
+locations open the database — a newer build refuses an older database until
+it is migrated. Run it from any image that has the new rivers:
+
+```sh
+rivers db migrate --surreal-endpoint ws://surrealdb:8000
+```
+
+A migration can also raise the oldest build allowed to *write* (see
+[Schema versioning](../api-reference/storage.md#schema-versioning-migration)).
+When it does, rebuild every `CodeLocation` image on the new rivers version
+right after migrating: an image built on an older rivers is refused as a
+writer and its code location stops serving. Schema versions 5 and 6 (asset
+actions) both raise the write floor.
+
 ## Uninstall
 
 ```sh

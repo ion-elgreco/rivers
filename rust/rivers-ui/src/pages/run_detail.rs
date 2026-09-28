@@ -1068,6 +1068,8 @@ fn event_type_label(evt: &StoredEvent) -> &'static str {
         EventType::StepSlotWaiting => "SLOT_WAITING",
         EventType::StepSlotRenewed => "SLOT_RENEWED",
         EventType::StepSlotReleased => "SLOT_RELEASED",
+        EventType::ActionCompleted => "ACTION_COMPLETED",
+        EventType::Deletion => "DELETION",
     }
 }
 
@@ -1084,6 +1086,8 @@ fn event_row_class(evt: &StoredEvent) -> &'static str {
         EventType::StepSlotClaimed | EventType::StepSlotReleased => "log-row--info",
         EventType::StepSlotWaiting => "log-row--warn",
         EventType::StepSlotRenewed => "log-row--muted",
+        EventType::ActionCompleted => "log-row--success",
+        EventType::Deletion => "log-row--warn",
     }
 }
 
@@ -1153,6 +1157,20 @@ fn event_info(evt: &StoredEvent) -> String {
         }
         EventType::StepSlotRenewed => "Lease renewed".to_string(),
         EventType::StepSlotReleased => "Released pool slots".to_string(),
+        EventType::ActionCompleted => {
+            let action = metadata_value(evt, "action");
+            format!(
+                "Action completed{}",
+                action.map(|a| format!(" ({a})")).unwrap_or_default()
+            )
+        }
+        EventType::Deletion => {
+            let action = metadata_value(evt, "action");
+            format!(
+                "Materialization state cleared{}",
+                action.map(|a| format!(" ({a})")).unwrap_or_default()
+            )
+        }
     }
 }
 

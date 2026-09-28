@@ -10,12 +10,13 @@ use surrealdb::types::{Bytes, RecordId, SurrealValue};
 #[cfg(test)]
 use super::DEFAULT_CODE_LOCATION_ID;
 use super::{
-    AssetRecord, BackfillFilter, BackfillRecord, BackfillStatus, BackfillsPage, BackfillsSummary,
-    BlockReason, ConcurrencyClaimStatus, ConditionEvalRecord, ConditionTickRecord,
-    CoordinatorRunInfo, EventRecord, EventType, LogRecord, PartitionKey, PerCodeLocationStorage,
-    PoolBlockDetail, PoolInfo, PoolLimit, RunFilter, RunOutcome, RunProgress, RunRecord, RunStatus,
-    RunsPage, RunsSummary, SlotHolder, StepOutcome, StorageBackend, StoredConditionEval,
-    StoredConditionTick, StoredEvent, StoredLog, StoredTick, TickRecord,
+    ASSET_POOL_PREFIX, AssetRecord, AssetScope, BackfillFilter, BackfillRecord, BackfillStatus,
+    BackfillsPage, BackfillsSummary, BlockReason, ConcurrencyClaimStatus, ConditionEvalRecord,
+    ConditionTickRecord, CoordinatorRunInfo, EventRecord, EventType, LogRecord, PartitionKey,
+    PerCodeLocationStorage, PoolBlockDetail, PoolInfo, PoolLimit, RunFilter, RunOutcome,
+    RunProgress, RunRecord, RunStatus, RunsPage, RunsSummary, SlotHolder, StepOutcome,
+    StorageBackend, StoredConditionEval, StoredConditionTick, StoredEvent, StoredLog, StoredTick,
+    TickRecord,
 };
 #[cfg(test)]
 use crate::assets::graph::GraphTopology;
@@ -39,6 +40,9 @@ struct DbDynamicPartition {
 
 #[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
 struct DbEventWrite {
+    /// Client-generated so a retried closure re-inserts the same record id —
+    /// `INSERT IGNORE` then makes the replay a no-op instead of a duplicate.
+    id: RecordId,
     code_location_id: String,
     event_type: String,
     asset_key: Option<String>,
@@ -105,7 +109,17 @@ impl DbStoredRunLog {
     }
 }
 
-/// One `asset_partitions` row, written in bulk via `upsert_asset_partitions`.
+/// One partition deletion tombstone, written by [`RECORD_PARTITION_TOMBSTONES`].
+#[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
+struct DbPartitionDeletion {
+    code_location_id: String,
+    asset_key: String,
+    partition_key: PartitionKey,
+    timestamp: i64,
+}
+
+/// One `asset_partitions` row, upserted via [`UPSERT_ASSET_PARTITIONS`] in
+/// the same transaction as its asset's row update.
 #[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
 struct DbAssetPartitionWrite {
     code_location_id: String,
@@ -327,9 +341,10 @@ impl DbStoredTick {
     }
 }
 
-impl From<&EventRecord> for DbEventWrite {
-    fn from(e: &EventRecord) -> Self {
+impl DbEventWrite {
+    fn from_event(e: &EventRecord, id: RecordId) -> Self {
         Self {
+            id,
             code_location_id: e.code_location_id.clone(),
             event_type: e.event_type.type_name().to_string(),
             asset_key: e.asset_key.clone(),
@@ -447,6 +462,15 @@ impl Drop for SurrealStorage {
             if tokio::runtime::Handle::try_current().is_ok() {
                 runtime.shutdown_background();
             } else {
+                // The router closes the datastore only when it exits on its
+                // own; shutting the runtime down first cancels it and leaves
+                // the RocksDB files open until the process exits.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while runtime.metrics().num_alive_tasks() > 0
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
                 runtime.shutdown_timeout(std::time::Duration::from_secs(5));
             }
         }
@@ -752,6 +776,11 @@ impl SurrealStorage {
                      AND string::contains(string::lowercase($t[1]), $partition_pat))",
                 );
             }
+            match &filter.action {
+                Some(Some(_)) => wheres.push("action = $action"),
+                Some(None) => wheres.push("action IS NONE"),
+                None => {}
+            }
             let where_clause = if wheres.is_empty() {
                 String::new()
             } else {
@@ -785,6 +814,9 @@ impl SurrealStorage {
             }
             if let Some(pat) = &filter.partition_substring {
                 q = q.bind(("partition_pat", pat.to_lowercase()));
+            }
+            if let Some(Some(verb)) = &filter.action {
+                q = q.bind(("action", verb.clone()));
             }
 
             let mut result = q.await?;
@@ -1218,6 +1250,12 @@ fn record_id_str(id: &RecordId) -> String {
     format!("{}:{:?}", id.table.as_str(), id.key)
 }
 
+/// Client-generated `events` record id — retried inserts replay the same id
+/// so `INSERT IGNORE` deduplicates instead of appending.
+fn new_event_record_id() -> RecordId {
+    RecordId::new("events", uuid::Uuid::new_v4().simple().to_string())
+}
+
 fn now_nanos() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1248,9 +1286,34 @@ fn run_queued_event(record: &RunRecord) -> EventRecord {
 }
 
 impl SurrealStorage {
+    /// Conditional `update_run_status`: mark `Failure` only while the run is
+    /// still non-terminal. Returns whether a row matched — `false` means the
+    /// run already reached a terminal status and was left alone (a late
+    /// launch-error must not stomp a concurrent Canceled/Success write).
+    pub async fn fail_run_if_active(&self, run_id: &str, end_time: i64) -> Result<bool> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut response = self
+                .db
+                .query(
+                    "UPDATE runs SET status = 'Failure', end_time = $end_time \
+                     WHERE run_id = $run_id \
+                     AND status IN ['NotStarted', 'Queued', 'Started'] \
+                     RETURN AFTER",
+                )
+                .bind(("run_id", run_id.to_string()))
+                .bind(("end_time", end_time))
+                .await
+                .context("failed to fail-out run")?
+                .check()?;
+            let rows: Vec<RunRecord> = response.take(0)?;
+            Ok(!rows.is_empty())
+        })
+        .await
+    }
+
     /// Persist a queued `RunRecord` and emit its `RunQueued` event in one step.
     pub async fn enqueue_run(&self, record: &RunRecord) -> Result<()> {
-        let event = DbEventWrite::from(&run_queued_event(record));
+        let event = DbEventWrite::from_event(&run_queued_event(record), new_event_record_id());
         let result = super::retry::with_retry(&self.retry_config, || async {
             self.db
                 .query(
@@ -1276,7 +1339,7 @@ impl SurrealStorage {
         }
         let events: Vec<DbEventWrite> = records
             .iter()
-            .map(|r| DbEventWrite::from(&run_queued_event(r)))
+            .map(|r| DbEventWrite::from_event(&run_queued_event(r), new_event_record_id()))
             .collect();
         let result = super::retry::with_retry(&self.retry_config, || async {
             self.db
@@ -1313,7 +1376,7 @@ impl SurrealStorage {
         }
         let events: Vec<DbEventWrite> = records
             .iter()
-            .map(|r| DbEventWrite::from(&run_queued_event(r)))
+            .map(|r| DbEventWrite::from_event(&run_queued_event(r), new_event_record_id()))
             .collect();
         let run_ids: Vec<String> = records.iter().map(|r| r.run_id.clone()).collect();
         let result = super::retry::with_retry(&self.retry_config, || async {
@@ -1439,43 +1502,160 @@ impl SurrealStorage {
         Ok(rows.first().and_then(|r| r.value.clone()))
     }
 
-    /// Bulk upsert `asset_partitions` rows, matched on the table's UNIQUE (code_location_id, asset_key, partition_key) index.
-    async fn upsert_asset_partitions(&self, rows: Vec<DbAssetPartitionWrite>) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
+    /// Apply one Deletion event's state clearing.
+    /// Partition-scoped deletions drop that partition's row; whole-asset
+    /// deletions clear the asset's materialization state and every partition
+    /// row. `last_event_id` points the timeline at the deletion, while
+    /// `last_run_id`, `last_timestamp` and `last_data_version` are cleared with
+    /// the rest of the materialization state — conditions read them as "the run
+    /// whose data this asset holds" and "when it acquired that data", and a
+    /// deleted asset holds none (so `Missing` fires again, and `NewlyUpdated`
+    /// does not). A partition-scoped deletion leaves the asset's
+    /// `last_data_version` alone — other partitions may still hold data.
+    /// Rows apply by event time, not commit order: state materialized after
+    /// the deletion stays.
+    async fn consolidate_deletion(
+        &self,
+        cl: &str,
+        asset_key: &str,
+        event: &EventRecord,
+        event_id: &str,
+    ) -> Result<()> {
+        match &event.partition_key {
+            Some(pk) => {
+                self.delete_partitions(cl, asset_key, vec![(pk.clone(), event.timestamp)])
+                    .await?;
+            }
+            None => {
+                // `last_timestamp` is cleared with the rest: downstream reads
+                // it as "this dependency produced something new", so leaving it
+                // to advance would make deleting an asset trigger a
+                // materialization from data that no longer exists. The event id
+                // still points at the deletion so timelines resolve. One
+                // transaction, not separate statements: without it each statement
+                // commits on its own, and a concurrent materialization can land
+                // between them — leaving the asset row and its partition rows
+                // disagreeing. A conflict aborts the whole transaction and the
+                // caller's retry re-applies all of it. An unset time is NONE,
+                // which sorts below every number.
+                self.db
+                    .query(format!(
+                        "BEGIN TRANSACTION; {CLEAR_DELETED_ASSET} COMMIT TRANSACTION;"
+                    ))
+                    .bind(("cl", cl.to_string()))
+                    .bind(("asset_key", asset_key.to_string()))
+                    .bind(("event_id", event_id.to_string()))
+                    .bind(("ts", event.timestamp))
+                    .await?
+                    .check()?;
+            }
         }
-        self.db
-            .query(
-                "INSERT INTO asset_partitions $rows ON DUPLICATE KEY UPDATE \
-                 last_event_id = $input.last_event_id, \
-                 last_run_id = $input.last_run_id, \
-                 last_timestamp = $input.last_timestamp",
-            )
-            .bind(("rows", rows))
-            .await?
-            .check()?;
         Ok(())
     }
 
+    /// Apply partition-scoped deletions of one asset: rows no newer than
+    /// their key's deletion gone, tombstones kept at each key's newest
+    /// deletion time.
+    async fn delete_partitions(
+        &self,
+        cl: &str,
+        asset_key: &str,
+        deletions: Vec<(PartitionKey, i64)>,
+    ) -> Result<()> {
+        let mut newest: HashMap<PartitionKey, i64> = HashMap::new();
+        for (pk, ts) in deletions {
+            newest
+                .entry(pk)
+                .and_modify(|t| *t = (*t).max(ts))
+                .or_insert(ts);
+        }
+        let mut by_time: HashMap<i64, Vec<PartitionKey>> = HashMap::new();
+        for (pk, ts) in &newest {
+            by_time.entry(*ts).or_default().push(pk.clone());
+        }
+        let rows: Vec<DbPartitionDeletion> = newest
+            .into_iter()
+            .map(|(partition_key, timestamp)| DbPartitionDeletion {
+                code_location_id: cl.to_string(),
+                asset_key: asset_key.to_string(),
+                partition_key,
+                timestamp,
+            })
+            .collect();
+        // One DELETE per deletion time, not a FOR loop, which costs more. The
+        // members of one delete step share a time, so this is one statement.
+        let mut sql = String::from("BEGIN TRANSACTION; ");
+        for i in 0..by_time.len() {
+            sql.push_str(&format!(
+                "DELETE FROM asset_partitions WHERE code_location_id = $cl \
+                 AND asset_key = $asset_key AND partition_key IN $keys_{i} \
+                 AND last_timestamp <= $deleted_at_{i}; "
+            ));
+        }
+        sql.push_str(RECORD_PARTITION_TOMBSTONES);
+        let mut query = self
+            .db
+            .query(sql)
+            .bind(("cl", cl.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .bind(("rows", rows));
+        for (i, (deleted_at, keys)) in by_time.into_iter().enumerate() {
+            query = query
+                .bind((format!("keys_{i}"), keys))
+                .bind((format!("deleted_at_{i}"), deleted_at));
+        }
+        query.await?.check()?;
+        Ok(())
+    }
+
+    /// Which of `ids` belong to action runs. Events don't carry the verb, so
+    /// the materialization consolidation reads it off the run record; a
+    /// missing row reads as materialize (fail-open to the old behavior).
+    async fn action_run_ids(&self, ids: Vec<String>) -> Result<std::collections::HashSet<String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let mut result = self
+            .db
+            .query("SELECT VALUE run_id FROM runs WHERE run_id IN $ids AND action IS NOT NONE")
+            .bind(("ids", ids))
+            .await?;
+        let rows: Vec<String> = result.take(0)?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// `claiming_step` (run id, step key) leaves that step's own row out of
+    /// the count: its claim takes the row over.
     async fn query_pool_usage(
         &self,
         code_location_id: &str,
         pool_key: &str,
         now_ns: i64,
+        claiming_step: Option<(&str, &str)>,
     ) -> Result<(PoolLimit, u32)> {
-        let mut result = self
+        let not_own_row = if claiming_step.is_some() {
+            "AND (run_id != $run_id OR step_key != $step_key) "
+        } else {
+            ""
+        };
+        let mut query = self
             .db
-            .query(
+            .query(format!(
                 "SELECT * FROM concurrency_pools \
                      WHERE code_location_id = $cl AND pool_key = $pool_key LIMIT 1; \
                  SELECT math::sum(slots_consumed) AS total FROM concurrency_slots \
                      WHERE code_location_id = $cl AND pool_key = $pool_key \
-                     AND lease_expires_at > $now GROUP ALL",
-            )
+                     AND lease_expires_at > $now {not_own_row}GROUP ALL",
+            ))
             .bind(("cl", code_location_id.to_string()))
             .bind(("pool_key", pool_key.to_string()))
-            .bind(("now", now_ns))
-            .await?;
+            .bind(("now", now_ns));
+        if let Some((run_id, step_key)) = claiming_step {
+            query = query
+                .bind(("run_id", run_id.to_string()))
+                .bind(("step_key", step_key.to_string()));
+        }
+        let mut result = query.await?;
 
         let pools: Vec<PoolLimit> = result.take(0)?;
         let pool = pools
@@ -1486,11 +1666,71 @@ impl SurrealStorage {
         Ok((pool, claimed.unwrap_or(0)))
     }
 
+    /// SurrealQL predicate that finds a live slot conflicting with `scope` on
+    /// an implicit asset pool. Empty result = free to claim. Shared verbatim
+    /// by the pre-check probe and the claim transaction — the two enforce the
+    /// same rule and must never drift. `pool_param`/`parts_param` name the
+    /// bind parameters at each site.
+    ///
+    /// Two non-exclusive holders never conflict, so the cheap `exclusive` test
+    /// is first and the set comparison is skipped entirely on the hot path
+    /// (concurrent materializes). Beyond that a whole-asset scope (`NONE`)
+    /// conflicts with everything, and otherwise the partition sets must
+    /// actually intersect.
+    fn asset_conflict_predicate(
+        pool_param: &str,
+        parts_param: &str,
+        scope: Option<&AssetScope>,
+    ) -> String {
+        let (mine_exclusive, mine_is_whole_asset) = match scope {
+            Some(s) => (s.exclusive, s.partitions.is_none()),
+            // No scope supplied: treat as whole-asset exclusive, matching how a
+            // pre-V5 row (partitions NONE) reads back.
+            None => (true, true),
+        };
+        let overlap = if mine_is_whole_asset {
+            "true".to_string()
+        } else {
+            format!("(partitions IS NONE OR partitions CONTAINSANY ${parts_param})")
+        };
+        format!(
+            "SELECT VALUE id FROM concurrency_slots \
+                 WHERE code_location_id = $cl AND pool_key = ${pool_param} \
+                 AND lease_expires_at > $now \
+                 AND (run_id != $run_id OR step_key != $step_key) \
+                 AND ({mine_exclusive} OR exclusive) \
+                 AND {overlap} LIMIT 1"
+        )
+    }
+
+    /// The claim transaction's `LET` wrapper around the shared predicate.
+    fn asset_conflict_clause(i: usize, scope: Option<&AssetScope>) -> String {
+        format!(
+            "LET $conf_{i} = ({});\n",
+            Self::asset_conflict_predicate(&format!("p{i}"), &format!("parts{i}"), scope)
+        )
+    }
+
     /// Build a SurrealQL transaction that atomically checks capacity and claims slots.
-    fn build_claim_transaction(pools: &[(String, u32)]) -> String {
+    ///
+    /// `asset_pools` are the indices of `pools` whose admission is by partition
+    /// overlap instead of slot count; they still take their slot so the shared
+    /// `claim_version` bump keeps concurrent claims serialized.
+    fn build_claim_transaction(
+        pools: &[(String, u32)],
+        asset_pools: &[usize],
+        scope: Option<&AssetScope>,
+    ) -> String {
         let mut q = String::from("BEGIN TRANSACTION;\n");
 
+        // Asset pools are admitted by overlap, not capacity — their `$lim`/
+        // `$used` would be computed (a full slot aggregate inside the write
+        // transaction) and referenced by nothing. `$used` leaves out the
+        // step's own row, which the UPSERT below takes over.
         for (i, (_, _slots)) in pools.iter().enumerate() {
+            if asset_pools.contains(&i) {
+                continue;
+            }
             q += &format!(
                 "LET $lim_{i} = (SELECT VALUE slot_limit \
                      FROM concurrency_pools \
@@ -1499,15 +1739,29 @@ impl SurrealStorage {
                      FROM concurrency_slots \
                      WHERE code_location_id = $cl AND pool_key = $p{i} \
                      AND lease_expires_at > $now \
+                     AND (run_id != $run_id OR step_key != $step_key) \
                      GROUP ALL)[0] ?? 0;\n"
             );
         }
+        for &i in asset_pools {
+            q += &Self::asset_conflict_clause(i, scope);
+        }
 
-        let conditions: Vec<String> = pools
+        // Asset pools carry no capacity condition — they are admitted purely by
+        // partition overlap, so a limit of -1 (or any value) cannot switch the
+        // exclusion off. They still take a slot, which is what bumps
+        // `claim_version` and serializes concurrent claims.
+        let mut conditions: Vec<String> = pools
             .iter()
             .enumerate()
+            .filter(|(i, _)| !asset_pools.contains(i))
             .map(|(i, (_, slots))| format!("($used_{i} + {slots}) <= $lim_{i}"))
             .collect();
+        conditions.extend(
+            asset_pools
+                .iter()
+                .map(|i| format!("array::len($conf_{i}) == 0")),
+        );
         q += &format!("IF {} {{\n", conditions.join(" AND "));
 
         for i in 0..pools.len() {
@@ -1519,12 +1773,30 @@ impl SurrealStorage {
         }
 
         for (i, (_, slots)) in pools.iter().enumerate() {
+            let scope_fields = if asset_pools.contains(&i) {
+                match scope {
+                    Some(s) if s.partitions.is_some() => {
+                        format!(
+                            ", partitions = <set<string>> $parts{i}, exclusive = {}",
+                            s.exclusive
+                        )
+                    }
+                    Some(s) => format!(", partitions = NONE, exclusive = {}", s.exclusive),
+                    None => ", partitions = NONE, exclusive = true".to_string(),
+                }
+            } else {
+                String::new()
+            };
+            // A step run again under its run and step key (a retry pod, a
+            // resume) takes over the row its killed attempt left behind.
             q += &format!(
-                "  CREATE concurrency_slots SET \
+                "  UPSERT concurrency_slots SET \
                      code_location_id = $cl, \
                      pool_key = $p{i}, run_id = $run_id, step_key = $step_key, \
                      slots_consumed = {slots}, claimed_at = $now, \
-                     lease_expires_at = $lease_exp, last_heartbeat = $now;\n"
+                     lease_expires_at = $lease_exp, last_heartbeat = $now{scope_fields} \
+                     WHERE code_location_id = $cl AND pool_key = $p{i} \
+                     AND run_id = $run_id AND step_key = $step_key;\n"
             );
         }
 
@@ -1532,14 +1804,19 @@ impl SurrealStorage {
                   WHERE run_id = $run_id AND step_key = $step_key;\n";
         q += "};\n";
         q += "COMMIT TRANSACTION;\n";
+        // Only the rows this claim wrote: when the `IF` is false, the rows an
+        // earlier attempt of the step left behind are still there.
         q += "SELECT count() AS total FROM concurrency_slots \
-                  WHERE run_id = $run_id AND step_key = $step_key GROUP ALL;\n";
+                  WHERE run_id = $run_id AND step_key = $step_key \
+                  AND claimed_at = $now GROUP ALL;\n";
         q
     }
 
     /// Statement index of the post-COMMIT SELECT in the claim transaction query.
-    fn claim_check_statement_index(num_pools: usize) -> usize {
-        2 * num_pools + 3
+    /// Two capacity `LET`s per counted pool, one conflict `LET` per
+    /// asset-scoped pool.
+    fn claim_check_statement_index(num_pools: usize, num_asset_pools: usize) -> usize {
+        2 * (num_pools - num_asset_pools) + num_asset_pools + 3
     }
 
     async fn kv_get_json<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
@@ -1587,12 +1864,205 @@ fn swallow_phantom_commit(result: Result<()>, op: &'static str, id: &str) -> Res
     }
 }
 
+/// A whole-asset deletion's clearing, one transaction in `consolidate_deletion`.
+/// The data and the provenance each clear by their own time.
+const CLEAR_DELETED_ASSET: &str = "\
+     UPDATE assets SET last_event_id = $event_id, last_run_id = NONE, \
+     last_timestamp = NONE, last_data_version = NONE \
+     WHERE code_location_id = $cl AND asset_key = $asset_key \
+     AND last_timestamp <= $ts AND last_deletion_timestamp <= $ts; \
+     UPDATE assets SET last_materialization_code_version = NONE, \
+     last_input_data_versions = [], last_provenance_timestamp = NONE \
+     WHERE code_location_id = $cl AND asset_key = $asset_key \
+     AND last_provenance_timestamp <= $ts; \
+     UPDATE assets SET last_deletion_timestamp = IF last_deletion_timestamp > $ts \
+     THEN last_deletion_timestamp ELSE $ts END \
+     WHERE code_location_id = $cl AND asset_key = $asset_key; \
+     DELETE FROM asset_partitions WHERE code_location_id = $cl \
+     AND asset_key = $asset_key AND last_timestamp <= $ts;";
+
+/// Roll an `assets` row's data forward to a materialization event.
+const MATERIALIZE_ASSET_DATA: &str = "UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version WHERE code_location_id = $cl AND asset_key = $asset_key";
+
+/// Roll the row's provenance, the code version and inputs its data was built
+/// from, forward to the materialization that recorded them. An action run's
+/// `materialized()` writes none: it executed the verb body, not the asset's
+/// materialize function, so the pending code-version comparison
+/// (`code_version_changed()`, the Stale(Code) badge) must survive it.
+const MATERIALIZE_ASSET_PROVENANCE: &str = "UPDATE assets SET last_materialization_code_version = $mcv, last_input_data_versions = $idv, last_provenance_timestamp = $provenance_timestamp WHERE code_location_id = $cl AND asset_key = $asset_key";
+
+/// Same, keeping the inputs. An event that consumed no inputs — an action's
+/// `ActionResult.materialized()`, a mapped fan-out instance — reports an empty
+/// list because it never read upstream, not because upstream is gone. Writing
+/// it through would erase the real provenance and leave the asset permanently
+/// Stale against every dependency.
+const MATERIALIZE_ASSET_PROVENANCE_KEEP_IDV: &str = "UPDATE assets SET last_materialization_code_version = $mcv, last_provenance_timestamp = $provenance_timestamp WHERE code_location_id = $cl AND asset_key = $asset_key";
+
+/// Added to the data update: the `assets` row takes the materialization only
+/// when it holds no newer materialization and no newer whole-asset deletion.
+/// NONE sorts below every number. An `OR` in a WHERE drops the index, so the
+/// unset case is not spelled out.
+const MATERIALIZATION_IS_NEWER: &str =
+    "AND last_timestamp <= $timestamp AND last_deletion_timestamp < $timestamp";
+
+/// Added to each provenance update: the same rule by the provenance's own
+/// time. A newer action's `materialized()` moves the data only, so an older
+/// real materialization landing after it still records its provenance.
+const PROVENANCE_IS_NEWER: &str = "AND last_provenance_timestamp <= $provenance_timestamp AND last_deletion_timestamp < $provenance_timestamp";
+
+/// Ends `delete_partitions`' transaction: record the tombstones at each
+/// key's newest deletion time. The tombstone outlives the Deletion event:
+/// failure supersession reads it, and deleting the run must not undo the
+/// deletion. A later materialization of the key reads it too.
+const RECORD_PARTITION_TOMBSTONES: &str = "\
+     INSERT INTO asset_partition_deletions $rows ON DUPLICATE KEY UPDATE timestamp = \
+     IF $input.timestamp > timestamp THEN $input.timestamp ELSE timestamp END; \
+     COMMIT TRANSACTION;";
+
+/// Upsert `asset_partitions` rows on the UNIQUE index — one row per
+/// partition, newest event wins. A key deleted at or after its event, alone or
+/// with its whole asset, keeps no row. Always rides one transaction with the
+/// asset-row update above so the two never disagree under a concurrent
+/// whole-asset deletion. `$oldest` is the oldest event time in `$rows`.
+///
+/// The `assets` row is read before its update: its `last_timestamp` bounds
+/// every partition row's, so a batch no older than it takes the plain upsert.
+/// Only an older batch pays for the per-row time check. Its row update may
+/// write nothing, so it writes the `assets` row and puts it back. A concurrent
+/// whole-asset deletion writes that row too: one of the two then fails to
+/// commit and retries, and the deletion cannot miss this batch's new rows.
+///
+/// The keys' tombstones are read with an UPDATE that sets nothing, not a
+/// SELECT: only UPDATE and DELETE look up the object-valued `partition_key` on
+/// the UNIQUE index. A SELECT reads every tombstone of the asset. A DELETE
+/// gets that lookup only from a plain param, hence `$deleted_key`.
+const UPSERT_ASSET_PARTITIONS: &str = "\
+     LET $asset = (SELECT last_timestamp, last_deletion_timestamp, last_event_id FROM assets \
+         WHERE code_location_id = $cl AND asset_key = $asset_key)[0]; \
+     LET $live = IF $asset.last_deletion_timestamp >= $oldest { \
+         $rows[WHERE last_timestamp > $asset.last_deletion_timestamp] \
+     } ELSE { $rows }; \
+     IF $asset.last_timestamp > $oldest { \
+         UPDATE assets SET last_event_id = $event_id \
+             WHERE code_location_id = $cl AND asset_key = $asset_key; \
+         UPDATE assets SET last_event_id = $asset.last_event_id \
+             WHERE code_location_id = $cl AND asset_key = $asset_key; \
+         INSERT INTO asset_partitions $live ON DUPLICATE KEY UPDATE \
+         last_event_id = IF last_timestamp > $input.last_timestamp \
+             THEN last_event_id ELSE $input.last_event_id END, \
+         last_run_id = IF last_timestamp > $input.last_timestamp \
+             THEN last_run_id ELSE $input.last_run_id END, \
+         last_timestamp = IF last_timestamp > $input.last_timestamp \
+             THEN last_timestamp ELSE $input.last_timestamp END; \
+     } ELSE { \
+         INSERT INTO asset_partitions $live ON DUPLICATE KEY UPDATE \
+         last_event_id = $input.last_event_id, \
+         last_run_id = $input.last_run_id, \
+         last_timestamp = $input.last_timestamp; \
+     }; \
+     IF (SELECT VALUE timestamp FROM asset_partition_deletions \
+         WHERE code_location_id = $cl AND asset_key = $asset_key LIMIT 1) { \
+         FOR $deletion IN (UPDATE asset_partition_deletions \
+             WHERE code_location_id = $cl AND asset_key = $asset_key \
+             AND partition_key IN $keys AND timestamp >= $oldest \
+             RETURN partition_key, timestamp) { \
+             LET $deleted_key = $deletion.partition_key; \
+             DELETE FROM asset_partitions WHERE code_location_id = $cl \
+             AND asset_key = $asset_key AND partition_key = $deleted_key \
+             AND last_timestamp <= $deletion.timestamp; \
+         }; \
+     }";
+
+impl SurrealStorage {
+    /// Roll the `assets` row (and any partition rows, in one transaction)
+    /// forward to a materialization event — the single consolidation shared
+    /// by `store_event` and `store_events`. The data comes from the event at
+    /// `timestamp`, the provenance (`code_version`, `idv`) from the one at
+    /// `provenance_timestamp`: in a drain, the newest event that read inputs
+    /// can be older than the newest event. `from_action`: the event's run is
+    /// an action run AND no co-drained event supplied real provenance
+    /// (`idv`) — then no provenance is written, so a pending Stale(Code)
+    /// badge survives the verb.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_materialization(
+        &self,
+        cl: &str,
+        asset_key: &str,
+        event_id: &str,
+        run_id: &str,
+        timestamp: i64,
+        data_version: Option<String>,
+        provenance_timestamp: i64,
+        code_version: Option<String>,
+        idv: Option<Vec<(String, String)>>,
+        from_action: bool,
+        parts: Vec<DbAssetPartitionWrite>,
+    ) -> Result<()> {
+        let update_sql = format!("{MATERIALIZE_ASSET_DATA} {MATERIALIZATION_IS_NEWER}");
+        let update_sql = if from_action {
+            update_sql
+        } else {
+            let provenance_sql = if idv.is_some() {
+                MATERIALIZE_ASSET_PROVENANCE
+            } else {
+                MATERIALIZE_ASSET_PROVENANCE_KEEP_IDV
+            };
+            format!("{update_sql}; {provenance_sql} {PROVENANCE_IS_NEWER}")
+        };
+        // The asset row and its partition rows commit together — a concurrent
+        // whole-asset deletion lands wholly before or wholly after this
+        // materialization, never between the two. The partition upsert reads
+        // the asset row first, so it runs before the row's update. The data
+        // and provenance updates commit together too: no reader sees new data
+        // with the provenance of the materialization it replaced.
+        let has_parts = !parts.is_empty();
+        let sql = if has_parts {
+            format!(
+                "BEGIN TRANSACTION; {UPSERT_ASSET_PARTITIONS}; {update_sql}; COMMIT TRANSACTION;"
+            )
+        } else {
+            format!("BEGIN TRANSACTION; {update_sql}; COMMIT TRANSACTION;")
+        };
+        let mut query = self
+            .db
+            .query(sql)
+            .bind(("cl", cl.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .bind(("event_id", event_id.to_string()))
+            .bind(("run_id", run_id.to_string()))
+            .bind(("timestamp", timestamp))
+            .bind(("data_version", data_version));
+        if !from_action {
+            query = query
+                .bind(("provenance_timestamp", provenance_timestamp))
+                .bind(("mcv", code_version));
+            if let Some(idv) = idv {
+                query = query.bind(("idv", idv));
+            }
+        }
+        if has_parts {
+            let keys: Vec<PartitionKey> = parts.iter().map(|p| p.partition_key.clone()).collect();
+            let oldest = parts.iter().map(|p| p.last_timestamp).min();
+            query = query
+                .bind(("keys", keys))
+                .bind(("oldest", oldest))
+                .bind(("rows", parts));
+        }
+        query.await?.check()?;
+        Ok(())
+    }
+}
+
 impl StorageBackend for SurrealStorage {
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(cl = %event.code_location_id, asset_key = event.asset_key))]
     async fn store_event(&self, event: &EventRecord) -> Result<String> {
+        // Generated outside the retry closure: a replayed attempt re-inserts
+        // the same record id, which INSERT IGNORE turns into a no-op.
+        let record_id = new_event_record_id();
+        let event_id = record_id_str(&record_id);
         super::retry::with_retry(&self.retry_config, || async {
         let cl = event.code_location_id.as_str();
-        let mut db_event = DbEventWrite::from(event);
+        let mut db_event = DbEventWrite::from_event(event, record_id.clone());
 
         let mut materialization_code_version: Option<String> = None;
         if let Some(asset_key) = &event.asset_key
@@ -1603,44 +2073,50 @@ impl StorageBackend for SurrealStorage {
                 materialization_code_version = cv;
             }
 
-        let result: Option<DbStoredEvent> = self
-            .db
-            .create("events")
-            .content(db_event)
+        self.db
+            .query("INSERT IGNORE INTO events $rows RETURN NONE")
+            .bind(("rows", vec![db_event]))
             .await
-            .context("failed to store event")?;
-        let stored = result.context("no event returned from create")?;
-        let event_id = record_id_str(&stored.id);
+            .context("failed to store event")?
+            .check()?;
+        let event_id = event_id.clone();
 
         if let Some(asset_key) = &event.asset_key
             && event.event_type.is_materialization() {
-                let code_version = materialization_code_version;
                 let input_data_versions = event.input_data_versions.clone();
-
-                let data_version = event.event_type.data_version().map(|s| s.to_string());
-                self.db
-                    .query("UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv, last_input_data_versions = $idv WHERE code_location_id = $cl AND asset_key = $asset_key")
-                    .bind(("cl", cl.to_string()))
-                    .bind(("asset_key", asset_key.clone()))
-                    .bind(("event_id", event_id.clone()))
-                    .bind(("run_id", event.run_id.clone()))
-                    .bind(("timestamp", event.timestamp))
-                    .bind(("data_version", data_version))
-                    .bind(("mcv", code_version))
-                    .bind(("idv", input_data_versions))
-                    .await?;
-
-                if let Some(partition_key) = &event.partition_key {
-                    self.upsert_asset_partitions(vec![DbAssetPartitionWrite {
-                        code_location_id: cl.to_string(),
-                        asset_key: asset_key.clone(),
-                        partition_key: partition_key.clone(),
-                        last_event_id: event_id.clone(),
-                        last_run_id: event.run_id.clone(),
-                        last_timestamp: event.timestamp,
-                    }])
-                    .await?;
-                }
+                let is_action = !self
+                    .action_run_ids(vec![event.run_id.clone()])
+                    .await?
+                    .is_empty();
+                let idv = (!input_data_versions.is_empty()).then_some(input_data_versions);
+                let parts = event
+                    .partition_key
+                    .as_ref()
+                    .map(|partition_key| {
+                        vec![DbAssetPartitionWrite {
+                            code_location_id: cl.to_string(),
+                            asset_key: asset_key.clone(),
+                            partition_key: partition_key.clone(),
+                            last_event_id: event_id.clone(),
+                            last_run_id: event.run_id.clone(),
+                            last_timestamp: event.timestamp,
+                        }]
+                    })
+                    .unwrap_or_default();
+                self.apply_materialization(
+                    cl,
+                    asset_key,
+                    &event_id,
+                    &event.run_id,
+                    event.timestamp,
+                    event.event_type.data_version().map(|s| s.to_string()),
+                    event.timestamp,
+                    materialization_code_version,
+                    idv,
+                    is_action,
+                    parts,
+                )
+                .await?;
             }
 
         if let Some(asset_key) = &event.asset_key
@@ -1653,7 +2129,13 @@ impl StorageBackend for SurrealStorage {
                     .bind(("event_id", event_id.clone()))
                     .bind(("timestamp", event.timestamp))
                     .bind(("data_version", data_version))
-                    .await?;
+                    .await?
+                    .check()?;
+            }
+
+        if let Some(asset_key) = &event.asset_key
+            && event.event_type.is_deletion() {
+                self.consolidate_deletion(cl, asset_key, event, &event_id).await?;
             }
 
         Ok(event_id)
@@ -1663,23 +2145,34 @@ impl StorageBackend for SurrealStorage {
 
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = events.len()))]
     async fn store_events(&self, events: &[EventRecord]) -> Result<Vec<String>> {
-        super::retry::with_retry(&self.retry_config, || async {
         if events.is_empty() {
             return Ok(vec![]);
         }
-
-        let db_events: Vec<DbEventWrite> = events.iter().map(DbEventWrite::from).collect();
-        let results: Vec<DbStoredEvent> = self
-            .db
-            .insert("events")
-            .content(db_events)
+        // Ids generated outside the retry closure: one consolidation conflict
+        // replays the whole drained batch, and INSERT IGNORE needs the same
+        // record ids to turn the re-insert into a no-op.
+        let rows: Vec<DbEventWrite> = events
+            .iter()
+            .map(|e| DbEventWrite::from_event(e, new_event_record_id()))
+            .collect();
+        let event_ids: Vec<String> = rows.iter().map(|r| record_id_str(&r.id)).collect();
+        super::retry::with_retry(&self.retry_config, || async {
+        self.db
+            .query("INSERT IGNORE INTO events $rows RETURN NONE")
+            .bind(("rows", rows.clone()))
             .await
-            .context("failed to batch store events")?;
+            .context("failed to batch store events")?
+            .check()?;
 
-        let event_ids: Vec<String> = results.iter().map(|e| record_id_str(&e.id)).collect();
-
-        // Group materializations by asset (latest wins), then one bulk upsert.
+        // Group materializations by asset, then one bulk upsert. The newest
+        // event wins, by time, not by place in the drain: the `assets` row
+        // must hold a time no older than any of its partition rows.
         let mut latest_mat: std::collections::HashMap<(&str, &str), usize> =
+            std::collections::HashMap::new();
+        // Latest event that actually consumed inputs, tracked apart from
+        // `latest_mat` so an action's provenance-free materialization landing
+        // in the same drain doesn't drop a real materialize's provenance.
+        let mut latest_idv: std::collections::HashMap<(&str, &str), usize> =
             std::collections::HashMap::new();
         let mut part_rows: std::collections::HashMap<
             (&str, &str, &PartitionKey),
@@ -1694,45 +2187,91 @@ impl StorageBackend for SurrealStorage {
                 continue;
             }
             let cl = event.code_location_id.as_str();
-            latest_mat.insert((cl, asset_key.as_str()), idx);
+            let key = (cl, asset_key.as_str());
+            let newest = |held: Option<&usize>| {
+                held.is_none_or(|&i| events[i].timestamp <= event.timestamp)
+            };
+            if newest(latest_mat.get(&key)) {
+                latest_mat.insert(key, idx);
+            }
+            if !event.input_data_versions.is_empty() && newest(latest_idv.get(&key)) {
+                latest_idv.insert(key, idx);
+            }
             if let Some(partition_key) = &event.partition_key {
-                part_rows.insert(
-                    (cl, asset_key.as_str(), partition_key),
-                    DbAssetPartitionWrite {
-                        code_location_id: cl.to_string(),
-                        asset_key: asset_key.clone(),
-                        partition_key: partition_key.clone(),
-                        last_event_id: event_id.clone(),
-                        last_run_id: event.run_id.clone(),
-                        last_timestamp: event.timestamp,
-                    },
-                );
+                let part = (cl, asset_key.as_str(), partition_key);
+                if part_rows
+                    .get(&part)
+                    .is_none_or(|held| held.last_timestamp <= event.timestamp)
+                {
+                    part_rows.insert(
+                        part,
+                        DbAssetPartitionWrite {
+                            code_location_id: cl.to_string(),
+                            asset_key: asset_key.clone(),
+                            partition_key: partition_key.clone(),
+                            last_event_id: event_id.clone(),
+                            last_run_id: event.run_id.clone(),
+                            last_timestamp: event.timestamp,
+                        },
+                    );
+                }
             }
         }
 
-        // One `assets` row update per materialized asset (latest event wins).
+        // One `assets` row update per materialized asset (newest event wins).
+        let update_run_ids: Vec<String> = latest_mat
+            .values()
+            .map(|&idx| events[idx].run_id.clone())
+            .collect::<std::collections::HashSet<String>>()
+            .into_iter()
+            .collect();
+        let action_ids = self.action_run_ids(update_run_ids).await?;
+        // Each asset's partition rows commit in one transaction with its
+        // `assets` row update — a concurrent whole-asset deletion lands
+        // wholly before or wholly after, never between the two. Every
+        // partition row comes from a materialization event, so its asset is
+        // always in `latest_mat`.
+        let mut parts_by_asset: std::collections::HashMap<(&str, &str), Vec<DbAssetPartitionWrite>> =
+            std::collections::HashMap::new();
+        for ((cl, ak, _), row) in part_rows {
+            parts_by_asset.entry((cl, ak)).or_default().push(row);
+        }
         for (&(cl, asset_key), &idx) in &latest_mat {
             let event = &events[idx];
             let event_id = &event_ids[idx];
-            let code_version = self.get_code_version(cl, asset_key).await?;
-            let data_version = event.event_type.data_version().map(|s| s.to_string());
-            self.db
-                .query("UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version, last_materialization_code_version = $mcv, last_input_data_versions = $idv WHERE code_location_id = $cl AND asset_key = $asset_key")
-                .bind(("cl", cl.to_string()))
-                .bind(("asset_key", asset_key.to_string()))
-                .bind(("event_id", event_id.clone()))
-                .bind(("run_id", event.run_id.clone()))
-                .bind(("timestamp", event.timestamp))
-                .bind(("data_version", data_version))
-                .bind(("mcv", code_version))
-                .bind(("idv", event.input_data_versions.clone()))
-                .await?;
+            let idv_event = latest_idv.get(&(cl, asset_key)).map(|&i| &events[i]);
+            let idv = idv_event.map(|e| e.input_data_versions.clone());
+            let provenance_timestamp = idv_event.map_or(event.timestamp, |e| e.timestamp);
+            // A co-drained real materialize (the `idv` entry) legitimately
+            // owns provenance and the code-version stamp even when the
+            // action's event is the newer one.
+            let action_only = action_ids.contains(&event.run_id) && idv.is_none();
+            let code_version = if action_only {
+                None
+            } else {
+                self.get_code_version(cl, asset_key).await?
+            };
+            let parts = parts_by_asset.remove(&(cl, asset_key)).unwrap_or_default();
+            self.apply_materialization(
+                cl,
+                asset_key,
+                event_id,
+                &event.run_id,
+                event.timestamp,
+                event.event_type.data_version().map(|s| s.to_string()),
+                provenance_timestamp,
+                code_version,
+                idv,
+                action_only,
+                parts,
+            )
+            .await?;
         }
 
-        // Upsert the affected partition rows in one bulk statement.
-        self.upsert_asset_partitions(part_rows.into_values().collect())
-            .await?;
-
+        // Partition-scoped deletions collapse to one DELETE per asset — a
+        // purge over a date range lands thousands of them in one drain.
+        let mut part_deletes: HashMap<(&str, &str), Vec<(PartitionKey, i64)>> = HashMap::new();
+        let mut whole_deletes: HashMap<(&str, &str), (&EventRecord, &String)> = HashMap::new();
         for (event, event_id) in events.iter().zip(event_ids.iter()) {
             let cl = event.code_location_id.as_str();
             if let Some(asset_key) = &event.asset_key
@@ -1745,11 +2284,39 @@ impl StorageBackend for SurrealStorage {
                         .bind(("event_id", event_id.clone()))
                         .bind(("timestamp", event.timestamp))
                         .bind(("data_version", data_version))
-                        .await?;
+                        .await?
+                        .check()?;
+                }
+            if let Some(asset_key) = &event.asset_key
+                && event.event_type.is_deletion() {
+                    match &event.partition_key {
+                        Some(pk) => part_deletes
+                            .entry((cl, asset_key.as_str()))
+                            .or_default()
+                            .push((pk.clone(), event.timestamp)),
+                        // The newest deletion per asset wins — repeats in one
+                        // drain only re-clear the same row.
+                        None => {
+                            let key = (cl, asset_key.as_str());
+                            if whole_deletes
+                                .get(&key)
+                                .is_none_or(|(held, _)| held.timestamp <= event.timestamp)
+                            {
+                                whole_deletes.insert(key, (event, event_id));
+                            }
+                        }
+                    }
                 }
         }
+        for ((cl, asset_key), (event, event_id)) in whole_deletes {
+            self.consolidate_deletion(cl, asset_key, event, event_id)
+                .await?;
+        }
+        for ((cl, asset_key), deletions) in part_deletes {
+            self.delete_partitions(cl, asset_key, deletions).await?;
+        }
 
-        Ok(event_ids)
+        Ok(event_ids.clone())
         })
         .await
     }
@@ -1838,6 +2405,48 @@ impl StorageBackend for SurrealStorage {
                     })
                 })
                 .collect())
+        })
+        .await
+    }
+
+    /// The index hint makes `run_id IN $run_ids` a union of index scans, one
+    /// per run; left to itself the planner scans every Materialization event
+    /// on `idx_events_type`. `asset_key` is matched here, as in `step_outcomes`.
+    async fn materialized_by_runs(
+        &self,
+        asset_keys: &[String],
+        run_ids: &[String],
+    ) -> Result<HashMap<String, HashSet<String>>> {
+        if asset_keys.is_empty() || run_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let wanted: HashSet<&str> = asset_keys.iter().map(String::as_str).collect();
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(
+                    "SELECT asset_key, run_id FROM events WITH INDEX idx_events_run_type \
+                     WHERE run_id IN $run_ids AND event_type = 'Materialization' \
+                     GROUP BY asset_key, run_id",
+                )
+                .bind(("run_ids", run_ids.to_vec()))
+                .await?;
+
+            #[derive(SurrealValue)]
+            struct Row {
+                asset_key: Option<String>,
+                run_id: String,
+            }
+            let rows: Vec<Row> = result.take(0)?;
+            let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+            for row in rows {
+                if let Some(asset_key) = row.asset_key
+                    && wanted.contains(asset_key.as_str())
+                {
+                    out.entry(asset_key).or_default().insert(row.run_id);
+                }
+            }
+            Ok(out)
         })
         .await
     }
@@ -2748,6 +3357,65 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
+    async fn get_step_attempts(
+        &self,
+        run_id: &str,
+    ) -> Result<HashMap<String, super::StepAttempts>> {
+        super::retry::with_retry(&self.retry_config, || async {
+            // One statement per type so each anchors on idx_events_run_type.
+            let mut result = self
+                .db
+                .query(
+                    "SELECT asset_key FROM events \
+                         WHERE run_id = $run_id AND event_type = 'StepStart'; \
+                     SELECT asset_key FROM events \
+                         WHERE run_id = $run_id AND event_type = 'StepFailure' \
+                         AND partition_key IS NONE; \
+                     SELECT asset_key FROM events \
+                         WHERE run_id = $run_id AND event_type = 'StepRetry'; \
+                     SELECT asset_key, partition_key FROM events \
+                         WHERE run_id = $run_id AND event_type = 'StepFailure' \
+                         AND partition_key IS NOT NONE;",
+                )
+                .bind(("run_id", run_id.to_string()))
+                .await?;
+
+            #[derive(SurrealValue, serde::Deserialize)]
+            struct Row {
+                asset_key: Option<String>,
+            }
+            #[derive(SurrealValue)]
+            struct KeyedRow {
+                asset_key: Option<String>,
+                partition_key: PartitionKey,
+            }
+            let mut out: HashMap<String, super::StepAttempts> = HashMap::new();
+            let started: Vec<Row> = result.take(0)?;
+            for key in started.into_iter().filter_map(|r| r.asset_key) {
+                out.entry(key).or_default().starts += 1;
+            }
+            let failed: Vec<Row> = result.take(1)?;
+            for key in failed.into_iter().filter_map(|r| r.asset_key) {
+                out.entry(key).or_default().failed = true;
+            }
+            let retries: Vec<Row> = result.take(2)?;
+            for key in retries.into_iter().filter_map(|r| r.asset_key) {
+                out.entry(key).or_default().retries += 1;
+            }
+            let keyed: Vec<KeyedRow> = result.take(3)?;
+            for row in keyed {
+                if let Some(key) = row.asset_key {
+                    out.entry(key)
+                        .or_default()
+                        .failed_keys
+                        .extend(row.partition_key.members());
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     async fn get_step_data_versions(&self, run_id: &str) -> Result<HashMap<String, String>> {
         super::retry::with_retry(&self.retry_config, || async {
             let mut result = self
@@ -2993,9 +3661,9 @@ impl PerCodeLocationStorage for SurrealStorage {
                 "SELECT count() AS total FROM concurrency_slots \
                      WHERE lease_expires_at <= $now GROUP ALL; \
                  DELETE FROM concurrency_slots WHERE lease_expires_at <= $now; \
-                 SELECT run_id, code_location_id, tags, node_names, job_name, priority, partition_key, start_time \
+                 SELECT run_id, code_location_id, tags, node_names, job_name, priority, partition_key, start_time, action \
                      FROM runs WHERE status IN ['NotStarted', 'Started'] AND code_location_id = $cl; \
-                 SELECT run_id, code_location_id, tags, node_names, job_name, priority, partition_key, start_time \
+                 SELECT run_id, code_location_id, tags, node_names, job_name, priority, partition_key, start_time, action \
                      FROM runs WHERE status = 'Queued' AND code_location_id = $cl",
             )
             .bind(("now", now_ns))
@@ -3377,7 +4045,7 @@ impl PerCodeLocationStorage for SurrealStorage {
     ) -> Result<Vec<(PartitionKey, i64)>> {
         let mut result = self
             .db
-            .query("SELECT partition_key, last_timestamp FROM asset_partitions WHERE code_location_id = $cl AND asset_key = $asset_key AND last_timestamp IS NOT NULL")
+            .query("SELECT partition_key, last_timestamp FROM asset_partitions WHERE code_location_id = $cl AND asset_key = $asset_key AND last_timestamp IS NOT NONE")
             .bind(("cl", code_location_id.to_string()))
             .bind(("asset_key", asset_key.to_string()))
             .await?;
@@ -3426,18 +4094,56 @@ impl PerCodeLocationStorage for SurrealStorage {
             .collect())
     }
 
+    async fn get_partition_timestamps_for_keys(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        keys: &[PartitionKey],
+    ) -> Result<Vec<(PartitionKey, i64, Option<String>)>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut result = self
+            .db
+            .query(
+                "SELECT partition_key, last_timestamp, last_run_id FROM asset_partitions \
+                 WHERE code_location_id = $cl AND asset_key = $asset_key \
+                 AND partition_key IN $keys AND last_timestamp IS NOT NONE",
+            )
+            .bind(("cl", code_location_id.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .bind(("keys", keys.to_vec()))
+            .await?;
+
+        #[derive(Debug, SurrealValue)]
+        struct PartTsRow {
+            partition_key: PartitionKey,
+            last_timestamp: i64,
+            last_run_id: Option<String>,
+        }
+
+        let rows: Vec<PartTsRow> = result.take(0)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.partition_key, r.last_timestamp, r.last_run_id))
+            .collect())
+    }
+
     async fn get_in_progress_partitions(
         &self,
         code_location_id: &str,
         asset_key: &str,
     ) -> Result<Vec<PartitionKey>> {
+        // `action IS NONE`: an in-flight action is not an in-flight
+        // materialization. Without it a long `optimize` reads as in-flight and
+        // `eager()` suppresses the asset and every dependent for its duration.
         let mut result = self
             .db
             .query(
                 "SELECT partition_key FROM events WHERE code_location_id = $cl AND asset_key = $asset_key \
                  AND event_type = 'StepStart' AND partition_key IS NOT NONE \
                  AND run_id IN (SELECT VALUE run_id FROM runs WHERE code_location_id = $cl AND status = 'Started' \
-                 AND $asset_key IN node_names) \
+                 AND action IS NONE AND $asset_key IN node_names) \
                  GROUP BY partition_key",
             )
             .bind(("cl", code_location_id.to_string()))
@@ -3459,16 +4165,60 @@ impl PerCodeLocationStorage for SurrealStorage {
         asset_key: &str,
         materialized: &std::collections::HashMap<PartitionKey, i64>,
     ) -> Result<std::collections::HashMap<PartitionKey, i64>> {
+        // One narrow scan serves both consumers below — `$asset_key IN
+        // node_names` defeats every index, so each extra runs query here is a
+        // full table walk per invalidated asset per tick. (An inline subquery
+        // is worse, not better: SurrealDB re-evaluates a non-planner-computable
+        // WHERE per outer row.) The predicate keeps only the rows the two
+        // consumers read — action runs and failures — so a hot asset's
+        // thousands of clean materializes never leave the database.
+        let mut result = self
+            .db
+            .query(
+                "SELECT run_id, status, action, partition_key, start_time, end_time \
+                 FROM runs \
+                 WHERE code_location_id = $cl AND $asset_key IN node_names \
+                 AND (action IS NOT NONE OR status = 'Failure')",
+            )
+            .bind(("cl", code_location_id.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .await?;
+
+        #[derive(Debug, SurrealValue)]
+        struct RunScanRow {
+            run_id: String,
+            status: String,
+            action: Option<String>,
+            partition_key: Option<PartitionKey>,
+            start_time: i64,
+            end_time: Option<i64>,
+        }
+
+        let scan: Vec<RunScanRow> = result.take(0)?;
+
+        // A failed action did not fail to *materialize* anything, so it must not
+        // floor a partition here: the floor is cleared only by a materialization,
+        // which the floor itself then suppresses. Keyed StepFailure events from
+        // action runs stay in storage — backfill accounting reads them — so the
+        // filtering belongs on this reader, not on the emitter.
+        let action_runs: Vec<String> = scan
+            .iter()
+            .filter(|r| r.action.is_some())
+            .map(|r| r.run_id.clone())
+            .collect();
+
         let mut result = self
             .db
             .query(
                 "SELECT partition_key, math::max(timestamp) AS ts FROM events \
                  WHERE code_location_id = $cl AND asset_key = $asset_key \
                  AND event_type = 'StepFailure' AND partition_key IS NOT NONE \
+                 AND run_id NOT IN $action_runs \
                  GROUP BY partition_key",
             )
             .bind(("cl", code_location_id.to_string()))
             .bind(("asset_key", asset_key.to_string()))
+            .bind(("action_runs", action_runs))
             .await?;
 
         #[derive(Debug, SurrealValue)]
@@ -3489,37 +4239,149 @@ impl PerCodeLocationStorage for SurrealStorage {
             }
         }
 
+        // A run that materialized one of this asset's partitions and then failed
+        // on another asset did not fail that partition — the unpartitioned
+        // path's `materialized_here` rule. Read off the run's own events, not
+        // the partition row, which a delete or a newer run moves off the run.
+        // The index hint anchors the scan on the runs, as in
+        // `materialized_by_runs`.
+        let failed_keyed_runs: Vec<String> = scan
+            .iter()
+            .filter(|r| r.status == "Failure" && r.action.is_none() && r.partition_key.is_some())
+            .map(|r| r.run_id.clone())
+            .collect();
+        let mut materialized_by: std::collections::HashMap<PartitionKey, HashSet<String>> =
+            std::collections::HashMap::new();
+        if !failed_keyed_runs.is_empty() {
+            let mut result = self
+                .db
+                .query(
+                    "SELECT partition_key, run_id FROM events WITH INDEX idx_events_run_type \
+                     WHERE run_id IN $runs AND event_type = 'Materialization' \
+                     AND asset_key = $asset_key AND partition_key IS NOT NONE",
+                )
+                .bind(("asset_key", asset_key.to_string()))
+                .bind(("runs", failed_keyed_runs))
+                .await?;
+
+            #[derive(Debug, SurrealValue)]
+            struct BuiltRow {
+                partition_key: PartitionKey,
+                run_id: String,
+            }
+
+            let built: Vec<BuiltRow> = result.take(0)?;
+            for row in built {
+                for member in row.partition_key.members() {
+                    materialized_by
+                        .entry(member)
+                        .or_default()
+                        .insert(row.run_id.clone());
+                }
+            }
+        }
+
+        for row in &scan {
+            if row.status != "Failure" || row.action.is_some() {
+                continue;
+            }
+            let Some(pk) = &row.partition_key else {
+                continue;
+            };
+            // End-time basis, like every other reader of the supersession
+            // rule: the failure happens when the run ends, so a deletion
+            // during the run must not outrank it.
+            let ts = row.end_time.unwrap_or(row.start_time);
+            for member in pk.members() {
+                if materialized_by
+                    .get(&member)
+                    .is_some_and(|runs| runs.contains(&row.run_id))
+                {
+                    continue;
+                }
+                latest_failure
+                    .entry(member)
+                    .and_modify(|t| *t = (*t).max(ts))
+                    .or_insert(ts);
+            }
+        }
+
+        // A deletion supersedes older failures the same way a newer
+        // materialization does: deleting a partition removes the timestamp row
+        // that superseded them, so without this the partition resurrects as
+        // failed on the next load — and `eager()`'s failure gate then keeps it
+        // from ever being rebuilt. A whole-asset deletion covers every key.
+        // Read off the tombstone rows, which outlive the delete run's events.
         let mut result = self
             .db
             .query(
-                "SELECT partition_key, start_time FROM runs \
-                 WHERE code_location_id = $cl AND status = 'Failure' \
-                 AND $asset_key IN node_names AND partition_key IS NOT NONE",
+                "SELECT partition_key, timestamp AS ts FROM asset_partition_deletions \
+                 WHERE code_location_id = $cl AND asset_key = $asset_key; \
+                 SELECT last_deletion_timestamp AS ts FROM assets \
+                 WHERE code_location_id = $cl AND asset_key = $asset_key \
+                 AND last_deletion_timestamp IS NOT NONE;",
             )
             .bind(("cl", code_location_id.to_string()))
             .bind(("asset_key", asset_key.to_string()))
             .await?;
 
         #[derive(Debug, SurrealValue)]
-        struct RunFailRow {
+        struct DelRow {
             partition_key: PartitionKey,
-            start_time: i64,
+            ts: i64,
+        }
+        #[derive(Debug, SurrealValue)]
+        struct AssetDelRow {
+            ts: i64,
         }
 
-        let run_rows: Vec<RunFailRow> = result.take(0)?;
-        for row in run_rows {
+        let del_rows: Vec<DelRow> = result.take(0)?;
+        let mut latest_deletion: std::collections::HashMap<PartitionKey, i64> =
+            std::collections::HashMap::new();
+        for row in del_rows {
             for member in row.partition_key.members() {
-                latest_failure
+                latest_deletion
                     .entry(member)
-                    .and_modify(|t| *t = (*t).max(row.start_time))
-                    .or_insert(row.start_time);
+                    .and_modify(|t| *t = (*t).max(row.ts))
+                    .or_insert(row.ts);
             }
         }
+        let asset_rows: Vec<AssetDelRow> = result.take(1)?;
+        let asset_deletion_ts: Option<i64> = asset_rows.into_iter().map(|r| r.ts).max();
 
         Ok(latest_failure
             .into_iter()
-            .filter(|(pk, ts)| materialized.get(pk).is_none_or(|&mat_ts| mat_ts < *ts))
+            .filter(|(pk, ts)| {
+                let deleted_at = latest_deletion.get(pk).copied().max(asset_deletion_ts);
+                materialized.get(pk).is_none_or(|&mat_ts| mat_ts < *ts)
+                    && deleted_at.is_none_or(|del_ts| del_ts < *ts)
+            })
             .collect())
+    }
+
+    async fn get_asset_deletion_timestamps(
+        &self,
+        code_location_id: &str,
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        // The asset rows, not Deletion events: the time outlives the delete
+        // run, and a code location has far fewer assets than deletions.
+        let mut result = self
+            .db
+            .query(
+                "SELECT asset_key, last_deletion_timestamp AS ts FROM assets \
+                 WHERE code_location_id = $cl AND last_deletion_timestamp IS NOT NONE",
+            )
+            .bind(("cl", code_location_id.to_string()))
+            .await?;
+
+        #[derive(Debug, SurrealValue)]
+        struct DelTsRow {
+            asset_key: String,
+            ts: i64,
+        }
+
+        let rows: Vec<DelTsRow> = result.take(0)?;
+        Ok(rows.into_iter().map(|r| (r.asset_key, r.ts)).collect())
     }
 
     async fn get_backfills(
@@ -3558,21 +4420,29 @@ impl PerCodeLocationStorage for SurrealStorage {
         limit: i32,
         lease_duration_secs: u32,
     ) -> Result<()> {
-        self.db
-            .query(
-                "UPSERT concurrency_pools SET \
-                     code_location_id = $cl, \
-                     pool_key = $pool_key, \
-                     slot_limit = $slot_limit, \
-                     lease_duration_secs = $lease_duration_secs \
-                 WHERE code_location_id = $cl AND pool_key = $pool_key",
-            )
-            .bind(("cl", code_location_id.to_string()))
-            .bind(("pool_key", pool_key.to_string()))
-            .bind(("slot_limit", limit))
-            .bind(("lease_duration_secs", lease_duration_secs))
-            .await?;
-        Ok(())
+        // These rows are load-bearing: a lost `__asset__:` registration makes
+        // every claim on that asset hard-fail "pool not configured". Bare
+        // `.await?` swallows per-statement errors (conflicts included), and
+        // without them surfacing the retry never fires.
+        super::retry::with_retry(&self.retry_config, || async {
+            self.db
+                .query(
+                    "UPSERT concurrency_pools SET \
+                         code_location_id = $cl, \
+                         pool_key = $pool_key, \
+                         slot_limit = $slot_limit, \
+                         lease_duration_secs = $lease_duration_secs \
+                     WHERE code_location_id = $cl AND pool_key = $pool_key",
+                )
+                .bind(("cl", code_location_id.to_string()))
+                .bind(("pool_key", pool_key.to_string()))
+                .bind(("slot_limit", limit))
+                .bind(("lease_duration_secs", lease_duration_secs))
+                .await?
+                .check()?;
+            Ok(())
+        })
+        .await
     }
 
     async fn get_pool_limits(&self, code_location_id: &str) -> Result<Vec<PoolLimit>> {
@@ -3588,7 +4458,7 @@ impl PerCodeLocationStorage for SurrealStorage {
     async fn get_pool_info(&self, code_location_id: &str, pool_key: &str) -> Result<PoolInfo> {
         let now_ns = now_nanos();
         let (pool, claimed_count) = self
-            .query_pool_usage(code_location_id, pool_key, now_ns)
+            .query_pool_usage(code_location_id, pool_key, now_ns, None)
             .await?;
 
         let mut result = self
@@ -3671,6 +4541,7 @@ impl PerCodeLocationStorage for SurrealStorage {
         step_key: &str,
         priority: i32,
         lease_duration_secs: u32,
+        scope: Option<&AssetScope>,
     ) -> Result<ConcurrencyClaimStatus> {
         anyhow::ensure!(!pools.is_empty(), "pools must not be empty");
 
@@ -3689,6 +4560,7 @@ impl PerCodeLocationStorage for SurrealStorage {
                 step_key,
                 priority,
                 lease_duration_secs,
+                scope,
             )
             .await
         })
@@ -3853,6 +4725,47 @@ impl PerCodeLocationStorage for SurrealStorage {
 }
 
 impl SurrealStorage {
+    /// Whether a live slot on `pool_key` conflicts with `scope`. Mirrors
+    /// [`Self::asset_conflict_clause`] so the pre-check and the transaction
+    /// agree on what "blocked" means.
+    /// Asset-pool pre-check, one round trip: the existence probe (whose
+    /// missing-row error is load-bearing — without a `concurrency_pools` row
+    /// the claim transaction's `claim_version` bump matches nothing, silently
+    /// removing the fence that serializes claims) plus the same conflict rule
+    /// the transaction enforces. Returns whether a live slot conflicts.
+    async fn asset_pool_precheck(
+        &self,
+        code_location_id: &str,
+        pool_key: &str,
+        run_id: &str,
+        step_key: &str,
+        now_ns: i64,
+        scope: Option<&AssetScope>,
+    ) -> Result<bool> {
+        let mine_parts = scope.and_then(|s| s.partitions.clone());
+        let mut q = self
+            .db
+            .query(format!(
+                "SELECT VALUE 1 FROM concurrency_pools \
+                 WHERE code_location_id = $cl AND pool_key = $pool_key LIMIT 1; \
+                 {}",
+                Self::asset_conflict_predicate("pool_key", "parts", scope)
+            ))
+            .bind(("cl", code_location_id.to_string()))
+            .bind(("pool_key", pool_key.to_string()))
+            .bind(("run_id", run_id.to_string()))
+            .bind(("step_key", step_key.to_string()))
+            .bind(("now", now_ns));
+        if let Some(parts) = mine_parts {
+            q = q.bind(("parts", parts));
+        }
+        let mut response = q.await?;
+        let exists: Vec<i64> = response.take(0)?;
+        anyhow::ensure!(!exists.is_empty(), "pool '{}' not configured", pool_key);
+        let hits: Vec<RecordId> = response.take(1)?;
+        Ok(!hits.is_empty())
+    }
+
     /// One attempt of the [`PerCodeLocationStorage::claim_concurrency_slots`] flow.
     async fn try_claim_concurrency_slots_once(
         &self,
@@ -3862,15 +4775,48 @@ impl SurrealStorage {
         step_key: &str,
         priority: i32,
         lease_duration_secs: u32,
+        scope: Option<&AssetScope>,
     ) -> Result<ConcurrencyClaimStatus> {
         let now_ns = now_nanos();
         let lease_exp = now_ns + (lease_duration_secs as i64) * 1_000_000_000;
 
         let mut blocked = Vec::new();
         let mut limited_pools: Vec<(String, u32)> = Vec::new();
+        let mut asset_pools: Vec<usize> = Vec::new();
         for (pool_key, slots_needed) in pools {
+            // An implicit asset pool is never "unlimited": its admission is by
+            // partition overlap, not capacity, so dropping it here would remove
+            // the exclusion *and* the shared `claim_version` write that fences
+            // concurrent claims. `rivers pools set __asset__:x -1` must not be
+            // able to switch destructive-action exclusion off. The pre-check
+            // enforces the same overlap rule as the transaction — without it a
+            // step blocked purely by scope would fall through, fail the
+            // transaction's `IF`, and surface as PoolContended, which retries
+            // and then hard-fails instead of waiting like any blocked claim.
+            if pool_key.starts_with(ASSET_POOL_PREFIX) {
+                let conflict = self
+                    .asset_pool_precheck(
+                        code_location_id,
+                        pool_key,
+                        run_id,
+                        step_key,
+                        now_ns,
+                        scope,
+                    )
+                    .await?;
+                if conflict {
+                    blocked.push(PoolBlockDetail {
+                        pool_key: pool_key.clone(),
+                        claimed: 1,
+                        limit: 1,
+                    });
+                }
+                asset_pools.push(limited_pools.len());
+                limited_pools.push((pool_key.clone(), *slots_needed));
+                continue;
+            }
             let (pool, current_used) = self
-                .query_pool_usage(code_location_id, pool_key, now_ns)
+                .query_pool_usage(code_location_id, pool_key, now_ns, Some((run_id, step_key)))
                 .await?;
             if pool.slot_limit < 0 {
                 continue;
@@ -3934,10 +4880,15 @@ impl SurrealStorage {
             });
         }
 
-        let txn_query = Self::build_claim_transaction(&limited_pools);
+        let txn_query = Self::build_claim_transaction(&limited_pools, &asset_pools, scope);
         let mut q = self.db.query(&txn_query);
         for (i, (pool_key, _)) in limited_pools.iter().enumerate() {
             q = q.bind((format!("p{i}"), pool_key.clone()));
+        }
+        if let Some(parts) = scope.and_then(|s| s.partitions.as_ref()) {
+            for &i in &asset_pools {
+                q = q.bind((format!("parts{i}"), parts.clone()));
+            }
         }
         q = q
             .bind(("cl", code_location_id.to_string()))
@@ -3948,7 +4899,11 @@ impl SurrealStorage {
 
         let mut response = q.await?.check()?;
 
-        let check_idx = Self::claim_check_statement_index(pools.len());
+        // Indexed by the pools actually in the transaction: unlimited ones were
+        // dropped above. Counting `pools` instead reads a statement past the
+        // end, so a transaction that committed is reported as contention — and
+        // the retry then finds the slots it already claimed.
+        let check_idx = Self::claim_check_statement_index(limited_pools.len(), asset_pools.len());
         let count: Option<u32> = response.take((check_idx, "total"))?;
 
         if count.unwrap_or(0) > 0 {
@@ -3992,6 +4947,106 @@ mod tests {
             .expect("failed to create in-memory storage")
     }
 
+    /// An action's `materialized()` must not advance
+    /// `last_materialization_code_version`: the verb body ran, not the
+    /// asset's materialize function, so a pending code-change rebuild (and
+    /// the Stale(Code) badge) must survive the action. Keyed off the run's
+    /// verb — idv-emptiness also matches every source asset's legitimate
+    /// materializations, which must keep stamping the version.
+    #[tokio::test]
+    async fn action_materialization_preserves_code_version() {
+        let storage = make_storage().await;
+        let cl = "default";
+        let record = |cv: &str| AssetRecord {
+            code_location_id: cl.to_string(),
+            asset_key: "orders".to_string(),
+            tags: vec![],
+            kinds: vec![],
+            asset_group: None,
+            code_version: Some(cv.to_string()),
+            last_event_id: None,
+            last_run_id: None,
+            last_timestamp: None,
+            last_data_version: None,
+            last_materialization_code_version: None,
+            last_input_data_versions: vec![],
+            pool: vec![],
+        };
+        let run = |id: &str, action: Option<&str>, ts: i64| RunRecord {
+            run_id: id.to_string(),
+            code_location_id: cl.to_string(),
+            job_name: None,
+            status: RunStatus::Success,
+            start_time: ts,
+            end_time: Some(ts),
+            tags: vec![],
+            node_names: vec!["orders".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::default(),
+            action: action.map(String::from),
+        };
+        let mat_event = |run_id: &str, ts: i64| EventRecord {
+            code_location_id: cl.to_string(),
+            event_type: EventType::Materialization {
+                data_version: Some(format!("dv_{ts}")),
+            },
+            asset_key: Some("orders".to_string()),
+            run_id: run_id.to_string(),
+            partition_key: None,
+            timestamp: ts,
+            metadata: vec![],
+            input_data_versions: vec![],
+        };
+        let mcv = |records: &[AssetRecord]| {
+            records
+                .iter()
+                .find(|r| r.asset_key == "orders")
+                .and_then(|r| r.last_materialization_code_version.clone())
+        };
+
+        // A real materialize under v1 stamps the version…
+        storage.register_assets(cl, &[record("v1")]).await.unwrap();
+        storage.create_run(&run("r1", None, 1000)).await.unwrap();
+        storage.store_event(&mat_event("r1", 1000)).await.unwrap();
+        let records = storage.get_asset_records(cl).await.unwrap();
+        assert_eq!(mcv(&records).as_deref(), Some("v1"));
+
+        // …the code changes (re-resolve registers v2, leaves mcv at v1)…
+        storage.register_assets(cl, &[record("v2")]).await.unwrap();
+
+        // …then an action run's materialized() lands, via both store paths.
+        storage
+            .create_run(&run("r2", Some("merge"), 2000))
+            .await
+            .unwrap();
+        storage.store_event(&mat_event("r2", 2000)).await.unwrap();
+        let records = storage.get_asset_records(cl).await.unwrap();
+        assert_eq!(
+            mcv(&records).as_deref(),
+            Some("v1"),
+            "store_event: an action's materialized() must not clear the pending rebuild"
+        );
+
+        storage
+            .store_events(&[mat_event("r2", 3000)])
+            .await
+            .unwrap();
+        let records = storage.get_asset_records(cl).await.unwrap();
+        assert_eq!(
+            mcv(&records).as_deref(),
+            Some("v1"),
+            "store_events: an action's materialized() must not clear the pending rebuild"
+        );
+
+        // A later real materialize under v2 re-arms as usual.
+        storage.create_run(&run("r3", None, 4000)).await.unwrap();
+        storage.store_event(&mat_event("r3", 4000)).await.unwrap();
+        let records = storage.get_asset_records(cl).await.unwrap();
+        assert_eq!(mcv(&records).as_deref(), Some("v2"));
+    }
+
     /// The run-events page must scan `idx_events_run_ts` (timestamp order), not sort.
     #[tokio::test]
     async fn run_events_page_uses_ordering_index() {
@@ -4001,6 +5056,7 @@ mod tests {
             .unwrap();
         let rows: Vec<DbEventWrite> = (0..2000i64)
             .map(|i| DbEventWrite {
+                id: new_event_record_id(),
                 code_location_id: "default".into(),
                 event_type: if i % 50 == 0 {
                     "StepStart"
@@ -4115,6 +5171,7 @@ mod tests {
             .unwrap();
         let rows: Vec<DbEventWrite> = (0..2000i64)
             .map(|i| DbEventWrite {
+                id: new_event_record_id(),
                 code_location_id: "default".into(),
                 event_type: if i % 3 == 0 {
                     "Observation"
@@ -4161,6 +5218,70 @@ mod tests {
         );
     }
 
+    /// Which assets and keys the failed runs materialized is read one run at a
+    /// time off `idx_events_run_type`, not by scanning every Materialization.
+    #[tokio::test]
+    async fn failed_run_materializations_scan_only_those_runs() {
+        let temp = test_temp_dir::test_temp_dir!();
+        let s = SurrealStorage::new_embedded(temp.as_path_untracked().to_str().unwrap())
+            .await
+            .unwrap();
+        let rows: Vec<DbEventWrite> = (0..2000i64)
+            .map(|i| DbEventWrite {
+                id: new_event_record_id(),
+                code_location_id: "default".into(),
+                event_type: if i % 2 == 0 {
+                    "Materialization"
+                } else {
+                    "StepSuccess"
+                }
+                .into(),
+                asset_key: Some("a".into()),
+                run_id: format!("r{}", i % 100),
+                partition_key: Some(PartitionKey::Single {
+                    keys: vec![format!("p{i}")],
+                }),
+                timestamp: i,
+                sort_order: 0,
+                metadata: vec![],
+                data_version: None,
+                code_version: None,
+                input_data_versions: vec![],
+            })
+            .collect();
+        s.db.query("INSERT INTO events $rows RETURN NONE")
+            .bind(("rows", rows))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        for query in [
+            "SELECT asset_key, run_id FROM events WITH INDEX idx_events_run_type \
+             WHERE run_id IN $runs AND event_type = 'Materialization' \
+             GROUP BY asset_key, run_id EXPLAIN",
+            "SELECT partition_key, run_id FROM events WITH INDEX idx_events_run_type \
+             WHERE run_id IN $runs AND event_type = 'Materialization' \
+             AND asset_key = $asset_key AND partition_key IS NOT NONE EXPLAIN",
+        ] {
+            let plan: Vec<serde_json::Value> =
+                s.db.query(query)
+                    .bind(("runs", vec!["r1".to_string(), "r2".to_string()]))
+                    .bind(("asset_key", "a".to_string()))
+                    .await
+                    .unwrap()
+                    .take(0)
+                    .unwrap();
+            let plan = serde_json::to_string(&plan).unwrap();
+            assert!(
+                plan.contains("UnionIndexScan")
+                    && plan.contains("idx_events_run_type")
+                    && !plan.contains("\"idx_events_type\""),
+                "one index scan per run, not every Materialization: {plan}"
+            );
+        }
+    }
+
     /// The UNIQUE index compares the SERIALIZED partition_key, so a reordered-dims Multi key canonicalizes to one row.
     #[tokio::test]
     async fn test_multi_partition_key_dims_order_canonicalized() {
@@ -4175,25 +5296,15 @@ mod tests {
                 .map(|(d, v)| (d.to_string(), vec![v.to_string()]))
                 .collect(),
         };
-        let row = |pk: PartitionKey, event_id: &str, ts: i64| super::DbAssetPartitionWrite {
-            code_location_id: cl.to_string(),
-            asset_key: "inventory".to_string(),
-            partition_key: pk,
-            last_event_id: event_id.to_string(),
-            last_run_id: "r".to_string(),
-            last_timestamp: ts,
-        };
 
         let date_first = mk(vec![("date", "2024-01-01"), ("region", "eu")]);
         let region_first = mk(vec![("region", "eu"), ("date", "2024-01-01")]);
-        storage
-            .upsert_asset_partitions(vec![row(date_first.clone(), "ev1", 1)])
-            .await
-            .unwrap();
-        storage
-            .upsert_asset_partitions(vec![row(region_first, "ev2", 2)])
-            .await
-            .unwrap();
+        let mut first = make_event("inventory", "r", 1);
+        first.partition_key = Some(date_first.clone());
+        storage.store_event(&first).await.unwrap();
+        let mut second = make_event("inventory", "r", 2);
+        second.partition_key = Some(region_first);
+        storage.store_event(&second).await.unwrap();
 
         let parts = storage
             .get_materialized_partitions(cl, "inventory")
@@ -4214,7 +5325,6 @@ mod tests {
         );
     }
 
-    /// `store_events`/`store_event` upsert `asset_partitions` on the UNIQUE index to replace rather than duplicate.
     #[tokio::test]
     async fn test_register_assets_upserts_definition_and_keeps_history() {
         // register_assets bulk-upserts on the UNIQUE (code_location_id,
@@ -4298,8 +5408,9 @@ mod tests {
         assert_eq!(all.len(), 1, "upsert created a duplicate row");
     }
 
+    /// `store_events`/`store_event` upsert `asset_partitions` on the UNIQUE index to replace rather than duplicate.
     #[tokio::test]
-    async fn test_upsert_asset_partitions_replaces_on_unique_index() {
+    async fn test_partition_row_replaces_on_unique_index() {
         let temp_dir = test_temp_dir::test_temp_dir!();
         let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
             .await
@@ -4308,23 +5419,13 @@ mod tests {
         let pk = PartitionKey::Single {
             keys: vec!["p1".to_string()],
         };
-        let row = |event_id: &str, ts: i64| super::DbAssetPartitionWrite {
-            code_location_id: cl.to_string(),
-            asset_key: "inventory".to_string(),
-            partition_key: pk.clone(),
-            last_event_id: event_id.to_string(),
-            last_run_id: "r".to_string(),
-            last_timestamp: ts,
-        };
 
-        storage
-            .upsert_asset_partitions(vec![row("ev1", 1)])
-            .await
-            .unwrap();
-        storage
-            .upsert_asset_partitions(vec![row("ev2", 2)])
-            .await
-            .unwrap();
+        let mut first = make_event("inventory", "r", 1);
+        first.partition_key = Some(pk.clone());
+        storage.store_event(&first).await.unwrap();
+        let mut second = make_event("inventory", "r", 2);
+        second.partition_key = Some(pk.clone());
+        storage.store_event(&second).await.unwrap();
 
         // Upsert on the unique index updates in place: one row, latest values.
         let parts = storage
@@ -4345,6 +5446,918 @@ mod tests {
             vec![(pk.clone(), 2)],
             "must update the existing row in place"
         );
+    }
+
+    /// Race partitioned materializations against whole-asset deletions per
+    /// iteration on the RocksDB backend (kv-mem misses write-write conflicts)
+    /// and return each iteration's final asset row + partition set. Retries
+    /// keep their full budget but near-zero backoff so contended iterations
+    /// stay fast. `mat{r}` writes partition `p{r}`; the seed writes `pseed`.
+    async fn race_deletion_against_partitioned_mat(
+        iters: usize,
+    ) -> Vec<(AssetRecord, Vec<PartitionKey>)> {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let retry = super::super::retry::StorageRetryConfig {
+            max_retries: 10,
+            initial_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(5),
+            backoff_multiplier: 1.0,
+            max_elapsed: None,
+        };
+        let storage = std::sync::Arc::new(
+            SurrealStorage::new_embedded_with_retry(
+                temp_dir.as_path_untracked().to_str().unwrap(),
+                retry,
+                Capability::ReadWrite,
+            )
+            .await
+            .expect("failed to create rocksdb storage"),
+        );
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let single = |name: &str| PartitionKey::Single {
+            keys: vec![name.to_string()],
+        };
+        let mut finals = Vec::with_capacity(iters);
+        for i in 0..iters {
+            let key = format!("orders_{i}");
+            storage
+                .register_assets(cl, &[make_asset_record(&key)])
+                .await
+                .unwrap();
+            let mut seed = make_event(&key, "seed", 1);
+            seed.partition_key = Some(single("pseed"));
+            storage.store_event(&seed).await.unwrap();
+
+            let mut racers = Vec::new();
+            for r in 0..8 {
+                let mut mat = make_event(&key, &format!("mat{r}"), 100 + r as i64);
+                mat.partition_key = Some(single(&format!("p{r}")));
+                racers.push(mat);
+                let mut del = make_event(&key, &format!("del{r}"), 200 + r as i64);
+                del.event_type = EventType::Deletion;
+                racers.push(del);
+            }
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(racers.len()));
+            let tasks: Vec<_> = racers
+                .into_iter()
+                .map(|event| {
+                    let (s, b) = (storage.clone(), barrier.clone());
+                    tokio::spawn(async move {
+                        b.wait().await;
+                        // Contention exhausting the retry budget is a loud,
+                        // clean failure for the caller — only committed state
+                        // is under test here.
+                        let _ = s.store_event(&event).await;
+                    })
+                })
+                .collect();
+            for task in tasks {
+                task.await.unwrap();
+            }
+
+            let record = storage.get_asset_record(cl, &key).await.unwrap().unwrap();
+            let parts = storage.get_materialized_partitions(cl, &key).await.unwrap();
+            finals.push((record, parts));
+        }
+        finals
+    }
+
+    /// A whole-asset deletion and a partitioned materialization racing on the
+    /// same asset must serialize: afterwards the asset row and the partition
+    /// rows agree, whichever won. A torn state means one side's writes split
+    /// around the other's — the deletion's clear+delete or the materialize's
+    /// update+upsert landed as two independently-committed pieces.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deletion_and_materialization_consolidate_atomically() {
+        for (i, (record, parts)) in race_deletion_against_partitioned_mat(300)
+            .await
+            .iter()
+            .enumerate()
+        {
+            match record.last_run_id.as_deref() {
+                Some(run) => {
+                    let own = PartitionKey::Single {
+                        keys: vec![if run == "seed" {
+                            "pseed".to_string()
+                        } else {
+                            format!("p{}", run.trim_start_matches("mat"))
+                        }],
+                    };
+                    assert!(
+                        parts.contains(&own),
+                        "iteration {i}: asset row holds {run} but its partition \
+                         row is gone — a deletion split around that materialization \
+                         (partitions: {parts:?})"
+                    );
+                }
+                None => assert!(
+                    parts.is_empty(),
+                    "iteration {i}: asset row is cleared but partition rows \
+                     survived — a materialization split around a deletion \
+                     (partitions: {parts:?})"
+                ),
+            }
+        }
+    }
+
+    /// What an asset holds after its write-backs: one key's `asset_partitions`
+    /// row and tombstone, and the `assets` row.
+    #[derive(Debug, PartialEq)]
+    struct AssetWrites {
+        part_row: Option<(i64, Option<String>)>,
+        part_deleted_at: Option<i64>,
+        last_run_id: Option<String>,
+        last_timestamp: Option<i64>,
+        last_data_version: Option<String>,
+        deleted_at: Option<i64>,
+    }
+
+    /// `last`: the run and time of the materialization the `assets` row holds.
+    fn writes(
+        part_row: Option<(i64, &str)>,
+        part_deleted_at: Option<i64>,
+        last: Option<(&str, i64)>,
+        deleted_at: Option<i64>,
+    ) -> AssetWrites {
+        AssetWrites {
+            part_row: part_row.map(|(ts, run)| (ts, Some(run.to_string()))),
+            part_deleted_at,
+            last_run_id: last.map(|(run, _)| run.to_string()),
+            last_timestamp: last.map(|(_, ts)| ts),
+            last_data_version: last.map(|(_, ts)| format!("dv_{ts}")),
+            deleted_at,
+        }
+    }
+
+    fn order_key() -> PartitionKey {
+        PartitionKey::Single {
+            keys: vec!["2024-01-01".to_string()],
+        }
+    }
+
+    fn mat_at(asset_key: &str, run_id: &str, ts: i64, pk: Option<&PartitionKey>) -> EventRecord {
+        let mut event = make_event(asset_key, run_id, ts);
+        event.event_type = EventType::Materialization {
+            data_version: Some(format!("dv_{ts}")),
+        };
+        event.partition_key = pk.cloned();
+        event
+    }
+
+    fn del_at(asset_key: &str, ts: i64, pk: Option<&PartitionKey>) -> EventRecord {
+        let mut event = make_event(asset_key, "del", ts);
+        event.event_type = EventType::Deletion;
+        event.partition_key = pk.cloned();
+        event
+    }
+
+    /// Commit `events` one call at a time, in the given order, through the
+    /// single-event or the batched write path.
+    async fn commit_one_by_one(
+        storage: &SurrealStorage,
+        asset_key: &str,
+        batched: bool,
+        events: &[EventRecord],
+    ) -> AssetWrites {
+        register(storage, &[asset_key]).await;
+        for event in events {
+            if batched {
+                storage
+                    .store_events(std::slice::from_ref(event))
+                    .await
+                    .unwrap();
+            } else {
+                storage.store_event(event).await.unwrap();
+            }
+        }
+        read_writes(storage, asset_key, &order_key()).await
+    }
+
+    async fn read_writes(
+        storage: &SurrealStorage,
+        asset_key: &str,
+        pk: &PartitionKey,
+    ) -> AssetWrites {
+        let cl = DEFAULT_CODE_LOCATION_ID;
+        let pk = pk.clone();
+        let part_row = storage
+            .get_partition_timestamps_for_keys(cl, asset_key, std::slice::from_ref(&pk))
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .map(|(_, ts, run)| (ts, run));
+        let mut result = storage
+            .db
+            .query(
+                "SELECT VALUE timestamp FROM asset_partition_deletions \
+                 WHERE code_location_id = $cl AND asset_key = $asset_key \
+                 AND partition_key = $pk",
+            )
+            .bind(("cl", cl.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .bind(("pk", pk))
+            .await
+            .unwrap();
+        let part_deleted_at: Vec<i64> = result.take(0).unwrap();
+        let record = storage
+            .get_asset_record(cl, asset_key)
+            .await
+            .unwrap()
+            .unwrap();
+        AssetWrites {
+            part_row,
+            part_deleted_at: part_deleted_at.first().copied(),
+            last_run_id: record.last_run_id,
+            last_timestamp: record.last_timestamp,
+            last_data_version: record.last_data_version,
+            deleted_at: storage
+                .get_asset_deletion_timestamps(cl)
+                .await
+                .unwrap()
+                .get(asset_key)
+                .copied(),
+        }
+    }
+
+    /// A keyed delete's members drain over many batches after its slot is
+    /// released, so a materialize of one member can commit first. The older
+    /// Deletion must not remove the newer partition row.
+    #[tokio::test]
+    async fn a_late_partition_deletion_keeps_the_newer_materialization() {
+        let storage = make_storage().await;
+        let p = order_key();
+        for batched in [false, true] {
+            let key = format!("orders_{batched}");
+            let events = [
+                mat_at(&key, "mat", 200, Some(&p)),
+                del_at(&key, 100, Some(&p)),
+            ];
+            assert_eq!(
+                commit_one_by_one(&storage, &key, batched, &events).await,
+                writes(Some((200, "mat")), Some(100), Some(("mat", 200)), None),
+                "batched={batched}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_materialization_does_not_recreate_a_deleted_partition() {
+        let storage = make_storage().await;
+        let p = order_key();
+        for batched in [false, true] {
+            let key = format!("orders_{batched}");
+            let events = [
+                del_at(&key, 200, Some(&p)),
+                mat_at(&key, "old", 100, Some(&p)),
+            ];
+            assert_eq!(
+                commit_one_by_one(&storage, &key, batched, &events).await,
+                writes(None, Some(200), Some(("old", 100)), None),
+                "batched={batched}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_materialization_keeps_the_newer_partition_row() {
+        let storage = make_storage().await;
+        let p = order_key();
+        for batched in [false, true] {
+            let key = format!("orders_{batched}");
+            let events = [
+                mat_at(&key, "new", 200, Some(&p)),
+                mat_at(&key, "old", 100, Some(&p)),
+            ];
+            assert_eq!(
+                commit_one_by_one(&storage, &key, batched, &events).await,
+                writes(Some((200, "new")), None, Some(("new", 200)), None),
+                "batched={batched}"
+            );
+        }
+    }
+
+    /// One drain can hold a newer event before an older one. The newest by
+    /// time decides the rows, and a later stale event must still find them.
+    #[tokio::test]
+    async fn a_drain_out_of_time_order_keeps_the_newest_rows() {
+        let storage = make_storage().await;
+        register(&storage, &["orders"]).await;
+        let p1 = order_key();
+        let p2 = PartitionKey::Single {
+            keys: vec!["2024-01-02".to_string()],
+        };
+        storage
+            .store_events(&[
+                mat_at("orders", "new", 200, Some(&p1)),
+                mat_at("orders", "old", 100, Some(&p2)),
+            ])
+            .await
+            .unwrap();
+        storage
+            .store_events(&[mat_at("orders", "late", 150, Some(&p1))])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_writes(&storage, "orders", &p1).await,
+            writes(Some((200, "new")), None, Some(("new", 200)), None)
+        );
+        assert_eq!(
+            read_writes(&storage, "orders", &p2).await.part_row,
+            Some((100, Some("old".to_string())))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_asset_deletion_keeps_the_newer_materialization() {
+        let storage = make_storage().await;
+        for batched in [false, true] {
+            for pk in [None, Some(order_key())] {
+                let key = format!("orders_{batched}_{}", pk.is_some());
+                let events = [
+                    mat_at(&key, "mat", 200, pk.as_ref()),
+                    del_at(&key, 100, None),
+                ];
+                let part_row = pk.as_ref().map(|_| (200, "mat"));
+                assert_eq!(
+                    commit_one_by_one(&storage, &key, batched, &events).await,
+                    writes(part_row, None, Some(("mat", 200)), Some(100)),
+                    "batched={batched} partitioned={}",
+                    pk.is_some()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_materialization_does_not_undo_a_newer_asset_deletion() {
+        let storage = make_storage().await;
+        for batched in [false, true] {
+            for pk in [None, Some(order_key())] {
+                let key = format!("orders_{batched}_{}", pk.is_some());
+                let events = [
+                    del_at(&key, 200, None),
+                    mat_at(&key, "old", 100, pk.as_ref()),
+                ];
+                assert_eq!(
+                    commit_one_by_one(&storage, &key, batched, &events).await,
+                    writes(None, None, None, Some(200)),
+                    "batched={batched} partitioned={}",
+                    pk.is_some()
+                );
+            }
+        }
+    }
+
+    /// A whole-asset deletion and an older materialization of a new partition,
+    /// in flight together: neither snapshot holds the other's writes. They must
+    /// still serialize, so no partition row outlives the newer deletion. The
+    /// deletion's transaction stays open across the materialization to pin that
+    /// interleaving; a failed commit is retried as `with_retry` would.
+    #[tokio::test]
+    async fn a_concurrent_asset_deletion_leaves_no_older_partition_row() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let p0 = order_key();
+        let p3 = PartitionKey::Single {
+            keys: vec!["2024-01-04".to_string()],
+        };
+        for batched in [false, true] {
+            let key = format!("orders_{batched}");
+            register(&storage, &[&key]).await;
+            // The newer partition holds the asset row, so the older one's
+            // update of that row changes nothing.
+            let newer_event_id = storage
+                .store_event(&mat_at(&key, "r3", 120, Some(&p3)))
+                .await
+                .unwrap();
+
+            let deletion = del_at(&key, 200, None);
+            let tx = storage.db.clone().begin().await.unwrap();
+            tx.query(CLEAR_DELETED_ASSET)
+                .bind(("cl", DEFAULT_CODE_LOCATION_ID.to_string()))
+                .bind(("asset_key", key.clone()))
+                .bind(("event_id", "deletion".to_string()))
+                .bind(("ts", deletion.timestamp))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+
+            let older = mat_at(&key, "r0", 100, Some(&p0));
+            if batched {
+                storage
+                    .store_events(std::slice::from_ref(&older))
+                    .await
+                    .unwrap();
+            } else {
+                storage.store_event(&older).await.unwrap();
+            }
+            let record = storage
+                .get_asset_record(DEFAULT_CODE_LOCATION_ID, &key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (
+                    record.last_event_id,
+                    record.last_run_id,
+                    record.last_timestamp
+                ),
+                (Some(newer_event_id), Some("r3".to_string()), Some(120)),
+                "batched={batched}: the older materialization changed the asset row"
+            );
+
+            if let Err(e) = tx.commit().await {
+                assert!(
+                    super::super::retry::is_transient_surrealdb_error(&e),
+                    "batched={batched}: {e}"
+                );
+                storage.store_event(&deletion).await.unwrap();
+            }
+
+            assert_eq!(
+                read_writes(&storage, &key, &p0).await,
+                writes(None, None, None, Some(200)),
+                "batched={batched}"
+            );
+            assert_eq!(
+                storage
+                    .get_materialized_partitions(DEFAULT_CODE_LOCATION_ID, &key)
+                    .await
+                    .unwrap(),
+                Vec::<PartitionKey>::new(),
+                "batched={batched}: a partition row outlived the newer whole-asset deletion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn in_order_deletes_and_materializations_apply_as_before() {
+        let storage = make_storage().await;
+        let p = order_key();
+        type Events = fn(&str, &PartitionKey) -> Vec<EventRecord>;
+        let cases: [(&str, Events, AssetWrites); 7] = [
+            (
+                "mat_then_part_del",
+                |k, p| vec![mat_at(k, "mat", 100, Some(p)), del_at(k, 200, Some(p))],
+                writes(None, Some(200), Some(("mat", 100)), None),
+            ),
+            (
+                "part_del_then_mat",
+                |k, p| vec![del_at(k, 100, Some(p)), mat_at(k, "mat", 200, Some(p))],
+                writes(Some((200, "mat")), Some(100), Some(("mat", 200)), None),
+            ),
+            (
+                "mat_then_mat",
+                |k, p| {
+                    vec![
+                        mat_at(k, "old", 100, Some(p)),
+                        mat_at(k, "new", 200, Some(p)),
+                    ]
+                },
+                writes(Some((200, "new")), None, Some(("new", 200)), None),
+            ),
+            (
+                "mat_then_asset_del",
+                |k, p| vec![mat_at(k, "mat", 100, Some(p)), del_at(k, 200, None)],
+                writes(None, None, None, Some(200)),
+            ),
+            (
+                "asset_del_then_mat",
+                |k, p| vec![del_at(k, 100, None), mat_at(k, "mat", 200, Some(p))],
+                writes(Some((200, "mat")), None, Some(("mat", 200)), Some(100)),
+            ),
+            (
+                "unpartitioned_mat_then_asset_del",
+                |k, _| vec![mat_at(k, "mat", 100, None), del_at(k, 200, None)],
+                writes(None, None, None, Some(200)),
+            ),
+            (
+                "asset_del_then_unpartitioned_mat",
+                |k, _| vec![del_at(k, 100, None), mat_at(k, "mat", 200, None)],
+                writes(None, None, Some(("mat", 200)), Some(100)),
+            ),
+        ];
+        for batched in [false, true] {
+            for (case, events, expected) in &cases {
+                let key = format!("{case}_{batched}");
+                assert_eq!(
+                    &commit_one_by_one(&storage, &key, batched, &events(&key, &p)).await,
+                    expected,
+                    "{case} batched={batched}"
+                );
+            }
+        }
+    }
+
+    /// `mat_at` for a materialization that read upstream `u` at `u_version`.
+    fn mat_reading(
+        asset_key: &str,
+        run_id: &str,
+        ts: i64,
+        u_version: Option<&str>,
+        pk: Option<&PartitionKey>,
+    ) -> EventRecord {
+        let mut event = mat_at(asset_key, run_id, ts, pk);
+        event.input_data_versions = u_version
+            .map(|v| vec![("u".to_string(), v.to_string())])
+            .unwrap_or_default();
+        event
+    }
+
+    /// One write-back step of an asset: a deploy that registers its code
+    /// version, or one drain of events.
+    enum Step {
+        Deploy(&'static str),
+        Drain(Vec<EventRecord>),
+    }
+
+    /// What an `assets` row holds: the materialization its data comes from,
+    /// and its provenance — the code version and inputs the data was built
+    /// from, and the time of the materialization that recorded them.
+    #[derive(Debug, PartialEq)]
+    struct RowProvenance {
+        last_run_id: Option<String>,
+        last_timestamp: Option<i64>,
+        last_data_version: Option<String>,
+        code_version: Option<String>,
+        inputs: Vec<(String, String)>,
+        provenance_at: Option<i64>,
+    }
+
+    /// `data`: the run and time of the materialization the data comes from.
+    /// `built`: the code version, the version of `u` read, and the time of
+    /// the materialization the provenance comes from.
+    fn row(data: Option<(&str, i64)>, built: Option<(&str, Option<&str>, i64)>) -> RowProvenance {
+        RowProvenance {
+            last_run_id: data.map(|(run, _)| run.to_string()),
+            last_timestamp: data.map(|(_, ts)| ts),
+            last_data_version: data.map(|(_, ts)| format!("dv_{ts}")),
+            code_version: built.map(|(cv, ..)| cv.to_string()),
+            inputs: built
+                .and_then(|(_, u, _)| u)
+                .map(|u| vec![("u".to_string(), u.to_string())])
+                .unwrap_or_default(),
+            provenance_at: built.map(|(.., ts)| ts),
+        }
+    }
+
+    /// Apply `steps` in order. `batched`: each drain is one `store_events`
+    /// call; otherwise its events are stored one `store_event` call at a time.
+    async fn apply_steps(
+        storage: &SurrealStorage,
+        asset_key: &str,
+        batched: bool,
+        steps: Vec<Step>,
+    ) -> RowProvenance {
+        let cl = DEFAULT_CODE_LOCATION_ID;
+        for step in steps {
+            match step {
+                Step::Deploy(code_version) => storage
+                    .register_assets(
+                        cl,
+                        &[AssetRecord {
+                            code_version: Some(code_version.to_string()),
+                            ..make_asset_record(asset_key)
+                        }],
+                    )
+                    .await
+                    .unwrap(),
+                Step::Drain(events) if batched => {
+                    storage.store_events(&events).await.unwrap();
+                }
+                Step::Drain(events) => {
+                    for event in &events {
+                        storage.store_event(event).await.unwrap();
+                    }
+                }
+            }
+        }
+        let record = storage
+            .get_asset_record(cl, asset_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut result = storage
+            .db
+            .query(
+                "SELECT VALUE last_provenance_timestamp FROM assets \
+                 WHERE code_location_id = $cl AND asset_key = $asset_key",
+            )
+            .bind(("cl", cl.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .await
+            .unwrap();
+        let provenance_at: Vec<Option<i64>> = result.take(0).unwrap();
+        RowProvenance {
+            last_run_id: record.last_run_id,
+            last_timestamp: record.last_timestamp,
+            last_data_version: record.last_data_version,
+            code_version: record.last_materialization_code_version,
+            inputs: record.last_input_data_versions,
+            provenance_at: provenance_at.into_iter().flatten().next(),
+        }
+    }
+
+    /// An action's `materialized()` moves an asset's data but writes no
+    /// provenance. A real materialization that lands after a newer action must
+    /// still record the code version and inputs it was built from, unless a
+    /// newer real materialization or whole-asset deletion holds them. Each
+    /// case must end as its events would applied in time order, however they
+    /// drain. `a*` runs are action runs.
+    #[tokio::test]
+    async fn provenance_applies_in_event_order_apart_from_the_data() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        for run_id in ["a2", "a4"] {
+            let run = RunRecord {
+                action: Some("merge".to_string()),
+                ..minimal_run(run_id, RunStatus::Success)
+            };
+            storage.create_run(&run).await.unwrap();
+        }
+        use Step::{Deploy, Drain};
+        type Steps = fn(&str, Option<&PartitionKey>) -> Vec<Step>;
+        let cases: [(&str, Steps, RowProvenance); 9] = [
+            (
+                "real_lands_after_newer_action",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, Some("u1"), p)]),
+                        Deploy("v2"),
+                        Drain(vec![mat_reading(k, "a2", 200, None, p)]),
+                        Drain(vec![mat_reading(k, "r1", 100, Some("u2"), p)]),
+                    ]
+                },
+                row(Some(("a2", 200)), Some(("v2", Some("u2"), 100))),
+            ),
+            (
+                "real_without_inputs_lands_after_newer_action",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, None, p)]),
+                        Deploy("v2"),
+                        Drain(vec![mat_reading(k, "a2", 200, None, p)]),
+                        Drain(vec![mat_reading(k, "r1", 100, None, p)]),
+                    ]
+                },
+                row(Some(("a2", 200)), Some(("v2", None, 100))),
+            ),
+            (
+                "real_lands_after_newer_real",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, Some("u1"), p)]),
+                        Deploy("v2"),
+                        Drain(vec![mat_reading(k, "r3", 300, Some("u3"), p)]),
+                        Deploy("v3"),
+                        Drain(vec![mat_reading(k, "r1", 100, Some("u2"), p)]),
+                    ]
+                },
+                row(Some(("r3", 300)), Some(("v2", Some("u3"), 300))),
+            ),
+            (
+                "action_and_older_real_drain_together",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, Some("u1"), p)]),
+                        Deploy("v2"),
+                        Drain(vec![
+                            mat_reading(k, "a2", 200, None, p),
+                            mat_reading(k, "r1", 100, Some("u2"), p),
+                        ]),
+                    ]
+                },
+                row(Some(("a2", 200)), Some(("v2", Some("u2"), 100))),
+            ),
+            (
+                "drain_older_than_the_rows_data",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, Some("u1"), p)]),
+                        Deploy("v2"),
+                        Drain(vec![mat_reading(k, "a2", 200, None, p)]),
+                        Drain(vec![
+                            mat_reading(k, "r1", 100, Some("u2"), p),
+                            mat_reading(k, "a4", 150, None, p),
+                        ]),
+                    ]
+                },
+                row(Some(("a2", 200)), Some(("v2", Some("u2"), 100))),
+            ),
+            (
+                "drain_inputs_older_than_the_rows_provenance",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, Some("u1"), p)]),
+                        Deploy("v2"),
+                        Drain(vec![mat_reading(k, "r3", 300, Some("u3"), p)]),
+                        Deploy("v3"),
+                        Drain(vec![
+                            mat_reading(k, "r1", 100, Some("u2"), p),
+                            mat_reading(k, "a4", 400, None, p),
+                        ]),
+                    ]
+                },
+                row(Some(("a4", 400)), Some(("v2", Some("u3"), 300))),
+            ),
+            (
+                "late_deletion_clears_older_provenance",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, Some("u1"), p)]),
+                        Deploy("v2"),
+                        Drain(vec![mat_reading(k, "a2", 300, None, p)]),
+                        Drain(vec![del_at(k, 200, None)]),
+                        Drain(vec![mat_reading(k, "r1", 100, Some("u2"), p)]),
+                    ]
+                },
+                row(Some(("a2", 300)), None),
+            ),
+            (
+                "late_deletion_keeps_newer_provenance",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r3", 300, Some("u3"), p)]),
+                        Drain(vec![del_at(k, 200, None)]),
+                    ]
+                },
+                row(Some(("r3", 300)), Some(("v1", Some("u3"), 300))),
+            ),
+            (
+                "older_real_after_deletion_stays_deleted",
+                |k, p| {
+                    vec![
+                        Deploy("v1"),
+                        Drain(vec![mat_reading(k, "r0", 50, Some("u1"), p)]),
+                        Drain(vec![del_at(k, 200, None)]),
+                        Deploy("v2"),
+                        Drain(vec![mat_reading(k, "r1", 100, Some("u2"), p)]),
+                    ]
+                },
+                row(None, None),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for batched in [false, true] {
+            for pk in [None, Some(order_key())] {
+                for (case, steps, expected) in &cases {
+                    let key = format!("{case}_{batched}_{}", pk.is_some());
+                    let got = apply_steps(&storage, &key, batched, steps(&key, pk.as_ref())).await;
+                    if &got != expected {
+                        wrong.push(format!(
+                            "{case} batched={batched} partitioned={}:\n  got  {got:?}\n  want {expected:?}",
+                            pk.is_some()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Concurrent unpartitioned materializations of one asset conflict on the
+    /// `assets` row; the retry re-runs the whole closure, so the event insert
+    /// must be idempotent — every stored materialization appears exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conflict_retry_does_not_duplicate_events() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let retry = super::super::retry::StorageRetryConfig {
+            max_retries: 10,
+            initial_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(5),
+            backoff_multiplier: 1.0,
+            max_elapsed: None,
+        };
+        let storage = std::sync::Arc::new(
+            SurrealStorage::new_embedded_with_retry(
+                temp_dir.as_path_untracked().to_str().unwrap(),
+                retry,
+                Capability::ReadWrite,
+            )
+            .await
+            .expect("failed to create rocksdb storage"),
+        );
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        for i in 0..100 {
+            let key = format!("orders_{i}");
+            storage
+                .register_assets(cl, &[make_asset_record(&key)])
+                .await
+                .unwrap();
+            let racers: Vec<EventRecord> = (0..8)
+                .map(|r| make_event(&key, &format!("mat{r}"), 100 + r as i64))
+                .collect();
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(racers.len()));
+            let tasks: Vec<_> = racers
+                .into_iter()
+                .map(|event| {
+                    let (s, b) = (storage.clone(), barrier.clone());
+                    tokio::spawn(async move {
+                        b.wait().await;
+                        s.store_event(&event).await.unwrap();
+                    })
+                })
+                .collect();
+            for task in tasks {
+                task.await.unwrap();
+            }
+            let events = storage.get_events_for_asset(cl, &key, 1000).await.unwrap();
+            assert_eq!(
+                events.len(),
+                8,
+                "iteration {i}: 8 materializations stored but {} event rows — \
+                 a conflict retry re-inserted an already-committed event",
+                events.len()
+            );
+        }
+    }
+
+    /// Concurrent observations race the same `assets` row. Whatever commits
+    /// last, the row must hold one observation's consistent (timestamp,
+    /// data_version) pair, and — once observation updates surface conflicts
+    /// and retry — the retried closure must not duplicate event rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_observations_stay_consistent() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let retry = super::super::retry::StorageRetryConfig {
+            max_retries: 10,
+            initial_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(5),
+            backoff_multiplier: 1.0,
+            max_elapsed: None,
+        };
+        let storage = std::sync::Arc::new(
+            SurrealStorage::new_embedded_with_retry(
+                temp_dir.as_path_untracked().to_str().unwrap(),
+                retry,
+                Capability::ReadWrite,
+            )
+            .await
+            .expect("failed to create rocksdb storage"),
+        );
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        for i in 0..100 {
+            let key = format!("sensor_{i}");
+            storage
+                .register_assets(cl, &[make_asset_record(&key)])
+                .await
+                .unwrap();
+            let racers: Vec<EventRecord> = (0..8)
+                .map(|r| {
+                    let mut e = make_event(&key, &format!("obs{r}"), 100 + r as i64);
+                    e.event_type = EventType::Observation {
+                        data_version: Some(format!("dv{r}")),
+                    };
+                    e
+                })
+                .collect();
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(racers.len()));
+            let tasks: Vec<_> = racers
+                .into_iter()
+                .map(|event| {
+                    let (s, b) = (storage.clone(), barrier.clone());
+                    tokio::spawn(async move {
+                        b.wait().await;
+                        s.store_event(&event).await.unwrap();
+                    })
+                })
+                .collect();
+            for task in tasks {
+                task.await.unwrap();
+            }
+            let events = storage.get_events_for_asset(cl, &key, 1000).await.unwrap();
+            assert_eq!(
+                events.len(),
+                8,
+                "iteration {i}: 8 observations stored but {} event rows",
+                events.len()
+            );
+            let record = storage.get_asset_record(cl, &key).await.unwrap().unwrap();
+            let ts = record.last_timestamp.expect("an observation committed");
+            let r = ts - 100;
+            assert!((0..8).contains(&r), "iteration {i}: foreign timestamp {ts}");
+            assert_eq!(
+                record.last_data_version.as_deref(),
+                Some(format!("dv{r}").as_str()),
+                "iteration {i}: assets row mixes two observations \
+                 (ts {ts} with {:?})",
+                record.last_data_version
+            );
+        }
     }
 
     /// Per-partition lookups receive the display string and must still match a persisted Multi key.
@@ -5001,6 +7014,42 @@ mod tests {
         assert!(updated.last_input_data_versions.is_empty());
     }
 
+    /// An action's `ActionResult.materialized()` reports no upstream
+    /// provenance — it merged existing data rather than consuming inputs.
+    /// Writing that empty list through would erase the asset's real
+    /// provenance and flip it to Stale forever.
+    #[tokio::test]
+    async fn test_empty_input_data_versions_preserves_existing() {
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let consumed = vec![("a".to_string(), "dv-a".to_string())];
+
+        for batched in [false, true] {
+            let storage = make_storage().await;
+            register(&storage, &["a", "b"]).await;
+
+            let mut materialize = make_event("b", "run-1", 1000);
+            materialize.input_data_versions = consumed.clone();
+            let mut action = make_event("b", "run-2", 2000);
+            action.event_type = EventType::Materialization {
+                data_version: Some("merged-v2".to_string()),
+            };
+
+            if batched {
+                storage.store_events(&[materialize, action]).await.unwrap();
+            } else {
+                storage.store_event(&materialize).await.unwrap();
+                storage.store_event(&action).await.unwrap();
+            }
+
+            let record = storage.get_asset_record(cl, "b").await.unwrap().unwrap();
+            assert_eq!(
+                record.last_input_data_versions, consumed,
+                "provenance erased by an empty write (batched={batched})"
+            );
+            assert_eq!(record.last_data_version.as_deref(), Some("merged-v2"));
+        }
+    }
+
     #[tokio::test]
     async fn test_observation_does_not_overwrite_materialization_fields() {
         let storage = make_storage().await;
@@ -5039,6 +7088,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
         let mat_event = EventRecord {
@@ -5112,6 +7162,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
 
@@ -5166,6 +7217,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
 
         // First CREATE succeeds.
@@ -5212,6 +7264,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             };
             storage.create_run(&run).await.unwrap();
             all_runs.push(run);
@@ -5242,6 +7295,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         let run_fail = RunRecord {
             run_id: "fail".to_string(),
@@ -5256,6 +7310,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run_ok).await.unwrap();
         storage.create_run(&run_fail).await.unwrap();
@@ -5285,6 +7340,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             };
             storage.create_run(&run).await.unwrap();
         }
@@ -5360,6 +7416,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             };
             storage.create_run(&run).await.unwrap();
         }
@@ -5372,6 +7429,51 @@ mod tests {
         let page = storage.get_all_runs_page(0, 10, &filter).await.unwrap();
         assert_eq!(page.total, 2);
         assert!(page.rows.iter().all(|r| r.status == RunStatus::Success));
+
+        // Verb filter: action runs are separable from materializations, so a
+        // "what did the purge touch" question doesn't scan every run.
+        let mut action_run = RunRecord {
+            run_id: "run-delete".into(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Success,
+            start_time: 9000,
+            end_time: Some(9001),
+            tags: vec![],
+            node_names: vec!["events".into()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: Some("delete".into()),
+        };
+        storage.create_run(&action_run).await.unwrap();
+        action_run.run_id = "run-compact".into();
+        action_run.action = Some("compact".into());
+        storage.create_run(&action_run).await.unwrap();
+
+        let filter = RunFilter {
+            action: Some(Some("delete".into())),
+            ..Default::default()
+        };
+        let page = storage.get_all_runs_page(0, 10, &filter).await.unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].run_id, "run-delete");
+
+        let filter = RunFilter {
+            action: Some(None),
+            ..Default::default()
+        };
+        let page = storage.get_all_runs_page(0, 50, &filter).await.unwrap();
+        assert!(
+            page.rows.iter().all(|r| r.action.is_none()),
+            "materialize filter must exclude action runs"
+        );
+        assert!(
+            page.total >= 3,
+            "materialize runs still match, got {}",
+            page.total
+        );
 
         // Job substring (case-insensitive)
         let filter = RunFilter {
@@ -5446,6 +7548,7 @@ mod tests {
                     partition_key: None,
                     block_reason: None,
                     launched_by: LaunchedBy::Manual { user: None },
+                    action: None,
                 })
                 .await
                 .unwrap();
@@ -5497,6 +7600,7 @@ mod tests {
                         partition_key: None,
                         block_reason: None,
                         launched_by: LaunchedBy::Manual { user: None },
+                        action: None,
                     })
                     .await
                     .unwrap();
@@ -5555,6 +7659,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             };
             storage.create_run(&run).await.unwrap();
         }
@@ -5595,6 +7700,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             };
             storage_w.create_run(&run).await.unwrap();
         });
@@ -5652,6 +7758,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             };
             storage.create_run(&run).await.unwrap();
         })
@@ -5711,6 +7818,7 @@ mod tests {
                 end_time: None,
                 error: None,
                 launched_by: LaunchedBy::default(),
+                action: None,
             };
             storage.create_backfill(&bf).await.unwrap();
         })
@@ -5821,6 +7929,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .collect();
 
@@ -5860,6 +7969,7 @@ mod tests {
                 }),
                 block_reason: Some("global run limit".to_string()),
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             },
             RunRecord {
                 run_id: "queued_2".to_string(),
@@ -5874,6 +7984,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             },
         ];
 
@@ -6693,6 +8804,7 @@ mod tests {
                     partition_key: None,
                     block_reason: None,
                     launched_by: LaunchedBy::Manual { user: None },
+                    action: None,
                 })
                 .await
                 .unwrap();
@@ -6747,6 +8859,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -6764,6 +8877,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -6781,6 +8895,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -6883,6 +8998,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -6900,6 +9016,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -7422,6 +9539,44 @@ mod tests {
         );
     }
 
+    /// Only the runs' own Materialization events count, for the assets asked
+    /// about, and a later delete of the asset does not erase them.
+    #[tokio::test]
+    async fn materialized_by_runs_reads_the_runs_own_materializations() {
+        let storage = make_storage().await;
+        register(&storage, &["a", "b", "c"]).await;
+        let mut deletion = make_event("a", "delete", 400);
+        deletion.event_type = EventType::Deletion;
+        storage
+            .store_events(&[
+                make_event("a", "r1", 100),
+                make_event("b", "r1", 100),
+                EventRecord {
+                    event_type: EventType::StepSuccess,
+                    ..make_event("b", "r2", 200)
+                },
+                make_event("c", "r3", 300),
+                deletion,
+            ])
+            .await
+            .unwrap();
+
+        let built = storage
+            .materialized_by_runs(
+                &["a".to_string(), "b".to_string()],
+                &["r1".to_string(), "r2".to_string(), "r3".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            built,
+            HashMap::from([
+                ("a".to_string(), HashSet::from(["r1".to_string()])),
+                ("b".to_string(), HashSet::from(["r1".to_string()])),
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn test_get_asset_records_by_keys() {
         let storage = make_storage().await;
@@ -7480,6 +9635,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         let run2 = RunRecord {
             run_id: "run_2".to_string(),
@@ -7494,6 +9650,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         let run3 = RunRecord {
             run_id: "run_3".to_string(),
@@ -7508,6 +9665,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run1).await.unwrap();
         storage.create_run(&run2).await.unwrap();
@@ -7555,6 +9713,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&mk("zzz", 1000)).await.unwrap();
         storage.create_run(&mk("mmm", 2000)).await.unwrap();
@@ -7592,6 +9751,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         let run2 = RunRecord {
             run_id: "run_2".to_string(),
@@ -7606,6 +9766,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         let run3 = RunRecord {
             run_id: "run_3".to_string(),
@@ -7620,6 +9781,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run1).await.unwrap();
         storage.create_run(&run2).await.unwrap();
@@ -8149,6 +10311,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_partition_timestamps_for_keys_skips_null_timestamps() {
+        // `last_timestamp` is `option<int>` in the schema, so an unset row is
+        // schema-legal and reads back as NONE. Every reader here deserializes
+        // into a non-Option `i64`, so one such row fails the whole
+        // condition-cache refresh tick for the asset rather than one partition.
+        // `IS NOT NULL` does *not* exclude NONE in SurrealDB — the guard has to
+        // be `IS NOT NONE`, which is why both readers are asserted below.
+        let storage = make_storage().await;
+        register(&storage, &["asset"]).await;
+
+        let single = |k: &str| PartitionKey::Single {
+            keys: vec![k.to_string()],
+        };
+        for (pk, ts) in [("p1", 1000), ("p2", 1500)] {
+            storage
+                .store_event(&EventRecord {
+                    code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                    event_type: EventType::Materialization { data_version: None },
+                    asset_key: Some("asset".to_string()),
+                    run_id: "r1".to_string(),
+                    partition_key: Some(single(pk)),
+                    timestamp: ts,
+                    metadata: vec![],
+                    input_data_versions: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        // Legacy/foreign writer shape: the row exists with no timestamp.
+        storage
+            .db
+            .query(
+                "UPDATE asset_partitions SET last_timestamp = NONE \
+                 WHERE code_location_id = $cl AND asset_key = 'asset' \
+                 AND partition_key = $pk",
+            )
+            .bind(("cl", DEFAULT_CODE_LOCATION_ID.to_string()))
+            .bind(("pk", single("p1")))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let timestamps = storage
+            .get_partition_timestamps_for_keys(
+                DEFAULT_CODE_LOCATION_ID,
+                "asset",
+                &[single("p1"), single("p2")],
+            )
+            .await
+            .expect("an unset last_timestamp must not fail the whole keyed read");
+        assert_eq!(
+            timestamps,
+            vec![(single("p2"), 1500, Some("r1".to_string()))],
+            "the unset row must be skipped, the real one still returned"
+        );
+
+        let all = storage
+            .get_partition_timestamps(DEFAULT_CODE_LOCATION_ID, "asset")
+            .await
+            .expect("an unset last_timestamp must not fail the whole-asset read");
+        assert_eq!(
+            all,
+            vec![(single("p2"), 1500)],
+            "the whole-asset reader needs the same NONE guard"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_in_progress_partitions() {
         let storage = make_storage().await;
         register(&storage, &["asset"]).await;
@@ -8167,6 +10399,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
 
@@ -8217,6 +10450,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_in_progress_partitions_ignores_action_runs() {
+        // An in-flight `optimize` is not an in-flight *materialization*. Counting
+        // it here makes `eager()`'s `!in_flight()` (and `!any_deps_in_progress()`)
+        // suppress the asset and every dependent for the action's whole duration.
+        // Mirrors the action filter `get_failed_partitions` already applies.
+        let storage = make_storage().await;
+        register(&storage, &["asset"]).await;
+
+        let single = |k: &str| PartitionKey::Single {
+            keys: vec![k.to_string()],
+        };
+        let run = |id: &str, action: Option<&str>| RunRecord {
+            run_id: id.to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Started,
+            start_time: 1000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["asset".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: action.map(str::to_string),
+        };
+
+        storage
+            .create_run(&run("run_opt", Some("optimize")))
+            .await
+            .unwrap();
+        storage.create_run(&run("run_mat", None)).await.unwrap();
+
+        for (run_id, pk) in [("run_opt", "p1"), ("run_mat", "p2")] {
+            storage
+                .store_event(&EventRecord {
+                    code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                    event_type: EventType::StepStart,
+                    asset_key: Some("asset".to_string()),
+                    run_id: run_id.to_string(),
+                    partition_key: Some(single(pk)),
+                    timestamp: 1000,
+                    metadata: vec![],
+                    input_data_versions: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        let in_progress = storage
+            .get_in_progress_partitions(DEFAULT_CODE_LOCATION_ID, "asset")
+            .await
+            .unwrap();
+        let keys: Vec<String> = in_progress
+            .iter()
+            .map(|pk| match pk {
+                PartitionKey::Single { keys } => keys[0].clone(),
+                other => panic!("expected Single, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["p2"],
+            "an in-flight action must not count as an in-flight materialization"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_failed_partitions() {
         let storage = make_storage().await;
         register(&storage, &["asset"]).await;
@@ -8235,6 +10536,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
 
@@ -8289,6 +10591,265 @@ mod tests {
         assert!(empty.is_empty());
     }
 
+    /// A late launch-error must not stomp a terminal status written by a
+    /// concurrent canceller — the fail-out only lands on active runs.
+    #[tokio::test]
+    async fn fail_run_if_active_leaves_terminal_runs_alone() {
+        let storage = make_storage().await;
+
+        let mut canceled = RunRecord {
+            run_id: "gone".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Canceled,
+            start_time: 100,
+            end_time: Some(150),
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+        };
+        storage.create_run(&canceled).await.unwrap();
+        assert!(
+            !storage.fail_run_if_active("gone", 200).await.unwrap(),
+            "terminal run must be left alone"
+        );
+        let rec = storage.get_run("gone").await.unwrap().unwrap();
+        assert_eq!(rec.status, RunStatus::Canceled, "status stomped");
+        assert_eq!(rec.end_time, Some(150));
+
+        canceled.run_id = "fresh".to_string();
+        canceled.status = RunStatus::NotStarted;
+        canceled.end_time = None;
+        storage.create_run(&canceled).await.unwrap();
+        assert!(
+            storage.fail_run_if_active("fresh", 200).await.unwrap(),
+            "active run must fail out"
+        );
+        let rec = storage.get_run("fresh").await.unwrap().unwrap();
+        assert_eq!(rec.status, RunStatus::Failure);
+        assert_eq!(rec.end_time, Some(200));
+    }
+
+    /// Status-only keyed failures floor at run END: a whole-asset deletion
+    /// landing mid-run (start < deletion < end) must not outrank the failure —
+    /// every other reader of the supersession rule uses the end-time basis.
+    #[tokio::test]
+    async fn deletion_during_a_run_does_not_outrank_its_failure() {
+        let storage = make_storage().await;
+        register(&storage, &["orders"]).await;
+
+        let run = RunRecord {
+            run_id: "late_fail".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Failure,
+            start_time: 90,
+            end_time: Some(110),
+            tags: vec![],
+            node_names: vec!["orders".to_string()],
+            priority: 0,
+            partition_key: Some(PartitionKey::Single {
+                keys: vec!["p1".to_string()],
+            }),
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+        };
+        storage.create_run(&run).await.unwrap();
+
+        let mut deletion = make_event("orders", "cleanup", 100);
+        deletion.event_type = EventType::Deletion;
+        storage.store_event(&deletion).await.unwrap();
+
+        let failed = storage
+            .get_failed_partitions(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                "orders",
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            failed.contains_key(&PartitionKey::Single {
+                keys: vec!["p1".to_string()]
+            }),
+            "a deletion at 100 must not clear a failure that ended at 110"
+        );
+    }
+
+    /// A joint run that materialized `raw`'s partition, then failed on `clean`,
+    /// did not fail `raw`'s partition: the end-time floor would otherwise
+    /// outrank the run's own materialization and stop `eager()` for good.
+    #[tokio::test]
+    async fn a_failed_run_does_not_fail_the_partitions_it_materialized() {
+        let storage = make_storage().await;
+        register(&storage, &["raw", "clean"]).await;
+        let p1 = PartitionKey::Single {
+            keys: vec!["p1".to_string()],
+        };
+
+        let run = RunRecord {
+            run_id: "joint".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Failure,
+            start_time: 90,
+            end_time: Some(110),
+            tags: vec![],
+            node_names: vec!["raw".to_string(), "clean".to_string()],
+            priority: 0,
+            partition_key: Some(p1.clone()),
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+        };
+        storage.create_run(&run).await.unwrap();
+
+        let mut mat = make_event("raw", "joint", 100);
+        mat.partition_key = Some(p1.clone());
+        storage.store_event(&mat).await.unwrap();
+
+        let raw_failed = storage
+            .get_failed_partitions(
+                DEFAULT_CODE_LOCATION_ID,
+                "raw",
+                &std::collections::HashMap::from([(p1.clone(), 100)]),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !raw_failed.contains_key(&p1),
+            "raw/p1 materialized in the run that later failed on clean"
+        );
+
+        let clean_failed = storage
+            .get_failed_partitions(
+                DEFAULT_CODE_LOCATION_ID,
+                "clean",
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(clean_failed.contains_key(&p1), "clean really failed");
+    }
+
+    /// The failed run's own events say which keys it built, not the key's
+    /// row: a delete, or another run's newer materialization, of `raw/p1`
+    /// after the run built it must not bring the run's floor back. `raw/p2`,
+    /// which the run did not build, keeps its floor.
+    #[tokio::test]
+    async fn a_failed_run_does_not_fail_the_partitions_it_materialized_after_they_moved() {
+        let single = |k: &str| PartitionKey::Single {
+            keys: vec![k.to_string()],
+        };
+        let run = |run_id: &str, status, start, end, nodes: &[&str], pk: Option<PartitionKey>| {
+            RunRecord {
+                run_id: run_id.to_string(),
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                job_name: None,
+                status,
+                start_time: start,
+                end_time: Some(end),
+                tags: vec![],
+                node_names: nodes.iter().map(|n| n.to_string()).collect(),
+                priority: 0,
+                partition_key: pk,
+                block_reason: None,
+                launched_by: LaunchedBy::Manual { user: None },
+                action: None,
+            }
+        };
+        for case in [
+            "keyed delete",
+            "whole-asset delete",
+            "rebuilt by another run",
+        ] {
+            let temp = test_temp_dir::test_temp_dir!();
+            let storage = SurrealStorage::new_embedded(temp.as_path_untracked().to_str().unwrap())
+                .await
+                .unwrap();
+            register(&storage, &["raw", "clean"]).await;
+
+            let joint = PartitionKey::Single {
+                keys: vec!["p1".to_string(), "p2".to_string()],
+            };
+            storage
+                .create_run(&run(
+                    "joint",
+                    RunStatus::Failure,
+                    50,
+                    200,
+                    &["raw", "clean"],
+                    Some(joint),
+                ))
+                .await
+                .unwrap();
+            let mut built = make_event("raw", "joint", 100);
+            built.partition_key = Some(single("p1"));
+            storage.store_event(&built).await.unwrap();
+
+            if case == "rebuilt by another run" {
+                storage
+                    .create_run(&run(
+                        "other",
+                        RunStatus::Success,
+                        140,
+                        150,
+                        &["raw"],
+                        Some(single("p1")),
+                    ))
+                    .await
+                    .unwrap();
+                let mut rebuilt = make_event("raw", "other", 150);
+                rebuilt.partition_key = Some(single("p1"));
+                storage.store_event(&rebuilt).await.unwrap();
+            } else {
+                let pk = (case == "keyed delete").then(|| single("p1"));
+                let mut delete = run("delete", RunStatus::Success, 140, 150, &["raw"], pk.clone());
+                delete.action = Some("delete".to_string());
+                storage.create_run(&delete).await.unwrap();
+                let mut deletion = make_event("raw", "delete", 150);
+                deletion.event_type = EventType::Deletion;
+                deletion.partition_key = pk;
+                storage.store_event(&deletion).await.unwrap();
+            }
+
+            let materialized: std::collections::HashMap<PartitionKey, i64> = storage
+                .get_partition_timestamps(DEFAULT_CODE_LOCATION_ID, "raw")
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+            let raw_failed = storage
+                .get_failed_partitions(DEFAULT_CODE_LOCATION_ID, "raw", &materialized)
+                .await
+                .unwrap();
+            assert_eq!(
+                raw_failed,
+                std::collections::HashMap::from([(single("p2"), 200)]),
+                "{case}: the failed run built raw/p1, not raw/p2"
+            );
+
+            let clean_failed = storage
+                .get_failed_partitions(
+                    DEFAULT_CODE_LOCATION_ID,
+                    "clean",
+                    &std::collections::HashMap::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                clean_failed,
+                std::collections::HashMap::from([(single("p1"), 200), (single("p2"), 200)]),
+                "{case}: clean really failed"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_get_failed_partitions_includes_marked_in_success_run() {
         let storage = make_storage().await;
@@ -8307,6 +10868,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
 
@@ -8359,6 +10921,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
 
@@ -8427,6 +10990,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
 
@@ -8498,6 +11062,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         storage.create_run(&run).await.unwrap();
 
@@ -8540,6 +11105,102 @@ mod tests {
             keys,
             vec!["a", "b", "c"],
             "Set failure expands to its members"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_failed_partitions_ignores_action_runs() {
+        // A failed `delete` did not fail to *materialize* anything. Both sources
+        // this reads — keyed StepFailure events and Failure run records — must
+        // skip action runs, or the partition takes a materialization floor that
+        // only a materialization can clear (and the floor suppresses it).
+        let storage = make_storage().await;
+        register(&storage, &["asset"]).await;
+
+        let single = |k: &str| PartitionKey::Single {
+            keys: vec![k.to_string()],
+        };
+        let run = |id: &str, action: Option<&str>, status, pk: &str| RunRecord {
+            run_id: id.to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status,
+            start_time: 1000,
+            end_time: Some(1500),
+            tags: vec![],
+            node_names: vec!["asset".to_string()],
+            priority: 0,
+            partition_key: Some(single(pk)),
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: action.map(str::to_string),
+        };
+
+        // A failed partitioned `delete` — floors p1 via the runs query.
+        storage
+            .create_run(&run("run_del", Some("delete"), RunStatus::Failure, "p1"))
+            .await
+            .unwrap();
+        // A *successful* batched `delete` that marked p2 failed — floors p2 via
+        // the events query. The event itself is legitimate (backfill accounting
+        // reads it); only the failure-floor reader must ignore it.
+        storage
+            .create_run(&run("run_mark", Some("delete"), RunStatus::Success, "p2"))
+            .await
+            .unwrap();
+        storage
+            .store_event(&EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("asset".to_string()),
+                run_id: "run_mark".to_string(),
+                partition_key: Some(single("p2")),
+                timestamp: 1000,
+                metadata: vec![("error".to_string(), "corrupt".to_string())],
+                input_data_versions: vec![],
+            })
+            .await
+            .unwrap();
+        // A real materialization failure on p3 — must still be reported.
+        storage
+            .create_run(&run("run_mat", None, RunStatus::Failure, "p3"))
+            .await
+            .unwrap();
+        storage
+            .store_event(&EventRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("asset".to_string()),
+                run_id: "run_mat".to_string(),
+                partition_key: Some(single("p3")),
+                timestamp: 1000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            })
+            .await
+            .unwrap();
+
+        let failed = storage
+            .get_failed_partitions(
+                DEFAULT_CODE_LOCATION_ID,
+                "asset",
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let mut keys: Vec<String> = failed
+            .keys()
+            .map(|pk| match pk {
+                PartitionKey::Single { keys } => keys[0].clone(),
+                other => panic!("expected Single, got {other:?}"),
+            })
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["p3"],
+            "only the materialization failure floors a partition; \
+             action runs (failed or marking) must not"
         );
     }
 
@@ -8764,6 +11425,7 @@ mod tests {
                     name: None,
                 }),
             },
+            action: None,
         };
         storage.create_backfill(&record).await.unwrap();
 
@@ -8818,6 +11480,7 @@ mod tests {
             end_time: None,
             error: None,
             launched_by: LaunchedBy::default(),
+            action: None,
         }
     }
 
@@ -8917,6 +11580,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -8951,6 +11615,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -8970,6 +11635,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -8989,6 +11655,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -9026,6 +11693,7 @@ mod tests {
                     partition_key: None,
                     block_reason: None,
                     launched_by: LaunchedBy::Manual { user: None },
+                    action: None,
                 })
                 .await
                 .unwrap();
@@ -9055,6 +11723,7 @@ mod tests {
                 }),
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .collect();
 
@@ -9104,6 +11773,7 @@ mod tests {
                     partition_key: None,
                     block_reason: None,
                     launched_by: LaunchedBy::Manual { user: None },
+                    action: None,
                 })
                 .await
                 .unwrap();
@@ -9131,6 +11801,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -9170,6 +11841,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -9189,6 +11861,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -9481,6 +12154,195 @@ mod tests {
         assert_eq!(stored.code_version, Some("v2".to_string()));
     }
 
+    /// Pins `get_failed_partitions` across every source class in one place:
+    /// keyed failure runs floor, action runs never do (neither their run
+    /// status nor their keyed StepFailure events), and a newer
+    /// materialization or deletion supersedes. Guards the single-scan shape —
+    /// the runs table has no usable index for `$asset_key IN node_names`, so
+    /// each extra scan is a full table walk per invalidated asset per tick.
+    #[tokio::test]
+    async fn failed_partitions_sources_and_supersession() {
+        let storage = make_storage().await;
+        let cl = "default";
+        let single = |k: &str| PartitionKey::Single {
+            keys: vec![k.to_string()],
+        };
+        let run =
+            |id: &str, status: RunStatus, action: Option<&str>, pk: &str, ts: i64| RunRecord {
+                run_id: id.to_string(),
+                code_location_id: cl.to_string(),
+                job_name: None,
+                status,
+                start_time: ts,
+                end_time: Some(ts),
+                tags: vec![],
+                node_names: vec!["events".to_string()],
+                priority: 0,
+                partition_key: Some(single(pk)),
+                block_reason: None,
+                launched_by: LaunchedBy::default(),
+                action: action.map(String::from),
+            };
+
+        // p1: a real keyed failure — floors.
+        storage
+            .create_run(&run("rf", RunStatus::Failure, None, "p1", 1000))
+            .await
+            .unwrap();
+        // p2: an action run failed — not a failure to materialize.
+        storage
+            .create_run(&run("ra", RunStatus::Failure, Some("compact"), "p2", 1000))
+            .await
+            .unwrap();
+        // p3: a keyed StepFailure event from an action run — same rule.
+        storage
+            .create_run(&run("rb", RunStatus::Success, Some("compact"), "p3", 1000))
+            .await
+            .unwrap();
+        storage
+            .store_event(&EventRecord {
+                code_location_id: cl.to_string(),
+                event_type: EventType::StepFailure,
+                asset_key: Some("events".to_string()),
+                run_id: "rb".to_string(),
+                partition_key: Some(single("p3")),
+                timestamp: 1000,
+                metadata: vec![],
+                input_data_versions: vec![],
+            })
+            .await
+            .unwrap();
+        // p4: failed, then superseded by a newer materialization timestamp.
+        storage
+            .create_run(&run("rs", RunStatus::Failure, None, "p4", 1000))
+            .await
+            .unwrap();
+
+        let materialized: std::collections::HashMap<PartitionKey, i64> =
+            std::iter::once((single("p4"), 2000)).collect();
+        let failed = storage
+            .get_failed_partitions(cl, "events", &materialized)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            failed.get(&single("p1")),
+            Some(&1000),
+            "a keyed failure run must floor its partition"
+        );
+        assert!(
+            !failed.contains_key(&single("p2")),
+            "an action run's failure is not a failure to materialize"
+        );
+        assert!(
+            !failed.contains_key(&single("p3")),
+            "an action run's StepFailure events must not floor"
+        );
+        assert!(
+            !failed.contains_key(&single("p4")),
+            "a newer materialization supersedes the floor"
+        );
+    }
+
+    /// The pre-check probe and the claim transaction enforce the same
+    /// conflict rule — a drift between them turns "wait like any blocked
+    /// claim" into hard PoolContended failures (or vice versa admits a
+    /// conflicting writer). Both must embed the one shared predicate.
+    #[test]
+    fn conflict_predicate_shared_between_precheck_and_transaction() {
+        for scope in [
+            None,
+            Some(AssetScope {
+                exclusive: true,
+                partitions: Some(vec!["p1".to_string()].into_iter().collect()),
+            }),
+        ] {
+            let clause = SurrealStorage::asset_conflict_clause(0, scope.as_ref());
+            let predicate =
+                SurrealStorage::asset_conflict_predicate("p0", "parts0", scope.as_ref());
+            assert!(
+                clause.contains(&predicate),
+                "transaction LET must embed the shared predicate:\n{clause}\nvs\n{predicate}"
+            );
+        }
+    }
+
+    /// Asset pools are admitted by partition overlap, not capacity — the
+    /// claim transaction must not compute `$lim`/`$used` for them (a second
+    /// full slot aggregate inside the write transaction, referenced by
+    /// nothing, paid per attempt and per ~1s blocked poll).
+    #[test]
+    fn claim_transaction_skips_capacity_lets_for_asset_pools() {
+        let pools = vec![
+            ("__asset__:orders".to_string(), 1u32),
+            ("db".to_string(), 2u32),
+        ];
+        let q = SurrealStorage::build_claim_transaction(&pools, &[0], None);
+        assert!(
+            !q.contains("LET $lim_0") && !q.contains("LET $used_0"),
+            "asset pool must not compute unused capacity:\n{q}"
+        );
+        assert!(
+            q.contains("LET $lim_1") && q.contains("LET $used_1"),
+            "counted pool must keep its capacity check:\n{q}"
+        );
+        assert!(
+            q.contains("$conf_0") && q.contains("array::len($conf_0) == 0"),
+            "asset pool must keep its conflict clause:\n{q}"
+        );
+        assert!(
+            q.contains("($used_1 + 2) <= $lim_1"),
+            "counted pool must keep its admission condition:\n{q}"
+        );
+    }
+
+    /// `set_pool_limit` rows are load-bearing: a lost `__asset__:` registration
+    /// makes every claim on that asset hard-fail "pool not configured". Under
+    /// same-key contention every call must land or error loudly — with the
+    /// retry + check inside the storage layer, they all land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn set_pool_limit_survives_same_key_contention() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = std::sync::Arc::new(
+            SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+                .await
+                .expect("failed to create rocksdb storage"),
+        );
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(50));
+        let mut handles = Vec::new();
+        for i in 0..50u32 {
+            let storage = storage.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                storage
+                    .set_pool_limit(
+                        crate::storage::DEFAULT_CODE_LOCATION_ID,
+                        "__asset__:orders",
+                        (i % 7) as i32,
+                        300,
+                    )
+                    .await
+            }));
+        }
+        for h in handles {
+            h.await
+                .unwrap()
+                .expect("set_pool_limit must not fail under same-key contention");
+        }
+
+        let pools = storage
+            .get_pool_limits(crate::storage::DEFAULT_CODE_LOCATION_ID)
+            .await
+            .unwrap();
+        let rows: Vec<_> = pools
+            .iter()
+            .filter(|p| p.pool_key == "__asset__:orders")
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one row must survive contention");
+    }
+
     // ── Claim/Release protocol tests ──
 
     // This test runs against the RocksDB backend rather than `make_storage()`
@@ -9595,7 +12457,7 @@ mod tests {
         for n in 1..=5 {
             let pools: Vec<(String, u32)> =
                 pool_names[..n].iter().map(|k| (k.to_string(), 1)).collect();
-            let query = SurrealStorage::build_claim_transaction(&pools);
+            let query = SurrealStorage::build_claim_transaction(&pools, &[], None);
             let now_ns = now_nanos();
             let lease_exp = now_ns + 300_000_000_000i64;
 
@@ -9611,12 +12473,50 @@ mod tests {
                 .bind(("lease_exp", lease_exp));
 
             let mut response = q.await.unwrap().check().unwrap();
-            let idx = SurrealStorage::claim_check_statement_index(n);
+            let idx = SurrealStorage::claim_check_statement_index(n, 0);
             let count: Option<u32> = response.take((idx, "total")).unwrap();
             assert_eq!(
                 count,
                 Some(n as u32),
                 "pools={n}: expected {n} slots at statement index {idx}"
+            );
+        }
+
+        // Mixed counted + asset pools: asset pools emit one LET (the overlap
+        // predicate) instead of two ($lim/$used), so the formula's asset term
+        // is only exercised when both kinds ride one transaction.
+        for n_counted in 1..=2 {
+            let mut pools: Vec<(String, u32)> = pool_names[..n_counted]
+                .iter()
+                .map(|k| (k.to_string(), 1))
+                .collect();
+            // Distinct per iteration — the exclusive overlap claim from one
+            // iteration would contend the next on a shared asset pool.
+            pools.push((format!("__asset__:orders_{n_counted}"), 1));
+            let asset_idx = [pools.len() - 1];
+            let query = SurrealStorage::build_claim_transaction(&pools, &asset_idx, None);
+            let now_ns = now_nanos();
+            let lease_exp = now_ns + 300_000_000_000i64;
+
+            let mut q = storage.db.query(&query);
+            for (i, (pk, _)) in pools.iter().enumerate() {
+                q = q.bind((format!("p{i}"), pk.clone()));
+            }
+            q = q
+                .bind(("cl", crate::storage::DEFAULT_CODE_LOCATION_ID.to_string()))
+                .bind(("run_id", format!("mixed_run_{n_counted}")))
+                .bind(("step_key", format!("mixed_step_{n_counted}")))
+                .bind(("now", now_ns))
+                .bind(("lease_exp", lease_exp));
+
+            let mut response = q.await.unwrap().check().unwrap();
+            let idx = SurrealStorage::claim_check_statement_index(pools.len(), 1);
+            let count: Option<u32> = response.take((idx, "total")).unwrap();
+            assert_eq!(
+                count,
+                Some(pools.len() as u32),
+                "mixed pools={} + 1 asset: expected slots at statement index {idx}",
+                n_counted
             );
         }
     }
@@ -9637,6 +12537,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9669,6 +12570,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9683,6 +12585,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9720,6 +12623,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9745,10 +12649,976 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
         assert_eq!(s, ConcurrencyClaimStatus::Claimed);
+    }
+
+    /// Claim `pool` for `(run, step)` with the given scope, asserting the
+    /// storage call itself succeeded, and return whether it got in.
+    async fn claim_scoped(
+        storage: &SurrealStorage,
+        pool: &str,
+        run: &str,
+        step: &str,
+        partitions: Option<&[&str]>,
+        exclusive: bool,
+    ) -> bool {
+        let scope = AssetScope {
+            partitions: partitions.map(|p| p.iter().map(|s| s.to_string()).collect()),
+            exclusive,
+        };
+        let status = storage
+            .claim_concurrency_slots(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                &[(pool.to_string(), 1)],
+                run,
+                step,
+                0,
+                300,
+                Some(&scope),
+            )
+            .await
+            .unwrap();
+        matches!(status, ConcurrencyClaimStatus::Claimed)
+    }
+
+    /// The whole point of scoping the implicit pool: an action on one partition
+    /// must not block work on a different one.
+    #[tokio::test]
+    async fn test_asset_scope_disjoint_partitions_do_not_conflict() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        // delete(p1) — exclusive on p1 only.
+        assert!(
+            claim_scoped(&storage, pool, "r1", "delete", Some(&["p1"]), true).await,
+            "first claim on an empty pool always lands"
+        );
+        // materialize(p2) — different partition, must not be blocked.
+        assert!(
+            claim_scoped(&storage, pool, "r2", "mat_p2", Some(&["p2"]), false).await,
+            "materialize of p2 must run beside delete(p1)"
+        );
+        // delete(p3) — a second exclusive action, disjoint from both holders.
+        assert!(
+            claim_scoped(&storage, pool, "r3", "delete_p3", Some(&["p3"]), true).await,
+            "two actions on disjoint partitions must run together"
+        );
+        // delete(p2) overlaps the running materialize of p2, so it must wait.
+        assert!(
+            !claim_scoped(&storage, pool, "r5", "delete_p2", Some(&["p2"]), true).await,
+            "an action must wait for a materialize of the same partition"
+        );
+        // materialize(p1) — same partition as the running delete, must wait.
+        assert!(
+            !claim_scoped(&storage, pool, "r4", "mat_p1", Some(&["p1"]), false).await,
+            "materialize of p1 must block on delete(p1)"
+        );
+    }
+
+    /// The safety-critical cell: two exclusive actions on the SAME partition
+    /// must serialize, and two whole-asset actions must serialize too — the old
+    /// slot-count rule gave both for free, the overlap rule has to re-earn them.
+    #[tokio::test]
+    async fn test_asset_scope_exclusive_conflicts_with_exclusive() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        assert!(claim_scoped(&storage, pool, "r1", "del_a", Some(&["p1"]), true).await);
+        assert!(
+            !claim_scoped(&storage, pool, "r2", "del_b", Some(&["p1"]), true).await,
+            "two exclusive actions on the same partition must serialize"
+        );
+
+        let storage2 = make_storage().await;
+        storage2
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+        assert!(claim_scoped(&storage2, pool, "r1", "opt_a", None, true).await);
+        assert!(
+            !claim_scoped(&storage2, pool, "r2", "opt_b", None, true).await,
+            "two whole-asset actions must serialize"
+        );
+    }
+
+    /// `CONTAINSANY` must mean *any* member, on both sides. Every other test
+    /// uses a single-element set, which a wrong all-vs-any operator would pass.
+    #[tokio::test]
+    async fn test_asset_scope_batched_sets_overlap_by_any_member() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        // A batched *exclusive* action — the only place a multi-member set is
+        // written with exclusive = true.
+        assert!(
+            claim_scoped(
+                &storage,
+                pool,
+                "r1",
+                "del_batch",
+                Some(&["p1", "p2", "p3"]),
+                true
+            )
+            .await
+        );
+        // Overlap on the tail member only.
+        assert!(
+            !claim_scoped(&storage, pool, "r2", "mat_b", Some(&["p3", "p9"]), false).await,
+            "one shared member is enough to conflict"
+        );
+        // Fully disjoint batch.
+        assert!(
+            claim_scoped(&storage, pool, "r3", "mat_c", Some(&["p9", "p10"]), false).await,
+            "disjoint batches must not conflict"
+        );
+        // A second exclusive batch, disjoint from the first.
+        assert!(
+            claim_scoped(&storage, pool, "r4", "del_d", Some(&["p4", "p5"]), true).await,
+            "disjoint exclusive batches run together"
+        );
+    }
+
+    /// Whole-asset scope on the *claimant* side with `exclusive: false` — an
+    /// unpartitioned materialize while a partition action runs.
+    #[tokio::test]
+    async fn test_asset_scope_whole_asset_shared_blocks_on_partition_action() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        assert!(claim_scoped(&storage, pool, "r1", "del_p1", Some(&["p1"]), true).await);
+        assert!(
+            !claim_scoped(&storage, pool, "r2", "mat_all", None, false).await,
+            "a whole-asset materialize covers p1, so it must wait for delete(p1)"
+        );
+    }
+
+    /// The pre-check and the transaction both read other rows' scopes before
+    /// writing their own. Concurrency is fenced by the shared `claim_version`
+    /// bump on the pool row; without it both would see "no conflict" and commit.
+    #[tokio::test]
+    async fn test_asset_scope_concurrent_exclusive_claims_admit_one() {
+        let storage = std::sync::Arc::new(make_storage().await);
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let s = storage.clone();
+            tasks.push(tokio::spawn(async move {
+                claim_scoped(&s, pool, &format!("r{i}"), "del", Some(&["p1"]), true).await
+            }));
+        }
+        let mut claimed = 0;
+        for t in tasks {
+            if t.await.unwrap() {
+                claimed += 1;
+            }
+        }
+        assert_eq!(
+            claimed, 1,
+            "exactly one exclusive claim on a partition may be admitted"
+        );
+        let holders = storage
+            .get_pool_slot_holders(crate::storage::DEFAULT_CODE_LOCATION_ID, pool)
+            .await
+            .unwrap();
+        assert_eq!(holders.len(), 1, "and only one slot row exists");
+    }
+
+    #[tokio::test]
+    async fn test_asset_scope_shared_never_conflicts() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        // Fan-out: many materialize instances of the SAME partition coexist.
+        for i in 0..5 {
+            assert!(
+                claim_scoped(
+                    &storage,
+                    pool,
+                    "r1",
+                    &format!("inst_{i}"),
+                    Some(&["p1"]),
+                    false
+                )
+                .await,
+                "non-exclusive holders never conflict, even on one partition"
+            );
+        }
+        // An action on that partition now has to wait for all of them.
+        assert!(
+            !claim_scoped(&storage, pool, "r2", "delete", Some(&["p1"]), true).await,
+            "an action must wait for the materializes it overlaps"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_asset_scope_batch_overlap_blocks() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        // A batched materialize over p1..p3 — one row carrying the whole set.
+        assert!(
+            claim_scoped(
+                &storage,
+                pool,
+                "r1",
+                "batch",
+                Some(&["p1", "p2", "p3"]),
+                false
+            )
+            .await
+        );
+        // An action inside the batch's range overlaps it.
+        assert!(
+            !claim_scoped(&storage, pool, "r2", "del_p2", Some(&["p2"]), true).await,
+            "delete(p2) overlaps the batch and must wait"
+        );
+        // An action outside it does not — no threshold, no over-blocking.
+        assert!(
+            claim_scoped(&storage, pool, "r3", "del_p9", Some(&["p9"]), true).await,
+            "delete(p9) is disjoint from the batch and must run"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_asset_scope_whole_asset_conflicts_with_everything() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        // An unpartitioned action: `partitions: None` = the whole asset.
+        assert!(claim_scoped(&storage, pool, "r1", "optimize", None, true).await);
+        assert!(
+            !claim_scoped(&storage, pool, "r2", "mat_p1", Some(&["p1"]), false).await,
+            "a whole-asset action blocks every partition"
+        );
+
+        // And the reverse order: a partition holder blocks a whole-asset action.
+        let storage2 = make_storage().await;
+        storage2
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+        assert!(claim_scoped(&storage2, pool, "r1", "mat_p1", Some(&["p1"]), false).await);
+        assert!(
+            !claim_scoped(&storage2, pool, "r2", "optimize", None, true).await,
+            "a whole-asset action waits for any partition holder"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_asset_scope_released_slot_unblocks() {
+        let storage = make_storage().await;
+        let pool = "__asset__:orders";
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                pool,
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        assert!(claim_scoped(&storage, pool, "r1", "delete", Some(&["p1"]), true).await);
+        assert!(!claim_scoped(&storage, pool, "r2", "mat_p1", Some(&["p1"]), false).await);
+
+        storage
+            .free_concurrency_slots("r1", "delete")
+            .await
+            .unwrap();
+        assert!(
+            claim_scoped(&storage, pool, "r2", "mat_p1", Some(&["p1"]), false).await,
+            "releasing the action's slot must unblock the partition"
+        );
+    }
+
+    /// One `concurrency_slots` row, read back to check what a claim wrote.
+    #[derive(Debug, PartialEq, SurrealValue)]
+    struct HeldSlot {
+        pool_key: String,
+        slots_consumed: u32,
+        claimed_at: i64,
+        lease_expires_at: i64,
+        partitions: Option<Vec<String>>,
+        exclusive: bool,
+    }
+
+    /// Every slot row `(run, step)` holds, by pool. `partitions` is a set in
+    /// storage and comes back as a sorted array.
+    async fn held_slots(storage: &SurrealStorage, run: &str, step: &str) -> Vec<HeldSlot> {
+        storage
+            .db
+            .query(
+                "SELECT pool_key, slots_consumed, claimed_at, lease_expires_at, exclusive, \
+                     IF partitions IS NONE THEN NONE ELSE array::sort(<array> partitions) END \
+                         AS partitions \
+                 FROM concurrency_slots \
+                 WHERE run_id = $run_id AND step_key = $step_key ORDER BY pool_key",
+            )
+            .bind(("run_id", run.to_string()))
+            .bind(("step_key", step.to_string()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap()
+    }
+
+    /// A step that runs again under its run and step key (a Kubernetes retry
+    /// pod after an OOM kill, or a `--resume`) claims while the row of its
+    /// killed attempt still holds the pool. The claim must take that row over:
+    /// a second row for the step collided with `idx_slot_unique`, the claim
+    /// failed after its whole retry budget, and the step never ran.
+    #[tokio::test]
+    async fn test_asset_pool_reclaim_by_same_step_takes_over_its_slot() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let scope = |partitions: Option<&[&str]>, exclusive| AssetScope {
+            partitions: partitions.map(|p| p.iter().map(|s| s.to_string()).collect()),
+            exclusive,
+        };
+        // (killed attempt's scope, re-claim's scope)
+        let cases = [
+            // A materialize, of the whole asset and of one partition.
+            (scope(None, false), scope(None, false)),
+            (scope(Some(&["p1"]), false), scope(Some(&["p1"]), false)),
+            // An exclusive action, likewise.
+            (scope(None, true), scope(None, true)),
+            (scope(Some(&["p1"]), true), scope(Some(&["p1"]), true)),
+            // The re-claim's scope replaces the killed attempt's.
+            (scope(None, true), scope(Some(&["p1"]), false)),
+        ];
+        for (i, (killed_scope, scope)) in cases.iter().enumerate() {
+            let pool = format!("__asset__:orders_{i}");
+            let pools = [(pool.clone(), 1)];
+            let run = format!("run_{i}");
+            storage.set_pool_limit(cl, &pool, -1, 300).await.unwrap();
+
+            let status = storage
+                .claim_concurrency_slots(cl, &pools, &run, "orders", 0, 60, Some(killed_scope))
+                .await
+                .unwrap();
+            assert_eq!(status, ConcurrencyClaimStatus::Claimed, "case {i}");
+            let killed = held_slots(&storage, &run, "orders").await;
+
+            // The killed attempt never released its slot.
+            let status = storage
+                .claim_concurrency_slots(cl, &pools, &run, "orders", 0, 300, Some(scope))
+                .await
+                .unwrap_or_else(|e| panic!("case {i}: re-claim failed: {e:#}"));
+            assert_eq!(status, ConcurrencyClaimStatus::Claimed, "case {i}");
+
+            let held = held_slots(&storage, &run, "orders").await;
+            assert_eq!(
+                held.len(),
+                1,
+                "case {i}: one row per pool and step: {held:?}"
+            );
+            let row = &held[0];
+            assert_eq!(row.pool_key, pool);
+            assert_eq!(row.slots_consumed, 1);
+            assert!(
+                row.claimed_at > killed[0].claimed_at
+                    && row.lease_expires_at > killed[0].lease_expires_at,
+                "case {i}: the row must carry the re-claim's lease: {row:?} vs {killed:?}"
+            );
+            assert_eq!(row.partitions, scope.partitions, "case {i}");
+            assert_eq!(row.exclusive, scope.exclusive, "case {i}");
+
+            let parts: Option<Vec<&str>> = scope
+                .partitions
+                .as_ref()
+                .map(|p| p.iter().map(String::as_str).collect());
+            assert!(
+                !claim_scoped(
+                    &storage,
+                    &pool,
+                    "other_run",
+                    "optimize",
+                    parts.as_deref(),
+                    true
+                )
+                .await,
+                "case {i}: the taken-over slot must still hold off another run's action"
+            );
+        }
+        // The killed attempt held the whole asset exclusively; the re-claim
+        // holds p1, shared. Another run's materialize of p2 must get in.
+        assert!(
+            claim_scoped(
+                &storage,
+                "__asset__:orders_4",
+                "other_run",
+                "mat_p2",
+                Some(&["p2"]),
+                false
+            )
+            .await
+        );
+    }
+
+    /// The same take-over on a counted pool: the step holds one slot, not two.
+    #[tokio::test]
+    async fn test_user_pool_reclaim_by_same_step_takes_over_its_slot() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        storage.set_pool_limit(cl, "db", 2, 300).await.unwrap();
+        let pools = [("db".to_string(), 1)];
+        let claim = async |run: &str, lease: u32| {
+            storage
+                .claim_concurrency_slots(cl, &pools, run, "load", 0, lease, None)
+                .await
+                .unwrap_or_else(|e| panic!("claim by {run} failed: {e:#}"))
+        };
+
+        assert_eq!(claim("run_r", 60).await, ConcurrencyClaimStatus::Claimed);
+        let killed = held_slots(&storage, "run_r", "load").await;
+        assert_eq!(claim("run_r", 300).await, ConcurrencyClaimStatus::Claimed);
+
+        let held = held_slots(&storage, "run_r", "load").await;
+        assert_eq!(held.len(), 1, "one row per pool and step: {held:?}");
+        let row = &held[0];
+        assert_eq!(
+            (row.pool_key.as_str(), row.slots_consumed, row.exclusive),
+            ("db", 1, false)
+        );
+        assert_eq!(row.partitions, None);
+        assert!(
+            row.claimed_at > killed[0].claimed_at
+                && row.lease_expires_at > killed[0].lease_expires_at,
+            "the row must carry the re-claim's lease: {row:?} vs {killed:?}"
+        );
+        assert_eq!(
+            storage.get_pool_info(cl, "db").await.unwrap().claimed_count,
+            1
+        );
+        assert_eq!(claim("run_b", 300).await, ConcurrencyClaimStatus::Claimed);
+        assert!(
+            matches!(
+                claim("run_c", 300).await,
+                ConcurrencyClaimStatus::Pending { .. }
+            ),
+            "the pool of two is full with run_r and run_b"
+        );
+    }
+
+    /// A step on a counted pool and its asset's pool takes over both rows.
+    #[tokio::test]
+    async fn test_multi_pool_reclaim_by_same_step_takes_over_every_slot() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        storage.set_pool_limit(cl, "db", 2, 300).await.unwrap();
+        storage
+            .set_pool_limit(cl, "__asset__:orders", -1, 300)
+            .await
+            .unwrap();
+        let pools = [("db".to_string(), 1), ("__asset__:orders".to_string(), 1)];
+        let scope = AssetScope {
+            partitions: Some(vec!["p1".to_string()]),
+            exclusive: false,
+        };
+
+        for lease in [60, 300] {
+            let status = storage
+                .claim_concurrency_slots(cl, &pools, "run_r", "orders", 0, lease, Some(&scope))
+                .await
+                .unwrap_or_else(|e| panic!("claim with a {lease}s lease failed: {e:#}"));
+            assert_eq!(status, ConcurrencyClaimStatus::Claimed);
+        }
+
+        let held = held_slots(&storage, "run_r", "orders").await;
+        let pools_held: Vec<(&str, Option<&[String]>)> = held
+            .iter()
+            .map(|r| (r.pool_key.as_str(), r.partitions.as_deref()))
+            .collect();
+        assert_eq!(
+            pools_held,
+            [
+                ("__asset__:orders", Some(&["p1".to_string()][..])),
+                ("db", None)
+            ]
+        );
+        let now = now_nanos();
+        assert!(
+            held.iter()
+                .all(|r| r.lease_expires_at > now + 200 * 1_000_000_000),
+            "both rows must carry the re-claim's 300s lease: {held:?}"
+        );
+        assert_eq!(
+            storage.get_pool_info(cl, "db").await.unwrap().claimed_count,
+            1
+        );
+    }
+
+    /// The count a claim reads from its claim-result statement, for the claim
+    /// transaction run the way a claim runs it once its pre-check has passed.
+    /// A claim by another step that commits between the two leaves the
+    /// transaction's `IF` false.
+    async fn claim_transaction_count(
+        storage: &SurrealStorage,
+        pools: &[(String, u32)],
+        asset_pools: &[usize],
+        run: &str,
+        step: &str,
+        scope: Option<&AssetScope>,
+    ) -> u32 {
+        let now_ns = now_nanos();
+        let query = SurrealStorage::build_claim_transaction(pools, asset_pools, scope);
+        let mut q = storage.db.query(&query);
+        for (i, (pool_key, _)) in pools.iter().enumerate() {
+            q = q.bind((format!("p{i}"), pool_key.clone()));
+        }
+        if let Some(parts) = scope.and_then(|s| s.partitions.as_ref()) {
+            for &i in asset_pools {
+                q = q.bind((format!("parts{i}"), parts.clone()));
+            }
+        }
+        let mut response = q
+            .bind(("cl", crate::storage::DEFAULT_CODE_LOCATION_ID.to_string()))
+            .bind(("run_id", run.to_string()))
+            .bind(("step_key", step.to_string()))
+            .bind(("now", now_ns))
+            .bind(("lease_exp", now_ns + 300_000_000_000))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let idx = SurrealStorage::claim_check_statement_index(pools.len(), asset_pools.len());
+        let count: Option<u32> = response.take((idx, "total")).unwrap();
+        count.unwrap_or(0)
+    }
+
+    /// A step run again under its run and step key after its killed attempt's
+    /// lease ran out, while another run holds the asset in a way that blocks
+    /// it, must wait. That run can claim between the re-claim's pre-check and
+    /// its transaction: the step's leftover row then still exists, but the
+    /// transaction did not write it, so the claim must not report Claimed.
+    #[tokio::test]
+    async fn test_asset_pool_reclaim_by_same_step_waits_for_another_runs_claim() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let scope = |partitions: Option<&[&str]>, exclusive| AssetScope {
+            partitions: partitions.map(|p| p.iter().map(|s| s.to_string()).collect()),
+            exclusive,
+        };
+        // (the re-run step's scope, the other run's scope)
+        let cases = [
+            // A materialize, blocked by a delete of the whole asset.
+            (scope(None, false), scope(None, true)),
+            // Both on one partition.
+            (scope(Some(&["p1"]), false), scope(Some(&["p1"]), true)),
+            // The re-run step is the action; the other run materializes.
+            (scope(Some(&["p1"]), true), scope(Some(&["p1"]), false)),
+        ];
+        for (i, (mine, theirs)) in cases.iter().enumerate() {
+            let pool = format!("__asset__:orders_{i}");
+            let pools = [(pool.clone(), 1)];
+            let run = format!("run_{i}");
+            storage.set_pool_limit(cl, &pool, -1, 300).await.unwrap();
+            let claim = async |run: &str, lease: u32, scope: &AssetScope| {
+                storage
+                    .claim_concurrency_slots(cl, &pools, run, "orders", 0, lease, Some(scope))
+                    .await
+                    .unwrap_or_else(|e| panic!("case {i}: claim by {run} failed: {e:#}"))
+            };
+
+            // The killed attempt never released its slot, and its lease ran out.
+            assert_eq!(
+                claim(&run, 0, mine).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}"
+            );
+            let killed = held_slots(&storage, &run, "orders").await;
+            assert_eq!(
+                claim("other_run", 300, theirs).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}"
+            );
+
+            let status = claim(&run, 300, mine).await;
+            assert!(
+                matches!(status, ConcurrencyClaimStatus::Pending { .. }),
+                "case {i}: {status:?}"
+            );
+            assert_eq!(
+                claim_transaction_count(&storage, &pools, &[0], &run, "orders", Some(mine)).await,
+                0,
+                "case {i}: the transaction claimed nothing; the leftover row is not its claim"
+            );
+            assert_eq!(
+                held_slots(&storage, &run, "orders").await,
+                killed,
+                "case {i}"
+            );
+            let holders: Vec<(String, String)> = storage
+                .get_pool_slot_holders(cl, &pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|h| (h.run_id, h.step_key))
+                .collect();
+            assert_eq!(
+                holders,
+                [("other_run".to_string(), "orders".to_string())],
+                "case {i}"
+            );
+
+            storage
+                .free_concurrency_slots("other_run", "orders")
+                .await
+                .unwrap();
+            assert_eq!(
+                claim(&run, 300, mine).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}"
+            );
+            let held = held_slots(&storage, &run, "orders").await;
+            assert_eq!(held.len(), 1, "case {i}: {held:?}");
+            assert!(
+                held[0].claimed_at > killed[0].claimed_at
+                    && held[0].lease_expires_at > killed[0].lease_expires_at,
+                "case {i}: the re-claim must take the row over: {held:?} vs {killed:?}"
+            );
+        }
+    }
+
+    /// A re-run step whose own leftover row is all that fills a counted pool
+    /// takes that row over at once: the row does not count toward the limit
+    /// its re-claim is checked against, so the step does not wait out its
+    /// killed attempt's lease.
+    #[tokio::test]
+    async fn test_user_pool_reclaim_by_same_step_does_not_wait_for_its_old_lease() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        let scope = AssetScope {
+            partitions: Some(vec!["p1".to_string()]),
+            exclusive: false,
+        };
+        // (the counted pool's limit, the pools the step claims)
+        let cases = [
+            (1, vec![("db_0".to_string(), 1)]),
+            // Two slots of a pool of two.
+            (2, vec![("db_1".to_string(), 2)]),
+            // Beside its asset's pool.
+            (
+                1,
+                vec![("db_2".to_string(), 1), ("__asset__:orders".to_string(), 1)],
+            ),
+        ];
+        for (i, (limit, pools)) in cases.iter().enumerate() {
+            let run = format!("run_{i}");
+            let (db, slots) = &pools[0];
+            storage.set_pool_limit(cl, db, *limit, 300).await.unwrap();
+            let scope = if pools.len() > 1 {
+                storage
+                    .set_pool_limit(cl, "__asset__:orders", -1, 300)
+                    .await
+                    .unwrap();
+                Some(&scope)
+            } else {
+                None
+            };
+            let claim = async |run: &str| {
+                storage
+                    .claim_concurrency_slots(cl, pools, run, "load", 0, 300, scope)
+                    .await
+                    .unwrap_or_else(|e| panic!("case {i}: claim by {run} failed: {e:#}"))
+            };
+
+            assert_eq!(
+                claim(&run).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}"
+            );
+            let killed = held_slots(&storage, &run, "load").await;
+            // The killed attempt never released its slot; its lease is live.
+            assert_eq!(
+                claim(&run).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}: the re-claim must not wait for its own old lease"
+            );
+
+            let held = held_slots(&storage, &run, "load").await;
+            assert_eq!(held.len(), pools.len(), "case {i}: {held:?}");
+            for (row, old) in held.iter().zip(&killed) {
+                assert_eq!(
+                    (&row.pool_key, row.slots_consumed),
+                    (&old.pool_key, old.slots_consumed),
+                    "case {i}"
+                );
+                assert!(
+                    row.claimed_at > old.claimed_at && row.lease_expires_at > old.lease_expires_at,
+                    "case {i}: the re-claim must take the row over: {row:?} vs {old:?}"
+                );
+            }
+            assert_eq!(
+                storage.get_pool_info(cl, db).await.unwrap().claimed_count,
+                *slots,
+                "case {i}"
+            );
+            match claim("other_run").await {
+                ConcurrencyClaimStatus::Pending {
+                    reason:
+                        BlockReason::PoolFull {
+                            pool_key,
+                            claimed,
+                            limit: pool_limit,
+                        },
+                    ..
+                } => assert_eq!(
+                    (pool_key.as_str(), claimed, pool_limit),
+                    (db.as_str(), *slots, *limit),
+                    "case {i}"
+                ),
+                other => panic!("case {i}: the taken-over row must fill the pool: {other:?}"),
+            }
+        }
+    }
+
+    /// A re-run step must still wait for a counted pool's slot that another
+    /// step holds, whether its own leftover row's lease ran out or not, also
+    /// when that step claims between the re-claim's pre-check and its
+    /// transaction. Only the step's own row, by run and step key, is left out
+    /// of the count.
+    #[tokio::test]
+    async fn test_user_pool_reclaim_by_same_step_waits_for_another_steps_slot() {
+        let temp_dir = test_temp_dir::test_temp_dir!();
+        let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+            .await
+            .expect("failed to create rocksdb storage");
+        let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
+        // (the killed attempt's lease, the re-run step, the other holder)
+        let cases = [
+            // The lease ran out, and another run's step of the same name took
+            // the slot.
+            (0, ("run_0", "load"), ("other_run", "load")),
+            // The lease is live, and a sibling step of the same run holds the
+            // only slot left after the limit was lowered.
+            (300, ("run_1", "load"), ("run_1", "sibling")),
+        ];
+        for (i, (lease, (run, step), (holder_run, holder_step))) in cases.into_iter().enumerate() {
+            let pool = format!("db_{i}");
+            let pools = [(pool.clone(), 1)];
+            let claim = async |run: &str, step: &str, lease: u32| {
+                storage
+                    .claim_concurrency_slots(cl, &pools, run, step, 0, lease, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("case {i}: claim by {run}/{step} failed: {e:#}"))
+            };
+            storage.set_pool_limit(cl, &pool, 2, 300).await.unwrap();
+            assert_eq!(
+                claim(run, step, lease).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}"
+            );
+            let killed = held_slots(&storage, run, step).await;
+            assert_eq!(
+                claim(holder_run, holder_step, 300).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}"
+            );
+            storage.set_pool_limit(cl, &pool, 1, 300).await.unwrap();
+
+            match claim(run, step, 300).await {
+                ConcurrencyClaimStatus::Pending {
+                    reason:
+                        BlockReason::PoolFull {
+                            pool_key,
+                            claimed,
+                            limit,
+                        },
+                    ..
+                } => assert_eq!(
+                    (pool_key.as_str(), claimed, limit),
+                    (pool.as_str(), 1, 1),
+                    "case {i}"
+                ),
+                other => panic!("case {i}: expected Pending on the full pool, got {other:?}"),
+            }
+            assert_eq!(
+                claim_transaction_count(&storage, &pools, &[], run, step, None).await,
+                0,
+                "case {i}: the transaction claimed nothing; the leftover row is not its claim"
+            );
+            assert_eq!(held_slots(&storage, run, step).await, killed, "case {i}");
+
+            storage
+                .free_concurrency_slots(holder_run, holder_step)
+                .await
+                .unwrap();
+            assert_eq!(
+                claim(run, step, 300).await,
+                ConcurrencyClaimStatus::Claimed,
+                "case {i}"
+            );
+            let held = held_slots(&storage, run, step).await;
+            assert_eq!(held.len(), 1, "case {i}: {held:?}");
+            assert!(
+                held[0].claimed_at > killed[0].claimed_at
+                    && held[0].lease_expires_at > killed[0].lease_expires_at,
+                "case {i}: the re-claim must take the row over: {held:?} vs {killed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_claim_mixing_unlimited_and_limited_pools() {
+        // Unlimited pools are dropped from the transaction, so the post-COMMIT
+        // check has to be indexed by the pools actually in it. An asset that
+        // declares a pool with no explicit limit (auto-registered as -1) and an
+        // exclusive action (its implicit pool) hits exactly this shape.
+        let storage = make_storage().await;
+        storage
+            .set_pool_limit(crate::storage::DEFAULT_CODE_LOCATION_ID, "db", -1, 300)
+            .await
+            .unwrap();
+        storage
+            .set_pool_limit(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                "__asset__:orders",
+                1_000_000,
+                300,
+            )
+            .await
+            .unwrap();
+
+        let status = storage
+            .claim_concurrency_slots(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                &[
+                    ("db".to_string(), 1),
+                    ("__asset__:orders".to_string(), 1_000_000),
+                ],
+                "run1",
+                "step_a",
+                0,
+                300,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            ConcurrencyClaimStatus::Claimed,
+            "an unlimited pool alongside a limited one must not be read as contention"
+        );
+
+        // And the limited pool really was claimed, so exclusion still holds.
+        let blocked = storage
+            .claim_concurrency_slots(
+                crate::storage::DEFAULT_CODE_LOCATION_ID,
+                &[("__asset__:orders".to_string(), 1)],
+                "run2",
+                "step_b",
+                0,
+                300,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(blocked, ConcurrencyClaimStatus::Pending { .. }));
     }
 
     #[tokio::test]
@@ -9768,6 +13638,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9782,6 +13653,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9796,6 +13668,7 @@ mod tests {
                 "step_c",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9830,6 +13703,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9844,6 +13718,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9883,6 +13758,7 @@ mod tests {
                 "s1",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9894,6 +13770,7 @@ mod tests {
                 "s2",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9907,6 +13784,7 @@ mod tests {
                 "s3",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9941,6 +13819,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9952,6 +13831,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -9992,6 +13872,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10003,6 +13884,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10044,6 +13926,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10055,6 +13938,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10075,6 +13959,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10099,6 +13984,7 @@ mod tests {
                 "s1",
                 0,
                 300,
+                None,
             )
             .await;
         assert!(result.is_err());
@@ -10116,6 +14002,7 @@ mod tests {
                 "s1",
                 0,
                 300,
+                None,
             )
             .await;
         assert!(result.is_err());
@@ -10146,6 +14033,7 @@ mod tests {
                         &format!("step_{i}"),
                         0,
                         300,
+                        None,
                     )
                     .await
                     .unwrap()
@@ -10188,6 +14076,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10199,6 +14088,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10237,6 +14127,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10251,6 +14142,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10283,6 +14175,7 @@ mod tests {
                 "step_a",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -10323,6 +14216,7 @@ mod tests {
                 "step_a",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -10336,6 +14230,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10353,6 +14248,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10376,6 +14272,7 @@ mod tests {
                 "step_a",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -10422,6 +14319,7 @@ mod tests {
                 "step_a",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -10475,6 +14373,7 @@ mod tests {
                 "step_a",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -10486,6 +14385,7 @@ mod tests {
                 "step_b",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -10497,6 +14397,7 @@ mod tests {
                 "step_c",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10532,6 +14433,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10570,6 +14472,7 @@ mod tests {
                 "step_a",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -10618,6 +14521,7 @@ mod tests {
                     step,
                     0,
                     300,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -10659,6 +14563,7 @@ mod tests {
                 "step_1",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10670,6 +14575,7 @@ mod tests {
                 "step_2",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10685,6 +14591,7 @@ mod tests {
                 "step_3",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10703,6 +14610,7 @@ mod tests {
                 "step_3",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10731,6 +14639,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10742,6 +14651,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10763,6 +14673,7 @@ mod tests {
                 "other",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10774,6 +14685,7 @@ mod tests {
                 "step_c",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -10822,6 +14734,7 @@ mod tests {
                 "step_a",
                 0,
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -10953,6 +14866,7 @@ mod tests {
                         partition_key: None,
                         block_reason: None,
                         launched_by: LaunchedBy::Manual { user: None },
+                        action: None,
                     })
                     .await
                     .unwrap();
@@ -10974,6 +14888,7 @@ mod tests {
                         partition_key: None,
                         block_reason: None,
                         launched_by: LaunchedBy::Manual { user: None },
+                        action: None,
                     })
                     .await
                     .unwrap();
@@ -11043,6 +14958,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -11141,6 +15057,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -11176,6 +15093,7 @@ mod tests {
             EventType::StepSlotWaiting,
             EventType::StepSlotRenewed,
             EventType::StepSlotReleased,
+            EventType::ActionCompleted,
         ];
 
         for evt in types {
@@ -11204,6 +15122,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -11217,6 +15136,7 @@ mod tests {
                 "step_b",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -11255,6 +15175,7 @@ mod tests {
                 "step_a",
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -11307,6 +15228,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -11363,6 +15285,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -11376,6 +15299,7 @@ mod tests {
                 "blocker",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -11387,6 +15311,7 @@ mod tests {
                 "step_a",
                 0,
                 300,
+                None,
             )
             .await
             .unwrap();
@@ -11428,6 +15353,7 @@ mod tests {
                 partition_key: None,
                 block_reason: Some("global limit".into()),
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -11457,6 +15383,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -11690,6 +15617,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         }
     }
 
@@ -12417,6 +16345,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_step_attempts() {
+        let storage = make_storage().await;
+        let event = |event_type, asset: &str, pk: Option<&str>| EventRecord {
+            code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+            event_type,
+            asset_key: Some(asset.to_string()),
+            run_id: "run-1".to_string(),
+            partition_key: pk.map(|k| PartitionKey::Single {
+                keys: vec![k.to_string()],
+            }),
+            timestamp: 100,
+            metadata: vec![],
+            input_data_versions: vec![],
+        };
+        storage
+            .store_events(&[
+                event(EventType::StepStart, "cut_off", None),
+                event(EventType::StepRetry, "cut_off", None),
+                event(EventType::StepStart, "cut_off", None),
+                event(EventType::StepStart, "failed", None),
+                event(EventType::StepFailure, "failed", None),
+                // A keyed failure is one partition of a batch, not the step.
+                event(EventType::StepStart, "one_key", None),
+                event(EventType::StepFailure, "one_key", Some("p1")),
+            ])
+            .await
+            .unwrap();
+
+        let attempts = storage.get_step_attempts("run-1").await.unwrap();
+        let get = |k: &str| attempts.get(k).cloned().unwrap_or_default();
+        assert_eq!(
+            get("cut_off"),
+            crate::storage::StepAttempts {
+                starts: 2,
+                failed: false,
+                retries: 1,
+                failed_keys: vec![],
+            }
+        );
+        assert!(get("failed").failed);
+        assert!(get("one_key").starts == 1 && !get("one_key").failed);
+        assert_eq!(
+            get("one_key").failed_keys,
+            vec![PartitionKey::Single {
+                keys: vec!["p1".to_string()]
+            }]
+        );
+        assert!(storage.get_step_attempts("other").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_get_completed_step_keys_empty() {
         let storage = make_storage().await;
         let keys = storage
@@ -12712,6 +16691,7 @@ mod tests {
                     partition_key: None,
                     block_reason: None,
                     launched_by: LaunchedBy::Manual { user: None },
+                    action: None,
                 })
                 .await
                 .unwrap();
@@ -12731,6 +16711,7 @@ mod tests {
                 partition_key: None,
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
+                action: None,
             })
             .await
             .unwrap();
@@ -12814,6 +16795,7 @@ mod tests {
                     partition_key: None,
                     block_reason: None,
                     launched_by: LaunchedBy::Manual { user: None },
+                    action: None,
                 })
                 .await
                 .unwrap();
@@ -12857,6 +16839,7 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         // CL-A: 2 success, 1 failure
         for r in [
@@ -12912,6 +16895,7 @@ mod tests {
                     partition_key: None,
                     block_reason: None,
                     launched_by: LaunchedBy::Manual { user: None },
+                    action: None,
                 })
                 .await
                 .unwrap();
@@ -12957,6 +16941,7 @@ mod tests {
             end_time: None,
             error: None,
             launched_by: LaunchedBy::default(),
+            action: None,
         }
     }
 

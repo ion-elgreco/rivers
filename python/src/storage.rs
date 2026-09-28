@@ -391,6 +391,8 @@ pub struct PyRunRecord {
     pub partition_key: Option<PyPartitionKey>,
     pub block_reason: Option<String>,
     pub launched_by: PyLaunchedBy,
+    /// The verb this run executes. `None` means materialize.
+    pub action: Option<String>,
 }
 
 impl From<RunRecord> for PyRunRecord {
@@ -407,6 +409,7 @@ impl From<RunRecord> for PyRunRecord {
             partition_key: r.partition_key.as_ref().map(PyPartitionKey::from),
             block_reason: r.block_reason,
             launched_by: r.launched_by.into(),
+            action: r.action,
         }
     }
 }
@@ -1319,7 +1322,7 @@ impl PyStorage {
             let status = io_rt()
                 .block_on(
                     self.scoped()
-                        .claim_concurrency_slots(&pools, run_id, step_key, priority, secs),
+                        .claim_concurrency_slots(&pools, run_id, step_key, priority, secs, None),
                 )
                 .map_err(to_py_err)?;
             Ok(PyConcurrencyClaimStatus::from(status))
@@ -1402,7 +1405,8 @@ impl PyStorage {
     }
 
     /// Create a run record (test helper). Not part of the public API.
-    #[pyo3(name = "_create_run", signature = (run_id, job_name, status, start_time, priority=0, tags=vec![], block_reason=None))]
+    #[pyo3(name = "_create_run", signature = (run_id, job_name, status, start_time, priority=0, tags=vec![], block_reason=None, node_names=vec![], action=None))]
+    #[allow(clippy::too_many_arguments)]
     fn create_run(
         &self,
         py: Python<'_>,
@@ -1413,6 +1417,8 @@ impl PyStorage {
         priority: i32,
         tags: Vec<(String, String)>,
         block_reason: Option<String>,
+        node_names: Vec<String>,
+        action: Option<String>,
     ) -> PyResult<()> {
         use rivers_core::storage::RunRecord;
         let record = RunRecord {
@@ -1427,11 +1433,12 @@ impl PyStorage {
             start_time,
             end_time: None,
             tags,
-            node_names: vec![],
+            node_names,
             priority,
             partition_key: None,
             block_reason,
             launched_by: LaunchedBy::Manual { user: None },
+            action,
         };
         py.detach(|| {
             io_rt()
@@ -1485,6 +1492,7 @@ impl PyStorage {
             end_time: None,
             error: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
         };
         py.detach(|| {
             io_rt()
