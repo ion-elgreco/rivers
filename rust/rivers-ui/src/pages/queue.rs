@@ -120,6 +120,7 @@ pub fn QueuePage() -> impl IntoView {
                                         let job = r.job_name.clone().unwrap_or_else(|| {
                                             r.node_names.first().cloned().unwrap_or_else(|| "—".into())
                                         });
+                                        let job = crate::helpers::with_verb(job, r.action.as_deref());
                                         let (ns, name) = loc.get();
                                         QueuedRun {
                                             id: short_id,

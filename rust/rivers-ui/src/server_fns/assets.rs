@@ -127,10 +127,14 @@ pub async fn get_asset_events_page(
     let event_types: Vec<String> = match filter.as_str() {
         "mat" => vec!["Materialization".to_string()],
         "fail" => vec!["StepFailure".to_string()],
+        // A deletion flips the asset to Missing, so it must be visible here —
+        // without it the timeline shows no reason for the state change.
         _ => vec![
             "Materialization".to_string(),
             "Observation".to_string(),
             "StepFailure".to_string(),
+            "ActionCompleted".to_string(),
+            "Deletion".to_string(),
         ],
     };
     let (rows, total) = state

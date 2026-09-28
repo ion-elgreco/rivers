@@ -631,6 +631,27 @@ impl ResolvedNode {
         self.find_action(verb).is_some_and(|a| a.is_async)
     }
 
+    /// `(name, outcome, exclusive, partitioning, description)` for every
+    /// action this node supports — the gRPC `ActionInfo` projection.
+    pub(crate) fn list_actions(&self) -> Vec<(String, String, bool, String, Option<String>)> {
+        match self {
+            ResolvedNode::Asset(node) => node
+                .actions
+                .iter()
+                .map(|a| {
+                    (
+                        a.name.clone(),
+                        a.outcome.as_str().to_string(),
+                        a.exclusive,
+                        a.partitioning.as_str().to_string(),
+                        a.description.clone(),
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn is_graph_asset(&self) -> bool {
         matches!(self, ResolvedNode::Asset(node) if node.kind == AssetKind::Graph)
     }

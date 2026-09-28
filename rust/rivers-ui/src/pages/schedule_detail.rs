@@ -6,10 +6,12 @@ use leptos_router::hooks::use_params_map;
 
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::ui_kit::{Crumb, TickRunChips, Topbar};
-use crate::helpers::{tick_counts_summary, tick_status_class};
+use crate::helpers::{job_actions_by_name, tick_counts_summary, tick_status_class};
 use crate::loc::{loc_path, use_current_location};
 use crate::now::RelTime;
-use crate::server_fns::automation::{evaluate_schedule, get_next_tick, get_schedules, get_ticks};
+use crate::server_fns::automation::{
+    evaluate_schedule, get_jobs, get_next_tick, get_schedules, get_ticks,
+};
 
 #[component]
 pub fn ScheduleDetailPage() -> impl IntoView {
@@ -33,6 +35,11 @@ pub fn ScheduleDetailPage() -> impl IntoView {
             (loc.get(), name(), refresh_tick.get())
         },
         |((ns, lname), name, _)| get_ticks(ns, lname, name, Some(50)),
+    );
+
+    let jobs = Resource::new(
+        move || loc.get(),
+        |(ns, lname)| async move { get_jobs(ns, lname).await },
     );
 
     let eval_action = Action::new(move |_: &()| {
@@ -88,6 +95,7 @@ pub fn ScheduleDetailPage() -> impl IntoView {
                             let (lns, lnm) = loc.get();
                             let job_href = loc_path(&lns, &lnm, &format!("jobs/{}", s.job_name));
                             let job_name = s.job_name.clone();
+                            let verb_job = job_name.clone();
                             let timezone_value = s.timezone.clone().unwrap_or_else(|| "UTC".to_string());
                             let tags = s.tags.clone();
 
@@ -99,7 +107,15 @@ pub fn ScheduleDetailPage() -> impl IntoView {
                                     </div>
                                     <div class="meta-tile">
                                         <div class="meta-tile-label">"JOB"</div>
-                                        <div class="meta-tile-value"><A href=job_href>{job_name}</A></div>
+                                        <div class="meta-tile-value">
+                                            <A href=job_href>{job_name}</A>
+                                            {move || jobs.get()
+                                                .and_then(|r| r.ok())
+                                                .and_then(|js| job_actions_by_name(&js).remove(&verb_job))
+                                                .map(|v| view! {
+                                                    <span class="grid-cell-muted" title="asset action">{format!(" · {v}")}</span>
+                                                })}
+                                        </div>
                                     </div>
                                     <div class="meta-tile">
                                         <div class="meta-tile-label">"TIMEZONE"</div>

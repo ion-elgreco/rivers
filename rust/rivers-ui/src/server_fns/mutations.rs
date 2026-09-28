@@ -1,4 +1,5 @@
-//! Server functions for write actions (materialize, observe) dispatched via gRPC.
+//! Server functions for UI mutations (materialize, asset actions, backfills,
+//! run cancel/delete) dispatched via gRPC.
 
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,14 @@ async fn connect_to_run_owner(
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
+#[cfg(feature = "ssr")]
+fn tags_to_proto(tags: Option<Vec<(String, String)>>) -> Vec<rivers_api::rivers::Tag> {
+    tags.unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| rivers_api::rivers::Tag { key: k, value: v })
+        .collect()
+}
+
 /// Convert a UI-side `SubmitPartitionKey` into the proto wire type
 /// `ProtoPartitionKey`. SSR-only because `rivers_api` isn't compiled on
 /// WASM.
@@ -118,7 +127,7 @@ pub async fn trigger_materialize(
     partition_key: Option<SubmitPartitionKey>,
     tags: Option<Vec<(String, String)>>,
 ) -> Result<MaterializeResult, ServerFnError> {
-    use rivers_api::rivers::{MaterializeRequest, Tag};
+    use rivers_api::rivers::MaterializeRequest;
 
     let state = expect_context::<crate::state::AppState>();
     let (_, mut client) = state
@@ -130,11 +139,7 @@ pub async fn trigger_materialize(
         .materialize(MaterializeRequest {
             selection: selection.unwrap_or_default(),
             partition_key: partition_key.map(submit_to_proto),
-            tags: tags
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(k, v)| Tag { key: k, value: v })
-                .collect(),
+            tags: tags_to_proto(tags),
             user: current_user_ref().await,
         })
         .await
@@ -145,6 +150,58 @@ pub async fn trigger_materialize(
         run_id: r.run_id,
         status: r.status,
     })
+}
+
+/// Run a named asset action over a selection. Returns the run id.
+/// `whole_asset` is the user's explicit choice to run an Optional-key verb on
+/// every partition; without it the backend rejects a keyless run of one.
+#[server]
+pub async fn trigger_action(
+    loc_ns: String,
+    loc_name: String,
+    action: String,
+    selection: Vec<String>,
+    partition_key: Option<SubmitPartitionKey>,
+    tags: Option<Vec<(String, String)>>,
+    whole_asset: bool,
+) -> Result<String, ServerFnError> {
+    use rivers_api::rivers::RunActionRequest;
+
+    // The backend rejects an empty selection too (all_assets is always false
+    // here) — this copy just fails fast with a clean message instead of a
+    // gRPC status string, and without the round trip.
+    if selection.is_empty() {
+        return Err(ServerFnError::new(format!(
+            "action '{action}' needs at least one asset"
+        )));
+    }
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let resp = client
+        .run_action(RunActionRequest {
+            action,
+            selection,
+            partition_key: partition_key.map(submit_to_proto),
+            tags: tags_to_proto(tags),
+            user: current_user_ref().await,
+            all_assets: false,
+            whole_asset,
+        })
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let r = resp.into_inner();
+    if !r.success {
+        return Err(ServerFnError::new(
+            r.error.unwrap_or_else(|| "action failed".to_string()),
+        ));
+    }
+    Ok(r.run_id)
 }
 
 /// Re-execute a run by id, server-side: replays it on its original partition,
@@ -273,8 +330,23 @@ pub async fn launch_backfill(
     partition_keys: Vec<SubmitPartitionKey>,
     tags: Option<Vec<(String, String)>>,
     job_name: Option<String>,
+    /// The verb the child runs execute; `None` materializes. For a job target
+    /// it is the verb the page showed for the job: the backend refuses the
+    /// backfill if the job now runs another one.
+    action: Option<String>,
 ) -> Result<BackfillRerunResult, ServerFnError> {
-    use rivers_api::rivers::{LaunchBackfillRequest, Tag};
+    use rivers_api::rivers::LaunchBackfillRequest;
+
+    // Same rule as `trigger_action`: a `#[server]` fn is a public HTTP
+    // endpoint, so an empty selection with a verb must not reach the backend
+    // and read as "every asset declaring it".
+    if let Some(verb) = &action {
+        if job_name.is_none() && selection.as_ref().is_none_or(|s| s.is_empty()) {
+            return Err(ServerFnError::new(format!(
+                "backfill with action '{verb}' needs at least one asset"
+            )));
+        }
+    }
 
     let state = expect_context::<crate::state::AppState>();
     let (_, mut client) = state
@@ -284,17 +356,14 @@ pub async fn launch_backfill(
 
     let resp = client
         .launch_backfill(LaunchBackfillRequest {
+            action,
             selection: selection.unwrap_or_default(),
             partition_keys: partition_keys.into_iter().map(submit_to_proto).collect(),
             partition_range: None,
             strategy: None,
             failure_policy: String::new(),
             max_concurrency: 4,
-            tags: tags
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(k, v)| Tag { key: k, value: v })
-                .collect(),
+            tags: tags_to_proto(tags),
             dry_run: false,
             job_name,
             user: current_user_ref().await,
@@ -309,12 +378,17 @@ pub async fn launch_backfill(
 /// the `run_id` immediately; the caller polls the run-detail page for
 /// completion. The dispatcher mode (`"queued"` or `"direct"`) is not
 /// reported here — the UI navigates to the run page either way.
+/// `action` is the verb the page showed for the job (`None` materializes):
+/// the backend refuses the run if the job now runs another one.
+/// `whole_asset` is as for [`trigger_action`], for the job's verb.
 #[server]
 pub async fn execute_job(
     loc_ns: String,
     loc_name: String,
     job_name: String,
+    action: Option<String>,
     partition_key: Option<SubmitPartitionKey>,
+    whole_asset: bool,
 ) -> Result<MaterializeResult, ServerFnError> {
     use rivers_api::rivers::ExecuteJobRequest;
 
@@ -329,6 +403,8 @@ pub async fn execute_job(
             job_name,
             partition_key: partition_key.map(submit_to_proto),
             user: current_user_ref().await,
+            whole_asset,
+            action,
         })
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;

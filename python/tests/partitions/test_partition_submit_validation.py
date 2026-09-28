@@ -338,7 +338,8 @@ def test_grpc_materialize_invalid_partition_key_propagates_error(
                 partition_key=_single_pk(pb2, "garbage"),
             )
         )
-    assert exc.value.code() == grpc.StatusCode.INTERNAL
+    # A caller error, not a server fault — the boundary validates and says so.
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert exc.value.details() == GRPC_BAD_KEY_PART_ALPHA
 
 

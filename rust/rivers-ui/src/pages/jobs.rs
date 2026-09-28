@@ -1,9 +1,10 @@
 //! Jobs list page.
 //!
-//! The job *definitions* come from the gRPC code-location service (static for
-//! the session); the *last-run-per-job* data comes from storage and live-
-//! updates on the `runs` channel. Splitting the two keeps the definitions
-//! Resource keyed on `()` (one fetch per session) while kicks only rerun the
+//! The job *definitions* come from the gRPC code-location service, fetched
+//! once per page (Execute sends the verb it shows, and the server refuses a
+//! job whose verb changed since); the *last-run-per-job* data comes from
+//! storage and live-updates on the `runs` channel. Splitting the two keeps
+//! the definitions Resource keyed on the location while kicks only rerun the
 //! much cheaper last-run query.
 
 use std::collections::HashMap;
@@ -15,14 +16,15 @@ use crate::components::execute_job_dialog::ExecuteJobDialog;
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::ui_kit::{AssetStack, Crumb, EmptyState, KindBadge, StatusChip, Topbar};
 use crate::helpers::{
-    JobPartitionPicker, partition_picker_for_assets, run_status_class, run_status_kind, short_id,
+    JobPartitionPicker, job_partition_picker, job_verb, replay_click, run_status_class,
+    run_status_kind, short_id,
 };
 use crate::loc::{loc_path, use_current_location};
-use crate::server_fns::actions::execute_job;
 use crate::server_fns::automation::get_jobs;
+use crate::server_fns::mutations::execute_job;
 use crate::server_fns::overview::get_assets_info;
 use crate::server_fns::runs::get_last_run_per_job;
-use crate::types::{AssetDefinitionInfo, RunRecord};
+use crate::types::{AssetActionInfo, AssetDefinitionInfo, RunRecord};
 
 #[component]
 pub fn JobsListPage() -> impl IntoView {
@@ -69,8 +71,10 @@ pub fn JobsListPage() -> impl IntoView {
     let show_dialog = RwSignal::new(false);
     let dialog_job = RwSignal::new(String::new());
     let dialog_picker = RwSignal::new(JobPartitionPicker::None);
+    let dialog_verb = RwSignal::new(None::<AssetActionInfo>);
     let dialog_job_signal: Signal<String> = dialog_job.into();
     let dialog_picker_signal: Signal<JobPartitionPicker> = dialog_picker.into();
+    let dialog_verb_signal: Signal<Option<AssetActionInfo>> = dialog_verb.into();
 
     view! {
         <Topbar crumbs=vec![Crumb::new("Jobs")]>
@@ -84,6 +88,7 @@ pub fn JobsListPage() -> impl IntoView {
             show=show_dialog
             job_name=dialog_job_signal
             picker=dialog_picker_signal
+            verb=dialog_verb_signal
         />
 
         <Transition fallback=move || view! { <div class="loading">"Loading jobs..."</div> }>
@@ -138,10 +143,15 @@ pub fn JobsListPage() -> impl IntoView {
                                         .map(|r| format!("grid-row-rail grid-row-rail--{}", run_status_class(&r.status)))
                                         .unwrap_or_else(|| "grid-row-rail grid-row-rail--muted".to_string());
 
+                                    let verb = job_verb(job.action.as_deref(), &asset_selection, &asset_info_by_key);
                                     let row_picker =
-                                        partition_picker_for_assets(&asset_selection, &asset_info_by_key);
+                                        job_partition_picker(verb.as_ref(), &asset_selection, &asset_info_by_key);
+                                    let destructive = verb.as_ref().is_some_and(|v| v.is_destructive());
+                                    let verb_name = verb.as_ref().map(|v| v.name.clone());
+                                    let armed_label = verb_name.clone().unwrap_or_default();
 
                                     let (exec_pending, set_exec_pending) = signal(false);
+                                    let armed = RwSignal::new(false);
                                     let navigate = navigate.clone();
                                     let nav_run = navigate.clone();
 
@@ -149,16 +159,25 @@ pub fn JobsListPage() -> impl IntoView {
                                         let ns = ns.clone();
                                         let name = name.clone();
                                         let row_picker = row_picker.clone();
+                                        let shown = verb_name.clone();
                                         move |ev: leptos::ev::MouseEvent| {
                                             ev.prevent_default();
                                             ev.stop_propagation();
                                             if !matches!(row_picker, JobPartitionPicker::None) {
                                                 dialog_job.set(exec_name.clone());
                                                 dialog_picker.set(row_picker.clone());
+                                                dialog_verb.set(verb.clone());
                                                 show_dialog.set(true);
                                                 return;
                                             }
+                                            // A destructive verb takes a second click, as on the run page.
+                                            let (dispatch, now_armed) = replay_click(destructive, armed.get());
+                                            armed.set(now_armed);
+                                            if !dispatch {
+                                                return;
+                                            }
                                             let n = exec_name.clone();
+                                            let shown = shown.clone();
                                             let navigate = navigate.clone();
                                             let ns = ns.clone();
                                             let name = name.clone();
@@ -166,7 +185,7 @@ pub fn JobsListPage() -> impl IntoView {
                                             leptos::task::spawn_local(async move {
                                                 let path_ns = ns.clone();
                                                 let path_name = name.clone();
-                                                match execute_job(ns, name, n, None).await {
+                                                match execute_job(ns, name, n, shown, None, false).await {
                                                     Ok(result) if !result.run_id.is_empty() => {
                                                         let path = loc_path(&path_ns, &path_name, &format!("runs/{}", result.run_id));
                                                         navigate(&path, Default::default());
@@ -212,7 +231,12 @@ pub fn JobsListPage() -> impl IntoView {
                                     view! {
                                         <A href=href attr:class="grid-row" attr:style=GRID>
                                             <span class=rail_cls></span>
-                                            <span class="grid-cell-mono">{job_name}</span>
+                                            <span class="grid-cell-mono">
+                                                {job_name}
+                                                {verb_name.map(|v| view! {
+                                                    <span class="grid-cell-muted" title="asset action">{format!(" · {v}")}</span>
+                                                })}
+                                            </span>
                                             <KindBadge kind=executor_type/>
                                             {if asset_selection.is_empty() {
                                                 view! { <span class="grid-cell-muted">"all"</span> }.into_any()
@@ -231,7 +255,13 @@ pub fn JobsListPage() -> impl IntoView {
                                                 <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
                                                     <path d="M3 2l7 4-7 4V2z"/>
                                                 </svg>
-                                                {move || if exec_pending.get() { "..." } else { "Execute" }}
+                                                {move || if exec_pending.get() {
+                                                    "...".to_string()
+                                                } else if armed.get() {
+                                                    format!("Confirm {armed_label}?")
+                                                } else {
+                                                    "Execute".to_string()
+                                                }}
                                             </button>
                                         </A>
                                     }

@@ -20,7 +20,7 @@ service CodeLocationService {
   rpc GetJobs(GetJobsRequest) returns (GetJobsResponse);
   rpc EvaluateSchedule(EvaluateScheduleRequest) returns (EvaluateScheduleResponse);
   rpc EvaluateSensor(EvaluateSensorRequest) returns (EvaluateSensorResponse);
-  rpc ObserveAsset(ObserveAssetRequest) returns (ObserveAssetResponse);
+  rpc RunAction(RunActionRequest) returns (RunActionResponse);
   rpc LaunchBackfill(LaunchBackfillRequest) returns (LaunchBackfillResponse);
   rpc MaterializeMissing(MaterializeMissingRequest) returns (LaunchBackfillResponse);
   rpc RerunBackfill(RerunBackfillRequest) returns (RerunBackfillResponse);
@@ -77,6 +77,15 @@ message ExecuteJobRequest {
   string job_name = 1;
   optional ProtoPartitionKey partition_key = 2;
   optional UserRef user = 3;
+  // Run the job's verb on the whole asset. Without a partition_key, a verb
+  // whose key is Optional (delete) acts on every partition, and a caller that
+  // could not build a key sends none either. So a keyless run of such a verb
+  // on a partitioned asset is rejected unless this is set.
+  bool whole_asset = 4;
+  // The verb the caller showed for the job. Unset or empty means materialize.
+  // The job runs its own verb, so a request naming another one (a page that
+  // has not loaded the job, or loaded it before a redeploy) is rejected.
+  optional string action = 5;
 }
 
 message ExecuteJobResponse {
@@ -152,6 +161,17 @@ message AssetDefinitionInfo {
   optional string group = 11;
   optional string code_version = 12;
   string asset_type = 13;
+  repeated ActionInfo actions = 14;
+}
+
+message ActionInfo {
+  string name = 1;
+  // "unchanged" | "may_materialize" | "unmaterialize" | "observe"
+  string outcome = 2;
+  bool exclusive = 3;
+  optional string description = 4;
+  // "required" | "keyless" | "optional" — partition-key rule for the verb
+  string partitioning = 5;
 }
 
 message PartitionDefInfo {
@@ -233,6 +253,8 @@ message JobInfo {
   string name = 1;
   repeated string asset_selection = 2;
   string executor_type = 3;
+  // The verb this job's runs execute. Unset means materialize.
+  optional string action = 4;
 }
 
 // --- Schedule & sensor evaluation ---
@@ -254,14 +276,29 @@ message EvaluateSensorResponse {
   optional string cursor = 3;
 }
 
-// --- External asset observation ---
+// --- Asset actions ---
+// One verb over a selection; `observe` is the built-in action on externals.
 
-message ObserveAssetRequest {
-  string asset_key = 1;
+message RunActionRequest {
+  string action = 1;
+  repeated string selection = 2;
+  optional ProtoPartitionKey partition_key = 3;
+  repeated Tag tags = 4;
+  optional UserRef user = 5;
+  // Target every asset declaring the verb. `repeated` has no presence, so
+  // without this an empty `selection` is indistinguishable from "not set" —
+  // and a caller that computed an empty list would silently fan a destructive
+  // verb across the whole code location. Empty + unset is rejected instead.
+  bool all_assets = 6;
+  // The same opt-in for partitions: without a partition_key, a verb whose key
+  // is Optional (delete) acts on every partition of a partitioned asset.
+  // Such a keyless run is rejected unless this is set.
+  bool whole_asset = 7;
 }
-message ObserveAssetResponse {
-  bool success = 1;
-  optional string error = 2;
+message RunActionResponse {
+  string run_id = 1;
+  bool success = 2;
+  optional string error = 3;
 }
 
 // --- Backfills ---
@@ -339,6 +376,10 @@ message LaunchBackfillRequest {
   // job's own plan + executor. Mutually exclusive with `selection`.
   optional string job_name = 9;
   optional UserRef user = 10;
+  // Verb child runs execute. Unset means materialize. For a Job target it is
+  // the verb the caller showed for the job, as in ExecuteJobRequest: a
+  // backfill naming another verb than the job's own is rejected.
+  optional string action = 11;
 }
 
 message LaunchBackfillResponse {
@@ -390,6 +431,8 @@ message GetBackfillStatusResponse {
   string launched_by_kind = 9;
   optional string launched_by_name = 10;
   optional UserRef launched_by_user = 11;
+  // The verb the backfill's runs execute. Unset means materialize.
+  optional string action = 12;
 }
 
 message CancelBackfillRequest {

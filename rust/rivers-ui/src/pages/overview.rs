@@ -245,6 +245,7 @@ pub fn OverviewPage() -> impl IntoView {
                                     let sid = short_id(&r.run_id, 8);
                                     let assets = r.node_names.iter().take(2).cloned().collect::<Vec<_>>().join(", ");
                                     let desc = if assets.is_empty() { "—".to_string() } else { assets };
+                                    let desc = crate::helpers::with_verb(desc, r.action.as_deref());
                                     let kind = run_status_kind(&r.status).to_string();
                                     let glyph = if r.job_name.is_some() { "▶" } else { "◉" };
                                     let title = format!("{glyph} {sid}");

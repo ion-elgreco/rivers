@@ -22,7 +22,9 @@ import time
 import obstore.store
 from rivers import (
     Asset,
+    AssetAction,
     AssetDef,
+    AssetExecutionContext,
     BashTask,
     CodeRepository,
     Compute,
@@ -30,7 +32,9 @@ from rivers import (
     Executor,
     InMemoryIOHandler,
     Job,
+    Outcome,
     Output,
+    PartitionsDefinition,
     PickleIOHandler,
     RetryOn,
     RetryPolicy,
@@ -73,7 +77,9 @@ def transform_data(source_data: dict):
 
 @Asset(io_handler=mem_io, metadata=INPROCESS_META)
 def final_report(transform_data: dict):
-    return Output(value={"status": "complete", "processed": transform_data["processed"]})
+    return Output(
+        value={"status": "complete", "processed": transform_data["processed"]}
+    )
 
 
 k8s_inprocess_job = Job(
@@ -97,13 +103,34 @@ def s3_transform(s3_source: dict):
 
 @Asset(io_handler=s3_io)
 def s3_report(s3_transform: dict):
-    return Output(value={"status": "complete", "transformed": s3_transform["transformed"]})
+    return Output(
+        value={"status": "complete", "transformed": s3_transform["transformed"]}
+    )
 
 
 k8s_step_job = Job(
     name="k8s_step_job",
     assets=[s3_source, s3_transform, s3_report],
 )
+
+
+# --- Action verb asset (queued action backfills route the verb to run pods) ---
+
+
+def _touch(ctx):
+    pass
+
+
+touch_action = AssetAction(name="touch", outcome=Outcome.Unchanged)(_touch)
+
+
+@Asset(
+    io_handler=s3_io,
+    partitions_def=PartitionsDefinition.static_(["p1", "p2"]),
+    actions=[touch_action],
+)
+def k8s_action_events(context: AssetExecutionContext):
+    return Output(value={"partition": context.partition_key})
 
 
 # --- Failing job (in-process; asset always raises) ---
@@ -169,7 +196,10 @@ def graph_inner_load() -> dict:
 
 @Task(io_handler=s3_io)
 def graph_inner_transform(graph_inner_load: dict) -> dict:
-    return {"records": graph_inner_load["records"], "doubled": graph_inner_load["records"] * 2}
+    return {
+        "records": graph_inner_load["records"],
+        "doubled": graph_inner_load["records"] * 2,
+    }
 
 
 @Asset.from_graph(
@@ -382,27 +412,55 @@ k8s_compute_job = Job(
 
 
 all_assets = [
-    source_data, transform_data, final_report,
-    s3_source, s3_transform, s3_report,
-    always_fails, slow_asset, resume_slow,
+    source_data,
+    transform_data,
+    final_report,
+    s3_source,
+    s3_transform,
+    s3_report,
+    k8s_action_events,
+    always_fails,
+    slow_asset,
+    resume_slow,
     graph_pipeline,
-    retry_always_fails, oom_hungry, oom_no_retry,
-    exc_match_listed, exc_match_unlisted,
-    multi_retry, graph_retry_pipeline, job_default_flaky,
+    retry_always_fails,
+    oom_hungry,
+    oom_no_retry,
+    exc_match_listed,
+    exc_match_unlisted,
+    multi_retry,
+    graph_retry_pipeline,
+    job_default_flaky,
     sized_step,
 ]
 
-all_tasks = [graph_inner_load, graph_inner_transform, task_retry, bash_retry, graph_flaky_inner]
+all_tasks = [
+    graph_inner_load,
+    graph_inner_transform,
+    task_retry,
+    bash_retry,
+    graph_flaky_inner,
+]
 
 repo = CodeRepository(
     assets=all_assets,
     tasks=all_tasks,
     jobs=[
-        k8s_inprocess_job, k8s_step_job, k8s_failing_job, k8s_slow_job, k8s_resume_job,
+        k8s_inprocess_job,
+        k8s_step_job,
+        k8s_failing_job,
+        k8s_slow_job,
+        k8s_resume_job,
         k8s_graph_job,
-        k8s_retry_exhausted_job, k8s_oom_escalation_job, k8s_oom_no_retry_job,
-        k8s_exc_listed_job, k8s_exc_unlisted_job,
-        k8s_multi_retry_job, k8s_task_retry_job, k8s_bash_retry_job, k8s_graph_retry_job,
+        k8s_retry_exhausted_job,
+        k8s_oom_escalation_job,
+        k8s_oom_no_retry_job,
+        k8s_exc_listed_job,
+        k8s_exc_unlisted_job,
+        k8s_multi_retry_job,
+        k8s_task_retry_job,
+        k8s_bash_retry_job,
+        k8s_graph_retry_job,
         k8s_job_retry_job,
         k8s_compute_job,
     ],

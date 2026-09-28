@@ -28,8 +28,8 @@ use crate::helpers::{
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::now::RelTime;
-use crate::server_fns::actions::{BulkRunActionResult, cancel_runs, delete_runs};
 use crate::server_fns::locations::list_code_locations;
+use crate::server_fns::mutations::{BulkRunActionResult, cancel_runs, delete_runs};
 use crate::server_fns::runs::{get_runs_page, get_runs_summary};
 use crate::types::{CodeLocationEntry, RunFilter, RunRecord, RunStatus, RunsSummary};
 
@@ -105,6 +105,7 @@ pub fn RunsListPage() -> impl IntoView {
     let (filter_job, set_filter_job) = signal(String::new());
     let (filter_asset, set_filter_asset) = signal(String::new());
     let (filter_partition, set_filter_partition) = signal(String::new());
+    let (filter_verb, set_filter_verb) = signal(String::new());
     let (page, set_page) = signal(0u64);
     let (page_size, set_page_size) = signal(25u64);
 
@@ -118,22 +119,27 @@ pub fn RunsListPage() -> impl IntoView {
             filter_job.get(),
             filter_asset.get(),
             filter_partition.get(),
+            filter_verb.get(),
             page.get(),
             page_size.get(),
             refresh_tick.get(),
         )
     };
-    let runs_page = Resource::new(page_key, |(tab, job, asset, partition, p, ps, _tick)| {
-        // Empty strings are coerced to `None` server-side in the `From` impl.
-        let filter = RunFilter {
-            status: status_from_tab(&tab),
-            job_name: None,
-            job_substring: Some(job),
-            asset_substring: Some(asset),
-            partition_substring: Some(partition),
-        };
-        async move { get_runs_page(p * ps, ps, filter).await }
-    });
+    let runs_page = Resource::new(
+        page_key,
+        |(tab, job, asset, partition, verb, p, ps, _tick)| {
+            // Empty strings are coerced to `None` server-side in the `From` impl.
+            let filter = RunFilter {
+                status: status_from_tab(&tab),
+                job_name: None,
+                job_substring: Some(job),
+                asset_substring: Some(asset),
+                partition_substring: Some(partition),
+                action: crate::helpers::verb_filter_from_input(&verb),
+            };
+            async move { get_runs_page(p * ps, ps, filter).await }
+        },
+    );
 
     let locations = Resource::new(|| (), |_| list_code_locations());
 
@@ -307,6 +313,11 @@ pub fn RunsListPage() -> impl IntoView {
                 value=Signal::derive(move || filter_partition.get())
                 on_input=Callback::new(move |v| { set_filter_partition.set(v); set_page.set(0); })
                 placeholder="partition…"
+            />
+            <RiversSearch
+                value=Signal::derive(move || filter_verb.get())
+                on_input=Callback::new(move |v| { set_filter_verb.set(v); set_page.set(0); })
+                placeholder="verb (materialize, delete…)"
             />
         </div>
 
@@ -530,13 +541,17 @@ fn RunRow(
         .and_then(|p| p.preview.first())
         .map(|k| partition_scheme_for(k))
         .unwrap_or("·");
-    let launched_cell =
-        match crate::helpers::launched_by_sub_line(&launched_by, job_name.as_deref()) {
-            Some(sub) => {
-                view! { <LaunchedByCell launched_by=launched_by.clone() sub=sub/> }.into_any()
-            }
-            None => view! { <LaunchedByCell launched_by=launched_by/> }.into_any(),
-        };
+    let sub_line = crate::helpers::launched_by_sub_line(&launched_by, job_name.as_deref());
+    // Action runs surface their verb where the job name would sit.
+    let sub_line = match (record.action.clone(), sub_line) {
+        (Some(verb), Some(sub)) => Some(format!("{verb} · {sub}")),
+        (Some(verb), None) => Some(verb),
+        (None, sub) => sub,
+    };
+    let launched_cell = match sub_line {
+        Some(sub) => view! { <LaunchedByCell launched_by=launched_by.clone() sub=sub/> }.into_any(),
+        None => view! { <LaunchedByCell launched_by=launched_by/> }.into_any(),
+    };
 
     view! {
         <A href=href attr:class="grid-row" attr:style=GRID attr:title=created_abs>

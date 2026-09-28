@@ -65,6 +65,21 @@ fn event_badge_class(label: &str) -> &'static str {
         "StepFailure" => "error",
         "StepStart" => "warning",
         "Observation" => "info",
+        "ActionCompleted" => "success",
+        "Deletion" => "warning",
         _ => "muted",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::event_badge_class;
+
+    #[test]
+    fn action_events_are_not_muted() {
+        // Both were falling through to "muted", making an action run's own
+        // events read as noise in its timeline.
+        assert_eq!(event_badge_class("ActionCompleted"), "success");
+        assert_eq!(event_badge_class("Deletion"), "warning");
     }
 }

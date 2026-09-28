@@ -860,8 +860,15 @@ impl PyStorage {
             .map_err(|e| StorageError::new_err(format!("Failed to create storage dir: {e}")))?;
         let storage =
             py.detach(|| SurrealStorage::new_embedded_blocking(path).map_err(to_py_err))?;
-        tracing::info!(target: "rivers::storage", backend = "embedded", path = %path, "storage ready (test runtime)");
+        tracing::info!(target: "rivers::storage", backend = "embedded", path = %path, "storage ready (own runtime)");
         Ok(Self::from_storage(storage, PyStorageType::Embedded))
+    }
+
+    /// CLI scratch store: embedded storage on its own runtime, so dropping it
+    /// releases its files before the scratch directory is removed.
+    #[staticmethod]
+    fn _scratch(py: Python<'_>, path: &str) -> PyResult<Self> {
+        Self::_test_embedded(py, path)
     }
 
     /// Test-only: in-memory counterpart of [`_test_embedded`](Self::_test_embedded).

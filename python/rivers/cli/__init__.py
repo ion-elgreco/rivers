@@ -7,6 +7,7 @@ import importlib
 import os
 import shutil
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +37,14 @@ def _parse_partition_key(raw: str | None):
     return PK.single(raw)
 
 
+def _split_names(raw: str | None) -> list[str] | None:
+    """``None`` when the flag is omitted. An explicit empty value stays ``[]``:
+    a caller's list that came out empty, never "every asset"."""
+    if raw is None:
+        return None
+    return [name.strip() for name in raw.split(",") if name.strip()]
+
+
 def _cleanup_storage(path: str) -> None:
     """Remove embedded storage directory on exit."""
     p = Path(path)
@@ -47,13 +56,50 @@ def _cleanup_storage(path: str) -> None:
             parent.rmdir()
 
 
-def _create_storage(memory: bool, storage_path: str) -> Storage:
-    """Create storage backend based on CLI flags."""
+_CODE_LOCATION_ID_OPT = typer.Option(
+    None,
+    envvar="RIVERS_CODE_LOCATION_ID",
+    help="Code location to record runs, asset state and pool claims under "
+    "(default: 'default')",
+)
+
+
+def _create_storage(
+    memory: bool,
+    storage_path: str | None,
+    surreal_endpoint: str | None,
+    code_location_id: str | None = None,
+) -> tuple[Storage, str | None]:
+    """Create storage backend based on CLI flags.
+
+    The storage and ``resolve()`` read the code location from the
+    environment. Also returns the scratch store's directory, which the caller
+    removes at exit; a path the user passed is never removed.
+    """
+    if code_location_id is not None:
+        os.environ["RIVERS_CODE_LOCATION_ID"] = code_location_id
+    if surreal_endpoint is not None:
+        if not code_location_id:
+            typer.echo(
+                "Warning: without --code-location-id, runs, asset state and pool "
+                "claims go to code location 'default', which a deployed code "
+                "location does not read.",
+                err=True,
+            )
+        return Storage.connect(surreal_endpoint), None
     if memory:
-        return Storage.memory()
-    storage = Storage.embedded(storage_path)
-    atexit.register(_cleanup_storage, storage_path)
-    return storage
+        return Storage.memory(), None
+    if storage_path is not None:
+        return Storage.embedded(storage_path), None
+    scratch = tempfile.mkdtemp(prefix="rivers-scratch-")
+    return Storage._scratch(scratch), scratch  # type: ignore[attr-defined]
+
+
+def _remove_scratch(repo_obj, scratch: str) -> None:
+    """Windows cannot remove open files: the repository lets go of the store
+    first, which closes it."""
+    repo_obj._release_storage()
+    shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _open_or_prompt_migrate(open_fn, migrate_fn) -> Storage:
@@ -307,13 +353,44 @@ def execute(
     pk = _parse_partition_key(partition_key)
     selection = [a.strip() for a in target.split(",")] if target else None
 
+    # The run record is the only place the verb lives; without the record
+    # nothing can run. Exit 1 lets the operator retry — the record may be
+    # missing transiently, or the run was deleted.
+    record = storage.get_run(run_id)
+    if record is None:
+        typer.echo(f"Error: no run record for '{run_id}' — cannot execute", err=True)
+        raise typer.Exit(1)
+    action = record.action
+
     try:
         if job:
-            result = repo_obj.get_job(job)._execute_run(
+            job_obj = repo_obj.get_job(job)
+            # A job runs its own verb, which in this image may not be the one
+            # the run was launched with. The run never started: exit 1 with a
+            # stored outcome, which the operator honors, writing the run's
+            # terminal status.
+            if job_obj.action != action:
+                msg = (
+                    f"job '{job}' now runs '{job_obj.action or 'materialize'}', "
+                    f"not '{action or 'materialize'}'"
+                )
+                storage.set_run_outcome(run_id, "Failure", 0, 0, message=msg)
+                typer.echo(f"Run {run_id} failed: {msg}", err=True)
+                raise typer.Exit(1)
+            result = job_obj._execute_run(
                 run_id,
                 partition_key=pk,
                 resume=resume,
                 raise_on_error=False,
+            )
+        elif action is not None:
+            result = repo_obj.run_action(
+                action,
+                selection=selection,
+                partition_key=pk,
+                run_id_override=run_id,
+                raise_on_error=False,
+                resume=resume,
             )
         else:
             result = repo_obj.materialize(
@@ -343,7 +420,7 @@ def execute(
             msg = f"Failed assets: {', '.join(failed_names)}"
             storage.set_run_outcome(run_id, "Failure", completed, total, message=msg)
             typer.echo(f"Run {run_id} failed: {msg}", err=True)
-    except SystemExit:
+    except (SystemExit, typer.Exit):
         raise
     except BaseException as exc:
         # Crash path: no outcome is written — the operator restarts the
@@ -431,20 +508,119 @@ def materialize(
     memory: bool = typer.Option(
         False, help="Use in-memory storage instead of embedded"
     ),
-    storage_path: str = typer.Option(
-        ".rivers/storage/", help="Path for embedded storage"
+    storage_path: str | None = typer.Option(
+        None,
+        help="Path for embedded storage (default: a scratch store, removed at exit)",
     ),
+    surreal_endpoint: str | None = typer.Option(
+        None,
+        envvar="RIVERS_SURREAL_ENDPOINT",
+        help="Remote SurrealDB endpoint (overrides --storage-path)",
+    ),
+    code_location_id: str | None = _CODE_LOCATION_ID_OPT,
 ) -> None:
     """Materialize all assets in a repository."""
     from rivers import PartitionKey
 
-    repo_obj = _load_repo(module, repo_var, memory, storage_path)
+    repo_obj = _load_repo(
+        module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
+    )
     pk = PartitionKey.single(partition_key) if partition_key else None
     result = repo_obj.materialize(partition_key=pk)
     typer.echo(f"Materialization complete. Assets: {result.materialized_assets}")
 
 
-def _load_repo(module: str, repo_var: str, memory: bool, storage_path: str):
+@app.command(name="run-action")
+def run_action(
+    module: str = typer.Argument(help="Python module path containing CodeRepository"),
+    action: str = typer.Argument(help="The verb to run, e.g. optimize or delete"),
+    repo_var: str = typer.Option(
+        "repo", help="Variable name of CodeRepository in module"
+    ),
+    select: str | None = typer.Option(
+        None,
+        "--select",
+        "-s",
+        help="Comma-separated asset names (default: every asset that defines the verb)",
+    ),
+    partition_key: str | None = typer.Option(None, help="Partition key to act on"),
+    memory: bool = typer.Option(
+        False, help="Use in-memory storage instead of embedded"
+    ),
+    storage_path: str | None = typer.Option(
+        None,
+        help="Path for embedded storage (default: a scratch store, removed at exit)",
+    ),
+    surreal_endpoint: str | None = typer.Option(
+        None,
+        envvar="RIVERS_SURREAL_ENDPOINT",
+        help="Remote SurrealDB endpoint (overrides --storage-path)",
+    ),
+    code_location_id: str | None = _CODE_LOCATION_ID_OPT,
+) -> None:
+    """Run an asset action (a verb besides materialize) over a selection."""
+    from rivers import PartitionKey
+
+    selection = _split_names(select)
+    if selection == []:
+        typer.echo(
+            "Error: --select is empty — omit it to run the verb on every asset "
+            "that defines it",
+            err=True,
+        )
+        raise typer.Exit(1)
+    repo_obj = _load_repo(
+        module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
+    )
+    _warn_if_destructive_on_scratch(
+        repo_obj, action, selection, memory, storage_path, surreal_endpoint
+    )
+    pk = PartitionKey.single(partition_key) if partition_key is not None else None
+    result = repo_obj.run_action(action, selection=selection, partition_key=pk)
+    typer.echo(f"Action '{action}' complete. Run: {result.run_id}")
+
+
+def _warn_if_destructive_on_scratch(
+    repo_obj,
+    verb: str,
+    selection: list[str] | None,
+    memory: bool,
+    storage_path: str | None,
+    surreal_endpoint: str | None,
+) -> None:
+    """Warn when a verb that clears materialization state keeps its state and
+    pool claims in a store that is gone at exit (the scratch store or memory)."""
+    if surreal_endpoint is not None or (storage_path is not None and not memory):
+        return
+    from rivers import MultiAsset, Outcome
+
+    for name, asset in repo_obj.assets.items():
+        if selection is not None and name not in selection:
+            continue
+        actions = asset.actions
+        if actions is None and isinstance(asset, MultiAsset):
+            # A multi-asset's verbs live on each output.
+            actions = next((d.actions for d in asset.output_defs if d.name == name), [])
+        if any(
+            a.name == verb and a.outcome == Outcome.Unmaterialize for a in actions or []
+        ):
+            typer.echo(
+                f"Warning: '{verb}' is destructive, but its state and pool claims go "
+                "to a scratch store that is removed at exit; pass --surreal-endpoint "
+                "to record them in shared storage.",
+                err=True,
+            )
+            return
+
+
+def _load_repo(
+    module: str,
+    repo_var: str,
+    memory: bool,
+    storage_path: str | None,
+    surreal_endpoint: str | None,
+    code_location_id: str | None,
+):
     """Load and resolve a CodeRepository from a module."""
     sys.path.insert(0, ".")
     mod = importlib.import_module(module)
@@ -459,8 +635,12 @@ def _load_repo(module: str, repo_var: str, memory: bool, storage_path: str):
         typer.echo(f"Error: '{repo_var}' is not a CodeRepository", err=True)
         raise typer.Exit(1)
 
-    storage = _create_storage(memory, storage_path)
+    storage, scratch = _create_storage(
+        memory, storage_path, surreal_endpoint, code_location_id
+    )
     repo_obj.resolve(storage=storage)
+    if scratch is not None:
+        atexit.register(_remove_scratch, repo_obj, scratch)
     return repo_obj
 
 
@@ -515,17 +695,29 @@ def backfill(
         "continue", "--on-failure", help="continue or stop_on_failure"
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without executing"),
-    memory: bool = typer.Option(False, help="Use in-memory storage"),
-    storage_path: str = typer.Option(
-        ".rivers/storage/", help="Path for embedded storage"
+    action: str | None = typer.Option(
+        None, "--action", help="Run this verb instead of materializing"
     ),
+    memory: bool = typer.Option(False, help="Use in-memory storage"),
+    storage_path: str | None = typer.Option(
+        None,
+        help="Path for embedded storage (default: a scratch store, removed at exit)",
+    ),
+    surreal_endpoint: str | None = typer.Option(
+        None,
+        envvar="RIVERS_SURREAL_ENDPOINT",
+        help="Remote SurrealDB endpoint (overrides --storage-path)",
+    ),
+    code_location_id: str | None = _CODE_LOCATION_ID_OPT,
 ) -> None:
     """Backfill partitions for selected assets."""
     from rivers import PartitionKey, PartitionKeyRange
 
-    repo_obj = _load_repo(module, repo_var, memory, storage_path)
+    repo_obj = _load_repo(
+        module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
+    )
 
-    selection = [a.strip() for a in assets.split(",")] if assets else None
+    selection = _split_names(assets)
 
     # Resolve partition keys or range
     pk_list: list[PartitionKey] | None = None
@@ -551,6 +743,11 @@ def backfill(
 
     resolved_strategy = _parse_strategy(strategy)
 
+    if action is not None:
+        _warn_if_destructive_on_scratch(
+            repo_obj, action, selection, memory, storage_path, surreal_endpoint
+        )
+
     result = repo_obj.backfill(
         selection=selection,
         partition_keys=pk_list,
@@ -560,6 +757,7 @@ def backfill(
         max_concurrency=concurrency,
         block=True,
         dry_run=dry_run,
+        action=action,
     )
 
     if dry_run:
@@ -579,24 +777,40 @@ def backfill_status(
     module: str = typer.Argument(help="Python module path"),
     repo_var: str = typer.Option("repo", help="Variable name of CodeRepository"),
     memory: bool = typer.Option(False, help="Use in-memory storage"),
-    storage_path: str = typer.Option(
-        ".rivers/storage/", help="Path for embedded storage"
+    storage_path: str | None = typer.Option(
+        None,
+        help="Path for embedded storage (default: a scratch store, removed at exit)",
     ),
+    surreal_endpoint: str | None = typer.Option(
+        None,
+        envvar="RIVERS_SURREAL_ENDPOINT",
+        help="Remote SurrealDB endpoint (overrides --storage-path)",
+    ),
+    code_location_id: str | None = _CODE_LOCATION_ID_OPT,
 ) -> None:
     """Check status of a backfill."""
-    repo_obj = _load_repo(module, repo_var, memory, storage_path)
+    repo_obj = _load_repo(
+        module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
+    )
     status = repo_obj.get_backfill(backfill_id)
     if status is None:
         typer.echo(f"Backfill '{backfill_id}' not found", err=True)
         raise typer.Exit(1)
-    typer.echo(
-        f"Backfill {status.backfill_id}: {status.status}\n"
+    typer.echo(_format_backfill_status(status))
+
+
+def _format_backfill_status(status) -> str:
+    lines = [
+        f"Backfill {status.backfill_id}: {status.status}",
         f"  Partitions: {status.completed_partitions}/{status.total_partitions} completed, "
-        f"{status.failed_partitions} failed, {status.canceled_partitions} canceled\n"
-        f"  Runs: {len(status.run_ids)}"
-    )
+        f"{status.failed_partitions} failed, {status.canceled_partitions} canceled",
+        f"  Runs: {len(status.run_ids)}",
+    ]
+    if status.action:
+        lines.append(f"  Action: {status.action}")
     if status.error:
-        typer.echo(f"  Error: {status.error}")
+        lines.append(f"  Error: {status.error}")
+    return "\n".join(lines)
 
 
 @app.command(name="backfill-cancel")
@@ -605,12 +819,21 @@ def backfill_cancel(
     module: str = typer.Argument(help="Python module path"),
     repo_var: str = typer.Option("repo", help="Variable name of CodeRepository"),
     memory: bool = typer.Option(False, help="Use in-memory storage"),
-    storage_path: str = typer.Option(
-        ".rivers/storage/", help="Path for embedded storage"
+    storage_path: str | None = typer.Option(
+        None,
+        help="Path for embedded storage (default: a scratch store, removed at exit)",
     ),
+    surreal_endpoint: str | None = typer.Option(
+        None,
+        envvar="RIVERS_SURREAL_ENDPOINT",
+        help="Remote SurrealDB endpoint (overrides --storage-path)",
+    ),
+    code_location_id: str | None = _CODE_LOCATION_ID_OPT,
 ) -> None:
     """Cancel a running backfill."""
-    repo_obj = _load_repo(module, repo_var, memory, storage_path)
+    repo_obj = _load_repo(
+        module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
+    )
     success = repo_obj.cancel_backfill(backfill_id)
     if success:
         typer.echo(
@@ -715,14 +938,16 @@ def queue_list(storage_path: str = _STORAGE_PATH_OPT) -> None:
         return
     runs.sort(key=_QUEUE_SORT_KEY)
     typer.echo(
-        f"{'POS':>4} {'RUN ID':<38} {'JOB':<20} {'PRI':>4} {'QUEUED AT':>24} {'BLOCK REASON'}"
+        f"{'POS':>4} {'RUN ID':<38} {'JOB':<20} {'VERB':<12} {'PRI':>4} "
+        f"{'QUEUED AT':>24} {'BLOCK REASON'}"
     )
-    typer.echo("-" * 120)
+    typer.echo("-" * 133)
     for i, r in enumerate(runs, 1):
         reason = r.block_reason or "-"
+        # An ad-hoc run has no job; a materialize run has no verb.
         typer.echo(
-            f"{i:>4} {r.run_id:<38} {r.job_name:<20} {r.priority:>4} "
-            f"{_ns_to_iso(r.start_time):>24} {reason}"
+            f"{i:>4} {r.run_id:<38} {r.job_name or '-':<20} {r.action or 'materialize':<12} "
+            f"{r.priority:>4} {_ns_to_iso(r.start_time):>24} {reason}"
         )
 
 
@@ -763,7 +988,8 @@ def queue_why(
     )
 
     typer.echo(f"Run:          {run.run_id}")
-    typer.echo(f"Job:          {run.job_name}")
+    typer.echo(f"Job:          {run.job_name or '-'}")
+    typer.echo(f"Action:       {run.action or 'materialize'}")
     typer.echo(f"Priority:     {run.priority}")
     typer.echo(f"Position:     {position}/{len(all_queued)}")
     typer.echo(f"Queued since: {_ns_to_iso(run.start_time)}")
