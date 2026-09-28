@@ -30,13 +30,13 @@ pub fn Pagination(
         let ps = page_size.get();
         if ps == 0 {
             // Single-page view: show the whole range.
-            return format!("1 - {total} of {total}");
+            return format!("1–{total} of {total}");
         }
         let pages = total_pages(total, ps);
         let current = page.get().min(pages.saturating_sub(1));
         let start = current * ps;
         let end = (start + ps).min(total);
-        format!("{} - {} of {}", start + 1, end, total)
+        format!("{}–{} of {}", start + 1, end, total)
     };
     let at_first = move || page.get() == 0;
     let at_last = move || page.get() + 1 >= total_pages(total, page_size.get());
@@ -44,30 +44,35 @@ pub fn Pagination(
     view! {
         <div class="pagination">
             <span class="pagination-info">{info}</span>
-            <select
-                class="pagination-select"
-                on:change=move |ev| {
-                    let val: u64 = leptos::prelude::event_target_value(&ev).parse().unwrap_or(25);
-                    set_page_size.set(val);
-                    set_page.set(0);
-                }
-            >
-                <option value="25" selected=move || page_size.get() == 25>"25"</option>
-                <option value="50" selected=move || page_size.get() == 50>"50"</option>
-                <option value="100" selected=move || page_size.get() == 100>"100"</option>
-                <option value="1000" selected=move || page_size.get() == 1000>"1000"</option>
-            </select>
-            <div class="pagination-btns">
-                <button
-                    class="btn btn-small"
-                    disabled=at_first
-                    on:click=move |_| set_page.update(|p| *p = p.saturating_sub(1))
-                >"Prev"</button>
-                <button
-                    class="btn btn-small"
-                    disabled=at_last
-                    on:click=move |_| set_page.update(|p| *p += 1)
-                >"Next"</button>
+            <div class="pagination-controls">
+                <label class="pagination-size">
+                    "Rows"
+                    <select
+                        class="pagination-select"
+                        on:change=move |ev| {
+                            let val: u64 = leptos::prelude::event_target_value(&ev).parse().unwrap_or(25);
+                            set_page_size.set(val);
+                            set_page.set(0);
+                        }
+                    >
+                        <option value="25" selected=move || page_size.get() == 25>"25"</option>
+                        <option value="50" selected=move || page_size.get() == 50>"50"</option>
+                        <option value="100" selected=move || page_size.get() == 100>"100"</option>
+                        <option value="1000" selected=move || page_size.get() == 1000>"1000"</option>
+                    </select>
+                </label>
+                <div class="pagination-btns">
+                    <button
+                        class="btn btn-small"
+                        disabled=at_first
+                        on:click=move |_| set_page.update(|p| *p = p.saturating_sub(1))
+                    >"Prev"</button>
+                    <button
+                        class="btn btn-small"
+                        disabled=at_last
+                        on:click=move |_| set_page.update(|p| *p += 1)
+                    >"Next"</button>
+                </div>
             </div>
         </div>
     }
@@ -128,7 +133,7 @@ where
                         .into_any()
                     }
                     Err(e) => {
-                        view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any()
+                        view! { <div class="error-msg">{format!("Couldn't load data: {}", crate::helpers::err_text(&e))}</div> }.into_any()
                     }
                 })
             }}

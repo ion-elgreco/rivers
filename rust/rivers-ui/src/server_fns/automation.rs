@@ -76,7 +76,7 @@ pub async fn get_schedules(
     let resp = client
         .get_schedules(GetSchedulesRequest {})
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     Ok(resp
         .into_inner()
@@ -114,7 +114,7 @@ pub async fn get_sensors(
     let resp = client
         .get_sensors(GetSensorsRequest {})
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     Ok(resp
         .into_inner()
@@ -145,7 +145,7 @@ pub async fn get_jobs(loc_ns: String, loc_name: String) -> Result<Vec<JobRecord>
     let resp = client
         .get_jobs(GetJobsRequest {})
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     Ok(resp
         .into_inner()
@@ -212,7 +212,7 @@ pub async fn evaluate_schedule(
     let resp = client
         .evaluate_schedule(EvaluateScheduleRequest { schedule_name })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     let inner = resp.into_inner();
     Ok(EvaluateResult {
@@ -238,7 +238,7 @@ pub async fn evaluate_sensor(
     let resp = client
         .evaluate_sensor(EvaluateSensorRequest { sensor_name })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     let inner = resp.into_inner();
     Ok(EvaluateResult {

@@ -169,9 +169,18 @@ td input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
     gap: 1rem;
     padding: 0.75rem 0;
 }
+.pagination-controls { display: flex; align-items: center; gap: 16px; }
+.pagination-size {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-muted);
+    font-size: 12px;
+}
 .pagination-btns { display: flex; gap: 0.5rem; }
 .pagination-select {
-    padding: 0.25rem 0.5rem;
+    height: 22px;
+    padding: 0 0.4rem;
     font-size: 0.75rem;
     background: var(--bg-surface);
     color: var(--text);

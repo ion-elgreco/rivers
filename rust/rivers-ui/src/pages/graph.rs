@@ -8,7 +8,7 @@ use crate::components::icons::{IconMinus, IconPlay, IconPlus};
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::materialize_dialog::MaterializeDialog;
 use crate::components::multi_select::{MultiSelect, SelectOption};
-use crate::components::ui_kit::{Crumb, DagMinimap, KindBadge, MinimapNode, Tag, Topbar};
+use crate::components::ui_kit::{DagMinimap, KindBadge, MinimapNode, StatusChip, Tag, Topbar};
 use crate::helpers::{
     common_actions, partition_picker_for_assets, sorted_verbs, use_query_param_list,
 };
@@ -423,14 +423,14 @@ pub fn GraphPage() -> impl IntoView {
     };
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Lineage")]>
+        <Topbar title="Lineage">
             <LiveStatusChip
                 status=live_status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
         </Topbar>
 
-        <Transition fallback=move || view! { <div class="loading">"Computing layout..."</div> }>
+        <Transition fallback=move || view! { <div class="loading">"Computing layout…"</div> }>
 
         <div class="filter-bar">
             {
@@ -481,7 +481,7 @@ pub fn GraphPage() -> impl IntoView {
             }
         </div>
 
-        <div class="split-panel">
+        <div class="split-panel" class:split-panel--open=move || !selected_nodes.get().is_empty()>
             <div class="split-panel-main dag-viewport"
                 node_ref=viewport_ref
                 on:contextmenu=move |ev| {
@@ -676,7 +676,7 @@ pub fn GraphPage() -> impl IntoView {
                                     />
                                 }.into_any()
                             }
-                            Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                            Err(e) => view! { <div class="error-msg">{format!("Couldn't load lineage: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                         })
                     }}
 
@@ -771,10 +771,7 @@ pub fn GraphPage() -> impl IntoView {
                     return Some(view! {
                         <div class="dag-selected-sidebar">
                             <div class="dag-sidebar-header">
-                                <div class="dag-sidebar-status dag-sidebar-status--healthy">
-                                    <span class="dag-sidebar-status-dot"></span>
-                                    <span>{format!("{} SELECTED", sel.len())}</span>
-                                </div>
+                                <span class="section-header-label">{format!("{} selected", sel.len())}</span>
                                 <button
                                     class="icon-btn"
                                     on:click=move |_| set_selected_nodes.set(Vec::new())
@@ -855,7 +852,7 @@ pub fn GraphPage() -> impl IntoView {
 
                     Some(view! {
                         <div class="dag-selected-sidebar">
-                            <Transition fallback=move || view! { <div class="loading">"Loading..."</div> }>
+                            <Transition fallback=move || view! { <div class="loading">"Loading…"</div> }>
                                 {move || {
                                     asset_detail.get().map(|result| match result {
                                         Ok(Some(record)) => {
@@ -863,11 +860,7 @@ pub fn GraphPage() -> impl IntoView {
                                             let href = loc_path(&lns, &lnm, &format!("assets/{}", record.asset_key));
                                             let mat_key = record.asset_key.clone();
                                             let is_task = task_node_names.get().contains(&record.asset_key);
-                                            let (status_word, status_cls) = match record.stale_status {
-                                                crate::types::StaleStatus::UpToDate => ("UP-TO-DATE", "dag-sidebar-status--healthy"),
-                                                crate::types::StaleStatus::Stale => ("STALE", "dag-sidebar-status--stale"),
-                                                crate::types::StaleStatus::Missing => ("MISSING", "dag-sidebar-status--pending"),
-                                            };
+                                            let status_kind = crate::helpers::stale_status_kind(&record.stale_status);
                                             // The relative-time piece is emitted as a reactive
                                             // `<RelTimeOpt>` so it ticks live.
                                             let static_parts: Vec<String> = [
@@ -886,10 +879,7 @@ pub fn GraphPage() -> impl IntoView {
                                             let key_for_actions = record.asset_key.clone();
                                             view! {
                                                 <div class="dag-sidebar-header">
-                                                    <div class=format!("dag-sidebar-status {status_cls}")>
-                                                        <span class="dag-sidebar-status-dot"></span>
-                                                        <span>{status_word}</span>
-                                                    </div>
+                                                    <StatusChip kind=status_kind/>
                                                     <button
                                                         class="icon-btn"
                                                         on:click=move |_| set_selected_nodes.set(Vec::new())

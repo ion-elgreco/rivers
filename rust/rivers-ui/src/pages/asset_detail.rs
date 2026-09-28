@@ -9,12 +9,11 @@ use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::materialize_dialog::MaterializeDialog;
 use crate::components::pagination::PaginatedView;
 use crate::components::ui_kit::{
-    Crumb, EventGlyphTimeline, GlyphEvent, RecentRunsStrip, RunLaunched, StripRun, Topbar,
-    UnderlineTabs,
+    Crumb, EmptyState, EventGlyphTimeline, GlyphEvent, RecentRunsStrip, RunLaunched, RunsGrid,
+    SectionHeader, StatusChip, StripRun, TickRunChips, Topbar, UnderlineTabs, meta_tile_fill,
 };
 use crate::helpers::{
-    JobPartitionPicker, format_duration, format_relative_time, format_timestamp,
-    partition_picker_for_assets, run_status_class, run_status_kind, short_id, use_query_param,
+    JobPartitionPicker, format_timestamp, partition_picker_for_assets, short_id, use_query_param,
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::{get_asset, get_asset_events, get_asset_events_page, get_assets};
@@ -362,29 +361,28 @@ pub fn AssetDetailPage() -> impl IntoView {
         </Transition>
 
         <div class="tab-content" style=move || if active_tab.get() == "overview" { "" } else { "display:none" }>
-            <Transition fallback=move || view! { <div class="loading">"Loading..."</div> }>
+            <Transition fallback=move || view! { <div class="loading">"Loading…"</div> }>
                 {move || {
                     let current_key = key();
-                    let rec = asset.get().and_then(|r| r.ok()).flatten();
+                    let rec = match asset.get() {
+                        Some(Err(e)) => return view! {
+                            <div class="error-msg">{format!("Couldn't load asset: {}", crate::helpers::err_text(&e))}</div>
+                        }.into_any(),
+                        other => other.and_then(|r| r.ok()).flatten(),
+                    };
                     let info = assets_info
                         .get()
                         .and_then(|r| r.ok())
                         .and_then(|infos| infos.into_iter().find(|a| a.asset_key == current_key));
                     let Some(record) = rec else {
-                        return view! { <div class="empty-state">"Asset not found."</div> }.into_any();
+                        return view! { <EmptyState message="Asset not found" compact=true/> }.into_any();
                     };
 
                     let kind_val = if record.kinds.is_empty() { "—".to_string() } else { record.kinds.join(", ") };
                     let group_val = record.asset_group.clone().unwrap_or_else(|| "—".to_string());
-                    let last_ts_val = if record.last_timestamp.is_some() {
-                        format_timestamp(record.last_timestamp)
-                    } else {
-                        "never".to_string()
-                    };
-                    // Tooltip text (hover only — no reactive tick needed).
-                    let last_ts_rel = record.last_timestamp
-                        .map(|t| format_relative_time(t, jiff::Timestamp::now().as_second()))
-                        .unwrap_or_default();
+                    let last_ts = record.last_timestamp;
+                    let last_ts_abs = format_timestamp(record.last_timestamp);
+                    let status_kind = crate::helpers::stale_status_kind(&record.stale_status);
                     let last_label = if is_external.get() { "LAST OBSERVED" } else { "LAST MATERIALIZED" };
                     let partitioned_val = info
                         .as_ref()
@@ -423,7 +421,17 @@ pub fn AssetDetailPage() -> impl IntoView {
                     let automation_cond = info.as_ref().and_then(|i| i.automation_condition.clone());
 
                     view! {
-                        <div class="meta-tile-grid meta-tile-grid--4">
+                        <div class="meta-tile-grid meta-tile-grid--5">
+                            <div class="meta-tile">
+                                <div class="meta-tile-label">"STATUS"</div>
+                                <div class="meta-tile-value"><StatusChip kind=status_kind/></div>
+                            </div>
+                            <div class="meta-tile">
+                                <div class="meta-tile-label">{last_label}</div>
+                                <div class="meta-tile-value" title=last_ts_abs>
+                                    <crate::now::RelTimeOpt ts=last_ts/>
+                                </div>
+                            </div>
                             <div class="meta-tile">
                                 <div class="meta-tile-label">"KIND"</div>
                                 <div class="meta-tile-value">{kind_val}</div>
@@ -431,10 +439,6 @@ pub fn AssetDetailPage() -> impl IntoView {
                             <div class="meta-tile">
                                 <div class="meta-tile-label">"GROUP"</div>
                                 <div class="meta-tile-value">{group_val}</div>
-                            </div>
-                            <div class="meta-tile">
-                                <div class="meta-tile-label">{last_label}</div>
-                                <div class="meta-tile-value" title=last_ts_rel>{last_ts_val}</div>
                             </div>
                             <div class="meta-tile">
                                 <div class="meta-tile-label">"PARTITIONED"</div>
@@ -462,11 +466,12 @@ pub fn AssetDetailPage() -> impl IntoView {
                                         <div class="meta-tile-value meta-tile-value--secondary">{val.clone()}</div>
                                     </div>
                                 }).collect::<Vec<_>>()}
+                                {meta_tile_fill(secondary_count, 3)}
                             </div>
                         </Show>
 
                         {automation_cond.map(|cond| view! {
-                            <div class="section-header-label" style="margin: 14px 0 8px">"AUTOMATION CONDITION"</div>
+                            <SectionHeader label="AUTOMATION CONDITION"/>
                             <pre class="automation-condition"><code>{cond}</code></pre>
                         })}
                     }.into_any()
@@ -475,8 +480,8 @@ pub fn AssetDetailPage() -> impl IntoView {
 
             {move || if is_external.get() {
                 view! {
-                    <h2>"Recent Observations"</h2>
-                    <Transition fallback=move || view! { <div class="loading">"Loading observations..."</div> }>
+                    <SectionHeader label="RECENT OBSERVATIONS"/>
+                    <Transition fallback=move || view! { <div class="loading">"Loading observations…"</div> }>
                         {move || {
                             events.get().map(|result| match result {
                                 Ok(all_events) => {
@@ -485,95 +490,60 @@ pub fn AssetDetailPage() -> impl IntoView {
                                         .take(10)
                                         .collect();
                                     if observations.is_empty() {
-                                        return view! { <div class="empty-state">"No observations for this asset."</div> }.into_any();
+                                        return view! { <EmptyState message="No observations yet" compact=true/> }.into_any();
                                     }
+                                    const GRID: &str = "grid-template-columns: 0.8fr 1.4fr 0.8fr";
+                                    let (lns, lnm) = loc.get();
                                     view! {
-                                        <div class="item-list">
+                                        <div class="grid-table">
+                                            <div class="grid-table-head" style=GRID>
+                                                <span>"OBSERVED"</span>
+                                                <span>"DATA VERSION"</span>
+                                                <span>"RUN"</span>
+                                            </div>
                                             {observations.into_iter().map(|evt| {
                                                 let evt_ts = evt.timestamp;
                                                 let ts_abs = format_timestamp(Some(evt.timestamp));
-                                                let dv = evt.data_version.clone();
+                                                let dv = evt.data_version.clone().unwrap_or_else(|| "—".to_string());
+                                                let run = (!evt.run_id.is_empty()).then(|| {
+                                                    let href = loc_path(&lns, &lnm, &format!("runs/{}", evt.run_id));
+                                                    view! { <A href=href attr:class="grid-cell-mono">{short_id(&evt.run_id, 8)}</A> }
+                                                });
                                                 view! {
-                                                    <div class="item-row item-row--muted">
-                                                        <div class="item-row-bar"></div>
-                                                        <div class="item-row-body">
-                                                            <div class="item-row-top">
-                                                                <span class="item-row-meta" title={ts_abs}><crate::now::RelTime ts=evt_ts/></span>
-                                                                {dv.map(|v| {
-                                                                    let short = if v.len() > 12 { format!("{}...", &v[..12]) } else { v };
-                                                                    view! { <span class="tag tag-muted">{format!("v:{short}")}</span> }
-                                                                })}
-                                                                <span class="item-row-spacer"></span>
-                                                                <span class="item-row-status item-row-status--muted">"Observed"</span>
-                                                            </div>
-                                                        </div>
+                                                    <div class="grid-row grid-row--plain" style=GRID>
+                                                        <span class="grid-row-rail grid-row-rail--muted"></span>
+                                                        <span class="grid-cell-muted" title=ts_abs><crate::now::RelTime ts=evt_ts/></span>
+                                                        <span class="grid-cell-mono grid-cell-truncate" title=dv.clone()>{dv.clone()}</span>
+                                                        {run.map(|r| r.into_any()).unwrap_or_else(|| view! { <span class="grid-cell-muted">"—"</span> }.into_any())}
                                                     </div>
                                                 }
                                             }).collect::<Vec<_>>()}
                                         </div>
                                     }.into_any()
                                 }
-                                Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                                Err(e) => view! { <div class="error-msg">{format!("Couldn't load observations: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                             })
                         }}
                     </Transition>
                 }.into_any()
             } else {
                 view! {
-                    <h2>"Recent Runs"</h2>
-                    <Transition fallback=move || view! { <div class="loading">"Loading runs..."</div> }>
+                    <SectionHeader label="RECENT RUNS"/>
+                    <Transition fallback=move || view! { <div class="loading">"Loading runs…"</div> }>
                         {move || {
                             asset_runs.get().map(|result| match result {
                                 Ok(runs) => {
                                     if runs.is_empty() {
-                                        return view! { <div class="empty-state">"No runs for this asset."</div> }.into_any();
+                                        return view! { <EmptyState message="No runs yet" compact=true/> }.into_any();
                                     }
                                     let strip = StripRun::from_runs(&runs, runs.len());
                                     view! {
                                         <RecentRunsStrip runs=strip/>
-                                        <div class="run-list" style="margin-top:14px">
-                                            {runs.into_iter().map(|r| {
-                                                let run_id = r.run_id.clone();
-                                                let (lns, lnm) = loc.get();
-                                                let href = loc_path(&lns, &lnm, &format!("runs/{}", run_id));
-                                                let sid = short_id(&run_id, 8);
-                                                let st_class = run_status_class(&r.status);
-                                                let st_kind = run_status_kind(&r.status);
-                                                let start_ts = r.start_time;
-                                                let created_abs = format_timestamp(Some(r.start_time));
-                                                let duration = format_duration(Some(r.start_time), r.end_time);
-                                                let partition_val: Option<String> = r.tags.iter()
-                                                    .find(|(k, _)| k == "partition" || k == "partition_key")
-                                                    .map(|(_, v)| v.clone());
-                                                let job_name = r.job_name.clone();
-                                                let job_href = job_name
-                                                    .as_ref()
-                                                    .map(|j| loc_path(&lns, &lnm, &format!("jobs/{}", j)));
-                                                view! {
-                                                    <div class={format!("run-row run-row--{}", st_class)}>
-                                                        <div class="run-row-bar"></div>
-                                                        <div class="run-row-body">
-                                                            <div class="run-row-top">
-                                                                <A href={href}><span class="run-row-id">{sid}</span></A>
-                                                                {job_name.zip(job_href).map(|(j, h)| view! { <A href={h}><span class="run-row-job">{j}</span></A> })}
-                                                                {partition_val.map(|p| view! {
-                                                                    <span class="run-row-partition">{p}</span>
-                                                                })}
-                                                                <span class="run-row-spacer"></span>
-                                                                <span class={format!("run-row-status run-row-status--{}", st_class)}>{st_kind}</span>
-                                                            </div>
-                                                            <div class="run-row-bottom">
-                                                                <span class="run-row-meta" title={created_abs}><crate::now::RelTime ts=start_ts/></span>
-                                                                <span class="run-row-meta">{duration}</span>
-                                                            </div>
-                                                        </div>
-                                                    </div>
-                                                }
-                                            }).collect::<Vec<_>>()}
-                                        </div>
+                                        <div class="section-gap"></div>
+                                        <RunsGrid rows=runs/>
                                     }.into_any()
                                 }
-                                Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                                Err(e) => view! { <div class="error-msg">{format!("Couldn't load runs: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                             })
                         }}
                     </Transition>
@@ -643,8 +613,8 @@ pub fn AssetDetailPage() -> impl IntoView {
                 set_page=set_ev_page
                 page_size=ev_page_size
                 set_page_size=set_ev_page_size
-                fallback=move || view! { <div class="loading">"Loading events..."</div> }
-                empty=move || view! { <div class="empty-state">"No events for this filter."</div> }
+                fallback=move || view! { <div class="loading">"Loading events…"</div> }
+                empty=move || view! { <EmptyState message="No events for this filter" compact=true/> }
                 render={move |rows: Vec<crate::types::StoredEvent>| {
                                 view! {
                                     <div class="events-list">
@@ -721,7 +691,7 @@ pub fn AssetDetailPage() -> impl IntoView {
         </div>
 
         <div class="tab-content" style=move || if active_tab.get() == "lineage" { "" } else { "display:none" }>
-            <Transition fallback=move || view! { <div class="loading">"Loading lineage..."</div> }>
+            <Transition fallback=move || view! { <div class="loading">"Loading lineage…"</div> }>
                 {move || {
                     let current_key = key();
                     let topo = graph.get().and_then(|r| r.ok());
@@ -737,8 +707,8 @@ pub fn AssetDetailPage() -> impl IntoView {
                         if keys.is_empty() {
                             view! {
                                 <div>
-                                    <div class="section-header-label" style="margin-bottom:10px">{format!("{label} · {count}")}</div>
-                                    <div class="lineage-col-empty">{empty_msg}</div>
+                                    <SectionHeader label=label count=count.to_string()/>
+                                    <EmptyState message=empty_msg compact=true/>
                                 </div>
                             }.into_any()
                         } else {
@@ -769,7 +739,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                             }).collect();
                             view! {
                                 <div>
-                                    <div class="section-header-label" style="margin-bottom:10px">{format!("{label} · {count}")}</div>
+                                    <SectionHeader label=label count=count.to_string()/>
                                     <div class="lineage-rows">{rows}</div>
                                 </div>
                             }.into_any()
@@ -778,8 +748,8 @@ pub fn AssetDetailPage() -> impl IntoView {
 
                     view! {
                         <div class="lineage-grid">
-                            {render_col("UPSTREAM", upstream, "— no upstream dependencies (source asset)", &records_by_key)}
-                            {render_col("DOWNSTREAM", downstream, "— no downstream consumers", &records_by_key)}
+                            {render_col("UPSTREAM", upstream, "No upstream assets (this is a source asset)", &records_by_key)}
+                            {render_col("DOWNSTREAM", downstream, "No downstream assets", &records_by_key)}
                         </div>
                     }.into_any()
                 }}
@@ -845,12 +815,12 @@ fn PartitionsTab(
     });
 
     view! {
-        <Transition fallback=move || view! { <div class="loading">"Loading partitions..."</div> }>
+        <Transition fallback=move || view! { <div class="loading">"Loading partitions…"</div> }>
             {move || {
                 partition_status.get().map(|result| match result {
                     Ok(status) => {
                         if status.partition_details.is_empty() {
-                            return view! { <div class="empty-state">"This asset has no partitions, or no partitions have been materialized yet."</div> }.into_any();
+                            return view! { <EmptyState message="No partitions yet" compact=true/> }.into_any();
                         }
                         let has_missing = status.missing > 0;
                         use crate::components::ui_kit::{HeatCell, PartitionHeatmap};
@@ -919,7 +889,7 @@ fn PartitionsTab(
                             <PartitionHeatmap cells=cells labels=heatmap_labels legend=true freshness_gradient=true/>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load partitions: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
@@ -948,7 +918,7 @@ fn AutomationTicksTab(asset_key: String, #[prop(into)] refresh_tick: Signal<u32>
     let preselect_applied = RwSignal::new(false);
 
     view! {
-        <Transition fallback=move || view! { <div class="loading">"Loading..."</div> }>
+        <Transition fallback=move || view! { <div class="loading">"Loading…"</div> }>
             {move || {
                 let current_key = info_key.clone();
                 assets_info.get().map(|result| match result {
@@ -956,29 +926,27 @@ fn AutomationTicksTab(asset_key: String, #[prop(into)] refresh_tick: Signal<u32>
                         if let Some(info) = infos.into_iter().find(|a| a.asset_key == current_key) {
                             if let Some(cond) = info.automation_condition {
                                 view! {
-                                    <div class="section-header-row">
-                                        <span class="section-header-label">"AUTOMATION CONDITION"</span>
-                                    </div>
+                                    <SectionHeader label="AUTOMATION CONDITION"/>
                                     <pre class="automation-condition"><code>{cond}</code></pre>
                                 }.into_any()
                             } else {
-                                view! { <div class="empty-state">"This asset has no automation condition."</div> }.into_any()
+                                view! { <EmptyState message="No automation condition" compact=true/> }.into_any()
                             }
                         } else {
-                            view! { <div class="empty-state">"Asset definition not found."</div> }.into_any()
+                            view! { <EmptyState message="Asset definition not found" compact=true/> }.into_any()
                         }
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load asset definition: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
 
-        <Transition fallback=move || view! { <div class="loading">"Loading evaluations..."</div> }>
+        <Transition fallback=move || view! { <div class="loading">"Loading evaluations…"</div> }>
             {move || {
                 evals.get().map(|result| match result {
                     Ok(records) => {
                         if records.is_empty() {
-                            return view! { <div class="empty-state">"No evaluations yet. The daemon stores evaluations every tick."</div> }.into_any();
+                            return view! { <EmptyState message="No evaluations yet" hint="The daemon stores an evaluation every tick" compact=true/> }.into_any();
                         }
                         let now = jiff::Timestamp::now().as_nanosecond() as i64;
                         let window_ns: i64 = 60 * 60 * 1_000_000_000;
@@ -1011,9 +979,7 @@ fn AutomationTicksTab(asset_key: String, #[prop(into)] refresh_tick: Signal<u32>
                         view! {
                             {hist}
 
-                            <div class="section-header-row" style="margin-top:24px">
-                                <span class="section-header-label">{format!("RECENT TICKS · LAST {}", records.len())}</span>
-                            </div>
+                            <SectionHeader label="RECENT TICKS" count=format!("last {}", records.len())/>
                             <div class="grid-table">
                                 {records.iter().enumerate().map(|(idx, e)| {
                                     let ts_now = e.timestamp;
@@ -1078,9 +1044,7 @@ fn AutomationTicksTab(asset_key: String, #[prop(into)] refresh_tick: Signal<u32>
                                 }).collect::<Vec<_>>()}
                             </div>
 
-                            <div class="section-header-row" style="margin-top:24px">
-                                <span class="section-header-label">"EVALUATION DETAIL"</span>
-                            </div>
+                            <SectionHeader label="EVALUATION DETAIL"/>
                             {move || {
                                 let idx = selected_idx.get();
                                 if let Some(eval) = records_for_tree.get(idx) {
@@ -1088,57 +1052,23 @@ fn AutomationTicksTab(asset_key: String, #[prop(into)] refresh_tick: Signal<u32>
                                     let fired = eval.fired;
                                     let run_ids = eval.run_ids.clone();
                                     let backfill_ids = eval.backfill_ids.clone();
-                                    let (lns, lnm) = loc.get();
                                     view! {
-                                        // Prefer the backfill chip over raw run chips: sub-runs are
-                                        // an implementation detail of the backfill.
-                                        {fired.then(move || {
-                                            if !backfill_ids.is_empty() {
-                                                let lns = lns.clone();
-                                                let lnm = lnm.clone();
-                                                Some(view! {
-                                                    <div style="margin-bottom: 0.75rem">
-                                                        <span class="detail-label">"Backfill: "</span>
-                                                        {backfill_ids.into_iter().map(move |bid| {
-                                                            let href = loc_path(&lns, &lnm, &format!("backfills/{}", bid));
-                                                            let short = short_id(&bid, 8);
-                                                            view! {
-                                                                <A href={href}>
-                                                                    <span class="item-row-chip item-row-chip--backfill">
-                                                                        <span class="chip-backfill-prefix">"BF"</span>
-                                                                        {short}
-                                                                    </span>
-                                                                </A>
-                                                            }
-                                                        }).collect::<Vec<_>>()}
-                                                    </div>
-                                                }.into_any())
-                                            } else if !run_ids.is_empty() {
-                                                let lns = lns.clone();
-                                                let lnm = lnm.clone();
-                                                Some(view! {
-                                                    <div style="margin-bottom: 0.75rem">
-                                                        <span class="detail-label">"Run: "</span>
-                                                        {run_ids.into_iter().map(move |id| {
-                                                            let href = loc_path(&lns, &lnm, &format!("runs/{}", id));
-                                                            let short = short_id(&id, 8);
-                                                            view! { <A href={href}><span class="item-row-chip">{short}</span></A> }
-                                                        }).collect::<Vec<_>>()}
-                                                    </div>
-                                                }.into_any())
-                                            } else {
-                                                None
-                                            }
+                                        // TickRunChips prefers the backfill chip over raw run chips:
+                                        // sub-runs are an implementation detail of the backfill.
+                                        {fired.then(move || view! {
+                                            <div class="eval-links">
+                                                <TickRunChips run_ids=run_ids backfill_ids=backfill_ids/>
+                                            </div>
                                         })}
                                         <crate::components::eval_tree::EvalTree tree=tree/>
                                     }.into_any()
                                 } else {
-                                    view! { <div class="empty-state">"Select an evaluation to view its decision tree."</div> }.into_any()
+                                    view! { <EmptyState message="Select an evaluation to see its decision tree" compact=true/> }.into_any()
                                 }
                             }}
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load evaluations: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>

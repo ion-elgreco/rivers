@@ -135,18 +135,18 @@ pub fn nanos_to_datetime(ts: i64) -> Option<jiff::Timestamp> {
     jiff::Timestamp::from_nanosecond(ts as i128).ok()
 }
 
-/// Format an optional nanosecond timestamp as "YYYY-MM-DD HH:MM:SS" or "-".
+/// Format an optional nanosecond timestamp as "YYYY-MM-DD HH:MM:SS" or "—".
 pub fn format_timestamp(ts: Option<i64>) -> String {
     ts.and_then(nanos_to_datetime)
         .map(|d| d.strftime("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| "-".to_string())
+        .unwrap_or_else(|| "—".to_string())
 }
 
-/// Format a nanosecond timestamp (non-optional) as "YYYY-MM-DD HH:MM:SS" or "-".
+/// Format a nanosecond timestamp (non-optional) as "YYYY-MM-DD HH:MM:SS" or "—".
 pub fn format_timestamp_nanos(ts: i64) -> String {
     nanos_to_datetime(ts)
         .map(|d| d.strftime("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| "-".to_string())
+        .unwrap_or_else(|| "—".to_string())
 }
 
 /// Format a count of seconds as a compact human-readable duration.
@@ -163,9 +163,10 @@ pub fn format_seconds(secs: i64) -> String {
 /// Format a duration between two optional nanosecond timestamps.
 pub fn format_duration(start: Option<i64>, end: Option<i64>) -> String {
     match (start, end) {
+        (Some(s), Some(e)) if e - s < 1_000_000_000 => "<1s".to_string(),
         (Some(s), Some(e)) => format_seconds((e - s) / 1_000_000_000),
-        (Some(_), None) => "Running...".to_string(),
-        _ => "-".to_string(),
+        (Some(_), None) => "Running…".to_string(),
+        _ => "—".to_string(),
     }
 }
 
@@ -181,7 +182,7 @@ pub fn format_elapsed(start_ns: Option<i64>, end_ns: Option<i64>, now_secs: i64)
             let end_secs = end_ns.map(|e| e / 1_000_000_000).unwrap_or(now_secs);
             format_seconds((end_secs - start_secs).max(0))
         }
-        None => "-".to_string(),
+        None => "—".to_string(),
     }
 }
 
@@ -263,6 +264,26 @@ pub fn backfill_status_kind(status: &str) -> &'static str {
     }
 }
 
+/// Colour for a backfill's progress bar and rail, matching its status chip.
+pub fn backfill_status_color(status: &str) -> &'static str {
+    match status {
+        "CompletedFailed" => "var(--error)",
+        "Canceled" => "var(--text-muted)",
+        "InProgress" | "Requested" => "var(--secondary)",
+        _ => "var(--success)",
+    }
+}
+
+/// Status-chip kind for a schedule or sensor tick.
+pub fn tick_status_kind(status: &str) -> &'static str {
+    match status {
+        "Success" | "Requested" => "success",
+        "Failure" => "failed",
+        "Skipped" => "skipped",
+        _ => "pending",
+    }
+}
+
 /// Map a tick status string to a CSS class suffix.
 pub fn tick_status_class(status: &str) -> &'static str {
     match status {
@@ -298,7 +319,7 @@ pub fn format_relative_time(ts: i64, now: i64) -> String {
     }
     nanos_to_datetime(ts)
         .map(|d| d.strftime("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| "-".to_string())
+        .unwrap_or_else(|| "—".to_string())
 }
 
 /// Badge text for a job executor: "InProcess" → "in-process",
@@ -1154,12 +1175,13 @@ mod tests {
 
     #[test]
     fn test_format_timestamp_none() {
-        assert_eq!(format_timestamp(None), "-");
+        assert_eq!(format_timestamp(None), "—");
     }
 
     #[test]
     fn test_format_duration_completed() {
         let s = 1_000_000_000i64;
+        assert_eq!(format_duration(Some(0), Some(s / 2)), "<1s");
         assert_eq!(format_duration(Some(0), Some(30 * s)), "30s");
         assert_eq!(format_duration(Some(0), Some(125 * s)), "2m 5s");
         assert_eq!(format_duration(Some(0), Some(7265 * s)), "2h 1m");
@@ -1167,13 +1189,13 @@ mod tests {
 
     #[test]
     fn test_format_duration_running() {
-        assert_eq!(format_duration(Some(100), None), "Running...");
+        assert_eq!(format_duration(Some(100), None), "Running…");
     }
 
     #[test]
     fn test_format_duration_no_start() {
-        assert_eq!(format_duration(None, None), "-");
-        assert_eq!(format_duration(None, Some(100)), "-");
+        assert_eq!(format_duration(None, None), "—");
+        assert_eq!(format_duration(None, Some(100)), "—");
     }
 
     #[test]

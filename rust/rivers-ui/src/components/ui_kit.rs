@@ -326,9 +326,13 @@ impl Crumb {
     }
 }
 
+/// Page header. List pages pass `title` (+ an optional `subtitle` line);
+/// detail pages pass `crumbs`. Children are the page actions.
 #[component]
 pub fn Topbar(
-    #[prop(into)] crumbs: Vec<Crumb>,
+    #[prop(optional, into)] crumbs: Vec<Crumb>,
+    #[prop(optional, into)] title: Option<String>,
+    #[prop(optional, into)] subtitle: Option<ViewFn>,
     #[prop(optional)] children: Option<Children>,
 ) -> impl IntoView {
     let last = crumbs.len().saturating_sub(1);
@@ -358,14 +362,20 @@ pub fn Topbar(
         })
         .collect();
 
+    let head = match title {
+        Some(t) => view! { <h1 class="topbar-title">{t}</h1> }.into_any(),
+        None => view! { <div class="topbar-crumbs">{rendered}</div> }.into_any(),
+    };
+    let subtitled = subtitle.is_some();
     view! {
         <div class="topbar">
-            <div class="topbar-row">
-                <div class="topbar-crumbs">{rendered}</div>
+            <div class="topbar-row" class:topbar-row--subtitled=subtitled>
+                {head}
                 <div class="topbar-actions">
                     {children.map(|c| c())}
                 </div>
             </div>
+            {subtitle.map(|s| view! { <div class="topbar-subtitle">{s.run()}</div> })}
         </div>
     }
 }
@@ -585,7 +595,19 @@ pub fn PartitionHeatmap(
 pub fn EmptyState(
     #[prop(into)] message: String,
     #[prop(optional, into)] hint: Option<String>,
+    /// Inside a page section: no illustration, less padding.
+    #[prop(optional)]
+    compact: bool,
 ) -> impl IntoView {
+    if compact {
+        return view! {
+            <div class="empty-state">
+                <span class="empty-state-msg">{message}</span>
+                {hint.map(|h| view! { <span class="empty-state-hint">{h}</span> })}
+            </div>
+        }
+        .into_any();
+    }
     view! {
         <div class="empty-state-rich">
             <svg class="empty-state-wave" width="96" height="40" viewBox="0 0 96 40" fill="none">
@@ -605,10 +627,11 @@ pub fn EmptyState(
                     opacity="0.7"
                 />
             </svg>
-            <div style="color:var(--text); font-weight:500">{message}</div>
-            {hint.map(|h| view! { <div style="margin-top:4px; opacity:0.7">{h}</div> })}
+            <div class="empty-state-msg">{message}</div>
+            {hint.map(|h| view! { <div class="empty-state-hint">{h}</div> })}
         </div>
     }
+    .into_any()
 }
 
 /// ConditionReplay — real per-sub-condition history for a single asset over
@@ -646,7 +669,7 @@ pub fn ConditionReplay(
     view! {
         <div class="cond-replay">
             <Transition fallback=move || view! {
-                <div class="cond-replay-empty">"Loading evaluation history..."</div>
+                <div class="cond-replay-empty">"Loading evaluation history…"</div>
             }>
                 {move || {
                     let records = evals.get().and_then(|r| r.ok()).unwrap_or_default();
@@ -1090,7 +1113,7 @@ fn format_strip_secs(s: f64) -> String {
 #[component]
 pub fn RecentRunsStrip(
     #[prop(into)] runs: Vec<StripRun>,
-    #[prop(optional, into, default = "RECENT RUNS".to_string())] label: String,
+    #[prop(optional, into, default = "RUN DURATIONS".to_string())] label: String,
 ) -> impl IntoView {
     if runs.is_empty() {
         return view! {
@@ -2600,4 +2623,149 @@ pub fn RunLaunched(#[prop(into)] run_id: String, #[prop(optional)] queued: bool)
         if queued { "queued" } else { "started" },
     );
     view! { <A href=href attr:class="launch-result">{text}</A> }
+}
+
+/// Run history table for detail pages (job, backfill, asset). The runs page
+/// keeps its own wider table with selection and launch columns.
+#[component]
+pub fn RunsGrid(
+    rows: Vec<crate::types::RunRecord>,
+    #[prop(optional)] show_assets: bool,
+) -> impl IntoView {
+    let (ns, name) = crate::loc::use_current_location().get();
+    let grid = if show_assets {
+        "grid-template-columns: 88px 0.7fr 1.5fr 0.9fr 0.8fr 0.6fr"
+    } else {
+        "grid-template-columns: 88px 0.7fr 1.4fr 0.8fr 0.6fr"
+    };
+    view! {
+        <div class="grid-table">
+            <div class="grid-table-head" style=grid>
+                <span>"RUN"</span>
+                <span>"STATUS"</span>
+                {show_assets.then(|| view! { <span>"ASSETS"</span> })}
+                <span>"PARTITION"</span>
+                <span>"STARTED"</span>
+                <span>"DURATION"</span>
+            </div>
+            {rows
+                .into_iter()
+                .map(|r| {
+                    let href = crate::loc::loc_path(&ns, &name, &format!("runs/{}", r.run_id));
+                    let sid = crate::helpers::short_id(&r.run_id, 8);
+                    let rail_cls = format!(
+                        "grid-row-rail grid-row-rail--{}",
+                        crate::helpers::run_status_class(&r.status)
+                    );
+                    let st_kind = crate::helpers::run_status_kind(&r.status);
+                    let start_ts = r.start_time;
+                    let created_abs = crate::helpers::format_timestamp(Some(r.start_time));
+                    let duration = crate::helpers::format_duration(Some(r.start_time), r.end_time);
+                    let assets = r.node_names.clone();
+                    let partition = r.partition_key.clone().map(|p| {
+                        let scheme = p
+                            .preview
+                            .first()
+                            .map(|k| partition_scheme_for(k))
+                            .unwrap_or("·");
+                        view! { <PartitionCell scheme=scheme count_label=p.label()/> }
+                    });
+                    view! {
+                        <A href=href attr:class="grid-row" attr:style=grid attr:title=created_abs>
+                            <span class=rail_cls></span>
+                            <span class="grid-cell-mono">{sid}</span>
+                            <StatusChip kind=st_kind small=true/>
+                            {show_assets.then(|| view! { <AssetStack assets=assets/> })}
+                            {match partition {
+                                Some(cell) => cell.into_any(),
+                                None => view! { <span class="grid-cell-muted">"—"</span> }.into_any(),
+                            }}
+                            <span class="grid-cell-muted"><crate::now::RelTime ts=start_ts/></span>
+                            <span class="grid-cell-muted">{duration}</span>
+                        </A>
+                    }
+                })
+                .collect::<Vec<_>>()}
+        </div>
+    }
+}
+
+/// Blank tiles that complete the last row of a `.meta-tile-grid`, so the
+/// grid's separator colour never shows as an empty block.
+pub fn meta_tile_fill(tiles: usize, cols: usize) -> impl IntoView {
+    let missing = (cols - tiles % cols) % cols;
+    (0..missing)
+        .map(|_| view! { <div class="meta-tile" aria-hidden="true"></div> })
+        .collect_view()
+}
+
+/// Schedule or sensor state ("RUNNING" / "STOPPED" on the wire): a dot and a
+/// lowercase word. Not a status chip — a running chip means a live run.
+#[component]
+pub fn AutomationState(#[prop(into)] status: String) -> impl IntoView {
+    let running = status.eq_ignore_ascii_case("running");
+    let (dot, word) = if running {
+        ("status-dot--ok", "running")
+    } else {
+        ("status-dot--muted", "stopped")
+    };
+    view! {
+        <span class="status-dot-row">
+            <span class=format!("status-dot {dot}")></span>
+            <span class="grid-cell-muted">{word}</span>
+        </span>
+    }
+}
+
+/// Tick history table shared by the schedule and sensor pages.
+#[component]
+pub fn TickHistory(ticks: Vec<crate::types::TickRecord>) -> impl IntoView {
+    if ticks.is_empty() {
+        return view! {
+            <SectionHeader label="TICK HISTORY"/>
+            <EmptyState message="No ticks yet" compact=true/>
+        }
+        .into_any();
+    }
+    const GRID: &str = "grid-template-columns: 120px 130px 1fr 160px";
+    let count = format!("last {}", ticks.len());
+    view! {
+        <SectionHeader label="TICK HISTORY" count=count/>
+        <div class="grid-table">
+            <div class="grid-table-head" style=GRID>
+                <span>"TIME"</span>
+                <span>"STATUS"</span>
+                <span>"DETAIL"</span>
+                <span>"RUNS"</span>
+            </div>
+            {ticks
+                .into_iter()
+                .map(|t| {
+                    let ts = t.timestamp;
+                    let ts_abs = crate::helpers::format_timestamp_nanos(t.timestamp);
+                    let kind = crate::helpers::tick_status_kind(&t.status);
+                    let detail_cls = if t.error.is_some() {
+                        "grid-cell-muted grid-cell-truncate text-error"
+                    } else {
+                        "grid-cell-muted grid-cell-truncate"
+                    };
+                    let detail = t
+                        .skip_reason
+                        .clone()
+                        .or_else(|| t.error.clone())
+                        .or_else(|| crate::helpers::tick_counts_summary(&t.run_ids, &t.backfill_ids))
+                        .unwrap_or_else(|| "—".to_string());
+                    view! {
+                        <div class="grid-row grid-row--plain" style=GRID title=ts_abs>
+                            <span class="grid-cell-muted"><crate::now::RelTime ts=ts/></span>
+                            <StatusChip kind=kind small=true/>
+                            <span class=detail_cls title=detail.clone()>{detail.clone()}</span>
+                            <TickRunChips run_ids=t.run_ids.clone() backfill_ids=t.backfill_ids.clone()/>
+                        </div>
+                    }
+                })
+                .collect::<Vec<_>>()}
+        </div>
+    }
+    .into_any()
 }

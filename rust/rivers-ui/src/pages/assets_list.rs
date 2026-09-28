@@ -10,7 +10,7 @@ use crate::components::loading_skeleton::TableSkeleton;
 use crate::components::materialize_dialog::MaterializeDialog;
 use crate::components::multi_select::{MultiSelect, SelectOption};
 use crate::components::ui_kit::{
-    AttentionBanner, Crumb, KindBadge, RiversSearch, StatusChip, Tag, Topbar,
+    AttentionBanner, EmptyState, KindBadge, RiversSearch, StatusChip, Tag, Topbar,
 };
 use crate::helpers::{use_query_param, use_query_param_list};
 use crate::loc::{loc_path, use_current_location};
@@ -319,70 +319,64 @@ pub fn AssetsListPage() -> impl IntoView {
     });
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Assets")]>
-            <LiveStatusChip
-                status=live_status
-                on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
-            />
-        </Topbar>
-
-        <div class="page-header-row" style="align-items: flex-end">
-            <div class="page-header">
-                <h1>"Assets"</h1>
-                // Wrap resource read in Transition so hydration waits for the async fetch.
+        <Topbar
+            title="Assets"
+            subtitle=move || view! {
+                // Transition so hydration waits for the async fetch.
                 <Transition>
                     {move || {
                         let (total, groups, stale, missing) = header_counts.get();
                         view! {
-                            <p>
-                                <span class="page-header-num">{total.to_string()}</span>
-                                {if total == 1 { " asset" } else { " assets" }}
-                                <span class="page-header-sep">"·"</span>
-                                <span class="page-header-num">{groups.to_string()}</span>
-                                {if groups == 1 { " group" } else { " groups" }}
-                                <span class="page-header-sep">"·"</span>
-                                <span class="page-header-num page-header-num--warning">{stale.to_string()}</span>
-                                " stale"
-                                <span class="page-header-sep">"·"</span>
-                                <span class="page-header-num">{missing.to_string()}</span>
-                                " missing"
-                            </p>
+                            <span class="page-header-num">{total.to_string()}</span>
+                            {if total == 1 { " asset" } else { " assets" }}
+                            <span class="page-header-sep">"·"</span>
+                            <span class="page-header-num">{groups.to_string()}</span>
+                            {if groups == 1 { " group" } else { " groups" }}
+                            <span class="page-header-sep">"·"</span>
+                            <span class="page-header-num page-header-num--warning">{stale.to_string()}</span>
+                            " stale"
+                            <span class="page-header-sep">"·"</span>
+                            <span class="page-header-num">{missing.to_string()}</span>
+                            " missing"
                         }
                     }}
                 </Transition>
-            </div>
+            }
+        >
+            <LiveStatusChip
+                status=live_status
+                on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
+            />
             <Show when=move || !selected.get().is_empty()>
-                <div class="page-header-actions">
-                    {move || crate::helpers::sorted_verbs(selection_verbs.get()).into_iter().map(|act| {
-                        let destructive = act.is_destructive();
-                        let label = format!("{}…", crate::helpers::verb_label(&act.name));
-                        let title = crate::helpers::action_title(&act, true);
-                        view! {
-                            <button
-                                class=if destructive { "btn btn-danger" } else { "btn" }
-                                title=title
-                                on:click=move |_| {
-                                    dialog_verb.set(Some(act.clone()));
-                                    dialog_destructive.set(destructive);
-                                    show_dialog.set(true);
-                                }
-                            >{label}</button>
-                        }
-                    }).collect::<Vec<_>>()}
-                    <button class="btn btn-primary" on:click=move |_| {
-                        dialog_verb.set(None);
-                        dialog_destructive.set(false);
-                        show_dialog.set(true);
-                    }>
-                        <crate::components::icons::IconPlay/>
-                        {move || format!(
-                            "Materialize {}…",
-                            crate::helpers::plural(selected.get().len() as u64, "asset", "assets"),
-                        )}
-                    </button>
-                </div>
+                {move || crate::helpers::sorted_verbs(selection_verbs.get()).into_iter().map(|act| {
+                    let destructive = act.is_destructive();
+                    let label = format!("{}…", crate::helpers::verb_label(&act.name));
+                    let title = crate::helpers::action_title(&act, true);
+                    view! {
+                        <button
+                            class=if destructive { "btn btn-danger" } else { "btn" }
+                            title=title
+                            on:click=move |_| {
+                                dialog_verb.set(Some(act.clone()));
+                                dialog_destructive.set(destructive);
+                                show_dialog.set(true);
+                            }
+                        >{label}</button>
+                    }
+                }).collect::<Vec<_>>()}
+                <button class="btn btn-primary" on:click=move |_| {
+                    dialog_verb.set(None);
+                    dialog_destructive.set(false);
+                    show_dialog.set(true);
+                }>
+                    <crate::components::icons::IconPlay/>
+                    {move || format!(
+                        "Materialize {}…",
+                        crate::helpers::plural(selected.get().len() as u64, "asset", "assets"),
+                    )}
+                </button>
             </Show>
-        </div>
+        </Topbar>
 
         <div class="rv-toolbar">
             <RiversSearch
@@ -451,13 +445,18 @@ pub fn AssetsListPage() -> impl IntoView {
 
         <Transition fallback=move || view! { <TableSkeleton rows=8 cols=7/> }>
             {move || {
+                if let Some(Err(e)) = all_assets.get() {
+                    return view! {
+                        <div class="error-msg">{format!("Couldn't load assets: {}", crate::helpers::err_text(&e))}</div>
+                    }.into_any();
+                }
                 let records = sorted_filtered();
                 let infos = assets_info.get().and_then(|r| r.ok()).unwrap_or_default();
                 let info_map: std::collections::HashMap<String, _> = infos.into_iter().map(|i| (i.asset_key.clone(), i)).collect();
                 let topo = graph.get().and_then(|r| r.ok());
 
                 if records.is_empty() {
-                    return view! { <div class="empty-state">"No assets found matching filters."</div> }.into_any();
+                    return view! { <EmptyState message="No assets match the filters" hint="Clear a filter to see more"/> }.into_any();
                 }
 
                 let (attention, healthy): (Vec<_>, Vec<_>) = records.into_iter().partition(|r| {

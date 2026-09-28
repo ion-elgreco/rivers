@@ -151,19 +151,6 @@
    growth via .split-panel { flex: 1 }. */
 .main-content > * { flex-shrink: 0; }
 
-.page-header { margin-bottom: 1.5rem; }
-
-.page-header h1 {
-    font-family: var(--font-display);
-    font-size: 1.5rem;
-    font-weight: 600;
-}
-
-.page-header p {
-    color: var(--text-muted);
-    margin-top: 0.25rem;
-    font-size: 0.875rem;
-}
 .page-header-num { font-family: var(--font-mono); color: var(--text); }
 .page-header-num--error { color: var(--error); }
 .page-header-num--warning { color: var(--warning); }
@@ -198,7 +185,6 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
-    margin-bottom: 28px;
 }
 .asset-summary-row {
     display: flex;

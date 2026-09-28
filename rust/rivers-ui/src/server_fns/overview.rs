@@ -42,7 +42,7 @@ pub async fn get_assets_info(
     let resp = client
         .get_assets_info(GetAssetsInfoRequest {})
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     let mut assets: Vec<AssetDefinitionInfo> = resp
         .into_inner()
@@ -289,7 +289,7 @@ pub async fn get_partition_keys_page(
             dimension,
         })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .map_err(super::grpc_err)?
         .into_inner();
     Ok((resp.keys, resp.total))
 }
@@ -317,7 +317,7 @@ pub async fn get_partition_key_index(
             dimension,
         })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .map_err(super::grpc_err)?
         .into_inner();
     Ok(resp.index)
 }

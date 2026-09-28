@@ -143,7 +143,7 @@ pub async fn trigger_materialize(
             user: current_user_ref().await,
         })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     let r = resp.into_inner();
     Ok(MaterializeResult {
@@ -193,7 +193,7 @@ pub async fn trigger_action(
             whole_asset,
         })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     let r = resp.into_inner();
     if !r.success {
@@ -219,7 +219,7 @@ pub async fn rerun_run(run_id: String) -> Result<MaterializeResult, ServerFnErro
             user: current_user_ref().await,
         })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     let r = resp.into_inner();
     Ok(MaterializeResult {
@@ -273,7 +273,7 @@ pub async fn rerun_backfill(
             user: current_user_ref().await,
         })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     let r = resp.into_inner();
     Ok(BackfillRerunResult {
@@ -308,7 +308,7 @@ pub async fn materialize_missing_partitions(
             user: current_user_ref().await,
         })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     Ok(resp.into_inner().into())
 }
@@ -369,7 +369,7 @@ pub async fn launch_backfill(
             user: current_user_ref().await,
         })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     Ok(resp.into_inner().into())
 }
@@ -407,7 +407,7 @@ pub async fn execute_job(
             action,
         })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     let r = resp.into_inner();
     Ok(MaterializeResult {
@@ -429,7 +429,7 @@ pub async fn cancel_run(run_id: String) -> Result<bool, ServerFnError> {
     let resp = client
         .cancel_run(CancelRunRequest { run_id })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     Ok(resp.into_inner().success)
 }
@@ -453,7 +453,7 @@ async fn cancel_one(run_id: &str) -> Result<(), ServerFnError> {
             run_id: run_id.to_string(),
         })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
     Ok(())
 }
 
@@ -483,7 +483,7 @@ async fn delete_one(run_id: &str) -> Result<(), ServerFnError> {
             run_id: run_id.to_string(),
         })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
     if !resp.into_inner().success {
         return Err(ServerFnError::new(format!("run '{run_id}' not found")));
     }
@@ -501,7 +501,7 @@ pub async fn delete_run(run_id: String) -> Result<bool, ServerFnError> {
     let resp = client
         .delete_run(DeleteRunRequest { run_id })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     Ok(resp.into_inner().success)
 }

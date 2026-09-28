@@ -15,7 +15,7 @@ use leptos_router::components::A;
 use crate::components::execute_job_dialog::ExecuteJobDialog;
 use crate::components::icons::IconPlay;
 use crate::components::live::{LiveStatusChip, use_live_kick};
-use crate::components::ui_kit::{AssetStack, Crumb, EmptyState, KindBadge, StatusChip, Topbar};
+use crate::components::ui_kit::{AssetStack, EmptyState, KindBadge, StatusChip, Topbar};
 use crate::helpers::{
     JobPartitionPicker, job_partition_picker, job_verb, replay_click, run_status_class,
     run_status_kind, short_id,
@@ -79,7 +79,17 @@ pub fn JobsListPage() -> impl IntoView {
     let exec_error = RwSignal::new(Option::<String>::None);
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Jobs")]>
+        <Topbar
+            title="Jobs"
+            subtitle=move || view! {
+                <Transition>
+                    {move || jobs.get().and_then(|r| r.ok()).map(|list| view! {
+                        <span class="page-header-num">{list.len().to_string()}</span>
+                        {if list.len() == 1 { " job" } else { " jobs" }}
+                    })}
+                </Transition>
+            }
+        >
             <LiveStatusChip
                 status=live_status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
@@ -95,7 +105,7 @@ pub fn JobsListPage() -> impl IntoView {
 
         {move || exec_error.get().map(|msg| view! { <div class="error-msg" style="margin-bottom: 1rem">{msg}</div> })}
 
-        <Transition fallback=move || view! { <div class="loading">"Loading jobs..."</div> }>
+        <Transition fallback=move || view! { <div class="loading">"Loading jobs…"</div> }>
             {move || {
                 // Wait for BOTH resources before rendering — rendering with
                 // last_runs==None would flip DOM structure between SSR and
@@ -117,7 +127,7 @@ pub fn JobsListPage() -> impl IntoView {
                             return Some(view! {
                                 <EmptyState
                                     message="No jobs defined"
-                                    hint="declare a job with rivers.asset_job() in your code location"
+                                    hint="Add an rs.Job(name, assets=[…]) to your code location"
                                 />
                             }.into_any());
                         }
@@ -280,7 +290,7 @@ pub fn JobsListPage() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load jobs: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>

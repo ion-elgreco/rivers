@@ -5,7 +5,6 @@
 //! `runs` channel bump a `refresh_tick` that refetches the current slice.
 
 use leptos::prelude::*;
-use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 
 use crate::components::execute_job_dialog::ExecuteJobDialog;
@@ -13,12 +12,12 @@ use crate::components::icons::IconPlay;
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::pagination::Pagination;
 use crate::components::ui_kit::{
-    AssetStack, AssetSummaryRow, Crumb, KindBadge, PartitionCell, RecentRunsStrip, StatusChip,
-    StripRun, Topbar,
+    AssetSummaryRow, Crumb, EmptyState, KindBadge, RecentRunsStrip, RunsGrid, SectionHeader,
+    StatusChip, StripRun, Topbar,
 };
 use crate::helpers::{
-    JobPartitionPicker, format_duration, format_timestamp, job_partition_picker, job_verb,
-    replay_click, run_status_class, run_status_kind, short_id, use_confirm_armed,
+    JobPartitionPicker, job_partition_picker, job_verb, replay_click, run_status_kind,
+    use_confirm_armed,
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::get_assets;
@@ -229,7 +228,7 @@ pub fn JobDetailPage() -> impl IntoView {
             verb=job_verb_signal
         />
 
-        <Transition fallback=move || view! { <div class="loading">"Loading..."</div> }>
+        <Transition fallback=move || view! { <div class="loading">"Loading…"</div> }>
             {move || {
                 let current_name = name();
                 let latest = latest_runs
@@ -293,16 +292,12 @@ pub fn JobDetailPage() -> impl IntoView {
                                 </div>
 
                                 <div style="margin-top:20px">
-                                    <RecentRunsStrip runs=strip label="RECENT RUNS · LAST 20".to_string()/>
+                                    <RecentRunsStrip runs=strip label="RUN DURATIONS · LAST 20".to_string()/>
                                 </div>
 
-                                <div class="section-header-row" style="margin-top:24px">
-                                    <span class="section-header-label">
-                                        {format!("ASSET SELECTION · {}", asset_count)}
-                                    </span>
-                                </div>
+                                <SectionHeader label="ASSET SELECTION" count=asset_count.to_string()/>
                                 {if assets.is_empty() {
-                                    view! { <div class="empty-state">"This job has no asset selection."</div> }.into_any()
+                                    view! { <EmptyState message="Selects all assets" compact=true/> }.into_any()
                                 } else {
                                     view! {
                                         <div class="asset-summary-list">
@@ -315,71 +310,27 @@ pub fn JobDetailPage() -> impl IntoView {
                                 }}
                             }.into_any()
                         } else {
-                            view! { <div class="error-msg">"Job not found."</div> }.into_any()
+                            view! { <div class="error-msg">"Job not found"</div> }.into_any()
                         }
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load job: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
 
-        <Transition fallback=move || view! { <div class="loading" style="margin-top:24px">"Loading runs..."</div> }>
+        <Transition fallback=move || view! { <div class="loading" style="margin-top:24px">"Loading runs…"</div> }>
             {move || {
                 runs_page_res.get().map(|result| match result {
                     Ok(page_data) => {
                         let run_count = page_data.total;
                         let rows = page_data.rows;
                         view! {
-                            <div class="section-header-row" style="margin-top:28px">
-                                <span class="section-header-label">{format!("RUN HISTORY · {run_count}")}</span>
-                            </div>
+                            <SectionHeader label="RUN HISTORY" count=run_count.to_string()/>
                             {if rows.is_empty() {
-                                view! { <div class="empty-state">"No runs for this job."</div> }.into_any()
+                                view! { <EmptyState message="No runs yet" compact=true/> }.into_any()
                             } else {
-                                const GRID: &str = "grid-template-columns: 88px 0.7fr 1.5fr 0.6fr 0.9fr 0.7fr";
                                 view! {
-                                    <div class="grid-table">
-                                        <div class="grid-table-head" style=GRID>
-                                            <span>"RUN"</span>
-                                            <span>"STATUS"</span>
-                                            <span>"ASSETS"</span>
-                                            <span>"PARTITION"</span>
-                                            <span>"STARTED"</span>
-                                            <span>"DURATION"</span>
-                                        </div>
-                                        {rows.into_iter().map(|r| {
-                                            let run_id = r.run_id.clone();
-                                            let (ns, lname) = loc.get();
-                                            let href = loc_path(&ns, &lname, &format!("runs/{}", run_id));
-                                            let sid = short_id(&run_id, 8);
-                                            let st_class = run_status_class(&r.status);
-                                            let st_kind = run_status_kind(&r.status);
-                                            let start_ts = r.start_time;
-                                            let created_abs = format_timestamp(Some(r.start_time));
-                                            let duration = format_duration(Some(r.start_time), r.end_time);
-                                            let partition_val: Option<String> = r.tags.iter()
-                                                .find(|(k, _)| k == "partition" || k == "partition_key")
-                                                .map(|(_, v)| v.clone());
-                                            let asset_names = r.node_names.clone();
-                                            let rail_cls = format!("grid-row-rail grid-row-rail--{}", st_class);
-                                            let part_scheme = partition_val.as_deref()
-                                                .map(crate::components::ui_kit::partition_scheme_for)
-                                                .unwrap_or("·");
-                                            view! {
-                                                <A href=href attr:class="grid-row" attr:style=GRID attr:title=created_abs>
-                                                    <span class=rail_cls></span>
-                                                    <span class="grid-cell-mono">{sid}</span>
-                                                    <StatusChip kind=st_kind small=true/>
-                                                    <AssetStack assets=asset_names/>
-                                                    {partition_val
-                                                        .map(|p| view! { <PartitionCell scheme=part_scheme count_label=p/> }.into_any())
-                                                        .unwrap_or_else(|| view! { <span class="grid-cell-muted">"—"</span> }.into_any())}
-                                                    <span class="grid-cell-muted"><crate::now::RelTime ts=start_ts/></span>
-                                                    <span class="grid-cell-muted">{duration}</span>
-                                                </A>
-                                            }
-                                        }).collect::<Vec<_>>()}
-                                    </div>
+                                    <RunsGrid rows=rows show_assets=true/>
                                     <Pagination
                                         total=run_count
                                         page=page
@@ -391,7 +342,7 @@ pub fn JobDetailPage() -> impl IntoView {
                             }}
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load runs: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>

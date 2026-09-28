@@ -11,6 +11,18 @@ pub mod pools;
 pub mod runs;
 pub mod user;
 
+/// A failed gRPC call as a server-fn error: the status message alone,
+/// without tonic's `code: …, message: …` wrapper.
+#[cfg(feature = "ssr")]
+pub(crate) fn grpc_err(status: tonic::Status) -> leptos::prelude::ServerFnError {
+    let msg = status.message();
+    if msg.is_empty() {
+        leptos::prelude::ServerFnError::new(status.code().description())
+    } else {
+        leptos::prelude::ServerFnError::new(msg)
+    }
+}
+
 /// The request's authenticated session identity, or `None` in auth mode
 /// `none` (the middleware inserts the extension only when auth is enabled).
 #[cfg(feature = "ssr")]

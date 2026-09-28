@@ -82,6 +82,17 @@
 .topbar-crumb--mono { font-family: var(--font-mono); font-size: 13px; }
 .topbar-crumb--current { color: var(--text); font-weight: 500; }
 .topbar-crumb-sep { color: var(--text-comment); font-size: 11px; }
+.topbar-row--subtitled { min-height: 34px; padding-bottom: 0; }
+.topbar-title {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--font-display);
+    font-size: 1.5rem;
+    font-weight: 600;
+    line-height: 1.2;
+    color: var(--text);
+}
+.topbar-subtitle { color: var(--text-muted); font-size: 0.875rem; padding: 2px 0 14px; }
 .topbar-actions {
     display: flex;
     align-items: center;
@@ -1038,8 +1049,9 @@
     background: var(--bg-surface-low);
     padding: 7px 12px;
     border-radius: 4px;
-    min-width: 280px;
-    flex: 0 1 360px;
+    min-width: 200px;
+    max-width: 360px;
+    flex: 1 1 220px;
 }
 .rv-search input {
     flex: 1;
@@ -1594,6 +1606,9 @@ code[title],
    column in that row only and push the row out of line with the header. */
 .grid-row > *,
 .grid-table-head > * { min-width: 0; }
+.grid-row > .chip,
+.grid-row > .kind-badge,
+.grid-row > .rv-tag { justify-self: start; }
 .grid-row-rail {
     position: absolute;
     left: 0;

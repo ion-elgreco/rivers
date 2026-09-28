@@ -5,7 +5,7 @@ use leptos::prelude::*;
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::TableSkeleton;
 use crate::components::ui_kit::{
-    BottleneckCard, Crumb, EmptyState, LaneSpec, QueueLanes, QueuedRun, StatTile, Topbar,
+    BottleneckCard, EmptyState, LaneSpec, QueueLanes, QueuedRun, StatTile, Topbar,
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::now::use_now;
@@ -54,17 +54,12 @@ pub fn QueuePage() -> impl IntoView {
     );
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Queue")]>
+        <Topbar title="Queue" subtitle=|| "Runs waiting on a resource">
             <LiveStatusChip
                 status=live_status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
         </Topbar>
-
-        <div class="page-header">
-            <h1>"Queue"</h1>
-            <p>"Runs waiting on a resource"</p>
-        </div>
 
         <Transition fallback=move || view! { <TableSkeleton rows=6 cols=6/> }>
             {move || {
@@ -73,8 +68,8 @@ pub fn QueuePage() -> impl IntoView {
                         if runs.is_empty() {
                             return view! {
                                 <EmptyState
-                                    message="No runs in queue"
-                                    hint="cluster is caught up · nothing waiting on a resource"
+                                    message="No queued runs"
+                                    hint="Nothing is waiting on a pool or concurrency limit"
                                 />
                             }.into_any();
                         }
@@ -153,7 +148,7 @@ pub fn QueuePage() -> impl IntoView {
                             <QueueLanes lanes=lanes/>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error loading queue: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load the queue: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>

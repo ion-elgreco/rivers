@@ -7,7 +7,7 @@ use leptos_router::hooks::use_params_map;
 use crate::components::icons::{IconRetry, IconStop, IconTrash};
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::pagination::{InfiniteEventList, PaginatedView};
-use crate::components::ui_kit::{Crumb, StatusChip, Topbar};
+use crate::components::ui_kit::{Crumb, EmptyState, StatusChip, Topbar};
 use crate::helpers::{
     code_location_label, format_elapsed, format_relative_time, format_timestamp,
     launched_by_display, nanos_to_datetime, run_status_kind, short_id,
@@ -259,42 +259,27 @@ pub fn RunDetailPage() -> impl IntoView {
     view! {
         <div class="run-detail-layout">
         <div class="run-detail-main">
-        <Transition fallback=move || view! { <div class="loading">"Loading..."</div> }>
-            {move || {
-                run.get().map(|result| match result {
-                    Ok(Some(record)) => {
-                        let rerun_run_id = record.run_id.clone();
-                        let rerun_verb = record.action.clone();
-                        let rerun_verb_text = rerun_verb.clone();
-                        let status_kind = run_status_kind(&record.status);
-                        let sid = short_id(&record.run_id, 8);
-                        let is_active_status = crate::helpers::run_is_active(&record.status);
-                        let (_, _, trigger_label, trigger_sub) = launched_by_display(&record.launched_by);
-                        // Reactive elapsed: ticks once per second while end_time
-                        // is None (run still in flight), freezes when end_time
-                        // is set.
-                        let run_start_ns = record.start_time;
-                        let run_end_ns = record.end_time;
-                        let elapsed_label = move || {
-                            format_elapsed(Some(run_start_ns), run_end_ns, use_now().get())
-                        };
-                        let (ns, name) = loc.get();
-                        let runs_href = loc_path(&ns, &name, "runs");
-                        let cl_id = record.code_location_id.clone();
-                        let cl_label = {
-                            let entries = locations.get().and_then(|r| r.ok()).unwrap_or_default();
-                            code_location_label(&cl_id, &entries)
-                        };
-                        view! {
-                            <Topbar crumbs=vec![
-                                Crumb::linked("Runs", runs_href),
-                                Crumb::new(sid.clone()).mono(),
-                            ]>
-                                <LiveStatusChip
-                                    status=live_status
-                                    on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
-                                />
-                                {move || action_error.get().map(|msg| view! { <span class="text-error">{msg}</span> })}
+        {move || {
+            let id = run_id_memo.get();
+            let (ns, name) = loc.get();
+            let runs_href = loc_path(&ns, &name, "runs");
+            view! {
+                <Topbar crumbs=vec![
+                    Crumb::linked("Runs", runs_href),
+                    Crumb::new(short_id(&id, 8)).mono().copyable(id.clone()),
+                ]>
+                    <LiveStatusChip
+                        status=live_status
+                        on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
+                    />
+                    {move || action_error.get().map(|msg| view! { <span class="text-error">{msg}</span> })}
+                    <Transition>
+                        {move || run.get().and_then(|r| r.ok()).flatten().map(|record| {
+                            let rerun_run_id = record.run_id.clone();
+                            let rerun_verb = record.action.clone();
+                            let rerun_verb_text = rerun_verb.clone();
+                            let is_active_status = crate::helpers::run_is_active(&record.status);
+                            view! {
                                 {is_active_status.then(|| {
                                     let cancel_id = record.run_id.clone();
                                     view! {
@@ -373,7 +358,33 @@ pub fn RunDetailPage() -> impl IntoView {
                                         )}
                                     </button>
                                 })}
-                            </Topbar>
+                            }
+                        })}
+                    </Transition>
+                </Topbar>
+            }
+        }}
+        <Transition fallback=move || view! { <div class="loading">"Loading…"</div> }>
+            {move || {
+                run.get().map(|result| match result {
+                    Ok(Some(record)) => {
+                        let sid = short_id(&record.run_id, 8);
+                        let status_kind = run_status_kind(&record.status);
+                        let (_, _, trigger_label, trigger_sub) = launched_by_display(&record.launched_by);
+                        // Reactive elapsed: ticks once per second while end_time
+                        // is None (run still in flight), freezes when end_time
+                        // is set.
+                        let run_start_ns = record.start_time;
+                        let run_end_ns = record.end_time;
+                        let elapsed_label = move || {
+                            format_elapsed(Some(run_start_ns), run_end_ns, use_now().get())
+                        };
+                        let cl_id = record.code_location_id.clone();
+                        let cl_label = {
+                            let entries = locations.get().and_then(|r| r.ok()).unwrap_or_default();
+                            code_location_label(&cl_id, &entries)
+                        };
+                        view! {
 
                             <div class="run-header-block">
                                 <div class="section-header-label">{
@@ -435,49 +446,56 @@ pub fn RunDetailPage() -> impl IntoView {
 
                         }.into_any()
                     }
-                    Ok(None) => view! { <div class="error-msg">"Run not found."</div> }.into_any(),
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                    Ok(None) => view! { <div class="error-msg">"Run not found"</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load run: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
 
-        <div class="tab-content">
-            <Transition fallback=move || view! { <div class="loading">"Loading timeline..."</div> }>
-                {move || {
-                    let run_data = run.get().and_then(|r| r.ok()).flatten();
-                    let steps = step_events.get()?.ok()?;
-                    let run_start = run_data.as_ref().map(|r| r.start_time);
-                    Some(view! {
-                        <RunTimelinePanel
-                            events={steps}
-                            run_start={run_start}
-                            node_names={run_data.as_ref().map(|r| r.node_names.clone()).unwrap_or_default()}
-                            topology={topology.get().and_then(|r| r.ok())}
-                            selected_step=selected_step
-                            on_select=set_selected_step
-                            view_mode=view_mode
-                            set_view_mode=set_view_mode
-                        />
-                    })
-                }}
-            </Transition>
-            // Created once (not in the resource Transition) so a live refresh can't
-            // re-mount it and reset the scroll buffer. `run_logs` is reactive, so
-            // stdout/stderr still update live.
-            <RunLogPanel
-                run_id=run_id_memo
-                refresh_tick=refresh_tick
-                run_logs=Signal::derive(move || {
-                    run_logs.get().and_then(|r| r.ok()).unwrap_or_default()
-                })
-                selected_step=selected_step
-                on_clear=set_selected_step
-                log_tab=log_tab
-                set_log_tab=set_log_tab
-                log_level=log_level
-                set_log_level=set_log_level
-            />
-        </div>
+        <Transition>
+            <Show when=move || !matches!(run.get(), Some(Ok(None)))>
+                <div class="tab-content">
+                    <Transition fallback=move || view! { <div class="loading">"Loading timeline…"</div> }>
+                        {move || {
+                            let run_data = run.get().and_then(|r| r.ok()).flatten();
+                            let steps = step_events.get()?.ok()?;
+                            let run_start = run_data.as_ref().map(|r| r.start_time);
+                            Some(view! {
+                                <RunTimelinePanel
+                                    events={steps}
+                                    run_start={run_start}
+                                    node_names={run_data.as_ref().map(|r| r.node_names.clone()).unwrap_or_default()}
+                                    topology={topology.get().and_then(|r| r.ok())}
+                                    selected_step=selected_step
+                                    on_select=set_selected_step
+                                    view_mode=view_mode
+                                    set_view_mode=set_view_mode
+                                />
+                            })
+                        }}
+                    </Transition>
+                    // Mounted once (not in a closure over the run) so a live refresh can't
+                    // re-mount it and reset the scroll buffer. `run_logs` is reactive, so
+                    // stdout/stderr still update live.
+                    <RunLogPanel
+                        run_id=run_id_memo
+                        refresh_tick=refresh_tick
+                        run_logs=Signal::derive(move || {
+                            run_logs.get().and_then(|r| r.ok()).unwrap_or_default()
+                        })
+                        logs_error=Signal::derive(move || {
+                            run_logs.get().and_then(|r| r.err()).map(|e| crate::helpers::err_text(&e))
+                        })
+                        selected_step=selected_step
+                        on_clear=set_selected_step
+                        log_tab=log_tab
+                        set_log_tab=set_log_tab
+                        log_level=log_level
+                        set_log_level=set_log_level
+                    />
+                </div>
+            </Show>
+        </Transition>
 
         </div>
 
@@ -1107,7 +1125,7 @@ fn RunTimelinePanel(
                 </div>
             </div>
             {if !has_steps {
-                view! { <div class="empty-state" style="margin:20px 16px">"No execution steps recorded yet."</div> }.into_any()
+                view! { <div class="run-view-empty"><EmptyState message="No steps recorded yet" compact=true/></div> }.into_any()
             } else {
                 view! { {body_view} }.into_any()
             }}
@@ -1123,10 +1141,16 @@ struct LaneRow {
     width_pct: f64,
 }
 
+/// Finer units for shorter spans, so the axis ticks of a fast run stay distinct.
 fn fmt_dur_short(secs: f64) -> String {
     let abs = secs.abs();
-    if abs < 1.0 {
-        // Sub-second: show millis so a sub-second run doesn't render every tick as "0s".
+    if abs == 0.0 {
+        "0ms".to_string()
+    } else if abs < 0.001 {
+        format!("{}µs", (abs * 1e6).round() as i64)
+    } else if abs < 0.01 {
+        format!("{:.1}ms", abs * 1000.0)
+    } else if abs < 1.0 {
         format!("{}ms", (abs * 1000.0).round() as i64)
     } else if abs < 10.0 {
         format!("{:.1}s", abs)
@@ -1547,6 +1571,7 @@ fn RunLogPanel(
     run_id: Memo<String>,
     refresh_tick: ReadSignal<u32>,
     run_logs: Signal<Vec<RunLog>>,
+    logs_error: Signal<Option<String>>,
     selected_step: ReadSignal<Option<String>>,
     on_clear: WriteSignal<Option<String>>,
     log_tab: ReadSignal<String>,
@@ -1672,6 +1697,9 @@ fn RunLogPanel(
                 </div>
             </div>
 
+            {move || logs_error.get().map(|msg| view! {
+                <div class="error-msg log-panel-error">{format!("Couldn't load logs: {msg}")}</div>
+            })}
             <div style=move || if log_tab.get() == "events" { "" } else { "display:none" }>
                 <div class="log-event-row log-event-head">
                     <span class="log-col-time">"Time"</span>
@@ -1748,6 +1776,20 @@ fn RunLogPanel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_spans_keep_axis_ticks_distinct() {
+        let labels: Vec<String> = (0..=8)
+            .map(|i| fmt_dur_short(i as f64 * 0.001 / 8.0))
+            .collect();
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "{labels:?}");
+        assert_eq!(fmt_dur_short(0.0), "0ms");
+        assert_eq!(fmt_dur_short(0.000_125), "125µs");
+        assert_eq!(fmt_dur_short(0.0042), "4.2ms");
+        assert_eq!(fmt_dur_short(0.25), "250ms");
+        assert_eq!(fmt_dur_short(3.0), "3.0s");
+    }
 
     fn ev(event_type: EventType, partition_key: Option<&str>) -> StoredEvent {
         StoredEvent {

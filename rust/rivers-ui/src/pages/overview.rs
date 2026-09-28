@@ -6,7 +6,7 @@ use leptos_router::components::A;
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::StatsSkeleton;
 use crate::components::ui_kit::{
-    Crumb, DonutStatCard, FeaturedDonut, Rail, SectionHeader, StatTile, SummaryCard, Topbar,
+    DonutStatCard, EmptyState, FeaturedDonut, Rail, SectionHeader, StatTile, SummaryCard, Topbar,
 };
 use crate::helpers::{run_status_kind, short_id};
 use crate::loc::{loc_path, use_current_location};
@@ -46,7 +46,7 @@ pub fn OverviewPage() -> impl IntoView {
     );
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Overview")]>
+        <Topbar title="Overview">
             <LiveStatusChip
                 status=live_status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
@@ -115,7 +115,7 @@ pub fn OverviewPage() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load run counts: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
@@ -192,13 +192,13 @@ pub fn OverviewPage() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load assets: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
 
         <SectionHeader label="AUTOMATION" count="schedules · sensors · conditions"/>
-        <Transition fallback=move || view! { <div class="loading">"Loading..."</div> }>
+        <Transition fallback=move || view! { <div class="loading">"Loading…"</div> }>
             {move || {
                 let sched = schedules.get().and_then(|r| r.ok()).unwrap_or_default();
                 let sens = sensors.get().and_then(|r| r.ok()).unwrap_or_default();
@@ -240,7 +240,7 @@ pub fn OverviewPage() -> impl IntoView {
                 {move || {
                     let runs_all = recent_runs.get().and_then(|r| r.ok()).unwrap_or_default();
                     if runs_all.is_empty() {
-                        view! { <div class="empty-state" style="padding:16px">"No recent runs."</div> }.into_any()
+                        view! { <EmptyState message="No recent runs" compact=true/> }.into_any()
                     } else {
                         let (ns, name) = loc.get();
                         view! {

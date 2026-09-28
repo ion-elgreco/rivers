@@ -5,7 +5,7 @@ use leptos_router::components::A;
 
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::TableSkeleton;
-use crate::components::ui_kit::{Crumb, PoolUtilBar, StatTile, Topbar};
+use crate::components::ui_kit::{EmptyState, PoolUtilBar, StatTile, Topbar};
 use crate::helpers::{format_seconds, short_id};
 use crate::loc::{loc_path, use_current_location};
 use crate::now::RelTime;
@@ -55,7 +55,7 @@ pub fn PoolsPage() -> impl IntoView {
         move || (loc.get(), expanded_pool.get(), refresh_tick.get()),
         |((ns, name), pool_key, _)| async move {
             match pool_key {
-                Some(key) => get_pool_detail(ns, name, key).await.ok(),
+                Some(key) => Some(get_pool_detail(ns, name, key).await),
                 None => None,
             }
         },
@@ -68,17 +68,12 @@ pub fn PoolsPage() -> impl IntoView {
     );
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Pools")]>
+        <Topbar title="Pools" subtitle=|| "Concurrency slots across the cluster">
             <LiveStatusChip
                 status=live_status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
         </Topbar>
-
-        <div class="page-header">
-            <h1>"Pools"</h1>
-            <p>"Concurrency slots across the cluster"</p>
-        </div>
 
         <Transition>
             {move || {
@@ -106,7 +101,7 @@ pub fn PoolsPage() -> impl IntoView {
                 pools.get().map(|result| match result {
                     Ok(pool_list) => {
                         if pool_list.is_empty() {
-                            return view! { <div class="empty-state">"No concurrency pools configured."</div> }.into_any();
+                            return view! { <EmptyState message="No concurrency pools configured"/> }.into_any();
                         }
 
                         view! {
@@ -150,7 +145,7 @@ pub fn PoolsPage() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error loading pools: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load pools: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
@@ -169,7 +164,7 @@ fn PoolRow(
     waiting: Vec<RunRecord>,
     expanded_pool: ReadSignal<Option<String>>,
     set_expanded_pool: WriteSignal<Option<String>>,
-    detail: Resource<Option<PoolDetail>>,
+    detail: Resource<Option<Result<PoolDetail, ServerFnError>>>,
 ) -> impl IntoView {
     let pool_key_click = pool_key.clone();
     let pool_key_check = pool_key.clone();
@@ -316,10 +311,15 @@ fn PoolRow(
 
                     {move || {
                         match detail.get() {
-                            Some(Some(d)) if pool_key_detail.with_value(|k| d.info.pool_key == *k) => {
+                            Some(Some(Ok(d))) if pool_key_detail.with_value(|k| d.info.pool_key == *k) => {
                                 view! { <HoldersTable detail=d/> }.into_any()
                             }
-                            _ => view! { <div class="loading" style="margin-top:12px">"Loading holders..."</div> }.into_any(),
+                            Some(Some(Err(e))) => view! {
+                                <div class="error-msg" style="margin-top:12px">
+                                    {format!("Couldn't load holders: {}", crate::helpers::err_text(&e))}
+                                </div>
+                            }.into_any(),
+                            _ => view! { <div class="loading" style="margin-top:12px">"Loading holders…"</div> }.into_any(),
                         }
                     }}
                 </div>
@@ -334,7 +334,7 @@ fn HoldersTable(detail: PoolDetail) -> impl IntoView {
         return view! {
             <div style="margin-top:12px">
                 <div class="section-header-label" style="margin-bottom:6px">"SLOT HOLDERS"</div>
-                <div class="empty-state">"No active slot holders."</div>
+                <EmptyState message="No active slot holders" compact=true/>
             </div>
         }
         .into_any();

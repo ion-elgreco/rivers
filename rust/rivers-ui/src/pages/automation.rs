@@ -7,7 +7,9 @@ use leptos_router::components::A;
 
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::TableSkeleton;
-use crate::components::ui_kit::{Crumb, EmptyState, EvaluateOutcomeShort, Topbar, UnderlineTabs};
+use crate::components::ui_kit::{
+    AutomationState, EmptyState, EvaluateOutcomeShort, SectionHeader, Topbar, UnderlineTabs,
+};
 use crate::helpers::{job_actions_by_name, short_id, use_query_param};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::automation::{
@@ -212,22 +214,15 @@ pub fn AutomationPage() -> impl IntoView {
     );
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Automation")]>
-            <LiveStatusChip
-                status=live_status
-                on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
-            />
-        </Topbar>
-
-        <div class="page-header">
-            <h1>"Automation"</h1>
-            <Transition>
-                {move || {
-                    let n_sched = sched_records().len();
-                    let n_sensors = sensor_records().len();
-                    let n_cond = condition_assets().len();
-                    view! {
-                        <p>
+        <Topbar
+            title="Automation"
+            subtitle=move || view! {
+                <Transition>
+                    {move || {
+                        let n_sched = sched_records().len();
+                        let n_sensors = sensor_records().len();
+                        let n_cond = condition_assets().len();
+                        view! {
                             <span class="page-header-num">{n_sched.to_string()}</span>
                             {if n_sched == 1 { " schedule" } else { " schedules" }}
                             <span class="page-header-sep">"·"</span>
@@ -236,11 +231,16 @@ pub fn AutomationPage() -> impl IntoView {
                             <span class="page-header-sep">"·"</span>
                             <span class="page-header-num">{n_cond.to_string()}</span>
                             {if n_cond == 1 { " declarative condition" } else { " declarative conditions" }}
-                        </p>
-                    }
-                }}
-            </Transition>
-        </div>
+                        }
+                    }}
+                </Transition>
+            }
+        >
+            <LiveStatusChip
+                status=live_status
+                on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
+            />
+        </Topbar>
 
 
         {
@@ -261,6 +261,18 @@ pub fn AutomationPage() -> impl IntoView {
                 let field = sort_by.get();
                 let asc = sort_asc.get();
                 let (loc_ns, loc_name) = loc.get();
+
+                // A failed fetch must not read as "nothing defined".
+                let load_error = match tab.as_str() {
+                    "sensors" => sensors.get().and_then(|r| r.err()),
+                    "conditions" => assets_info.get().and_then(|r| r.err()),
+                    _ => schedules.get().and_then(|r| r.err()),
+                };
+                if let Some(e) = load_error {
+                    return view! {
+                        <div class="error-msg">{format!("Couldn't load automation: {}", crate::helpers::err_text(&e))}</div>
+                    }.into_any();
+                }
 
                 match tab.as_str() {
                     "sensors" => {
@@ -352,7 +364,7 @@ fn render_schedules_table(
         return view! {
             <EmptyState
                 message="No schedules defined"
-                hint="add @schedule(cron='0 */6 * * *') decorators in your code location"
+                hint="Add an @rs.Schedule(cron_schedule=…, job_name=…) to your code location"
             />
         }
         .into_any();
@@ -387,9 +399,8 @@ fn render_schedules_table(
                 let eval_name = name.clone();
                 let href = loc_path(&loc_ns, &loc_name, &format!("automation/schedules/{}", name));
                 let job_name = s.job_name.clone();
-                let tick_text = next_ticks.get(&s.name).cloned().unwrap_or_else(|| "-".to_string());
+                let tick_text = next_ticks.get(&s.name).cloned().unwrap_or_else(|| "—".to_string());
                 let status_raw = s.status.clone();
-                let status_running = status_raw.eq_ignore_ascii_case("running");
 
                 let eval_ns = loc_ns.clone();
                 let eval_loc = loc_name.clone();
@@ -425,10 +436,7 @@ fn render_schedules_table(
                         <span class="grid-cell-mono" style="color:var(--secondary); font-size:11.5px">
                             {job_actions.get(&job_name).map(|v| format!("{job_name} · {v}")).unwrap_or(job_name)}
                         </span>
-                        <span class="status-dot-row">
-                            <span class=format!("status-dot status-dot--{}", if status_running { "ok" } else { "muted" })></span>
-                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{status_raw}</span>
-                        </span>
+                        <AutomationState status=status_raw/>
                         <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{tick_text}</span>
                         <span style="display:flex; gap:4px; flex-wrap:wrap">
                             {s.tags.iter().map(|(k, v)| {
@@ -464,7 +472,7 @@ fn render_sensors_table(
         return view! {
             <EmptyState
                 message="No sensors defined"
-                hint="add @sensor() event-driven triggers in your code location"
+                hint="Add an @rs.Sensor(job_name=…) to your code location"
             />
         }
         .into_any();
@@ -507,7 +515,6 @@ fn render_sensors_table(
                     s.asset_selection.join(" · ")
                 };
                 let status_raw = s.status.clone();
-                let status_running = status_raw.eq_ignore_ascii_case("running");
 
                 let eval_ns = loc_ns.clone();
                 let eval_loc = loc_name.clone();
@@ -532,10 +539,7 @@ fn render_sensors_table(
                             }
                             None => view! { <span class="grid-cell-muted">"—"</span> }.into_any()
                         }}
-                        <span class="status-dot-row">
-                            <span class=format!("status-dot status-dot--{}", if status_running { "ok" } else { "muted" })></span>
-                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{status_raw}</span>
-                        </span>
+                        <AutomationState status=status_raw/>
                         <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{interval}</span>
                         <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0">{asset_selection_str}</span>
                         <span style="display:flex; align-items:center; gap:6px; justify-content:flex-end">
@@ -574,7 +578,7 @@ fn render_conditions_tab(
         return view! {
             <EmptyState
                 message="No assets with automation conditions"
-                hint="attach AutomationCondition.eager() to an asset for declarative materialization"
+                hint="Set automation_condition=rs.AutomationCondition.eager() on an asset"
             />
         }
         .into_any();
@@ -696,18 +700,14 @@ fn render_conditions_tab(
 
         {if ticks.is_empty() {
             view! {
-                <div class="section-header-row" style="margin-top:28px">
-                    <span class="section-header-label">"EVALUATION TICKS"</span>
-                </div>
-                <div class="empty-state">"No evaluation ticks recorded yet."</div>
+                <SectionHeader label="EVALUATION TICKS"/>
+                <EmptyState message="No evaluation ticks yet" compact=true/>
             }.into_any()
         } else {
             const GRID: &str = "grid-template-columns: 24px 1.1fr 0.5fr 0.55fr 0.55fr 1.2fr 1.2fr";
             let tick_count = ticks.len();
             view! {
-                <div class="section-header-row" style="margin-top:28px">
-                    <span class="section-header-label">{format!("EVALUATION TICKS · LAST {tick_count}")}</span>
-                </div>
+                <SectionHeader label="EVALUATION TICKS" count=format!("last {tick_count}")/>
                 <div class="grid-table">
                     <div class="grid-table-head" style=GRID>
                         <span></span>
@@ -858,7 +858,7 @@ fn render_conditions_tab(
                                         let loc_ns_inner = loc_ns_show.clone();
                                         let loc_name_inner = loc_name_show.clone();
                                         if tick_detail_loading.get() {
-                                            return view! { <span class="text-muted" style="font-size:11.5px">"Loading..."</span> }.into_any();
+                                            return view! { <span class="text-muted" style="font-size:11.5px">"Loading…"</span> }.into_any();
                                         }
                                         let detail = tick_detail.get();
                                         if detail.evals.is_empty() {

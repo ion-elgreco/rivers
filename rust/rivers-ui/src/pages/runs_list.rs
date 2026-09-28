@@ -20,7 +20,7 @@ use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::GridRowSkeleton;
 use crate::components::pagination::PaginatedView;
 use crate::components::ui_kit::{
-    AssetStack, Crumb, DurationCell, EmptyState, FilterPillGroup, LaunchedByCell, PartitionCell,
+    AssetStack, DurationCell, EmptyState, FilterPillGroup, LaunchedByCell, PartitionCell,
     RiversSearch, StatusChip, Topbar, partition_scheme_for,
 };
 use crate::helpers::{
@@ -234,79 +234,59 @@ pub fn RunsListPage() -> impl IntoView {
     });
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Runs")]>
+        <Topbar
+            title="Runs"
+            subtitle=move || view! {
+                // Derived from `summary` only, so typing in a filter does not
+                // re-render it. On fetch error show "unavailable", not zeros —
+                // zero counts would falsely claim "no runs exist".
+                <Transition>
+                    {move || summary.get().map(|res| match res {
+                        Ok(RunsSummary { total, failure, last_24h, .. }) => view! {
+                            <span class="page-header-num">{total.to_string()}</span>
+                            " total"
+                            <span class="page-header-sep">"·"</span>
+                            <span class="page-header-num">{last_24h.to_string()}</span>
+                            " in last 24h"
+                            <span class="page-header-sep">"·"</span>
+                            <span class="page-header-num page-header-num--error">{failure.to_string()}</span>
+                            " failed"
+                        }.into_any(),
+                        Err(e) => view! {
+                            <span
+                                class="page-header-summary-error"
+                                title=format!("Summary fetch failed: {}", crate::helpers::err_text(&e))
+                            >
+                                "Summary unavailable — will retry on next update"
+                            </span>
+                        }.into_any(),
+                    })}
+                </Transition>
+            }
+        >
             <LiveStatusChip
                 status=live_status
                 on_refresh=Callback::new(move |_| reload.run(()))
             />
         </Topbar>
 
-        // Derived from `summary` only, so typing in a job/asset/partition filter
-        // does NOT re-render this block. On fetch error we render "unavailable"
-        // instead of falling back to zeros — zero counts would falsely claim
-        // "no runs exist" and mask the real state.
-        <Transition fallback=move || view! { <GridRowSkeleton rows=2 cols=5/> }>
-            {move || match summary.get() {
-                None => ().into_any(),
-                Some(Ok(s)) => {
-                    let RunsSummary { total, in_progress, queued, failure, success, last_24h } = s;
-                    let status_items = run_status_pills([
-                        Some(total),
-                        Some(in_progress),
-                        Some(queued),
-                        Some(failure),
-                        Some(success),
-                    ]);
-                    view! {
-                        <div class="page-header-row" style="align-items: flex-end">
-                            <div class="page-header">
-                                <h1>"Runs"</h1>
-                                <p>
-                                    "All runs · "
-                                    <span class="page-header-num">{total.to_string()}</span>
-                                    " total"
-                                    <span class="page-header-sep">"·"</span>
-                                    <span class="page-header-num">{last_24h.to_string()}</span>
-                                    " in last 24h"
-                                    <span class="page-header-sep">"·"</span>
-                                    <span class="page-header-num page-header-num--error">
-                                        {failure.to_string()}
-                                    </span>
-                                    " failed"
-                                </p>
-                            </div>
-                            <FilterPillGroup
-                                label="STATUS"
-                                items=status_items
-                                active=active_tab_sig
-                                on_select=on_tab
-                            />
-                        </div>
-                    }.into_any()
+        <Transition fallback=move || view! { <GridRowSkeleton rows=1 cols=5/> }>
+            {move || summary.get().map(|res| {
+                let counts = match res {
+                    Ok(s) => [Some(s.total), Some(s.in_progress), Some(s.queued), Some(s.failure), Some(s.success)],
+                    Err(_) => [None; 5],
+                };
+                view! {
+                    <div class="rv-toolbar">
+                        <FilterPillGroup
+                            label="STATUS"
+                            items=run_status_pills(counts)
+                            active=active_tab_sig
+                            on_select=on_tab
+                        />
+                    </div>
                 }
-                Some(Err(e)) => {
-                    let status_items = run_status_pills([None; 5]);
-                    view! {
-                        <div class="page-header-row" style="align-items: flex-end">
-                            <div class="page-header">
-                                <h1>"Runs"</h1>
-                                <p
-                                    class="page-header-summary-error"
-                                    title=format!("Summary fetch failed: {}", crate::helpers::err_text(&e))
-                                >
-                                    "Summary unavailable — will retry on next update"
-                                </p>
-                            </div>
-                            <FilterPillGroup
-                                label="STATUS"
-                                items=status_items
-                                active=active_tab_sig
-                                on_select=on_tab
-                            />
-                        </div>
-                    }.into_any()
-                }
-            }}
+            })}
         </Transition>
 
         <div class="rv-toolbar">
@@ -342,7 +322,7 @@ pub fn RunsListPage() -> impl IntoView {
             empty=move || view! {
                 <EmptyState
                     message="No runs match the current filters"
-                    hint="clear a filter or widen the status tab"
+                    hint="Clear a filter or pick another status"
                 />
             }
             render={move |rows: Vec<RunRecord>| {

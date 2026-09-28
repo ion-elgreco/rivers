@@ -2,23 +2,33 @@
 
 use leptos::prelude::*;
 
+use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::CardSkeleton;
-use crate::components::ui_kit::{
-    Crumb, DeployCard, DeployRow, DeploymentDiagram, DeploymentNode, Topbar,
-};
+use crate::components::ui_kit::{DeployCard, DeployRow, DeploymentDiagram, DeploymentNode, Topbar};
 use crate::loc::use_current_location;
 use crate::server_fns::overview::get_deployment_info;
 
 #[component]
 pub fn DeploymentPage() -> impl IntoView {
     let loc = use_current_location();
+    let (refresh_tick, set_refresh_tick) = signal(0u32);
     let info = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_deployment_info(ns, name).await },
+        move || (loc.get(), refresh_tick.get()),
+        |((ns, name), _)| async move { get_deployment_info(ns, name).await },
+    );
+    let live_status = use_live_kick(
+        &["runs"],
+        300,
+        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
     );
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Deployment")]/>
+        <Topbar title="Deployment">
+            <LiveStatusChip
+                status=live_status
+                on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
+            />
+        </Topbar>
 
         <Transition fallback=move || view! { <CardSkeleton/> }>
             {move || {
@@ -98,7 +108,7 @@ pub fn DeploymentPage() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load deployment info: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>

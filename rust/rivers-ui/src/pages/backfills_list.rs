@@ -12,7 +12,7 @@ use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::GridRowSkeleton;
 use crate::components::pagination::Pagination;
 use crate::components::ui_kit::{
-    AssetStack, Crumb, EmptyState, FilterPillGroup, PartitionCell, ProgressBar, StatusChip, Topbar,
+    AssetStack, EmptyState, FilterPillGroup, PartitionCell, ProgressBar, StatusChip, Topbar,
 };
 use crate::helpers::{
     backfill_status_kind, code_location_label, format_duration, format_timestamp,
@@ -30,7 +30,7 @@ fn rail_class(status: &str) -> &'static str {
         "InProgress" => "running",
         "CompletedSuccess" => "success",
         "CompletedFailed" => "failed",
-        "Canceled" => "warning",
+        "Canceled" => "canceled",
         _ => "queued",
     }
 }
@@ -117,7 +117,23 @@ pub fn BackfillsListPage() -> impl IntoView {
     });
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Backfills")]>
+        <Topbar
+            title="Backfills"
+            subtitle=move || view! {
+                <Transition>
+                    {move || summary.get().and_then(|r| r.ok()).map(|s| view! {
+                        <span class="page-header-num">{s.total.to_string()}</span>
+                        {if s.total == 1 { " backfill" } else { " backfills" }}
+                        <span class="page-header-sep">"·"</span>
+                        <span class="page-header-num">{s.in_progress.to_string()}</span>
+                        " running"
+                        <span class="page-header-sep">"·"</span>
+                        <span class="page-header-num page-header-num--error">{s.completed_failed.to_string()}</span>
+                        " failed"
+                    })}
+                </Transition>
+            }
+        >
             <LiveStatusChip
                 status=live_status
                 on_refresh=Callback::new(move |_| reload.run(()))
@@ -164,12 +180,12 @@ pub fn BackfillsListPage() -> impl IntoView {
             {move || match backfills_page.get() {
                 None => view! { <GridRowSkeleton rows=10 cols=9/> }.into_any(),
                 Some(Err(e)) => view! {
-                    <div class="error-msg">{format!("Error loading backfills: {}", crate::helpers::err_text(&e))}</div>
+                    <div class="error-msg">{format!("Couldn't load backfills: {}", crate::helpers::err_text(&e))}</div>
                 }.into_any(),
                 Some(Ok(page_data)) if page_data.total == 0 => view! {
                     <EmptyState
                         message="No backfills match this filter"
-                        hint="switch tabs or trigger one from an asset page"
+                        hint="Pick another status, or launch one from an asset page"
                     />
                 }.into_any(),
                 Some(Ok(page_data)) => {
@@ -249,13 +265,7 @@ fn BackfillRow(record: BackfillInfo, code_location_label: String) -> impl IntoVi
     let progress_sig = Signal::derive(move || progress_ratio);
     let partition_label = format!("{completed} of {total}");
     let run_count = record.run_ids.len();
-    let color = match record.status.as_str() {
-        "CompletedFailed" => "var(--error)",
-        "Canceled" => "var(--warning)",
-        "InProgress" => "var(--secondary)",
-        _ => "var(--success)",
-    }
-    .to_string();
+    let color = crate::helpers::backfill_status_color(&record.status).to_string();
 
     view! {
         <A href=href attr:class="grid-row" attr:style=GRID attr:title=created_abs>

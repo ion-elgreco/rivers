@@ -181,3 +181,22 @@ async fn search_hint_renders_with_cmd_k_kbd() {
     let hint = query_one(&host, ".search-hint").text_content().unwrap();
     assert!(hint.contains("Cmd+K"));
 }
+
+#[wasm_bindgen_test]
+async fn search_hint_click_opens_search_with_input_focused() {
+    let host = mount_shell("/locations/default/demo");
+    flush_effects().await;
+    assert!(query_all(&host, ".search-modal").is_empty());
+
+    click(&query_one(&host, ".search-hint"), false);
+    flush_effects().await;
+
+    assert_eq!(query_all(&host, ".search-modal").len(), 1);
+    let focused = web_sys::window()
+        .unwrap()
+        .document()
+        .unwrap()
+        .active_element()
+        .unwrap();
+    assert_eq!(focused.class_name(), "search-input");
+}
