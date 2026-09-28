@@ -110,26 +110,6 @@ pub fn use_query_param_list(
     (value, set_value)
 }
 
-/// Read a query parameter as usize, defaulting to `default` if absent.
-pub fn use_query_param_usize(
-    key: &'static str,
-    default: usize,
-) -> (Signal<usize>, impl Fn(usize) + Clone + 'static) {
-    let (raw, set_raw) = use_query_param(key, &default.to_string());
-
-    let value = Signal::derive(move || raw.get().parse::<usize>().unwrap_or(default));
-
-    let set_value = move |n: usize| {
-        set_raw(if n == default {
-            String::new()
-        } else {
-            n.to_string()
-        });
-    };
-
-    (value, set_value)
-}
-
 /// Convert a nanosecond timestamp to a UTC instant.
 pub fn nanos_to_datetime(ts: i64) -> Option<jiff::Timestamp> {
     jiff::Timestamp::from_nanosecond(ts as i128).ok()

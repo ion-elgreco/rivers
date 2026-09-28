@@ -149,26 +149,6 @@ pub async fn get_asset_events_page(
 }
 
 #[server]
-pub async fn get_asset_events_by_partition(
-    loc_ns: String,
-    loc_name: String,
-    key: String,
-    partition_key: String,
-    limit: Option<usize>,
-) -> Result<Vec<StoredEvent>, ServerFnError> {
-    use rivers_core::storage::StorageBackend;
-    let ctx = super::resolve_identity(&loc_ns, &loc_name).await?;
-    let state = expect_context::<crate::state::AppState>();
-    state
-        .storage
-        .for_code_location(&ctx)
-        .get_partition_events(&key, &partition_key, limit.unwrap_or(50))
-        .await
-        .map(|evts| evts.into_iter().map(Into::into).collect())
-        .map_err(|e| ServerFnError::new(e.to_string()))
-}
-
-#[server]
 pub async fn get_dynamic_partitions(
     loc_ns: String,
     loc_name: String,
