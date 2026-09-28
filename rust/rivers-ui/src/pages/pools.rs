@@ -292,10 +292,10 @@ fn PoolRow(
                             let job = r.job_name.clone().unwrap_or_else(|| "—".into());
                             view! {
                                 <div style="display:grid; grid-template-columns:32px 100px 1fr 100px; gap:12px; align-items:center; padding:6px 0">
-                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11px">{format!("#{}", i + 1)}</span>
-                                    <A href=run_href attr:class="grid-cell-mono" attr:style="color:var(--secondary); font-size:11.5px">{short}</A>
-                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{job}</span>
-                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px; text-align:right"><RelTime ts=start_ts/></span>
+                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-xs)">{format!("#{}", i + 1)}</span>
+                                    <A href=run_href attr:class="grid-cell-mono" attr:style="color:var(--secondary); font-size:var(--fs-sm)">{short}</A>
+                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm)">{job}</span>
+                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm); text-align:right"><RelTime ts=start_ts/></span>
                                 </div>
                             }
                         }).collect();
@@ -364,16 +364,16 @@ fn HoldersTable(detail: PoolDetail) -> impl IntoView {
                     let expires = format_lease_remaining(h.lease_expires_at, now);
                     let lease_class = lease_time_class(h.lease_expires_at, now);
                     let lease_style = match lease_class {
-                        "lease-expired" => "color:var(--error); font-size:11.5px",
-                        "lease-expiring" => "color:var(--warning); font-size:11.5px",
-                        _ => "color:var(--text-muted); font-size:11.5px",
+                        "lease-expired" => "color:var(--error); font-size:var(--fs-sm)",
+                        "lease-expiring" => "color:var(--warning); font-size:var(--fs-sm)",
+                        _ => "color:var(--text-muted); font-size:var(--fs-sm)",
                     };
                     view! {
                         <div class="grid-row grid-row--plain" style=GRID>
-                            <A href=run_href attr:class="grid-cell-mono" attr:style="color:var(--text); font-size:11.5px">{short}</A>
-                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0">{h.step_key}</span>
-                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{h.slots_consumed.to_string()}</span>
-                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{claimed}</span>
+                            <A href=run_href attr:class="grid-cell-mono" attr:style="color:var(--text); font-size:var(--fs-sm)">{short}</A>
+                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0">{h.step_key}</span>
+                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm)">{h.slots_consumed.to_string()}</span>
+                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm)">{claimed}</span>
                             <span class="grid-cell-mono" style=lease_style>{expires}</span>
                         </div>
                     }

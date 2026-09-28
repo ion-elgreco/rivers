@@ -147,7 +147,7 @@ pub fn MaterializeDialog(
         let pks = partition_keys.get();
         let whole = whole_asset_chosen.get();
         let t = tags.get();
-        let (ns, name) = loc.get();
+        let (ns, name) = loc.get_untracked();
         let verb = verb.get();
         async move {
             let tags_opt = if t.is_empty() { None } else { Some(t) };
@@ -205,7 +205,7 @@ pub fn MaterializeDialog(
                 _ => None,
             };
             if let Some(rel) = rel {
-                let (ns, name) = loc.get();
+                let (ns, name) = loc.get_untracked();
                 set_nav_to.set(Some(loc_path(&ns, &name, &rel)));
             }
         }

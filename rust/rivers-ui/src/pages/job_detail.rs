@@ -151,7 +151,7 @@ pub fn JobDetailPage() -> impl IntoView {
         let job_name = name();
         let shown = verb.map(|v| v.name);
         let navigate = navigate.clone();
-        let (ns, lname) = loc.get();
+        let (ns, lname) = loc.get_untracked();
         set_exec_pending.set(true);
         set_exec_error.set(None);
         leptos::task::spawn_local(async move {
@@ -184,7 +184,7 @@ pub fn JobDetailPage() -> impl IntoView {
         }
     });
 
-    let (ns_t, name_t) = loc.get();
+    let (ns_t, name_t) = loc.get_untracked();
     let jobs_href = loc_path(&ns_t, &name_t, "jobs");
     view! {
         <Topbar crumbs=vec![
@@ -263,7 +263,7 @@ pub fn JobDetailPage() -> impl IntoView {
                                         <div class="meta-tile-label">"STATUS"</div>
                                         <div class="meta-tile-value">
                                             {match last_run_status {
-                                                Some(s) => view! { <StatusChip kind=s small=true/> }.into_any(),
+                                                Some(s) => view! { <StatusChip kind=s/> }.into_any(),
                                                 None => view! { <span>"—"</span> }.into_any(),
                                             }}
                                         </div>

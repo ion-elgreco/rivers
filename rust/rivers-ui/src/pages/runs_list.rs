@@ -509,7 +509,7 @@ fn RunRow(
     let run_id = record.run_id.clone();
     let id_for_check = run_id.clone();
     let id_for_toggle = run_id.clone();
-    let (ns, name) = use_current_location().get();
+    let (ns, name) = use_current_location().get_untracked();
     let href = loc_path(&ns, &name, &format!("runs/{}", run_id));
     let short_id = if run_id.len() > 8 {
         run_id[..8].to_string()
@@ -564,7 +564,7 @@ fn RunRow(
             </span>
             <span class="grid-cell-mono">{short_id}</span>
             {launched_cell}
-            <StatusChip kind=st_kind small=true/>
+            <StatusChip kind=st_kind/>
             <AssetStack assets=asset_names/>
             {partition_val
                 .map(|p| view! { <PartitionCell scheme=part_scheme count_label=p.label()/> }.into_any())

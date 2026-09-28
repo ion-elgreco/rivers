@@ -2,9 +2,8 @@
 //! that don't depend on the router (i.e. don't take an `href` they
 //! actually use, or take an explicit no-href branch).
 //!
-//! Covers: `FilterPill`, `FilterPills`, `StatTile` (no-href branch),
-//! `DonutStatCard`, `SummaryCard` (no-href branch), `AlertCard`,
-//! `UnderlineTabs`, `Topbar` (plain crumbs), `EvalTimelineBars`,
+//! Covers: `StatTile` (no-href branch), `DonutStatCard`, `SummaryCard`
+//! (no-href branch), `UnderlineTabs`, `Topbar` (plain crumbs), `EvalTimelineBars`,
 //! `PartitionCell` + `partition_scheme_for`, `DurationCell`,
 //! `LaunchedByCell`.
 
@@ -16,100 +15,13 @@ use common::{click, flush_effects, fresh_mount_target, query_all, query_one};
 use leptos::mount::mount_to;
 use leptos::prelude::*;
 use rivers_ui::components::ui_kit::{
-    AlertCard, AlertSev, Crumb, DonutStatCard, DurationCell, EvalTimelineBars, FilterPill,
-    FilterPills, LaunchedByCell, PartitionCell, Rail, StatTile, SummaryCard, Topbar, UnderlineTabs,
-    partition_scheme_for,
+    Crumb, DonutStatCard, DurationCell, EvalTimelineBars, LaunchedByCell, PartitionCell, Rail,
+    StatTile, SummaryCard, Topbar, UnderlineTabs, partition_scheme_for,
 };
 use rivers_ui::types::LaunchedBy;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_browser);
-
-#[wasm_bindgen_test]
-async fn filter_pill_active_signal_drives_active_class() {
-    let target = fresh_mount_target();
-    let active = RwSignal::new(false);
-    let _handle = mount_to(target.clone(), move || {
-        view! {
-            <FilterPill
-                label="Running"
-                active=Signal::derive(move || active.get())
-                on_click=Callback::new(|_| {})
-            />
-        }
-    });
-
-    let btn = query_one(&target, "button.filter-pill");
-    assert!(!btn.class_name().contains("filter-pill--active"));
-
-    active.set(true);
-    flush_effects().await;
-    let btn = query_one(&target, "button.filter-pill");
-    assert!(btn.class_name().contains("filter-pill--active"));
-}
-
-#[wasm_bindgen_test]
-async fn filter_pill_click_invokes_callback() {
-    let target = fresh_mount_target();
-    let fired = RwSignal::new(0u32);
-    let _handle = mount_to(target.clone(), move || {
-        view! {
-            <FilterPill
-                label="Foo"
-                active=Signal::derive(|| false)
-                on_click=Callback::new(move |_| { fired.update(|n| *n += 1); })
-            />
-        }
-    });
-
-    let btn = query_one(&target, "button.filter-pill");
-    click(&btn, false);
-    flush_effects().await;
-    click(&btn, false);
-    flush_effects().await;
-
-    assert_eq!(fired.get_untracked(), 2);
-}
-
-#[wasm_bindgen_test]
-fn filter_pill_optional_count_renders_count_span() {
-    let target = fresh_mount_target();
-    let _handle = mount_to(target.clone(), || {
-        view! {
-            <FilterPill
-                label="A"
-                count="9"
-                active=Signal::derive(|| false)
-                on_click=Callback::new(|_| {})
-            />
-        }
-    });
-    let cnt = query_one(&target, "button.filter-pill .count");
-    assert_eq!(cnt.text_content().unwrap(), "9");
-}
-
-#[wasm_bindgen_test]
-fn filter_pills_wraps_children_in_filter_pills_container() {
-    let target = fresh_mount_target();
-    let _handle = mount_to(target.clone(), || {
-        view! {
-            <FilterPills>
-                <FilterPill
-                    label="A"
-                    active=Signal::derive(|| false)
-                    on_click=Callback::new(|_| {})
-                />
-                <FilterPill
-                    label="B"
-                    active=Signal::derive(|| true)
-                    on_click=Callback::new(|_| {})
-                />
-            </FilterPills>
-        }
-    });
-
-    assert_eq!(query_all(&target, ".filter-pills .filter-pill").len(), 2);
-}
 
 #[wasm_bindgen_test]
 fn stat_tile_no_href_renders_div_with_label_and_value() {
@@ -195,60 +107,6 @@ fn summary_card_no_href_uses_kind_in_rail_class_and_chip() {
     assert!(chip.text_content().unwrap().contains("failed"));
     let dot = query_one(&target, ".chip .dot");
     assert!(dot.class_name().contains("dot-failed"));
-}
-
-#[wasm_bindgen_test]
-fn alert_card_critical_severity_uses_critical_modifier_classes() {
-    let target = fresh_mount_target();
-    let _handle = mount_to(target.clone(), || {
-        view! {
-            <AlertCard
-                sev=AlertSev::Critical
-                id="ALRT-1"
-                age_ts=0
-                title="Database unreachable"
-            />
-        }
-    });
-    let sev = query_one(&target, ".alert-card-sev");
-    assert!(sev.class_name().contains("alert-card-sev--critical"));
-    assert_eq!(sev.text_content().unwrap(), "critical");
-    let rail = query_one(&target, ".alert-card-rail");
-    assert!(rail.class_name().contains("alert-card-rail--critical"));
-}
-
-#[wasm_bindgen_test]
-fn alert_card_omits_rule_block_when_rule_and_source_absent() {
-    let target = fresh_mount_target();
-    let _handle = mount_to(target.clone(), || {
-        view! {
-            <AlertCard
-                sev=AlertSev::Info
-                id="ALRT-2"
-                age_ts=0
-                title="Heads up"
-            />
-        }
-    });
-    assert_eq!(query_all(&target, ".alert-card-rule").len(), 0);
-}
-
-#[wasm_bindgen_test]
-fn alert_card_renders_rule_block_when_either_field_present() {
-    let target = fresh_mount_target();
-    let _handle = mount_to(target.clone(), || {
-        view! {
-            <AlertCard
-                sev=AlertSev::Warning
-                id="ALRT-3"
-                age_ts=0
-                title="Watch out"
-                rule="freshness < 24h"
-            />
-        }
-    });
-    let rule = query_one(&target, ".alert-card-rule");
-    assert!(rule.text_content().unwrap().contains("freshness < 24h"));
 }
 
 #[wasm_bindgen_test]

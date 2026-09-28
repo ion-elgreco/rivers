@@ -165,7 +165,7 @@ pub fn AutomationPage() -> impl IntoView {
     let tick_detail_loading = RwSignal::new(false);
     let fetch_tick_detail = Action::new(move |tick_id: &String| {
         let id = tick_id.clone();
-        let (ns, name) = loc.get();
+        let (ns, name) = loc.get_untracked();
         async move {
             tick_detail_loading.set(true);
             let result = get_condition_tick_detail(ns, name, id)
@@ -433,11 +433,11 @@ fn render_schedules_table(
                                 <crate::components::icons::IconCopy/>
                             </button>
                         </span>
-                        <span class="grid-cell-mono" style="color:var(--secondary); font-size:11.5px">
+                        <span class="grid-cell-mono" style="color:var(--secondary); font-size:var(--fs-sm)">
                             {job_actions.get(&job_name).map(|v| format!("{job_name} · {v}")).unwrap_or(job_name)}
                         </span>
                         <AutomationState status=status_raw/>
-                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{tick_text}</span>
+                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm)">{tick_text}</span>
                         <span style="display:flex; gap:4px; flex-wrap:wrap">
                             {s.tags.iter().map(|(k, v)| {
                                 view! { <span class="tag">{format!("{k}={v}")}</span> }
@@ -540,8 +540,8 @@ fn render_sensors_table(
                             None => view! { <span class="grid-cell-muted">"—"</span> }.into_any()
                         }}
                         <AutomationState status=status_raw/>
-                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{interval}</span>
-                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0">{asset_selection_str}</span>
+                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm)">{interval}</span>
+                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0">{asset_selection_str}</span>
                         <span style="display:flex; align-items:center; gap:6px; justify-content:flex-end">
                             <button
                                 class="btn"
@@ -680,14 +680,14 @@ fn render_conditions_tab(
                         >{asset_key}</A>
                         <code
                             class="grid-cell-mono"
-                            style="color:var(--text-muted); font-size:11.5px; background:transparent; padding:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0"
+                            style="color:var(--text-muted); font-size:var(--fs-sm); background:transparent; padding:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0"
                             title={condition.clone()}
                         >{condition.clone()}</code>
-                        <span class="grid-cell-mono" style="color:var(--text-comment); font-size:11.5px">
+                        <span class="grid-cell-mono" style="color:var(--text-comment); font-size:var(--fs-sm)">
                             <crate::now::RelTimeOpt ts=last_eval_ts/>
                         </span>
-                        <span class="grid-cell-mono" style=format!("color:{result_color}; font-size:11.5px")>{result_label}</span>
-                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px; text-align:right">{evals_formatted}</span>
+                        <span class="grid-cell-mono" style=format!("color:{result_color}; font-size:var(--fs-sm)")>{result_label}</span>
+                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm); text-align:right">{evals_formatted}</span>
                     </div>
                     <Show when=move || is_expanded.get()>
                         <div class="grid-row-expansion grid-row-expansion--accent">
@@ -763,23 +763,23 @@ fn render_conditions_tab(
                             view! {
                                 <span class="status-dot-row" style="justify-content:flex-end">
                                     <span class="status-dot status-dot--accent"></span>
-                                    <span class="grid-cell-mono" style="color:var(--accent); font-size:11.5px">{fired.to_string()}</span>
+                                    <span class="grid-cell-mono" style="color:var(--accent); font-size:var(--fs-sm)">{fired.to_string()}</span>
                                 </span>
                             }.into_any()
                         } else {
                             view! {
-                                <span class="grid-cell-mono" style="color:var(--text-comment); font-size:11.5px; text-align:right">"—"</span>
+                                <span class="grid-cell-mono" style="color:var(--text-comment); font-size:var(--fs-sm); text-align:right">"—"</span>
                             }.into_any()
                         };
 
                         let runs_cell = if run_ids.is_empty() {
                             if fired > 0 && backfill_ids.is_empty() {
                                 view! {
-                                    <span class="grid-cell-mono" style="color:var(--text-comment); font-size:11.5px" title="No direct runs — expand the row for per-asset detail.">"—"</span>
+                                    <span class="grid-cell-mono" style="color:var(--text-comment); font-size:var(--fs-sm)" title="No direct runs — expand the row for per-asset detail.">"—"</span>
                                 }.into_any()
                             } else {
                                 view! {
-                                    <span class="grid-cell-mono" style="color:var(--text-comment); font-size:11.5px">"—"</span>
+                                    <span class="grid-cell-mono" style="color:var(--text-comment); font-size:var(--fs-sm)">"—"</span>
                                 }.into_any()
                             }
                         } else {
@@ -804,7 +804,7 @@ fn render_conditions_tab(
 
                         let backfills_cell = if backfill_ids.is_empty() {
                             view! {
-                                <span class="grid-cell-mono" style="color:var(--text-comment); font-size:11.5px">"—"</span>
+                                <span class="grid-cell-mono" style="color:var(--text-comment); font-size:var(--fs-sm)">"—"</span>
                             }.into_any()
                         } else {
                             let chips = {
@@ -817,12 +817,11 @@ fn render_conditions_tab(
                                 view! {
                                     <A
                                         href=href
-                                        attr:class="tag"
-                                        attr:style="background:color-mix(in oklab, var(--secondary) 12%, transparent); color:var(--secondary); border:1px solid color-mix(in oklab, var(--secondary) 30%, transparent)"
+                                        attr:class="tag tag--backfill"
                                         attr:title=title
                                         on:click=|ev: leptos::ev::MouseEvent| ev.stop_propagation()
                                     >
-                                        <span style="font-size:9px; letter-spacing:0.04em; margin-right:4px; opacity:0.7">"BF"</span>
+                                        <span class="chip-backfill-prefix">"BF"</span>
                                         {short}
                                     </A>
                                 }
@@ -840,11 +839,11 @@ fn render_conditions_tab(
                                 >
                                     <crate::components::icons::IconChevronRight/>
                                 </span>
-                                <span class="grid-cell-mono" style="color:var(--text); font-size:11.5px">
+                                <span class="grid-cell-mono" style="color:var(--text); font-size:var(--fs-sm)">
                                     <crate::now::RelTime ts=ts_now/>
                                 </span>
-                                <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{dur_label}</span>
-                                <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px; text-align:right">{evaluated.to_string()}</span>
+                                <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm)">{dur_label}</span>
+                                <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm); text-align:right">{evaluated.to_string()}</span>
                                 {fired_cell}
                                 {runs_cell}
                                 {backfills_cell}
@@ -858,11 +857,11 @@ fn render_conditions_tab(
                                         let loc_ns_inner = loc_ns_show.clone();
                                         let loc_name_inner = loc_name_show.clone();
                                         if tick_detail_loading.get() {
-                                            return view! { <span class="text-muted" style="font-size:11.5px">"Loading…"</span> }.into_any();
+                                            return view! { <span class="text-muted" style="font-size:var(--fs-sm)">"Loading…"</span> }.into_any();
                                         }
                                         let detail = tick_detail.get();
                                         if detail.evals.is_empty() {
-                                            return view! { <span class="text-muted" style="font-size:11.5px">"No evaluations found."</span> }.into_any();
+                                            return view! { <span class="text-muted" style="font-size:var(--fs-sm)">"No evaluations found."</span> }.into_any();
                                         }
                                         let fired_evals: Vec<_> = detail.evals.iter().filter(|e| e.fired).cloned().collect();
                                         let total = detail.evals.len();
@@ -882,7 +881,7 @@ fn render_conditions_tab(
                                             <div style="display:flex; flex-direction:column; gap:10px">
                                                 <div style="display:flex; align-items:baseline; gap:10px; flex-wrap:wrap">
                                                     <span class="section-header-label">"PER-ASSET RESULT"</span>
-                                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11px">
+                                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-xs)">
                                                         {format!(
                                                             "{} evaluated · {} requested · {} · {}",
                                                             crate::helpers::plural(total as u64, "condition", "conditions"),
@@ -892,14 +891,14 @@ fn render_conditions_tab(
                                                         )}
                                                     </span>
                                                     {(without_link > 0).then(|| view! {
-                                                        <span class="grid-cell-mono" style="color:var(--warning); font-size:11px">
+                                                        <span class="grid-cell-mono" style="color:var(--warning); font-size:var(--fs-xs)">
                                                             {format!("{without_link} requested but no run/backfill linked")}
                                                         </span>
                                                     })}
                                                 </div>
                                                 {if fired_evals.is_empty() {
                                                     view! {
-                                                        <div class="text-muted" style="font-size:11.5px">
+                                                        <div class="text-muted" style="font-size:var(--fs-sm)">
                                                             "No materializations requested in this tick."
                                                         </div>
                                                     }.into_any()
@@ -931,11 +930,11 @@ fn render_conditions_tab(
                                                                         view! {
                                                                             <A
                                                                                 href=href
-                                                                                attr:class="tag"
-                                                                                attr:style="font-size:10.5px; background:color-mix(in oklab, var(--secondary) 12%, transparent); color:var(--secondary); border:1px solid color-mix(in oklab, var(--secondary) 30%, transparent)"
+                                                                                attr:class="tag tag--backfill"
+                                                                                attr:style="font-size:var(--fs-xs)"
                                                                                 attr:title=title
                                                                             >
-                                                                                <span style="font-size:9px; letter-spacing:0.04em; margin-right:4px; opacity:0.7">"BF"</span>
+                                                                                <span class="chip-backfill-prefix">"BF"</span>
                                                                                 {short}
                                                                             </A>
                                                                         }
@@ -950,7 +949,7 @@ fn render_conditions_tab(
                                                                         let href = loc_path(&lns, &lnm, &format!("runs/{}", rid));
                                                                         let short = short_id(&rid, 8);
                                                                         view! {
-                                                                            <A href=href attr:class="tag" attr:style="font-size:10.5px" attr:title="Run">{short}</A>
+                                                                            <A href=href attr:class="tag" attr:style="font-size:var(--fs-xs)" attr:title="Run">{short}</A>
                                                                         }
                                                                     }).collect::<Vec<_>>();
                                                                     view! {
@@ -958,14 +957,14 @@ fn render_conditions_tab(
                                                                     }.into_any()
                                                                 } else {
                                                                     view! {
-                                                                        <span class="grid-cell-mono" style="color:var(--warning); font-size:10.5px" title="Requested but no run or backfill linked — likely batched elsewhere or dropped">
+                                                                        <span class="grid-cell-mono" style="color:var(--warning); font-size:var(--fs-xs)" title="Requested but no run or backfill linked — likely batched elsewhere or dropped">
                                                                             "no run"
                                                                         </span>
                                                                     }.into_any()
                                                                 };
                                                                 view! {
                                                                     <div style="display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; padding:6px 10px; background:var(--bg-surface); border-radius:3px">
-                                                                        <A href=asset_href attr:class="grid-cell-mono" attr:style="color:var(--accent); font-size:11.5px; font-weight:500">{key}</A>
+                                                                        <A href=asset_href attr:class="grid-cell-mono" attr:style="color:var(--accent); font-size:var(--fs-sm); font-weight:500">{key}</A>
                                                                         {links_view}
                                                                     </div>
                                                                 }

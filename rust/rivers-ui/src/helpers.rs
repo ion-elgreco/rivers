@@ -284,16 +284,6 @@ pub fn tick_status_kind(status: &str) -> &'static str {
     }
 }
 
-/// Map a tick status string to a CSS class suffix.
-pub fn tick_status_class(status: &str) -> &'static str {
-    match status {
-        "Success" | "Requested" => "success",
-        "Failure" => "failure",
-        "Skipped" => "muted",
-        _ => "muted",
-    }
-}
-
 /// Format a nanosecond timestamp as relative time (e.g. "2 hours ago").
 ///
 /// `now` is unix seconds; pass [`crate::now::use_now`]`().get()` from a

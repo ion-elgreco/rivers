@@ -578,7 +578,7 @@ pub fn AssetsListPage() -> impl IntoView {
                             <span class="grid-cell-muted grid-cell-truncate" title=group_title>{if group.is_empty() { "—".into() } else { group }}</span>
                             <span style="display:flex; gap:4px; flex-wrap:wrap">{tags_view}</span>
                             <span class="grid-cell-muted"><RelTimeOpt ts=last_ts/></span>
-                            <StatusChip kind=status_kind small=true/>
+                            <StatusChip kind=status_kind/>
                         </A>
                     }
                 }
@@ -612,7 +612,7 @@ pub fn AssetsListPage() -> impl IntoView {
                             attention.into_iter().map(|r| render_row(r, &info_map, selected, set_selected, &topo, &lns, &lnm)).collect::<Vec<_>>()
                         })}
                         {(!is_collapsed && n_attention > 0 && !healthy.is_empty()).then(|| view! {
-                            <div style="display:flex; align-items:center; gap:10px; padding:12px 20px 6px; font-family:'Inter',sans-serif; font-size:10px; font-weight:500; letter-spacing:0.08em; text-transform:uppercase; color:var(--text-muted)">
+                            <div style="display:flex; align-items:center; gap:10px; padding:12px 20px 6px; font-family:'Inter',sans-serif; font-size:var(--fs-2xs); font-weight:500; letter-spacing:0.08em; text-transform:uppercase; color:var(--text-muted)">
                                 <span>{format!("HEALTHY · {}", healthy.len())}</span>
                                 <span style="flex:1; height:1px; background:var(--bg-highest)"></span>
                             </div>

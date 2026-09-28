@@ -171,7 +171,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                                     }
                                                     let id = rerun_id.clone();
                                                     let navigate = navigate.clone();
-                                                    let (ns, lname) = loc.get();
+                                                    let (ns, lname) = loc.get_untracked();
                                                     rerun_pending.set(true);
                                                     action_error.set(None);
                                                     leptos::task::spawn_local(async move {

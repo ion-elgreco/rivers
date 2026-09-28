@@ -239,7 +239,7 @@ fn BackfillsTable(rows: Vec<BackfillInfo>, locations: Vec<CodeLocationEntry>) ->
 
 #[component]
 fn BackfillRow(record: BackfillInfo, code_location_label: String) -> impl IntoView {
-    let (ns, name) = use_current_location().get();
+    let (ns, name) = use_current_location().get_untracked();
     let href = loc_path(&ns, &name, &format!("backfills/{}", record.backfill_id));
     let short_id = if record.backfill_id.len() > 8 {
         record.backfill_id[..8].to_string()
@@ -271,7 +271,7 @@ fn BackfillRow(record: BackfillInfo, code_location_label: String) -> impl IntoVi
         <A href=href attr:class="grid-row" attr:style=GRID attr:title=created_abs>
             <span class=rail></span>
             <span class="grid-cell-mono">{short_id}</span>
-            <StatusChip kind=st_kind small=true/>
+            <StatusChip kind=st_kind/>
             // A destructive sweep must be identifiable while scanning the list,
             // not only from the detail page.
             <span class="grid-cell-muted" title=record.strategy_code.clone()>

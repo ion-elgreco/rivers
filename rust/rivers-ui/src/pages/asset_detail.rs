@@ -167,7 +167,7 @@ pub fn AssetDetailPage() -> impl IntoView {
     let observe_key = key();
     let observe_action = Action::new(move |_: &()| {
         let k = observe_key.clone();
-        let (ns, lname) = loc.get();
+        let (ns, lname) = loc.get_untracked();
         async move { observe_asset(ns, lname, k).await }
     });
     let observe_pending = observe_action.pending();
@@ -195,7 +195,7 @@ pub fn AssetDetailPage() -> impl IntoView {
 
     let materialize_action = Action::new(move |_: &()| {
         let k = key();
-        let (ns, lname) = loc.get();
+        let (ns, lname) = loc.get_untracked();
         async move { trigger_materialize(ns, lname, Some(vec![k]), None, None).await }
     });
     let materialize_pending = materialize_action.pending();
@@ -206,7 +206,7 @@ pub fn AssetDetailPage() -> impl IntoView {
     let run_asset_action = Action::new(move |verb: &String| {
         let verb = verb.clone();
         let k = key();
-        let (ns, lname) = loc.get();
+        let (ns, lname) = loc.get_untracked();
         async move {
             crate::server_fns::mutations::trigger_action(
                 ns,
@@ -224,7 +224,7 @@ pub fn AssetDetailPage() -> impl IntoView {
     let dialog_verb = RwSignal::new(Option::<crate::types::AssetActionInfo>::None);
     let dialog_destructive = RwSignal::new(false);
 
-    let (ns_t, name_t) = loc.get();
+    let (ns_t, name_t) = loc.get_untracked();
     let assets_href = loc_path(&ns_t, &name_t, "assets");
     view! {
         <Topbar crumbs=vec![
@@ -794,7 +794,7 @@ fn PartitionsTab(
     // resolves which are missing.
     let materialize_missing = Action::new(move |_: &()| {
         let k = mat_key.clone();
-        let (ns, name) = loc.get();
+        let (ns, name) = loc.get_untracked();
         async move { materialize_missing_partitions(ns, name, k).await }
     });
     let mat_pending = materialize_missing.pending();
@@ -805,7 +805,7 @@ fn PartitionsTab(
         if let Some(Ok(res)) = materialize_missing.value().get()
             && !res.backfill_id.is_empty()
         {
-            let (ns, name) = loc.get();
+            let (ns, name) = loc.get_untracked();
             set_mm_nav.set(Some(loc_path(
                 &ns,
                 &name,
@@ -848,7 +848,7 @@ fn PartitionsTab(
                                     {(total_n > PAGE as usize).then(|| {
                                         let off = offset.get() as usize;
                                         view! {
-                                            <span class="stat-inline muted">
+                                            <span class="stat-inline">
                                                 {format!("showing {}–{} of {}", off + 1, off + shown, total_n)}
                                             </span>
                                             <button
@@ -1035,10 +1035,10 @@ fn AutomationTicksTab(asset_key: String, #[prop(into)] refresh_tick: Signal<u32>
                                                 node_ref
                                             }
                                         >
-                                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px"><crate::now::RelTime ts=ts_now/></span>
-                                            <span class="grid-cell-mono" style=format!("color:{result_color}; font-size:11.5px")>{result_label}</span>
-                                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0">{detail_text}</span>
-                                            <span class="grid-cell-mono" style="color:var(--text-comment); font-size:11.5px; text-align:right">{dur_label}</span>
+                                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm)"><crate::now::RelTime ts=ts_now/></span>
+                                            <span class="grid-cell-mono" style=format!("color:{result_color}; font-size:var(--fs-sm)")>{result_label}</span>
+                                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0">{detail_text}</span>
+                                            <span class="grid-cell-mono" style="color:var(--text-comment); font-size:var(--fs-sm); text-align:right">{dur_label}</span>
                                         </div>
                                     }
                                 }).collect::<Vec<_>>()}

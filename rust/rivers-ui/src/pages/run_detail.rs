@@ -797,7 +797,7 @@ pub fn RunAssetDrawer(
     });
     let step_count = asset_step_events.len() as u64;
 
-    let (loc_ns, loc_name) = use_current_location().get();
+    let (loc_ns, loc_name) = use_current_location().get_untracked();
     let asset_href = loc_path(&loc_ns, &loc_name, &format!("assets/{asset_key}"));
     view! {
         <div class="run-asset-drawer">

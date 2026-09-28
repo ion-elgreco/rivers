@@ -117,7 +117,7 @@ pub fn ExecuteJobDialog(
         match result {
             Ok(ExecOutcome::Run(run_id)) if !run_id.is_empty() => {
                 show.set(false);
-                let (ns, name) = loc.get();
+                let (ns, name) = loc.get_untracked();
                 let path = if run_count.get_untracked() <= 1 {
                     loc_path(&ns, &name, &format!("runs/{run_id}"))
                 } else {
@@ -127,7 +127,7 @@ pub fn ExecuteJobDialog(
             }
             Ok(ExecOutcome::Backfill(backfill_id)) if !backfill_id.is_empty() => {
                 show.set(false);
-                let (ns, name) = loc.get();
+                let (ns, name) = loc.get_untracked();
                 nav_to.set(Some(loc_path(
                     &ns,
                     &name,

@@ -220,7 +220,7 @@ pub fn JobsListPage() -> impl IntoView {
                                     };
 
                                     let status_cell = match &last_run {
-                                        Some(r) => view! { <StatusChip kind=run_status_kind(&r.status).to_string() small=true/> }.into_any(),
+                                        Some(r) => view! { <StatusChip kind=run_status_kind(&r.status).to_string()/> }.into_any(),
                                         None => view! { <span class="grid-cell-muted">"—"</span> }.into_any(),
                                     };
                                     let last_run_cell = match last_run.as_ref() {
@@ -241,7 +241,7 @@ pub fn JobsListPage() -> impl IntoView {
                                                             nav_run(&rhref, Default::default());
                                                         }
                                                     >{rid}</span>
-                                                    <span class="grid-cell-muted" style="font-size:10.5px">
+                                                    <span class="grid-cell-muted" style="font-size:var(--fs-xs)">
                                                         <crate::now::RelTime ts=start_ts/>
                                                     </span>
                                                 </span>

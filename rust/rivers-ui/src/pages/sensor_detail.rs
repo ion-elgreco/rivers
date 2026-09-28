@@ -42,7 +42,7 @@ pub fn SensorDetailPage() -> impl IntoView {
 
     let eval_action = Action::new(move |_: &()| {
         let n = name();
-        let (ns, lname) = loc.get();
+        let (ns, lname) = loc.get_untracked();
         async move { evaluate_sensor(ns, lname, n).await }
     });
     let eval_pending = eval_action.pending();
@@ -53,7 +53,7 @@ pub fn SensorDetailPage() -> impl IntoView {
         Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
     );
 
-    let (ns_t, name_t) = loc.get();
+    let (ns_t, name_t) = loc.get_untracked();
     let auto_href = loc_path(&ns_t, &name_t, "automation?tab=sensors");
     view! {
         <Topbar crumbs=vec![
