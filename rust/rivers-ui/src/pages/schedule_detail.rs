@@ -5,7 +5,7 @@ use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 
 use crate::components::live::{LiveStatusChip, use_live_kick};
-use crate::components::ui_kit::{Crumb, TickRunChips, Topbar};
+use crate::components::ui_kit::{Crumb, EvaluateOutcome, TickRunChips, Topbar};
 use crate::helpers::{job_actions_by_name, tick_counts_summary, tick_status_class};
 use crate::loc::{loc_path, use_current_location};
 use crate::now::RelTime;
@@ -71,9 +71,11 @@ pub fn ScheduleDetailPage() -> impl IntoView {
                 on:click=move |_| { eval_action.dispatch(()); }
                 disabled=move || eval_pending.get()
             >
-                {move || if eval_pending.get() { "Evaluating..." } else { "Evaluate Now" }}
+                {move || if eval_pending.get() { "Evaluating..." } else { "Evaluate now" }}
             </button>
         </Topbar>
+
+        {move || eval_action.value().get().map(|result| view! { <EvaluateOutcome result/> })}
 
         <Transition fallback=move || view! { <div class="loading">"Loading..."</div> }>
             {move || {
@@ -84,12 +86,11 @@ pub fn ScheduleDetailPage() -> impl IntoView {
                             let cron_raw = s.cron_schedule.clone();
                             let cron_display = s.cron_description.clone().unwrap_or_else(|| s.cron_schedule.clone());
                             let cron_copy_text = cron_raw.clone();
-                            let cron_title = format!("{} (click to copy)", cron_raw);
 
-                            let cron_for_next = s.cron_schedule.clone();
+                            let cron_for_next = (s.cron_schedule.clone(), s.timezone.clone());
                             let next_tick = Resource::new(
                                 move || cron_for_next.clone(),
-                                |expr| get_next_tick(expr),
+                                |(expr, tz)| get_next_tick(expr, tz),
                             );
 
                             let (lns, lnm) = loc.get();
@@ -138,7 +139,7 @@ pub fn ScheduleDetailPage() -> impl IntoView {
                                     <span class="section-header-label">"CRON"</span>
                                 </div>
                                 <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px">
-                                    <code class="rivers-cron-code" style="font-size:13px; padding:6px 10px" title=cron_title.clone()>{cron_display}</code>
+                                    <code class="rivers-cron-code" style="font-size:13px; padding:6px 10px" title=cron_raw.clone()>{cron_display}</code>
                                     <button
                                         class="icon-btn copyable"
                                         title="Copy cron expression"
@@ -173,7 +174,7 @@ pub fn ScheduleDetailPage() -> impl IntoView {
                             view! { <div class="error-msg">"Schedule not found."</div> }.into_any()
                         }
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
@@ -239,7 +240,7 @@ pub fn ScheduleDetailPage() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>

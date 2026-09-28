@@ -128,7 +128,7 @@ where
                         .into_any()
                     }
                     Err(e) => {
-                        view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any()
+                        view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any()
                     }
                 })
             }}

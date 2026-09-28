@@ -355,4 +355,11 @@
     background: rgba(34, 197, 94, 0.1);
     border-radius: 6px;
 }
+.info-msg {
+    color: var(--text-muted);
+    padding: 1rem;
+    background: var(--bg-surface);
+    border-radius: 6px;
+}
+.eval-outcome { margin-bottom: 1rem; }
 

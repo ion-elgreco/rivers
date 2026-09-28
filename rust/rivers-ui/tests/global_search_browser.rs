@@ -1,9 +1,9 @@
 //! Browser-based component tests for `GlobalSearch`.
 //!
-//! The component renders nothing visible until a Cmd+K / Ctrl+K
-//! keydown lands on the (positioned-offscreen) `.global-search-trigger`
-//! element. These tests synthesize that keystroke to drive the open
-//! flow, then assert on the modal structure. The search index loads
+//! The component renders nothing until a Cmd+K / Ctrl+K keydown reaches
+//! the window. These tests dispatch that keystroke on `document.body` —
+//! where a real keypress lands when nothing has focus — then assert on the
+//! modal structure. The search index loads
 //! via server fns (`get_assets`, `get_jobs`, etc.) which all 404 in
 //! tests — that puts the result list permanently in the empty branch,
 //! which is itself worth pinning.
@@ -34,6 +34,16 @@ fn dispatch_key(target: &Element, key: &str, meta: bool) {
     target.dispatch_event(&ev).unwrap();
 }
 
+fn press_cmd_k() {
+    let body = web_sys::window()
+        .unwrap()
+        .document()
+        .unwrap()
+        .body()
+        .unwrap();
+    dispatch_key(&body, "k", true);
+}
+
 fn mount() -> web_sys::HtmlElement {
     nav_to("/locations/default/demo");
     let target = fresh_mount_target();
@@ -49,12 +59,9 @@ fn mount() -> web_sys::HtmlElement {
 }
 
 #[wasm_bindgen_test]
-fn closed_search_renders_only_the_invisible_trigger() {
+fn closed_search_renders_nothing() {
     let host = mount();
 
-    // The trigger is always present (hidden via inline styles).
-    assert_eq!(query_all(&host, ".global-search-trigger").len(), 1);
-    // No modal yet.
     assert_eq!(query_all(&host, ".search-modal").len(), 0);
 }
 
@@ -62,8 +69,7 @@ fn closed_search_renders_only_the_invisible_trigger() {
 async fn cmd_k_keydown_opens_search_modal_with_input() {
     let host = mount();
 
-    let trigger = query_one(&host, ".global-search-trigger");
-    dispatch_key(&trigger, "k", true);
+    press_cmd_k();
     flush_effects().await;
 
     // Modal is in the DOM, with the input rendered inside it.
@@ -79,8 +85,7 @@ async fn empty_search_index_shows_no_results_branch() {
     // in the `.search-empty` branch rather than the result-list one.
     let host = mount();
 
-    let trigger = query_one(&host, ".global-search-trigger");
-    dispatch_key(&trigger, "k", true);
+    press_cmd_k();
     flush_effects().await;
 
     // Wait an extra tick for `LocalResource` to resolve.
@@ -96,8 +101,7 @@ async fn empty_search_index_shows_no_results_branch() {
 async fn footer_renders_keyboard_hints_when_open() {
     let host = mount();
 
-    let trigger = query_one(&host, ".global-search-trigger");
-    dispatch_key(&trigger, "k", true);
+    press_cmd_k();
     flush_effects().await;
 
     let hints = query_all(&host, ".search-footer-hint");
@@ -112,8 +116,7 @@ async fn footer_renders_keyboard_hints_when_open() {
 async fn escape_keydown_closes_open_search_modal() {
     let host = mount();
 
-    let trigger = query_one(&host, ".global-search-trigger");
-    dispatch_key(&trigger, "k", true);
+    press_cmd_k();
     flush_effects().await;
     assert_eq!(query_all(&host, ".search-modal").len(), 1);
 

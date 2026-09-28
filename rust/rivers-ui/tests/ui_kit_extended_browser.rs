@@ -374,14 +374,16 @@ fn eval_timeline_bars_summary_counts_total_ticks_and_fires() {
 }
 
 #[wasm_bindgen_test]
-fn partition_cell_default_scheme_dot_uses_static_tooltip() {
+fn partition_cell_unknown_scheme_shows_no_badge() {
     let target = fresh_mount_target();
-    let _handle = mount_to(target.clone(), || view! { <PartitionCell /> });
-    let badge = query_one(&target, ".partition-cell-badge");
-    assert_eq!(badge.text_content().unwrap(), "·");
+    let _handle = mount_to(target.clone(), || {
+        view! { <PartitionCell count_label="date=2025-01|region=eu" /> }
+    });
+    assert!(query_all(&target, ".partition-cell-badge").is_empty());
+    let cnt = query_one(&target, ".partition-cell-count");
     assert_eq!(
-        badge.get_attribute("data-tip").unwrap(),
-        "static / no partitioning"
+        cnt.get_attribute("title").unwrap(),
+        "date=2025-01|region=eu"
     );
 }
 

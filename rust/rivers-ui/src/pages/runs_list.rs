@@ -80,7 +80,7 @@ fn wire_bulk_completion(
                     let detail = r
                         .failed
                         .iter()
-                        .map(|(id, e)| format!("{id}: {e}"))
+                        .map(|(id, e)| format!("{id}: {}", crate::helpers::err_text(&e)))
                         .collect::<Vec<_>>()
                         .join("\n");
                     set_last_result.set(Some((
@@ -91,7 +91,7 @@ fn wire_bulk_completion(
                 }
             }
             Err(e) => set_last_result.set(Some((
-                format!("{fail_verb} failed: {e}"),
+                format!("{fail_verb} failed: {}", crate::helpers::err_text(&e)),
                 true,
                 String::new(),
             ))),
@@ -281,7 +281,7 @@ pub fn RunsListPage() -> impl IntoView {
                                 <h1>"Runs"</h1>
                                 <p
                                     class="page-header-summary-error"
-                                    title=format!("Summary fetch failed: {e}")
+                                    title=format!("Summary fetch failed: {}", crate::helpers::err_text(&e))
                                 >
                                     "Summary unavailable — will retry on next update"
                                 </p>

@@ -7,7 +7,7 @@ use leptos_router::components::A;
 
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::TableSkeleton;
-use crate::components::ui_kit::{Crumb, EmptyState, Topbar, UnderlineTabs};
+use crate::components::ui_kit::{Crumb, EmptyState, EvaluateOutcomeShort, Topbar, UnderlineTabs};
 use crate::helpers::{job_actions_by_name, short_id, use_query_param};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::automation::{
@@ -82,9 +82,15 @@ pub fn AutomationPage() -> impl IntoView {
 
     let next_ticks = Resource::new(
         move || {
-            let exprs: Vec<(String, String)> = sched_records()
+            let exprs: Vec<(String, String, String)> = sched_records()
                 .iter()
-                .map(|s| (s.name.clone(), s.cron_schedule.clone()))
+                .map(|s| {
+                    (
+                        s.name.clone(),
+                        s.cron_schedule.clone(),
+                        s.timezone.clone().unwrap_or_default(),
+                    )
+                })
                 .collect();
             (refresh_tick.get(), exprs)
         },
@@ -223,13 +229,13 @@ pub fn AutomationPage() -> impl IntoView {
                     view! {
                         <p>
                             <span class="page-header-num">{n_sched.to_string()}</span>
-                            " schedules"
+                            {if n_sched == 1 { " schedule" } else { " schedules" }}
                             <span class="page-header-sep">"·"</span>
                             <span class="page-header-num">{n_sensors.to_string()}</span>
-                            " sensors"
+                            {if n_sensors == 1 { " sensor" } else { " sensors" }}
                             <span class="page-header-sep">"·"</span>
                             <span class="page-header-num">{n_cond.to_string()}</span>
-                            " declarative conditions"
+                            {if n_cond == 1 { " declarative condition" } else { " declarative conditions" }}
                         </p>
                     }
                 }}
@@ -440,18 +446,7 @@ fn render_schedules_table(
                             >
                                 {move || if eval_pending.get() { "..." } else { "Evaluate" }}
                             </button>
-                            {move || eval_action.value().get().map(|result| match result {
-                                Ok(run_ids) => view! {
-                                    <span class="text-success" style="font-size:11px">
-                                        {format!("{} run(s)", run_ids.len())}
-                                    </span>
-                                }.into_any(),
-                                Err(e) => view! {
-                                    <span class="text-error" style="font-size:11px">
-                                        {format!("{e}")}
-                                    </span>
-                                }.into_any(),
-                            })}
+                            {move || eval_action.value().get().map(|result| view! { <EvaluateOutcomeShort result/> })}
                         </span>
                     </div>
                 }
@@ -555,18 +550,7 @@ fn render_sensors_table(
                             >
                                 {move || if eval_pending.get() { "..." } else { "Evaluate" }}
                             </button>
-                            {move || eval_action.value().get().map(|result| match result {
-                                Ok(run_ids) => view! {
-                                    <span class="text-success" style="font-size:11px">
-                                        {format!("{} run(s)", run_ids.len())}
-                                    </span>
-                                }.into_any(),
-                                Err(e) => view! {
-                                    <span class="text-error" style="font-size:11px">
-                                        {format!("{e}")}
-                                    </span>
-                                }.into_any(),
-                            })}
+                            {move || eval_action.value().get().map(|result| view! { <EvaluateOutcomeShort result/> })}
                         </span>
                     </div>
                 }
@@ -834,7 +818,7 @@ fn render_conditions_tab(
                                 let loc_name_chip = loc_name_iter.clone();
                                 backfill_ids.into_iter().map(move |bid| {
                                 let href = loc_path(&loc_ns_chip, &loc_name_chip, &format!("backfills/{}", bid));
-                                let short = short_id(&bid, 10);
+                                let short = short_id(&bid, 8);
                                 let title = format!("Backfill {bid}");
                                 view! {
                                     <A
@@ -908,12 +892,11 @@ fn render_conditions_tab(
                                                     <span class="section-header-label">"PER-ASSET RESULT"</span>
                                                     <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11px">
                                                         {format!(
-                                                            "{total} conditions evaluated · {} requested · {} run{} · {} backfill{}",
+                                                            "{} evaluated · {} requested · {} · {}",
+                                                            crate::helpers::plural(total as u64, "condition", "conditions"),
                                                             fired_evals.len(),
-                                                            unique_runs,
-                                                            if unique_runs == 1 { "" } else { "s" },
-                                                            unique_backfills,
-                                                            if unique_backfills == 1 { "" } else { "s" },
+                                                            crate::helpers::plural(unique_runs as u64, "run", "runs"),
+                                                            crate::helpers::plural(unique_backfills as u64, "backfill", "backfills"),
                                                         )}
                                                     </span>
                                                     {(without_link > 0).then(|| view! {
@@ -951,7 +934,7 @@ fn render_conditions_tab(
                                                                     let lnm = loc_name_e.clone();
                                                                     let chips = backfill_ids.into_iter().map(move |bid| {
                                                                         let href = loc_path(&lns, &lnm, &format!("backfills/{}", bid));
-                                                                        let short = short_id(&bid, 10);
+                                                                        let short = short_id(&bid, 8);
                                                                         let title = format!("Backfill {bid}");
                                                                         view! {
                                                                             <A

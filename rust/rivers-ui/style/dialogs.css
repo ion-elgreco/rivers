@@ -139,9 +139,29 @@ code {
     font-size: 0.85em;
 }
 
-.copyable { cursor: pointer; }
+.copyable { cursor: pointer; position: relative; }
 
 .copyable:hover { opacity: 0.7; }
+
+/* Set by the document click handler in app.rs; never touches the element's own content. */
+.copyable[data-copied] { opacity: 1; }
+.copyable[data-copied]::after {
+    content: "Copied";
+    position: absolute;
+    left: 50%;
+    bottom: calc(100% + 6px);
+    transform: translateX(-50%);
+    padding: 2px 6px;
+    border-radius: 3px;
+    background: var(--bg-highest);
+    color: var(--text);
+    font: 500 10px/1.4 var(--font-sans);
+    letter-spacing: 0;
+    text-transform: none;
+    white-space: nowrap;
+    pointer-events: none;
+    z-index: 10;
+}
 
 /* === Sidebar nav updates === */
 .sidebar-nav a { font-size: 0.85rem; }
@@ -306,6 +326,8 @@ code {
 .bulk-count { margin-left: auto; color: inherit; }
 .text-muted { color: var(--text-muted); }
 .text-error { color: var(--error); }
+.text-success { color: var(--success); }
+.text-warning { color: var(--warning); }
 
 /* === Sortable columns === */
 th.sortable { cursor: pointer; user-select: none; }
@@ -399,7 +421,8 @@ th.sortable:hover { color: var(--text); }
     align-items: center;
     padding: 1.25rem;
 }
-.modal-header h2 { font-size: 1.125rem; font-weight: 600; }
+/* Beats `.main-content h2`: dialogs render inside main-content. */
+.modal-content .modal-header h2 { margin: 0; font-family: inherit; font-size: 1.125rem; font-weight: 600; }
 .modal-body {
     padding: 1.25rem;
     overflow-y: auto;
@@ -780,7 +803,7 @@ th.sortable:hover { color: var(--text); }
     transition: background 0.1s;
 }
 .search-result-item:hover,
-.search-result-item.active { background: var(--bg-hover); }
+.search-result-item.active { background: var(--bg-hover); color: var(--text); }
 .search-result-category {
     font-size: 0.7rem;
     text-transform: uppercase;
@@ -838,7 +861,7 @@ th.sortable:hover { color: var(--text); }
     color: var(--text-comment);
     padding: 2px 4px;
 }
-.locations-empty--error { color: var(--status-failed, #e06c75); }
+.locations-empty--error { color: var(--error); }
 .locations-groups {
     display: flex;
     flex-direction: column;

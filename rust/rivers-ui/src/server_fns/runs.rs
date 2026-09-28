@@ -206,7 +206,7 @@ pub async fn get_runs_for_asset(
     let runs = state
         .storage
         .for_code_location(&ctx)
-        .get_runs(limit.unwrap_or(1000), None)
+        .get_runs(1000, None)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(runs

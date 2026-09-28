@@ -75,6 +75,7 @@ pub fn JobsListPage() -> impl IntoView {
     let dialog_job_signal: Signal<String> = dialog_job.into();
     let dialog_picker_signal: Signal<JobPartitionPicker> = dialog_picker.into();
     let dialog_verb_signal: Signal<Option<AssetActionInfo>> = dialog_verb.into();
+    let exec_error = RwSignal::new(Option::<String>::None);
 
     view! {
         <Topbar crumbs=vec![Crumb::new("Jobs")]>
@@ -90,6 +91,8 @@ pub fn JobsListPage() -> impl IntoView {
             picker=dialog_picker_signal
             verb=dialog_verb_signal
         />
+
+        {move || exec_error.get().map(|msg| view! { <div class="error-msg" style="margin-bottom: 1rem">{msg}</div> })}
 
         <Transition fallback=move || view! { <div class="loading">"Loading jobs..."</div> }>
             {move || {
@@ -182,15 +185,21 @@ pub fn JobsListPage() -> impl IntoView {
                                             let ns = ns.clone();
                                             let name = name.clone();
                                             set_exec_pending.set(true);
+                                            exec_error.set(None);
                                             leptos::task::spawn_local(async move {
                                                 let path_ns = ns.clone();
                                                 let path_name = name.clone();
-                                                match execute_job(ns, name, n, shown, None, false).await {
+                                                match execute_job(ns, name, n.clone(), shown, None, false).await {
                                                     Ok(result) if !result.run_id.is_empty() => {
                                                         let path = loc_path(&path_ns, &path_name, &format!("runs/{}", result.run_id));
                                                         navigate(&path, Default::default());
                                                     }
-                                                    _ => {
+                                                    Ok(_) => {
+                                                        exec_error.set(Some(format!("Execute {n}: no run id returned.")));
+                                                        set_exec_pending.set(false);
+                                                    }
+                                                    Err(e) => {
+                                                        exec_error.set(Some(format!("Execute {n} failed: {}", crate::helpers::err_text(&e))));
                                                         set_exec_pending.set(false);
                                                     }
                                                 }
@@ -237,7 +246,7 @@ pub fn JobsListPage() -> impl IntoView {
                                                     <span class="grid-cell-muted" title="asset action">{format!(" · {v}")}</span>
                                                 })}
                                             </span>
-                                            <KindBadge kind=executor_type/>
+                                            <KindBadge kind=crate::helpers::executor_label(&executor_type)/>
                                             {if asset_selection.is_empty() {
                                                 view! { <span class="grid-cell-muted">"all"</span> }.into_any()
                                             } else {
@@ -270,7 +279,7 @@ pub fn JobsListPage() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>

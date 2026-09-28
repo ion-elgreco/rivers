@@ -415,7 +415,7 @@ pub fn MaterializeDialog(
                         </div>
 
                         {move || materialize_action.value().get().and_then(|r| r.err()).map(|e| {
-                            view! { <div class="error-msg">{format!("{e}")}</div> }
+                            view! { <div class="error-msg">{crate::helpers::err_text(&e)}</div> }
                         })}
                     </div>
 

@@ -100,25 +100,21 @@ pub fn GlobalSearch() -> impl IntoView {
             .collect::<Vec<_>>()
     };
 
-    view! {
-        // Keyboard shortcut listener (Cmd+K / Ctrl+K)
-        <div
-            class="global-search-trigger"
-            on:keydown=move |ev| {
-                if (ev.meta_key() || ev.ctrl_key()) && ev.key() == "k" {
-                    ev.prevent_default();
-                    set_open.update(|o| *o = !*o);
-                    set_query.set(String::new());
-                    set_selected_idx.set(0);
-                }
-                if ev.key() == "Escape" {
-                    set_open.set(false);
-                }
-            }
-            tabindex="-1"
-            style="position: fixed; top: 0; left: 0; width: 0; height: 0; opacity: 0"
-        ></div>
+    let navigate = leptos_router::hooks::use_navigate();
 
+    let shortcut = window_event_listener(leptos::ev::keydown, move |ev| {
+        if (ev.meta_key() || ev.ctrl_key()) && ev.key() == "k" {
+            ev.prevent_default();
+            set_open.update(|o| *o = !*o);
+            set_query.set(String::new());
+            set_selected_idx.set(0);
+        } else if ev.key() == "Escape" {
+            set_open.set(false);
+        }
+    });
+    on_cleanup(move || shortcut.remove());
+
+    view! {
         <Show when=move || open.get()>
             <div class="modal-overlay search-overlay" on:click=move |_| set_open.set(false)>
                 <div class="search-modal" on:click=move |ev| ev.stop_propagation()>
@@ -133,34 +129,33 @@ pub fn GlobalSearch() -> impl IntoView {
                                 set_query.set(event_target_value(&ev));
                                 set_selected_idx.set(0);
                             }
-                            on:keydown=move |ev| {
-                                let results = filtered();
-                                match ev.key().as_str() {
-                                    "ArrowDown" => {
-                                        ev.prevent_default();
-                                        set_selected_idx.update(|i| {
-                                            if *i + 1 < results.len() { *i += 1; }
-                                        });
-                                    }
-                                    "ArrowUp" => {
-                                        ev.prevent_default();
-                                        set_selected_idx.update(|i| {
-                                            if *i > 0 { *i -= 1; }
-                                        });
-                                    }
-                                    "Enter" => {
-                                        let idx = selected_idx.get();
-                                        if let Some(entry) = results.get(idx) {
-                                            let href = entry.href.clone();
-                                            set_open.set(false);
-                                            let _ = leptos_router::hooks::use_navigate()(
-                                                &href,
-                                                Default::default(),
-                                            );
+                            on:keydown={
+                                let navigate = navigate.clone();
+                                move |ev| {
+                                    let results = filtered();
+                                    match ev.key().as_str() {
+                                        "ArrowDown" => {
+                                            ev.prevent_default();
+                                            set_selected_idx.update(|i| {
+                                                if *i + 1 < results.len() { *i += 1; }
+                                            });
                                         }
+                                        "ArrowUp" => {
+                                            ev.prevent_default();
+                                            set_selected_idx.update(|i| {
+                                                if *i > 0 { *i -= 1; }
+                                            });
+                                        }
+                                        "Enter" => {
+                                            let idx = selected_idx.get();
+                                            if let Some(entry) = results.get(idx) {
+                                                set_open.set(false);
+                                                navigate(&entry.href, Default::default());
+                                            }
+                                        }
+                                        "Escape" => set_open.set(false),
+                                        _ => {}
                                     }
-                                    "Escape" => set_open.set(false),
-                                    _ => {}
                                 }
                             }
                         />

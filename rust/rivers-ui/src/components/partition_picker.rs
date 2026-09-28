@@ -156,7 +156,8 @@ pub fn PartitionPicker(
                     <label>"Partitions"</label>
                     <div class="exec-dialog-partition-hint">
                         {format!(
-                            "{total} dynamic partitions — scroll to browse, search to filter, or jump to a key.",
+                            "{} — scroll to browse, search to filter, or jump to a key.",
+                            crate::helpers::plural(total as u64, "dynamic partition", "dynamic partitions"),
                         )}
                     </div>
                     <VirtualPartitionList
@@ -204,7 +205,7 @@ pub fn PartitionPicker(
                                 <div class="exec-dialog-partition-dim">
                                     <label>{dim_name.clone()}</label>
                                     <div class="exec-dialog-partition-hint">
-                                        {format!("{dim_total} values — scroll, search, or jump.")}
+                                        {format!("{} — scroll, search, or jump.", crate::helpers::plural(dim_total as u64, "value", "values"))}
                                     </div>
                                     <VirtualPartitionList
                                         source=KeySource::Asset { asset_key: ak, dimension: dim_name }
@@ -634,7 +635,7 @@ fn VirtualPartitionList(
                     } else if query.get().is_empty() {
                         format!("{sel} selected · {} total", view_total.get())
                     } else {
-                        format!("{sel} selected · {} matches", view_total.get())
+                        format!("{sel} selected · {}", crate::helpers::plural(view_total.get() as u64, "match", "matches"))
                     }
                 }}
             </span>

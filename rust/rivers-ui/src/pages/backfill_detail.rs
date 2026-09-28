@@ -11,8 +11,7 @@ use crate::components::ui_kit::{
     AssetSummaryRow, Crumb, HeatCell, PartitionHeatmap, StatusChip, Topbar,
 };
 use crate::helpers::{
-    code_location_label, format_call_multiline, format_duration, format_timestamp, run_status_kind,
-    short_id,
+    code_location_label, format_duration, format_timestamp, run_status_kind, short_id,
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::get_assets;
@@ -95,6 +94,15 @@ pub fn BackfillDetailPage() -> impl IntoView {
         async move { cancel_backfill(id).await }
     });
     let cancel_pending = cancel.pending();
+    let action_error = RwSignal::new(Option::<String>::None);
+    Effect::new(move |_| {
+        if let Some(Err(e)) = cancel.value().get() {
+            action_error.set(Some(format!(
+                "Cancel failed: {}",
+                crate::helpers::err_text(&e)
+            )));
+        }
+    });
 
     let live_status = use_live_kick(
         &["backfills", "runs"],
@@ -145,7 +153,10 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                     view! {
                                         <button
                                             class="btn btn-danger"
-                                            on:click=move |_| { cancel.dispatch(cancel_id.clone()); }
+                                            on:click=move |_| {
+                                                action_error.set(None);
+                                                cancel.dispatch(cancel_id.clone());
+                                            }
                                             disabled=move || cancel_pending.get()
                                         >
                                             {move || if cancel_pending.get() { "Canceling..." } else { "Cancel" }}
@@ -174,6 +185,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                                 let navigate = navigate.clone();
                                                 let (ns, lname) = loc.get();
                                                 set_pending.set(true);
+                                                action_error.set(None);
                                                 leptos::task::spawn_local(async move {
                                                     let path_ns = ns.clone();
                                                     let path_name = lname.clone();
@@ -182,7 +194,12 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                                             let path = loc_path(&path_ns, &path_name, &format!("backfills/{}", result.backfill_id));
                                                             navigate(&path, Default::default());
                                                         }
-                                                        _ => {
+                                                        Ok(_) => {
+                                                            action_error.set(Some("Re-execute returned no backfill id.".to_string()));
+                                                            set_pending.set(false);
+                                                        }
+                                                        Err(e) => {
+                                                            action_error.set(Some(format!("Re-execute failed: {}", crate::helpers::err_text(&e))));
                                                             set_pending.set(false);
                                                         }
                                                     }
@@ -199,6 +216,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                         </button>
                                     }
                                 })}
+                                {move || action_error.get().map(|msg| view! { <span class="text-error">{msg}</span> })}
                             </Topbar>
 
                             <div class="backfill-meta-grid">
@@ -212,7 +230,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                 </div>
                                 <div class="backfill-meta-tile">
                                     <div class="backfill-meta-label">"Strategy"</div>
-                                    <div class="backfill-meta-value grid-cell-code">{format_call_multiline(&record.strategy)}</div>
+                                    <div class="backfill-meta-value" title=record.strategy_code.clone()>{record.strategy.clone()}</div>
                                 </div>
                                 <div class="backfill-meta-tile">
                                     <div class="backfill-meta-label">"Launched by"</div>
@@ -242,7 +260,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                 })}
                                 <div class="backfill-meta-tile">
                                     <div class="backfill-meta-label">"Max concurrency"</div>
-                                    <div class="backfill-meta-value">{format!("{} partitions", record.max_concurrency)}</div>
+                                    <div class="backfill-meta-value">{crate::helpers::plural(record.max_concurrency as u64, "partition", "partitions")}</div>
                                 </div>
                                 <div class="backfill-meta-tile">
                                     <div class="backfill-meta-label">"Runs"</div>
@@ -272,7 +290,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                 <div class="detail-item" style="grid-column: 1 / -1">
                                     <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px">
                                         <span class="detail-label">"PROGRESS"</span>
-                                        <span class="font-mono" style="color:var(--text-muted); font-size:11.5px">{format!("{} of {} partitions", completed, total)}</span>
+                                        <span class="font-mono" style="color:var(--text-muted); font-size:11.5px">{format!("{completed} of {}", crate::helpers::plural(total as u64, "partition", "partitions"))}</span>
                                     </div>
                                     <div style="background: var(--bg-highest); border-radius: 4px; height: 10px; overflow: hidden;">
                                         <div style={format!("width: {}%; height: 100%; background: var(--success); border-radius: 4px; transition: width 0.3s;", progress_pct)}></div>
@@ -413,14 +431,14 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                                 </div>
                                             }.into_any()
                                         }
-                                        Err(e) => view! { <div class="error-msg">{format!("Failed to load runs: {e}")}</div> }.into_any(),
+                                        Err(e) => view! { <div class="error-msg">{format!("Failed to load runs: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                                     })
                                 }}
                             </Transition>
                         }.into_any()
                     }
                     Ok(None) => view! { <div class="error-msg">"Backfill not found."</div> }.into_any(),
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>

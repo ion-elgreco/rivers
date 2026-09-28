@@ -115,7 +115,7 @@ pub fn OverviewPage() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
@@ -149,7 +149,11 @@ pub fn OverviewPage() -> impl IntoView {
                         }
                         let n_groups = groups.len();
                         let n_assets = records.len();
-                        let count_label = format!("{n_groups} groups · {n_assets} assets");
+                        let count_label = format!(
+                            "{} · {}",
+                            crate::helpers::plural(n_groups as u64, "group", "groups"),
+                            crate::helpers::plural(n_assets as u64, "asset", "assets"),
+                        );
                         let (ns, name) = loc.get();
                         view! {
                             <SectionHeader label="ASSET HEALTH" count=count_label/>
@@ -188,7 +192,7 @@ pub fn OverviewPage() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>

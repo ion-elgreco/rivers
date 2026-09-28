@@ -22,7 +22,6 @@ ssr = [
     "dep:tonic",
     "dep:clap",
     "dep:anyhow",
-    "dep:croner",
     "dep:cron-descriptor",
     "dep:tracing",
     "dep:tracing-subscriber",
@@ -76,7 +75,6 @@ rivers-api = { path = "../rivers-api", optional = true }
 rivers-k8s = { path = "../rivers-k8s", optional = true }
 tonic = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
-croner = { workspace = true, optional = true }
 cron-descriptor = { version = "0.1", optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }

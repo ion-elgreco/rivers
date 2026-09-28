@@ -309,6 +309,29 @@ pub enum EventType {
     Deletion,
 }
 
+impl EventType {
+    /// Log-style label shown in event tables and tooltips.
+    pub fn label(&self) -> &'static str {
+        match self {
+            EventType::StepStart => "STEP_START",
+            EventType::StepSuccess => "STEP_SUCCESS",
+            EventType::StepFailure => "STEP_FAILURE",
+            EventType::StepRetry => "STEP_RETRY",
+            EventType::Materialization => "MATERIALIZATION",
+            EventType::Observation => "OBSERVATION",
+            EventType::RunQueued => "RUN_QUEUED",
+            EventType::RunDequeued => "RUN_DEQUEUED",
+            EventType::RunLaunchFailed => "RUN_LAUNCH_FAILED",
+            EventType::StepSlotClaimed => "SLOT_CLAIMED",
+            EventType::StepSlotWaiting => "SLOT_WAITING",
+            EventType::StepSlotRenewed => "SLOT_RENEWED",
+            EventType::StepSlotReleased => "SLOT_RELEASED",
+            EventType::ActionCompleted => "ACTION_COMPLETED",
+            EventType::Deletion => "DELETION",
+        }
+    }
+}
+
 /// One row from the events table — drives the run-detail / asset-detail
 /// timelines. Mirrors `rivers_core::storage::EventRecord`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -754,7 +777,11 @@ pub struct BackfillsSummary {
 pub struct BackfillInfo {
     pub backfill_id: String,
     pub status: String,
+    /// Plain-language summary, e.g. "one run per region".
     pub strategy: String,
+    /// The Python API form, shown as a tooltip.
+    #[serde(default)]
+    pub strategy_code: String,
     /// `Some` when the backfill targets a named job (runs use the job's plan +
     /// executor); `None` for an ad-hoc asset-selection backfill.
     #[serde(default)]
@@ -1339,18 +1366,31 @@ mod conversions {
 
     impl From<rivers_core::storage::BackfillRecord> for BackfillInfo {
         fn from(b: rivers_core::storage::BackfillRecord) -> Self {
-            let strategy = match &b.strategy {
-                rivers_core::storage::BackfillStrategy::MultiRun => "MultiRun".to_string(),
-                rivers_core::storage::BackfillStrategy::SingleRun => "SingleRun".to_string(),
+            let (strategy, strategy_code) = match &b.strategy {
+                rivers_core::storage::BackfillStrategy::MultiRun => (
+                    "one run per partition".to_string(),
+                    "multi_run()".to_string(),
+                ),
+                rivers_core::storage::BackfillStrategy::SingleRun => {
+                    ("one run".to_string(), "single_run()".to_string())
+                }
                 rivers_core::storage::BackfillStrategy::PerDimension {
                     multi_run,
                     single_run,
-                } => format!("PerDimension(multi_run={multi_run:?}, single_run={single_run:?})"),
+                } => (
+                    if multi_run.is_empty() {
+                        "one run".to_string()
+                    } else {
+                        format!("one run per {}", multi_run.join(" × "))
+                    },
+                    format!("per_dimension(multi_run={multi_run:?}, single_run={single_run:?})"),
+                ),
             };
             Self {
                 backfill_id: b.backfill_id,
                 status: format!("{:?}", b.status),
                 strategy,
+                strategy_code,
                 job_name: b.job_name,
                 asset_selection: b.asset_selection,
                 total_partitions: b

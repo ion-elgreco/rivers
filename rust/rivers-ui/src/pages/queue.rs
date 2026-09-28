@@ -138,7 +138,7 @@ pub fn QueuePage() -> impl IntoView {
 
                         view! {
                             {top.map(|(label, n)| {
-                                let title = format!("{label} · {n} runs waiting");
+                                let title = format!("{label} · {} waiting", crate::helpers::plural(n as u64, "run", "runs"));
                                 let sub = format!("largest backlog · oldest queued {oldest}");
                                 let warn = n < count / 2;
                                 let suggestion_label: &str = if label.contains("Pool") {
@@ -197,7 +197,7 @@ pub fn QueuePage() -> impl IntoView {
                             <QueueLanes lanes=lanes/>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error loading queue: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error loading queue: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>

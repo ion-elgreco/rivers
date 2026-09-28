@@ -5,8 +5,8 @@ use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 
 use crate::components::live::{LiveStatusChip, use_live_kick};
-use crate::components::ui_kit::{Crumb, TickRunChips, Topbar};
-use crate::helpers::{job_actions_by_name, short_id, tick_counts_summary, tick_status_class};
+use crate::components::ui_kit::{Crumb, EvaluateOutcome, TickRunChips, Topbar};
+use crate::helpers::{job_actions_by_name, tick_counts_summary, tick_status_class};
 use crate::loc::{loc_path, use_current_location};
 use crate::now::RelTime;
 use crate::server_fns::automation::{evaluate_sensor, get_jobs, get_sensors, get_ticks};
@@ -68,31 +68,11 @@ pub fn SensorDetailPage() -> impl IntoView {
                 on:click=move |_| { eval_action.dispatch(()); }
                 disabled=move || eval_pending.get()
             >
-                {move || if eval_pending.get() { "Evaluating..." } else { "Evaluate Now" }}
+                {move || if eval_pending.get() { "Evaluating..." } else { "Evaluate now" }}
             </button>
         </Topbar>
 
-        {move || eval_action.value().get().map(|result| match result {
-            Ok(run_ids) => {
-                if run_ids.is_empty() {
-                    view! { <div class="success-msg" style="margin-bottom: 1rem">"Evaluation completed, no runs created."</div> }.into_any()
-                } else {
-                    view! {
-                        <div class="success-msg" style="margin-bottom: 1rem">
-                            {format!("Evaluation created {} run(s): ", run_ids.len())}
-                            {{
-                                let (lns, lnm) = loc.get();
-                                run_ids.into_iter().map(move |id| {
-                                let href = loc_path(&lns, &lnm, &format!("runs/{}", id));
-                                let short = short_id(&id, 8);
-                                view! { <A href={href} attr:class="tag">{short}</A> }
-                            }).collect::<Vec<_>>()}}
-                        </div>
-                    }.into_any()
-                }
-            }
-            Err(e) => view! { <div class="error-msg" style="margin-bottom: 1rem">{format!("Evaluation failed: {e}")}</div> }.into_any(),
-        })}
+        {move || eval_action.value().get().map(|result| view! { <EvaluateOutcome result/> })}
 
         <Transition fallback=move || view! { <div class="loading">"Loading..."</div> }>
             {move || {
@@ -183,7 +163,7 @@ pub fn SensorDetailPage() -> impl IntoView {
                             view! { <div class="error-msg">"Sensor not found."</div> }.into_any()
                         }
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
@@ -250,7 +230,7 @@ pub fn SensorDetailPage() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>

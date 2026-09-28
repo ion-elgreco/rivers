@@ -301,43 +301,43 @@ pub fn format_relative_time(ts: i64, now: i64) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-/// Format a function-call-style value like `PerDimension(multi_run=["a"], single_run=["b"])`
-/// into a multi-line display form when it has at least two top-level, comma-separated args.
-/// Single-arg or unparenthesized strings are returned unchanged. Brackets inside arguments
-/// are respected (top-level comma split only).
-pub fn format_call_multiline(s: &str) -> String {
-    let Some(open) = s.find('(') else {
-        return s.to_string();
+/// Badge text for a job executor: "InProcess" → "in-process",
+/// "Parallel(4)" → "parallel · 4".
+pub fn executor_label(raw: &str) -> String {
+    let (name, arg) = match raw.split_once('(') {
+        Some((name, rest)) => (name, rest.strip_suffix(')')),
+        None => (raw, None),
     };
-    if !s.ends_with(')') {
-        return s.to_string();
+    match (name, arg) {
+        ("InProcess", _) => "in-process".to_string(),
+        ("Parallel", Some(n)) => format!("parallel · {n}"),
+        ("Parallel", None) => "parallel".to_string(),
+        ("Kubernetes", _) => "kubernetes".to_string(),
+        _ => raw.to_string(),
     }
-    let prefix = &s[..open];
-    let inner = &s[open + 1..s.len() - 1];
-    let mut parts: Vec<&str> = Vec::new();
-    let mut depth: i32 = 0;
-    let mut start = 0usize;
-    for (i, b) in inner.bytes().enumerate() {
-        match b {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b',' if depth == 0 => {
-                parts.push(&inner[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
+}
+
+/// "TimeWindow" → "time window", "Multi" → "multi".
+pub fn partition_kind_label(kind: &str) -> String {
+    match kind {
+        "TimeWindow" => "time window".to_string(),
+        other => other.to_ascii_lowercase(),
     }
-    parts.push(&inner[start..]);
-    if parts.len() < 2 {
-        return s.to_string();
+}
+
+/// "1 run", "3 runs".
+pub fn plural(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Error text for the UI, without server_fn's "error running server
+/// function:" prefix on `ServerFnError::ServerError`.
+pub fn err_text(e: &impl std::fmt::Display) -> String {
+    let s = e.to_string();
+    match s.strip_prefix("error running server function: ") {
+        Some(msg) => msg.to_string(),
+        None => s,
     }
-    let body = parts
-        .iter()
-        .map(|p| format!("  {},", p.trim()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("{prefix}(\n{body}\n)")
 }
 
 /// Truncate an id-like string for compact display. Returns an owned String

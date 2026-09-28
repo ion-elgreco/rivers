@@ -306,16 +306,16 @@ pub fn AssetDetailPage() -> impl IntoView {
                 // RunAction returns once the run is dispatched, not once the
                 // verb has run — don't claim the observation already happened.
                 Ok(_) => view! { <span class="text-success" style="margin-left: 0.5rem">"Observe submitted"</span> }.into_any(),
-                Err(e) => view! { <span class="text-error" style="margin-left: 0.5rem">{format!("{e}")}</span> }.into_any(),
+                Err(e) => view! { <span class="text-error" style="margin-left: 0.5rem">{crate::helpers::err_text(&e)}</span> }.into_any(),
             })}
             {move || run_asset_action.value().get().map(|result| match result {
                 Ok(run_id) => view! { <span class="text-success" style="margin-left: 0.5rem">{format!("Action run {}", crate::helpers::short_id(&run_id, 8))}</span> }.into_any(),
-                Err(e) => view! { <span class="text-error" style="margin-left: 0.5rem">{format!("{e}")}</span> }.into_any(),
+                Err(e) => view! { <span class="text-error" style="margin-left: 0.5rem">{crate::helpers::err_text(&e)}</span> }.into_any(),
             })}
             {move || materialize_action.value().get().map(|result| match result {
                 Ok(ref r) if r.status == "queued" => view! { <span class="text-warning" style="margin-left: 0.5rem">"Queued"</span> }.into_any(),
                 Ok(_) => view! { <span class="text-success" style="margin-left: 0.5rem">"Materialized"</span> }.into_any(),
-                Err(e) => view! { <span class="text-error" style="margin-left: 0.5rem">{format!("{e}")}</span> }.into_any(),
+                Err(e) => view! { <span class="text-error" style="margin-left: 0.5rem">{crate::helpers::err_text(&e)}</span> }.into_any(),
             })}
         </Topbar>
 
@@ -389,7 +389,11 @@ pub fn AssetDetailPage() -> impl IntoView {
                     let partitioned_val = info
                         .as_ref()
                         .and_then(|i| i.partition_def.as_ref())
-                        .map(|pd| format!("{} · {} keys", pd.kind, pd.total_count))
+                        .map(|pd| format!(
+                            "{} · {}",
+                            crate::helpers::partition_kind_label(&pd.kind),
+                            crate::helpers::plural(pd.total_count, "key", "keys"),
+                        ))
                         .unwrap_or_else(|| "no".to_string());
 
                     let code_version = record.code_version.clone().unwrap_or_else(|| "—".to_string());
@@ -508,7 +512,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                                         </div>
                                     }.into_any()
                                 }
-                                Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                                Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                             })
                         }}
                     </Transition>
@@ -523,18 +527,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                                     if runs.is_empty() {
                                         return view! { <div class="empty-state">"No runs for this asset."</div> }.into_any();
                                     }
-                                    let strip: Vec<StripRun> = runs.iter().rev().map(|r| {
-                                        let status = match r.status {
-                                            crate::types::RunStatus::Success => "ok",
-                                            crate::types::RunStatus::Failure => "err",
-                                            crate::types::RunStatus::Started | crate::types::RunStatus::NotStarted | crate::types::RunStatus::Queued => "retry",
-                                            _ => "err",
-                                        };
-                                        let live = matches!(r.status, crate::types::RunStatus::Started);
-                                        let dur = r.end_time.map(|e| (e - r.start_time).max(1) as f64 / 1000.0).unwrap_or(5.0);
-                                        let id = short_id(&r.run_id, 8);
-                                        StripRun { id, status, duration_s: dur, live }
-                                    }).collect();
+                                    let strip = StripRun::from_runs(&runs, runs.len());
                                     view! {
                                         <RecentRunsStrip runs=strip/>
                                         <div class="run-list" style="margin-top:14px">
@@ -579,7 +572,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                                         </div>
                                     }.into_any()
                                 }
-                                Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                                Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                             })
                         }}
                     </Transition>
@@ -617,7 +610,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                                     glyph,
                                     status,
                                     run: Some(e.run_id.clone()),
-                                    label: format!("{:?} · {}", e.event_type, e.run_id),
+                                    label: format!("{} · {}", e.event_type.label(), e.run_id),
                                 })
                             })
                             .take(80)
@@ -661,7 +654,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                                             let time_abs = crate::helpers::nanos_to_datetime(evt.timestamp)
                                                 .map(|d| d.strftime("%Y-%m-%d %H:%M:%S").to_string())
                                                 .unwrap_or_default();
-                                            let type_label = format!("{:?}", evt.event_type);
+                                            let type_label = evt.event_type.label();
                                             let type_cls = event_type_class(&evt.event_type);
                                             let glyph = event_glyph(&evt.event_type);
                                             let mut msg_parts: Vec<String> = Vec::new();
@@ -916,11 +909,17 @@ fn PartitionsTab(
                                         {move || if mat_pending.get() { "Materializing..." } else { "Materialize Missing" }}
                                     </button>
                                 })}
+                                {move || match materialize_missing.value().get() {
+                                    Some(Err(e)) => Some(view! {
+                                        <span class="text-error">{crate::helpers::err_text(&e)}</span>
+                                    }),
+                                    _ => None,
+                                }}
                             </div>
                             <PartitionHeatmap cells=cells labels=heatmap_labels legend=true freshness_gradient=true/>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
@@ -969,7 +968,7 @@ fn AutomationTicksTab(asset_key: String, #[prop(into)] refresh_tick: Signal<u32>
                             view! { <div class="empty-state">"Asset definition not found."</div> }.into_any()
                         }
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
@@ -1102,7 +1101,7 @@ fn AutomationTicksTab(asset_key: String, #[prop(into)] refresh_tick: Signal<u32>
                                                         <span class="detail-label">"Backfill: "</span>
                                                         {backfill_ids.into_iter().map(move |bid| {
                                                             let href = loc_path(&lns, &lnm, &format!("backfills/{}", bid));
-                                                            let short = short_id(&bid, 10);
+                                                            let short = short_id(&bid, 8);
                                                             view! {
                                                                 <A href={href}>
                                                                     <span class="item-row-chip item-row-chip--backfill">
@@ -1139,7 +1138,7 @@ fn AutomationTicksTab(asset_key: String, #[prop(into)] refresh_tick: Signal<u32>
                             }}
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>

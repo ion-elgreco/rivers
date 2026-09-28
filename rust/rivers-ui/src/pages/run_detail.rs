@@ -203,10 +203,47 @@ pub fn RunDetailPage() -> impl IntoView {
     // A deleted run has no page to stay on — back to the list. Ok(false)
     // means the run was already gone, which lands in the same place.
     let navigate = leptos_router::hooks::use_navigate();
+    let navigate_rerun = navigate.clone();
     Effect::new(move |_| {
         if let Some(Ok(_)) = delete.value().get() {
             let (ns, name) = loc.get_untracked();
             navigate(&loc_path(&ns, &name, "runs"), Default::default());
+        }
+    });
+    Effect::new(move |_| {
+        if let Some(Ok(r)) = reexecute.value().get()
+            && !r.run_id.is_empty()
+        {
+            let (ns, name) = loc.get_untracked();
+            navigate_rerun(
+                &loc_path(&ns, &name, &format!("runs/{}", r.run_id)),
+                Default::default(),
+            );
+        }
+    });
+    let action_error = RwSignal::new(Option::<String>::None);
+    Effect::new(move |_| {
+        if let Some(Err(e)) = reexecute.value().get() {
+            action_error.set(Some(format!(
+                "Re-execute failed: {}",
+                crate::helpers::err_text(&e)
+            )));
+        }
+    });
+    Effect::new(move |_| {
+        if let Some(Err(e)) = cancel.value().get() {
+            action_error.set(Some(format!(
+                "Cancel failed: {}",
+                crate::helpers::err_text(&e)
+            )));
+        }
+    });
+    Effect::new(move |_| {
+        if let Some(Err(e)) = delete.value().get() {
+            action_error.set(Some(format!(
+                "Delete failed: {}",
+                crate::helpers::err_text(&e)
+            )));
         }
     });
 
@@ -273,6 +310,7 @@ pub fn RunDetailPage() -> impl IntoView {
                                         );
                                         reexecute_armed.set(armed);
                                         if dispatch {
+                                            action_error.set(None);
                                             reexecute.dispatch(rerun_run_id.clone());
                                         }
                                     }
@@ -294,7 +332,10 @@ pub fn RunDetailPage() -> impl IntoView {
                                     view! {
                                         <button
                                             class="btn btn-danger"
-                                            on:click=move |_| { cancel.dispatch(cancel_id.clone()); }
+                                            on:click=move |_| {
+                                                action_error.set(None);
+                                                cancel.dispatch(cancel_id.clone());
+                                            }
                                             disabled=move || cancel_pending.get()
                                         >
                                             <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
@@ -313,6 +354,7 @@ pub fn RunDetailPage() -> impl IntoView {
                                             on:click=move |_| {
                                                 if delete_armed.get() {
                                                     delete_armed.set(false);
+                                                    action_error.set(None);
                                                     delete.dispatch(delete_id.clone());
                                                 } else {
                                                     delete_armed.set(true);
@@ -338,6 +380,7 @@ pub fn RunDetailPage() -> impl IntoView {
                                         </button>
                                     }
                                 })}
+                                {move || action_error.get().map(|msg| view! { <span class="text-error">{msg}</span> })}
                             </Topbar>
 
                             <div class="run-header-block">
@@ -401,7 +444,7 @@ pub fn RunDetailPage() -> impl IntoView {
                         }.into_any()
                     }
                     Ok(None) => view! { <div class="error-msg">"Run not found."</div> }.into_any(),
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
@@ -1188,26 +1231,6 @@ fn format_log_timestamp(ts: i64) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn event_type_label(evt: &StoredEvent) -> &'static str {
-    match evt.event_type {
-        EventType::StepStart => "STEP_START",
-        EventType::StepSuccess => "STEP_SUCCESS",
-        EventType::StepFailure => "STEP_FAILURE",
-        EventType::StepRetry => "STEP_RETRY",
-        EventType::Materialization => "MATERIALIZATION",
-        EventType::Observation => "OBSERVATION",
-        EventType::RunQueued => "RUN_QUEUED",
-        EventType::RunDequeued => "RUN_DEQUEUED",
-        EventType::RunLaunchFailed => "RUN_LAUNCH_FAILED",
-        EventType::StepSlotClaimed => "SLOT_CLAIMED",
-        EventType::StepSlotWaiting => "SLOT_WAITING",
-        EventType::StepSlotRenewed => "SLOT_RENEWED",
-        EventType::StepSlotReleased => "SLOT_RELEASED",
-        EventType::ActionCompleted => "ACTION_COMPLETED",
-        EventType::Deletion => "DELETION",
-    }
-}
-
 fn event_row_class(evt: &StoredEvent) -> &'static str {
     match evt.event_type {
         EventType::StepStart => "log-row--info",
@@ -1679,7 +1702,7 @@ fn RunLogPanel(
                         let row_class = event_row_class(&evt);
                         let ts = format_log_timestamp(evt.timestamp);
                         let asset = evt.asset_key.clone().unwrap_or_default();
-                        let etype = event_type_label(&evt);
+                        let etype = evt.event_type.label();
                         let info = event_info(&evt);
                         view! {
                             <div class=format!("log-event-row {row_class}")>

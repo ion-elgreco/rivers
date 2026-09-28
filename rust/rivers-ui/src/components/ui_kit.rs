@@ -867,7 +867,7 @@ pub fn ConditionReplay(
                             <div class="cond-replay-head">
                                 <span class="section-header-label">{format!("CONDITION REPLAY · LAST {minutes} MIN")}</span>
                                 <span class="cond-replay-hint">
-                                    {recent.len().to_string()} " ticks · click a cell to inspect"
+                                    {crate::helpers::plural(recent.len() as u64, "tick", "ticks")} " · click a cell to inspect"
                                 </span>
                             </div>
                             <div class="cond-tracks">{tracks}</div>
@@ -946,12 +946,12 @@ pub fn EvalTimelineBars(
                 <span class="eval-timeline-stats">
                     <span class="eval-timeline-stat">
                         <span class="eval-timeline-stat-num">{total_ticks.to_string()}</span>
-                        " ticks"
+                        {if total_ticks == 1 { " tick" } else { " ticks" }}
                     </span>
                     <span class="eval-timeline-sep">"·"</span>
                     <span class="eval-timeline-stat">
                         <span class="eval-timeline-stat-num" style="color:var(--accent)">{fire_count.to_string()}</span>
-                        " fires"
+                        {if fire_count == 1 { " fire" } else { " fires" }}
                     </span>
                     <span class="eval-timeline-sep">"·"</span>
                     <span class="eval-timeline-stat">
@@ -1058,9 +1058,33 @@ pub fn LineageMini(
 #[derive(Clone, Debug)]
 pub struct StripRun {
     pub id: String,
-    pub status: &'static str, // "ok" | "err" | "retry"
-    pub duration_s: f64,
-    pub live: bool,
+    /// Chip vocabulary from `run_status_kind`.
+    pub kind: &'static str,
+    /// `None` until the run has an end time.
+    pub duration_s: Option<f64>,
+}
+
+impl StripRun {
+    /// Bars for the newest `n` of `runs` (newest first), oldest on the left.
+    pub fn from_runs(runs: &[crate::types::RunRecord], n: usize) -> Vec<StripRun> {
+        runs.iter()
+            .take(n)
+            .rev()
+            .map(|r| StripRun {
+                id: crate::helpers::short_id(&r.run_id, 8),
+                kind: crate::helpers::run_status_kind(&r.status),
+                duration_s: r.end_time.map(|e| (e - r.start_time).max(0) as f64 / 1e9),
+            })
+            .collect()
+    }
+}
+
+fn format_strip_secs(s: f64) -> String {
+    if s < 60.0 {
+        format!("{s:.1}s")
+    } else {
+        crate::helpers::format_seconds(s as i64)
+    }
 }
 
 #[component]
@@ -1079,46 +1103,32 @@ pub fn RecentRunsStrip(
         }
         .into_any();
     }
-    let max = runs
-        .iter()
-        .map(|r| r.duration_s)
-        .fold(0.0_f64, f64::max)
-        .max(1.0);
-    let avg = runs.iter().map(|r| r.duration_s).sum::<f64>() / runs.len() as f64;
-    let ok_count = runs.iter().filter(|r| r.status == "ok").count();
-    let err_count = runs.iter().filter(|r| r.status == "err").count();
-    let avg_offset = (1.0 - (avg / max)) * 60.0 + 8.0;
+    let finished: Vec<f64> = runs.iter().filter_map(|r| r.duration_s).collect();
+    let max = finished.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+    let avg = (!finished.is_empty()).then(|| finished.iter().sum::<f64>() / finished.len() as f64);
+    let ok_count = runs.iter().filter(|r| r.kind == "success").count();
+    let err_count = runs.iter().filter(|r| r.kind == "failed").count();
 
     let bars = runs
         .iter()
         .map(|r| {
-            let h = (r.duration_s / max * 60.0).max(8.0);
-            let cls = match r.status {
-                "err" => "runs-strip-bar runs-strip-bar--err",
-                "retry" => "runs-strip-bar runs-strip-bar--retry",
-                _ => "runs-strip-bar runs-strip-bar--ok",
+            let h = r.duration_s.map_or(8.0, |d| (d / max * 60.0).max(8.0));
+            let cls = match r.kind {
+                "success" => "runs-strip-bar runs-strip-bar--ok",
+                "failed" => "runs-strip-bar runs-strip-bar--err",
+                "canceled" => "runs-strip-bar runs-strip-bar--canceled",
+                "running" => "runs-strip-bar runs-strip-bar--retry runs-strip-bar--live",
+                _ => "runs-strip-bar runs-strip-bar--retry",
             };
-            let cls = if r.live {
-                format!("{cls} runs-strip-bar--live")
-            } else {
-                cls.to_string()
-            };
-            let x_marker = (r.status == "err").then(|| {
+            let x_marker = (r.kind == "failed").then(|| {
                 view! {
                     <span class="runs-strip-bar-x">"✕"</span>
                 }
             });
-            // Rivers tooltip: "run · status · Xs · [live]"
-            let status_label = match r.status {
-                "err" => "failed",
-                "retry" => "retry",
-                _ => "ok",
+            let tip = match r.duration_s {
+                Some(d) => format!("{} · {} · {}", r.id, r.kind, format_strip_secs(d)),
+                None => format!("{} · {}", r.id, r.kind),
             };
-            let live_suffix = if r.live { " · live" } else { "" };
-            let tip = format!(
-                "{} · {} · {:.1}s{}",
-                r.id, status_label, r.duration_s, live_suffix
-            );
             view! {
                 <div class=cls style=format!("height:{h:.0}px") title=tip>
                     {x_marker}
@@ -1132,13 +1142,16 @@ pub fn RecentRunsStrip(
             <div class="runs-strip-head">
                 <span class="section-header-label">{label}</span>
                 <div class="stats">
-                    <span>"avg " {format!("{:.1}s", avg)}</span>
+                    <span>"avg " {avg.map_or_else(|| "—".to_string(), format_strip_secs)}</span>
                     <span style="color:var(--success)">"✓ " {ok_count}</span>
                     <span style="color:var(--error)">"✕ " {err_count}</span>
                 </div>
             </div>
             <div class="runs-strip-bars">
-                <span class="runs-strip-avg" style=format!("top:{avg_offset:.1}px")></span>
+                {avg.map(|a| {
+                    let offset = (1.0 - (a / max)) * 60.0 + 8.0;
+                    view! { <span class="runs-strip-avg" style=format!("top:{offset:.1}px")></span> }
+                })}
                 {bars}
             </div>
         </div>
@@ -1555,24 +1568,26 @@ pub fn AssetStack(
 ///
 /// Scheme is derived from the partition key format: a hyphenated ISO date like
 /// `2025-04-19` → `D` (daily), an ISO datetime like `2025-04-19T14` → `H`
-/// (hourly), and anything else → `·` (custom/static).
+/// (hourly). Any other scheme shows no badge.
 #[component]
 pub fn PartitionCell(
-    /// 'D' daily, 'H' hourly, '·' static/no partitioning.
+    /// 'D' daily, 'H' hourly; anything else hides the badge.
     #[prop(into, default = "·".to_string())]
     scheme: String,
     #[prop(optional, into)] count_label: Option<String>,
 ) -> impl IntoView {
     let tip = match scheme.as_str() {
-        "D" => "daily partition",
-        "H" => "hourly partition",
-        _ => "static / no partitioning",
-    }
-    .to_string();
+        "D" => Some("daily partition"),
+        "H" => Some("hourly partition"),
+        _ => None,
+    };
     view! {
         <span class="partition-cell">
-            <span class="partition-cell-badge" data-tip=tip>{scheme}</span>
-            {count_label.map(|c| view! { <span class="partition-cell-count">{c}</span> })}
+            {tip.map(|t| view! { <span class="partition-cell-badge" data-tip=t>{scheme}</span> })}
+            {count_label.map(|c| {
+                let tip = c.clone();
+                view! { <span class="partition-cell-count" title=tip>{c}</span> }
+            })}
         </span>
     }
 }
@@ -1695,7 +1710,7 @@ pub fn TickRunChips(run_ids: Vec<String>, backfill_ids: Vec<String>) -> impl Int
             <span style="display:flex; flex-wrap:wrap; gap:4px">
                 {backfill_ids.into_iter().map(move |bid| {
                     let href = crate::loc::loc_path(&lns_b, &lnm_b, &format!("backfills/{}", bid));
-                    let short = crate::helpers::short_id(&bid, 10);
+                    let short = crate::helpers::short_id(&bid, 8);
                     let title = format!("Backfill {bid}");
                     view! {
                         <A
@@ -1974,9 +1989,9 @@ pub fn DeployCard(
 ) -> impl IntoView {
     let status_chip = status_label.map(|text| {
         let dot_cls = if status_ok {
-            "dot dot-healthy"
+            "dot dot-success"
         } else {
-            "dot dot-warn"
+            "dot dot-stale"
         };
         view! {
             <span class="chip">
@@ -2040,7 +2055,7 @@ pub fn AttentionBanner(
         <div class="attention-banner">
             <span class="attention-banner-dot"></span>
             <span class="attention-banner-msg">
-                <strong>{count}</strong> " " {plural} " need" {(count != 1).then_some("")} " attention"
+                <strong>{count}</strong> " " {plural} {if count == 1 { " needs" } else { " need" }} " attention"
             </span>
             {breakdown.map(|b| view! { <span class="attention-banner-sub">{b}</span> })}
             {toggle_view.map(|t| view! { <span class="attention-banner-spacer"></span> {t} })}
@@ -2494,4 +2509,68 @@ pub fn EventGlyphTimeline(
             </Show>
         </div>
     }
+}
+
+type EvaluateOutcomeResult = Result<crate::server_fns::automation::EvaluateResult, ServerFnError>;
+
+/// Result of an on-demand schedule or sensor tick, shown under the top bar.
+#[component]
+pub fn EvaluateOutcome(result: EvaluateOutcomeResult) -> impl IntoView {
+    let loc = crate::loc::use_current_location();
+    match result {
+        Err(e) => view! {
+            <div class="error-msg eval-outcome">
+                {format!("Evaluation failed: {}", crate::helpers::err_text(&e))}
+            </div>
+        }
+        .into_any(),
+        Ok(r) if r.run_ids.is_empty() => {
+            let text = match r.skip_reason {
+                Some(reason) => format!("Skipped: {reason}"),
+                None => "Evaluated. No runs requested.".to_string(),
+            };
+            view! { <div class="info-msg eval-outcome">{text}</div> }.into_any()
+        }
+        Ok(r) => {
+            let (ns, name) = loc.get();
+            let count = crate::helpers::plural(r.run_ids.len() as u64, "run", "runs");
+            let links = r
+                .run_ids
+                .into_iter()
+                .map(|id| {
+                    let href = crate::loc::loc_path(&ns, &name, &format!("runs/{id}"));
+                    let label = crate::helpers::short_id(&id, 8);
+                    view! { <A href=href attr:class="tag">{label}</A> }
+                })
+                .collect::<Vec<_>>();
+            view! {
+                <div class="success-msg eval-outcome">
+                    {format!("Evaluation requested {count}: ")}
+                    {links}
+                </div>
+            }
+            .into_any()
+        }
+    }
+}
+
+/// One-line Evaluate outcome for a table row.
+#[component]
+pub fn EvaluateOutcomeShort(result: EvaluateOutcomeResult) -> impl IntoView {
+    let (text, cls, tip) = match result {
+        Err(e) => {
+            let msg = crate::helpers::err_text(&e);
+            ("failed".to_string(), "text-error", msg)
+        }
+        Ok(r) if r.run_ids.is_empty() => match r.skip_reason {
+            Some(reason) => ("skipped".to_string(), "text-muted", reason),
+            None => ("no runs".to_string(), "text-muted", String::new()),
+        },
+        Ok(r) => (
+            crate::helpers::plural(r.run_ids.len() as u64, "run", "runs"),
+            "text-success",
+            String::new(),
+        ),
+    };
+    view! { <span class=cls style="font-size:11px" title=tip>{text}</span> }
 }

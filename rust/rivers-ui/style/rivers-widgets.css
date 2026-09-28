@@ -443,6 +443,7 @@
 .heatmap-info-state--running { color: var(--secondary); }
 .heatmap-info-state--failed { color: var(--error); }
 .heatmap-info-state--pending { color: var(--text-muted); }
+.heatmap-info-state--canceled { color: var(--warning); }
 
 /* ── Rivers: LineageMini SVG block ── */
 .lineage-mini-wrap {
@@ -501,6 +502,7 @@
 .runs-strip-bar--ok    { background: var(--success); opacity: 0.9; }
 .runs-strip-bar--err   { background: var(--error); opacity: 0.7; }
 .runs-strip-bar--retry { background: var(--warning); opacity: 0.55; }
+.runs-strip-bar--canceled { background: var(--text-muted); opacity: 0.4; }
 .runs-strip-bar--live  { animation: pulse-op 1.4s ease-in-out infinite; }
 .runs-strip-bar-x {
     position: absolute;
@@ -1079,6 +1081,8 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
+    min-width: 0;
+    max-width: 100%;
     font-family: var(--font-mono);
     font-size: 11px;
     color: var(--text-muted);
@@ -1094,6 +1098,12 @@
     color: var(--text);
     font-size: 9.5px;
     font-weight: 600;
+}
+.partition-cell-count {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 .partition-cell-count strong { color: var(--text); font-weight: 500; }
 
@@ -1224,7 +1234,7 @@
     flex-shrink: 0;
 }
 .dag-legend-dot--success { background: var(--success); }
-.dag-legend-dot--running { background: var(--running, #60a5fa); box-shadow: 0 0 6px rgba(96, 165, 250, 0.5); }
+.dag-legend-dot--running { background: var(--secondary); box-shadow: 0 0 6px var(--secondary); }
 .dag-legend-dot--stale { background: var(--text-muted); opacity: 0.55; }
 .dag-legend-dot--external { background: transparent; border: 1px solid var(--text-muted); }
 
@@ -1354,8 +1364,8 @@
 }
 
 /* ── Rivers: tooltip styling on truncated code/text ── */
-[title] code,
-[title] .grid-cell-mono {
+code[title],
+.grid-cell-mono[title] {
     text-decoration-style: dotted;
     text-decoration-line: underline;
     text-decoration-color: var(--text-muted);
@@ -1580,6 +1590,10 @@
     cursor: pointer;
 }
 .grid-row:hover { background: var(--bg-hover); }
+/* Grid items default to min-width: auto, so one long cell would widen its
+   column in that row only and push the row out of line with the header. */
+.grid-row > *,
+.grid-table-head > * { min-width: 0; }
 .grid-row-rail {
     position: absolute;
     left: 0;
@@ -1612,8 +1626,12 @@
     overflow-wrap: anywhere;
     word-break: break-word;
 }
-/* Preserve newlines for code-like rendered strings (e.g. formatted strategy values) */
-.grid-cell-code { white-space: pre-wrap; }
+/* For identifiers: one line with an ellipsis instead of a break mid-word. */
+.grid-cell-truncate {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 
 /* ── Rivers: Underline tab bar (replaces standard tab-bar) ── */
 .tabs-underline {
@@ -1979,7 +1997,7 @@
     font-size: 11.5px;
     text-decoration: none;
 }
-.sensor-job-link:hover { filter: brightness(1.15); }
+.sensor-job-link:hover { color: var(--secondary); filter: brightness(1.15); }
 
 /* Non-linkable grid-row variant (used when the row itself is clickable via on:click) */
 .grid-row.grid-row--static { cursor: pointer; }

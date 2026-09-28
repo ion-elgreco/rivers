@@ -176,9 +176,11 @@
 
 /* Backfill-flavored chip: secondary-tinted background + border, with a "BF"
    prefix. Used wherever a backfill id appears inline as a chip/tag (schedule
-   & sensor tick history, asset-detail automation ticks). */
-.tag--backfill,
-.item-row-chip--backfill {
+   & sensor tick history, asset-detail automation ticks). The class is doubled
+   because .tag and .item-row-chip load later and would win at equal weight. */
+.tag.tag--backfill,
+.item-row-chip.item-row-chip--backfill,
+.item-row-chip.item-row-chip--backfill:hover {
     background: color-mix(in oklab, var(--secondary) 12%, transparent);
     color: var(--secondary);
     border: 1px solid color-mix(in oklab, var(--secondary) 30%, transparent);

@@ -74,7 +74,8 @@ td input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
 .run-row--success .run-row-bar { background: var(--success); }
 .run-row--failure .run-row-bar { background: var(--error); }
 .run-row--running .run-row-bar { background: var(--info); animation: bar-pulse 2s ease-in-out infinite; }
-.run-row--queued .run-row-bar { background: var(--text-muted); }
+.run-row--queued .run-row-bar,
+.run-row--pending .run-row-bar { background: var(--text-muted); }
 .run-row--canceled .run-row-bar { background: var(--warning); }
 
 @keyframes bar-pulse {
@@ -147,7 +148,8 @@ td input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
 .run-row-status--success { color: var(--success); }
 .run-row-status--failure { color: var(--error); }
 .run-row-status--running { color: var(--info); }
-.run-row-status--queued { color: var(--text-muted); }
+.run-row-status--queued,
+.run-row-status--pending { color: var(--text-muted); }
 .run-row-status--canceled { color: var(--warning); }
 
 /* Meta items (created, duration) */

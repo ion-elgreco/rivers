@@ -25,6 +25,7 @@
 
     /* Secondary — flowing cyan */
     --secondary: #50e1f9;
+    --secondary-dim: rgba(80, 225, 249, 0.35);
 
     /* Semantic (Rivers palette) */
     --success: #7dd67a;
@@ -107,11 +108,15 @@ html, body {
     color: var(--text);
     min-height: 100vh;
     font-size: 14px;
+    color-scheme: dark;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
     font-feature-settings: "ss01", "cv11";
 }
+
+/* Form controls default to the UA font, not the page font. */
+button, input, select, textarea { font-family: inherit; }
 
 .layout {
     display: flex;

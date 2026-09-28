@@ -344,10 +344,10 @@ pub fn AssetsListPage() -> impl IntoView {
                         view! {
                             <p>
                                 <span class="page-header-num">{total.to_string()}</span>
-                                " assets"
+                                {if total == 1 { " asset" } else { " assets" }}
                                 <span class="page-header-sep">"·"</span>
                                 <span class="page-header-num">{groups.to_string()}</span>
-                                " groups"
+                                {if groups == 1 { " group" } else { " groups" }}
                                 <span class="page-header-sep">"·"</span>
                                 <span class="page-header-num page-header-num--warning">{stale.to_string()}</span>
                                 " stale"
@@ -490,6 +490,7 @@ pub fn AssetsListPage() -> impl IntoView {
                     let kinds_str = record.kinds.join(", ");
                     let kinds_for_badge = record.kinds.first().cloned().unwrap_or_else(|| "—".into());
                     let group = record.asset_group.clone().unwrap_or_default();
+                    let group_title = group.clone();
                     let tags_view: Vec<_> = record.tags.iter().take(3).map(|t| view! { <Tag label=t.clone()/> }).collect();
                     // Snapshot once per row render for the fallback dim_value;
                     // the live-tick path is the explicit `<RelTime>` cell,
@@ -619,7 +620,7 @@ pub fn AssetsListPage() -> impl IntoView {
                             <span class="grid-cell-mono" title=kinds_str.clone()>{key.clone()}</span>
                             <KindBadge kind=kinds_for_badge/>
                             <span class="grid-cell-muted">{if asset_type.is_empty() { "—".into() } else { asset_type }}</span>
-                            <span class="grid-cell-muted">{if group.is_empty() { "—".into() } else { group }}</span>
+                            <span class="grid-cell-muted grid-cell-truncate" title=group_title>{if group.is_empty() { "—".into() } else { group }}</span>
                             <span style="display:flex; gap:4px; flex-wrap:wrap">{tags_view}</span>
                             <span class="grid-cell-muted" style=format!("color:{dim_color}; font-family:'JetBrains Mono',monospace; font-size:11.5px")>
                                 {dim_value}

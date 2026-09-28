@@ -673,7 +673,7 @@ pub fn GraphPage() -> impl IntoView {
                                     />
                                 }.into_any()
                             }
-                            Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                            Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                         })
                     }}
 
@@ -816,7 +816,7 @@ pub fn GraphPage() -> impl IntoView {
 
                             {(n_skipped > 0).then(|| view! {
                                 <div class="dag-sidebar-empty">
-                                    {format!("{n_skipped} task node(s) can't be materialized directly")}
+                                    {format!("{} can't be materialized directly", crate::helpers::plural(n_skipped as u64, "task node", "task nodes"))}
                                 </div>
                             })}
 
@@ -832,7 +832,7 @@ pub fn GraphPage() -> impl IntoView {
                                     <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
                                         <path d="M3 2l7 4-7 4V2z"/>
                                     </svg>
-                                    {format!("Materialize {n_mat} assets…")}
+                                    {format!("Materialize {}…", crate::helpers::plural(n_mat as u64, "asset", "assets"))}
                                 </button>
                                 {common_actions(&mat_keys, &asset_info_by_key.get()).into_iter().map(|act| {
                                     let destructive = act.is_destructive();
@@ -996,7 +996,7 @@ pub fn GraphPage() -> impl IntoView {
                                             }.into_any()
                                         }
                                         Ok(None) => view! { <p class="dag-sidebar-empty">"No data available."</p> }.into_any(),
-                                        Err(e) => view! { <div class="error-msg">{format!("{e}")}</div> }.into_any(),
+                                        Err(e) => view! { <div class="error-msg">{crate::helpers::err_text(&e)}</div> }.into_any(),
                                     })
                                 }}
                             </Transition>

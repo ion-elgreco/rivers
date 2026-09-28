@@ -33,6 +33,16 @@ fn dispatch_key(target: &Element, key: &str, meta: bool) {
     target.dispatch_event(&ev).unwrap();
 }
 
+fn press_cmd_k() {
+    let body = web_sys::window()
+        .unwrap()
+        .document()
+        .unwrap()
+        .body()
+        .unwrap();
+    dispatch_key(&body, "k", true);
+}
+
 /// Wait up to ~2s for `pred` to become true, yielding to the macrotask
 /// queue between checks. The `LocalResource` chain that powers the
 /// search index resolves asynchronously across multiple ticks.
@@ -152,8 +162,7 @@ async fn populated_search_index_renders_one_result_row_per_entry() {
     flush_effects().await;
 
     // Open via Cmd+K and wait for the search index to load.
-    let trigger = query_one(&target, ".global-search-trigger");
-    dispatch_key(&trigger, "k", true);
+    press_cmd_k();
     flush_effects().await;
 
     let loaded = wait_until(|| {
@@ -214,7 +223,7 @@ async fn search_input_filters_results_by_label_substring() {
     .forget();
     flush_effects().await;
 
-    dispatch_key(&query_one(&target, ".global-search-trigger"), "k", true);
+    press_cmd_k();
     flush_effects().await;
 
     // Wait for the unfiltered list to load (3 entries).
@@ -263,7 +272,7 @@ async fn arrow_keys_move_active_result_marker() {
     })
     .forget();
     flush_effects().await;
-    dispatch_key(&query_one(&target, ".global-search-trigger"), "k", true);
+    press_cmd_k();
     flush_effects().await;
     let _ = wait_until(|| query_all(&target, ".search-result-item").len() == 3).await;
 

@@ -87,7 +87,7 @@ pub fn PoolsPage() -> impl IntoView {
                 let asset_pools = list.len() - n;
                 let pending: u32 = list.iter().map(|p| p.pending_count).sum();
                 let pools_suffix = if asset_pools > 0 {
-                    format!("active · {asset_pools} asset")
+                    format!("active · {}", crate::helpers::plural(asset_pools as u64, "asset pool", "asset pools"))
                 } else {
                     "active".to_string()
                 };
@@ -150,7 +150,7 @@ pub fn PoolsPage() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error loading pools: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error loading pools: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>

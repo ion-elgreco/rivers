@@ -28,7 +28,11 @@ pub fn DeploymentPage() -> impl IntoView {
                             DeploymentNode {
                                 label: "Daemon".into(),
                                 sub: if info.daemon_active {
-                                    format!("{} schedules · {} sensors", info.daemon_schedules, info.daemon_sensors)
+                                    format!(
+                                        "{} · {}",
+                                        crate::helpers::plural(info.daemon_schedules as u64, "schedule", "schedules"),
+                                        crate::helpers::plural(info.daemon_sensors as u64, "sensor", "sensors"),
+                                    )
                                 } else {
                                     "inactive".into()
                                 },
@@ -95,7 +99,7 @@ pub fn DeploymentPage() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>

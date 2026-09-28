@@ -64,7 +64,7 @@ pub fn ExecuteJobDialog(
                 // server resolves the job's assets.
                 let r = launch_backfill(ns, name, None, keys, None, Some(job), shown)
                     .await
-                    .map_err(|e| format!("{e}"))?;
+                    .map_err(|e| crate::helpers::err_text(&e))?;
                 return Ok::<ExecOutcome, String>(ExecOutcome::Backfill(r.backfill_id));
             }
             let key_opts = if keys.is_empty() {
@@ -83,7 +83,7 @@ pub fn ExecuteJobDialog(
                     whole_asset,
                 )
                 .await
-                .map_err(|e| format!("{e}"))?
+                .map_err(|e| crate::helpers::err_text(&e))?
                 .run_id;
             }
             Ok(ExecOutcome::Run(last_run_id))

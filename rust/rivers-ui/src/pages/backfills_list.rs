@@ -15,8 +15,7 @@ use crate::components::ui_kit::{
     AssetStack, Crumb, EmptyState, FilterPillGroup, PartitionCell, ProgressBar, StatusChip, Topbar,
 };
 use crate::helpers::{
-    backfill_status_kind, code_location_label, format_call_multiline, format_duration,
-    format_timestamp,
+    backfill_status_kind, code_location_label, format_duration, format_timestamp,
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::now::RelTime;
@@ -135,7 +134,7 @@ pub fn BackfillsListPage() -> impl IntoView {
                                 ("Failed".into(), None),
                                 ("Canceled".into(), None),
                             ],
-                            Some(format!("Summary fetch failed: {e}")),
+                            Some(format!("Summary fetch failed: {}", crate::helpers::err_text(&e))),
                         ),
                         None => return ().into_any(),
                     };
@@ -156,7 +155,7 @@ pub fn BackfillsListPage() -> impl IntoView {
             {move || match backfills_page.get() {
                 None => view! { <GridRowSkeleton rows=10 cols=9/> }.into_any(),
                 Some(Err(e)) => view! {
-                    <div class="error-msg">{format!("Error loading backfills: {e}")}</div>
+                    <div class="error-msg">{format!("Error loading backfills: {}", crate::helpers::err_text(&e))}</div>
                 }.into_any(),
                 Some(Ok(page_data)) if page_data.total == 0 => view! {
                     <EmptyState
@@ -256,10 +255,10 @@ fn BackfillRow(record: BackfillInfo, code_location_label: String) -> impl IntoVi
             <StatusChip kind=st_kind small=true/>
             // A destructive sweep must be identifiable while scanning the list,
             // not only from the detail page.
-            <span class="grid-cell-muted grid-cell-code">
+            <span class="grid-cell-muted" title=record.strategy_code.clone()>
                 {match &record.action {
-                    Some(verb) => format!("{verb} · {}", format_call_multiline(&record.strategy)),
-                    None => format_call_multiline(&record.strategy),
+                    Some(verb) => format!("{verb} · {}", record.strategy),
+                    None => record.strategy.clone(),
                 }}
             </span>
             <AssetStack assets=record.asset_selection/>

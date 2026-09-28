@@ -59,6 +59,21 @@ pub fn JobDetailPage() -> impl IntoView {
         },
     );
 
+    // Tiles and the strip always describe the newest runs, whatever history page is open.
+    let latest_runs = Resource::new(
+        move || {
+            params.track();
+            (name(), refresh_tick.get())
+        },
+        |(job_name, _tick)| async move {
+            let filter = RunFilter {
+                job_name: Some(job_name),
+                ..Default::default()
+            };
+            get_runs_page(0, 20, filter).await
+        },
+    );
+
     let all_assets = Resource::new(
         move || loc.get(),
         |(ns, name)| get_assets(ns, name, None, None, None),
@@ -152,7 +167,7 @@ pub fn JobDetailPage() -> impl IntoView {
                     set_exec_pending.set(false);
                 }
                 Err(e) => {
-                    set_exec_error.set(Some(format!("{e}")));
+                    set_exec_error.set(Some(crate::helpers::err_text(&e)));
                     set_exec_pending.set(false);
                 }
             }
@@ -214,12 +229,12 @@ pub fn JobDetailPage() -> impl IntoView {
         <Transition fallback=move || view! { <div class="loading">"Loading..."</div> }>
             {move || {
                 let current_name = name();
-                let run_records = runs_page_res
+                let latest = latest_runs
                     .get()
                     .and_then(|r| r.ok())
                     .map(|p| p.rows)
                     .unwrap_or_default();
-                let last_run = run_records.first().cloned();
+                let last_run = latest.first().cloned();
                 let last_run_ts: Option<i64> = last_run.as_ref().map(|r| r.start_time);
                 let last_run_status = last_run.as_ref()
                     .map(|r| run_status_kind(&r.status).to_string());
@@ -236,18 +251,7 @@ pub fn JobDetailPage() -> impl IntoView {
                             };
                             let executor_type = job.executor_type.clone();
 
-                            let strip: Vec<StripRun> = run_records.iter().rev().take(20).rev().map(|r| {
-                                let status = match r.status {
-                                    crate::types::RunStatus::Success => "ok",
-                                    crate::types::RunStatus::Failure => "err",
-                                    crate::types::RunStatus::Started | crate::types::RunStatus::NotStarted | crate::types::RunStatus::Queued => "retry",
-                                    _ => "err",
-                                };
-                                let live = matches!(r.status, crate::types::RunStatus::Started);
-                                let dur = r.end_time.map(|e| (e - r.start_time).max(1) as f64 / 1e9).unwrap_or(5.0);
-                                let id = short_id(&r.run_id, 8);
-                                StripRun { id, status, duration_s: dur, live }
-                            }).collect();
+                            let strip = StripRun::from_runs(&latest, 20);
 
                             let asset_records = all_assets.get().and_then(|r| r.ok()).unwrap_or_default();
 
@@ -269,7 +273,7 @@ pub fn JobDetailPage() -> impl IntoView {
                                             // the executor, so the verb is the useful fact here.
                                             {match job.action.clone() {
                                                 Some(verb) => view! { <span class="grid-cell-mono">{verb}</span> }.into_any(),
-                                                None => view! { <KindBadge kind=executor_type/> }.into_any(),
+                                                None => view! { <KindBadge kind=crate::helpers::executor_label(&executor_type)/> }.into_any(),
                                             }}
                                         </div>
                                     </div>
@@ -311,7 +315,7 @@ pub fn JobDetailPage() -> impl IntoView {
                             view! { <div class="error-msg">"Job not found."</div> }.into_any()
                         }
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
@@ -384,7 +388,7 @@ pub fn JobDetailPage() -> impl IntoView {
                             }}
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Error: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
