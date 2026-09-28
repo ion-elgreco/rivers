@@ -141,57 +141,13 @@ pub fn QueuePage() -> impl IntoView {
                                 let title = format!("{label} · {} waiting", crate::helpers::plural(n as u64, "run", "runs"));
                                 let sub = format!("largest backlog · oldest queued {oldest}");
                                 let warn = n < count / 2;
-                                let suggestion_label: &str = if label.contains("Pool") {
-                                    "Add 2 slots"
-                                } else if label.contains("Concurrency") {
-                                    "Raise concurrency limit"
-                                } else if label.contains("Backfill") {
-                                    "Pause active backfill"
-                                } else if label.contains("Waiting") {
-                                    "Scale worker pool"
-                                } else {
-                                    "Materialize blocking assets"
-                                };
-                                let bars: Vec<_> = (0..24).map(|i| {
-                                    let remaining = ((n as f64 - (i as f64 / 24.0) * n as f64) / n as f64 * 100.0).clamp(0.0, 100.0);
-                                    let opacity = 0.25 + (remaining / 100.0) * 0.75;
-                                    let color = if i < 6 { "var(--error)" }
-                                        else if i < 14 { "var(--warning)" }
-                                        else { "var(--success)" };
-                                    view! {
-                                        <div
-                                            class="drain-forecast-bar"
-                                            style=format!("height:{remaining:.0}%; opacity:{opacity:.2}; background:{color}")
-                                        ></div>
-                                    }
-                                }).collect();
-                                view! {
-                                    <BottleneckCard title=title sub=sub warn_only=warn>
-                                        <div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px; min-width:240px">
-                                            <div class="section-header-label" style="align-self:flex-start">"DRAIN FORECAST · 24 MIN"</div>
-                                            <div class="drain-forecast" style="width:100%">{bars}</div>
-                                            <div class="drain-forecast-labels" style="width:100%">
-                                                <span>"now"</span>
-                                                <span>"+6m"</span>
-                                                <span>"+12m"</span>
-                                                <span>"+18m"</span>
-                                                <span>"+24m"</span>
-                                            </div>
-                                            <div style="display:flex; align-items:center; gap:8px; margin-top:6px">
-                                                <span class="section-header-label" style="font-size:9.5px">"SUGGESTED ACTION"</span>
-                                                <button class="btn btn-primary btn-small" title=suggestion_label.to_string()>
-                                                    {suggestion_label.to_string()} " →"
-                                                </button>
-                                            </div>
-                                        </div>
-                                    </BottleneckCard>
-                                }
+                                view! { <BottleneckCard title=title sub=sub warn_only=warn/> }
                             })}
 
                             <div class="stats-grid" style="grid-template-columns:repeat(3, 1fr); margin-bottom:24px">
                                 <StatTile label="QUEUED RUNS" value=count.to_string() suffix="waiting"/>
                                 <StatTile label="HIGH PRIORITY" value=high.to_string() suffix=format!("of {count}")/>
-                                <StatTile label="OLDEST QUEUED" value=oldest suffix="waiting"/>
+                                <StatTile label="OLDEST QUEUED" value=oldest/>
                             </div>
 
                             <QueueLanes lanes=lanes/>

@@ -12,15 +12,15 @@ use crate::helpers::{run_status_kind, short_id};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::get_assets;
 use crate::server_fns::automation::{get_schedules, get_sensors};
-use crate::server_fns::overview::{get_assets_info, get_run_stats};
-use crate::server_fns::runs::get_runs;
+use crate::server_fns::overview::get_assets_info;
+use crate::server_fns::runs::{get_runs, get_runs_summary};
 
 #[component]
 pub fn OverviewPage() -> impl IntoView {
     let (refresh_tick, set_refresh_tick) = signal(0u32);
     let loc = use_current_location();
 
-    let stats = Resource::new(move || refresh_tick.get(), |_| get_run_stats());
+    let stats = Resource::new(move || refresh_tick.get(), |_| get_runs_summary());
     let recent_runs = Resource::new(move || refresh_tick.get(), |_| get_runs(Some(10), None));
     let assets = Resource::new(
         move || (loc.get(), refresh_tick.get()),
@@ -60,7 +60,7 @@ pub fn OverviewPage() -> impl IntoView {
                         let total = s.total;
                         let success = s.success;
                         let failure = s.failure;
-                        let started = s.started;
+                        let started = s.in_progress;
                         let rate = if total > 0 { success as f64 / total as f64 } else { 0.0 };
                         let success_rate_pct = format!("{:.1}%", rate * 100.0);
                         let ring_success = Signal::derive(move || rate);
@@ -74,9 +74,9 @@ pub fn OverviewPage() -> impl IntoView {
                         view! {
                             <div style="margin-bottom:36px; padding:24px 0 0">
                                 <FeaturedDonut
-                                    label="● LIVE · TOTAL RUNS · 24H"
+                                    label="● LIVE · TOTAL RUNS"
                                     value=format!("{total}")
-                                    unit="runs".to_string()
+                                    unit=if total == 1 { "run" } else { "runs" }.to_string()
                                     ring_value=ring_success
                                     color="var(--success)".to_string()
                                     metrics=vec![

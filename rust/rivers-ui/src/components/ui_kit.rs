@@ -893,20 +893,20 @@ pub fn ConditionReplay(
     }
 }
 
-/// Global evaluation timeline — bucketed bar chart showing when the automation
+/// Evaluation timeline — bucketed bar chart showing when the automation
 /// engine evaluated conditions (bar height = eval count per bucket) and when
 /// those evals resulted in a materialization request (accent-colored bars).
 #[component]
 pub fn EvalTimelineBars(
-    /// (eval_count, had_request) buckets ordered oldest → newest.
+    /// (eval_count, fire_count) buckets ordered oldest → newest.
     #[prop(into)]
-    buckets: Vec<(u32, bool)>,
+    buckets: Vec<(u32, u32)>,
 ) -> impl IntoView {
     let total_ticks: u64 = buckets.iter().map(|(c, _)| *c as u64).sum();
-    let fire_count: usize = buckets.iter().filter(|(_, r)| *r).count();
+    let fire_count: u64 = buckets.iter().map(|(_, f)| *f as u64).sum();
     let n = buckets.len().max(1);
     let mins_per_bucket = 60.0 / n as f64;
-    let last_fire_idx = buckets.iter().rposition(|(_, r)| *r);
+    let last_fire_idx = buckets.iter().rposition(|(_, f)| *f > 0);
     let last_fire_label = last_fire_idx
         .map(|i| {
             let mins_ago = ((n - 1 - i) as f64 * mins_per_bucket).round() as u32;
@@ -921,14 +921,14 @@ pub fn EvalTimelineBars(
     let max = buckets.iter().map(|(c, _)| *c).max().unwrap_or(1).max(1) as f64;
     let bars = buckets
         .into_iter()
-        .map(|(c, req)| {
+        .map(|(c, fires)| {
             let h = (c as f64 / max * 100.0).clamp(2.0, 100.0);
-            let color = if req { "var(--accent)" } else { "var(--bg-highest)" };
-            let plural = if c == 1 { "tick" } else { "ticks" };
-            let title = if req {
-                format!("{c} {plural} · fired")
+            let color = if fires > 0 { "var(--accent)" } else { "var(--bg-highest)" };
+            let ticks = crate::helpers::plural(c as u64, "tick", "ticks");
+            let title = if fires > 0 {
+                format!("{ticks} · {fires} fired")
             } else {
-                format!("{c} {plural}")
+                ticks
             };
             view! {
                 <div
@@ -942,7 +942,7 @@ pub fn EvalTimelineBars(
     view! {
         <div class="eval-timeline-panel">
             <div class="eval-timeline-head">
-                <span class="section-header-label">"GLOBAL EVALUATION TIMELINE · LAST HOUR"</span>
+                <span class="section-header-label">"EVALUATION TIMELINE · LAST HOUR"</span>
                 <span class="eval-timeline-stats">
                     <span class="eval-timeline-stat">
                         <span class="eval-timeline-stat-num">{total_ticks.to_string()}</span>

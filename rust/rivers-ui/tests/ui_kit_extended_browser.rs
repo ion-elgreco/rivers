@@ -337,14 +337,7 @@ fn topbar_copyable_crumb_carries_data_copy_attr() {
 #[wasm_bindgen_test]
 fn eval_timeline_bars_renders_one_bar_per_bucket() {
     let target = fresh_mount_target();
-    let buckets = vec![
-        (3u32, false),
-        (5, true),
-        (1, false),
-        (0, false),
-        (2, true),
-        (4, false),
-    ];
+    let buckets = vec![(3u32, 0u32), (5, 1), (1, 0), (0, 0), (2, 2), (4, 0)];
     let _handle = mount_to(target.clone(), move || {
         view! { <EvalTimelineBars buckets=buckets.clone() /> }
     });
@@ -356,7 +349,7 @@ fn eval_timeline_bars_renders_one_bar_per_bucket() {
 #[wasm_bindgen_test]
 fn eval_timeline_bars_summary_counts_total_ticks_and_fires() {
     let target = fresh_mount_target();
-    let buckets = vec![(2u32, false), (5, true), (0, false), (3, true)];
+    let buckets = vec![(2u32, 0u32), (5, 2), (0, 0), (3, 1)];
     let _handle = mount_to(target.clone(), move || {
         view! { <EvalTimelineBars buckets=buckets.clone() /> }
     });
@@ -368,8 +361,8 @@ fn eval_timeline_bars_summary_counts_total_ticks_and_fires() {
         "total = 2+5+0+3 = 10, got: {summary}"
     );
     assert!(
-        summary.contains("2 fires"),
-        "exactly 2 fire buckets, got: {summary}"
+        summary.contains("3 fires"),
+        "fires = 2+1 = 3, got: {summary}"
     );
 }
 

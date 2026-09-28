@@ -244,12 +244,8 @@ td input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
 .item-row--warning .item-row-bar { background: var(--warning); }
 .item-row--muted .item-row-bar { background: var(--text-muted); }
 
-/* Item row action button (inline in row) */
-/* Multi-select dropdown */
-/* Rivers-aligned MultiSelect: mono compact trigger chip that opens a flat
- * surface-container-high menu with outline-variant checkboxes. Matches the
- * visual language of Rivers' FilterGroup pills + .dim-menu dropdown.
- */
+/* Multi-select dropdown: mono compact trigger chip that opens a flat
+ * surface-container-high menu with outline-variant checkboxes. */
 .multi-select { position: relative; }
 .multi-select-trigger {
     appearance: none;

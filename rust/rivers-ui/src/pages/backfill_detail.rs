@@ -304,19 +304,15 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                 let canceled = record.canceled_partitions as usize;
                                 let total_usize = total as usize;
                                 let pending_count = total_usize.saturating_sub(done + failed + canceled);
-                                let (scheme_label, cell_word) = if total_usize <= 24 {
-                                    ("HOURLY", "hour")
-                                } else if total_usize <= 96 {
-                                    ("STATIC", "region")
-                                } else {
-                                    ("DAILY", "day")
-                                };
-                                let description = format!("{} cells · each cell = one {} partition · oldest top-left", total_usize, cell_word);
+                                let description = format!(
+                                    "{} · one cell per partition",
+                                    crate::helpers::plural(total_usize as u64, "partition", "partitions"),
+                                );
                                 view! {
                                     <div class="partition-panel">
                                         <div class="partition-panel-header">
                                             <div>
-                                                <div class="section-header-label">{format!("PARTITIONS · {}", scheme_label)}</div>
+                                                <div class="section-header-label">"PARTITIONS"</div>
                                                 <div class="partition-panel-desc">{description}</div>
                                             </div>
                                             <div class="partition-panel-legend">
@@ -325,7 +321,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                                     <span><span class="partition-legend-swatch partition-legend-swatch--failed"></span>{format!("failed · {}", failed)}</span>
                                                 })}
                                                 {(canceled > 0).then(|| view! {
-                                                    <span><span class="partition-legend-swatch partition-legend-swatch--pending"></span>{format!("canceled · {}", canceled)}</span>
+                                                    <span><span class="partition-legend-swatch partition-legend-swatch--canceled"></span>{format!("canceled · {}", canceled)}</span>
                                                 })}
                                                 <span><span class="partition-legend-swatch partition-legend-swatch--pending"></span>{format!("pending · {}", pending_count)}</span>
                                             </div>

@@ -89,6 +89,7 @@
 .partition-legend-swatch--running { background: var(--secondary); animation: pulse-op 1.4s ease-in-out infinite; }
 .partition-legend-swatch--failed { background: var(--error); }
 .partition-legend-swatch--pending { background: var(--bg-highest); }
+.partition-legend-swatch--canceled { background: var(--text-muted); opacity: 0.35; }
 
 /* Rivers-style flat metadata tile grid — 4 or 3 column, 1px hairline separator
  * via the container's background bleeding through the gap between tiles.

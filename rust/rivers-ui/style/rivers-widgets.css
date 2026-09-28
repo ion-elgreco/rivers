@@ -443,7 +443,7 @@
 .heatmap-info-state--running { color: var(--secondary); }
 .heatmap-info-state--failed { color: var(--error); }
 .heatmap-info-state--pending { color: var(--text-muted); }
-.heatmap-info-state--canceled { color: var(--warning); }
+.heatmap-info-state--canceled { color: var(--text-muted); }
 
 /* ── Rivers: LineageMini SVG block ── */
 .lineage-mini-wrap {
@@ -1139,29 +1139,6 @@
     font-size: 11px;
     color: var(--text-muted);
 }
-.drain-forecast {
-    display: flex;
-    align-items: flex-end;
-    gap: 2px;
-    height: 28px;
-    margin-top: 8px;
-}
-.drain-forecast-bar {
-    flex: 1;
-    min-width: 3px;
-    background: var(--error);
-    border-radius: 1px;
-    transition: opacity 200ms ease;
-}
-.drain-forecast-labels {
-    display: flex;
-    justify-content: space-between;
-    font-family: var(--font-mono);
-    font-size: 9.5px;
-    color: var(--text-muted);
-    margin-top: 4px;
-}
-
 /* ── Rivers: DAG Minimap ── */
 .dag-minimap {
     position: absolute;

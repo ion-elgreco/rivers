@@ -4,7 +4,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[allow(unused_imports)]
-use crate::types::{AssetDefinitionInfo, PartitionDetail, PartitionStatus, RunStats};
+use crate::types::{AssetDefinitionInfo, PartitionDetail, PartitionStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentInfo {
@@ -23,34 +23,6 @@ pub struct DeploymentInfo {
     pub daemon_active: bool,
     pub daemon_schedules: usize,
     pub daemon_sensors: usize,
-}
-
-#[server]
-pub async fn get_run_stats() -> Result<RunStats, ServerFnError> {
-    use rivers_core::storage::{RunStatus, StorageBackend};
-    let state = expect_context::<crate::state::AppState>();
-
-    let runs = state
-        .storage
-        .get_all_runs(10000, None)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let mut stats = RunStats {
-        total: runs.len(),
-        ..Default::default()
-    };
-    for run in &runs {
-        match run.status {
-            RunStatus::Success => stats.success += 1,
-            RunStatus::Failure => stats.failure += 1,
-            RunStatus::Started => stats.started += 1,
-            RunStatus::NotStarted => stats.not_started += 1,
-            RunStatus::Queued => stats.queued += 1,
-            RunStatus::Canceled => stats.canceled += 1,
-        }
-    }
-    Ok(stats)
 }
 
 #[server]

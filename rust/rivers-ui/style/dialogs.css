@@ -201,66 +201,6 @@ code {
     background: var(--bg-surface);
 }
 .form-input-small { min-width: 100px; padding: 0.35rem 0.5rem; }
-/* Rivers-style in-header dimension dropdown (Assets table "LAST MATERIALIZED"
- * column), mirrors rivers-screens.jsx AssetsTableHeader. Accent-colored button
- * with chevron, opens a menu listing alternate dimensions. */
-.dim-header-cell { position: relative; }
-.dim-header-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    background: transparent;
-    border: 0;
-    padding: 0;
-    color: var(--accent);
-    font-family: var(--font-sans);
-    font-size: 10px;
-    font-weight: 500;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    cursor: pointer;
-}
-.dim-header-chevron {
-    display: inline-block;
-    font-size: 13px;
-    line-height: 1;
-    opacity: 0.9;
-    transform: rotate(0deg);
-    transition: transform 160ms ease;
-}
-.dim-header-chevron--open { transform: rotate(90deg); }
-.dim-menu {
-    position: absolute;
-    top: 100%;
-    left: 0;
-    margin-top: 6px;
-    z-index: 20;
-    background: var(--bg-hover);
-    border-radius: 4px;
-    padding: 4px;
-    min-width: 180px;
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
-    display: flex;
-    flex-direction: column;
-}
-.dim-menu-item {
-    display: block;
-    width: 100%;
-    text-align: left;
-    padding: 6px 10px;
-    border-radius: 3px;
-    border: 0;
-    font-family: var(--font-mono);
-    font-size: 11px;
-    letter-spacing: 0.05em;
-    color: var(--text-muted);
-    background: transparent;
-    cursor: pointer;
-    transition: background 120ms ease, color 120ms ease;
-}
-.dim-menu-item:hover { color: var(--text); }
-.dim-menu-item--active { color: var(--text); background: var(--bg-highest); }
-
 /* Rivers-style row checkbox: 16×16, square with 2px radius, transparent when
  * unchecked (outline-variant border) and accent-filled with check glyph when
  * checked. Mirrors rivers-screens.jsx AssetRow custom <button>-checkbox. */

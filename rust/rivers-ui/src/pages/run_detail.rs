@@ -293,16 +293,6 @@ pub fn RunDetailPage() -> impl IntoView {
                                 />
                                 <button
                                     class="btn btn-tertiary"
-                                    title="Export run events (CSV)"
-                                    disabled=true
-                                >
-                                    <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
-                                        <path d="M7 2v7M4 6l3 3 3-3M2 11h10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
-                                    </svg>
-                                    "Export"
-                                </button>
-                                <button
-                                    class="btn btn-tertiary"
                                     on:click=move |_| {
                                         let (dispatch, armed) = crate::helpers::replay_click(
                                             rerun_verb.is_some(),

@@ -983,14 +983,14 @@ fn AutomationTicksTab(asset_key: String, #[prop(into)] refresh_tick: Signal<u32>
                         let now = jiff::Timestamp::now().as_nanosecond() as i64;
                         let window_ns: i64 = 60 * 60 * 1_000_000_000;
                         let bucket_ns = window_ns / 60;
-                        let mut buckets: Vec<(u32, bool)> = vec![(0, false); 60];
+                        let mut buckets: Vec<(u32, u32)> = vec![(0, 0); 60];
                         for r in records.iter() {
                             let age = now.saturating_sub(r.timestamp);
                             if age >= 0 && age < window_ns {
                                 let idx = (59 - (age / bucket_ns).min(59)) as usize;
                                 buckets[idx].0 += 1;
                                 if r.fired {
-                                    buckets[idx].1 = true;
+                                    buckets[idx].1 += 1;
                                 }
                             }
                         }

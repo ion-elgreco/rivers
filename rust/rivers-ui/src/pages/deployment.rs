@@ -67,7 +67,6 @@ pub fn DeploymentPage() -> impl IntoView {
                             <div class="deploy-grid">
                                 <DeployCard label="VERSION">
                                     <DeployRow label="rivers".to_string() value=info.version.clone() mono=true/>
-                                    <DeployRow label="abi".to_string() value="cp310-abi3".to_string() mono=true/>
                                 </DeployCard>
 
                                 <DeployCard

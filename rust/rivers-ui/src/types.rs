@@ -737,17 +737,6 @@ pub struct PartitionDetail {
     pub last_timestamp: Option<i64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RunStats {
-    pub total: usize,
-    pub success: usize,
-    pub failure: usize,
-    pub started: usize,
-    pub not_started: usize,
-    pub queued: usize,
-    pub canceled: usize,
-}
-
 /// Filter passed to the paginated backfills server fn. Empty/`None` means no
 /// restriction. Mirrors `rivers_core::storage::BackfillFilter`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
