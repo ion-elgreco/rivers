@@ -19,7 +19,8 @@ TRACE_SERVICE = "opentelemetry.proto.collector.trace.v1.TraceService"
 TOKEN = "Bearer test-token"
 
 # One sensor evaluation is the only code path that opens a span, so the
-# exporter has something to send.
+# exporter has something to send. The script exits right after, with every
+# span still queued: `_emit_span` sets batch limits the run never reaches.
 EMIT_SPAN_SCRIPT = """
 import time
 
@@ -52,7 +53,6 @@ deadline = time.monotonic() + 15
 while time.monotonic() < deadline and not storage.get_ticks("otel_probe", limit=1):
     time.sleep(0.1)
 daemon.stop()
-time.sleep(2)
 """
 
 
@@ -155,7 +155,9 @@ def _emit_span(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
         [sys.executable, "-c", EMIT_SPAN_SCRIPT],
         env={
             **os.environ,
-            "OTEL_BSP_SCHEDULE_DELAY": "100",
+            "OTEL_BSP_SCHEDULE_DELAY": "60000",
+            "OTEL_BSP_MAX_QUEUE_SIZE": "1000000",
+            "OTEL_BSP_MAX_EXPORT_BATCH_SIZE": "1000000",
             "OTEL_EXPORTER_OTLP_TIMEOUT": "2000",
             **env,
         },
@@ -215,6 +217,23 @@ def test_export_over_mutual_tls_with_bearer_header(tmp_path: Path) -> None:
     assert b"rivers" in export.body
     assert b"eval" in export.body
     assert b"otel_probe" in export.body
+
+
+def test_spans_still_queued_at_exit_are_exported(tmp_path: Path) -> None:
+    ca = _pem("rivers-test-ca", ca=True)
+    server = _pem("otlp-receiver", issuer=ca, usage=ExtendedKeyUsageOID.SERVER_AUTH)
+
+    with Receiver(server, ca, require_client_auth=False) as receiver:
+        result = _emit_span(
+            {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": f"https://127.0.0.1:{receiver.port}",
+                "OTEL_EXPORTER_OTLP_CERTIFICATE": _write(tmp_path, "ca.pem", ca.cert),
+            }
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert receiver.exports, f"no export received; stderr:\n{result.stderr}"
+    assert b"otel_probe" in receiver.exports[0].body
 
 
 def test_receiver_requiring_a_client_certificate_gets_nothing_without_one(

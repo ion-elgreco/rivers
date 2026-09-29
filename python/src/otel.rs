@@ -3,9 +3,19 @@
 //! The exporter crate reads the endpoint, headers, and timeout itself but
 //! not the TLS variables, so those are read here.
 
+use std::sync::OnceLock;
+
 use anyhow::Context;
+use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::{SpanExporter, WithTonicConfig};
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider};
+use pyo3::prelude::*;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity};
+
+use crate::runtime::rt;
+
+static PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
 type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
@@ -17,7 +27,30 @@ pub(crate) fn export_enabled() -> bool {
     otlp_var(&env_lookup, "ENDPOINT").is_some()
 }
 
-pub(crate) fn span_exporter() -> anyhow::Result<SpanExporter> {
+/// Batches spans for export; [`shutdown`] sends the ones still queued.
+pub(crate) fn tracer() -> anyhow::Result<SdkTracer> {
+    let _runtime_guard = rt().enter();
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(span_exporter()?)
+        .with_resource(Resource::builder().with_service_name("rivers").build())
+        .build();
+    let tracer = provider.tracer("rivers");
+    let _ = PROVIDER.set(provider);
+    Ok(tracer)
+}
+
+/// Registered with `atexit`. Waits at most five seconds for the export.
+#[pyfunction]
+pub(crate) fn shutdown(py: Python<'_>) {
+    let Some(provider) = PROVIDER.get() else {
+        return;
+    };
+    if let Err(err) = py.detach(|| provider.shutdown()) {
+        tracing::warn!(error = %err, "failed to export the remaining spans at exit");
+    }
+}
+
+fn span_exporter() -> anyhow::Result<SpanExporter> {
     let mut builder = SpanExporter::builder().with_tonic();
     if let Some(tls) = tls_config(&env_lookup)? {
         builder = builder.with_tls_config(tls);

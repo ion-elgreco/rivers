@@ -9,7 +9,6 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use opentelemetry::trace::TracerProvider;
 use pyo3::prelude::*;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -76,18 +75,11 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Optional OTel layer — activates when an OTLP endpoint is configured
     let mut otel_build_err = None;
     let otel_layer = if otel::export_enabled() {
-        let _runtime_guard = runtime::rt().enter();
-        match otel::span_exporter() {
-            Ok(exp) => {
-                let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                    .with_batch_exporter(exp)
-                    .with_resource(
-                        opentelemetry_sdk::Resource::builder()
-                            .with_service_name("rivers")
-                            .build(),
-                    )
-                    .build();
-                let tracer = provider.tracer("rivers");
+        match otel::tracer() {
+            Ok(tracer) => {
+                m.py()
+                    .import("atexit")?
+                    .call_method1("register", (pyo3::wrap_pyfunction!(otel::shutdown, m)?,))?;
                 Some(tracing_opentelemetry::layer().with_tracer(tracer))
             }
             Err(err) => {
