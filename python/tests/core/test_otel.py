@@ -19,9 +19,10 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 TRACE_SERVICE = "opentelemetry.proto.collector.trace.v1.TraceService"
 TOKEN = "Bearer test-token"
 
-# One sensor evaluation is the only code path that opens a span, so the
-# exporter has something to send. The script exits right after, with every
-# span still queued: `_emit_span` sets batch limits the run never reaches.
+# Storage, resolve and the daemon loop all open spans too; the sensor's `eval`
+# span is the one whose name and `otel_probe` attribute a test can find. The
+# script exits right after, with every span still queued: `_emit_span` sets
+# batch limits the run never reaches.
 EMIT_SPAN_SCRIPT = """
 import time
 
@@ -344,6 +345,8 @@ def test_receiver_requiring_a_client_certificate_gets_nothing_without_one(
         )
 
     assert result.returncode == 0, result.stderr
+    assert "OpenTelemetry export disabled" not in result.stderr
+    assert "BatchSpanProcessor.ExportError" in result.stderr, result.stderr
     assert receiver.exports == []
 
 
