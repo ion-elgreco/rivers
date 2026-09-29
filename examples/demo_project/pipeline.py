@@ -1172,6 +1172,38 @@ def metadata_showcase(context: AssetExecutionContext) -> dict:
 
 
 # =============================================================================
+# Failure Showcase (always fails, so the UI has a traceback to show)
+# =============================================================================
+
+# The trailing commas make this invalid JSON.
+_PRICING_RULES = """
+{
+    "default_margin": 0.25,
+    "category_margins": {"books": 0.10, "electronics": 0.15,},
+}
+"""
+
+
+def _parse_pricing_rules(raw: str) -> dict:
+    return json.loads(raw)
+
+
+@Asset(
+    io_handler=output_io,
+    tags=["demo", "failure"],
+    kinds="showcase",
+    group="demo",
+)
+def broken_pricing_rules() -> dict:
+    """Always fails: its pricing rules are not valid JSON. The run page shows
+    the traceback, with json's frames folded and the parse error as the cause."""
+    try:
+        return _parse_pricing_rules(_PRICING_RULES)
+    except json.JSONDecodeError as e:
+        raise ValueError("pricing rules are not valid JSON") from e
+
+
+# =============================================================================
 # Asset Actions — native DeltaAsset with built-in maintenance verbs
 # =============================================================================
 # `event_log` is a real Delta table. `optimize`, `vacuum`, and `delete` come
@@ -1258,6 +1290,12 @@ metadata_showcase_job = Job(
     executor=Executor.in_process(),
 )
 
+failure_showcase_job = Job(
+    "failure_showcase",
+    assets=[broken_pricing_rules],
+    executor=Executor.in_process(),
+)
+
 full_pipeline_job = Job(
     "full_pipeline",
     assets=[
@@ -1341,6 +1379,20 @@ def hourly_skip_example(context: ScheduleEvaluationContext):
     if hour < 6 or hour > 22:
         return SkipReason(f"Outside business hours (hour={hour})")
     return RunRequest(run_key=f"hourly-{context.scheduled_execution_time}")
+
+
+@Schedule(
+    cron_schedule="*/5 * * * *",
+    job_name="failure_showcase",
+    name="failure_showcase_schedule",
+    default_status=ScheduleStatus.Running,
+    description="Run broken_pricing_rules every 5 minutes; every run fails",
+)
+def failure_showcase_schedule(context: ScheduleEvaluationContext):
+    return RunRequest(
+        run_key=f"failure-{context.scheduled_execution_time}",
+        tags={"triggered_by": "Schedule"},
+    )
 
 
 # =============================================================================
@@ -1716,6 +1768,8 @@ all_assets = [
     slow_step_d,
     # Metadata showcase
     metadata_showcase,
+    # Failure showcase
+    broken_pricing_rules,
     # Actions demo (class form)
     EventLog,
     # Backfill showcase
@@ -1749,6 +1803,7 @@ repo = CodeRepository(
         full_pipeline_job,
         slow_pipeline_job,
         metadata_showcase_job,
+        failure_showcase_job,
         backfill_demo_job,
         multi_partition_demo_job,
         million_partition_job,
@@ -1759,6 +1814,7 @@ repo = CodeRepository(
         daily_analytics_schedule,
         slow_pipeline_schedule,
         hourly_skip_example,
+        failure_showcase_schedule,
     ],
     sensors=[new_data_sensor, file_watcher_sensor, data_quality_sensor],
     run_queue=RunQueueConfig(
