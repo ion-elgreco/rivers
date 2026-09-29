@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::automation::schedule::TickRequest;
 use crate::automation::{PyScheduleStatus, PySensorStatus};
+use crate::config::run_config::{config_schema_json, validate_run_config};
 use crate::daemon::{BackfillDispatcherKind, RunDispatcherKind};
 use crate::executor::Executor;
 use crate::gil_threads::GilThreads;
@@ -69,6 +70,34 @@ impl CodeLocationImpl {
             .map_err(|_| Status::internal("thread panicked"))?
             .ok_or_else(|| Status::internal(PY_UNAVAILABLE))?
             .map_err(Status::internal)
+    }
+}
+
+/// The config a launch request carries, checked against the assets it will
+/// run. Unset or blank means no overrides.
+#[allow(clippy::result_large_err)]
+fn request_config(config: Option<String>, selection: &[String]) -> Result<Option<String>, Status> {
+    match config.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(json) => validate_run_config(json, selection)
+            .map_err(|e| Status::invalid_argument(e.to_string())),
+        None => Ok(None),
+    }
+}
+
+/// The JSON schema of `func`'s config class, or `None`. A schema that cannot
+/// be built is logged; it must not hide the asset from the UI.
+fn config_schema_or_log(py: Python<'_>, func: &Py<PyAny>, label: &str) -> Option<String> {
+    match config_schema_json(py, func) {
+        Ok(schema) => schema,
+        Err(e) => {
+            tracing::warn!(
+                target: "rivers::grpc",
+                asset = %label,
+                error = %e,
+                "config schema unavailable"
+            );
+            None
+        }
     }
 }
 
@@ -138,6 +167,7 @@ impl CodeLocationService for CodeLocationImpl {
             .validate_partition_for_selection(&asset_selection, pk.as_ref())
             .await
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let config = request_config(req.config, &asset_selection)?;
 
         let mat_request = crate::daemon::MaterializationRequestData {
             run_id: uuid::Uuid::new_v4().to_string(),
@@ -146,6 +176,7 @@ impl CodeLocationService for CodeLocationImpl {
             tags,
             launched_by,
             action: None,
+            config,
         };
         let run_id = mat_request.run_id.clone();
         let status = self.run_dispatcher.mode_label().to_string();
@@ -190,12 +221,18 @@ impl CodeLocationService for CodeLocationImpl {
                 .validate_keyless_job(&req.job_name)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         }
+        let job_assets = self
+            .handle
+            .job_asset_names(&req.job_name)
+            .unwrap_or_default();
+        let config = request_config(req.config, &job_assets)?;
         let run_request = crate::daemon::RunRequestData {
             run_key: None,
             tags: None,
             partition_key,
             job_name: Some(req.job_name),
             launched_by,
+            config,
         };
 
         let mut outcome = self
@@ -378,16 +415,29 @@ impl CodeLocationService for CodeLocationImpl {
                     let actions = node
                         .list_actions()
                         .into_iter()
-                        .map(
-                            |(name, outcome, exclusive, partitioning, description)| ActionInfo {
+                        .map(|(name, outcome, exclusive, partitioning, description)| {
+                            let config_schema = node
+                                .find_action(&name)
+                                .and_then(|a| a.func.as_ref())
+                                .and_then(|f| config_schema_or_log(py, f, &name));
+                            ActionInfo {
                                 name,
                                 outcome,
                                 exclusive,
                                 partitioning,
                                 description,
-                            },
-                        )
+                                config_schema,
+                            }
+                        })
                         .collect();
+                    // Only a Python function has a context annotation to read
+                    // (a bash task or an external asset without observe has none).
+                    let config_schema = node
+                        .annotations(py)
+                        .ok()
+                        .flatten()
+                        .and_then(|_| node.callable(py).ok())
+                        .and_then(|f| config_schema_or_log(py, &f, name));
 
                     assets.push(AssetDefinitionInfo {
                         asset_key: name.clone(),
@@ -404,6 +454,7 @@ impl CodeLocationService for CodeLocationImpl {
                         code_version: node.code_version(),
                         asset_type: node.asset_type().to_string(),
                         actions,
+                        config_schema,
                     });
                 }
 
@@ -611,6 +662,7 @@ impl CodeLocationService for CodeLocationImpl {
                 .validate_keyless_action(&asset_selection, &req.action)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         }
+        let config = request_config(req.config, &asset_selection)?;
 
         let action_request = crate::daemon::MaterializationRequestData {
             run_id: uuid::Uuid::new_v4().to_string(),
@@ -619,6 +671,7 @@ impl CodeLocationService for CodeLocationImpl {
             tags,
             launched_by,
             action: Some(req.action),
+            config,
         };
         let run_id = action_request.run_id.clone();
 
@@ -691,6 +744,17 @@ impl CodeLocationService for CodeLocationImpl {
             }
             None => req.action,
         };
+        // The assets the children run: a job's own, or the selection (empty
+        // means every asset).
+        let child_assets: Vec<String> = match &req.job_name {
+            Some(name) => self.handle.job_asset_names(name).unwrap_or_default(),
+            None if req.selection.is_empty() => self
+                .handle
+                .asset_names()
+                .map_err(|e| Status::internal(e.to_string()))?,
+            None => req.selection.clone(),
+        };
+        let config = request_config(req.config, &child_assets)?;
         let target = match req.job_name {
             Some(name) => crate::daemon::RunType::Job(name),
             None => crate::daemon::RunType::Materialization(req.selection),
@@ -707,6 +771,7 @@ impl CodeLocationService for CodeLocationImpl {
             backfill_id: None,
             launched_by: manual_launch(req.user),
             action,
+            config,
         };
 
         let mut outcome = self

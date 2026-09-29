@@ -48,6 +48,7 @@ impl ConditionTickEngine {
                 tags: vec![],
                 launched_by: LaunchedBy::Condition,
                 action: None,
+                config: None,
             });
         }
 
@@ -69,6 +70,7 @@ impl ConditionTickEngine {
                 tags: vec![],
                 launched_by: LaunchedBy::Condition,
                 action: None,
+                config: None,
             });
         }
         run_requests
@@ -174,6 +176,7 @@ impl ConditionTickEngine {
                 backfill_id,
                 launched_by: LaunchedBy::Condition,
                 action: None,
+                config: None,
             });
         }
 

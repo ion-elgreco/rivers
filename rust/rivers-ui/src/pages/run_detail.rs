@@ -449,6 +449,18 @@ pub fn RunDetailPage() -> impl IntoView {
                                 }
                             })}
 
+                            {record.config.as_ref().map(|config| {
+                                let pretty = serde_json::from_str::<serde_json::Value>(config)
+                                    .and_then(|v| serde_json::to_string_pretty(&v))
+                                    .unwrap_or_else(|_| config.clone());
+                                view! {
+                                    <div class="run-config">
+                                        <div class="section-header-label" style="margin-bottom:4px">"CONFIG"</div>
+                                        <pre class="run-config-text">{pretty}</pre>
+                                    </div>
+                                }
+                            })}
+
                         }.into_any()
                     }
                     Ok(None) => view! { <div class="error-msg">"Run not found"</div> }.into_any(),

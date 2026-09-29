@@ -117,8 +117,9 @@ pub struct MaterializeResult {
 
 /// Trigger a materialization run for `selection` (assets) at the given code
 /// location. `partition_key` is required iff every asset in the selection is
-/// partitioned. Fire-and-forget: returns the `run_id` immediately; the
-/// caller polls the run-detail page for completion.
+/// partitioned. `config` is the per-asset override JSON (keyed by asset name)
+/// the backend validates and stores on the run. Fire-and-forget: returns the
+/// `run_id` immediately; the caller polls the run-detail page for completion.
 #[server]
 pub async fn trigger_materialize(
     loc_ns: String,
@@ -126,6 +127,7 @@ pub async fn trigger_materialize(
     selection: Option<Vec<String>>,
     partition_key: Option<SubmitPartitionKey>,
     tags: Option<Vec<(String, String)>>,
+    config: Option<String>,
 ) -> Result<MaterializeResult, ServerFnError> {
     use rivers_api::rivers::MaterializeRequest;
 
@@ -141,6 +143,7 @@ pub async fn trigger_materialize(
             partition_key: partition_key.map(submit_to_proto),
             tags: tags_to_proto(tags),
             user: current_user_ref().await,
+            config,
         })
         .await
         .map_err(super::grpc_err)?;
@@ -155,6 +158,7 @@ pub async fn trigger_materialize(
 /// Run a named asset action over a selection. Returns the run id.
 /// `whole_asset` is the user's explicit choice to run an Optional-key verb on
 /// every partition; without it the backend rejects a keyless run of one.
+/// `config` is as for [`trigger_materialize`], for the action's config class.
 #[server]
 pub async fn trigger_action(
     loc_ns: String,
@@ -164,6 +168,7 @@ pub async fn trigger_action(
     partition_key: Option<SubmitPartitionKey>,
     tags: Option<Vec<(String, String)>>,
     whole_asset: bool,
+    config: Option<String>,
 ) -> Result<String, ServerFnError> {
     use rivers_api::rivers::RunActionRequest;
 
@@ -191,6 +196,7 @@ pub async fn trigger_action(
             user: current_user_ref().await,
             all_assets: false,
             whole_asset,
+            config,
         })
         .await
         .map_err(super::grpc_err)?;
@@ -334,6 +340,9 @@ pub async fn launch_backfill(
     /// it is the verb the page showed for the job: the backend refuses the
     /// backfill if the job now runs another one.
     action: Option<String>,
+    /// As for [`trigger_materialize`]; stored on the backfill and applied to
+    /// every child run.
+    config: Option<String>,
 ) -> Result<BackfillRerunResult, ServerFnError> {
     use rivers_api::rivers::LaunchBackfillRequest;
 
@@ -368,6 +377,7 @@ pub async fn launch_backfill(
             dry_run: false,
             job_name,
             user: current_user_ref().await,
+            config,
         })
         .await
         .map_err(super::grpc_err)?;
@@ -381,7 +391,8 @@ pub async fn launch_backfill(
 /// reported here — the UI navigates to the run page either way.
 /// `action` is the verb the page showed for the job (`None` materializes):
 /// the backend refuses the run if the job now runs another one.
-/// `whole_asset` is as for [`trigger_action`], for the job's verb.
+/// `whole_asset` and `config` are as for [`trigger_action`], for the job's
+/// verb and assets.
 #[server]
 pub async fn execute_job(
     loc_ns: String,
@@ -390,6 +401,7 @@ pub async fn execute_job(
     action: Option<String>,
     partition_key: Option<SubmitPartitionKey>,
     whole_asset: bool,
+    config: Option<String>,
 ) -> Result<MaterializeResult, ServerFnError> {
     use rivers_api::rivers::ExecuteJobRequest;
 
@@ -406,6 +418,7 @@ pub async fn execute_job(
             user: current_user_ref().await,
             whole_asset,
             action,
+            config,
         })
         .await
         .map_err(super::grpc_err)?;

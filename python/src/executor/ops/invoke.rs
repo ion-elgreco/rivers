@@ -59,7 +59,7 @@ pub(crate) fn get_annotations<'py>(
 /// evaluated in the function's module globals. Only this one annotation is
 /// evaluated: `typing.get_type_hints` fails as a whole when any other name in
 /// the signature exists only for type checkers.
-fn resolve_annotation<'py>(
+pub(crate) fn resolve_annotation<'py>(
     py: Python<'py>,
     func: &Py<PyAny>,
     annotation: &Bound<'py, PyAny>,

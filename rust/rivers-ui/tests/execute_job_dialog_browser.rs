@@ -123,6 +123,7 @@ fn verb(name: &str, outcome: &str, partitioning: &str) -> AssetActionInfo {
         exclusive: true,
         partitioning: partitioning.to_string(),
         description: None,
+        config_schema: None,
     }
 }
 

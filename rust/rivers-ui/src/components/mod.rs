@@ -1,5 +1,6 @@
 //! Reusable Leptos UI components.
 
+pub mod config_editor;
 pub mod dag;
 pub mod eval_tree;
 pub mod execute_job_dialog;

@@ -64,6 +64,7 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
 
     let node_names = args.plan.all_asset_names();
 
+    let config_json = crate::config::run_config::run_config_to_json(py, args.config.as_ref());
     let started = py.detach(|| -> PyResult<bool> {
         match args.init {
             RunInit::Create { launched_by } => {
@@ -82,6 +83,7 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
                     block_reason: None,
                     launched_by,
                     action: args.plan.action.clone(),
+                    config: config_json,
                 };
                 io_rt()
                     .block_on(args.storage.backend().create_run(&record))

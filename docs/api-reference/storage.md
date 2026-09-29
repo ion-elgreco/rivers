@@ -248,6 +248,9 @@ machine. The run page in the UI shows it.
 | `block_reason` | `str \| None` |
 | `launched_by` | `LaunchedBy` |
 | `action` | `str \| None` |
+| `config` | `dict[str, dict[str, Any]] \| None` |
+
+`config` holds the per-asset overrides the run was launched with, keyed by asset name; `None` means the definitions' defaults.
 
 ### `LaunchedBy`
 

@@ -104,7 +104,7 @@ When a `RunQueueConfig` is configured, the run queue applies to daemon-submitted
 | `partition_key` | `PartitionKey \| None` | `None` | Partition to materialize. Required for partitioned assets. |
 | `tags` | `list[tuple[str, str]] \| None` | `None` | Tags applied to the run for queue / observability filtering. |
 | `raise_on_error` | `bool` | `True` | Raise on first failure rather than returning a failed result. |
-| `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config overrides keyed by asset name. |
+| `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config overrides keyed by asset name. Kept on the run record when JSON-serializable. |
 | `run_id_override` | `str \| None` | `None` | Use a pre-assigned run ID (used by K8s execution pods). |
 | `include_upstream` | `bool` | `False` | Also materialize transitive deps of `selection`. |
 | `resume` | `bool` | `False` | Skip already-completed steps from a crashed prior run with the same `run_id_override`. |
@@ -131,7 +131,7 @@ def backfill(
 ) -> BackfillResult
 ```
 
-Backfill partitions for the selected assets. `action` runs that verb on every partition instead of materializing (every selected asset must define it). `config` needs `block=True`: the backfill record does not keep config, so `config` with `block=False` raises `ExecutionError`. See [Backfills](backfills.md) for the full reference.
+Backfill partitions for the selected assets. `action` runs that verb on every partition instead of materializing (every selected asset must define it). `config` is kept on the backfill record and applied to every child run, also when a daemon runs a `block=False` backfill later. See [Backfills](backfills.md) for the full reference.
 
 ### `cancel_backfill()`
 
@@ -210,7 +210,7 @@ Run a named [asset action](../concepts/actions.md) over a selection. The plan ha
 | `partition_key` | `PartitionKey \| None` | `None` | Partition to act on. The verb's [`partitioning`](assets.md#actionpartitioning) decides: required on partitioned targets for `Required`, rejected for `Keyless`, optional for `Optional` (none = the whole asset). |
 | `tags` | `list[tuple[str, str]] \| None` | `None` | Run tags. |
 | `raise_on_error` | `bool` | `True` | Raise the first failure instead of reporting it on the result. |
-| `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config overrides, keyed by asset name. Python API only — gRPC and UI launches use the definition's defaults. |
+| `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config overrides, keyed by asset name, for the action's own config class. Kept on the run record when JSON-serializable. |
 | `run_id_override` | `str \| None` | `None` | Re-execute an existing run record under its own id (used by K8s run pods). |
 | `resume` | `bool` | `False` | Skip already-completed steps from a crashed prior run with the same `run_id_override`. |
 

@@ -99,7 +99,8 @@ pub(crate) use finalize::{
 };
 pub(crate) use invoke::{
     annotation_is, drain_failed_partitions, enumerate_params, execute_action_step, execute_step,
-    extract_config_from_annotation, extract_return_hint, get_annotations, is_context_annotation,
+    extract_config_from_annotation, extract_return_hint, get_annotations,
+    is_action_context_annotation, is_context_annotation, resolve_annotation,
 };
 pub(crate) use io::{
     build_mapped_partition_context, build_partition_context, handle_step_output,

@@ -1,4 +1,6 @@
 //! Configuration and resource management — Pydantic model wrappers crossing the PyO3 boundary.
+pub(crate) mod run_config;
+
 use pyo3::prelude::*;
 
 use crate::errors::ConfigurationError;

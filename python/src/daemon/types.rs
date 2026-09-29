@@ -49,6 +49,8 @@ pub(crate) struct RunRequestData {
     /// requests in one tick share the automation's origin; gRPC launches carry
     /// the acting user.
     pub(crate) launched_by: rivers_core::storage::LaunchedBy,
+    /// See [`rivers_core::storage::RunRecord::config`]; stamped on the record.
+    pub(crate) config: Option<String>,
 }
 
 /// Materialization-shape run request — pre-resolved asset selection with
@@ -71,6 +73,8 @@ pub(crate) struct MaterializationRequestData {
     /// The verb the run executes; `None` means materialize. Reruns of action
     /// runs carry the original verb.
     pub(crate) action: Option<String>,
+    /// See [`rivers_core::storage::RunRecord::config`]; stamped on the record.
+    pub(crate) config: Option<String>,
 }
 
 /// A run re-execution from a stored `RunRecord`: `Job` → `dispatch_jobs`,
@@ -109,6 +113,9 @@ pub(crate) struct BackfillRequestData {
     pub(crate) launched_by: rivers_core::storage::LaunchedBy,
     /// The verb child runs execute. `None` means materialize.
     pub(crate) action: Option<String>,
+    /// See [`rivers_core::storage::BackfillRecord::config`]; every child run
+    /// is launched with it.
+    pub(crate) config: Option<String>,
 }
 
 pub(crate) enum TickOutcome {

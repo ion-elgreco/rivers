@@ -813,3 +813,23 @@ def test_run_status_round_trip(status: str):
     record = storage.get_run(run_id)
     assert record is not None
     assert record.status == status
+
+
+def test_run_record_keeps_its_config():
+    """`RunRecord.config` round-trips as the dict the launch was given; a run
+    launched with the defaults reads back `None`."""
+    storage = rs.Storage.memory()
+    storage._create_run(
+        "with-cfg",
+        "",
+        "Queued",
+        1,
+        node_names=["a"],
+        config={"a": {"threshold": 0.9, "mode": "full"}},
+    )
+    storage._create_run("defaults", "", "Queued", 2, node_names=["a"])
+
+    assert storage.get_run("with-cfg").config == {
+        "a": {"threshold": 0.9, "mode": "full"}
+    }
+    assert storage.get_run("defaults").config is None

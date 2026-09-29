@@ -198,9 +198,9 @@ external_weather_data = Asset.external(
     hooks=[log_success, alert_failure],
     pool="database",
 )
-def raw_users() -> dict:
+def raw_users(context: AssetExecutionContext[_IngestionSettings]) -> dict:
     """Simulate raw user data ingestion using pipeline config."""
-    settings = _IngestionSettings()
+    settings = context.config
     users = [
         {"id": 1, "name": "Alice", "region": "us-east", "active": True, "tier": "pro"},
         {"id": 2, "name": "Bob", "region": "us-west", "active": True, "tier": "free"},

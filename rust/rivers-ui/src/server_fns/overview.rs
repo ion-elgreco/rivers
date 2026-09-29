@@ -85,6 +85,7 @@ pub async fn get_assets_info(
                     exclusive: act.exclusive,
                     partitioning: act.partitioning,
                     description: act.description,
+                    config_schema: act.config_schema,
                 })
                 .collect();
             AssetDefinitionInfo {
@@ -102,6 +103,7 @@ pub async fn get_assets_info(
                 code_version: a.code_version,
                 asset_type: a.asset_type,
                 actions,
+                config_schema: a.config_schema,
             }
         })
         .collect();

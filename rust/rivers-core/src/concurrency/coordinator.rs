@@ -178,6 +178,7 @@ mod tests {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         }
     }
 

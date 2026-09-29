@@ -979,6 +979,7 @@ pub fn GraphPage() -> impl IntoView {
             destructive=dialog_destructive
             records=records_by_key
             records_failed=records_failed
+            definitions=asset_info_by_key
         />
     }
 }

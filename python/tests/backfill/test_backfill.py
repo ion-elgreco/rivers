@@ -468,10 +468,10 @@ class TestBackfillConfig:
         assert captured.get("mode") == "full_refresh"
 
     @pytest.mark.parametrize("action", [None, "purge"], ids=["materialize", "action"])
-    def test_config_without_block_is_rejected(self, storage, action):
-        """A non-blocking backfill keeps no config, so a daemon ran its
-        children later with the config defaults: `dry_run=True` became a real
-        purge. The call must fail before it records the backfill."""
+    def test_config_without_block_reaches_the_daemons_runs(self, storage, action):
+        """A non-blocking backfill keeps its config on the record, so the
+        children a daemon starts later run with it: `dry_run=True` stays a dry
+        run instead of becoming a real purge. A preview records nothing."""
         calls = []
 
         class PurgeConfig(BaseModel):
@@ -498,51 +498,40 @@ class TestBackfillConfig:
         verb = action or "materialize"
         config = {"events": {"dry_run": True}}
 
-        # A dry run rejects what the real call rejects.
-        for dry_run in (False, True):
-            with pytest.raises(
-                ExecutionError,
-                match=re.escape(
-                    "backfill(block=False) got config: the config would be lost "
-                    "and the runs would use the config defaults. Use block=True "
-                    "to run with this config"
-                ),
-            ):
-                repo.backfill(
-                    selection=["events"],
-                    partition_keys=[p1],
-                    action=action,
-                    config=config,
-                    block=False,
-                    dry_run=dry_run,
-                )
-
-        # No record was left for the daemon: it runs only this backfill, and
-        # stop() joins every backfill it picked up.
-        control = repo.backfill(
-            selection=["events"], partition_keys=[p2], action=action, block=False
+        preview = repo.backfill(
+            selection=["events"],
+            partition_keys=[p1],
+            action=action,
+            config=config,
+            block=False,
+            dry_run=True,
         )
+        assert preview.is_dry_run
+        launched = repo.backfill(
+            selection=["events"],
+            partition_keys=[p1],
+            action=action,
+            config=config,
+            block=False,
+        )
+        assert calls == []
+
         daemon = AutomationDaemon(repo=repo, storage=storage)
         daemon.start()
         try:
             wait_until(
                 lambda: (
-                    repo.get_backfill(control.backfill_id).status
+                    repo.get_backfill(launched.backfill_id).status
                     not in ("Requested", "InProgress")
                 ),
                 timeout=20,
             )
         finally:
             daemon.stop()
-        assert repo.get_backfill(control.backfill_id).status == "CompletedSuccess"
-        assert calls == [(verb, "p2", False)]
-
-        calls.clear()
-        result = repo.backfill(
-            selection=["events"], partition_keys=[p1], action=action, config=config
-        )
-        assert result.status == "CompletedSuccess"
+        status = repo.get_backfill(launched.backfill_id)
+        assert status.status == "CompletedSuccess"
         assert calls == [(verb, "p1", True)]
+        assert [repo.storage.get_run(r).config for r in status.run_ids] == [config]
 
 
 # ---------------------------------------------------------------------------

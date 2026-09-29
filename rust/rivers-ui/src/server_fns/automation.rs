@@ -262,6 +262,7 @@ pub async fn observe_asset(
         None,
         None,
         false,
+        None,
     )
     .await?;
     Ok(true)

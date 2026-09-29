@@ -16,6 +16,7 @@ fn mk_run(run_id: &str, status: RunStatus, assets: &[&str], ts: i64) -> RunRecor
         block_reason: None,
         launched_by: crate::storage::LaunchedBy::default(),
         action: None,
+        config: None,
     }
 }
 
@@ -224,6 +225,7 @@ async fn initial_load_run_completing_mid_load_is_not_lost() {
             block_reason: None,
             launched_by: crate::storage::LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         };
     let mat_event = |asset: &str, run_id: &str, ts: i64| crate::storage::EventRecord {
         code_location_id: cl.clone(),
@@ -704,6 +706,7 @@ async fn action_backfills_are_not_in_flight() {
         error: None,
         launched_by: LaunchedBy::default(),
         action: action.map(String::from),
+        config: None,
     };
     storage
         .create_backfill(&backfill("bf-mat", "rebuilt", None))

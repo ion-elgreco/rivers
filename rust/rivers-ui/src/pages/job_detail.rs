@@ -100,6 +100,27 @@ pub fn JobDetailPage() -> impl IntoView {
     // job's definition has loaded: with no verb to show, Execute waits.
     let jobs_value = crate::helpers::resource_value(jobs);
     let assets_info_value = crate::helpers::resource_value(assets_info);
+    // The dialog's config editor reads the job's assets and their schemas.
+    let job_assets = Signal::derive(move || {
+        let current = name();
+        jobs_value
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|j| j.name == current)
+            .map(|j| j.asset_selection)
+            .unwrap_or_default()
+    });
+    let asset_info_by_key = Memo::new(move |_| {
+        assets_info_value
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|i| (i.asset_key.clone(), i))
+            .collect::<std::collections::HashMap<String, AssetDefinitionInfo>>()
+    });
     let job_launch = Memo::new(
         move |_| -> Option<(Option<AssetActionInfo>, JobPartitionPicker)> {
             let current = name();
@@ -128,16 +149,26 @@ pub fn JobDetailPage() -> impl IntoView {
             .map_or(JobPartitionPicker::None, |(_, picker)| picker)
     });
     let job_verb_signal = Signal::derive(move || job_launch.get().and_then(|(verb, _)| verb));
+    // The dialog picks partitions and edits config; a job needing neither
+    // runs on the click.
+    let job_opens_dialog = Signal::derive(move || {
+        !matches!(job_picker.get(), JobPartitionPicker::None)
+            || crate::components::config_editor::launch_takes_config(
+                &job_assets.get(),
+                &asset_info_by_key.get(),
+                job_verb_signal.get().as_ref().map(|v| v.name.as_str()),
+            )
+    });
     let job_loaded = Signal::derive(move || job_launch.get().is_some());
     let exec_armed = use_confirm_armed(move || params.track());
 
     let dialog_job_name: Signal<String> = Signal::derive(name);
 
     let on_execute = move |_| {
-        let Some((verb, picker)) = job_launch.get() else {
+        let Some((verb, _)) = job_launch.get() else {
             return;
         };
-        if !matches!(picker, JobPartitionPicker::None) {
+        if job_opens_dialog.get() {
             set_exec_error.set(None);
             show_dialog.set(true);
             return;
@@ -158,7 +189,7 @@ pub fn JobDetailPage() -> impl IntoView {
         leptos::task::spawn_local(async move {
             let path_ns = ns.clone();
             let path_name = lname.clone();
-            match execute_job(ns, lname, job_name, shown, None, false).await {
+            match execute_job(ns, lname, job_name, shown, None, false, None).await {
                 Ok(result) if !result.run_id.is_empty() => {
                     let path = loc_path(&path_ns, &path_name, &format!("runs/{}", result.run_id));
                     navigate(&path, Default::default());
@@ -214,10 +245,10 @@ pub fn JobDetailPage() -> impl IntoView {
                         "Confirm {}?",
                         job_verb_signal.get().map(|v| v.name).unwrap_or_default()
                     )
-                } else if matches!(job_picker.get(), JobPartitionPicker::None) {
-                    "Execute".to_string()
-                } else {
+                } else if job_opens_dialog.get() {
                     "Execute…".to_string()
+                } else {
+                    "Execute".to_string()
                 }}
             </button>
         </Topbar>
@@ -227,6 +258,8 @@ pub fn JobDetailPage() -> impl IntoView {
             job_name=dialog_job_name
             picker=job_picker
             verb=job_verb_signal
+            assets=job_assets
+            definitions=asset_info_by_key
         />
 
         <Transition fallback=move || view! { <div class="loading">"Loading…"</div> }>

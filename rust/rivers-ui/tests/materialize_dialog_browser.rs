@@ -504,6 +504,7 @@ async fn optional_key_verb_blocks_a_partial_multi_pick() {
                             exclusive: true,
                             partitioning: "optional".to_string(),
                             description: None,
+                            config_schema: None,
                         })
                     })
                     destructive=Signal::derive(|| true)
@@ -558,6 +559,7 @@ async fn optional_key_verb_needs_a_partition_or_the_whole_asset() {
                             exclusive: true,
                             partitioning: "optional".to_string(),
                             description: None,
+                            config_schema: None,
                         })
                     })
                     destructive=Signal::derive(|| true)
@@ -618,6 +620,7 @@ async fn destructive_verb_is_named_and_flagged() {
                             exclusive: true,
                             partitioning: "optional".to_string(),
                             description: None,
+                            config_schema: None,
                         })
                     })
                     destructive=Signal::derive(|| true)
@@ -678,6 +681,7 @@ async fn back_to_another_code_location_closes_the_dialog() {
                                             exclusive: true,
                                             partitioning: "optional".to_string(),
                                             description: None,
+                                            config_schema: None,
                                         })
                                     })
                                     destructive=Signal::derive(|| true)
@@ -737,4 +741,197 @@ async fn back_to_another_code_location_closes_the_dialog() {
     assert_eq!(request_bodies(&sent).await, Vec::<String>::new());
     assert!(!show.get_untracked(), "the dialog stayed open on prod");
     assert!(query_all(&host, ".modal-overlay").is_empty());
+}
+
+// ── Config editor ──
+
+const PIPELINE_SCHEMA: &str = r#"{"properties":{"api_key":{"title":"Api Key","type":"string"},"batch_size":{"default":100,"title":"Batch Size","type":"integer"}},"required":["api_key"],"title":"PipelineConfig","type":"object"}"#;
+
+fn definition(key: &str, config_schema: Option<&str>) -> rivers_ui::types::AssetDefinitionInfo {
+    rivers_ui::types::AssetDefinitionInfo {
+        asset_key: key.to_string(),
+        description: None,
+        partition_def: None,
+        hooks: vec![],
+        io_handler: None,
+        has_self_dependency: false,
+        is_external: false,
+        automation_condition: None,
+        tags: vec![],
+        kinds: vec![],
+        group: None,
+        code_version: None,
+        asset_type: "asset".to_string(),
+        actions: vec![],
+        config_schema: config_schema.map(str::to_string),
+    }
+}
+
+fn mount_with_definitions(
+    show: RwSignal<bool>,
+    definitions: Vec<rivers_ui::types::AssetDefinitionInfo>,
+) -> web_sys::HtmlElement {
+    nav_to("/locations/default/demo");
+    let target = fresh_mount_target();
+    let keys: Vec<String> = definitions.iter().map(|d| d.asset_key.clone()).collect();
+    let by_key: HashMap<String, rivers_ui::types::AssetDefinitionInfo> = definitions
+        .into_iter()
+        .map(|d| (d.asset_key.clone(), d))
+        .collect();
+    mount_to(target.clone(), move || {
+        let keys = keys.clone();
+        let by_key = by_key.clone();
+        view! {
+            <Router>
+                <MaterializeDialog
+                    show=show
+                    asset_keys=Signal::derive(move || keys.clone())
+                    records=Signal::derive(HashMap::new)
+                    definitions=Signal::derive(move || by_key.clone())
+                />
+            </Router>
+        }
+    })
+    .forget();
+    target
+}
+
+/// Type `value` into the editor: set the value and fire `input`, as a user does.
+fn type_config(host: &web_sys::HtmlElement, value: &str) {
+    let textarea = query_one(host, ".config-editor-text");
+    js_sys::Reflect::set(&textarea, &"value".into(), &value.into()).unwrap();
+    let init = web_sys::EventInit::new();
+    init.set_bubbles(true);
+    textarea
+        .dispatch_event(&web_sys::Event::new_with_event_init_dict("input", &init).unwrap())
+        .unwrap();
+}
+
+fn editor_value(host: &web_sys::HtmlElement) -> String {
+    js_sys::Reflect::get(&query_one(host, ".config-editor-text"), &"value".into())
+        .unwrap()
+        .as_string()
+        .unwrap_or_default()
+}
+
+fn submit_disabled(host: &web_sys::HtmlElement) -> bool {
+    js_sys::Reflect::get(
+        &query_one(host, ".modal-footer .btn-primary"),
+        &"disabled".into(),
+    )
+    .unwrap()
+    .as_bool()
+    .unwrap_or(false)
+}
+
+/// An asset without config gets no editor: the dialog reads as before.
+#[wasm_bindgen_test]
+async fn config_editor_is_absent_without_a_schema() {
+    let show = RwSignal::new(true);
+    let host = mount_with_definitions(show, vec![definition("plain", None)]);
+    flush_effects().await;
+
+    assert!(query_all(&host, ".config-editor").is_empty());
+    assert!(!submit_disabled(&host));
+}
+
+/// The editor opens on each configured asset's defaults, keyed by asset. A
+/// field without a default is listed as required but never pre-filled, so
+/// nothing is sent for it unless typed.
+#[wasm_bindgen_test]
+async fn config_editor_prefills_defaults_and_lists_required_fields() {
+    let show = RwSignal::new(true);
+    let host = mount_with_definitions(
+        show,
+        vec![
+            definition("plain", None),
+            definition("api_data", Some(PIPELINE_SCHEMA)),
+        ],
+    );
+    flush_effects().await;
+
+    assert_eq!(
+        editor_value(&host),
+        "{\n  \"api_data\": {\n    \"batch_size\": 100\n  }\n}"
+    );
+    let fields: Vec<String> = query_all(&host, ".config-field")
+        .iter()
+        .map(|f| f.text_content().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        fields,
+        vec!["api_keystringrequired", "batch_sizeinteger= 100"]
+    );
+    assert_eq!(
+        query_all(&host, ".config-fields-asset")
+            .iter()
+            .map(|a| a.text_content().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["api_data"]
+    );
+    assert!(!submit_disabled(&host));
+}
+
+/// Malformed text blocks the submit with the reason; Reset restores the
+/// defaults and unblocks it.
+#[wasm_bindgen_test]
+async fn invalid_config_blocks_submit_until_reset() {
+    let show = RwSignal::new(true);
+    let host = mount_with_definitions(show, vec![definition("api_data", Some(PIPELINE_SCHEMA))]);
+    flush_effects().await;
+
+    type_config(&host, "{\"api_data\": ");
+    flush_effects().await;
+    let error = query_one(&host, ".config-editor-error")
+        .text_content()
+        .unwrap_or_default();
+    assert!(error.starts_with("Config is not valid JSON"), "{error}");
+    assert!(submit_disabled(&host));
+
+    type_config(&host, "{\"other\": {\"x\": 1}}");
+    flush_effects().await;
+    assert_eq!(
+        query_one(&host, ".config-editor-error")
+            .text_content()
+            .unwrap_or_default(),
+        "'other' is not in the selection."
+    );
+    assert!(submit_disabled(&host));
+
+    click(&query_one(&host, ".config-editor .link-btn"), false);
+    flush_effects().await;
+    assert!(query_all(&host, ".config-editor-error").is_empty());
+    assert_eq!(
+        editor_value(&host),
+        "{\n  \"api_data\": {\n    \"batch_size\": 100\n  }\n}"
+    );
+    assert!(!submit_disabled(&host));
+}
+
+/// Unchecking the only configured asset removes the editor; checking it
+/// again brings the defaults back (the user had not typed).
+#[wasm_bindgen_test]
+async fn config_editor_follows_the_checked_assets() {
+    let show = RwSignal::new(true);
+    let host = mount_with_definitions(
+        show,
+        vec![
+            definition("plain", None),
+            definition("api_data", Some(PIPELINE_SCHEMA)),
+        ],
+    );
+    flush_effects().await;
+    assert_eq!(query_all(&host, ".config-editor").len(), 1);
+
+    let checkboxes = query_all(&host, ".mat-dialog-asset-list .asset-row-check");
+    set_checked(&checkboxes[1], false);
+    flush_effects().await;
+    assert!(query_all(&host, ".config-editor").is_empty());
+
+    set_checked(&checkboxes[1], true);
+    flush_effects().await;
+    assert_eq!(
+        editor_value(&host),
+        "{\n  \"api_data\": {\n    \"batch_size\": 100\n  }\n}"
+    );
 }
