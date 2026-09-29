@@ -23,6 +23,7 @@ pub mod components;
 #[cfg(feature = "ssr")]
 pub mod favicon;
 pub mod helpers;
+pub mod json_text;
 #[cfg(feature = "ssr")]
 pub mod live;
 pub mod loc;
