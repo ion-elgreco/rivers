@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import grpc
+import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -165,6 +166,55 @@ def _emit_span(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=90,
     )
+
+
+def _service_name(body: bytes) -> str:
+    """The `service.name` resource attribute of an ExportTraceServiceRequest.
+
+    The attribute is a KeyValue with the key in field 1 and an AnyValue in
+    field 2 whose string_value is field 1. All lengths here fit one byte.
+    """
+    marker = b"\x0a\x0cservice.name\x12"
+    start = body.index(marker) + len(marker)
+    assert body[start + 1] == 0x0A, body[start : start + 8]
+    length = body[start + 2]
+    return body[start + 3 : start + 3 + length].decode()
+
+
+def _export_service_name(tmp_path: Path, env: dict[str, str]) -> str:
+    ca = _pem("rivers-test-ca", ca=True)
+    server = _pem("otlp-receiver", issuer=ca, usage=ExtendedKeyUsageOID.SERVER_AUTH)
+
+    with Receiver(server, ca, require_client_auth=False) as receiver:
+        result = _emit_span(
+            {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": f"https://127.0.0.1:{receiver.port}",
+                "OTEL_EXPORTER_OTLP_CERTIFICATE": _write(tmp_path, "ca.pem", ca.cert),
+                "OTEL_SERVICE_NAME": "",
+                "OTEL_RESOURCE_ATTRIBUTES": "",
+                **env,
+            }
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert receiver.exports, f"no export received; stderr:\n{result.stderr}"
+    return _service_name(receiver.exports[0].body)
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({}, "rivers"),
+        ({"OTEL_SERVICE_NAME": "analytics-cl"}, "analytics-cl"),
+        (
+            {"OTEL_RESOURCE_ATTRIBUTES": "team=data,service.name=from-attrs"},
+            "from-attrs",
+        ),
+    ],
+    ids=["default", "otel-service-name", "resource-attributes"],
+)
+def test_service_name(tmp_path: Path, env: dict[str, str], expected: str) -> None:
+    assert _export_service_name(tmp_path, env) == expected
 
 
 def _write(tmp_path: Path, name: str, data: bytes) -> str:

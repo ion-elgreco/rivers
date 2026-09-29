@@ -31,9 +31,13 @@ pub(crate) fn export_enabled() -> bool {
 /// Batches spans for export; [`shutdown`] sends the ones still queued.
 pub(crate) fn tracer() -> anyhow::Result<SdkTracer> {
     let _runtime_guard = rt().enter();
+    let mut resource = Resource::builder();
+    if !service_name_configured(&env_lookup) {
+        resource = resource.with_service_name("rivers");
+    }
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(span_exporter()?)
-        .with_resource(Resource::builder().with_service_name("rivers").build())
+        .with_resource(resource.build())
         .build();
     let tracer = provider.tracer("rivers");
     let _ = PROVIDER.set(provider);
@@ -60,6 +64,18 @@ fn span_exporter() -> anyhow::Result<SpanExporter> {
         builder = builder.with_tls_config(tls);
     }
     builder.build().context("building the OTLP span exporter")
+}
+
+/// `OTEL_SERVICE_NAME` or a `service.name` entry in `OTEL_RESOURCE_ATTRIBUTES`.
+fn service_name_configured(get: Lookup) -> bool {
+    get("OTEL_SERVICE_NAME").is_some_and(|name| !name.is_empty())
+        || get("OTEL_RESOURCE_ATTRIBUTES").is_some_and(|attrs| {
+            attrs.split_terminator(',').any(|entry| {
+                entry
+                    .split_once('=')
+                    .is_some_and(|(key, _)| key.trim() == "service.name")
+            })
+        })
 }
 
 /// Traces-specific variable first, then the generic one; empty counts as unset.
@@ -145,6 +161,29 @@ mod tests {
         )
         .unwrap();
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn service_name_from_env() {
+        let cases: &[(&[(&str, &str)], bool)] = &[
+            (&[], false),
+            (&[("OTEL_SERVICE_NAME", "")], false),
+            (&[("OTEL_SERVICE_NAME", "analytics-cl")], true),
+            (&[("OTEL_RESOURCE_ATTRIBUTES", "team=data")], false),
+            (
+                &[("OTEL_RESOURCE_ATTRIBUTES", "team=data, service.name = cl")],
+                true,
+            ),
+            (
+                &[("OTEL_RESOURCE_ATTRIBUTES", "service.namespace=data")],
+                false,
+            ),
+        ];
+        for (vars, expected) in cases {
+            let vars = lookup(vars);
+            let get = |k: &str| vars.get(k).cloned();
+            assert_eq!(service_name_configured(&get), *expected, "{vars:?}");
+        }
     }
 
     #[test]

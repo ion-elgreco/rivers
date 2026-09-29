@@ -354,7 +354,11 @@ replaces the chart value of the same name. A node-local collector endpoint
 such as `http://$(HOST_IP):4317` cannot go in `otel.endpoint`. Leave
 `otel.endpoint` unset and put two entries in `CodeLocation.spec.env`: first
 `HOST_IP` from a `status.hostIP` `fieldRef`, then the endpoint. Kubernetes
-expands `$(HOST_IP)` only from entries earlier in the list. The
+expands `$(HOST_IP)` only from entries earlier in the list.
+
+Spans from every pod have the service name `rivers`. To tell code locations
+apart in your backend, set `OTEL_SERVICE_NAME` in each `CodeLocation.spec.env`,
+for example `analytics`. Its run and step pods get the same name. The
 [environment variable reference](../api-reference/environment-variables.md#observability)
 lists every variable rivers reads.
 
