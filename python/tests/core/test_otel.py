@@ -107,7 +107,7 @@ def _pem(
 
 @dataclass
 class Export:
-    metadata: dict[str, str]
+    metadata: list[tuple[str, str]]
     body: bytes
     peer_common_name: str | None
 
@@ -128,7 +128,7 @@ class Receiver:
             auth = context.auth_context()
             common_name = auth.get("x509_common_name", [b""])[0].decode() or None
             self.exports.append(
-                Export(dict(context.invocation_metadata()), request, common_name)
+                Export(list(context.invocation_metadata()), request, common_name)
             )
             return b""  # an empty ExportTraceServiceResponse means success
 
@@ -166,6 +166,10 @@ def _emit_span(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=90,
     )
+
+
+def _metadata_values(export: Export, key: str) -> list[str]:
+    return [value for name, value in export.metadata if name == key]
 
 
 def _service_name(body: bytes) -> str:
@@ -261,7 +265,7 @@ def test_export_over_mutual_tls_with_bearer_header(tmp_path: Path) -> None:
     assert "OpenTelemetry export disabled" not in result.stderr
     assert receiver.exports, f"no export received; stderr:\n{result.stderr}"
     export = receiver.exports[0]
-    assert export.metadata["authorization"] == TOKEN
+    assert _metadata_values(export, "authorization") == [TOKEN]
     assert export.peer_common_name == "rivers-client"
     # Protobuf strings are raw UTF-8: the service name, span name and sensor name.
     assert b"rivers" in export.body
@@ -303,6 +307,25 @@ def test_empty_traces_endpoint_falls_back_to_generic_endpoint(tmp_path: Path) ->
     assert "OpenTelemetry export disabled" not in result.stderr
     assert receiver.exports, f"no export received; stderr:\n{result.stderr}"
     assert b"otel_probe" in receiver.exports[0].body
+
+
+def test_empty_traces_headers_fall_back_to_generic_headers(tmp_path: Path) -> None:
+    ca = _pem("rivers-test-ca", ca=True)
+    server = _pem("otlp-receiver", issuer=ca, usage=ExtendedKeyUsageOID.SERVER_AUTH)
+
+    with Receiver(server, ca, require_client_auth=False) as receiver:
+        result = _emit_span(
+            {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": f"https://127.0.0.1:{receiver.port}",
+                "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "",
+                "OTEL_EXPORTER_OTLP_HEADERS": f"authorization={TOKEN}",
+                "OTEL_EXPORTER_OTLP_CERTIFICATE": _write(tmp_path, "ca.pem", ca.cert),
+            }
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert receiver.exports, f"no export received; stderr:\n{result.stderr}"
+    assert _metadata_values(receiver.exports[0], "authorization") == [TOKEN]
 
 
 def test_receiver_requiring_a_client_certificate_gets_nothing_without_one(

@@ -68,7 +68,7 @@ Read by `rivers-ui` (the standalone UI server, distinct from the in-process UI s
 | `OTEL_EXPORTER_OTLP_CERTIFICATE` | unset | Path to a PEM file holding the CA that signs the collector's certificate. Replaces the system and bundled roots. Requires an `https://` endpoint. |
 | `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` / `OTEL_EXPORTER_OTLP_CLIENT_KEY` | unset | Paths to a PEM client certificate and private key for mutual TLS. Set both or neither. Requires an `https://` endpoint. |
 | `OTEL_EXPORTER_OTLP_TIMEOUT` | `10000` | Export timeout in milliseconds. |
-| `OTEL_EXPORTER_OTLP_TRACES_*` | unset | Traces-specific form of each variable above (`..._TRACES_ENDPOINT`, `..._TRACES_HEADERS`, ...). Takes precedence over the generic one. An empty `..._TRACES_ENDPOINT` or certificate variable counts as unset. |
+| `OTEL_EXPORTER_OTLP_TRACES_*` | unset | Traces-specific form of each variable above (`..._TRACES_ENDPOINT`, `..._TRACES_HEADERS`, ...). Takes precedence over the generic one. An empty `..._TRACES_ENDPOINT`, `..._TRACES_HEADERS` or certificate variable counts as unset. |
 | `OTEL_SERVICE_NAME` | `rivers` | `service.name` on exported spans. A `service.name` entry in `OTEL_RESOURCE_ATTRIBUTES` also sets it. Set one or the other, not both. |
 | `OTEL_RESOURCE_ATTRIBUTES` | unset | Extra resource attributes on exported spans, as comma-separated `key=value` pairs. |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter. Honoured by the operator and the UI binary. |

@@ -1,18 +1,21 @@
 //! OTLP span exporter built from the `OTEL_EXPORTER_OTLP_*` env vars.
 //!
-//! The exporter crate reads the headers and timeout itself. The endpoint is
+//! The exporter crate reads the timeout itself. The endpoint and headers are
 //! resolved here because the crate treats an empty traces-specific variable
 //! as set; the TLS variables because the crate does not read them.
 
+use std::str::FromStr;
 use std::sync::OnceLock;
 
 use anyhow::Context;
+use http::{HeaderMap, HeaderName, HeaderValue};
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithTonicConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider};
 use pyo3::prelude::*;
 use rustls::pki_types::TrustAnchor;
+use tonic::metadata::MetadataMap;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 
 use crate::runtime::rt;
@@ -61,6 +64,7 @@ fn span_exporter() -> anyhow::Result<SpanExporter> {
     if let Some((_, endpoint)) = otlp_var(&env_lookup, "ENDPOINT") {
         builder = builder.with_endpoint(endpoint);
     }
+    builder = builder.with_metadata(headers(&env_lookup));
     if let Some(tls) = tls_config(&env_lookup)? {
         builder = builder.with_tls_config(tls);
     }
@@ -89,6 +93,49 @@ fn otlp_var(get: Lookup, name: &str) -> Option<(String, String)> {
                 .filter(|value| !value.is_empty())
                 .map(|value| (var, value))
         })
+}
+
+/// Same format as the exporter crate: comma-separated `key=value` pairs with
+/// URL-encoded values. Invalid entries are skipped, as the crate does. The
+/// crate still adds the headers it reads itself; for a shared key its values
+/// replace these, so no header is sent twice.
+fn headers(get: Lookup) -> MetadataMap {
+    let Some((_, value)) = otlp_var(get, "HEADERS") else {
+        return MetadataMap::new();
+    };
+    let headers: HeaderMap = value
+        .split_terminator(',')
+        .filter_map(|entry| {
+            let (key, value) = entry.split_once('=')?;
+            let (key, value) = (key.trim(), value.trim());
+            if key.is_empty() || value.is_empty() {
+                return None;
+            }
+            let value = url_decode(value).unwrap_or_else(|| value.to_string());
+            Some((
+                HeaderName::from_str(key).ok()?,
+                HeaderValue::from_str(&value).ok()?,
+            ))
+        })
+        .collect();
+    MetadataMap::from_headers(headers)
+}
+
+/// `None` for a malformed `%XX` escape or bytes that are not UTF-8.
+fn url_decode(value: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(value.len());
+    let mut rest = value.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'%' {
+            let hex = std::str::from_utf8(tail.get(..2)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(byte);
+            rest = tail;
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn read_pem(get: Lookup, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -222,6 +269,31 @@ mod tests {
         assert_eq!(
             otlp_var(&get, "ENDPOINT").map(|(_, v)| v).as_deref(),
             Some("http://generic:4317")
+        );
+    }
+
+    #[test]
+    fn headers_from_env() {
+        let vars = lookup(&[
+            ("OTEL_EXPORTER_OTLP_TRACES_HEADERS", ""),
+            (
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                " Authorization = Bearer%20a%2Cb ,x-bad=%zz, =v,k=,no-equals,x-tenant=data",
+            ),
+        ]);
+        let get = |k: &str| vars.get(k).cloned();
+        let headers = headers(&get).into_headers();
+        let entries: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                ("authorization", "Bearer a,b"),
+                ("x-bad", "%zz"),
+                ("x-tenant", "data")
+            ]
         );
     }
 

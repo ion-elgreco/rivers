@@ -15,6 +15,7 @@ rivers-ui = { path = "../rust/rivers-ui", features = ["ssr"] }
 rivers-api = { path = "../rust/rivers-api" }
 petgraph.workspace = true
 tonic.workspace = true
+http = "1"
 tonic-prost.workspace = true
 tonic-health.workspace = true
 prost.workspace = true
