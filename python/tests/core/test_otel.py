@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import datetime as dt
+import ipaddress
 import os
-import shutil
-import socket
 import subprocess
 import sys
-import threading
+from concurrent import futures
+from dataclasses import dataclass, field
 from pathlib import Path
 
-import pytest
+import grpc
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+TRACE_SERVICE = "opentelemetry.proto.collector.trace.v1.TraceService"
+TOKEN = "Bearer test-token"
 
 # One sensor evaluation is the only code path that opens a span, so the
 # exporter has something to send.
@@ -26,69 +34,141 @@ def a() -> int:
 
 
 @rs.Sensor(
-    name="s",
+    name="otel_probe",
     asset_selection=["a"],
     minimum_interval="0s",
     default_status=rs.SensorStatus.Running,
 )
-def s(context: rs.SensorEvaluationContext):
+def otel_probe(context: rs.SensorEvaluationContext):
     return rs.SkipReason("noop")
 
 
 storage = memory_storage()
-repo = rs.CodeRepository(assets=[a], sensors=[s])
+repo = rs.CodeRepository(assets=[a], sensors=[otel_probe])
 repo.resolve(storage=storage)
 daemon = AutomationDaemon(repo=repo, storage=storage)
 daemon.start()
 deadline = time.monotonic() + 15
-while time.monotonic() < deadline and not storage.get_ticks("s", limit=1):
+while time.monotonic() < deadline and not storage.get_ticks("otel_probe", limit=1):
     time.sleep(0.1)
 daemon.stop()
 time.sleep(2)
 """
 
 
-def _otel_env(**overrides: str) -> dict[str, str]:
-    env = os.environ.copy()
-    env.update(
-        {
-            "OTEL_BSP_SCHEDULE_DELAY": "100",
-            "OTEL_EXPORTER_OTLP_TIMEOUT": "1000",
-        }
+@dataclass
+class Pem:
+    cert: bytes
+    key: bytes
+
+
+def _pem(
+    common_name: str,
+    *,
+    issuer: Pem | None = None,
+    ca: bool = False,
+    usage: x509.ObjectIdentifier | None = None,
+) -> Pem:
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    issuer_cert = x509.load_pem_x509_certificate(issuer.cert) if issuer else None
+    issuer_key = serialization.load_pem_private_key(issuer.key, None) if issuer else key
+    now = dt.datetime.now(dt.timezone.utc)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(issuer_cert.subject if issuer_cert else name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - dt.timedelta(minutes=1))
+        .not_valid_after(now + dt.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
     )
-    env.update(overrides)
-    return env
-
-
-def _run_and_capture_first_bytes(
-    env: dict[str, str],
-) -> tuple[subprocess.CompletedProcess[str], bytes]:
-    """Return the first bytes the exporter sends to a local listener."""
-    received: dict[str, bytes] = {}
-    with socket.socket() as server:
-        server.bind(("127.0.0.1", 0))
-        server.listen(1)
-        server.settimeout(40)
-        port = server.getsockname()[1]
-
-        def accept() -> None:
-            conn, _ = server.accept()
-            with conn:
-                conn.settimeout(10)
-                received["head"] = conn.recv(16)
-
-        thread = threading.Thread(target=accept, daemon=True)
-        thread.start()
-        env["OTEL_EXPORTER_OTLP_ENDPOINT"] = f"https://127.0.0.1:{port}"
-        result = subprocess.run(
-            [sys.executable, "-c", EMIT_SPAN_SCRIPT],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=90,
+    if usage is not None:
+        builder = builder.add_extension(
+            x509.ExtendedKeyUsage([usage]), critical=False
+        ).add_extension(
+            x509.SubjectAlternativeName(
+                [x509.IPAddress(ipaddress.IPv4Address("127.0.0.1"))]
+            ),
+            critical=False,
         )
-        thread.join(timeout=40)
-    return result, received.get("head", b"")
+    cert = builder.sign(issuer_key, hashes.SHA256())
+    return Pem(
+        cert=cert.public_bytes(serialization.Encoding.PEM),
+        key=key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ),
+    )
+
+
+@dataclass
+class Export:
+    metadata: dict[str, str]
+    body: bytes
+    peer_common_name: str | None
+
+
+@dataclass
+class Receiver:
+    """A TLS gRPC server that accepts OTLP trace exports and records them."""
+
+    server_pem: Pem
+    ca_pem: Pem
+    require_client_auth: bool
+    exports: list[Export] = field(default_factory=list)
+    port: int = 0
+    _server: grpc.Server = field(init=False)
+
+    def __enter__(self) -> Receiver:
+        def export(request: bytes, context: grpc.ServicerContext) -> bytes:
+            auth = context.auth_context()
+            common_name = auth.get("x509_common_name", [b""])[0].decode() or None
+            self.exports.append(
+                Export(dict(context.invocation_metadata()), request, common_name)
+            )
+            return b""  # an empty ExportTraceServiceResponse means success
+
+        handler = grpc.method_handlers_generic_handler(
+            TRACE_SERVICE,
+            {"Export": grpc.unary_unary_rpc_method_handler(export)},
+        )
+        self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+        self._server.add_generic_rpc_handlers((handler,))
+        credentials = grpc.ssl_server_credentials(
+            [(self.server_pem.key, self.server_pem.cert)],
+            root_certificates=self.ca_pem.cert,
+            require_client_auth=self.require_client_auth,
+        )
+        self.port = self._server.add_secure_port("127.0.0.1:0", credentials)
+        self._server.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.stop(grace=None)
+
+
+def _emit_span(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", EMIT_SPAN_SCRIPT],
+        env={
+            **os.environ,
+            "OTEL_BSP_SCHEDULE_DELAY": "100",
+            "OTEL_EXPORTER_OTLP_TIMEOUT": "2000",
+            **env,
+        },
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+
+
+def _write(tmp_path: Path, name: str, data: bytes) -> str:
+    path = tmp_path / name
+    path.write_bytes(data)
+    return str(path)
 
 
 def test_import_with_otlp_endpoint() -> None:
@@ -105,57 +185,55 @@ def test_import_with_otlp_endpoint() -> None:
     )
 
 
-def test_https_endpoint_negotiates_tls() -> None:
-    result, head = _run_and_capture_first_bytes(
-        _otel_env(OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer test-token")
-    )
+def test_export_over_mutual_tls_with_bearer_header(tmp_path: Path) -> None:
+    ca = _pem("rivers-test-ca", ca=True)
+    server = _pem("otlp-receiver", issuer=ca, usage=ExtendedKeyUsageOID.SERVER_AUTH)
+    client = _pem("rivers-client", issuer=ca, usage=ExtendedKeyUsageOID.CLIENT_AUTH)
 
-    assert result.returncode == 0, result.stderr
-    assert "OpenTelemetry export disabled" not in result.stderr
-    assert head, "the exporter never connected"
-    # TLS record header; plaintext HTTP/2 would start with "PRI * HTTP/2.0".
-    assert head[:2] == b"\x16\x03", head
-
-
-def test_mutual_tls_material_is_accepted(tmp_path: Path) -> None:
-    openssl = shutil.which("openssl")
-    if openssl is None:
-        pytest.skip("openssl CLI not available")
-    cert, key = tmp_path / "client.pem", tmp_path / "client.key"
-    subprocess.run(
-        [
-            openssl,
-            "req",
-            "-x509",
-            "-newkey",
-            "ec",
-            "-pkeyopt",
-            "ec_paramgen_curve:prime256v1",
-            "-nodes",
-            "-keyout",
-            str(key),
-            "-out",
-            str(cert),
-            "-subj",
-            "/CN=rivers-test",
-            "-days",
-            "1",
-        ],
-        check=True,
-        capture_output=True,
-    )
-
-    result, head = _run_and_capture_first_bytes(
-        _otel_env(
-            OTEL_EXPORTER_OTLP_CERTIFICATE=str(cert),
-            OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE=str(cert),
-            OTEL_EXPORTER_OTLP_CLIENT_KEY=str(key),
+    with Receiver(server, ca, require_client_auth=True) as receiver:
+        result = _emit_span(
+            {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": f"https://127.0.0.1:{receiver.port}",
+                "OTEL_EXPORTER_OTLP_HEADERS": f"authorization={TOKEN}",
+                "OTEL_EXPORTER_OTLP_CERTIFICATE": _write(tmp_path, "ca.pem", ca.cert),
+                "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE": _write(
+                    tmp_path, "client.pem", client.cert
+                ),
+                "OTEL_EXPORTER_OTLP_CLIENT_KEY": _write(
+                    tmp_path, "client.key", client.key
+                ),
+            }
         )
-    )
 
     assert result.returncode == 0, result.stderr
     assert "OpenTelemetry export disabled" not in result.stderr
-    assert head[:2] == b"\x16\x03", head
+    assert receiver.exports, f"no export received; stderr:\n{result.stderr}"
+    export = receiver.exports[0]
+    assert export.metadata["authorization"] == TOKEN
+    assert export.peer_common_name == "rivers-client"
+    # Protobuf strings are raw UTF-8: the service name, span name and sensor name.
+    assert b"rivers" in export.body
+    assert b"eval" in export.body
+    assert b"otel_probe" in export.body
+
+
+def test_receiver_requiring_a_client_certificate_gets_nothing_without_one(
+    tmp_path: Path,
+) -> None:
+    ca = _pem("rivers-test-ca", ca=True)
+    server = _pem("otlp-receiver", issuer=ca, usage=ExtendedKeyUsageOID.SERVER_AUTH)
+
+    with Receiver(server, ca, require_client_auth=True) as receiver:
+        result = _emit_span(
+            {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": f"https://127.0.0.1:{receiver.port}",
+                "OTEL_EXPORTER_OTLP_HEADERS": f"authorization={TOKEN}",
+                "OTEL_EXPORTER_OTLP_CERTIFICATE": _write(tmp_path, "ca.pem", ca.cert),
+            }
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert receiver.exports == []
 
 
 def test_unreadable_certificate_disables_export_and_names_the_variable(
