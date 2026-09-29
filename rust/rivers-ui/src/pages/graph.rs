@@ -108,9 +108,24 @@ pub fn GraphPage() -> impl IntoView {
     // topology come from the code-location gRPC and don't change mid-session.
     let (refresh_tick, set_refresh_tick) = signal(0u64);
     let loc = use_current_location();
+    let (filter_kind, set_filter_kind) = use_query_param_list("kind");
+    let (filter_group, set_filter_group) = use_query_param_list("group");
+    // Laid out from what is shown, so filtering or collapsing leaves no holes.
     let layout = Resource::new(
-        move || (center_layers.get(), loc.get()),
-        |(cl, (ns, name))| async move { get_graph_layout(ns, name, Some(cl)).await },
+        move || {
+            let mut expanded: Vec<String> = expanded_graphs.get().into_iter().collect();
+            expanded.sort();
+            (
+                center_layers.get(),
+                loc.get(),
+                filter_kind.get(),
+                filter_group.get(),
+                expanded,
+            )
+        },
+        |(cl, (ns, name), kinds, groups, expanded)| async move {
+            get_graph_layout(ns, name, cl, kinds, groups, expanded).await
+        },
     );
     let topology = Resource::new(
         move || loc.get(),
@@ -133,8 +148,6 @@ pub fn GraphPage() -> impl IntoView {
     // Multi-selection in click order; the last entry is the focused node.
     let (selected_nodes, set_selected_nodes) = signal(Vec::<String>::new());
     let focused_node = Signal::derive(move || selected_nodes.get().last().cloned());
-    let (filter_kind, set_filter_kind) = use_query_param_list("kind");
-    let (filter_group, set_filter_group) = use_query_param_list("group");
 
     // Memos, not derives: a derive re-walks the whole topology on every read
     // (each selection change reads these several times); a memo recomputes
@@ -183,6 +196,14 @@ pub fn GraphPage() -> impl IntoView {
     let (layout_h, set_layout_h) = signal(0.0f64);
 
     let (did_auto_fit, set_did_auto_fit) = signal(false);
+    // A filter change lays the graph out anew; fit that layout once it lands.
+    Effect::new(move |prev: Option<(Vec<String>, Vec<String>)>| {
+        let filters = (filter_kind.get(), filter_group.get());
+        if prev.is_some_and(|p| p != filters) {
+            set_did_auto_fit.set(false);
+        }
+        filters
+    });
 
     let (dragging, set_dragging) = signal(false);
     let (drag_start_x, set_drag_start_x) = signal(0.0f64);
@@ -309,12 +330,13 @@ pub fn GraphPage() -> impl IntoView {
         },
     );
 
+    // Filter options come from the whole graph, not the filtered layout.
     let all_kinds = Signal::derive(move || {
-        layout
+        topology
             .get()
             .and_then(|r| r.ok())
-            .map(|l| {
-                let mut kinds: Vec<String> = l.nodes.iter().map(|n| n.kind.clone()).collect();
+            .map(|t| {
+                let mut kinds: Vec<String> = t.nodes.iter().map(|n| n.kind.clone()).collect();
                 kinds.sort();
                 kinds.dedup();
                 kinds
@@ -323,12 +345,12 @@ pub fn GraphPage() -> impl IntoView {
     });
 
     let all_groups_list = Signal::derive(move || {
-        layout
+        topology
             .get()
             .and_then(|r| r.ok())
-            .map(|l| {
+            .map(|t| {
                 let mut groups: Vec<String> =
-                    l.nodes.iter().filter_map(|n| n.group.clone()).collect();
+                    t.nodes.iter().filter_map(|n| n.group.clone()).collect();
                 groups.sort();
                 groups.dedup();
                 groups
@@ -384,6 +406,11 @@ pub fn GraphPage() -> impl IntoView {
         let w = el_w.get() * vb_scale.get();
         let h = el_h.get() * vb_scale.get();
         (vb_x.get(), vb_y.get(), w, h)
+    });
+    // The map helps only while part of the graph is out of view.
+    let graph_in_view = Signal::derive(move || {
+        let (x, y, w, h) = viewport.get();
+        x <= 1.0 && y <= 1.0 && x + w >= layout_w.get() - 1.0 && y + h >= layout_h.get() - 1.0
     });
 
     let fit_to_view = move |_| {
@@ -546,56 +573,7 @@ pub fn GraphPage() -> impl IntoView {
             >
                     {move || {
                         layout.get().map(|result| match result {
-                            Ok(mut layout_result) => {
-                                let fk = filter_kind.get();
-                                let fg = filter_group.get();
-
-                                // Collapse: hide children of non-expanded graph assets
-                                let exp = expanded_graphs.get();
-                                {
-                                    let mut remap = std::collections::HashMap::<String, String>::new();
-                                    for node in &layout_result.nodes {
-                                        if let Some(ref pg) = node.parent_graph
-                                            && !exp.contains(pg) {
-                                                remap.insert(node.id.clone(), pg.clone());
-                                            }
-                                    }
-                                    if !remap.is_empty() {
-                                        let hidden: std::collections::HashSet<&str> =
-                                            remap.keys().map(|s| s.as_str()).collect();
-                                        layout_result.nodes.retain(|n| !hidden.contains(n.id.as_str()));
-
-                                        let visible: std::collections::HashSet<String> =
-                                            layout_result.nodes.iter().map(|n| n.id.clone()).collect();
-                                        let mut seen = std::collections::HashSet::new();
-                                        layout_result.edges = layout_result.edges.into_iter().filter_map(|mut e| {
-                                            if let Some(pg) = remap.get(&e.source) {
-                                                e.source = pg.clone();
-                                                e.waypoints.clear();
-                                            }
-                                            if let Some(pg) = remap.get(&e.target) {
-                                                e.target = pg.clone();
-                                                e.waypoints.clear();
-                                            }
-                                            if e.source == e.target { return None; }
-                                            if !visible.contains(&e.source) || !visible.contains(&e.target) { return None; }
-                                            let key = (e.source.clone(), e.target.clone());
-                                            if seen.insert(key) { Some(e) } else { None }
-                                        }).collect();
-                                    }
-                                }
-
-                                if !fk.is_empty() {
-                                    layout_result.nodes.retain(|n| fk.contains(&n.kind));
-                                    let node_ids: std::collections::HashSet<String> = layout_result.nodes.iter().map(|n| n.id.clone()).collect();
-                                    layout_result.edges.retain(|e| node_ids.contains(&e.source) && node_ids.contains(&e.target));
-                                }
-                                if !fg.is_empty() {
-                                    layout_result.nodes.retain(|n| n.group.as_ref().map(|g| fg.contains(g)).unwrap_or(false));
-                                    let node_ids: std::collections::HashSet<String> = layout_result.nodes.iter().map(|n| n.id.clone()).collect();
-                                    layout_result.edges.retain(|e| node_ids.contains(&e.source) && node_ids.contains(&e.target));
-                                }
-
+                            Ok(layout_result) => {
                                 set_layout_w.set(layout_result.width.max(400.0));
                                 set_layout_h.set(layout_result.height.max(300.0));
 
@@ -663,18 +641,20 @@ pub fn GraphPage() -> impl IntoView {
                                         graph_asset_names=ga_names
                                         expanded_graphs=exp_graphs
                                     />
-                                    <DagMinimap
-                                        nodes=mini_nodes
-                                        edges=mini_edges
-                                        viewport=viewport
-                                        selected=sel_for_mini
-                                        ancestors=anc_for_mini
-                                        descendants=desc_for_mini
-                                        on_pan=Callback::new(move |(x, y): (f64, f64)| {
-                                            set_vb_x.set(x);
-                                            set_vb_y.set(y);
-                                        })
-                                    />
+                                    <div style:display=move || if graph_in_view.get() { "none" } else { "" }>
+                                        <DagMinimap
+                                            nodes=mini_nodes
+                                            edges=mini_edges
+                                            viewport=viewport
+                                            selected=sel_for_mini
+                                            ancestors=anc_for_mini
+                                            descendants=desc_for_mini
+                                            on_pan=Callback::new(move |(x, y): (f64, f64)| {
+                                                set_vb_x.set(x);
+                                                set_vb_y.set(y);
+                                            })
+                                        />
+                                    </div>
                                 }.into_any()
                             }
                             Err(e) => view! { <div class="error-msg">{format!("Couldn't load lineage: {}", crate::helpers::err_text(&e))}</div> }.into_any(),

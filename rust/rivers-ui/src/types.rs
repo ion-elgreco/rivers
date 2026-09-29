@@ -369,6 +369,53 @@ pub struct GraphTopology {
 }
 
 impl GraphTopology {
+    /// What the lineage page shows. A node inside a collapsed graph asset
+    /// shows as the outermost collapsed graph around it, and its edges move
+    /// there; then the kind and group filters apply. An empty filter keeps
+    /// everything; a group filter drops ungrouped nodes.
+    pub fn visible(&self, kinds: &[String], groups: &[String], expanded: &[String]) -> Self {
+        use std::collections::{HashMap, HashSet};
+
+        let parent: HashMap<&str, &str> = self
+            .nodes
+            .iter()
+            .filter_map(|n| n.parent_graph.as_deref().map(|p| (n.name.as_str(), p)))
+            .collect();
+        let expanded: HashSet<&str> = expanded.iter().map(String::as_str).collect();
+        let shown_as = |name: &str| -> String {
+            let (mut shown, mut current) = (name, name);
+            for _ in 0..=parent.len() {
+                let Some(&p) = parent.get(current) else { break };
+                if !expanded.contains(p) {
+                    shown = p;
+                }
+                current = p;
+            }
+            shown.to_string()
+        };
+
+        let nodes: Vec<TopologyNode> = self
+            .nodes
+            .iter()
+            .filter(|n| shown_as(&n.name) == n.name)
+            .filter(|n| kinds.is_empty() || kinds.contains(&n.kind))
+            .filter(|n| groups.is_empty() || n.group.as_ref().is_some_and(|g| groups.contains(g)))
+            .cloned()
+            .collect();
+        let names: HashSet<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        let mut seen = HashSet::new();
+        let edges = self
+            .edges
+            .iter()
+            .map(|(from, to)| (shown_as(from), shown_as(to)))
+            .filter(|(from, to)| {
+                from != to && names.contains(from.as_str()) && names.contains(to.as_str())
+            })
+            .filter(|edge| seen.insert(edge.clone()))
+            .collect();
+        Self { nodes, edges }
+    }
+
     /// Compute (ancestors, descendants) of `node_name` from the edge list.
     /// Ancestors = transitive dependencies; descendants = transitive dependents.
     pub fn lineage(&self, node_name: &str) -> (Vec<String>, Vec<String>) {
@@ -433,53 +480,6 @@ impl GraphTopology {
             .filter(|(_, to)| to == node_name)
             .map(|(from, _)| from.clone())
             .collect()
-    }
-
-    /// Return a new topology with collapsed graph assets.
-    /// Nodes whose `parent_graph` points to a graph asset NOT in `expanded` are removed.
-    /// Edges to/from removed nodes are rewired to their parent graph asset node.
-    pub fn collapsed(&self, expanded: &std::collections::HashSet<String>) -> GraphTopology {
-        use std::collections::{HashMap, HashSet};
-
-        let mut remap: HashMap<&str, &str> = HashMap::new();
-        for node in &self.nodes {
-            if let Some(ref parent) = node.parent_graph
-                && !expanded.contains(parent)
-            {
-                remap.insert(&node.name, parent.as_str());
-            }
-        }
-
-        let hidden: HashSet<&str> = remap.keys().copied().collect();
-        let nodes: Vec<TopologyNode> = self
-            .nodes
-            .iter()
-            .filter(|n| !hidden.contains(n.name.as_str()))
-            .cloned()
-            .collect();
-
-        let visible: HashSet<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-
-        let mut edges: Vec<(String, String)> = Vec::new();
-        let mut seen_edges: HashSet<(String, String)> = HashSet::new();
-        for (from, to) in &self.edges {
-            let new_from = remap.get(from.as_str()).copied().unwrap_or(from.as_str());
-            let new_to = remap.get(to.as_str()).copied().unwrap_or(to.as_str());
-            // Self-edges arise from internal edges within a collapsed graph.
-            if new_from == new_to {
-                continue;
-            }
-            if !visible.contains(new_from) || !visible.contains(new_to) {
-                continue;
-            }
-            let edge = (new_from.to_string(), new_to.to_string());
-            if seen_edges.insert(edge.clone()) {
-                edges.push(edge);
-            }
-        }
-        edges.sort();
-
-        GraphTopology { nodes, edges }
     }
 }
 
@@ -1709,6 +1709,99 @@ mod topology_tests {
             group: None,
             parent_graph: None,
         }
+    }
+
+    fn inside(name: &str, graph: &str) -> TopologyNode {
+        TopologyNode {
+            name: name.into(),
+            kind: "task".into(),
+            group: None,
+            parent_graph: Some(graph.into()),
+        }
+    }
+
+    fn edge(from: &str, to: &str) -> (String, String) {
+        (from.into(), to.into())
+    }
+
+    fn names(topo: &GraphTopology) -> Vec<&str> {
+        topo.nodes.iter().map(|n| n.name.as_str()).collect()
+    }
+
+    /// A collapsed graph asset stands in for its children: their edges move
+    /// to it, edges between them vanish, and the resulting duplicates merge.
+    #[test]
+    fn visible_folds_children_into_a_collapsed_graph() {
+        let topo = GraphTopology {
+            nodes: vec![
+                node("raw"),
+                node("pipe"),
+                inside("pipe/a", "pipe"),
+                inside("pipe/b", "pipe"),
+                node("report"),
+            ],
+            edges: vec![
+                edge("pipe/a", "raw"),
+                edge("pipe/b", "pipe/a"),
+                edge("pipe", "pipe/b"),
+                edge("report", "pipe/a"),
+                edge("report", "pipe/b"),
+            ],
+        };
+
+        let collapsed = topo.visible(&[], &[], &[]);
+        assert_eq!(names(&collapsed), vec!["raw", "pipe", "report"]);
+        assert_eq!(
+            collapsed.edges,
+            vec![edge("pipe", "raw"), edge("report", "pipe")]
+        );
+
+        let expanded = topo.visible(&[], &[], &["pipe".into()]);
+        assert_eq!(expanded.nodes.len(), 5);
+        assert_eq!(expanded.edges, topo.edges);
+    }
+
+    /// Inside a collapsed outer graph, an expanded inner graph still hides:
+    /// everything shows as the outermost collapsed graph.
+    #[test]
+    fn visible_folds_nested_graphs_into_the_outermost_collapsed_one() {
+        let topo = GraphTopology {
+            nodes: vec![
+                node("src"),
+                node("outer"),
+                inside("inner", "outer"),
+                inside("leaf", "inner"),
+            ],
+            edges: vec![edge("leaf", "src")],
+        };
+        let shown = topo.visible(&[], &[], &["inner".into()]);
+        assert_eq!(names(&shown), vec!["src", "outer"]);
+        assert_eq!(shown.edges, vec![edge("outer", "src")]);
+    }
+
+    #[test]
+    fn visible_applies_kind_and_group_filters() {
+        let grouped = |name: &str, group: Option<&str>| TopologyNode {
+            group: group.map(Into::into),
+            ..node(name)
+        };
+        let topo = GraphTopology {
+            nodes: vec![
+                grouped("a", Some("g1")),
+                grouped("b", Some("g2")),
+                grouped("c", None),
+                inside("t", "b"),
+            ],
+            edges: vec![edge("b", "a"), edge("c", "b")],
+        };
+
+        let g1_g2 = topo.visible(&[], &["g1".into(), "g2".into()], &[]);
+        assert_eq!(names(&g1_g2), vec!["a", "b"]);
+        assert_eq!(g1_g2.edges, vec![edge("b", "a")]);
+
+        let tasks = topo.visible(&["task".into()], &[], &["b".into()]);
+        assert_eq!(names(&tasks), vec!["t"]);
+        assert!(tasks.edges.is_empty());
     }
 
     /// `summary` depends on `raw_data` → edge `(summary, raw_data)`. Selecting
