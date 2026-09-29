@@ -123,23 +123,51 @@ def test_collector_rejects_exports_without_the_bearer_token():
             export(b"", metadata=(("authorization", f"Bearer {TOKEN}"),), timeout=10)
 
 
+def _collector_logs() -> str:
+    pods = [
+        pod
+        for pod in Pod.list(
+            namespace=NAMESPACE,
+            label_selector=f"app.kubernetes.io/name={COLLECTOR}",
+            api=kube_api(),
+        )
+        if pod.raw["status"].get("phase") == "Running"
+        and not pod.raw["metadata"].get("deletionTimestamp")
+    ]
+    return "\n".join(line for pod in pods for line in pod.logs())
+
+
+def _probe_spans(logs: str) -> list[tuple[str, str]]:
+    """(resource header, span block) for each `eval` span of `otel_probe`.
+
+    The debug exporter prints each batch as a `ResourceSpans #N` header with
+    the resource attributes, followed by one `Span #N` block per span.
+    """
+    found = []
+    for batch in re.split(r"\bResourceSpans #\d+", logs)[1:]:
+        header, *spans = re.split(r"\bSpan #\d+", batch)
+        found += [
+            (header, span)
+            for span in spans
+            if re.search(r"^\s*Name\s*:\s*eval\s*$", span, re.M)
+            and "-> name: Str(otel_probe)" in span
+        ]
+    return found
+
+
 def test_collector_receives_the_probe_sensor_span():
     """The daemon in the code-location pod evaluates `otel_probe` every 30s; the
     collector logs the `eval` span it exports with the token from the Secret."""
-    (pod,) = Pod.list(
-        namespace=NAMESPACE,
-        label_selector=f"app.kubernetes.io/name={COLLECTOR}",
-        api=kube_api(),
-    )
     logs = ""
     deadline = time.monotonic() + 150
     while time.monotonic() < deadline:
-        logs = "\n".join(pod.logs(tail_lines=4000))
-        if re.search(r"Name\s*:\s*eval", logs) and "otel_probe" in logs:
+        logs = _collector_logs()
+        if spans := _probe_spans(logs):
             break
         time.sleep(5)
     else:
         pytest.fail(f"no eval span for otel_probe in collector logs:\n{logs[-4000:]}")
 
-    assert "service.name: Str(rivers)" in logs
-    assert "automation_type: Str(Sensor)" in logs
+    header, span = spans[-1]
+    assert "service.name: Str(rivers)" in header, header
+    assert "automation_type: Str(Sensor)" in span, span

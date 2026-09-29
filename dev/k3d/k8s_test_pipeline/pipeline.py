@@ -446,8 +446,9 @@ all_tasks = [
     graph_flaky_inner,
 ]
 
-# Sensor evaluation is the only code path that opens a tracing span; this
-# probe gives the OTel integration test something to find in the collector.
+
+# Storage and gRPC spans are exported too; this probe's `eval` span carries
+# `name=otel_probe`, so the OTel integration test can find it in the collector.
 @Sensor(
     name="otel_probe",
     asset_selection=["source_data"],
