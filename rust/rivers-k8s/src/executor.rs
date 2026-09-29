@@ -665,6 +665,10 @@ mod tests {
             env_val(&env, "OTEL_EXPORTER_OTLP_ENDPOINT"),
             Some("https://otlp.example.com:4317".to_string())
         );
+        assert_eq!(
+            env_val(&env, "RIVERS_OTEL_ENDPOINT"),
+            Some("https://otlp.example.com:4317".to_string())
+        );
         let envs = job.spec.unwrap().template.spec.unwrap().containers[0]
             .env
             .clone()

@@ -378,6 +378,7 @@ mod tests {
             serde_json::Value::Array(env[7..].to_vec()),
             json!([
                 { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://team-collector:4317" },
+                { "name": "RIVERS_OTEL_ENDPOINT", "value": "https://otlp.example.com:4317" },
                 { "name": "OTEL_EXPORTER_OTLP_HEADERS", "valueFrom": { "secretKeyRef": { "name": "otel-headers", "key": "headers" } } },
                 { "name": "RIVERS_OTEL_HEADERS_SECRET_NAME", "value": "otel-headers" },
                 { "name": "RIVERS_OTEL_HEADERS_SECRET_KEY", "value": "headers" },

@@ -193,10 +193,12 @@ downstream are only added when auth is requested.
 {{/*
 OTLP coordinates for the operator, forwarded to every code-location, run,
 and step pod. Headers reach pods as a secretKeyRef on the named Secret.
+RIVERS_OTEL_ENDPOINT, not the standard variable: an ambient
+OTEL_EXPORTER_OTLP_ENDPOINT on the operator pod must not reach child pods.
 */}}
 {{- define "rivers.otelEnv" -}}
 {{- if .Values.otel.endpoint -}}
-- name: OTEL_EXPORTER_OTLP_ENDPOINT
+- name: RIVERS_OTEL_ENDPOINT
   value: {{ .Values.otel.endpoint | quote }}
 {{- if .Values.otel.headers.existingSecret }}
 - name: RIVERS_OTEL_HEADERS_SECRET_NAME

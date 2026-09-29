@@ -266,6 +266,14 @@ mod tests {
             .find(|e| e.name == "RIVERS_OTEL_HEADERS_SECRET_NAME")
             .unwrap();
         assert_eq!(coord.value.as_deref(), Some("otel-headers"));
+        let endpoint_coord = envs
+            .iter()
+            .find(|e| e.name == "RIVERS_OTEL_ENDPOINT")
+            .unwrap();
+        assert_eq!(
+            endpoint_coord.value.as_deref(),
+            Some("https://otlp.example.com:4317")
+        );
     }
 
     #[test]

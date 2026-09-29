@@ -322,7 +322,9 @@ audit trail.
 Every pod that runs rivers Python code (code-location, run, step) can
 export traces over OTLP/gRPC. The operator and UI do not export traces. Set
 the endpoint once; the operator stamps it on every pod it creates, and the
-run pod stamps it on its step pods:
+run pod stamps it on its step pods. The chart gives the endpoint to the
+operator as `RIVERS_OTEL_ENDPOINT`, so an `OTEL_EXPORTER_OTLP_ENDPOINT` that
+something else injects into the operator pod does not reach your pods:
 
 ```yaml
 otel:
@@ -348,7 +350,11 @@ otel:
 `https://` endpoints use TLS with the image's system roots. To override the
 endpoint or headers for one code location, set the same
 `OTEL_EXPORTER_OTLP_*` variables in `CodeLocation.spec.env`; each entry there
-replaces the chart value of the same name. The
+replaces the chart value of the same name. A node-local collector endpoint
+such as `http://$(HOST_IP):4317` cannot go in `otel.endpoint`. Leave
+`otel.endpoint` unset and put two entries in `CodeLocation.spec.env`: first
+`HOST_IP` from a `status.hostIP` `fieldRef`, then the endpoint. Kubernetes
+expands `$(HOST_IP)` only from entries earlier in the list. The
 [environment variable reference](../api-reference/environment-variables.md#observability)
 lists every variable rivers reads.
 

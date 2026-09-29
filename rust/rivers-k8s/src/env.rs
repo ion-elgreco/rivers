@@ -22,6 +22,7 @@ pub const ENV_SURREAL_AUTH_SECRET_NAME: &str = "RIVERS_SURREAL_AUTH_SECRET_NAME"
 pub const ENV_SURREAL_AUTH_USERNAME_KEY: &str = "RIVERS_SURREAL_AUTH_USERNAME_KEY";
 pub const ENV_SURREAL_AUTH_PASSWORD_KEY: &str = "RIVERS_SURREAL_AUTH_PASSWORD_KEY";
 pub const ENV_OTEL_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+pub const ENV_RIVERS_OTEL_ENDPOINT: &str = "RIVERS_OTEL_ENDPOINT";
 pub const ENV_OTEL_HEADERS: &str = "OTEL_EXPORTER_OTLP_HEADERS";
 pub const ENV_OTEL_HEADERS_SECRET_NAME: &str = "RIVERS_OTEL_HEADERS_SECRET_NAME";
 pub const ENV_OTEL_HEADERS_SECRET_KEY: &str = "RIVERS_OTEL_HEADERS_SECRET_KEY";
@@ -279,6 +280,10 @@ pub fn build_surreal_pod_env(cfg: &SurrealPodConfig) -> Vec<EnvVar> {
 /// OTLP export settings for pods that run Python code. The headers Secret is
 /// referenced by coordinate, like the SurrealDB credentials, so the token
 /// never lands in a pod spec. An empty endpoint emits nothing.
+///
+/// The endpoint is read from `RIVERS_OTEL_ENDPOINT`, never from the standard
+/// `OTEL_EXPORTER_OTLP_ENDPOINT`: a value injected into this pod for a local
+/// sidecar must not be stamped on child pods where nothing listens.
 #[derive(Debug, Clone, Default)]
 pub struct OtelPodConfig {
     pub endpoint: String,
@@ -289,7 +294,7 @@ pub struct OtelPodConfig {
 impl OtelPodConfig {
     pub fn from_env() -> Self {
         Self {
-            endpoint: env_nonempty(ENV_OTEL_ENDPOINT).unwrap_or_default(),
+            endpoint: env_nonempty(ENV_RIVERS_OTEL_ENDPOINT).unwrap_or_default(),
             headers_secret_name: env_nonempty(ENV_OTEL_HEADERS_SECRET_NAME).unwrap_or_default(),
             headers_secret_key: env_nonempty(ENV_OTEL_HEADERS_SECRET_KEY).unwrap_or_default(),
         }
@@ -304,11 +309,18 @@ pub fn build_otel_pod_env(cfg: &OtelPodConfig) -> Vec<EnvVar> {
     if cfg.endpoint.is_empty() {
         return Vec::new();
     }
-    let mut env = vec![EnvVar {
-        name: ENV_OTEL_ENDPOINT.to_string(),
-        value: Some(cfg.endpoint.clone()),
-        ..Default::default()
-    }];
+    let mut env = vec![
+        EnvVar {
+            name: ENV_OTEL_ENDPOINT.to_string(),
+            value: Some(cfg.endpoint.clone()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: ENV_RIVERS_OTEL_ENDPOINT.to_string(),
+            value: Some(cfg.endpoint.clone()),
+            ..Default::default()
+        },
+    ];
     if cfg.headers_secret_is_set() {
         env.push(EnvVar {
             name: ENV_OTEL_HEADERS.to_string(),
@@ -367,24 +379,36 @@ mod tests {
         deployment: Option<&str>,
         f: impl FnOnce() -> R,
     ) -> R {
+        with_vars(
+            &[
+                ("RIVERS_CODE_LOCATION_ID", cl_id),
+                ("RIVERS_CODE_LOCATION_NAME", cl_name),
+                ("RIVERS_DEPLOYMENT", deployment),
+            ],
+            f,
+        )
+    }
+
+    fn with_vars<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
         use std::sync::Mutex;
         static LOCK: Mutex<()> = Mutex::new(());
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        let prev_id = std::env::var("RIVERS_CODE_LOCATION_ID").ok();
-        let prev_name = std::env::var("RIVERS_CODE_LOCATION_NAME").ok();
-        let prev_dep = std::env::var("RIVERS_DEPLOYMENT").ok();
         let set = |k: &str, v: Option<&str>| match v {
             Some(v) => unsafe { std::env::set_var(k, v) },
             None => unsafe { std::env::remove_var(k) },
         };
-        set("RIVERS_CODE_LOCATION_ID", cl_id);
-        set("RIVERS_CODE_LOCATION_NAME", cl_name);
-        set("RIVERS_DEPLOYMENT", deployment);
+        let prev: Vec<_> = vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .collect();
+        for (k, v) in vars {
+            set(k, *v);
+        }
         let out = f();
-        set("RIVERS_CODE_LOCATION_ID", prev_id.as_deref());
-        set("RIVERS_CODE_LOCATION_NAME", prev_name.as_deref());
-        set("RIVERS_DEPLOYMENT", prev_dep.as_deref());
+        for (k, v) in &prev {
+            set(k, v.as_deref());
+        }
         out
     }
 
@@ -575,7 +599,44 @@ mod tests {
             env_value_of(&env, ENV_OTEL_ENDPOINT).as_deref(),
             Some("https://otlp.example.com:4317")
         );
-        assert_eq!(env.len(), 1, "no header env without a Secret: {env:?}");
+        assert_eq!(env.len(), 2, "no header env without a Secret: {env:?}");
+    }
+
+    #[test]
+    fn otel_pod_config_from_env_ignores_ambient_otlp_endpoint() {
+        let ambient_only = with_vars(
+            &[
+                (ENV_OTEL_ENDPOINT, Some("http://localhost:4317")),
+                (ENV_RIVERS_OTEL_ENDPOINT, None),
+            ],
+            OtelPodConfig::from_env,
+        );
+        assert_eq!(ambient_only.endpoint, "");
+
+        let both = with_vars(
+            &[
+                (ENV_OTEL_ENDPOINT, Some("http://localhost:4317")),
+                (
+                    ENV_RIVERS_OTEL_ENDPOINT,
+                    Some("https://otlp.example.com:4317"),
+                ),
+            ],
+            OtelPodConfig::from_env,
+        );
+        assert_eq!(both.endpoint, "https://otlp.example.com:4317");
+    }
+
+    #[test]
+    fn build_otel_pod_env_emits_rivers_endpoint_coordinate() {
+        let cfg = OtelPodConfig {
+            endpoint: "https://otlp.example.com:4317".into(),
+            ..Default::default()
+        };
+        let env = build_otel_pod_env(&cfg);
+        assert_eq!(
+            env_value_of(&env, ENV_RIVERS_OTEL_ENDPOINT).as_deref(),
+            Some("https://otlp.example.com:4317")
+        );
     }
 
     #[test]
