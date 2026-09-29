@@ -76,6 +76,7 @@ pub fn build_deployment(
     resolved_image: &str,
     code_location_service_account: &str,
     surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
+    otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
 ) -> Deployment {
     let name = deployment_name(&cl.name_any());
     let ns = cl.namespace();
@@ -136,7 +137,7 @@ pub fn build_deployment(
                             ..Default::default()
                         }]),
                         resources: Some(spec.resources.clone()),
-                        env: Some(build_env(cl, resolved_image, surreal_pod_cfg)),
+                        env: Some(build_env(cl, resolved_image, surreal_pod_cfg, otel_pod_cfg)),
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -152,6 +153,7 @@ fn build_env(
     cl: &CodeLocation,
     resolved_image: &str,
     surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
+    otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
 ) -> Vec<EnvVar> {
     let mut env = vec![
         EnvVar {
@@ -176,6 +178,7 @@ fn build_env(
         },
     ];
     env.extend(rivers_k8s::env::build_surreal_pod_env(surreal_pod_cfg));
+    env.extend(rivers_k8s::env::build_otel_pod_env(otel_pod_cfg));
     env.extend(cl.spec.env.iter().cloned());
     env
 }
@@ -286,6 +289,7 @@ mod tests {
             "ghcr.io/acme/pipeline@sha256:abc",
             "rivers-code-location",
             &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig::default(),
         );
 
         let expected = json!({
@@ -339,6 +343,47 @@ mod tests {
     }
 
     #[test]
+    fn deployment_forwards_otel_export_settings_before_user_env() {
+        let cl = make_cl(
+            json!({
+                "image": "ghcr.io/acme/pipeline",
+                "tag": "v1.0.0",
+                "module": "acme.pipeline",
+                "env": [{ "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://team-collector:4317" }],
+            }),
+            "analytics",
+            "team-data",
+            "uid-1234",
+        );
+        let d = build_deployment(
+            &cl,
+            "ghcr.io/acme/pipeline@sha256:abc",
+            "rivers-code-location",
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig {
+                endpoint: "https://otlp.example.com:4317".to_string(),
+                headers_secret_name: "otel-headers".to_string(),
+                headers_secret_key: "headers".to_string(),
+            },
+        );
+
+        let env = serde_json::to_value(&d.spec.unwrap().template.spec.unwrap().containers[0].env)
+            .unwrap();
+        let tail = &env.as_array().unwrap()[7..];
+        assert_eq!(
+            serde_json::Value::Array(tail.to_vec()),
+            json!([
+                { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "https://otlp.example.com:4317" },
+                { "name": "OTEL_EXPORTER_OTLP_HEADERS", "valueFrom": { "secretKeyRef": { "name": "otel-headers", "key": "headers" } } },
+                { "name": "RIVERS_OTEL_HEADERS_SECRET_NAME", "value": "otel-headers" },
+                { "name": "RIVERS_OTEL_HEADERS_SECRET_KEY", "value": "headers" },
+                // spec.env is last, so it wins on duplicates.
+                { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://team-collector:4317" },
+            ])
+        );
+    }
+
+    #[test]
     fn deployment_matches_golden_for_full_featured_cr() {
         // Exercises every optional field we care about:
         //   * replicas overridden
@@ -387,6 +432,7 @@ mod tests {
             "ghcr.io/acme/pipeline@sha256:deadbeef",
             "rivers-code-location",
             &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig::default(),
         );
 
         let expected = json!({
@@ -474,6 +520,7 @@ mod tests {
             "img@sha256:a",
             "rivers-code-location",
             &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig::default(),
         );
 
         let expected_resources = json!({

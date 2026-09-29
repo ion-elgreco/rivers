@@ -21,6 +21,10 @@ pub const ENV_SURREAL_PASSWORD: &str = "RIVERS_SURREAL_PASSWORD";
 pub const ENV_SURREAL_AUTH_SECRET_NAME: &str = "RIVERS_SURREAL_AUTH_SECRET_NAME";
 pub const ENV_SURREAL_AUTH_USERNAME_KEY: &str = "RIVERS_SURREAL_AUTH_USERNAME_KEY";
 pub const ENV_SURREAL_AUTH_PASSWORD_KEY: &str = "RIVERS_SURREAL_AUTH_PASSWORD_KEY";
+pub const ENV_OTEL_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+pub const ENV_OTEL_HEADERS: &str = "OTEL_EXPORTER_OTLP_HEADERS";
+pub const ENV_OTEL_HEADERS_SECRET_NAME: &str = "RIVERS_OTEL_HEADERS_SECRET_NAME";
+pub const ENV_OTEL_HEADERS_SECRET_KEY: &str = "RIVERS_OTEL_HEADERS_SECRET_KEY";
 
 /// Read `name` from the process environment, treating empty strings as
 /// unset (so a `valueFrom.secretKeyRef` that resolves to "" doesn't shadow
@@ -272,6 +276,66 @@ pub fn build_surreal_pod_env(cfg: &SurrealPodConfig) -> Vec<EnvVar> {
     env
 }
 
+/// OTLP export settings for pods that run Python code. The headers Secret is
+/// referenced by coordinate, like the SurrealDB credentials, so the token
+/// never lands in a pod spec. An empty endpoint emits nothing.
+#[derive(Debug, Clone, Default)]
+pub struct OtelPodConfig {
+    pub endpoint: String,
+    pub headers_secret_name: String,
+    pub headers_secret_key: String,
+}
+
+impl OtelPodConfig {
+    pub fn from_env() -> Self {
+        Self {
+            endpoint: env_nonempty(ENV_OTEL_ENDPOINT).unwrap_or_default(),
+            headers_secret_name: env_nonempty(ENV_OTEL_HEADERS_SECRET_NAME).unwrap_or_default(),
+            headers_secret_key: env_nonempty(ENV_OTEL_HEADERS_SECRET_KEY).unwrap_or_default(),
+        }
+    }
+
+    fn headers_secret_is_set(&self) -> bool {
+        !self.headers_secret_name.is_empty() && !self.headers_secret_key.is_empty()
+    }
+}
+
+pub fn build_otel_pod_env(cfg: &OtelPodConfig) -> Vec<EnvVar> {
+    if cfg.endpoint.is_empty() {
+        return Vec::new();
+    }
+    let mut env = vec![EnvVar {
+        name: ENV_OTEL_ENDPOINT.to_string(),
+        value: Some(cfg.endpoint.clone()),
+        ..Default::default()
+    }];
+    if cfg.headers_secret_is_set() {
+        env.push(EnvVar {
+            name: ENV_OTEL_HEADERS.to_string(),
+            value_from: Some(EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector {
+                    name: cfg.headers_secret_name.clone(),
+                    key: cfg.headers_secret_key.clone(),
+                    optional: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        env.push(EnvVar {
+            name: ENV_OTEL_HEADERS_SECRET_NAME.to_string(),
+            value: Some(cfg.headers_secret_name.clone()),
+            ..Default::default()
+        });
+        env.push(EnvVar {
+            name: ENV_OTEL_HEADERS_SECRET_KEY.to_string(),
+            value: Some(cfg.headers_secret_key.clone()),
+            ..Default::default()
+        });
+    }
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +515,51 @@ mod tests {
         assert!(!s.is_set());
         s.password_key = "p".into();
         assert!(s.is_set());
+    }
+
+    #[test]
+    fn build_otel_pod_env_is_empty_without_endpoint() {
+        let cfg = OtelPodConfig {
+            headers_secret_name: "otel-headers".into(),
+            headers_secret_key: "headers".into(),
+            ..Default::default()
+        };
+        assert!(build_otel_pod_env(&cfg).is_empty());
+    }
+
+    #[test]
+    fn build_otel_pod_env_endpoint_only_omits_headers() {
+        let cfg = OtelPodConfig {
+            endpoint: "https://otlp.example.com:4317".into(),
+            ..Default::default()
+        };
+        let env = build_otel_pod_env(&cfg);
+        assert_eq!(
+            env_value_of(&env, ENV_OTEL_ENDPOINT).as_deref(),
+            Some("https://otlp.example.com:4317")
+        );
+        assert_eq!(env.len(), 1, "no header env without a Secret: {env:?}");
+    }
+
+    #[test]
+    fn build_otel_pod_env_with_headers_emits_secret_key_ref_and_coordinates() {
+        let cfg = OtelPodConfig {
+            endpoint: "https://otlp.example.com:4317".into(),
+            headers_secret_name: "otel-headers".into(),
+            headers_secret_key: "headers".into(),
+        };
+        let env = build_otel_pod_env(&cfg);
+        assert_eq!(
+            env_secret_ref(&env, ENV_OTEL_HEADERS),
+            Some(("otel-headers".to_string(), "headers".to_string()))
+        );
+        assert_eq!(
+            env_value_of(&env, ENV_OTEL_HEADERS_SECRET_NAME).as_deref(),
+            Some("otel-headers")
+        );
+        assert_eq!(
+            env_value_of(&env, ENV_OTEL_HEADERS_SECRET_KEY).as_deref(),
+            Some("headers")
+        );
     }
 }

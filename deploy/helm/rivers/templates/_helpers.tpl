@@ -190,6 +190,25 @@ downstream are only added when auth is requested.
 {{- end }}
 {{- end -}}
 
+{{/*
+OTLP coordinates for the operator, forwarded to every code-location, run,
+and step pod. Headers reach pods as a secretKeyRef on the named Secret.
+*/}}
+{{- define "rivers.otelEnv" -}}
+{{- if .Values.otel.endpoint -}}
+- name: OTEL_EXPORTER_OTLP_ENDPOINT
+  value: {{ .Values.otel.endpoint | quote }}
+{{- if .Values.otel.headers.existingSecret }}
+- name: RIVERS_OTEL_HEADERS_SECRET_NAME
+  value: {{ .Values.otel.headers.existingSecret | quote }}
+- name: RIVERS_OTEL_HEADERS_SECRET_KEY
+  value: {{ .Values.otel.headers.secretKey | quote }}
+{{- end }}
+{{- else if .Values.otel.headers.existingSecret }}
+{{ fail "otel.headers.existingSecret is set but otel.endpoint is empty; set otel.endpoint or drop the Secret" }}
+{{- end }}
+{{- end -}}
+
 {{- define "rivers.uiAuthCookieSecretName" -}}
 rivers-ui-auth
 {{- end -}}

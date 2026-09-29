@@ -317,6 +317,41 @@ loudly. See the [authentication guide](../guides/authentication.md) for the
 full option set, proxy header mappings, allowlists, and the launched-by
 audit trail.
 
+## OpenTelemetry export
+
+Every pod that runs rivers Python code (code-location, run, step) can
+export traces over OTLP/gRPC. The operator and UI do not export traces. Set
+the endpoint once; the operator stamps it on every pod it creates, and the
+run pod stamps it on its step pods:
+
+```yaml
+otel:
+  endpoint: https://otlp.example.com:4317
+```
+
+Most hosted backends need an API key or bearer token. Put it in a Secret in
+OTLP header form and reference the Secret. The value reaches pods via
+`valueFrom.secretKeyRef` and never lands in a pod spec or CR:
+
+```bash
+kubectl -n rivers create secret generic otel-headers \
+  --from-literal=headers='authorization=Bearer ...'
+```
+
+```yaml
+otel:
+  endpoint: https://otlp.example.com:4317
+  headers:
+    existingSecret: otel-headers   # key: headers
+```
+
+`https://` endpoints use TLS with the image's system roots. To override the
+endpoint or headers for one code location, set the same
+`OTEL_EXPORTER_OTLP_*` variables in `CodeLocation.spec.env`; entries there
+win over the chart values. The
+[environment variable reference](../api-reference/environment-variables.md#observability)
+lists every variable rivers reads.
+
 ## Open ports
 
 | Port    | Component         | Purpose                                       |

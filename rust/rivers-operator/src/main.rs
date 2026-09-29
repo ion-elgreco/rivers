@@ -77,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
     let services: Api<Service> = Api::namespaced(client.clone(), &namespace);
 
     let surreal_pod_cfg = rivers_k8s::env::SurrealPodConfig::from_env();
+    let otel_pod_cfg = rivers_k8s::env::OtelPodConfig::from_env();
 
     // Built up front so the run reconciler's Context can reference it; the
     // watcher + gRPC tasks are spawned later via `spawn_registry_service`.
@@ -88,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
         storage,
         directory: directory_state.clone(),
         surreal_pod_cfg: surreal_pod_cfg.clone(),
+        otel_pod_cfg: otel_pod_cfg.clone(),
     });
 
     let pod_identity = pod_identity();
@@ -118,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
         code_location_service_account: std::env::var(CODE_LOCATION_SA_ENV)
             .unwrap_or_else(|_| DEFAULT_CODE_LOCATION_SA.to_string()),
         surreal_pod_cfg: surreal_pod_cfg.clone(),
+        otel_pod_cfg: otel_pod_cfg.clone(),
     });
 
     let metrics_addr =

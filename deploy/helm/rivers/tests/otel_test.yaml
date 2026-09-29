@@ -1,0 +1,57 @@
+suite: OpenTelemetry export
+templates:
+  - templates/operator-deployment.yaml
+release:
+  name: rivers
+  namespace: rivers
+tests:
+  - it: emits no OTLP env by default
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OTEL_EXPORTER_OTLP_ENDPOINT
+          any: true
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_OTEL_HEADERS_SECRET_NAME
+          any: true
+
+  - it: endpoint only — plain env, no header Secret coordinates
+    set:
+      otel.endpoint: https://otlp.example.com:4317
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OTEL_EXPORTER_OTLP_ENDPOINT
+            value: https://otlp.example.com:4317
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_OTEL_HEADERS_SECRET_NAME
+          any: true
+
+  - it: endpoint + existingSecret — header Secret coordinates for the operator to forward
+    set:
+      otel.endpoint: https://otlp.example.com:4317
+      otel.headers.existingSecret: otel-headers
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_OTEL_HEADERS_SECRET_NAME
+            value: otel-headers
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_OTEL_HEADERS_SECRET_KEY
+            value: headers
+
+  - it: headers Secret without an endpoint fails the install
+    set:
+      otel.headers.existingSecret: otel-headers
+    asserts:
+      - failedTemplate:
+          errorPattern: "otel.headers.existingSecret is set but otel.endpoint is empty"

@@ -226,6 +226,7 @@ pub fn make_context(client: kube_client::Client, storage: Arc<SurrealStorage>) -
         storage,
         directory: Arc::new(DirectoryState::new()),
         surreal_pod_cfg: rivers_k8s::env::SurrealPodConfig::default(),
+        otel_pod_cfg: rivers_k8s::env::OtelPodConfig::default(),
     }
 }
 

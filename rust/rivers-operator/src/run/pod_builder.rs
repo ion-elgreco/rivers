@@ -22,6 +22,7 @@ pub fn build_executor_pod(
     resume: bool,
     cl_env: &[EnvVar],
     surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
+    otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
 ) -> Pod {
     let spec = &run.spec;
     let run_uid = run.metadata.uid.as_deref().unwrap_or_default();
@@ -124,6 +125,7 @@ pub fn build_executor_pod(
                             .clone()
                             .with_endpoint(spec.surreal_endpoint.clone()),
                     ));
+                    env.extend(rivers_k8s::env::build_otel_pod_env(otel_pod_cfg));
                     env.extend(cl_env.iter().cloned());
                     env
                 }),
@@ -213,7 +215,58 @@ mod tests {
             resume,
             cl_env,
             &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig::default(),
         )
+    }
+
+    #[test]
+    fn otel_settings_are_stamped_on_the_run_pod() {
+        let run = test_run();
+        let pod = build_executor_pod(
+            &run,
+            "test-pod",
+            "run-123",
+            false,
+            &[],
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig {
+                endpoint: "https://otlp.example.com:4317".to_string(),
+                headers_secret_name: "otel-headers".to_string(),
+                headers_secret_key: "headers".to_string(),
+            },
+        );
+        let envs = pod.spec.unwrap().containers[0].env.clone().unwrap();
+
+        let endpoint = envs
+            .iter()
+            .find(|e| e.name == "OTEL_EXPORTER_OTLP_ENDPOINT")
+            .unwrap();
+        assert_eq!(
+            endpoint.value.as_deref(),
+            Some("https://otlp.example.com:4317")
+        );
+
+        let headers = envs
+            .iter()
+            .find(|e| e.name == "OTEL_EXPORTER_OTLP_HEADERS")
+            .unwrap();
+        let secret_ref = headers
+            .value_from
+            .as_ref()
+            .unwrap()
+            .secret_key_ref
+            .as_ref()
+            .unwrap();
+        assert_eq!(secret_ref.name, "otel-headers");
+        assert_eq!(secret_ref.key, "headers");
+        assert!(headers.value.is_none());
+
+        // Coordinates the run pod re-emits on step pods.
+        let coord = envs
+            .iter()
+            .find(|e| e.name == "RIVERS_OTEL_HEADERS_SECRET_NAME")
+            .unwrap();
+        assert_eq!(coord.value.as_deref(), Some("otel-headers"));
     }
 
     #[test]

@@ -236,6 +236,15 @@ ui:
               type: PathPrefix
               value: /
 
+# OpenTelemetry trace export from code-location, run, and step pods.
+otel:
+  # OTLP/gRPC endpoint, e.g. https://otlp.example.com:4317. Empty disables export.
+  endpoint: ""
+  # Secret holding the OTLP headers string, e.g. `authorization=Bearer <token>`.
+  headers:
+    existingSecret: ""
+    secretKey: headers
+
 executor:
   serviceAccountName: rivers-executor
   defaultRunResources:

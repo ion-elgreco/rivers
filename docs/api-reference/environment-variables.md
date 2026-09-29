@@ -63,5 +63,12 @@ Read by `rivers-ui` (the standalone UI server, distinct from the in-process UI s
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | When set, rivers installs an OpenTelemetry tracing layer that exports to this OTLP endpoint. Leave unset to disable OTel export entirely. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/gRPC endpoint. When set, rivers installs an OpenTelemetry tracing layer that exports to it. `https://` endpoints use TLS and verify the server against the system roots. Leave unset to disable OTel export entirely. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | unset | Headers sent with every export, as comma-separated `key=value` pairs. This is where API keys and bearer tokens go, e.g. `authorization=Bearer <token>` or `x-honeycomb-team=<key>`. |
+| `OTEL_EXPORTER_OTLP_CERTIFICATE` | unset | Path to a PEM file holding the CA that signs the collector's certificate. Replaces the system roots. |
+| `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` / `OTEL_EXPORTER_OTLP_CLIENT_KEY` | unset | Paths to a PEM client certificate and private key for mutual TLS. Set both or neither. |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | `10000` | Export timeout in milliseconds. |
+| `OTEL_EXPORTER_OTLP_TRACES_*` | unset | Traces-specific form of each variable above (`..._TRACES_ENDPOINT`, `..._TRACES_HEADERS`, ...). Takes precedence over the generic one. |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter. Honoured by the operator and the UI binary. |
+
+If the exporter cannot be built (for example an unreadable certificate file), rivers logs one error at startup naming the variable and runs with export disabled. On Kubernetes the [Helm chart](../installation/kubernetes.md#opentelemetry-export) sets the endpoint and headers on every pod for you.

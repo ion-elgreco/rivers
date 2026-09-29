@@ -23,6 +23,7 @@ pub struct K8sStepExecutorConfig {
     /// rest of the rivers pods use — the run pod never holds the password
     /// in memory.
     pub surreal_pod_cfg: crate::env::SurrealPodConfig,
+    pub otel_pod_cfg: crate::env::OtelPodConfig,
     pub run_id: String,
     pub run_cr_name: String,
     pub run_cr_uid: String,
@@ -288,6 +289,7 @@ fn build_job_inner(
                                 },
                             ];
                             env.extend(crate::env::build_surreal_pod_env(&config.surreal_pod_cfg));
+                            env.extend(crate::env::build_otel_pod_env(&config.otel_pod_cfg));
                             env.extend(config.extra_env.iter().cloned());
                             env
                         }),
@@ -316,6 +318,7 @@ mod tests {
             module: "my_project.definitions".to_string(),
             surreal_pod_cfg: crate::env::SurrealPodConfig::default()
                 .with_endpoint("ws://surrealdb:8000"),
+            otel_pod_cfg: crate::env::OtelPodConfig::default(),
             run_id: "abc-123".to_string(),
             run_cr_name: "rivers-run-abc-123".to_string(),
             run_cr_uid: "uid-456".to_string(),
@@ -646,6 +649,41 @@ mod tests {
             env_val(&env, "RIVERS_S3_BUCKET"),
             Some("mybucket".to_string())
         );
+    }
+
+    #[test]
+    fn otel_env_forwarded_to_step_pod() {
+        let mut config = test_config();
+        config.otel_pod_cfg = crate::env::OtelPodConfig {
+            endpoint: "https://otlp.example.com:4317".to_string(),
+            headers_secret_name: "otel-headers".to_string(),
+            headers_secret_key: "headers".to_string(),
+        };
+        let job = build_step_job(&config, "step");
+        let env = get_env(&job);
+
+        assert_eq!(
+            env_val(&env, "OTEL_EXPORTER_OTLP_ENDPOINT"),
+            Some("https://otlp.example.com:4317".to_string())
+        );
+        let envs = job.spec.unwrap().template.spec.unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap();
+        let headers = envs
+            .iter()
+            .find(|e| e.name == "OTEL_EXPORTER_OTLP_HEADERS")
+            .unwrap();
+        let secret_ref = headers
+            .value_from
+            .as_ref()
+            .unwrap()
+            .secret_key_ref
+            .as_ref()
+            .unwrap();
+        assert_eq!(secret_ref.name, "otel-headers");
+        assert_eq!(secret_ref.key, "headers");
+        assert!(headers.value.is_none());
     }
 
     #[test]

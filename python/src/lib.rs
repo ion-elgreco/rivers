@@ -35,6 +35,7 @@ mod job;
 pub mod log_capture;
 pub mod metadata;
 pub mod net;
+mod otel;
 pub mod partitions;
 mod repository;
 pub mod result_types;
@@ -72,14 +73,11 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .compact()
         .with_writer(log_capture::TeeWriter);
 
-    // Optional OTel layer — activates when OTEL_EXPORTER_OTLP_ENDPOINT is set
+    // Optional OTel layer — activates when an OTLP endpoint is configured
     let mut otel_build_err = None;
-    let otel_layer = if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
+    let otel_layer = if otel::export_enabled() {
         let _runtime_guard = runtime::rt().enter();
-        match opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .build()
-        {
+        match otel::span_exporter() {
             Ok(exp) => {
                 let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
                     .with_batch_exporter(exp)
@@ -93,7 +91,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
                 Some(tracing_opentelemetry::layer().with_tracer(tracer))
             }
             Err(err) => {
-                otel_build_err = Some(err.to_string());
+                otel_build_err = Some(format!("{err:#}"));
                 None
             }
         }
