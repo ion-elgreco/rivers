@@ -40,6 +40,10 @@ from rivers import (
     RetryPolicy,
     RunBackendConfig,
     RunQueueConfig,
+    Sensor,
+    SensorEvaluationContext,
+    SensorStatus,
+    SkipReason,
     Task,
 )
 
@@ -442,9 +446,22 @@ all_tasks = [
     graph_flaky_inner,
 ]
 
+# Sensor evaluation is the only code path that opens a tracing span; this
+# probe gives the OTel integration test something to find in the collector.
+@Sensor(
+    name="otel_probe",
+    asset_selection=["source_data"],
+    minimum_interval="30s",
+    default_status=SensorStatus.Running,
+)
+def otel_probe(context: SensorEvaluationContext):
+    return SkipReason("probe only")
+
+
 repo = CodeRepository(
     assets=all_assets,
     tasks=all_tasks,
+    sensors=[otel_probe],
     jobs=[
         k8s_inprocess_job,
         k8s_step_job,
