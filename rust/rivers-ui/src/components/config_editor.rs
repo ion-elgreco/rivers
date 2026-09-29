@@ -3,69 +3,23 @@
 //! The text is the JSON the backend stores on the run —
 //! `{"asset": {"field": value}}`. It opens pre-filled with each selected
 //! asset's schema defaults; a field without a default (required, or a
-//! `BaseSettings` field the environment resolves) is only listed, never sent.
+//! `BaseSettings` field the environment resolves) is hinted, never sent.
+//! [`check_config`] gives the dialogs the issues that block a submit and
+//! the payload to send.
 
 use std::collections::HashMap;
 
 use leptos::prelude::*;
 use serde_json::{Map, Value};
 
+use crate::components::code_editor::CodeEditor;
+use crate::config_schema::{self, Schema};
+use crate::json_text::{self, Issue, Node, Span};
 use crate::types::AssetDefinitionInfo;
-
-/// One field of a config class, read from its pydantic JSON schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigField {
-    pub name: String,
-    /// Short type label: "integer", "string | null", "enum", a model name.
-    pub type_label: String,
-    /// The default as compact JSON; `None` for a field without one.
-    pub default: Option<String>,
-}
-
-fn type_label(prop: &Value) -> String {
-    match prop.get("type") {
-        Some(Value::String(t)) => return t.clone(),
-        Some(Value::Array(ts)) => {
-            return ts
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" | ");
-        }
-        _ => {}
-    }
-    if prop.get("enum").is_some() {
-        return "enum".to_string();
-    }
-    if let Some(Value::Array(any)) = prop.get("anyOf") {
-        return any.iter().map(type_label).collect::<Vec<_>>().join(" | ");
-    }
-    if let Some(reference) = prop.get("$ref").and_then(Value::as_str) {
-        return reference
-            .rsplit('/')
-            .next()
-            .unwrap_or(reference)
-            .to_string();
-    }
-    "any".to_string()
-}
 
 fn properties(schema_json: &str) -> Option<Map<String, Value>> {
     let schema: Value = serde_json::from_str(schema_json).ok()?;
     schema.get("properties")?.as_object().cloned()
-}
-
-/// The fields a config schema declares.
-pub fn schema_fields(schema_json: &str) -> Vec<ConfigField> {
-    properties(schema_json)
-        .unwrap_or_default()
-        .iter()
-        .map(|(name, prop)| ConfigField {
-            name: name.clone(),
-            type_label: type_label(prop),
-            default: prop.get("default").map(Value::to_string),
-        })
-        .collect()
 }
 
 /// The config schema per key for a launch: each asset's own for materialize,
@@ -158,17 +112,116 @@ pub fn validate_config_text(text: &str, selected: &[String]) -> Result<Option<St
     Ok(Some(Value::Object(out).to_string()))
 }
 
-/// The dialog section: a JSON textarea over `text`, the fields legend and a
-/// reset. Renders nothing when no selected key has a schema. `reset` turning
-/// true (the dialog opening) refills the template; a selection change does
-/// too until the user has typed.
+/// What the dialogs learn from the text: the issues that block a submit,
+/// the required fields not set (a hint), and the payload to send.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Check {
+    pub issues: Vec<Issue>,
+    pub missing: Vec<String>,
+    pub payload: Option<String>,
+}
+
+/// Syntax first, then the shape the backend checks (an object of objects
+/// keyed by selected assets), then each asset's schema. A syntax error is
+/// the only issue reported, as the tree past it is a guess.
+pub fn check_config(text: &str, selected: &[String], schemas: &HashMap<String, String>) -> Check {
+    if text.trim().is_empty() {
+        return Check::default();
+    }
+    let parsed = json_text::parse(text);
+    if let Some(error) = parsed.error {
+        return Check {
+            issues: vec![error],
+            ..Check::default()
+        };
+    }
+    let Some(root) = parsed.root else {
+        return Check::default();
+    };
+    let Node::Object { entries, .. } = &root else {
+        return Check {
+            issues: vec![Issue {
+                span: root.span(),
+                message: "Config must be a JSON object keyed by asset name.".to_string(),
+            }],
+            ..Check::default()
+        };
+    };
+    let mut issues = Vec::new();
+    let mut missing = Vec::new();
+    for entry in entries {
+        if !selected.contains(&entry.key) {
+            issues.push(Issue {
+                span: entry.key_span,
+                message: format!("'{}' is not in the selection.", entry.key),
+            });
+            continue;
+        }
+        if !matches!(entry.value, Node::Object { .. }) {
+            issues.push(Issue {
+                span: entry.value.span(),
+                message: format!(
+                    "Config for '{}' must be a JSON object of field values.",
+                    entry.key
+                ),
+            });
+            continue;
+        }
+        if let Some(schema) = schemas.get(&entry.key).and_then(|s| Schema::parse(s)) {
+            issues.extend(config_schema::validate(&schema, &entry.value, &entry.key));
+            missing.extend(config_schema::missing_required(
+                &schema,
+                &entry.value,
+                &entry.key,
+            ));
+        }
+    }
+    // A selected asset without an entry has set none of its fields.
+    let none = Node::Object {
+        span: Span::at(0),
+        entries: Vec::new(),
+        closed: true,
+    };
+    for key in selected {
+        if entries.iter().any(|e| &e.key == key) {
+            continue;
+        }
+        if let Some(schema) = schemas.get(key).and_then(|s| Schema::parse(s)) {
+            missing.extend(config_schema::missing_required(&schema, &none, key));
+        }
+    }
+    let payload = if issues.is_empty() {
+        match validate_config_text(text, selected) {
+            Ok(payload) => payload,
+            Err(message) => {
+                issues.push(Issue {
+                    span: root.span(),
+                    message,
+                });
+                None
+            }
+        }
+    } else {
+        None
+    };
+    Check {
+        issues,
+        missing,
+        payload,
+    }
+}
+
+/// The dialog section: the code editor over `text`, the required-fields
+/// hint and a reset. Renders nothing when no selected key has a schema.
+/// `reset` turning true (the dialog opening) refills the template; a
+/// selection change does too until the user has typed.
 #[component]
 pub fn ConfigEditor(
     #[prop(into)] selected: Signal<Vec<String>>,
     #[prop(into)] schemas: Signal<HashMap<String, String>>,
     text: RwSignal<String>,
     #[prop(into)] reset: Signal<bool>,
-    #[prop(into)] error: Signal<Option<String>>,
+    #[prop(into)] check: Signal<Check>,
 ) -> impl IntoView {
     let dirty = RwSignal::new(false);
     let template = Memo::new(move |_| config_template(&selected.get(), &schemas.get()));
@@ -187,17 +240,19 @@ pub fn ConfigEditor(
             text.set(template.unwrap_or_default());
         }
     });
-    let fields = Memo::new(move |_| -> Vec<(String, Vec<ConfigField>)> {
-        let schemas = schemas.get();
-        selected
-            .get()
-            .into_iter()
-            .filter_map(|key| {
-                let fields = schema_fields(schemas.get(&key)?);
-                Some((key, fields))
-            })
-            .collect()
-    });
+    let issues = Signal::derive(move || check.get().issues);
+    let missing = Signal::derive(move || check.get().missing);
+    let scaffold = move || {
+        let filled = config_schema::scaffold_missing(
+            &text.get_untracked(),
+            &selected.get_untracked(),
+            &schemas.get_untracked(),
+        );
+        if let Some(filled) = filled {
+            dirty.set(true);
+            text.set(filled);
+        }
+    };
 
     view! {
         <Show when=move || template.get().is_some()>
@@ -208,41 +263,19 @@ pub fn ConfigEditor(
                         <button class="link-btn" on:click=move |_| refill()>"Reset to defaults"</button>
                     </span>
                 </div>
-                <textarea
-                    class="form-input config-editor-text"
-                    spellcheck="false"
-                    aria-label="Config"
-                    prop:value=move || text.get()
-                    on:input=move |ev| {
-                        dirty.set(true);
-                        text.set(event_target_value(&ev));
-                    }
-                ></textarea>
-                {move || error.get().map(|e| view! {
-                    <div class="text-error config-editor-error">{e}</div>
-                })}
-                <div class="config-fields">
-                    {move || fields.get().into_iter().map(|(asset, fields)| view! {
-                        <div class="config-fields-asset">{asset}</div>
-                        {fields.into_iter().map(|f| view! {
-                            <div class="config-field">
-                                <span class="config-field-name">{f.name}</span>
-                                <span class="config-field-type">{f.type_label}</span>
-                                {match f.default {
-                                    Some(d) => view! {
-                                        <span class="config-field-default">{format!("= {d}")}</span>
-                                    }.into_any(),
-                                    None => view! {
-                                        <span class="config-field-required">"required"</span>
-                                    }.into_any(),
-                                }}
-                            </div>
-                        }).collect::<Vec<_>>()}
-                    }).collect::<Vec<_>>()}
-                </div>
-                <div class="config-editor-note">
-                    "Fields without a default are listed, not pre-filled; a BaseSettings field reads the environment unless set here."
-                </div>
+                <CodeEditor
+                    text=text
+                    issues=issues
+                    label="Config"
+                    on_edit=Callback::new(move |()| dirty.set(true))
+                />
+                <Show when=move || !missing.get().is_empty()>
+                    <div class="config-editor-hint">
+                        "Required, not set: "
+                        <span class="config-editor-hint-fields">{move || missing.get().join(", ")}</span>
+                        <button class="link-btn" on:click=move |_| scaffold()>"Insert missing fields"</button>
+                    </div>
+                </Show>
             </div>
         </Show>
     }
@@ -266,16 +299,12 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
-    #[test]
-    fn fields_carry_type_and_default() {
-        let fields = schema_fields(PIPELINE);
-        let by_name: HashMap<&str, &ConfigField> =
-            fields.iter().map(|f| (f.name.as_str(), f)).collect();
-        assert_eq!(by_name["api_key"].type_label, "string");
-        assert_eq!(by_name["api_key"].default, None);
-        assert_eq!(by_name["batch_size"].default.as_deref(), Some("100"));
-        assert_eq!(by_name["region"].type_label, "string | null");
-        assert_eq!(by_name["region"].default.as_deref(), Some("null"));
+    fn messages(check: &Check) -> Vec<(String, Span)> {
+        check
+            .issues
+            .iter()
+            .map(|i| (i.message.clone(), i.span))
+            .collect()
     }
 
     #[test]
@@ -377,5 +406,76 @@ mod tests {
         assert_eq!(err, "Config must be a JSON object keyed by asset name.");
         let err = validate_config_text("{\"a\": ", &selected).unwrap_err();
         assert!(err.starts_with("Config is not valid JSON:"), "{err}");
+    }
+
+    #[test]
+    fn check_reports_syntax_then_shape_then_schema_issues() {
+        let selected = keys(&["api", "plain"]);
+        let schemas = schemas(&[("api", PIPELINE)]);
+        let check = |text: &str| check_config(text, &selected, &schemas);
+
+        let syntax = check("{\"api\": ");
+        assert_eq!(
+            messages(&syntax),
+            vec![("Expected a value".to_string(), Span::at(8))]
+        );
+        assert_eq!(syntax.payload, None);
+        assert_eq!(
+            messages(&check("[1]")),
+            vec![(
+                "Config must be a JSON object keyed by asset name.".to_string(),
+                Span { start: 0, end: 3 }
+            )]
+        );
+        assert_eq!(
+            messages(&check(r#"{"other": {"x": 1}}"#)),
+            vec![(
+                "'other' is not in the selection.".to_string(),
+                Span { start: 1, end: 8 }
+            )]
+        );
+        assert_eq!(
+            messages(&check(r#"{"api": 1}"#)),
+            vec![(
+                "Config for 'api' must be a JSON object of field values.".to_string(),
+                Span { start: 8, end: 9 }
+            )]
+        );
+        assert_eq!(
+            messages(&check(r#"{"api": {"batch_sizes": 1, "region": 2}}"#)),
+            vec![
+                (
+                    "api: unknown field 'batch_sizes'; expected one of api_key, batch_size, region"
+                        .to_string(),
+                    Span { start: 9, end: 22 }
+                ),
+                (
+                    "api.region: expected string | null, got number".to_string(),
+                    Span { start: 37, end: 38 }
+                ),
+            ]
+        );
+        // An asset without a schema takes any object.
+        assert!(check(r#"{"plain": {"anything": 1}}"#).issues.is_empty());
+    }
+
+    #[test]
+    fn check_hints_required_fields_and_gives_the_payload() {
+        let selected = keys(&["api", "plain"]);
+        let schemas = schemas(&[("api", PIPELINE)]);
+        let check = |text: &str| check_config(text, &selected, &schemas);
+
+        assert_eq!(check("").missing, Vec::<String>::new());
+        assert_eq!(check("{}").missing, keys(&["api.api_key"]));
+        assert_eq!(check(r#"{"api": {}}"#).missing, keys(&["api.api_key"]));
+        let set = check(r#"{"api": {"api_key": "k"}, "plain": {}}"#);
+        assert_eq!(set.missing, Vec::<String>::new());
+        assert_eq!(set.payload.as_deref(), Some(r#"{"api":{"api_key":"k"}}"#));
+        assert_eq!(check(r#"{"api": {}}"#).payload, None);
+        assert_eq!(check("").payload, None);
+        // Issues leave no payload, and the hint still lists what is missing.
+        let broken = check(r#"{"api": {"batch_size": "x"}}"#);
+        assert_eq!(broken.payload, None);
+        assert_eq!(broken.missing, keys(&["api.api_key"]));
     }
 }
