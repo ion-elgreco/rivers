@@ -7,7 +7,6 @@ pub mod resolved_node;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use pyo3::prelude::*;
 
@@ -3835,12 +3834,11 @@ impl PyCodeRepository {
             .get(name)
             .ok_or_else(|| NodeNotFoundError::new_err(format!("Schedule '{}' not found", name)))?;
         let sched_ref = sched.borrow(py);
+        // RFC 3339 UTC, the form the daemon passes for a cron tick.
         let exec_time = execution_time.map(|s| s.to_string()).unwrap_or_else(|| {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            format!("{}", now)
+            jiff::Timestamp::now()
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
         });
         let empty = HashMap::new();
         let guard = self.state.read().unwrap();

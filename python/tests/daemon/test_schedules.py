@@ -2,6 +2,7 @@
 
 import logging
 import pickle
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -263,6 +264,28 @@ class TestScheduleEvaluation:
         assert result.run_requests[0].tags["date"] == "2025-03-10T00:00:00"
         assert result.run_requests[0].job_name == "my_job"
         assert result.skip_reason is None
+
+    def test_default_execution_time_is_now_in_rfc3339(self):
+        # The daemon passes RFC 3339 UTC; a manual evaluation must look the same.
+        @rs.Schedule(cron_schedule="0 0 * * *", job_name="my_job")
+        def my_sched(context: rs.ScheduleEvaluationContext):
+            return rs.RunRequest(tags={"t": context.scheduled_execution_time})
+
+        @rs.Asset
+        def a() -> Any:
+            return 1
+
+        repo = rs.CodeRepository(assets=[a], schedules=[my_sched])
+        before = datetime.now(timezone.utc).replace(microsecond=0)
+        result = repo.evaluate_schedule("my_sched")
+        after = datetime.now(timezone.utc)
+
+        tags = result.run_requests[0].tags
+        assert tags is not None
+        stamp = datetime.strptime(tags["t"], "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+        assert before <= stamp <= after
 
     def test_evaluate_returns_skip(self):
         @rs.Schedule(cron_schedule="0 0 * * *", job_name="my_job")
