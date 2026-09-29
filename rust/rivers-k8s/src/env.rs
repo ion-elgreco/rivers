@@ -217,62 +217,19 @@ impl Default for SurrealPodConfig {
 ///   pods without holding the password in memory
 pub fn build_surreal_pod_env(cfg: &SurrealPodConfig) -> Vec<EnvVar> {
     let mut env = vec![
-        EnvVar {
-            name: ENV_SURREAL_ENDPOINT.to_string(),
-            value: Some(cfg.endpoint.clone()),
-            ..Default::default()
-        },
-        EnvVar {
-            name: ENV_SURREAL_NAMESPACE.to_string(),
-            value: Some(cfg.namespace.clone()),
-            ..Default::default()
-        },
-        EnvVar {
-            name: ENV_SURREAL_DATABASE.to_string(),
-            value: Some(cfg.database.clone()),
-            ..Default::default()
-        },
+        value_env(ENV_SURREAL_ENDPOINT, &cfg.endpoint),
+        value_env(ENV_SURREAL_NAMESPACE, &cfg.namespace),
+        value_env(ENV_SURREAL_DATABASE, &cfg.database),
     ];
-    if cfg.auth_secret.is_set() {
-        env.push(EnvVar {
-            name: ENV_SURREAL_USERNAME.to_string(),
-            value_from: Some(EnvVarSource {
-                secret_key_ref: Some(SecretKeySelector {
-                    name: cfg.auth_secret.secret_name.clone(),
-                    key: cfg.auth_secret.username_key.clone(),
-                    optional: None,
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        env.push(EnvVar {
-            name: ENV_SURREAL_PASSWORD.to_string(),
-            value_from: Some(EnvVarSource {
-                secret_key_ref: Some(SecretKeySelector {
-                    name: cfg.auth_secret.secret_name.clone(),
-                    key: cfg.auth_secret.password_key.clone(),
-                    optional: None,
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        env.push(EnvVar {
-            name: ENV_SURREAL_AUTH_SECRET_NAME.to_string(),
-            value: Some(cfg.auth_secret.secret_name.clone()),
-            ..Default::default()
-        });
-        env.push(EnvVar {
-            name: ENV_SURREAL_AUTH_USERNAME_KEY.to_string(),
-            value: Some(cfg.auth_secret.username_key.clone()),
-            ..Default::default()
-        });
-        env.push(EnvVar {
-            name: ENV_SURREAL_AUTH_PASSWORD_KEY.to_string(),
-            value: Some(cfg.auth_secret.password_key.clone()),
-            ..Default::default()
-        });
+    let auth = &cfg.auth_secret;
+    if auth.is_set() {
+        env.extend([
+            secret_env(ENV_SURREAL_USERNAME, &auth.secret_name, &auth.username_key),
+            secret_env(ENV_SURREAL_PASSWORD, &auth.secret_name, &auth.password_key),
+            value_env(ENV_SURREAL_AUTH_SECRET_NAME, &auth.secret_name),
+            value_env(ENV_SURREAL_AUTH_USERNAME_KEY, &auth.username_key),
+            value_env(ENV_SURREAL_AUTH_PASSWORD_KEY, &auth.password_key),
+        ]);
     }
     env
 }
@@ -310,42 +267,54 @@ pub fn build_otel_pod_env(cfg: &OtelPodConfig) -> Vec<EnvVar> {
         return Vec::new();
     }
     let mut env = vec![
-        EnvVar {
-            name: ENV_OTEL_ENDPOINT.to_string(),
-            value: Some(cfg.endpoint.clone()),
-            ..Default::default()
-        },
-        EnvVar {
-            name: ENV_RIVERS_OTEL_ENDPOINT.to_string(),
-            value: Some(cfg.endpoint.clone()),
-            ..Default::default()
-        },
+        value_env(ENV_OTEL_ENDPOINT, &cfg.endpoint),
+        value_env(ENV_RIVERS_OTEL_ENDPOINT, &cfg.endpoint),
     ];
     if cfg.headers_secret_is_set() {
-        env.push(EnvVar {
-            name: ENV_OTEL_HEADERS.to_string(),
-            value_from: Some(EnvVarSource {
-                secret_key_ref: Some(SecretKeySelector {
-                    name: cfg.headers_secret_name.clone(),
-                    key: cfg.headers_secret_key.clone(),
-                    optional: None,
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        env.push(EnvVar {
-            name: ENV_OTEL_HEADERS_SECRET_NAME.to_string(),
-            value: Some(cfg.headers_secret_name.clone()),
-            ..Default::default()
-        });
-        env.push(EnvVar {
-            name: ENV_OTEL_HEADERS_SECRET_KEY.to_string(),
-            value: Some(cfg.headers_secret_key.clone()),
-            ..Default::default()
-        });
+        env.extend([
+            secret_env(
+                ENV_OTEL_HEADERS,
+                &cfg.headers_secret_name,
+                &cfg.headers_secret_key,
+            ),
+            value_env(ENV_OTEL_HEADERS_SECRET_NAME, &cfg.headers_secret_name),
+            value_env(ENV_OTEL_HEADERS_SECRET_KEY, &cfg.headers_secret_key),
+        ]);
     }
     env
+}
+
+fn value_env(name: &str, value: impl Into<String>) -> EnvVar {
+    EnvVar {
+        name: name.to_string(),
+        value: Some(value.into()),
+        ..Default::default()
+    }
+}
+
+fn secret_env(name: &str, secret: &str, key: &str) -> EnvVar {
+    EnvVar {
+        name: name.to_string(),
+        value_from: Some(EnvVarSource {
+            secret_key_ref: Some(SecretKeySelector {
+                name: secret.to_string(),
+                key: key.to_string(),
+                optional: None,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// `(secret, key)` of the `secretKeyRef` behind env var `name`.
+#[cfg(test)]
+pub(crate) fn env_secret_ref(env: &[EnvVar], name: &str) -> Option<(String, String)> {
+    env.iter()
+        .find(|e| e.name == name)
+        .and_then(|e| e.value_from.as_ref())
+        .and_then(|src| src.secret_key_ref.as_ref())
+        .map(|sk| (sk.name.clone(), sk.key.clone()))
 }
 
 /// Apply `overrides` on top of `base`: a same-named entry replaces the base
@@ -458,14 +427,6 @@ mod tests {
         env.iter()
             .find(|e| e.name == name)
             .and_then(|e| e.value.clone())
-    }
-
-    fn env_secret_ref(env: &[EnvVar], name: &str) -> Option<(String, String)> {
-        env.iter()
-            .find(|e| e.name == name)
-            .and_then(|e| e.value_from.as_ref())
-            .and_then(|src| src.secret_key_ref.as_ref())
-            .map(|sk| (sk.name.clone(), sk.key.clone()))
     }
 
     #[test]

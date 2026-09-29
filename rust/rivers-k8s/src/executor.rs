@@ -673,19 +673,14 @@ mod tests {
             .env
             .clone()
             .unwrap();
+        assert_eq!(
+            crate::env::env_secret_ref(&envs, "OTEL_EXPORTER_OTLP_HEADERS"),
+            Some(("otel-headers".to_string(), "headers".to_string()))
+        );
         let headers = envs
             .iter()
             .find(|e| e.name == "OTEL_EXPORTER_OTLP_HEADERS")
             .unwrap();
-        let secret_ref = headers
-            .value_from
-            .as_ref()
-            .unwrap()
-            .secret_key_ref
-            .as_ref()
-            .unwrap();
-        assert_eq!(secret_ref.name, "otel-headers");
-        assert_eq!(secret_ref.key, "headers");
         assert!(headers.value.is_none());
     }
 
@@ -739,15 +734,10 @@ mod tests {
             .clone()
             .unwrap();
         let secret_var = envs.iter().find(|e| e.name == "AWS_ACCESS_KEY_ID").unwrap();
-        let secret_ref = secret_var
-            .value_from
-            .as_ref()
-            .unwrap()
-            .secret_key_ref
-            .as_ref()
-            .unwrap();
-        assert_eq!(secret_ref.name, "aws-creds");
-        assert_eq!(secret_ref.key, "access-key");
+        assert_eq!(
+            crate::env::env_secret_ref(&envs, "AWS_ACCESS_KEY_ID"),
+            Some(("aws-creds".to_string(), "access-key".to_string()))
+        );
         assert!(secret_var.value.is_none());
     }
 

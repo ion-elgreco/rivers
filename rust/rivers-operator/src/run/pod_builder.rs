@@ -218,6 +218,14 @@ mod tests {
         )
     }
 
+    fn env_secret_ref(env: &[EnvVar], name: &str) -> Option<(String, String)> {
+        env.iter()
+            .find(|e| e.name == name)
+            .and_then(|e| e.value_from.as_ref())
+            .and_then(|src| src.secret_key_ref.as_ref())
+            .map(|sk| (sk.name.clone(), sk.key.clone()))
+    }
+
     #[test]
     fn otel_settings_are_stamped_on_the_run_pod() {
         let run = test_run();
@@ -245,19 +253,14 @@ mod tests {
             Some("https://otlp.example.com:4317")
         );
 
+        assert_eq!(
+            env_secret_ref(&envs, "OTEL_EXPORTER_OTLP_HEADERS"),
+            Some(("otel-headers".to_string(), "headers".to_string()))
+        );
         let headers = envs
             .iter()
             .find(|e| e.name == "OTEL_EXPORTER_OTLP_HEADERS")
             .unwrap();
-        let secret_ref = headers
-            .value_from
-            .as_ref()
-            .unwrap()
-            .secret_key_ref
-            .as_ref()
-            .unwrap();
-        assert_eq!(secret_ref.name, "otel-headers");
-        assert_eq!(secret_ref.key, "headers");
         assert!(headers.value.is_none());
 
         // Coordinates the run pod re-emits on step pods.
@@ -492,15 +495,10 @@ mod tests {
         assert_eq!(bucket.value.as_deref(), Some("my-bucket"));
 
         let key = envs.iter().find(|e| e.name == "AWS_ACCESS_KEY_ID").unwrap();
-        let secret_ref = key
-            .value_from
-            .as_ref()
-            .unwrap()
-            .secret_key_ref
-            .as_ref()
-            .unwrap();
-        assert_eq!(secret_ref.name, "aws-creds");
-        assert_eq!(secret_ref.key, "access-key");
+        assert_eq!(
+            env_secret_ref(&envs, "AWS_ACCESS_KEY_ID"),
+            Some(("aws-creds".to_string(), "access-key".to_string()))
+        );
         assert!(key.value.is_none());
 
         let cl_name = envs
