@@ -972,10 +972,10 @@ mod js {
 #[cfg(target_arch = "wasm32")]
 pub fn spawn_login_redirect_if_unauthorized() {
     leptos::task::spawn_local(async {
-        if let Err(e) = crate::server_fns::user::get_current_user().await {
-            if is_unauthorized(&e) {
-                redirect_to_login();
-            }
+        if let Err(e) = crate::server_fns::user::get_current_user().await
+            && is_unauthorized(&e)
+        {
+            redirect_to_login();
         }
     });
 }

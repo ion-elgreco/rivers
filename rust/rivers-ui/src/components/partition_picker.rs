@@ -157,7 +157,7 @@ pub fn PartitionPicker(
                     <div class="exec-dialog-partition-hint">
                         {format!(
                             "{} — scroll to browse, search to filter, or jump to a key.",
-                            crate::helpers::plural(total as u64, "dynamic partition", "dynamic partitions"),
+                            crate::helpers::plural(total, "dynamic partition", "dynamic partitions"),
                         )}
                     </div>
                     <VirtualPartitionList

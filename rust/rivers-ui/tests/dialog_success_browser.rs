@@ -48,7 +48,7 @@ async fn yield_macro() {
     use wasm_bindgen::closure::Closure;
     let promise = js_sys::Promise::new(&mut |resolve, _reject| {
         let cb = Closure::once_into_js(move || {
-            let _ = js_sys::Function::from(resolve).call0(&JsValue::NULL);
+            let _ = resolve.call0(&JsValue::NULL);
         });
         web_sys::window()
             .unwrap()
@@ -267,7 +267,8 @@ async fn execute_job_whole_asset_choice_sends_whole_asset() {
         "expected redirect to /runs/RUN-WHOLE, got: {}",
         current_path()
     );
-    let bodies = request_bodies(&requests.borrow()).await;
+    let recorded = requests.borrow().clone();
+    let bodies = request_bodies(&recorded).await;
     assert_eq!(
         bodies,
         vec![
@@ -318,7 +319,8 @@ async fn execute_job_backfill_sends_the_verb_it_showed() {
         "expected redirect to /backfills/BF-DEL, got: {}",
         current_path()
     );
-    let bodies = request_bodies(&requests.borrow()).await;
+    let recorded = requests.borrow().clone();
+    let bodies = request_bodies(&recorded).await;
     assert_eq!(
         bodies,
         vec![
@@ -364,7 +366,8 @@ async fn materialize_whole_asset_choice_sends_whole_asset() {
         "expected redirect to /runs/RUN-DEL, got: {}",
         current_path()
     );
-    let bodies = request_bodies(&requests.borrow()).await;
+    let recorded = requests.borrow().clone();
+    let bodies = request_bodies(&recorded).await;
     assert_eq!(
         bodies,
         vec![

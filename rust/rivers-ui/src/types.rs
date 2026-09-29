@@ -221,7 +221,7 @@ impl VerbFilter {
     /// Map to the core filter's nested-`Option` encoding, which is in-process
     /// only and so never has to survive serialization.
     #[cfg(feature = "ssr")]
-    fn to_core(self) -> Option<Option<String>> {
+    fn into_core(self) -> Option<Option<String>> {
         match self {
             Self::Any => None,
             Self::MaterializeOnly => Some(None),
@@ -1165,7 +1165,7 @@ mod conversions {
                 job_substring: f.job_substring.filter(|s| !s.is_empty()),
                 asset_substring: f.asset_substring.filter(|s| !s.is_empty()),
                 partition_substring: f.partition_substring.filter(|s| !s.is_empty()),
-                action: f.action.to_core(),
+                action: f.action.into_core(),
             }
         }
     }

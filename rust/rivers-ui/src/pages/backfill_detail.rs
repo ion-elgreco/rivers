@@ -379,7 +379,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                 {move || {
                                     backfill_runs.get().map(|result| match result {
                                         Ok(mut runs) => {
-                                            runs.sort_by(|a, b| b.start_time.cmp(&a.start_time));
+                                            runs.sort_by_key(|r| std::cmp::Reverse(r.start_time));
                                             let n_runs = runs.len();
                                             view! {
                                                 <SectionHeader label="RUNS" count=n_runs.to_string()/>

@@ -48,7 +48,7 @@ async fn connect_to_run_owner(
         .iter()
         .find(|e| e.identity == cl)
         // Single-location registries (dev mode) can't cross locations.
-        .or_else(|| match entries.as_slice() {
+        .or(match entries.as_slice() {
             [only] => Some(only),
             _ => None,
         })
@@ -340,12 +340,13 @@ pub async fn launch_backfill(
     // Same rule as `trigger_action`: a `#[server]` fn is a public HTTP
     // endpoint, so an empty selection with a verb must not reach the backend
     // and read as "every asset declaring it".
-    if let Some(verb) = &action {
-        if job_name.is_none() && selection.as_ref().is_none_or(|s| s.is_empty()) {
-            return Err(ServerFnError::new(format!(
-                "backfill with action '{verb}' needs at least one asset"
-            )));
-        }
+    if let Some(verb) = &action
+        && job_name.is_none()
+        && selection.as_ref().is_none_or(|s| s.is_empty())
+    {
+        return Err(ServerFnError::new(format!(
+            "backfill with action '{verb}' needs at least one asset"
+        )));
     }
 
     let state = expect_context::<crate::state::AppState>();

@@ -21,10 +21,10 @@ fn get_element_size(target: &Option<leptos::web_sys::EventTarget>) -> (f64, f64)
     #[cfg(target_arch = "wasm32")]
     {
         use leptos::wasm_bindgen::JsCast;
-        if let Some(t) = target {
-            if let Ok(el) = t.clone().dyn_into::<leptos::web_sys::HtmlElement>() {
-                return (el.client_width() as f64, el.client_height() as f64);
-            }
+        if let Some(t) = target
+            && let Ok(el) = t.clone().dyn_into::<leptos::web_sys::HtmlElement>()
+        {
+            return (el.client_width() as f64, el.client_height() as f64);
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -51,10 +51,9 @@ fn is_bare_canvas_click(ev: &leptos::ev::MouseEvent) -> bool {
         if !el.tag_name().eq_ignore_ascii_case("svg") {
             return false;
         }
-        return el
-            .parent_element()
+        el.parent_element()
             .map(|p| p.class_list().contains("dag-container"))
-            .unwrap_or(false);
+            .unwrap_or(false)
     }
     #[cfg(not(target_arch = "wasm32"))]
     {

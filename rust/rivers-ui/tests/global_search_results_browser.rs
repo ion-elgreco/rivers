@@ -50,7 +50,7 @@ async fn yield_macro() {
     use wasm_bindgen::closure::Closure;
     let promise = js_sys::Promise::new(&mut |resolve, _| {
         let cb = Closure::once_into_js(move || {
-            let _ = js_sys::Function::from(resolve).call0(&JsValue::NULL);
+            let _ = resolve.call0(&JsValue::NULL);
         });
         web_sys::window()
             .unwrap()

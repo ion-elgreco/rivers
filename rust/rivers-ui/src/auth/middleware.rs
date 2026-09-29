@@ -21,30 +21,6 @@ fn is_public(path: &str) -> bool {
         || path == crate::routes::LOGOUT
 }
 
-#[cfg(test)]
-mod tests {
-    use super::is_public;
-    use crate::routes;
-
-    /// The gate must treat every auth route as public — otherwise the login
-    /// flow itself would require a session. Ties the route consts to `is_public`.
-    #[test]
-    fn auth_routes_are_public() {
-        assert!(is_public(routes::LOGIN));
-        assert!(is_public(routes::CALLBACK));
-        assert!(is_public(routes::LOGOUT));
-        assert!(is_public("/healthz"));
-        assert!(is_public("/readyz"));
-        assert!(!is_public("/"));
-        assert!(!is_public("/api/events"));
-        // Only the three real handlers are public — not the whole `/auth/`
-        // namespace. An unmatched `/auth/*` path must still hit the gate so a
-        // future catch-all SSR fallback can't leak through it.
-        assert!(!is_public("/auth/foobar"));
-        assert!(!is_public("/auth/"));
-    }
-}
-
 fn wants_html(headers: &axum::http::HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
@@ -125,5 +101,29 @@ pub async fn require_auth(
                     .into_response(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_public;
+    use crate::routes;
+
+    /// The gate must treat every auth route as public — otherwise the login
+    /// flow itself would require a session. Ties the route consts to `is_public`.
+    #[test]
+    fn auth_routes_are_public() {
+        assert!(is_public(routes::LOGIN));
+        assert!(is_public(routes::CALLBACK));
+        assert!(is_public(routes::LOGOUT));
+        assert!(is_public("/healthz"));
+        assert!(is_public("/readyz"));
+        assert!(!is_public("/"));
+        assert!(!is_public("/api/events"));
+        // Only the three real handlers are public — not the whole `/auth/`
+        // namespace. An unmatched `/auth/*` path must still hit the gate so a
+        // future catch-all SSR fallback can't leak through it.
+        assert!(!is_public("/auth/foobar"));
+        assert!(!is_public("/auth/"));
     }
 }

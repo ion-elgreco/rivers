@@ -1024,7 +1024,7 @@ fn AutomationTicksTab(asset_key: String, #[prop(into)] refresh_tick: Signal<u32>
                                                 if is_initial_selected {
                                                     #[cfg(feature = "hydrate")]
                                                     {
-                                                        let nr = node_ref.clone();
+                                                        let nr = node_ref;
                                                         leptos::prelude::Effect::new(move |_| {
                                                             if let Some(el) = nr.get() {
                                                                 let el: &leptos::web_sys::Element = el.as_ref();
