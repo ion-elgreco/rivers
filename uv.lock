@@ -1672,6 +1672,7 @@ source = { virtual = "." }
 
 [package.dev-dependencies]
 dev = [
+    { name = "cryptography" },
     { name = "grpcio" },
     { name = "grpcio-tools" },
     { name = "kr8s" },
@@ -1690,6 +1691,7 @@ dev = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "cryptography", specifier = ">=48.0.1" },
     { name = "grpcio", specifier = ">=1.82.1" },
     { name = "grpcio-tools", specifier = ">=1.82.1" },
     { name = "kr8s", specifier = ">=0.20" },
