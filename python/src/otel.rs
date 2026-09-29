@@ -210,14 +210,31 @@ mod tests {
             .collect()
     }
 
-    fn pem_file(name: &str) -> String {
-        let path = std::env::temp_dir().join(format!("rivers-otel-{}-{name}", std::process::id()));
-        std::fs::write(
-            &path,
-            b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n",
-        )
-        .unwrap();
-        path.to_string_lossy().into_owned()
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(test: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("rivers-otel-{}-{test}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn pem_file(&self, name: &str) -> String {
+            let path = self.0.join(name);
+            std::fs::write(
+                &path,
+                b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n",
+            )
+            .unwrap();
+            path.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
@@ -313,9 +330,10 @@ mod tests {
 
     #[test]
     fn certificate_files_are_read() {
-        let ca = pem_file("ca.pem");
-        let cert = pem_file("client.pem");
-        let key = pem_file("client.key");
+        let dir = TempDir::new("certificate_files_are_read");
+        let ca = dir.pem_file("ca.pem");
+        let cert = dir.pem_file("client.pem");
+        let key = dir.pem_file("client.key");
         let vars = lookup(&[
             ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector:4317"),
             ("OTEL_EXPORTER_OTLP_CERTIFICATE", &ca),
@@ -364,7 +382,8 @@ mod tests {
 
     #[test]
     fn client_certificate_without_key_is_rejected() {
-        let cert = pem_file("lonely.pem");
+        let dir = TempDir::new("client_certificate_without_key_is_rejected");
+        let cert = dir.pem_file("lonely.pem");
         let vars = lookup(&[
             ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector:4317"),
             ("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", &cert),
