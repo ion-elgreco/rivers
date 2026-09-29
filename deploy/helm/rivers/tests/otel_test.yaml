@@ -60,3 +60,12 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "otel.headers.existingSecret is set but otel.endpoint is empty"
+
+  - it: headers Secret with an empty secretKey fails the install
+    set:
+      otel.endpoint: https://otlp.example.com:4317
+      otel.headers.existingSecret: otel-headers
+      otel.headers.secretKey: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: "otel.headers.secretKey must be set"

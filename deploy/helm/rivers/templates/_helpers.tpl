@@ -204,7 +204,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT on the operator pod must not reach child pods.
 - name: RIVERS_OTEL_HEADERS_SECRET_NAME
   value: {{ .Values.otel.headers.existingSecret | quote }}
 - name: RIVERS_OTEL_HEADERS_SECRET_KEY
-  value: {{ .Values.otel.headers.secretKey | quote }}
+  value: {{ required "otel.headers.secretKey must be set when otel.headers.existingSecret is" .Values.otel.headers.secretKey | quote }}
 {{- end }}
 {{- else if .Values.otel.headers.existingSecret }}
 {{ fail "otel.headers.existingSecret is set but otel.endpoint is empty; set otel.endpoint or drop the Secret" }}
