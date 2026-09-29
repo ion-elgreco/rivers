@@ -366,3 +366,24 @@ def test_certificate_with_plain_http_endpoint_disables_export(tmp_path: Path) ->
         "OTEL_EXPORTER_OTLP_CERTIFICATE is set but OTEL_EXPORTER_OTLP_ENDPOINT "
         "(http://127.0.0.1:4317) is not https://"
     ) in result.stderr
+
+
+def test_https_endpoint_without_a_system_ca_bundle_keeps_export(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "certs").mkdir()
+    env = os.environ.copy()
+    env["OTEL_EXPORTER_OTLP_ENDPOINT"] = "https://127.0.0.1:4317"
+    env["SSL_CERT_FILE"] = _write(tmp_path, "empty.pem", b"")
+    env["SSL_CERT_DIR"] = str(tmp_path / "certs")
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import rivers"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert "OpenTelemetry export disabled" not in result.stderr, result.stderr

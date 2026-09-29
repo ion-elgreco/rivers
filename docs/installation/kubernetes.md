@@ -347,7 +347,8 @@ otel:
     existingSecret: otel-headers   # key: headers
 ```
 
-`https://` endpoints use TLS with the image's system roots. To override the
+`https://` endpoints use TLS with the image's system roots plus bundled
+Mozilla roots, so images without a CA bundle work too. To override the
 endpoint or headers for one code location, set the same
 `OTEL_EXPORTER_OTLP_*` variables in `CodeLocation.spec.env`; each entry there
 replaces the chart value of the same name. A node-local collector endpoint

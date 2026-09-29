@@ -12,6 +12,7 @@ use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithTonicConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider};
 use pyo3::prelude::*;
+use rustls::pki_types::TrustAnchor;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 
 use crate::runtime::rt;
@@ -130,7 +131,9 @@ fn tls_config(get: Lookup) -> anyhow::Result<Option<ClientTlsConfig>> {
 
     let config = match ca {
         Some(ca) => ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca)),
-        None => ClientTlsConfig::new().with_enabled_roots(),
+        None => ClientTlsConfig::new()
+            .with_webpki_roots()
+            .trust_anchors(native_roots()),
     };
     let config = match (client_cert, client_key) {
         (Some(cert), Some(key)) => config.identity(Identity::from_pem(cert, key)),
@@ -140,6 +143,13 @@ fn tls_config(get: Lookup) -> anyhow::Result<Option<ClientTlsConfig>> {
         ),
     };
     Ok(Some(config))
+}
+
+/// Empty when the image has no CA bundle; the bundled Mozilla roots still apply.
+fn native_roots() -> Vec<TrustAnchor<'static>> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    roots.roots
 }
 
 #[cfg(test)]

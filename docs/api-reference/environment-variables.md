@@ -63,9 +63,9 @@ Read by `rivers-ui` (the standalone UI server, distinct from the in-process UI s
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/gRPC endpoint. When set, rivers installs an OpenTelemetry tracing layer that exports to it. `https://` endpoints use TLS and verify the server against the system roots. Leave unset to disable OTel export entirely. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/gRPC endpoint. When set, rivers installs an OpenTelemetry tracing layer that exports to it. `https://` endpoints use TLS and verify the server against the system roots plus bundled Mozilla roots. Leave unset to disable OTel export entirely. |
 | `OTEL_EXPORTER_OTLP_HEADERS` | unset | Headers sent with every export, as comma-separated `key=value` pairs. This is where API keys and bearer tokens go, e.g. `authorization=Bearer <token>` or `x-honeycomb-team=<key>`. |
-| `OTEL_EXPORTER_OTLP_CERTIFICATE` | unset | Path to a PEM file holding the CA that signs the collector's certificate. Replaces the system roots. Requires an `https://` endpoint. |
+| `OTEL_EXPORTER_OTLP_CERTIFICATE` | unset | Path to a PEM file holding the CA that signs the collector's certificate. Replaces the system and bundled roots. Requires an `https://` endpoint. |
 | `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` / `OTEL_EXPORTER_OTLP_CLIENT_KEY` | unset | Paths to a PEM client certificate and private key for mutual TLS. Set both or neither. Requires an `https://` endpoint. |
 | `OTEL_EXPORTER_OTLP_TIMEOUT` | `10000` | Export timeout in milliseconds. |
 | `OTEL_EXPORTER_OTLP_TRACES_*` | unset | Traces-specific form of each variable above (`..._TRACES_ENDPOINT`, `..._TRACES_HEADERS`, ...). Takes precedence over the generic one. An empty `..._TRACES_ENDPOINT` or certificate variable counts as unset. |
