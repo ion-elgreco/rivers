@@ -20,6 +20,7 @@ pub mod auth;
 #[cfg(feature = "ssr")]
 pub mod code_location_registry;
 pub mod components;
+pub mod config_schema;
 #[cfg(feature = "ssr")]
 pub mod favicon;
 pub mod helpers;
