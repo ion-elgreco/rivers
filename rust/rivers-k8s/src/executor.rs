@@ -290,8 +290,7 @@ fn build_job_inner(
                             ];
                             env.extend(crate::env::build_surreal_pod_env(&config.surreal_pod_cfg));
                             env.extend(crate::env::build_otel_pod_env(&config.otel_pod_cfg));
-                            env.extend(config.extra_env.iter().cloned());
-                            env
+                            crate::env::merge_env(env, config.extra_env.iter().cloned())
                         }),
                         ..Default::default()
                     }],
@@ -684,6 +683,32 @@ mod tests {
         assert_eq!(secret_ref.name, "otel-headers");
         assert_eq!(secret_ref.key, "headers");
         assert!(headers.value.is_none());
+    }
+
+    #[test]
+    fn extra_env_replaces_same_named_otel_env() {
+        let mut config = test_config();
+        config.otel_pod_cfg = crate::env::OtelPodConfig {
+            endpoint: "https://otlp.example.com:4317".to_string(),
+            ..Default::default()
+        };
+        config.extra_env = vec![EnvVar {
+            name: "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+            value: Some("http://team-collector:4317".to_string()),
+            ..Default::default()
+        }];
+        let job = build_step_job(&config, "step");
+        let envs = job.spec.unwrap().template.spec.unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap();
+
+        let endpoints: Vec<_> = envs
+            .iter()
+            .filter(|e| e.name == "OTEL_EXPORTER_OTLP_ENDPOINT")
+            .map(|e| e.value.as_deref())
+            .collect();
+        assert_eq!(endpoints, vec![Some("http://team-collector:4317")]);
     }
 
     #[test]

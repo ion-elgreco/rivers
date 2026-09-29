@@ -126,8 +126,7 @@ pub fn build_executor_pod(
                             .with_endpoint(spec.surreal_endpoint.clone()),
                     ));
                     env.extend(rivers_k8s::env::build_otel_pod_env(otel_pod_cfg));
-                    env.extend(cl_env.iter().cloned());
-                    env
+                    rivers_k8s::env::merge_env(env, cl_env.iter().cloned())
                 }),
                 ..Default::default()
             }],
@@ -421,6 +420,36 @@ mod tests {
             .unwrap()
             .clone();
         assert!(!args_no.contains(&"--resume".to_string()));
+    }
+
+    #[test]
+    fn cl_env_replaces_same_named_otel_env() {
+        let run = test_run();
+        let cl_env = vec![EnvVar {
+            name: "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+            value: Some("http://team-collector:4317".to_string()),
+            ..Default::default()
+        }];
+        let pod = build_executor_pod(
+            &run,
+            "test-pod",
+            "run-123",
+            false,
+            &cl_env,
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig {
+                endpoint: "https://otlp.example.com:4317".to_string(),
+                ..Default::default()
+            },
+        );
+        let envs = pod.spec.unwrap().containers[0].env.clone().unwrap();
+
+        let endpoints: Vec<_> = envs
+            .iter()
+            .filter(|e| e.name == "OTEL_EXPORTER_OTLP_ENDPOINT")
+            .map(|e| e.value.as_deref())
+            .collect();
+        assert_eq!(endpoints, vec![Some("http://team-collector:4317")]);
     }
 
     #[test]

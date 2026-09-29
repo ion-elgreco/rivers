@@ -179,8 +179,7 @@ fn build_env(
     ];
     env.extend(rivers_k8s::env::build_surreal_pod_env(surreal_pod_cfg));
     env.extend(rivers_k8s::env::build_otel_pod_env(otel_pod_cfg));
-    env.extend(cl.spec.env.iter().cloned());
-    env
+    rivers_k8s::env::merge_env(env, cl.spec.env.iter().cloned())
 }
 
 pub fn build_service(cl: &CodeLocation) -> Service {
@@ -343,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn deployment_forwards_otel_export_settings_before_user_env() {
+    fn deployment_spec_env_replaces_chart_otel_endpoint() {
         let cl = make_cl(
             json!({
                 "image": "ghcr.io/acme/pipeline",
@@ -369,16 +368,19 @@ mod tests {
 
         let env = serde_json::to_value(&d.spec.unwrap().template.spec.unwrap().containers[0].env)
             .unwrap();
-        let tail = &env.as_array().unwrap()[7..];
+        let env = env.as_array().unwrap();
+        let mut names: Vec<&str> = env.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before, "duplicate env names: {env:?}");
         assert_eq!(
-            serde_json::Value::Array(tail.to_vec()),
+            serde_json::Value::Array(env[7..].to_vec()),
             json!([
-                { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "https://otlp.example.com:4317" },
+                { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://team-collector:4317" },
                 { "name": "OTEL_EXPORTER_OTLP_HEADERS", "valueFrom": { "secretKeyRef": { "name": "otel-headers", "key": "headers" } } },
                 { "name": "RIVERS_OTEL_HEADERS_SECRET_NAME", "value": "otel-headers" },
                 { "name": "RIVERS_OTEL_HEADERS_SECRET_KEY", "value": "headers" },
-                // spec.env is last, so it wins on duplicates.
-                { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://team-collector:4317" },
             ])
         );
     }

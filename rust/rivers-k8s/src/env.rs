@@ -336,6 +336,22 @@ pub fn build_otel_pod_env(cfg: &OtelPodConfig) -> Vec<EnvVar> {
     env
 }
 
+/// Apply `overrides` on top of `base`: a same-named entry replaces the base
+/// one in place, a new name is appended. Server-side apply rejects duplicate
+/// names in a container's env list.
+pub fn merge_env(
+    mut base: Vec<EnvVar>,
+    overrides: impl IntoIterator<Item = EnvVar>,
+) -> Vec<EnvVar> {
+    for var in overrides {
+        match base.iter_mut().find(|e| e.name == var.name) {
+            Some(slot) => *slot = var,
+            None => base.push(var),
+        }
+    }
+    base
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +531,27 @@ mod tests {
         assert!(!s.is_set());
         s.password_key = "p".into();
         assert!(s.is_set());
+    }
+
+    #[test]
+    fn merge_env_replaces_in_place_and_appends_new_names() {
+        let var = |name: &str, value: &str| EnvVar {
+            name: name.to_string(),
+            value: Some(value.to_string()),
+            ..Default::default()
+        };
+        let merged = merge_env(
+            vec![var("A", "1"), var("B", "2"), var("C", "3")],
+            vec![var("D", "4"), var("B", "user"), var("D", "last")],
+        );
+        let pairs: Vec<_> = merged
+            .iter()
+            .map(|e| (e.name.as_str(), e.value.as_deref().unwrap()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("A", "1"), ("B", "user"), ("C", "3"), ("D", "last")]
+        );
     }
 
     #[test]

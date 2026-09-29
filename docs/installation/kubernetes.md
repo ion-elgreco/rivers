@@ -347,8 +347,8 @@ otel:
 
 `https://` endpoints use TLS with the image's system roots. To override the
 endpoint or headers for one code location, set the same
-`OTEL_EXPORTER_OTLP_*` variables in `CodeLocation.spec.env`; entries there
-win over the chart values. The
+`OTEL_EXPORTER_OTLP_*` variables in `CodeLocation.spec.env`; each entry there
+replaces the chart value of the same name. The
 [environment variable reference](../api-reference/environment-variables.md#observability)
 lists every variable rivers reads.
 
