@@ -1,13 +1,14 @@
 //! OTLP span exporter built from the `OTEL_EXPORTER_OTLP_*` env vars.
 //!
-//! The exporter crate reads the endpoint, headers, and timeout itself but
-//! not the TLS variables, so those are read here.
+//! The exporter crate reads the headers and timeout itself. The endpoint is
+//! resolved here because the crate treats an empty traces-specific variable
+//! as set; the TLS variables because the crate does not read them.
 
 use std::sync::OnceLock;
 
 use anyhow::Context;
 use opentelemetry::trace::TracerProvider;
-use opentelemetry_otlp::{SpanExporter, WithTonicConfig};
+use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithTonicConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider};
 use pyo3::prelude::*;
@@ -52,6 +53,9 @@ pub(crate) fn shutdown(py: Python<'_>) {
 
 fn span_exporter() -> anyhow::Result<SpanExporter> {
     let mut builder = SpanExporter::builder().with_tonic();
+    if let Some((_, endpoint)) = otlp_var(&env_lookup, "ENDPOINT") {
+        builder = builder.with_endpoint(endpoint);
+    }
     if let Some(tls) = tls_config(&env_lookup)? {
         builder = builder.with_tls_config(tls);
     }

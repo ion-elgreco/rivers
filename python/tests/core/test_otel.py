@@ -236,6 +236,25 @@ def test_spans_still_queued_at_exit_are_exported(tmp_path: Path) -> None:
     assert b"otel_probe" in receiver.exports[0].body
 
 
+def test_empty_traces_endpoint_falls_back_to_generic_endpoint(tmp_path: Path) -> None:
+    ca = _pem("rivers-test-ca", ca=True)
+    server = _pem("otlp-receiver", issuer=ca, usage=ExtendedKeyUsageOID.SERVER_AUTH)
+
+    with Receiver(server, ca, require_client_auth=False) as receiver:
+        result = _emit_span(
+            {
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "",
+                "OTEL_EXPORTER_OTLP_ENDPOINT": f"https://127.0.0.1:{receiver.port}",
+                "OTEL_EXPORTER_OTLP_CERTIFICATE": _write(tmp_path, "ca.pem", ca.cert),
+            }
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert "OpenTelemetry export disabled" not in result.stderr
+    assert receiver.exports, f"no export received; stderr:\n{result.stderr}"
+    assert b"otel_probe" in receiver.exports[0].body
+
+
 def test_receiver_requiring_a_client_certificate_gets_nothing_without_one(
     tmp_path: Path,
 ) -> None:

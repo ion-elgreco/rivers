@@ -68,7 +68,7 @@ Read by `rivers-ui` (the standalone UI server, distinct from the in-process UI s
 | `OTEL_EXPORTER_OTLP_CERTIFICATE` | unset | Path to a PEM file holding the CA that signs the collector's certificate. Replaces the system roots. Requires an `https://` endpoint. |
 | `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` / `OTEL_EXPORTER_OTLP_CLIENT_KEY` | unset | Paths to a PEM client certificate and private key for mutual TLS. Set both or neither. Requires an `https://` endpoint. |
 | `OTEL_EXPORTER_OTLP_TIMEOUT` | `10000` | Export timeout in milliseconds. |
-| `OTEL_EXPORTER_OTLP_TRACES_*` | unset | Traces-specific form of each variable above (`..._TRACES_ENDPOINT`, `..._TRACES_HEADERS`, ...). Takes precedence over the generic one. |
+| `OTEL_EXPORTER_OTLP_TRACES_*` | unset | Traces-specific form of each variable above (`..._TRACES_ENDPOINT`, `..._TRACES_HEADERS`, ...). Takes precedence over the generic one. An empty `..._TRACES_ENDPOINT` or certificate variable counts as unset. |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter. Honoured by the operator and the UI binary. |
 
 If the exporter cannot be built (for example an unreadable certificate file, or a certificate variable with an `http://` endpoint), rivers logs one error at startup naming the variable and runs with export disabled. Spans are sent in batches; when the process exits normally, rivers sends the spans still queued and waits at most five seconds for the collector. On Kubernetes the [Helm chart](../installation/kubernetes.md#opentelemetry-export) sets the endpoint and headers on every pod for you.
