@@ -19,6 +19,7 @@ use crate::metadata::{MetadataValue, coerce_to_metadata_value};
 use crate::result_types::ResultKind;
 
 use super::super::ops::{self, now_ts};
+use super::super::traceback;
 use super::context::BatchContext;
 use super::types::{CapturedLogs, WorkOutcome};
 
@@ -571,8 +572,14 @@ pub(crate) fn handle_failure(
     let err_msg = error.to_string();
     let classified = super::failure::classify_pyerr(py, &error);
     let ts = now_ts();
+    let package = traceback::node_package(py, ctx.repo.node_map.get(&step.name));
+    let failed_traceback = traceback::capture_json(py, &error, package.as_deref());
     for name in event_names {
-        ctx.emit_step_failure(name, &err_msg, Some(&classified));
+        let failed_at = now_ts();
+        if let Some(tb) = &failed_traceback {
+            ctx.emit_traceback(name, tb, failed_at);
+        }
+        ctx.emit_step_failure(name, &err_msg, Some(&classified), failed_at);
         ctx.emit_partition_failures(name, &err_msg, ts);
         ctx.state.mark_failed(name.clone());
     }

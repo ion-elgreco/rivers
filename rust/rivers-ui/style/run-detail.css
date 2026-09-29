@@ -443,3 +443,33 @@
 .run-trigger-meta-spacer { flex: 1; }
 .run-trigger-meta-tag { color: var(--text-muted); background: var(--bg-hover); border-radius: var(--round-xs); padding: 1px 6px; }
 
+
+/* Run detail: failed steps, each with its traceback */
+.run-failures .run-view-panel-header { margin-bottom: 4px; }
+.run-failures-title { display: flex; align-items: baseline; gap: 8px; }
+.run-failure { display: flex; flex-direction: column; gap: 10px; padding: 10px 0; }
+.run-failure + .run-failure { border-top: 1px solid var(--border); }
+.run-failure-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.run-failure-dot {
+    flex-shrink: 0;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--error);
+}
+.run-failure-asset { font-weight: 600; color: var(--text); }
+.run-failure-error {
+    flex: 1 1 320px;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: var(--fs-sm);
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.run-failure-where { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-muted); }
+.run-failure-toggle { margin-left: auto; }
+.run-failures-more { padding-top: 8px; font-size: var(--fs-xs); color: var(--text-muted); }

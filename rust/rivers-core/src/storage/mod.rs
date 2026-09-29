@@ -1363,11 +1363,19 @@ pub struct LogRecord {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub logs: Option<String>,
+    /// JSON [`crate::execution::traceback::Traceback`] of a failed attempt,
+    /// in a row of its own stamped with the attempt's `StepFailure` /
+    /// `StepRetry` event time.
+    #[serde(default)]
+    pub traceback: Option<String>,
 }
 
 impl LogRecord {
     pub fn is_empty(&self) -> bool {
-        self.stdout.is_none() && self.stderr.is_none() && self.logs.is_none()
+        self.stdout.is_none()
+            && self.stderr.is_none()
+            && self.logs.is_none()
+            && self.traceback.is_none()
     }
 }
 
@@ -1383,6 +1391,8 @@ pub struct StoredLog {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub logs: Option<String>,
+    #[serde(default)]
+    pub traceback: Option<String>,
 }
 
 /// Stored event with its database-assigned ID.

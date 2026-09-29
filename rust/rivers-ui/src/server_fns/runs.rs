@@ -3,7 +3,9 @@
 use leptos::prelude::*;
 use leptos::server_fn::codec::Json;
 
-use crate::types::{EventsPage, RunFilter, RunLog, RunRecord, RunsPage, RunsSummary, StoredEvent};
+use crate::types::{
+    EventsPage, RunFilter, RunLog, RunRecord, RunsPage, RunsSummary, StoredEvent, Traceback,
+};
 
 /// Latest runs across all code locations. `status` accepts the wire-string
 /// form of [`RunStatus`] (`"Success"`, `"Failure"`, `"Started"`,
@@ -81,6 +83,27 @@ pub async fn get_run_logs(run_id: String) -> Result<Vec<RunLog>, ServerFnError> 
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
+/// The traceback of `step_key`'s attempt that ended with the `StepFailure` or
+/// `StepRetry` event at `at`, for pages that do not load the run's logs.
+#[server]
+pub async fn get_step_traceback(
+    run_id: String,
+    step_key: String,
+    at: i64,
+) -> Result<Option<Traceback>, ServerFnError> {
+    use rivers_core::storage::StorageBackend;
+    let state = expect_context::<crate::state::AppState>();
+    let logs: Vec<RunLog> = state
+        .storage
+        .get_run_logs(&run_id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    Ok(crate::types::traceback_for(&logs, &step_key, at).cloned())
+}
+
 /// A page of a run's structured (non-log) events, optionally scoped to one
 /// asset (the selected step). Backs the run-detail events table.
 #[server(input = Json)]
@@ -148,8 +171,7 @@ pub async fn get_runs_page(
 #[server]
 pub async fn get_runs_summary() -> Result<RunsSummary, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let cutoff = (jiff::Timestamp::now().as_nanosecond() as i64)
-        .saturating_sub(86_400_000_000_000);
+    let cutoff = (jiff::Timestamp::now().as_nanosecond() as i64).saturating_sub(86_400_000_000_000);
     state
         .storage
         .get_all_runs_summary(cutoff)

@@ -51,3 +51,14 @@ class SchemaMigrationNeededError(StorageError):
 
 class TaskDefinitionError(Exception):
     """Raised when a ``Task`` / ``BashTask`` definition is invalid."""
+
+class WorkerStepError(Exception):
+    """Internal: carries a failed step out of a parallel worker process.
+
+    The parallel executor unwraps it and reports the step's own exception, so
+    user code never sees this type.
+    """
+
+    step_error: BaseException
+    captured_logs: tuple[str, str, str] | None
+    traceback: str | None

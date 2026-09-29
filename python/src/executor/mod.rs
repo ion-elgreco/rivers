@@ -13,6 +13,7 @@ pub mod kubernetes;
 pub mod ops;
 pub mod parallel;
 pub(crate) mod run_lifecycle;
+pub(crate) mod traceback;
 
 use std::collections::{HashMap, HashSet};
 

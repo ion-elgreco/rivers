@@ -7,6 +7,7 @@ use leptos_router::hooks::use_params_map;
 use crate::components::icons::{IconRetry, IconStop, IconTrash};
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::pagination::{InfiniteEventList, PaginatedView};
+use crate::components::traceback::RunFailures;
 use crate::components::ui_kit::{Crumb, EmptyState, StatusChip, Topbar};
 use crate::helpers::{
     code_location_label, format_elapsed, format_relative_time, format_timestamp,
@@ -147,6 +148,10 @@ pub fn RunDetailPage() -> impl IntoView {
         refresh_tick.get();
         async move { get_run_logs(id).await }
     });
+    let run_logs_list =
+        Signal::derive(move || run_logs.get().and_then(|r| r.ok()).unwrap_or_default());
+    // Read outside the step events' Transition, so through the effect-filled copy.
+    let step_events_value = crate::helpers::resource_value(step_events);
     let topology = Resource::new(
         move || loc.get(),
         |(ns, name)| async move { crate::server_fns::graph::get_graph_topology(ns, name).await },
@@ -455,6 +460,12 @@ pub fn RunDetailPage() -> impl IntoView {
         <Transition>
             <Show when=move || !matches!(run.get(), Some(Ok(None)))>
                 <div class="tab-content">
+                    <RunFailures
+                        step_events=Signal::derive(move || {
+                            step_events_value.get().and_then(|r| r.ok()).unwrap_or_default()
+                        })
+                        run_logs=run_logs_list
+                    />
                     <Transition fallback=move || view! { <div class="loading">"Loading timeline…"</div> }>
                         {move || {
                             let run_data = run.get().and_then(|r| r.ok()).flatten();
@@ -480,9 +491,7 @@ pub fn RunDetailPage() -> impl IntoView {
                     <RunLogPanel
                         run_id=run_id_memo
                         refresh_tick=refresh_tick
-                        run_logs=Signal::derive(move || {
-                            run_logs.get().and_then(|r| r.ok()).unwrap_or_default()
-                        })
+                        run_logs=run_logs_list
                         logs_error=Signal::derive(move || {
                             run_logs.get().and_then(|r| r.err()).map(|e| crate::helpers::err_text(&e))
                         })

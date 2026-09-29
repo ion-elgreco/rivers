@@ -13,4 +13,5 @@ pub mod materialize_dialog;
 pub mod multi_select;
 pub mod pagination;
 pub mod partition_picker;
+pub mod traceback;
 pub mod ui_kit;

@@ -8,6 +8,7 @@ use crate::components::icons::IconPlay;
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::materialize_dialog::MaterializeDialog;
 use crate::components::pagination::PaginatedView;
+use crate::components::traceback::TracebackView;
 use crate::components::ui_kit::{
     Crumb, EmptyState, EventGlyphTimeline, GlyphEvent, RecentRunsStrip, RunLaunched, RunsGrid,
     SectionHeader, StatusChip, StripRun, TickRunChips, Topbar, UnderlineTabs, meta_tile_fill,
@@ -21,7 +22,7 @@ use crate::server_fns::automation::{get_condition_evals, observe_asset};
 use crate::server_fns::graph::get_graph_topology;
 use crate::server_fns::mutations::{materialize_missing_partitions, trigger_materialize};
 use crate::server_fns::overview::{get_assets_info, get_partition_status};
-use crate::server_fns::runs::get_runs_for_asset;
+use crate::server_fns::runs::{get_runs_for_asset, get_step_traceback};
 
 /// Status-class vocabulary for this page's event list and glyph timeline.
 /// ActionCompleted is "ok" to match the run page's success styling.
@@ -46,6 +47,72 @@ fn event_glyph(t: &crate::types::EventType) -> &'static str {
         E::Deletion => "✕",
         E::StepStart => "◐",
         _ => "•",
+    }
+}
+
+/// A failure row's traceback, fetched the first time it is opened: this page
+/// does not load the run's logs.
+#[derive(Clone, Copy)]
+struct EventTraceback {
+    open: RwSignal<bool>,
+    load: Action<(), Result<Option<crate::types::Traceback>, ServerFnError>>,
+}
+
+impl EventTraceback {
+    /// For a `StepFailure` or `StepRetry` event, which ends an attempt.
+    fn for_event(evt: &crate::types::StoredEvent) -> Option<Self> {
+        use crate::types::EventType as E;
+        let ended_attempt = matches!(evt.event_type, E::StepFailure | E::StepRetry)
+            && evt.partition_key.is_none()
+            && !evt.run_id.is_empty();
+        let (run_id, step, at) = (
+            evt.run_id.clone(),
+            evt.asset_key.clone().unwrap_or_default(),
+            evt.timestamp,
+        );
+        ended_attempt.then(|| Self {
+            open: RwSignal::new(false),
+            load: Action::new(move |_: &()| {
+                let (run_id, step) = (run_id.clone(), step.clone());
+                async move { get_step_traceback(run_id, step, at).await }
+            }),
+        })
+    }
+
+    fn toggle(self) -> impl IntoView {
+        let Self { open, load } = self;
+        view! {
+            <button
+                class="event-row-traceback-toggle"
+                on:click=move |_| {
+                    if load.value().get_untracked().is_none() && !load.pending().get_untracked() {
+                        load.dispatch(());
+                    }
+                    open.update(|o| *o = !*o);
+                }
+            >
+                {move || if open.get() { "Hide traceback" } else { "Traceback" }}
+            </button>
+        }
+    }
+
+    fn panel(self) -> impl IntoView {
+        let Self { open, load } = self;
+        move || {
+            open.get().then(|| {
+                let body = match load.value().get() {
+                    None => view! { <span class="event-row-traceback-note">"Loading…"</span> }.into_any(),
+                    Some(Ok(Some(traceback))) => view! { <TracebackView traceback/> }.into_any(),
+                    Some(Ok(None)) => view! {
+                        <span class="event-row-traceback-note">"No traceback was stored for this failure."</span>
+                    }.into_any(),
+                    Some(Err(e)) => view! {
+                        <span class="error-msg">{format!("Couldn't load the traceback: {}", crate::helpers::err_text(&e))}</span>
+                    }.into_any(),
+                };
+                view! { <div class="event-row-traceback">{body}</div> }
+            })
+        }
     }
 }
 
@@ -653,16 +720,21 @@ pub fn AssetDetailPage() -> impl IntoView {
                                             };
                                             let (lns, lnm) = loc.get();
                                             let run_href = if evt.run_id.is_empty() { None } else { Some(loc_path(&lns, &lnm, &format!("runs/{}", evt.run_id))) };
+                                            let traceback = EventTraceback::for_event(&evt);
                                             view! {
                                                 <div class=format!("event-row event-row--{type_cls}") title={time_abs}>
                                                     <span class=format!("event-row-glyph event-row-glyph--{type_cls}")>{glyph}</span>
                                                     <span class=format!("event-row-type event-row-type--{type_cls}")>{type_label}</span>
                                                     <span class="event-row-time"><crate::now::RelTime ts=evt_ts/></span>
                                                     <span class="event-row-msg">{message}</span>
-                                                    {match run_href {
-                                                        Some(href) => view! { <A href=href attr:class="event-row-run">{run_short}</A> }.into_any(),
-                                                        None => view! { <span class="event-row-run event-row-run--none">{run_short}</span> }.into_any(),
-                                                    }}
+                                                    <span class="event-row-actions">
+                                                        {traceback.map(EventTraceback::toggle)}
+                                                        {match run_href {
+                                                            Some(href) => view! { <A href=href attr:class="event-row-run">{run_short}</A> }.into_any(),
+                                                            None => view! { <span class="event-row-run event-row-run--none">{run_short}</span> }.into_any(),
+                                                        }}
+                                                    </span>
+                                                    {traceback.map(EventTraceback::panel)}
                                                 </div>
                                             }
                                         }).collect::<Vec<_>>()}

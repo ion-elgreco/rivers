@@ -20,4 +20,4 @@ pub(crate) use step_lifecycle::{
     AsyncWorker, FinishedStep, SyncWorker, process_finished_steps, run_step_async_lifecycle,
     run_step_sync_lifecycle,
 };
-pub(crate) use types::{StepInstance, WorkOutcome};
+pub(crate) use types::{CapturedLogs, StepInstance, WorkOutcome};

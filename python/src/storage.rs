@@ -76,6 +76,7 @@ pub struct PyStoredLog {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub logs: Option<String>,
+    pub traceback: Option<String>,
 }
 
 impl From<StoredLog> for PyStoredLog {
@@ -88,6 +89,7 @@ impl From<StoredLog> for PyStoredLog {
             stdout: l.stdout,
             stderr: l.stderr,
             logs: l.logs,
+            traceback: l.traceback,
         }
     }
 }
@@ -99,6 +101,7 @@ impl PyStoredLog {
             self.stdout.as_ref().map(|_| "stdout"),
             self.stderr.as_ref().map(|_| "stderr"),
             self.logs.as_ref().map(|_| "logs"),
+            self.traceback.as_ref().map(|_| "traceback"),
         ]
         .into_iter()
         .flatten()

@@ -123,7 +123,7 @@
     color: var(--text-muted);
 }
 
-.log-col-info { color: var(--text); word-break: break-word; }
+.log-col-info { color: var(--text); white-space: pre-wrap; word-break: break-word; }
 
 /* Event type — only the word itself is colored, no badge background or row rail */
 

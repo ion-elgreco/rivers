@@ -239,6 +239,7 @@ impl<'a> BatchContext<'a> {
         step_name: &str,
         msg: &str,
         classified: Option<&(rivers_core::execution::retry::FailureReason, Vec<String>)>,
+        ts: i64,
     ) {
         ops::emit_step_failure(
             self.sink.writer,
@@ -246,7 +247,7 @@ impl<'a> BatchContext<'a> {
             step_name,
             msg,
             classified,
-            now_ts(),
+            ts,
         );
     }
 
@@ -256,6 +257,7 @@ impl<'a> BatchContext<'a> {
         attempt: u32,
         reason: rivers_core::execution::retry::FailureReason,
         delay: std::time::Duration,
+        ts: i64,
     ) {
         ops::emit_step_retry(
             self.sink.writer,
@@ -264,7 +266,7 @@ impl<'a> BatchContext<'a> {
             attempt,
             reason,
             delay,
-            now_ts(),
+            ts,
         );
     }
 
@@ -610,6 +612,18 @@ impl<'a> BatchContext<'a> {
             stdout,
             stderr,
             logs,
+            ts,
+        );
+    }
+
+    /// A failed attempt's traceback row. `ts` is its `StepFailure` /
+    /// `StepRetry` event's time, which is how the UI pairs them.
+    pub(crate) fn emit_traceback(&self, step_name: &str, traceback: &str, ts: i64) {
+        ops::emit_traceback(
+            self.sink.writer,
+            self.scope.run_id,
+            step_name,
+            traceback,
             ts,
         );
     }

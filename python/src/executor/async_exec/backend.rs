@@ -200,6 +200,10 @@ impl AsyncWorker for AsyncStepWorker {
         })
         .unwrap_or_else(python_not_attached_outcome)
     }
+
+    fn app_package(&self, py: Python) -> Option<String> {
+        crate::executor::traceback::node_package(py, self.shared.node_map.get(&self.step.name))
+    }
 }
 
 async fn dispatch_step(d: StepDispatch) -> (WorkOutcome, Option<PoolGuard>) {

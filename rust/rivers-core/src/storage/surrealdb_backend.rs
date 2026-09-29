@@ -65,6 +65,7 @@ struct DbRunLogWrite {
     stdout: Option<String>,
     stderr: Option<String>,
     logs: Option<String>,
+    traceback: Option<String>,
 }
 
 impl From<&LogRecord> for DbRunLogWrite {
@@ -77,6 +78,7 @@ impl From<&LogRecord> for DbRunLogWrite {
             stdout: l.stdout.clone(),
             stderr: l.stderr.clone(),
             logs: l.logs.clone(),
+            traceback: l.traceback.clone(),
         }
     }
 }
@@ -92,6 +94,8 @@ struct DbStoredRunLog {
     stdout: Option<String>,
     stderr: Option<String>,
     logs: Option<String>,
+    #[serde(default)]
+    traceback: Option<String>,
 }
 
 impl DbStoredRunLog {
@@ -105,6 +109,7 @@ impl DbStoredRunLog {
             stdout: self.stdout,
             stderr: self.stderr,
             logs: self.logs,
+            traceback: self.traceback,
         }
     }
 }
@@ -5117,6 +5122,7 @@ mod tests {
                     stdout: Some("b out".into()),
                     stderr: None,
                     logs: None,
+                    traceback: None,
                 },
                 LogRecord {
                     code_location_id: "default".into(),
@@ -5126,6 +5132,17 @@ mod tests {
                     stdout: Some("a out".into()),
                     stderr: Some("a err".into()),
                     logs: Some("a tracing".into()),
+                    traceback: None,
+                },
+                LogRecord {
+                    code_location_id: "default".into(),
+                    run_id: "run-1".into(),
+                    step_key: "b".into(),
+                    timestamp: 30,
+                    stdout: None,
+                    stderr: None,
+                    logs: None,
+                    traceback: Some(r#"{"exceptions":[],"text":"Traceback"}"#.into()),
                 },
                 LogRecord {
                     code_location_id: "default".into(),
@@ -5135,6 +5152,7 @@ mod tests {
                     stdout: None,
                     stderr: Some("c err".into()),
                     logs: None,
+                    traceback: None,
                 },
             ])
             .await
@@ -5145,14 +5163,20 @@ mod tests {
             logs.iter()
                 .map(|l| (l.step_key.as_str(), l.timestamp))
                 .collect::<Vec<_>>(),
-            vec![("a", 10), ("b", 20)],
+            vec![("a", 10), ("b", 20), ("b", 30)],
             "rows come back in timestamp order"
         );
         assert_eq!(logs[0].stdout.as_deref(), Some("a out"));
         assert_eq!(logs[0].stderr.as_deref(), Some("a err"));
         assert_eq!(logs[0].logs.as_deref(), Some("a tracing"));
+        assert_eq!(logs[0].traceback, None);
         assert_eq!(logs[1].stdout.as_deref(), Some("b out"));
         assert_eq!(logs[1].stderr, None);
+        assert_eq!(logs[2].stdout, None);
+        assert_eq!(
+            logs[2].traceback.as_deref(),
+            Some(r#"{"exceptions":[],"text":"Traceback"}"#)
+        );
 
         let logs2 = storage.get_run_logs("run-2").await.unwrap();
         assert_eq!(logs2.len(), 1);
@@ -15421,6 +15445,7 @@ mod tests {
                 stdout: Some("out".into()),
                 stderr: None,
                 logs: None,
+                traceback: None,
             }])
             .await
             .unwrap();

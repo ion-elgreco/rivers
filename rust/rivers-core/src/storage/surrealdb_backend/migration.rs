@@ -102,7 +102,7 @@ impl AsyncMigrate for SurrealMigrate {
 
 /// Highest embedded migration version. Bump by adding a `Vn__*.surql` + an
 /// [`embedded_migrations`] entry; a test pins this to that max.
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 /// One compat row per migration (the floors it set), folded by the open guard.
 const MIGRATION_META_TABLE: &str = "migration_meta";
@@ -142,6 +142,11 @@ fn embedded_migrations() -> Vec<Migration> {
             include_str!("migrations/V7__provenance_timestamp.surql"),
         )
         .expect("V7__provenance_timestamp migration name is well-formed"),
+        Migration::unapplied(
+            "V8__run_logs_traceback",
+            include_str!("migrations/V8__run_logs_traceback.surql"),
+        )
+        .expect("V8__run_logs_traceback migration name is well-formed"),
     ]
 }
 
@@ -867,7 +872,7 @@ mod tests {
         let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
         assert_eq!(
             (stamps.version, stamps.min_reader, stamps.min_writer),
-            (7, 2, 7),
+            (SCHEMA_VERSION, 2, 7),
             "a pre-v7 writer records a code version without its time, which a \
              v7 writer then lets an older materialization overwrite"
         );
@@ -893,7 +898,74 @@ mod tests {
         let mut expected = expected;
         expected[0].1 = Some(150);
         assert_eq!(provenance_times().await, expected);
-        assert_eq!(count_rows(&db, REFINERY_HISTORY_TABLE).await, 7);
+        assert_eq!(
+            count_rows(&db, REFINERY_HISTORY_TABLE).await,
+            u64::from(SCHEMA_VERSION)
+        );
+    }
+
+    /// V8 adds `traceback` to `run_logs`. It is additive: rows from before it
+    /// read back without one, and a V7 build can still read and write.
+    #[tokio::test]
+    async fn test_v8_adds_run_logs_traceback() {
+        let db = any::connect("mem://").await.unwrap();
+        db.use_ns(DEFAULT_NAMESPACE)
+            .use_db(DEFAULT_DATABASE)
+            .await
+            .unwrap();
+        let mut backend = SurrealMigrate { db: db.clone() };
+        let migrate_to = async |backend: &mut SurrealMigrate, version: usize| {
+            let migrations: Vec<Migration> =
+                embedded_migrations().into_iter().take(version).collect();
+            backend
+                .migrate(
+                    &migrations,
+                    true,
+                    false,
+                    false,
+                    Target::Latest,
+                    REFINERY_HISTORY_TABLE,
+                )
+                .await
+                .expect("apply migrations")
+        };
+        migrate_to(&mut backend, 7).await;
+        db.query(
+            "INSERT INTO run_logs [{ code_location_id: 'default', run_id: 'r1', \
+             step_key: 'a', timestamp: 1, stdout: 'out' }] RETURN NONE",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        migrate_to(&mut backend, 8).await;
+        db.query(
+            "INSERT INTO run_logs [{ code_location_id: 'default', run_id: 'r1', \
+             step_key: 'a', timestamp: 2, traceback: '{\"exceptions\":[]}' }] RETURN NONE",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        let rows: Vec<(i64, Option<String>)> = db
+            .query("SELECT VALUE [timestamp, traceback] FROM run_logs ORDER BY timestamp")
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(1, None), (2, Some(r#"{"exceptions":[]}"#.to_string()))]
+        );
+        let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
+        assert_eq!(
+            (stamps.version, stamps.min_reader, stamps.min_writer),
+            (8, 2, 7)
+        );
+        assert!(check_compatibility(stamps, Capability::Read, 7).is_ok());
+        assert!(check_compatibility(stamps, Capability::ReadWrite, 7).is_ok());
     }
 
     /// V5 adds `exclusive`/`partitions` to a SCHEMAFULL table. `DEFAULT` only

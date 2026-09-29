@@ -251,3 +251,16 @@
 }
 .eval-outcome { margin-bottom: 1rem; }
 
+.event-row-actions { display: flex; align-items: center; gap: 12px; }
+.event-row-traceback-toggle {
+    padding: 0;
+    background: none;
+    border: none;
+    font: inherit;
+    font-size: var(--fs-xs);
+    color: var(--accent);
+    cursor: pointer;
+}
+.event-row-traceback-toggle:hover { text-decoration: underline; }
+.event-row-traceback { grid-column: 1 / -1; }
+.event-row-traceback-note { font-size: var(--fs-sm); color: var(--text-muted); }

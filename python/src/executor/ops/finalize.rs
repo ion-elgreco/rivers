@@ -231,8 +231,50 @@ fn log_output_record(
         stdout: non_empty(stdout),
         stderr: non_empty(stderr),
         logs: non_empty(logs),
+        traceback: None,
     };
     (!record.is_empty()).then_some(record)
+}
+
+/// A failed attempt's traceback row (see [`LogRecord::traceback`]).
+fn traceback_record(
+    code_location_id: &str,
+    run_id: &str,
+    step_name: &str,
+    traceback: &str,
+    ts: i64,
+) -> LogRecord {
+    LogRecord {
+        code_location_id: code_location_id.to_string(),
+        run_id: run_id.to_string(),
+        step_key: step_name.to_string(),
+        timestamp: ts,
+        stdout: None,
+        stderr: None,
+        logs: None,
+        traceback: Some(traceback.to_string()),
+    }
+}
+
+pub(crate) fn emit_traceback(
+    writer: &EventWriter,
+    run_id: &str,
+    step_name: &str,
+    traceback: &str,
+    ts: i64,
+) {
+    writer.emit_log(traceback_record("", run_id, step_name, traceback, ts));
+}
+
+pub(crate) fn emit_traceback_via_tx(
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::executor::event_writer::WriterMsg>,
+    code_location_id: &str,
+    run_id: &str,
+    step_name: &str,
+    traceback: &str,
+    ts: i64,
+) {
+    let _ = tx.send(traceback_record(code_location_id, run_id, step_name, traceback, ts).into());
 }
 
 #[allow(clippy::too_many_arguments)]

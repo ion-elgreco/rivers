@@ -147,7 +147,7 @@ Every retried attempt leaves a `StepRetry` event on the run timeline carrying th
 | `rivers/next_delay_ms` | `5000` |
 | `rivers/next_compute` | `{"memory":"16Gi"}` |
 
-The attempt count for a step is the number of its `StepRetry` events plus one; the final `StepSuccess`/`StepFailure` settles the outcome.
+The attempt count for a step is the number of its `StepRetry` events plus one; the final `StepSuccess`/`StepFailure` settles the outcome. Each failed attempt also stores its Python traceback. The run page shows the traceback of each failed step, and the asset page shows each attempt's on its `StepRetry` or `StepFailure` event.
 
 ## Multi-assets
 

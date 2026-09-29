@@ -533,6 +533,7 @@ fn load_from_spec(py: Python, spec: &Py<PyAny>) -> PyResult<Py<PyAny>> {
 }
 
 use crate::context::asset::PyAssetExecutionContext;
+use crate::errors::WorkerStepError;
 use crate::executor::ops::{self, metadata_to_pickle_safe_dict, write_output};
 use crate::metadata::MetadataValue;
 
@@ -884,14 +885,32 @@ pub fn worker_execute_step(
             Ok(Py::new(py, wr)?.into_any())
         }
         Err(err) => {
-            // Stash captured logs on the exception itself so the parent can
-            // recover them after `future.result()` re-raises. cloudpickle
-            // preserves arbitrary attributes on most exception types.
-            if let Some(logs) = captured_logs {
-                let _ = err.value(py).setattr("_rivers_captured_logs", logs);
-            }
-            Err(err)
+            let package = crate::executor::traceback::app_package(func.bind(py));
+            let traceback = crate::executor::traceback::capture_json(py, &err, package.as_deref());
+            Err(wrap_step_error(py, err, captured_logs, traceback))
         }
+    }
+}
+
+/// Wrap a failed step's exception for the trip back to the parent (see
+/// [`WorkerStepError`]). The exception becomes the wrapper's cause, so loky's
+/// remote traceback text still shows the step's own frames.
+fn wrap_step_error(
+    py: Python,
+    err: PyErr,
+    captured_logs: Option<(String, String, String)>,
+    traceback: Option<String>,
+) -> PyErr {
+    let wrapper = WorkerStepError::new_err(err.to_string());
+    let value = wrapper.value(py);
+    let attached = value
+        .setattr("step_error", err.value(py))
+        .and_then(|()| value.setattr("captured_logs", captured_logs))
+        .and_then(|()| value.setattr("traceback", traceback))
+        .and_then(|()| value.setattr("__cause__", err.value(py)));
+    match attached {
+        Ok(()) => wrapper,
+        Err(_) => err,
     }
 }
 

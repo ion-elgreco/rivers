@@ -34,6 +34,7 @@ use crate::runtime::rt;
 
 use super::super::event_writer::{self, WriterMsg};
 use super::super::ops::{self, now_ts};
+use super::super::traceback;
 use super::context::BatchContext;
 use super::failure::{self, classify_pyerr};
 use super::pool_claim::{ClaimCancelled, PoolGuard};
@@ -54,6 +55,12 @@ pub(crate) trait SyncWorker {
 /// (shared via `Arc` across attempts) so the retry loop can re-run it.
 pub(crate) trait AsyncWorker: Send + Sync + 'static {
     fn run_work(&self) -> WorkOutcome;
+
+    /// See [`traceback::app_package`]. `None` where the error carries a
+    /// traceback its worker already captured.
+    fn app_package(&self, _py: Python) -> Option<String> {
+        None
+    }
 }
 
 /// Run the synchronous lifecycle around `worker`. Pool-claim failures use
@@ -139,13 +146,19 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
         else {
             break outcome;
         };
+        let package = traceback::node_package(py, ctx.repo.node_map.get(&step.name));
+        let failed_traceback = traceback::capture_json(py, error, package.as_deref());
         // Flush the failed attempt's logs now (taken out so a cancelled
         // backoff below can't re-emit them with the returned outcome).
         if let WorkOutcome::Error { captured_logs, .. } = &mut outcome {
             emit_captured_logs(ctx, step_name, captured_logs.take());
         }
+        let retried_at = now_ts();
         for name in event_names {
-            ctx.emit_step_retry(name, attempt, reason, delay);
+            if let Some(tb) = &failed_traceback {
+                ctx.emit_traceback(name, tb, retried_at);
+            }
+            ctx.emit_step_retry(name, attempt, reason, delay, retried_at);
         }
         if !delay.is_zero() {
             // A sleeping step must not hold pool slots (it would starve
@@ -334,13 +347,16 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
             break start_not_stored(e);
         }
         let w = Arc::clone(&worker);
-        // Classification needs the GIL; attach on the blocking thread, not here.
+        // Classification and the traceback need the GIL; attach on the
+        // blocking thread, not here.
         let joined = tokio::task::spawn_blocking(move || {
             let outcome = w.run_work();
             let classified = match &outcome {
-                WorkOutcome::Error { error, .. } if want_classify => {
-                    Python::try_attach(|py| classify_pyerr(py, error))
-                }
+                WorkOutcome::Error { error, .. } if want_classify => Python::try_attach(|py| {
+                    let package = w.app_package(py);
+                    let traceback = traceback::capture_json(py, error, package.as_deref());
+                    (classify_pyerr(py, error), traceback)
+                }),
                 _ => None,
             };
             (outcome, classified)
@@ -353,7 +369,9 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         if !matches!(outcome, WorkOutcome::Error { .. }) {
             break outcome;
         }
-        let (Some(policy), Some((reason, exc_types))) = (&retry_policy, classified.as_ref()) else {
+        let (Some(policy), Some(((reason, exc_types), failed_traceback))) =
+            (&retry_policy, classified.as_ref())
+        else {
             break outcome;
         };
         let Some(delay) =
@@ -377,7 +395,18 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
                 now_ts(),
             );
         }
+        let retried_at = now_ts();
         for name in &start_event_names {
+            if let Some(tb) = failed_traceback {
+                ops::emit_traceback_via_tx(
+                    &events_tx,
+                    &code_location_id,
+                    &run_id,
+                    name,
+                    tb,
+                    retried_at,
+                );
+            }
             ops::emit_step_retry_via_tx(
                 &events_tx,
                 &code_location_id,
@@ -386,7 +415,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
                 attempt,
                 *reason,
                 delay,
-                now_ts(),
+                retried_at,
             );
         }
         if !delay.is_zero() {

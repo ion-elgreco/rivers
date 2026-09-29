@@ -133,13 +133,23 @@ fn finalize_mapped_steps(ctx: &mut BatchContext, records: &[MappedStepRecord]) {
             }
         }
         if any_failed {
-            ctx.emit_step_failure(&step.name, "One or more map instances failed", None);
+            ctx.emit_step_failure(
+                &step.name,
+                "One or more map instances failed",
+                None,
+                now_ts(),
+            );
             ctx.state.mark_failed(step.name.clone());
         } else if any_cancelled {
             // Its StepStart is out, so the step must end. Unkeyed and kept
             // out of `failures`: the Canceled run fails no asset and floors
             // no partition.
-            ctx.emit_step_failure(&step.name, "Cancelled before every map instance ran", None);
+            ctx.emit_step_failure(
+                &step.name,
+                "Cancelled before every map instance ran",
+                None,
+                now_ts(),
+            );
             ctx.state.mark_failed(step.name.clone());
         } else {
             ctx.emit_success(&step.name);

@@ -33,7 +33,10 @@ class StoredEvent:
 class StoredLog:
     """One step execution's captured output (``run_logs`` row).
 
-    Streams the step didn't produce are ``None``.
+    Streams the step didn't produce are ``None``. A failed attempt writes its
+    ``traceback`` in a row of its own: JSON with the exception chain
+    (``exceptions``, oldest first, with frames and source lines) and ``text``,
+    the traceback as Python prints it.
     """
 
     id: str
@@ -43,6 +46,7 @@ class StoredLog:
     stdout: str | None
     stderr: str | None
     logs: str | None
+    traceback: str | None
 
 class StaleCause:
     """One reason an asset is considered stale relative to its deps / code version."""
