@@ -221,6 +221,7 @@ fn delete_verb() -> AssetActionInfo {
         exclusive: true,
         partitioning: "optional".to_string(),
         description: None,
+        config_schema: None,
     }
 }
 
@@ -464,5 +465,89 @@ async fn execute_job_with_multi_picker_fires_one_request_per_combination() {
         2,
         "expected one server-fn call per cartesian combination, got: {:?}",
         captured.borrow()
+    );
+}
+
+/// The edited config rides the materialize request as the JSON the backend
+/// stores on the run; an asset left at `{}` is not sent.
+#[wasm_bindgen_test]
+async fn materialize_sends_the_edited_config() {
+    nav_to("/locations/default/demo/assets/api_data");
+    let target = fresh_mount_target();
+    let (_mock, requests) =
+        install_recording_fetch_mock(r#"{"run_id": "RUN-CFG", "status": "direct"}"#);
+
+    let schema =
+        r#"{"properties":{"batch_size":{"default":100,"type":"integer"}},"type":"object"}"#;
+    let mut definitions = HashMap::new();
+    for (key, config_schema) in [("api_data", Some(schema)), ("plain", None)] {
+        definitions.insert(
+            key.to_string(),
+            rivers_ui::types::AssetDefinitionInfo {
+                asset_key: key.to_string(),
+                description: None,
+                partition_def: None,
+                hooks: vec![],
+                io_handler: None,
+                has_self_dependency: false,
+                is_external: false,
+                automation_condition: None,
+                tags: vec![],
+                kinds: vec![],
+                group: None,
+                code_version: None,
+                asset_type: "asset".to_string(),
+                actions: vec![],
+                config_schema: config_schema.map(str::to_string),
+            },
+        );
+    }
+
+    let show = RwSignal::new(true);
+    mount_to(target.clone(), move || {
+        let definitions = definitions.clone();
+        view! {
+            <Router>
+                <MaterializeDialog
+                    show=show
+                    asset_keys=Signal::derive(|| vec!["api_data".to_string(), "plain".to_string()])
+                    records=Signal::derive(HashMap::new)
+                    definitions=Signal::derive(move || definitions.clone())
+                />
+            </Router>
+        }
+    })
+    .forget();
+    flush_effects().await;
+
+    let textarea = query_one(&target, ".config-editor-text");
+    js_sys::Reflect::set(
+        &textarea,
+        &"value".into(),
+        &"{\"api_data\": {\"batch_size\": 5}, \"plain\": {}}".into(),
+    )
+    .unwrap();
+    let init = web_sys::EventInit::new();
+    init.set_bubbles(true);
+    textarea
+        .dispatch_event(&web_sys::Event::new_with_event_init_dict("input", &init).unwrap())
+        .unwrap();
+    flush_effects().await;
+
+    click(&query_one(&target, ".modal-footer .btn-primary"), false);
+    let arrived = wait_until(|| current_path().ends_with("/runs/RUN-CFG")).await;
+    assert!(
+        arrived,
+        "expected redirect to /runs/RUN-CFG, got: {}",
+        current_path()
+    );
+
+    let recorded = requests.borrow().clone();
+    let bodies = request_bodies(&recorded).await;
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(
+        bodies[0].ends_with("&config=%7B%22api_data%22%3A%7B%22batch_size%22%3A5%7D%7D"),
+        "{}",
+        bodies[0]
     );
 }

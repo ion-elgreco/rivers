@@ -102,7 +102,7 @@ impl AsyncMigrate for SurrealMigrate {
 
 /// Highest embedded migration version. Bump by adding a `Vn__*.surql` + an
 /// [`embedded_migrations`] entry; a test pins this to that max.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// One compat row per migration (the floors it set), folded by the open guard.
 const MIGRATION_META_TABLE: &str = "migration_meta";
@@ -147,6 +147,11 @@ fn embedded_migrations() -> Vec<Migration> {
             include_str!("migrations/V8__run_logs_traceback.surql"),
         )
         .expect("V8__run_logs_traceback migration name is well-formed"),
+        Migration::unapplied(
+            "V9__run_config",
+            include_str!("migrations/V9__run_config.surql"),
+        )
+        .expect("V9__run_config migration name is well-formed"),
     ]
 }
 
@@ -966,6 +971,70 @@ mod tests {
         );
         assert!(check_compatibility(stamps, Capability::Read, 7).is_ok());
         assert!(check_compatibility(stamps, Capability::ReadWrite, 7).is_ok());
+    }
+
+    /// V9 adds `config` to `runs`. It is additive: rows from before it read
+    /// back without one, and a V8 build can still read and write.
+    #[tokio::test]
+    async fn test_v9_adds_run_config() {
+        let db = any::connect("mem://").await.unwrap();
+        db.use_ns(DEFAULT_NAMESPACE)
+            .use_db(DEFAULT_DATABASE)
+            .await
+            .unwrap();
+        let mut backend = SurrealMigrate { db: db.clone() };
+        let migrate_to = async |backend: &mut SurrealMigrate, version: usize| {
+            let migrations: Vec<Migration> =
+                embedded_migrations().into_iter().take(version).collect();
+            backend
+                .migrate(
+                    &migrations,
+                    true,
+                    false,
+                    false,
+                    Target::Latest,
+                    REFINERY_HISTORY_TABLE,
+                )
+                .await
+                .expect("apply migrations")
+        };
+        migrate_to(&mut backend, 8).await;
+        db.query(
+            "INSERT INTO runs [{ run_id: 'r1', status: 'Queued', start_time: 1, \
+             tags: [], node_names: ['a'] }] RETURN NONE",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        migrate_to(&mut backend, 9).await;
+        db.query(
+            "INSERT INTO runs [{ run_id: 'r2', status: 'Queued', start_time: 2, \
+             tags: [], node_names: ['a'], config: '{\"a\":{\"x\":1}}' }] RETURN NONE",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        let rows: Vec<(i64, Option<String>)> = db
+            .query("SELECT VALUE [start_time, config] FROM runs ORDER BY start_time")
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(1, None), (2, Some(r#"{"a":{"x":1}}"#.to_string()))]
+        );
+        let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
+        assert_eq!(
+            (stamps.version, stamps.min_reader, stamps.min_writer),
+            (9, 2, 7)
+        );
+        assert!(check_compatibility(stamps, Capability::Read, 8).is_ok());
+        assert!(check_compatibility(stamps, Capability::ReadWrite, 8).is_ok());
     }
 
     /// V5 adds `exclusive`/`partitions` to a SCHEMAFULL table. `DEFAULT` only

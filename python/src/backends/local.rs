@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use rivers_core::run_backend::{RunBackend, RunHealthStatus};
 use rivers_core::storage::{CoordinatorRunInfo, LaunchedBy};
 
+use crate::config::run_config::parse_run_config_json;
 use crate::gil_threads::GilThreads;
 use crate::partitions::PyPartitionKey;
 use crate::repository::PyCodeRepository;
@@ -44,6 +45,7 @@ impl RunBackend for LocalRunBackend {
         let node_names = run_info.node_names.clone();
         let partition_key = run_info.partition_key.as_ref().map(PyPartitionKey::from);
         let action = run_info.action.clone();
+        let config_json = run_info.config.clone();
 
         let run_id_for_key = run_id.clone();
         let done = Arc::new(AtomicBool::new(false));
@@ -53,37 +55,38 @@ impl RunBackend for LocalRunBackend {
             // turn an empty list into every asset. `Some(run_id)` makes the
             // launcher reuse the existing queued record, so
             // `LaunchedBy::Manual` is ignored.
-            let result = match action {
-                Some(action) => repo
-                    .get()
-                    .run_action_with_launcher(
-                        action,
-                        Some(node_names),
-                        partition_key,
-                        None,
-                        false,
-                        None,
-                        Some(run_id.clone()),
-                        false,
-                        LaunchedBy::Manual { user: None },
-                    )
-                    .map(|_| ()),
-                None => repo
-                    .get()
-                    .materialize_with_launcher(
-                        Some(node_names),
-                        partition_key,
-                        None,
-                        false,
-                        None,
-                        Some(run_id.clone()),
-                        false,
-                        false,
-                        None,
-                        LaunchedBy::Manual { user: None },
-                    )
-                    .map(|_| ()),
-            };
+            let result =
+                parse_run_config_json(config_json.as_deref()).and_then(|config| match action {
+                    Some(action) => repo
+                        .get()
+                        .run_action_with_launcher(
+                            action,
+                            Some(node_names),
+                            partition_key,
+                            None,
+                            false,
+                            config,
+                            Some(run_id.clone()),
+                            false,
+                            LaunchedBy::Manual { user: None },
+                        )
+                        .map(|_| ()),
+                    None => repo
+                        .get()
+                        .materialize_with_launcher(
+                            Some(node_names),
+                            partition_key,
+                            None,
+                            false,
+                            config,
+                            Some(run_id.clone()),
+                            false,
+                            false,
+                            None,
+                            LaunchedBy::Manual { user: None },
+                        )
+                        .map(|_| ()),
+                });
             if let Err(e) = result {
                 tracing::error!(
                     target: "rivers::coordinator",

@@ -202,6 +202,10 @@ pub struct RunRecord {
     /// The verb this run executes. `None` means materialize.
     #[serde(default)]
     pub action: Option<String>,
+    /// Per-asset config overrides the run was launched with, as a JSON object
+    /// keyed by asset name. `None` means the definitions' defaults.
+    #[serde(default)]
+    pub config: Option<String>,
 }
 
 /// Which verb a run filter selects. Explicit variants rather than a nested
@@ -621,6 +625,9 @@ pub struct AssetDefinitionInfo {
     /// Named actions this asset supports beyond materialize.
     #[serde(default)]
     pub actions: Vec<AssetActionInfo>,
+    /// JSON schema of the asset's config class; `None` when it takes no config.
+    #[serde(default)]
+    pub config_schema: Option<String>,
 }
 
 /// Mirror of the gRPC `ActionInfo`.
@@ -634,6 +641,9 @@ pub struct AssetActionInfo {
     #[serde(default)]
     pub partitioning: String,
     pub description: Option<String>,
+    /// JSON schema of the action's own config class; `None` when it takes none.
+    #[serde(default)]
+    pub config_schema: Option<String>,
 }
 
 impl AssetActionInfo {
@@ -1190,6 +1200,7 @@ mod conversions {
                 launched_by: r.launched_by.into(),
                 code_location_id: r.code_location_id,
                 action: r.action,
+                config: r.config,
             }
         }
     }
@@ -1612,6 +1623,7 @@ mod conversions {
                 error: None,
                 launched_by: rivers_core::storage::LaunchedBy::Manual { user: None },
                 action: Some("purge".into()),
+                config: None,
             };
             let ui: BackfillInfo = core.into();
             assert_eq!(ui.action.as_deref(), Some("purge"));
@@ -1641,6 +1653,7 @@ mod conversions {
                 block_reason: None,
                 launched_by: rivers_core::storage::LaunchedBy::Manual { user: None },
                 action: None,
+                config: None,
             };
             let ui: RunRecord = core.into();
             let preview = ui

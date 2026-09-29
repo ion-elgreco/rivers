@@ -259,12 +259,31 @@ pub fn AssetDetailPage() -> impl IntoView {
         params.track();
         vec![key()]
     });
+    let asset_info_by_key = Memo::new(move |_| {
+        assets_info_value
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|i| (i.asset_key.clone(), i))
+            .collect::<std::collections::HashMap<String, crate::types::AssetDefinitionInfo>>()
+    });
     let show_dialog = RwSignal::new(false);
+    // One click materializes an unpartitioned asset — unless it takes config,
+    // which only the dialog can edit.
+    let materialize_opens_dialog = Signal::derive(move || {
+        !matches!(materialize_picker.get(), JobPartitionPicker::None)
+            || crate::components::config_editor::launch_takes_config(
+                &[key()],
+                &asset_info_by_key.get(),
+                None,
+            )
+    });
 
     let materialize_action = Action::new(move |_: &()| {
         let k = key();
         let (ns, lname) = loc.get_untracked();
-        async move { trigger_materialize(ns, lname, Some(vec![k]), None, None).await }
+        async move { trigger_materialize(ns, lname, Some(vec![k]), None, None, None).await }
     });
     let materialize_pending = materialize_action.pending();
 
@@ -284,6 +303,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                 None,
                 None,
                 false,
+                None,
             )
             .await
         }
@@ -329,7 +349,9 @@ pub fn AssetDetailPage() -> impl IntoView {
                     // dialog it opens says what it does. A keyed verb on a
                     // partitioned asset needs the dialog's partition picker.
                     let destructive = act.is_destructive();
-                    let one_click = !destructive && (!partitioned || act.is_keyless());
+                    let one_click = !destructive
+                        && (!partitioned || act.is_keyless())
+                        && act.config_schema.is_none();
                     let label = if one_click {
                         crate::helpers::verb_label(&verb)
                     } else {
@@ -381,10 +403,10 @@ pub fn AssetDetailPage() -> impl IntoView {
                             on:click=move |_| {
                                 dialog_verb.set(None);
                                 dialog_destructive.set(false);
-                                if matches!(materialize_picker.get(), JobPartitionPicker::None) {
-                                    materialize_action.dispatch(());
-                                } else {
+                                if materialize_opens_dialog.get() {
                                     show_dialog.set(true);
+                                } else {
+                                    materialize_action.dispatch(());
                                 }
                             }
                             disabled=move || materialize_pending.get()
@@ -392,10 +414,10 @@ pub fn AssetDetailPage() -> impl IntoView {
                             <IconPlay/>
                             {move || if materialize_pending.get() {
                                 "Materializing…"
-                            } else if matches!(materialize_picker.get(), JobPartitionPicker::None) {
-                                "Materialize"
-                            } else {
+                            } else if materialize_opens_dialog.get() {
                                 "Materialize…"
+                            } else {
+                                "Materialize"
                             }}
                         </button>
                     }.into_any()
@@ -837,6 +859,7 @@ pub fn AssetDetailPage() -> impl IntoView {
             destructive=dialog_destructive
             records=records_by_key
             records_failed=records_failed
+            definitions=asset_info_by_key
         />
     }
 }

@@ -7,16 +7,19 @@ use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{RunRecord, RunStatus};
 
 use super::types::{BackfillRequestData, MaterializationRequestData, RunRequestData};
+use crate::config::run_config::{parse_run_config, parse_run_config_json};
 use crate::gil_threads::GilThreads;
 use crate::partitions::PyPartitionKey;
 use crate::repository::{PyBackfillResult, PyCodeRepository, RepoHandle, priority_from_tags};
 
-/// Launch a `Started` run on a fresh OS thread.
+/// Launch a `Started` run on a fresh OS thread. `config` is the record's
+/// stored overrides.
 pub(crate) fn launch_started_run(
     handle: RepoHandle,
     job_name: String,
     partition_key: Option<PyPartitionKey>,
     run_id: String,
+    config: Option<String>,
     gil_threads: &GilThreads,
 ) {
     gil_threads.spawn(move || {
@@ -34,10 +37,15 @@ pub(crate) fn launch_started_run(
                     return;
                 }
             };
-            if let Err(e) =
-                job.borrow(py)
-                    .execute_run(py, &run_id, partition_key, None, false, true)
-            {
+            let launched = config
+                .as_deref()
+                .map(|s| parse_run_config(py, s))
+                .transpose()
+                .and_then(|config| {
+                    job.borrow(py)
+                        .execute_run(py, &run_id, partition_key, config, false, true)
+                });
+            if let Err(e) = launched {
                 tracing::error!(
                     target: "rivers::executor",
                     job = %job_name,
@@ -175,6 +183,7 @@ impl DirectRunDispatcher {
                     req.launched_by.clone(),
                     req.run_id.clone(),
                     req.action.clone(),
+                    req.config.clone(),
                 )
                 .await
             {
@@ -190,38 +199,40 @@ impl DirectRunDispatcher {
             let py_pk = req.partition_key.as_ref().map(PyPartitionKey::from);
             let launched_by = req.launched_by.clone();
             let action = req.action.clone();
+            let config_json = req.config.clone();
             self.gil_threads.spawn(move || {
-                let result = match action {
-                    Some(action) => repo
-                        .get()
-                        .run_action_with_launcher(
-                            action,
-                            Some(assets),
-                            py_pk,
-                            None,
-                            false,
-                            None,
-                            Some(run_id.clone()),
-                            false,
-                            launched_by,
-                        )
-                        .map(|_| ()),
-                    None => repo
-                        .get()
-                        .materialize_with_launcher(
-                            Some(assets),
-                            py_pk,
-                            None,
-                            false,
-                            None,
-                            Some(run_id.clone()),
-                            false,
-                            false,
-                            None,
-                            launched_by,
-                        )
-                        .map(|_| ()),
-                };
+                let result =
+                    parse_run_config_json(config_json.as_deref()).and_then(|config| match action {
+                        Some(action) => repo
+                            .get()
+                            .run_action_with_launcher(
+                                action,
+                                Some(assets),
+                                py_pk,
+                                None,
+                                false,
+                                config,
+                                Some(run_id.clone()),
+                                false,
+                                launched_by,
+                            )
+                            .map(|_| ()),
+                        None => repo
+                            .get()
+                            .materialize_with_launcher(
+                                Some(assets),
+                                py_pk,
+                                None,
+                                false,
+                                config,
+                                Some(run_id.clone()),
+                                false,
+                                false,
+                                None,
+                                launched_by,
+                            )
+                            .map(|_| ()),
+                    });
                 if let Err(e) = result {
                     tracing::error!(
                         target: "rivers::daemon",
@@ -263,7 +274,13 @@ impl DirectRunDispatcher {
 
             match self
                 .handle
-                .create_started_run(&job_name, py_pk.as_ref(), r.launched_by.clone(), None)
+                .create_started_run(
+                    &job_name,
+                    py_pk.as_ref(),
+                    r.launched_by.clone(),
+                    None,
+                    r.config.clone(),
+                )
                 .await
             {
                 Ok(run_id) => {
@@ -272,6 +289,7 @@ impl DirectRunDispatcher {
                         job_name,
                         py_pk,
                         run_id.clone(),
+                        r.config.clone(),
                         &self.gil_threads,
                     );
                     ids.push(run_id);
@@ -316,6 +334,7 @@ impl QueuedRunDispatcher {
                 block_reason: None,
                 launched_by: req.launched_by.clone(),
                 action: req.action.clone(),
+                config: req.config.clone(),
             };
             if let Err(e) = self.storage.enqueue_run(&run_record).await {
                 errors.push(anyhow!(
@@ -360,6 +379,7 @@ impl QueuedRunDispatcher {
                     None,
                     r.launched_by.clone(),
                     Some(job_name.clone()),
+                    r.config.clone(),
                 )
                 .await
             {
@@ -445,21 +465,23 @@ impl LocalBackfillDispatcher {
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect::<Vec<(String, String)>>()
                 });
-                let result = match repo.get().backfill_inner(
-                    target,
-                    bf.partition_keys.clone(),
-                    bf.partition_range.clone(),
-                    bf.strategy.clone(),
-                    bf.failure_policy.as_deref().unwrap_or("continue"),
-                    bf.max_concurrency,
-                    tags,
-                    None,  // config
-                    false, // block=false
-                    bf.dry_run,
-                    bf.backfill_id.clone(),
-                    bf.launched_by.clone(),
-                    bf.action.clone(),
-                ) {
+                let result = match parse_run_config_json(bf.config.as_deref()).and_then(|config| {
+                    repo.get().backfill_inner(
+                        target,
+                        bf.partition_keys.clone(),
+                        bf.partition_range.clone(),
+                        bf.strategy.clone(),
+                        bf.failure_policy.as_deref().unwrap_or("continue"),
+                        bf.max_concurrency,
+                        tags,
+                        config,
+                        false, // block=false
+                        bf.dry_run,
+                        bf.backfill_id.clone(),
+                        bf.launched_by.clone(),
+                        bf.action.clone(),
+                    )
+                }) {
                     Ok(result) => {
                         tracing::info!(
                             target: "rivers::daemon",

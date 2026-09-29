@@ -517,6 +517,7 @@ use crate::assets::io_handler::IOHandler;
 use crate::automation::schedule::{self, PyScheduleDefinition, PyScheduleTickResult};
 use crate::automation::sensor::{self, PySensorDefinition, PySensorTickResult};
 use crate::config::ResourceVariant;
+use crate::config::run_config::{parse_run_config_json, run_config_to_json};
 use crate::executor::Executor;
 use crate::executor::ops::{
     enumerate_params, get_annotations, is_context_annotation, now_ts, register_assets_from_nodes,
@@ -1586,6 +1587,8 @@ pub(crate) struct RunSubmission {
     /// The verb the dequeued run executes; `None` means materialize. For a
     /// job, the verb its backfill recorded, checked against the job's own.
     pub(crate) action: Option<String>,
+    /// See [`rivers_core::storage::RunRecord::config`].
+    pub(crate) config: Option<String>,
 }
 
 impl RepoHandle {
@@ -1728,7 +1731,8 @@ impl RepoHandle {
             .unwrap_or_default()
     }
 
-    /// See [`PyCodeRepository::submit_run`].
+    /// See [`PyCodeRepository::submit_run`]. `config` is stored on the
+    /// record for the dequeuing backend to apply.
     pub(crate) async fn submit_run(
         &self,
         selection: Option<Vec<String>>,
@@ -1736,6 +1740,7 @@ impl RepoHandle {
         tags: Option<Vec<(String, String)>>,
         launched_by: LaunchedBy,
         job_name: Option<String>,
+        config: Option<String>,
     ) -> PyResult<PyRunHandle> {
         // Sync prep under the read lock — drop the guard before the await.
         let (record, storage, dyn_checks) = {
@@ -1792,6 +1797,7 @@ impl RepoHandle {
                 block_reason: None,
                 launched_by,
                 action,
+                config,
             };
             (record, state.storage.clone(), dyn_checks)
         };
@@ -1874,6 +1880,7 @@ impl RepoHandle {
                     block_reason: None,
                     launched_by: launched_by.clone(),
                     action,
+                    config: sub.config.clone(),
                 });
             }
             (records, state.storage.clone(), dyn_checks)
@@ -1940,6 +1947,7 @@ impl RepoHandle {
         partition_key: Option<&PyPartitionKey>,
         launched_by: LaunchedBy,
         run_id_override: Option<String>,
+        config: Option<String>,
     ) -> PyResult<String> {
         let (record, storage, dyn_checks) = {
             let guard = self.state.read().unwrap();
@@ -1984,6 +1992,7 @@ impl RepoHandle {
                 block_reason: None,
                 launched_by,
                 action,
+                config,
             };
             (record, state.storage.clone(), dyn_checks)
         };
@@ -2027,6 +2036,7 @@ impl RepoHandle {
         launched_by: LaunchedBy,
         run_id: String,
         action: Option<String>,
+        config: Option<String>,
     ) -> PyResult<()> {
         let (record, storage) = {
             let guard = self.state.read().unwrap();
@@ -2049,6 +2059,7 @@ impl RepoHandle {
                 block_reason: None,
                 launched_by,
                 action,
+                config,
             };
             (record, state.storage.clone())
         };
@@ -2260,6 +2271,7 @@ impl RepoHandle {
             backfill_id: None,
             // A Job target must still run it: see `backfill_inner`.
             action: record.action,
+            config: None,
         })
     }
 
@@ -2307,6 +2319,7 @@ impl RepoHandle {
                         partition_key: record.partition_key.as_ref().map(PyPartitionKey::from),
                         job_name: Some(job_name),
                         launched_by,
+                        config: record.config,
                     },
                 ))
             }
@@ -2318,6 +2331,7 @@ impl RepoHandle {
                     tags,
                     launched_by,
                     action: record.action,
+                    config: record.config,
                 },
             )),
         }
@@ -2409,6 +2423,7 @@ impl RepoHandle {
             backfill_id: None,
             launched_by,
             action: None,
+            config: None,
         })
     }
 
@@ -2619,9 +2634,17 @@ impl PyCodeRepository {
         tags: Option<Vec<(String, String)>>,
         launched_by: LaunchedBy,
         job_name: Option<String>,
+        config: Option<String>,
     ) -> PyResult<PyRunHandle> {
         self.handle()
-            .submit_run(selection, partition_key, tags, launched_by, job_name)
+            .submit_run(
+                selection,
+                partition_key,
+                tags,
+                launched_by,
+                job_name,
+                config,
+            )
             .await
     }
 
@@ -2684,6 +2707,7 @@ impl PyCodeRepository {
                 launched_by,
                 run_id.clone(),
                 synthetic_job.action.clone(),
+                Python::attach(|py| run_config_to_json(py, config.as_ref())),
             ))?;
         }
 
@@ -4123,14 +4147,6 @@ impl PyCodeRepository {
                  to target every asset that defines it"
             )));
         }
-        // The backfill record keeps no config, and a non-blocking backfill runs
-        // later from that record.
-        if config.is_some() && !block {
-            return Err(ExecutionError::new_err(
-                "backfill(block=False) got config: the config would be lost and the runs \
-                 would use the config defaults. Use block=True to run with this config",
-            ));
-        }
         py.detach(|| {
             self.backfill_inner(
                 crate::daemon::RunType::Materialization(selection.unwrap_or_default()),
@@ -4362,14 +4378,16 @@ impl PyCodeRepository {
     }
 
     /// Test helper. Only works when run_queue is configured. `job_name`
-    /// submits the way the queued dispatcher does: the job's assets and verb.
-    #[pyo3(signature = (selection=None, partition_key=None, job_name=None))]
+    /// submits the way the queued dispatcher does: the job's assets and verb;
+    /// `config` is stored on the record for the dequeuing backend.
+    #[pyo3(signature = (selection=None, partition_key=None, job_name=None, config=None))]
     fn _submit_run(
         &self,
         py: Python,
         selection: Option<Vec<String>>,
         partition_key: Option<PyPartitionKey>,
         job_name: Option<String>,
+        config: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<PyRunHandle> {
         if !self.has_run_queue() {
             return Err(ExecutionError::new_err(
@@ -4385,6 +4403,7 @@ impl PyCodeRepository {
             Some(job) if selection.is_none() => self.handle().job_asset_names(job),
             _ => selection,
         };
+        let config = run_config_to_json(py, config.as_ref());
         py.detach(|| {
             io_rt().block_on(self.submit_run(
                 selection,
@@ -4392,6 +4411,7 @@ impl PyCodeRepository {
                 None,
                 LaunchedBy::Manual { user: None },
                 job_name,
+                config,
             ))
         })
     }
@@ -4745,6 +4765,7 @@ impl PyCodeRepository {
             launched_by,
             // The verb the children run — a Job target's own, not `None`.
             action: child_verb,
+            config: Python::attach(|py| run_config_to_json(py, config.as_ref())),
         };
 
         io_rt()
@@ -4834,6 +4855,7 @@ impl PyCodeRepository {
                 backfill_id: backfill_id.to_string(),
             },
             Some(run_id),
+            Python::attach(|py| run_config_to_json(py, config.as_ref())),
         ))?;
         Python::attach(|py| {
             job.bind(py)
@@ -4864,6 +4886,12 @@ impl PyCodeRepository {
             )));
         }
         fail_backfill_if_job_verb_changed(state, &record)?;
+        // A blocking `backfill(config=...)` passes its config; a daemon runs
+        // the backfill later from the record alone.
+        let config = match config {
+            Some(config) => Some(config),
+            None => parse_run_config_json(record.config.as_deref())?,
+        };
 
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
@@ -5108,6 +5136,7 @@ impl PyCodeRepository {
                     tags: Some(run_tags.clone()),
                     job_name: record.job_name.clone(),
                     action: record.action.clone(),
+                    config: record.config.clone(),
                 })
                 .collect();
 

@@ -361,6 +361,7 @@ def execute(
         typer.echo(f"Error: no run record for '{run_id}' — cannot execute", err=True)
         raise typer.Exit(1)
     action = record.action
+    config = record.config
 
     try:
         if job:
@@ -380,6 +381,7 @@ def execute(
             result = job_obj._execute_run(
                 run_id,
                 partition_key=pk,
+                config=config,
                 resume=resume,
                 raise_on_error=False,
             )
@@ -388,6 +390,7 @@ def execute(
                 action,
                 selection=selection,
                 partition_key=pk,
+                config=config,
                 run_id_override=run_id,
                 raise_on_error=False,
                 resume=resume,
@@ -396,6 +399,7 @@ def execute(
             result = repo_obj.materialize(
                 selection=selection,
                 partition_key=pk,
+                config=config,
                 run_id_override=run_id,
                 raise_on_error=False,
                 resume=resume,
@@ -481,12 +485,19 @@ def execute_step(
     if mapping_key:
         os.environ["RIVERS_MAPPING_KEY"] = mapping_key
 
+    # The run's config overrides live only on its record.
+    record = storage.get_run(run_id)
+    if record is None:
+        typer.echo(f"Error: no run record for '{run_id}' — cannot execute", err=True)
+        raise typer.Exit(1)
+
     name = ", ".join(step_key)
     label = f"{name}[{mapping_key}]" if mapping_key else name
     try:
         _ = repo_obj.materialize(
             selection=list(step_key),
             partition_key=pk,
+            config=record.config,
             run_id_override=run_id,
             raise_on_error=True,
         )

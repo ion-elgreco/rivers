@@ -1,6 +1,6 @@
 """Tests for config management and resources."""
 
-from typing import get_args, get_origin
+from typing import Any, get_args, get_origin
 
 import pytest
 from pydantic import BaseModel
@@ -1612,3 +1612,94 @@ def test_basemodel_uninitialized_instance_in_asset_fn_config_with_materialize_ov
         config={"overridden": {"rate": 9.9}},
     )
     assert repo.load_node("overridden") == {"rate": 9.9, "label": "default"}
+
+
+# ============================================================================
+# Tests: config overrides are kept on the run record
+# ============================================================================
+
+
+def test_materialize_records_its_config_on_the_run():
+    """The run record keeps the overrides (a rerun replays them, the run page
+    shows them); a run launched with the defaults records none."""
+
+    @rs.Asset
+    def recorded_cfg(context: rs.AssetExecutionContext[ThresholdConfig]):
+        return context.config.threshold
+
+    repo = rs.CodeRepository(assets=[recorded_cfg])
+    with_overrides = repo.materialize(config={"recorded_cfg": {"threshold": 0.9}})
+    defaults = repo.materialize()
+
+    assert repo.load_node("recorded_cfg") == 0.5
+    assert repo.storage.get_run(with_overrides.run_id).config == {
+        "recorded_cfg": {"threshold": 0.9}
+    }
+    assert repo.storage.get_run(defaults.run_id).config is None
+
+
+def test_unserializable_config_is_applied_but_not_recorded():
+    """A value pydantic cannot encode as JSON still reaches the step; the
+    record just has no config to replay."""
+
+    class HandleConfig(BaseModel):
+        model_config = {"arbitrary_types_allowed": True}
+        handle: Any = None
+
+    class Opaque:
+        pass
+
+    @rs.Asset
+    def opaque_cfg(context: rs.AssetExecutionContext[HandleConfig]):
+        return type(context.config.handle).__name__
+
+    repo = rs.CodeRepository(assets=[opaque_cfg])
+    result = repo.materialize(config={"opaque_cfg": {"handle": Opaque()}})
+
+    assert repo.load_node("opaque_cfg") == "Opaque"
+    assert repo.storage.get_run(result.run_id).config is None
+
+
+def test_job_execute_records_its_config():
+    @rs.Asset
+    def job_cfg(context: rs.AssetExecutionContext[ThresholdConfig]):
+        return context.config.max_retries
+
+    repo = rs.CodeRepository(
+        assets=[job_cfg], jobs=[rs.Job(name="j", assets=[job_cfg])]
+    )
+    repo.resolve()
+    result = repo.get_job("j").execute(config={"job_cfg": {"max_retries": 8}})
+
+    assert repo.load_node("job_cfg") == 8
+    assert repo.storage.get_run(result.run_id).config == {"job_cfg": {"max_retries": 8}}
+
+
+def test_non_blocking_backfill_keeps_config_for_its_runs():
+    """`block=False` used to refuse config because the record dropped it.
+    The record keeps it now, so the runs a daemon starts later apply it."""
+    seen = []
+
+    @rs.Asset(partitions_def=rs.PartitionsDefinition.static_(["p1", "p2"]))
+    def bf_cfg(context: rs.AssetExecutionContext[ThresholdConfig]):
+        seen.append((context.partition_key, context.config.threshold))
+        return context.config.threshold
+
+    repo = rs.CodeRepository(assets=[bf_cfg], default_executor=rs.Executor.in_process())
+    repo.resolve()
+    launched = repo.backfill(
+        selection=["bf_cfg"],
+        partition_keys=[rs.PartitionKey.single("p1"), rs.PartitionKey.single("p2")],
+        config={"bf_cfg": {"threshold": 0.25}},
+        block=False,
+    )
+    assert seen == []
+
+    # What a daemon does with the Requested record.
+    repo.execute_backfill(launched.backfill_id)
+
+    assert sorted(seen) == [("p1", 0.25), ("p2", 0.25)]
+    status = repo.get_backfill(launched.backfill_id)
+    assert status is not None and status.status == "CompletedSuccess"
+    for run_id in status.run_ids:
+        assert repo.storage.get_run(run_id).config == {"bf_cfg": {"threshold": 0.25}}

@@ -77,6 +77,29 @@ pub fn JobsListPage() -> impl IntoView {
     let dialog_picker_signal: Signal<JobPartitionPicker> = dialog_picker.into();
     let dialog_verb_signal: Signal<Option<AssetActionInfo>> = dialog_verb.into();
     let exec_error = RwSignal::new(Option::<String>::None);
+    // The dialog's config editor reads the job's assets and their schemas.
+    let jobs_value = crate::helpers::resource_value(jobs);
+    let assets_info_value = crate::helpers::resource_value(assets_info);
+    let dialog_assets = Signal::derive(move || {
+        let job = dialog_job.get();
+        jobs_value
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|j| j.name == job)
+            .map(|j| j.asset_selection)
+            .unwrap_or_default()
+    });
+    let asset_info_by_key = Memo::new(move |_| {
+        assets_info_value
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|i| (i.asset_key.clone(), i))
+            .collect::<std::collections::HashMap<String, crate::types::AssetDefinitionInfo>>()
+    });
 
     view! {
         <Topbar
@@ -101,6 +124,8 @@ pub fn JobsListPage() -> impl IntoView {
             job_name=dialog_job_signal
             picker=dialog_picker_signal
             verb=dialog_verb_signal
+            assets=dialog_assets
+            definitions=asset_info_by_key
         />
 
         {move || exec_error.get().map(|msg| view! { <div class="error-msg" style="margin-bottom: 1rem">{msg}</div> })}
@@ -161,8 +186,15 @@ pub fn JobsListPage() -> impl IntoView {
                                     let row_picker =
                                         job_partition_picker(verb.as_ref(), &asset_selection, &asset_info_by_key);
                                     let destructive = verb.as_ref().is_some_and(|v| v.is_destructive());
-                                    let opens_dialog = !matches!(row_picker, JobPartitionPicker::None);
                                     let verb_name = verb.as_ref().map(|v| v.name.clone());
+                                    // The dialog picks partitions and edits config; a job
+                                    // needing neither runs on the click.
+                                    let opens_dialog = !matches!(row_picker, JobPartitionPicker::None)
+                                        || crate::components::config_editor::launch_takes_config(
+                                            &asset_selection,
+                                            &asset_info_by_key,
+                                            verb_name.as_deref(),
+                                        );
                                     let armed_label = verb_name.clone().unwrap_or_default();
 
                                     let (exec_pending, set_exec_pending) = signal(false);
@@ -178,7 +210,7 @@ pub fn JobsListPage() -> impl IntoView {
                                         move |ev: leptos::ev::MouseEvent| {
                                             ev.prevent_default();
                                             ev.stop_propagation();
-                                            if !matches!(row_picker, JobPartitionPicker::None) {
+                                            if opens_dialog {
                                                 dialog_job.set(exec_name.clone());
                                                 dialog_picker.set(row_picker.clone());
                                                 dialog_verb.set(verb.clone());
@@ -201,7 +233,7 @@ pub fn JobsListPage() -> impl IntoView {
                                             leptos::task::spawn_local(async move {
                                                 let path_ns = ns.clone();
                                                 let path_name = name.clone();
-                                                match execute_job(ns, name, n.clone(), shown, None, false).await {
+                                                match execute_job(ns, name, n.clone(), shown, None, false, None).await {
                                                     Ok(result) if !result.run_id.is_empty() => {
                                                         let path = loc_path(&path_ns, &path_name, &format!("runs/{}", result.run_id));
                                                         navigate(&path, Default::default());

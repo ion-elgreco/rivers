@@ -5753,6 +5753,7 @@ async fn setup_storage_bench<S: StorageBackend>(storage: &S, n_assets: usize) ->
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
         action: None,
+        config: None,
     };
     storage.create_run(&run).await.unwrap();
 
@@ -5826,6 +5827,7 @@ async fn bench_cache_tick<S: StorageBackend>(
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         };
         storage.create_run(&run).await.unwrap();
         for key in &touched {
@@ -6234,6 +6236,7 @@ async fn test_cache_detects_in_progress_completion_as_change() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -6340,6 +6343,7 @@ async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completio
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
         action: None,
+        config: None,
     };
     storage
         .create_runs(&[
@@ -6563,6 +6567,7 @@ async fn test_incremental_partition_refresh_keeps_equal_timestamp_partitions() {
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
         action: None,
+        config: None,
     };
     let mk_event = |run_id: &str, k: &str, ts: i64| EventRecord {
         code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
@@ -6695,6 +6700,7 @@ async fn test_cache_completion_fallback_skips_still_started_sibling_effects() {
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
         action: None,
+        config: None,
     };
     storage
         .create_runs(&[mk_run("run_a", "a"), mk_run("run_b", "b")])
@@ -6814,6 +6820,7 @@ async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -6899,6 +6906,7 @@ async fn test_step_success_clears_floor_for_lagging_record_in_joint_failed_run()
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -6998,6 +7006,7 @@ async fn test_failed_joint_run_step_success_records_tick_tags() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7093,6 +7102,7 @@ async fn test_cache_clears_in_progress_when_run_canceled_after_cursor_advanced()
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7160,6 +7170,7 @@ async fn test_queued_run_from_scheduler_is_tracked_and_applies_effects() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7245,6 +7256,7 @@ async fn test_initial_load_tracks_queued_and_not_started_runs() {
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
         action: None,
+        config: None,
     };
     // run-s is the newest, so the seeded cursor sits above run-q / run-n.
     storage
@@ -7314,6 +7326,7 @@ async fn test_foreign_code_location_observations_do_not_clear_in_flight() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7388,6 +7401,7 @@ async fn test_backfill_terminal_clears_predispatch_placeholder() {
             error: None,
             launched_by: LaunchedBy::default(),
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7457,6 +7471,7 @@ async fn test_joint_partitioned_run_updates_unpartitioned_assets_scalar_tags() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7524,6 +7539,7 @@ async fn test_two_partition_runs_same_asset_both_update_slots() {
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
         action: None,
+        config: None,
     };
     storage
         .create_run(&mk("R1", "p1", "a", 2000))
@@ -7606,6 +7622,7 @@ async fn test_in_progress_partition_keys_expands_batched_members() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7652,6 +7669,7 @@ async fn test_failed_run_does_not_clobber_latest_materializing_tags() {
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
         action: None,
+        config: None,
     };
 
     let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
@@ -7732,6 +7750,7 @@ async fn test_later_finishing_run_keeps_latest_tags() {
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
         action: None,
+        config: None,
     };
 
     let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
@@ -7830,6 +7849,7 @@ async fn test_stale_eval_state_with_live_queued_run_does_not_redispatch() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7933,6 +7953,7 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -8107,6 +8128,7 @@ async fn test_initial_load_derives_failure_floor_from_run_history() {
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
         action: None,
+        config: None,
     };
     // a: failed, never materialized afterwards → floor stands.
     storage
@@ -8202,6 +8224,7 @@ async fn test_initial_load_ignores_failed_action_runs() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: Some("compact".to_string()),
+            config: None,
         })
         .await
         .unwrap();
@@ -8281,6 +8304,7 @@ async fn test_materializing_action_triggers_downstream_eager() {
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
         action: action.map(str::to_string),
+        config: None,
     };
     let materialization = |run_id: &str, asset: &str, ts: i64| EventRecord {
         code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
@@ -8453,6 +8477,7 @@ async fn test_verb_run_requests_downstream_it_did_not_build_after_dep() {
                 block_reason: None,
                 launched_by: LaunchedBy::Manual { user: None },
                 action: action.map(str::to_string),
+                config: None,
             }
         };
         storage
@@ -8530,6 +8555,7 @@ async fn storage_with_live_action_run(
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: action.map(str::to_string),
+            config: None,
         })
         .await
         .unwrap();
@@ -8627,6 +8653,7 @@ async fn test_steady_state_refresh_ignores_live_action_runs() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: Some("compact".to_string()),
+            config: None,
         })
         .await
         .unwrap();
@@ -8670,6 +8697,7 @@ async fn test_recover_pending_dispatch_clears_is_initial() {
             block_reason: None,
             launched_by: LaunchedBy::Condition,
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -8735,6 +8763,7 @@ async fn test_recover_pending_dispatch_skips_stale_intent() {
             block_reason: None,
             launched_by: LaunchedBy::Condition,
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -8811,6 +8840,7 @@ async fn test_recover_pending_dispatch_restores_handled_keys() {
             block_reason: None,
             launched_by: LaunchedBy::Condition,
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -8895,6 +8925,7 @@ async fn test_recover_pending_dispatch_backfill_id_no_false_match() {
             error: None,
             launched_by: LaunchedBy::default(),
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9009,6 +9040,7 @@ async fn test_crash_after_dispatch_recovers_latches_from_intent() {
         block_reason: None,
         launched_by: LaunchedBy::Condition,
         action: None,
+        config: None,
     };
     let mk_event = |run_id: &str, asset: &str, dv: &str, ts: i64| crate::storage::EventRecord {
         code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
@@ -9227,6 +9259,7 @@ async fn test_crash_before_dispatch_leaves_trigger_armed() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9334,6 +9367,7 @@ async fn test_restart_does_not_replay_newest_run_tick_tags() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9387,6 +9421,7 @@ async fn test_same_timestamp_run_committed_after_refresh_is_seen() {
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
         action: None,
+        config: None,
     };
 
     let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
@@ -9465,6 +9500,7 @@ async fn test_failure_floor_survives_daemon_restart() {
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
         action: None,
+        config: None,
     };
 
     let mut pass = ConditionPass::new(
@@ -9566,6 +9602,7 @@ async fn test_initial_load_seeds_observation_cursor() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9621,6 +9658,7 @@ async fn test_clearable_sweep_sets_failure_floor_on_missed_terminal_failure() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9686,6 +9724,7 @@ async fn test_clearable_sweep_records_partitioned_failure_in_partition_status() 
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9763,6 +9802,7 @@ async fn test_queued_run_is_not_cleared_by_sweep() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9815,6 +9855,7 @@ async fn test_cache_does_not_store_empty_run_tags() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9859,6 +9900,7 @@ async fn test_cache_does_not_store_empty_run_tags() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9929,6 +9971,7 @@ async fn test_cache_tick_materialization_tags() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9994,6 +10037,7 @@ async fn test_cache_tick_materialization_tags_includes_empty_tags() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -15665,6 +15709,7 @@ async fn test_pending_run_confirmed_by_storage_clears_pending() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -15811,6 +15856,7 @@ async fn test_pending_eviction_only_drops_phantom_run_id_not_other_runs() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -15917,6 +15963,7 @@ fn run_record(
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
         action: None,
+        config: None,
     }
 }
 
@@ -17434,6 +17481,7 @@ async fn test_initial_load_does_not_floor_asset_materialized_in_failed_joint_run
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -17569,6 +17617,7 @@ async fn test_completed_run_invalidates_event_less_partitioned_sibling() {
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         })
         .await
         .unwrap();

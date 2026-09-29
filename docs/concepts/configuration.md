@@ -51,6 +51,22 @@ repo.materialize(
 
 Overrides are merged with defaults at instantiation time. For `BaseSettings`, env vars are resolved first, then overrides take precedence.
 
+The run record keeps the overrides (`RunRecord.config`, as long as the values are JSON-serializable), so a rerun replays them and the run page shows them. Every launch path applies them: the run queue, Kubernetes run pods, backfill child runs and reruns.
+
+## Overrides from the UI
+
+The Materialize and Execute job dialogs show a **Config** editor when a selected asset (or the chosen action) takes config. It holds the same JSON object `materialize()` takes, keyed by asset name, and opens pre-filled with each field's default:
+
+```json
+{
+  "api_data": {
+    "batch_size": 100
+  }
+}
+```
+
+A field without a default — a required field, or a `BaseSettings` field the environment resolves — is listed next to the editor but not pre-filled, so nothing is sent for it unless you set it. The backend rejects a submit that is not a JSON object keyed by selected assets; values are validated by the config class when the run starts, so a wrong type fails the step with the pydantic error in its traceback.
+
 ## Tasks
 
 Tasks support config the same way as assets:

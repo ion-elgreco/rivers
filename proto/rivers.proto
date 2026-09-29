@@ -60,6 +60,10 @@ message MaterializeRequest {
   optional ProtoPartitionKey partition_key = 2;
   repeated Tag tags = 3;
   optional UserRef user = 4;
+  // Per-asset config overrides as a JSON object keyed by asset name:
+  // `{"asset": {"field": value}}`. Every key must be in the selection. Unset
+  // or empty means the definitions' defaults. Stored on the run.
+  optional string config = 5;
 }
 
 message MaterializeResponse {
@@ -86,6 +90,8 @@ message ExecuteJobRequest {
   // The job runs its own verb, so a request naming another one (a page that
   // has not loaded the job, or loaded it before a redeploy) is rejected.
   optional string action = 5;
+  // As MaterializeRequest.config, keyed by the job's assets.
+  optional string config = 6;
 }
 
 message ExecuteJobResponse {
@@ -162,6 +168,9 @@ message AssetDefinitionInfo {
   optional string code_version = 12;
   string asset_type = 13;
   repeated ActionInfo actions = 14;
+  // JSON schema (pydantic `model_json_schema()`) of the config class the
+  // asset's context annotation names. Unset when the asset takes no config.
+  optional string config_schema = 15;
 }
 
 message ActionInfo {
@@ -172,6 +181,8 @@ message ActionInfo {
   optional string description = 4;
   // "required" | "keyless" | "optional" — partition-key rule for the verb
   string partitioning = 5;
+  // As AssetDefinitionInfo.config_schema, for the action's own config class.
+  optional string config_schema = 6;
 }
 
 message PartitionDefInfo {
@@ -294,6 +305,8 @@ message RunActionRequest {
   // is Optional (delete) acts on every partition of a partitioned asset.
   // Such a keyless run is rejected unless this is set.
   bool whole_asset = 7;
+  // As MaterializeRequest.config, for the action's own config class.
+  optional string config = 8;
 }
 message RunActionResponse {
   string run_id = 1;
@@ -380,6 +393,9 @@ message LaunchBackfillRequest {
   // the verb the caller showed for the job, as in ExecuteJobRequest: a
   // backfill naming another verb than the job's own is rejected.
   optional string action = 11;
+  // As MaterializeRequest.config; stored on the backfill and applied to every
+  // child run.
+  optional string config = 12;
 }
 
 message LaunchBackfillResponse {

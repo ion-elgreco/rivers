@@ -423,6 +423,22 @@
     white-space: pre-wrap;
     word-break: break-word;
 }
+/* The per-asset config overrides the run was launched with. */
+.run-config {
+    background: var(--bg-inset);
+    border-left: 2px solid var(--border);
+    border-radius: var(--round-sm);
+    padding: 12px 16px;
+    margin: 0 0 16px;
+}
+.run-config-text {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: var(--fs-sm);
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
 
 /* Run detail: trigger metadata ribbon (matches Rivers 14:00:00 UTC · elapsed … · cron · commit …) */
 .run-trigger-meta {

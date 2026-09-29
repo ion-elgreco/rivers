@@ -247,3 +247,99 @@ def test_execute_job_runs_the_verb_the_run_was_launched_with(
     assert "ActionCompleted" in types and "Materialization" not in types
     outcome = store.kv_get("run_outcome:pod-run-5")
     assert outcome is not None and b"Success" in outcome
+
+
+CONFIG_REPO_MODULE = """
+from pathlib import Path
+
+import rivers as rs
+from pydantic import BaseModel
+
+
+class Cfg(BaseModel):
+    threshold: float = 0.5
+
+
+@rs.Asset(name="cfg")
+def cfg(context: rs.AssetExecutionContext[Cfg]) -> float:
+    Path("cfg_seen.txt").write_text(str(context.config.threshold))
+    return context.config.threshold
+
+
+repo = rs.CodeRepository(assets=[cfg])
+"""
+
+
+def test_execute_applies_the_records_config(resolved_tmp_path, monkeypatch):
+    """The config overrides ride the run record, not the pod args: a run
+    launched from the UI or the queue applies them in its pod."""
+    (resolved_tmp_path / "defs_cfg.py").write_text(CONFIG_REPO_MODULE)
+    store = _cloud_env(monkeypatch, resolved_tmp_path / "storage_cfg")
+    store._create_run(
+        "pod-cfg",
+        "",
+        "Queued",
+        1,
+        node_names=["cfg"],
+        config={"cfg": {"threshold": 0.9}},
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "execute",
+            "defs_cfg",
+            "--run-id",
+            "pod-cfg",
+            "--surreal-endpoint",
+            "ws://unused",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (resolved_tmp_path / "cfg_seen.txt").read_text() == "0.9"
+    outcome = store.kv_get("run_outcome:pod-cfg")
+    assert outcome is not None and b"Success" in outcome
+
+
+def test_execute_step_applies_the_records_config(resolved_tmp_path, monkeypatch):
+    """A step pod runs one step of a run the run pod started: it reads the
+    same record for the overrides."""
+    (resolved_tmp_path / "defs_cfg_step.py").write_text(CONFIG_REPO_MODULE)
+    store = _cloud_env(monkeypatch, resolved_tmp_path / "storage_cfg_step")
+    monkeypatch.setenv("RIVERS_SURREAL_ENDPOINT", "ws://unused")
+    store._create_run(
+        "pod-cfg-step",
+        "",
+        "Started",
+        1,
+        node_names=["cfg"],
+        config={"cfg": {"threshold": 0.75}},
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "execute-step",
+            "defs_cfg_step",
+            "--step-key",
+            "cfg",
+            "--run-id",
+            "pod-cfg-step",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (resolved_tmp_path / "cfg_seen.txt").read_text() == "0.75"
+
+
+def test_execute_step_without_a_run_record_fails_loudly(resolved_tmp_path, monkeypatch):
+    (resolved_tmp_path / "defs_cfg_missing.py").write_text(CONFIG_REPO_MODULE)
+    _cloud_env(monkeypatch, resolved_tmp_path / "storage_cfg_missing")
+    monkeypatch.setenv("RIVERS_SURREAL_ENDPOINT", "ws://unused")
+
+    result = runner.invoke(
+        app,
+        ["execute-step", "defs_cfg_missing", "--step-key", "cfg", "--run-id", "absent"],
+    )
+    assert result.exit_code == 1
+    assert "no run record for 'absent'" in result.output
+    assert not (resolved_tmp_path / "cfg_seen.txt").exists()

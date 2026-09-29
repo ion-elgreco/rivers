@@ -97,6 +97,7 @@ fn split_run_requests(
                     .map(|k| crate::partitions::PyPartitionKey::Single { key: vec![k] }),
                 job_name: rr.job_name.clone(),
                 launched_by: launched_by.clone(),
+                config: None,
             });
         } else if let Some(sel) = default_asset_selection {
             mat_reqs.push(MaterializationRequestData {
@@ -114,6 +115,7 @@ fn split_run_requests(
                     .unwrap_or_default(),
                 launched_by: launched_by.clone(),
                 action: None,
+                config: None,
             });
         }
         // else: dropped — resolve-time validation should keep this state out
@@ -138,6 +140,7 @@ pub(crate) fn extract_run_request_data(
                     .map(|k| crate::partitions::PyPartitionKey::Single { key: vec![k] }),
                 job_name: rr.job_name.clone(),
                 launched_by: launched_by.clone(),
+                config: None,
             }
         })
         .collect()
@@ -163,6 +166,7 @@ pub(crate) fn extract_backfill_request_data(
                 backfill_id: None,
                 launched_by: launched_by.clone(),
                 action: br.action.clone(),
+                config: None,
             }
         })
         .collect()

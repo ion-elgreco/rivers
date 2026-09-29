@@ -6,6 +6,7 @@
 //! argument from Python. Each query is exposed twice: a sync method that
 //! releases the GIL while awaiting the async storage call, and an
 //! `async_*` variant for `await`-friendly use from `asyncio`.
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
@@ -375,27 +376,53 @@ impl From<LaunchedBy> for PyLaunchedBy {
 #[pyclass(
     name = "RunRecord",
     frozen,
-    get_all,
     skip_from_py_object,
     module = "rivers._core"
 )]
 #[derive(Clone)]
 pub struct PyRunRecord {
+    #[pyo3(get)]
     pub run_id: String,
     /// `None` for ad-hoc runs (`materialize`, asset-selection sensors); `Some`
     /// when the run targets a user-defined `Job`.
+    #[pyo3(get)]
     pub job_name: Option<String>,
+    #[pyo3(get)]
     pub status: String,
+    #[pyo3(get)]
     pub start_time: i64,
+    #[pyo3(get)]
     pub end_time: Option<i64>,
+    #[pyo3(get)]
     pub tags: Vec<(String, String)>,
+    #[pyo3(get)]
     pub node_names: Vec<String>,
+    #[pyo3(get)]
     pub priority: i32,
+    #[pyo3(get)]
     pub partition_key: Option<PyPartitionKey>,
+    #[pyo3(get)]
     pub block_reason: Option<String>,
+    #[pyo3(get)]
     pub launched_by: PyLaunchedBy,
     /// The verb this run executes. `None` means materialize.
+    #[pyo3(get)]
     pub action: Option<String>,
+    /// See [`RunRecord::config`]; the `config` getter parses it.
+    pub config_json: Option<String>,
+}
+
+#[pymethods]
+impl PyRunRecord {
+    /// Per-asset config overrides the run was launched with, keyed by asset
+    /// name. `None` means the definitions' defaults.
+    #[getter]
+    fn config(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.config_json
+            .as_deref()
+            .map(|json| Ok(py.import("json")?.call_method1("loads", (json,))?.unbind()))
+            .transpose()
+    }
 }
 
 impl From<RunRecord> for PyRunRecord {
@@ -413,6 +440,7 @@ impl From<RunRecord> for PyRunRecord {
             block_reason: r.block_reason,
             launched_by: r.launched_by.into(),
             action: r.action,
+            config_json: r.config,
         }
     }
 }
@@ -1415,7 +1443,7 @@ impl PyStorage {
     }
 
     /// Create a run record (test helper). Not part of the public API.
-    #[pyo3(name = "_create_run", signature = (run_id, job_name, status, start_time, priority=0, tags=vec![], block_reason=None, node_names=vec![], action=None))]
+    #[pyo3(name = "_create_run", signature = (run_id, job_name, status, start_time, priority=0, tags=vec![], block_reason=None, node_names=vec![], action=None, config=None))]
     #[allow(clippy::too_many_arguments)]
     fn create_run(
         &self,
@@ -1429,8 +1457,10 @@ impl PyStorage {
         block_reason: Option<String>,
         node_names: Vec<String>,
         action: Option<String>,
+        config: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<()> {
         use rivers_core::storage::RunRecord;
+        let config = crate::config::run_config::run_config_to_json(py, config.as_ref());
         let record = RunRecord {
             run_id: run_id.to_string(),
             code_location_id: self.cl().to_string(),
@@ -1449,6 +1479,7 @@ impl PyStorage {
             block_reason,
             launched_by: LaunchedBy::Manual { user: None },
             action,
+            config,
         };
         py.detach(|| {
             io_rt()
@@ -1503,6 +1534,7 @@ impl PyStorage {
             error: None,
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
+            config: None,
         };
         py.detach(|| {
             io_rt()

@@ -269,6 +269,15 @@ pub fn AssetsListPage() -> impl IntoView {
 
     // The selection controls live outside the table's <Transition>.
     let assets_info_value = crate::helpers::resource_value(assets_info);
+    let asset_info_by_key = Memo::new(move |_| {
+        assets_info_value
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|i| (i.asset_key.clone(), i))
+            .collect::<std::collections::HashMap<String, crate::types::AssetDefinitionInfo>>()
+    });
     let materialize_picker = Signal::derive(move || {
         let infos = assets_info_value
             .get()
@@ -650,6 +659,7 @@ pub fn AssetsListPage() -> impl IntoView {
             destructive=dialog_destructive
             records=records_by_key
             records_failed=records_failed
+            definitions=asset_info_by_key
         />
     }
 }

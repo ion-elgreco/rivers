@@ -907,6 +907,7 @@ mod tests {
                         action: None,
                         code_location_id: rivers_core::storage::DEFAULT_CODE_LOCATION_ID
                             .to_string(),
+                        config: None,
                     };
                     storage.create_run(&run).await.expect("create_run");
                 },
@@ -1006,6 +1007,7 @@ mod tests {
                         error: None,
                         launched_by: rivers_core::storage::LaunchedBy::default(),
                         action: None,
+                        config: None,
                     };
                     storage.create_backfill(&bf).await.expect("create_backfill");
                 },
@@ -1119,6 +1121,7 @@ mod tests {
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
             code_location_id: rivers_core::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+            config: None,
         };
         storage.create_run(&run).await.expect("create_run");
 
@@ -1235,6 +1238,7 @@ mod tests {
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
             code_location_id: rivers_core::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+            config: None,
         };
         storage.create_run(&run).await.unwrap();
 
@@ -1349,6 +1353,7 @@ mod tests {
             launched_by: LaunchedBy::Manual { user: None },
             action: None,
             code_location_id: rivers_core::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
+            config: None,
         };
         storage.create_run(&run).await.unwrap();
 

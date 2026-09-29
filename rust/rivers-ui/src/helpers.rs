@@ -805,6 +805,7 @@ pub fn job_verb(
         exclusive: false,
         partitioning: partitioning.to_string(),
         description: None,
+        config_schema: None,
     };
     if verb == "observe" {
         return Some(fallback("observe", "optional"));
@@ -1277,6 +1278,7 @@ mod tests {
             code_version: None,
             asset_type: "asset".to_string(),
             actions: vec![],
+            config_schema: None,
         }
     }
 
@@ -1318,6 +1320,7 @@ mod tests {
                 exclusive: false,
                 partitioning: "required".to_string(),
                 description: None,
+                config_schema: None,
             })
             .collect();
         info
@@ -1336,6 +1339,7 @@ mod tests {
             exclusive: true,
             partitioning: partitioning.to_string(),
             description: None,
+            config_schema: None,
         }];
         info
     }

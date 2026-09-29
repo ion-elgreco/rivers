@@ -671,3 +671,41 @@ class TestBackfillResume:
             assert all(r.status == "Success" for r in bf_runs)
         finally:
             daemon.stop()
+
+
+class TestRunQueueConfig:
+    def test_queued_run_applies_the_config_on_its_record(self, storage):
+        """The queued record carries the config; the local run backend reads
+        it from the record when the coordinator launches the run."""
+        from pydantic import BaseModel
+
+        class Cfg(BaseModel):
+            threshold: float = 0.5
+
+        @rs.Asset(name="queued_cfg", io_handler=rs.InMemoryIOHandler())
+        def queued_cfg(context: rs.AssetExecutionContext[Cfg]) -> float:
+            return context.config.threshold
+
+        repo = rs.CodeRepository(
+            assets=[queued_cfg],
+            default_executor=rs.Executor.in_process(),
+            run_queue=rs.RunQueueConfig(
+                max_concurrent_runs=2, dequeue_interval="100ms"
+            ),
+        )
+        repo.resolve(storage=storage)
+        handle = repo._submit_run(
+            selection=["queued_cfg"], config={"queued_cfg": {"threshold": 0.9}}
+        )
+        assert storage.get_run(handle.run_id).config == {
+            "queued_cfg": {"threshold": 0.9}
+        }
+
+        daemon = AutomationDaemon(repo=repo, storage=storage)
+        daemon.start()
+        try:
+            run = _wait_for_run_terminal(storage, handle.run_id, timeout=20)
+            assert run is not None and run.status == "Success"
+            assert repo.load_node("queued_cfg") == 0.9
+        finally:
+            daemon.stop()

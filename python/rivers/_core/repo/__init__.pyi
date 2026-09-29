@@ -222,6 +222,7 @@ class CodeRepository:
         selection: list[str] | None = None,
         partition_key: PartitionKey | None = None,
         job_name: str | None = None,
+        config: dict[str, dict[str, Any]] | None = None,
     ) -> "RunHandle":
         """(Internal) submit a run to the queue and return a handle."""
         ...
@@ -289,7 +290,8 @@ class CodeRepository:
             partition_key: Partition to target (required for partitioned assets).
             tags: Run tags applied for queue / observability filtering.
             raise_on_error: Raise on first failure instead of returning a failed result.
-            config: Per-asset config, keyed by asset name.
+            config: Per-asset config, keyed by asset name. Kept on the run
+                record when JSON-serializable.
             run_id_override: Use a pre-assigned run ID (for K8s execution pods).
             include_upstream: Also materialize transitive deps (default: only ``selection``).
             resume: Skip already-completed steps from a crashed prior run with the same ID.
@@ -323,18 +325,13 @@ class CodeRepository:
             failure_policy: ``"continue"`` or ``"stop_on_failure"``.
             max_concurrency: Cap on concurrent partition runs.
             tags: Run tags applied to every spawned run.
-            config: Per-asset config, keyed by asset name. Needs ``block=True``.
+            config: Per-asset config, keyed by asset name. Kept on the backfill
+                record and applied to every child run.
             block: Wait for the backfill to finish before returning. ``False``
-                only records the backfill for a daemon to run later, and
-                raises if ``config`` is given.
+                only records the backfill for a daemon to run later.
             dry_run: Plan only — return the would-be run shape without launching.
             action: Verb child runs execute; ``None`` means materialize.
                 Every selected asset must define the action.
-
-        Raises:
-            ExecutionError: ``config`` is given with ``block=False``, also for a
-                dry run. The backfill record does not keep config, so the runs
-                would use the config defaults.
         """
         ...
 
