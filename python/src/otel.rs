@@ -79,10 +79,28 @@ fn read_pem(get: Lookup, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
         .with_context(|| format!("reading {var} ({path})"))
 }
 
-/// `None` for plain `http://` without certificate variables.
+/// `None` for plain `http://` without certificate variables. Certificate
+/// variables with a non-`https://` endpoint are an error: tonic only uses TLS
+/// for the `https` scheme and would send in cleartext.
 fn tls_config(get: Lookup) -> anyhow::Result<Option<ClientTlsConfig>> {
-    let https = otlp_var(get, "ENDPOINT")
+    let endpoint = otlp_var(get, "ENDPOINT");
+    let https = endpoint
+        .as_ref()
         .is_some_and(|(_, endpoint)| endpoint.to_ascii_lowercase().starts_with("https://"));
+    let cert_vars: Vec<String> = ["CERTIFICATE", "CLIENT_CERTIFICATE", "CLIENT_KEY"]
+        .into_iter()
+        .filter_map(|name| otlp_var(get, name).map(|(var, _)| var))
+        .collect();
+    if !https
+        && !cert_vars.is_empty()
+        && let Some((endpoint_var, endpoint)) = &endpoint
+    {
+        let verb = if cert_vars.len() == 1 { "is" } else { "are" };
+        anyhow::bail!(
+            "{} {verb} set but {endpoint_var} ({endpoint}) is not https://",
+            cert_vars.join(", ")
+        );
+    }
     let ca = read_pem(get, "CERTIFICATE")?;
     let client_cert = read_pem(get, "CLIENT_CERTIFICATE")?;
     let client_key = read_pem(get, "CLIENT_KEY")?;
@@ -174,13 +192,32 @@ mod tests {
         let cert = pem_file("client.pem");
         let key = pem_file("client.key");
         let vars = lookup(&[
-            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4317"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector:4317"),
             ("OTEL_EXPORTER_OTLP_CERTIFICATE", &ca),
             ("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", &cert),
             ("OTEL_EXPORTER_OTLP_CLIENT_KEY", &key),
         ]);
         let get = |k: &str| vars.get(k).cloned();
         assert!(tls_config(&get).unwrap().is_some());
+    }
+
+    #[test]
+    fn certificate_with_plain_http_endpoint_is_rejected() {
+        let vars = lookup(&[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c:4317"),
+            ("OTEL_EXPORTER_OTLP_CERTIFICATE", "/nonexistent/ca.pem"),
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+                "/nonexistent/client.pem",
+            ),
+        ]);
+        let get = |k: &str| vars.get(k).cloned();
+        let err = format!("{:#}", tls_config(&get).unwrap_err());
+        assert_eq!(
+            err,
+            "OTEL_EXPORTER_OTLP_CERTIFICATE, OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE \
+             are set but OTEL_EXPORTER_OTLP_ENDPOINT (http://c:4317) is not https://"
+        );
     }
 
     #[test]

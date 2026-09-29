@@ -275,3 +275,25 @@ def test_unreadable_certificate_disables_export_and_names_the_variable(
     assert (
         f"OTEL_EXPORTER_OTLP_CERTIFICATE ({tmp_path / 'missing.pem'})" in result.stderr
     )
+
+
+def test_certificate_with_plain_http_endpoint_disables_export(tmp_path: Path) -> None:
+    ca = _pem("rivers-test-ca", ca=True)
+    env = os.environ.copy()
+    env["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://127.0.0.1:4317"
+    env["OTEL_EXPORTER_OTLP_CERTIFICATE"] = _write(tmp_path, "ca.pem", ca.cert)
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import rivers"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert "OpenTelemetry export disabled" in result.stderr
+    assert (
+        "OTEL_EXPORTER_OTLP_CERTIFICATE is set but OTEL_EXPORTER_OTLP_ENDPOINT "
+        "(http://127.0.0.1:4317) is not https://"
+    ) in result.stderr
