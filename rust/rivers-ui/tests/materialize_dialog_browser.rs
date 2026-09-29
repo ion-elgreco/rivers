@@ -836,10 +836,10 @@ async fn config_editor_is_absent_without_a_schema() {
 }
 
 /// The editor opens on each configured asset's defaults, keyed by asset. A
-/// field without a default is listed as required but never pre-filled, so
+/// field without a default is hinted as required but never pre-filled, so
 /// nothing is sent for it unless typed.
 #[wasm_bindgen_test]
-async fn config_editor_prefills_defaults_and_lists_required_fields() {
+async fn config_editor_prefills_defaults_and_hints_required_fields() {
     let show = RwSignal::new(true);
     let host = mount_with_definitions(
         show,
@@ -854,21 +854,13 @@ async fn config_editor_prefills_defaults_and_lists_required_fields() {
         editor_value(&host),
         "{\n  \"api_data\": {\n    \"batch_size\": 100\n  }\n}"
     );
-    let fields: Vec<String> = query_all(&host, ".config-field")
-        .iter()
-        .map(|f| f.text_content().unwrap_or_default())
-        .collect();
     assert_eq!(
-        fields,
-        vec!["api_keystringrequired", "batch_sizeinteger= 100"]
+        query_one(&host, ".config-editor-hint-fields")
+            .text_content()
+            .unwrap_or_default(),
+        "api_data.api_key"
     );
-    assert_eq!(
-        query_all(&host, ".config-fields-asset")
-            .iter()
-            .map(|a| a.text_content().unwrap_or_default())
-            .collect::<Vec<_>>(),
-        vec!["api_data"]
-    );
+    assert!(query_all(&host, ".config-field").is_empty());
     assert!(!submit_disabled(&host));
 }
 
@@ -882,25 +874,26 @@ async fn invalid_config_blocks_submit_until_reset() {
 
     type_config(&host, "{\"api_data\": ");
     flush_effects().await;
-    let error = query_one(&host, ".config-editor-error")
+    let error = query_one(&host, ".code-editor-issue")
         .text_content()
         .unwrap_or_default();
-    assert!(error.starts_with("Config is not valid JSON"), "{error}");
+    assert_eq!(error, "1:14 Expected a value");
+    assert!(!query_all(&host, ".code-editor-mark").is_empty());
     assert!(submit_disabled(&host));
 
     type_config(&host, "{\"other\": {\"x\": 1}}");
     flush_effects().await;
     assert_eq!(
-        query_one(&host, ".config-editor-error")
+        query_one(&host, ".code-editor-issue")
             .text_content()
             .unwrap_or_default(),
-        "'other' is not in the selection."
+        "1:2 'other' is not in the selection."
     );
     assert!(submit_disabled(&host));
 
     click(&query_one(&host, ".config-editor .link-btn"), false);
     flush_effects().await;
-    assert!(query_all(&host, ".config-editor-error").is_empty());
+    assert!(query_all(&host, ".code-editor-issue").is_empty());
     assert_eq!(
         editor_value(&host),
         "{\n  \"api_data\": {\n    \"batch_size\": 100\n  }\n}"
@@ -929,6 +922,9 @@ async fn config_editor_follows_the_checked_assets() {
     assert!(query_all(&host, ".config-editor").is_empty());
 
     set_checked(&checkboxes[1], true);
+    // The template effect runs after the Show has mounted the textarea, so
+    // the value binding follows one microtask later.
+    flush_effects().await;
     flush_effects().await;
     assert_eq!(
         editor_value(&host),

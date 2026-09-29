@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use leptos::prelude::*;
 
-use crate::components::config_editor::{ConfigEditor, launch_config_schemas, validate_config_text};
+use crate::components::config_editor::{ConfigEditor, check_config, launch_config_schemas};
 use crate::components::partition_picker::{PartitionPicker, WholeAssetChoice};
 use crate::helpers::{JobPartitionPicker, close_on_navigation, stale_status_kind};
 use crate::loc::{loc_path, use_current_location};
@@ -136,10 +136,10 @@ pub fn MaterializeDialog(
     let config_schemas = Signal::derive(move || {
         launch_config_schemas(&selected.get(), &definitions.get(), verb.get().as_deref())
     });
-    // Blank text is no overrides; the submit button waits for valid text.
-    let config_result =
-        Memo::new(move |_| validate_config_text(&config_text.get(), &selected.get()));
-    let config_error = Signal::derive(move || config_result.get().err());
+    // Blank text is no overrides; the submit button waits for text without issues.
+    let config_check = Memo::new(move |_| {
+        check_config(&config_text.get(), &selected.get(), &config_schemas.get())
+    });
 
     Effect::new(move || {
         if show.get() {
@@ -167,7 +167,7 @@ pub fn MaterializeDialog(
         let t = tags.get();
         let (ns, name) = loc.get_untracked();
         let verb = verb.get();
-        let cfg = config_result.get_untracked().ok().flatten();
+        let cfg = config_check.get_untracked().payload;
         async move {
             let tags_opt = if t.is_empty() { None } else { Some(t) };
             if pks.len() > BACKFILL_THRESHOLD {
@@ -463,7 +463,7 @@ pub fn MaterializeDialog(
                             schemas=config_schemas
                             text=config_text
                             reset=show
-                            error=config_error
+                            check=config_check
                         />
 
                         {move || materialize_action.value().get().and_then(|r| r.err()).map(|e| {
@@ -485,7 +485,7 @@ pub fn MaterializeDialog(
                                 disabled=move || {
                                     if pending.get()
                                         || selected.get().is_empty()
-                                        || config_result.get().is_err()
+                                        || !config_check.get().issues.is_empty()
                                     {
                                         return true;
                                     }

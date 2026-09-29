@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use leptos::prelude::*;
 
-use crate::components::config_editor::{ConfigEditor, launch_config_schemas, validate_config_text};
+use crate::components::config_editor::{ConfigEditor, check_config, launch_config_schemas};
 use crate::components::partition_picker::{PartitionPicker, WholeAssetChoice};
 use crate::helpers::{JobPartitionPicker, close_on_navigation};
 use crate::loc::{loc_path, use_current_location};
@@ -67,9 +67,9 @@ pub fn ExecuteJobDialog(
             verb.as_ref().map(|v| v.name.as_str()),
         )
     });
-    // Blank text is no overrides; the submit button waits for valid text.
-    let config_result = Memo::new(move |_| validate_config_text(&config_text.get(), &assets.get()));
-    let config_error = Signal::derive(move || config_result.get().err());
+    // Blank text is no overrides; the submit button waits for text without issues.
+    let config_check =
+        Memo::new(move |_| check_config(&config_text.get(), &assets.get(), &config_schemas.get()));
 
     let loc = use_current_location();
     close_on_navigation(show);
@@ -208,7 +208,7 @@ pub fn ExecuteJobDialog(
                             schemas=config_schemas
                             text=config_text
                             reset=show
-                            error=config_error
+                            check=config_check
                         />
                         {move || error.get().map(|msg| view! {
                             <div class="error-msg">{msg}</div>
@@ -231,9 +231,9 @@ pub fn ExecuteJobDialog(
                                     error.set(Some(msg.to_string()));
                                     return;
                                 }
-                                action.dispatch((keys, whole, config_result.get_untracked().ok().flatten()));
+                                action.dispatch((keys, whole, config_check.get_untracked().payload));
                             }
-                            disabled=move || pending.get() || config_result.get().is_err()
+                            disabled=move || pending.get() || !config_check.get().issues.is_empty()
                         >
                             {move || {
                                 if pending.get() {

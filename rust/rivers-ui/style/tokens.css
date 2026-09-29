@@ -39,6 +39,14 @@
     --error-bg: color-mix(in srgb, var(--error) 15%, transparent);
     --info-bg: color-mix(in srgb, var(--info) 15%, transparent);
 
+    /* JSON syntax (config editor) */
+    --syn-key: var(--secondary);
+    --syn-string: var(--success);
+    --syn-number: var(--warning);
+    --syn-keyword: var(--accent);
+    --syn-punct: var(--text-muted);
+    --syn-invalid: var(--error);
+
     /* Accent tints (--accent at varying opacity, for hover/active/border states) */
     --accent-bg: color-mix(in srgb, var(--accent) 15%, transparent);
     --accent-bg-soft: color-mix(in srgb, var(--accent) 10%, transparent);
