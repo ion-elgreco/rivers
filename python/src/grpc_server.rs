@@ -4,6 +4,7 @@
 //! returning the result through a oneshot channel. `run_on_python` consolidates this
 //! plumbing so handlers only contain their actual logic.
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use rivers_api::rivers::code_location_service_server::{
     CodeLocationService, CodeLocationServiceServer,
 };
@@ -15,7 +16,10 @@ use std::sync::Arc;
 
 use crate::automation::schedule::TickRequest;
 use crate::automation::{PyScheduleStatus, PySensorStatus};
-use crate::config::run_config::{config_schema_json, validate_run_config};
+use crate::config::run_config::{
+    ConfigIssue, LocPart, config_class, config_errors, config_schema_json, parse_run_config,
+    validate_run_config,
+};
 use crate::daemon::{BackfillDispatcherKind, RunDispatcherKind};
 use crate::executor::Executor;
 use crate::gil_threads::GilThreads;
@@ -70,6 +74,96 @@ impl CodeLocationImpl {
             .map_err(|_| Status::internal("thread panicked"))?
             .ok_or_else(|| Status::internal(PY_UNAVAILABLE))?
             .map_err(Status::internal)
+    }
+
+    /// The errors each asset's config class raises for `config`, built as a
+    /// run builds it. Assets without a config class are skipped.
+    #[allow(clippy::result_large_err)]
+    async fn config_issues(
+        &self,
+        config: &str,
+        action: Option<String>,
+    ) -> Result<Vec<ConfigIssue>, Status> {
+        let config = config.to_string();
+        self.run_on_python(move |py, repo| {
+            let repo_ref = repo.get();
+            let guard = repo_ref.state.read().unwrap();
+            let state = guard.as_ref().ok_or("repository not resolved")?;
+            let overrides = parse_run_config(py, &config).map_err(|e| e.to_string())?;
+            let mut issues = Vec::new();
+            for (asset, fields) in &overrides {
+                let Some(node) = state.node_map.get(asset) else {
+                    continue;
+                };
+                let func = match &action {
+                    Some(verb) => match node.find_action(verb).and_then(|a| a.func.as_ref()) {
+                        Some(func) => func.clone_ref(py),
+                        None => continue,
+                    },
+                    None => match node.callable(py) {
+                        Ok(func) => func,
+                        Err(_) => continue,
+                    },
+                };
+                let Some(cls) = config_class(py, &func).map_err(|e| e.to_string())? else {
+                    continue;
+                };
+                let fields = fields
+                    .bind(py)
+                    .cast::<PyDict>()
+                    .map_err(|e| e.to_string())?;
+                issues.extend(config_errors(py, asset, &cls, fields).map_err(|e| e.to_string())?);
+            }
+            issues.sort_by(|a, b| a.asset.cmp(&b.asset));
+            Ok(issues)
+        })
+        .await
+    }
+
+    /// INVALID_ARGUMENT when the config classes reject `config`'s values.
+    /// A missing field passes: a `BaseSettings` field may come from the
+    /// run's environment, which this process does not see.
+    #[allow(clippy::result_large_err)]
+    async fn reject_config_errors(
+        &self,
+        config: Option<&str>,
+        action: Option<&str>,
+    ) -> Result<(), Status> {
+        let Some(config) = config else {
+            return Ok(());
+        };
+        let issues: Vec<String> = self
+            .config_issues(config, action.map(str::to_string))
+            .await?
+            .into_iter()
+            .filter(|issue| issue.kind != "missing")
+            .map(|issue| issue.to_string())
+            .collect();
+        if issues.is_empty() {
+            return Ok(());
+        }
+        Err(Status::invalid_argument(format!(
+            "config: {}",
+            issues.join("; ")
+        )))
+    }
+}
+
+fn proto_config_error(issue: ConfigIssue) -> ConfigError {
+    ConfigError {
+        asset: issue.asset,
+        loc: issue
+            .loc
+            .into_iter()
+            .map(|part| ConfigLoc {
+                part: Some(match part {
+                    LocPart::Key(key) => config_loc::Part::Key(key),
+                    LocPart::Index(index) => config_loc::Part::Index(index),
+                }),
+            })
+            .collect(),
+        message: issue.message,
+        kind: issue.kind,
     }
 }
 
@@ -168,6 +262,7 @@ impl CodeLocationService for CodeLocationImpl {
             .await
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let config = request_config(req.config, &asset_selection)?;
+        self.reject_config_errors(config.as_deref(), None).await?;
 
         let mat_request = crate::daemon::MaterializationRequestData {
             run_id: uuid::Uuid::new_v4().to_string(),
@@ -226,6 +321,8 @@ impl CodeLocationService for CodeLocationImpl {
             .job_asset_names(&req.job_name)
             .unwrap_or_default();
         let config = request_config(req.config, &job_assets)?;
+        self.reject_config_errors(config.as_deref(), shown.as_deref())
+            .await?;
         let run_request = crate::daemon::RunRequestData {
             run_key: None,
             tags: None,
@@ -367,6 +464,25 @@ impl CodeLocationService for CodeLocationImpl {
             })
             .await?;
         Ok(Response::new(resp))
+    }
+
+    #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.validate_config")]
+    async fn validate_config(
+        &self,
+        request: Request<ValidateConfigRequest>,
+    ) -> Result<Response<ValidateConfigResponse>, Status> {
+        let req = request.into_inner();
+        let Some(config) = request_config(Some(req.config), &req.selection)? else {
+            return Ok(Response::new(ValidateConfigResponse { errors: Vec::new() }));
+        };
+        let action = req.action.filter(|a| !a.is_empty());
+        let errors = self
+            .config_issues(&config, action)
+            .await?
+            .into_iter()
+            .map(proto_config_error)
+            .collect();
+        Ok(Response::new(ValidateConfigResponse { errors }))
     }
 
     #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.get_assets_info")]
@@ -663,6 +779,8 @@ impl CodeLocationService for CodeLocationImpl {
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         }
         let config = request_config(req.config, &asset_selection)?;
+        self.reject_config_errors(config.as_deref(), Some(&req.action))
+            .await?;
 
         let action_request = crate::daemon::MaterializationRequestData {
             run_id: uuid::Uuid::new_v4().to_string(),
@@ -755,6 +873,8 @@ impl CodeLocationService for CodeLocationImpl {
             None => req.selection.clone(),
         };
         let config = request_config(req.config, &child_assets)?;
+        self.reject_config_errors(config.as_deref(), action.as_deref())
+            .await?;
         let target = match req.job_name {
             Some(name) => crate::daemon::RunType::Job(name),
             None => crate::daemon::RunType::Materialization(req.selection),
