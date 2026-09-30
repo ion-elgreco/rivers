@@ -2,11 +2,10 @@
 //! has against it, the required fields it lacks, the completions a caret
 //! takes, the template it opens with and the payload it sends. The schema is
 //! a launch document's, composed from config classes' `model_json_schema()`
-//! text placed in it with [`inline`]. Two keywords of our own:
-//! `"x-launch-template": "keys"` on a container lists its keys as empty
-//! objects in the template instead of their fields' defaults, for sections
-//! whose values must only be sent when typed; `"x-requires": {"k": v}` on a
-//! property makes it an error unless the sibling `k` is set to `v`.
+//! text placed in it with [`inline`]. The payload keeps only what differs
+//! from the schema's defaults, so an untouched template sends nothing. One
+//! keyword of our own: `"x-requires": {"k": v}` on a property makes it an
+//! error unless the sibling `k` is set to `v`.
 
 use serde_json::{Map, Value};
 
@@ -226,16 +225,6 @@ fn template_of(schema: &Schema, node: &Value) -> Option<Value> {
         return None;
     }
     let props = node.get("properties")?.as_object()?;
-    if node.get("x-launch-template").and_then(Value::as_str) == Some("keys") {
-        if props.is_empty() {
-            return None;
-        }
-        let keys = props
-            .keys()
-            .map(|key| (key.clone(), Value::Object(Map::new())))
-            .collect();
-        return Some(Value::Object(keys));
-    }
     let children: Map<String, Value> = props
         .iter()
         .filter_map(|(name, prop)| Some((name.clone(), template_of(schema, prop)?)))
@@ -244,13 +233,14 @@ fn template_of(schema: &Schema, node: &Value) -> Option<Value> {
     (has_fields || !children.is_empty()).then_some(Value::Object(children))
 }
 
-/// `value` without the empty containers the template lists; `None` when
-/// nothing is left. A field set to `{}` stays: that is a value.
+/// `value` without what the definitions already say: a field equal to its
+/// default, and the containers left empty; `None` when nothing is left. A
+/// model is compared as a whole, so a partly changed one is sent whole.
 pub fn compact(schema: &Schema, value: Value) -> Option<Value> {
-    compact_at(&schema.root, value)
+    compact_at(schema, &schema.root, value)
 }
 
-fn compact_at(node: &Value, value: Value) -> Option<Value> {
+fn compact_at(schema: &Schema, node: &Value, value: Value) -> Option<Value> {
     let map = match value {
         Value::Object(map) => map,
         other => return Some(other),
@@ -260,7 +250,8 @@ fn compact_at(node: &Value, value: Value) -> Option<Value> {
         .into_iter()
         .filter_map(|(key, child)| {
             let kept = match props.and_then(|p| p.get(&key)) {
-                Some(prop) => compact_at(prop, child)?,
+                Some(prop) if schema.default_of(prop) == Some(&child) => return None,
+                Some(prop) => compact_at(schema, prop, child)?,
                 None => child,
             };
             Some((key, kept))
@@ -1212,19 +1203,18 @@ mod tests {
                 "outer": {"config": {}}
             }})
         );
-        // A `keys` container lists its keys without their values; a secret is
-        // never pre-filled.
-        let keyed = Schema {
+        // A secret is never pre-filled, whatever its default says.
+        let secret = Schema {
             root: serde_json::json!({"type": "object", "properties": {"resources": {
-                "type": "object", "x-launch-template": "keys", "properties": {
+                "type": "object", "properties": {
                     "db": {"type": "object", "properties": {"dsn": {"type": "string", "default": "x"}}},
                     "cache": {"type": "object", "properties": {"ttl": {"type": "integer", "default": 5}}}
                 }
             }, "secret": {"type": "string", "writeOnly": true, "default": "***"}}}),
         };
         assert_eq!(
-            template(&keyed),
-            serde_json::json!({"resources": {"cache": {}, "db": {}}})
+            template(&secret),
+            serde_json::json!({"resources": {"cache": {"ttl": 5}, "db": {"dsn": "x"}}})
         );
         // Nothing known anywhere: an empty document.
         let bare = Schema {
@@ -1236,19 +1226,31 @@ mod tests {
     }
 
     #[test]
-    fn compact_drops_empty_containers_but_keeps_empty_values() {
+    fn compact_drops_defaults_and_empty_containers() {
         let doc = document();
+        // `extra` and `name` sit at their defaults; `inner` does not (its
+        // default has a host and a port), so it is sent as typed.
         let text = serde_json::json!({"assets": {
-            "cfg": {"config": {"extra": {}, "inner": {}}, "metadata": {}},
+            "cfg": {
+                "config": {"extra": {}, "inner": {}, "name": "x", "threshold": 0.9},
+                "metadata": {}
+            },
             "api": {"config": {}},
             "outer": {}
         }});
         assert_eq!(
             compact(&doc, text),
-            Some(serde_json::json!({"assets": {"cfg": {"config": {"extra": {}, "inner": {}}}}}))
+            Some(
+                serde_json::json!({"assets": {"cfg": {"config": {"inner": {}, "threshold": 0.9}}}})
+            )
         );
+        // The template itself, untouched, sends nothing.
+        assert_eq!(compact(&doc, template(&doc)), None);
         assert_eq!(
-            compact(&doc, serde_json::json!({"assets": {"api": {"config": {}}}})),
+            compact(
+                &doc,
+                serde_json::json!({"assets": {"api": {"config": {"batch": 10}}}})
+            ),
             None
         );
         assert_eq!(compact(&doc, serde_json::json!({})), None);
