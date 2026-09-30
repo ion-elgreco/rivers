@@ -635,6 +635,14 @@ pub struct AssetDefinitionInfo {
     pub metadata: HashMap<String, String>,
 }
 
+/// A resource a launch document may override: its key and the JSON schema
+/// of its class (an instance's current values as the defaults).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceInfo {
+    pub key: String,
+    pub config_schema: String,
+}
+
 /// One step of pydantic's `loc`: a field name or a list index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConfigLoc {

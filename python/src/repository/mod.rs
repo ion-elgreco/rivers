@@ -517,7 +517,7 @@ use crate::assets::io_handler::IOHandler;
 use crate::automation::schedule::{self, PyScheduleDefinition, PyScheduleTickResult};
 use crate::automation::sensor::{self, PySensorDefinition, PySensorTickResult};
 use crate::config::ResourceVariant;
-use crate::config::run_config::{check_run_config, run_config_to_json};
+use crate::config::run_config::{check_run_config, check_run_document, run_config_to_json};
 use crate::executor::Executor;
 use crate::executor::ops::{
     enumerate_params, get_annotations, is_context_annotation, now_ts, register_assets_from_nodes,
@@ -2746,6 +2746,9 @@ impl PyCodeRepository {
         let guard = self.ensure_resolved()?;
         let state = guard.as_ref().unwrap();
         let config = check_run_config(config.as_deref(), |name| state.node_map.contains_key(name))?;
+        Python::attach(|py| {
+            check_run_document(py, config.as_deref(), &state.node_map, &state.resources)
+        })?;
         let graph = state
             .inner_repo
             .graph
@@ -2913,6 +2916,9 @@ impl PyCodeRepository {
         let guard = self.ensure_resolved()?;
         let state = guard.as_ref().unwrap();
         let config = check_run_config(config.as_deref(), |name| state.node_map.contains_key(name))?;
+        Python::attach(|py| {
+            check_run_document(py, config.as_deref(), &state.node_map, &state.resources)
+        })?;
         let graph = state
             .inner_repo
             .graph
@@ -4406,10 +4412,12 @@ impl PyCodeRepository {
         let config = {
             let guard = self.ensure_resolved()?;
             let state = guard.as_ref().unwrap();
-            check_run_config(
+            let config = check_run_config(
                 run_config_to_json(py, config.as_ref())?.as_deref(),
                 |name| state.node_map.contains_key(name),
-            )?
+            )?;
+            check_run_document(py, config.as_deref(), &state.node_map, &state.resources)?;
+            config
         };
         let selection = match &job_name {
             Some(job) if selection.is_none() => self.handle().job_asset_names(job),
@@ -4566,6 +4574,9 @@ impl PyCodeRepository {
         let guard = self.ensure_resolved()?;
         let state = guard.as_ref().unwrap();
         let config = check_run_config(config.as_deref(), |name| state.node_map.contains_key(name))?;
+        Python::attach(|py| {
+            check_run_document(py, config.as_deref(), &state.node_map, &state.resources)
+        })?;
 
         // A `Job` target resolves to its own asset selection; everything below
         // (partition resolution, strategy, the record) is identical for both kinds.

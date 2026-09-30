@@ -14,7 +14,7 @@ use crate::components::partition_picker::{PartitionPicker, WholeAssetChoice};
 use crate::helpers::{JobPartitionPicker, close_on_navigation};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::mutations::{execute_job, launch_backfill};
-use crate::types::{AssetActionInfo, AssetDefinitionInfo, SubmitPartitionKey};
+use crate::types::{AssetActionInfo, AssetDefinitionInfo, ResourceInfo, SubmitPartitionKey};
 
 /// Above this many selected partitions, submit one job-aware backfill instead of
 /// a run each (mirrors `MaterializeDialog`).
@@ -43,6 +43,9 @@ pub fn ExecuteJobDialog(
     #[prop(optional, into)]
     assets: Option<Signal<Vec<String>>>,
     #[prop(optional, into)] definitions: Option<Signal<HashMap<String, AssetDefinitionInfo>>>,
+    /// The resources a launch document may override, for the config editor.
+    #[prop(optional, into)]
+    resources: Option<Signal<Vec<ResourceInfo>>>,
 ) -> impl IntoView {
     let verb: Signal<Option<AssetActionInfo>> = verb.unwrap_or_else(|| Signal::derive(|| None));
     let destructive = Memo::new(move |_| verb.get().is_some_and(|v| v.is_destructive()));
@@ -59,11 +62,14 @@ pub fn ExecuteJobDialog(
     let definitions: Signal<HashMap<String, AssetDefinitionInfo>> =
         definitions.unwrap_or_else(|| Signal::derive(HashMap::new));
     let config_text = RwSignal::new(String::new());
+    let resources: Signal<Vec<ResourceInfo>> =
+        resources.unwrap_or_else(|| Signal::derive(Vec::new));
     let config_schema = Signal::derive(move || {
         let verb = verb.get();
         launch_schema(
             &assets.get(),
             &definitions.get(),
+            &resources.get(),
             verb.as_ref().map(|v| v.name.as_str()),
         )
     });

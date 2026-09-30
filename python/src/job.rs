@@ -17,7 +17,7 @@ use rivers_core::execution::retry::{RetryPolicy, RetryRef};
 
 use crate::assets::io_handler_registry::IOHandlerRegistry;
 use crate::config::ResourceVariant;
-use crate::config::run_config::{check_run_config, run_config_to_json};
+use crate::config::run_config::{check_run_config, check_run_document, run_config_to_json};
 use crate::errors::{ConfigurationError, ExecutionError, GraphValidationError, NodeNotFoundError};
 use crate::executor::run_lifecycle::{RunInit, RunPlanArgs, run_plan};
 
@@ -601,9 +601,11 @@ impl PyJob {
     /// against this job's nodes.
     fn checked_config(&self, py: Python, config: Option<&Py<PyAny>>) -> PyResult<Option<String>> {
         let (_, node_map, _) = self.validated_parts()?;
-        check_run_config(run_config_to_json(py, config)?.as_deref(), |name| {
+        let config = check_run_config(run_config_to_json(py, config)?.as_deref(), |name| {
             node_map.contains_key(name)
-        })
+        })?;
+        check_run_document(py, config.as_deref(), node_map, &self.resources)?;
+        Ok(config)
     }
 
     /// Single entry point used by `execute`, `execute_run`, and

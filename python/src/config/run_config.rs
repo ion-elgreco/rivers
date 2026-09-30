@@ -3,7 +3,8 @@
 //!
 //! ```json
 //! {"assets": {"raw_users": {"config": {"batch_size": 100},
-//!                           "metadata": {"delta/mode": "overwrite"}}}}
+//!                           "metadata": {"delta/mode": "overwrite"}}},
+//!  "resources": {"db": {"pool_size": 10}}}
 //! ```
 //!
 //! Every section is optional; an absent one means "as defined".
@@ -15,6 +16,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use serde_json::{Map, Value};
 
+use crate::config::ResourceVariant;
 use crate::errors::{ConfigurationError, ExecutionError};
 use crate::executor::ops::{
     enumerate_params, is_action_context_annotation, is_context_annotation, resolve_annotation,
@@ -22,7 +24,7 @@ use crate::executor::ops::{
 use crate::repository::resolved_node::ResolvedNode;
 
 /// The sections a document may have.
-const SECTIONS: &[&str] = &["assets"];
+const SECTIONS: &[&str] = &["assets", "resources"];
 
 /// Check the document a launch carries and return it canonical: compact,
 /// with empty parts dropped, or `None` when it sets nothing. `known` says
@@ -94,6 +96,23 @@ pub(crate) fn validate_run_config(
             out.insert("assets".to_string(), Value::Object(kept));
         }
     }
+    if let Some(resources) = root.remove("resources") {
+        let Value::Object(resources) = resources else {
+            bail!("config.resources must be a JSON object keyed by resource key");
+        };
+        let mut kept = Map::new();
+        for (key, fields) in resources {
+            let Value::Object(fields) = fields else {
+                bail!("config.resources.{key} must be a JSON object of field values");
+            };
+            if !fields.is_empty() {
+                kept.insert(key, Value::Object(fields));
+            }
+        }
+        if !kept.is_empty() {
+            out.insert("resources".to_string(), Value::Object(kept));
+        }
+    }
     if out.is_empty() {
         return Ok(None);
     }
@@ -125,6 +144,8 @@ pub(crate) struct AssetOverrides {
 /// A stored document, parsed for a run.
 pub(crate) struct RunDocument {
     pub assets: HashMap<String, AssetOverrides>,
+    /// Field values per resource key, each a dict.
+    pub resources: HashMap<String, Py<PyAny>>,
 }
 
 impl RunDocument {
@@ -138,20 +159,38 @@ impl RunDocument {
         (!map.is_empty()).then_some(map)
     }
 
+    /// The metadata overrides that apply to a node in `node_map`. Only an
+    /// asset carries metadata: an override for a task is an error.
+    fn metadata_overrides<'a>(
+        &'a self,
+        node_map: &HashMap<String, ResolvedNode>,
+    ) -> PyResult<Vec<(&'a String, &'a HashMap<String, String>)>> {
+        let mut overrides = Vec::new();
+        for (name, o) in &self.assets {
+            if o.metadata.is_empty() {
+                continue;
+            }
+            match node_map.get(name) {
+                Some(ResolvedNode::Asset(_)) => overrides.push((name, &o.metadata)),
+                Some(_) => {
+                    return Err(ConfigurationError::new_err(format!(
+                        "config: metadata overrides apply to assets; '{name}' is a task"
+                    )));
+                }
+                None => {}
+            }
+        }
+        Ok(overrides)
+    }
+
     /// `node_map` with the metadata overrides merged into the assets they
     /// name, or `None` when the document has none for a node in the map.
-    /// Only an asset carries metadata; an override for a task is an error.
     pub(crate) fn overlay_node_map(
         &self,
         py: Python<'_>,
         node_map: &HashMap<String, ResolvedNode>,
     ) -> PyResult<Option<HashMap<String, ResolvedNode>>> {
-        let overrides: Vec<(&String, &HashMap<String, String>)> = self
-            .assets
-            .iter()
-            .filter(|(name, o)| !o.metadata.is_empty() && node_map.contains_key(*name))
-            .map(|(name, o)| (name, &o.metadata))
-            .collect();
+        let overrides = self.metadata_overrides(node_map)?;
         if overrides.is_empty() {
             return Ok(None);
         }
@@ -160,20 +199,39 @@ impl RunDocument {
             .map(|(k, v)| (k.clone(), v.clone_ref(py)))
             .collect();
         for (name, metadata) in overrides {
-            match overlay.get_mut(name) {
-                Some(ResolvedNode::Asset(node)) => node
-                    .metadata
+            if let Some(ResolvedNode::Asset(node)) = overlay.get_mut(name) {
+                node.metadata
                     .get_or_insert_with(HashMap::new)
-                    .extend(metadata.iter().map(|(k, v)| (k.clone(), v.clone()))),
-                _ => {
-                    return Err(ConfigurationError::new_err(format!(
-                        "config: metadata overrides apply to assets; '{name}' is a task"
-                    )));
-                }
+                    .extend(metadata.iter().map(|(k, v)| (k.clone(), v.clone())));
             }
         }
         Ok(Some(overlay))
     }
+}
+
+/// What a run refuses before its first step, checked at the API boundary
+/// so that no run record is written for it: metadata on a task, a resource
+/// key the repository does not have, and resource values its class rejects.
+pub(crate) fn check_run_document(
+    py: Python<'_>,
+    config: Option<&str>,
+    node_map: &HashMap<String, ResolvedNode>,
+    resources: &HashMap<String, ResourceVariant>,
+) -> PyResult<()> {
+    let Some(json) = config else {
+        return Ok(());
+    };
+    let document = parse_run_config(py, json)?;
+    document.metadata_overrides(node_map)?;
+    for (key, overrides) in &document.resources {
+        let Some(variant) = resources.get(key) else {
+            return Err(ConfigurationError::new_err(format!(
+                "config: no resource '{key}'"
+            )));
+        };
+        variant.for_run(py, key, overrides.bind(py).cast::<PyDict>()?)?;
+    }
+    Ok(())
 }
 
 fn object<'py>(value: Bound<'py, PyAny>, what: &str) -> PyResult<Bound<'py, PyDict>> {
@@ -208,7 +266,80 @@ pub(crate) fn parse_run_config(py: Python<'_>, json: &str) -> PyResult<RunDocume
             assets.insert(name, AssetOverrides { config, metadata });
         }
     }
-    Ok(RunDocument { assets })
+    let mut resources = HashMap::new();
+    if let Some(section) = root.get_item("resources")? {
+        for (key, fields) in object(section, "'resources'")?.iter() {
+            let key: String = key.extract()?;
+            let fields = object(fields, &format!("the resource '{key}'"))?;
+            resources.insert(key, fields.into_any().unbind());
+        }
+    }
+    Ok(RunDocument { assets, resources })
+}
+
+/// The resources a run uses when its document overrides some: the
+/// repository's map with those keys replaced by instances built for this
+/// run, set up before the first step and torn down after the last.
+pub(crate) struct RunResources {
+    pub map: HashMap<String, ResourceVariant>,
+    /// The `Resource` instances built here, in setup order.
+    own: Vec<(String, Py<PyAny>)>,
+}
+
+impl RunResources {
+    /// `None` when the document overrides no resource.
+    pub(crate) fn build(
+        py: Python<'_>,
+        document: &RunDocument,
+        base: &HashMap<String, ResourceVariant>,
+    ) -> PyResult<Option<Self>> {
+        if document.resources.is_empty() {
+            return Ok(None);
+        }
+        let mut map: HashMap<String, ResourceVariant> = base
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone_ref(py)))
+            .collect();
+        let mut built = Vec::new();
+        for (key, overrides) in &document.resources {
+            let Some(variant) = base.get(key) else {
+                return Err(ConfigurationError::new_err(format!(
+                    "config: no resource '{key}'"
+                )));
+            };
+            let fresh = variant.for_run(py, key, overrides.bind(py).cast::<PyDict>()?)?;
+            if let ResourceVariant::Resource(inst) = &fresh {
+                built.push((key.clone(), inst.clone_ref(py)));
+            }
+            map.insert(key.clone(), fresh);
+        }
+        let mut run = Self {
+            map,
+            own: Vec::new(),
+        };
+        for (key, inst) in built {
+            if let Err(e) = inst.call_method0(py, "setup") {
+                run.teardown(py);
+                return Err(e);
+            }
+            run.own.push((key, inst));
+        }
+        Ok(Some(run))
+    }
+
+    /// `teardown()` on every instance built here; a failure is logged.
+    pub(crate) fn teardown(&self, py: Python<'_>) {
+        for (key, inst) in &self.own {
+            if let Err(e) = inst.call_method0(py, "teardown") {
+                tracing::warn!(
+                    target: "rivers::resources",
+                    resource = %key,
+                    error = %e,
+                    "per-run resource teardown failed"
+                );
+            }
+        }
+    }
 }
 
 /// The document a Python caller passed as the text the launchers carry.
@@ -282,6 +413,61 @@ pub(crate) fn config_schema_json(py: Python<'_>, func: &Py<PyAny>) -> PyResult<O
         return Ok(None);
     };
     let schema = cls.call_method0("model_json_schema")?;
+    let text: String = py
+        .import("json")?
+        .call_method1("dumps", (schema,))?
+        .extract()?;
+    Ok(Some(text))
+}
+
+/// The JSON schema a launch edits a resource by: its class's, with each
+/// field's `default` set to an instance's current value (a secret's is not
+/// shown) and nothing `required`, since the instance has every field. `None`
+/// for an IO handler, which cannot be overridden.
+pub(crate) fn resource_schema_json(
+    py: Python<'_>,
+    variant: &ResourceVariant,
+) -> PyResult<Option<String>> {
+    let (cls, instance) = match variant {
+        ResourceVariant::IOHandler(_) => return Ok(None),
+        ResourceVariant::PydanticModel(cls) => (cls.bind(py).clone(), None),
+        ResourceVariant::PydanticModelInstance(inst) | ResourceVariant::Resource(inst) => {
+            let inst = inst.bind(py);
+            (inst.get_type().into_any(), Some(inst))
+        }
+    };
+    let schema = cls
+        .call_method0("model_json_schema")?
+        .cast_into::<PyDict>()?;
+    if let Some(inst) = instance {
+        if schema.contains("required")? {
+            schema.del_item("required")?;
+        }
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("mode", "json")?;
+        let current = inst
+            .call_method("model_dump", (), Some(&kwargs))?
+            .cast_into::<PyDict>()?;
+        if let Some(props) = schema.get_item("properties")? {
+            let props = props.cast_into::<PyDict>()?;
+            for (name, value) in current.iter() {
+                let Some(prop) = props.get_item(&name)? else {
+                    continue;
+                };
+                let prop = prop.cast_into::<PyDict>()?;
+                let secret = prop
+                    .get_item("writeOnly")?
+                    .is_some_and(|w| w.is_truthy().unwrap_or(true));
+                if secret {
+                    if prop.contains("default")? {
+                        prop.del_item("default")?;
+                    }
+                    continue;
+                }
+                prop.set_item("default", value)?;
+            }
+        }
+    }
     let text: String = py
         .import("json")?
         .call_method1("dumps", (schema,))?
@@ -391,6 +577,11 @@ mod tests {
                 r#"{"assets":{"a":{"config":{"x":1}},"b":{"metadata":{"k":"v"}}}}"#.to_string()
             ))
         );
+        assert_eq!(check(r#"{"resources": {"db": {}}}"#), Ok(None));
+        assert_eq!(
+            check(r#"{"resources": {"db": {"pool_size": 5}}, "assets": {}}"#),
+            Ok(Some(r#"{"resources":{"db":{"pool_size":5}}}"#.to_string()))
+        );
     }
 
     #[test]
@@ -400,7 +591,7 @@ mod tests {
             ("[1]", "config must be a JSON object"),
             (
                 r#"{"other": {}}"#,
-                "unknown section 'other'; expected assets",
+                "unknown section 'other'; expected assets, resources",
             ),
             (r#"{"assets": 1}"#, "config.assets must be a JSON object"),
             (
@@ -426,6 +617,14 @@ mod tests {
             (
                 r#"{"assets": {"a": {"metadata": {"k": 1}}}}"#,
                 "config.assets.a.metadata.k must be a string",
+            ),
+            (
+                r#"{"resources": []}"#,
+                "config.resources must be a JSON object",
+            ),
+            (
+                r#"{"resources": {"db": 1}}"#,
+                "config.resources.db must be a JSON object of field values",
             ),
         ];
         for (json, expected) in cases {

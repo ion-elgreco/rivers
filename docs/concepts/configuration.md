@@ -40,7 +40,7 @@ def api_data(context: rs.AssetExecutionContext[PipelineConfig]):
 
 ## The launch document
 
-A run can depart from the definitions in one document, passed as `config=` to `materialize()`, `run_action()`, `backfill()` and `Job.execute()`, and edited in the UI's launch dialogs. Per asset it holds `config`, values for the asset's config class, and `metadata`, keys added to or replacing the asset's [metadata](assets.md#asset-metadata) for this run:
+A run can depart from the definitions in one document, passed as `config=` to `materialize()`, `run_action()`, `backfill()` and `Job.execute()`, and edited in the UI's launch dialogs. Per asset it holds `config`, values for the asset's config class, and `metadata`, keys added to or replacing the asset's [metadata](assets.md#asset-metadata) for this run; per [resource](resources.md#per-run-overrides), field values the resource is rebuilt with:
 
 ```python
 repo.materialize(
@@ -51,18 +51,19 @@ repo.materialize(
                 "config": {"min_value": 10, "max_value": 50},
                 "metadata": {"delta/mode": "overwrite", "rivers/executor": "in_process"},
             }
-        }
+        },
+        "resources": {"db": {"pool_size": 2}},
     },
 )
 ```
 
-Every part is optional; what is absent stays as defined. `config` values are merged with the class's defaults when the class is instantiated (for `BaseSettings`, env vars are resolved first, then these take precedence). `metadata` values are strings, like the asset's own; the merged metadata is what `context.asset_metadata`, the IO handlers and the engine's `rivers/` keys see for that run, so `rivers/executor` picks the executor for that asset's step. Only assets carry metadata: naming a task under `metadata` is an error.
+Every part is optional; what is absent stays as defined. `config` values are merged with the class's defaults when the class is instantiated (for `BaseSettings`, env vars are resolved first, then these take precedence). `metadata` values are strings, like the asset's own; the merged metadata is what `context.asset_metadata`, the IO handlers and the engine's `rivers/` keys see for that run, so `rivers/executor` picks the executor for that asset's step. Only assets carry metadata: naming a task under `metadata` is an error. A resource named under `resources` is rebuilt for the run with those values, set up before the first step and torn down after the last; the repository's instance is untouched.
 
 The document must be JSON-serializable (pydantic's encoder is used, so dates, paths and enums are fine). The run record keeps it (`RunRecord.config`), so a rerun replays it and the run page shows it, and every launch path applies it: the run queue, Kubernetes run and step pods, backfill child runs and reruns. A document that names an unknown asset, an unknown section, or a value its config class rejects is refused before a run exists.
 
 ## The document in the UI
 
-The Materialize and Execute job dialogs show a **Config** editor when a selected asset has a config class or metadata (or the chosen action takes config). It holds the launch document and opens pre-filled with each config field's default and each asset's current metadata:
+The Materialize and Execute job dialogs show a **Config** editor when a selected asset has a config class or metadata (or the chosen action takes config). It holds the launch document and opens pre-filled with each config field's default and each asset's current metadata, and lists the repository's resources by key:
 
 ```json
 {
@@ -75,9 +76,14 @@ The Materialize and Execute job dialogs show a **Config** editor when a selected
         "delta/mode": "append"
       }
     }
+  },
+  "resources": {
+    "db": {}
   }
 }
 ```
+
+A resource's fields are not pre-filled: a value typed under its key rebuilds it for the run, an empty `{}` sends nothing. Completion inside a resource offers its fields with their current values (a secret's is not shown).
 
 The editor checks the text against the document's JSON schema as you type. A syntax error, an unknown section, asset or field, a value of the wrong type or outside its bounds, a metadata value that is not a string, or a value that is not one of a `Literal`'s choices is underlined and listed under the editor with its line and column; clicking the line moves the caret there. Any of these disables the submit button: pydantic would otherwise ignore an unknown field silently, and a wrong value would fail the step when the run starts. Once the schema is satisfied, the code location checks the document as a run would, building each config class, so validators and `pattern` or `format` constraints show in the editor a moment after typing. A launch the code location refuses never becomes a run.
 

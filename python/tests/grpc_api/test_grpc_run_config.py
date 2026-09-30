@@ -14,7 +14,7 @@ import grpc
 import pytest
 import rivers as rs
 from _polling import wait_for_run_terminal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 from rivers._core import AutomationDaemon
 
 _STORE: dict = {}
@@ -56,6 +56,12 @@ class StrictConfig(BaseModel):
         if value == "nope":
             raise ValueError("'nope' is reserved")
         return value
+
+
+class DbResource(rs.Resource):
+    dsn: str = "memory://"
+    pool_size: int = Field(2, ge=1)
+    token: SecretStr = SecretStr("s3cret")
 
 
 def _build_repo(tmp_path, run_queue=None):
@@ -119,12 +125,17 @@ def _build_repo(tmp_path, run_queue=None):
     def tidy(context: rs.TaskExecutionContext) -> int:
         return 1
 
+    @rs.Asset(io_handler=handler)
+    def uses_db(db: DbResource):
+        return f"{db.dsn}/{db.pool_size}/{db.token.get_secret_value()}"
+
     job = rs.Job(name="cfg_job", assets=[configured])
     tidy_job = rs.Job(name="tidy_job", assets=[tidy])
     return rs.CodeRepository(
-        assets=[plain, configured, part_cfg, strict, tagged, pid, pid2],
+        assets=[plain, configured, part_cfg, strict, tagged, pid, pid2, uses_db],
         tasks=[tidy],
         jobs=[job, tidy_job],
+        resources={"db": DbResource(), "store": handler},
         default_executor=rs.Executor.in_process(),
         run_queue=run_queue,
     )
@@ -213,6 +224,25 @@ def test_get_assets_info_exposes_config_schemas(direct):
         "title": "Target Size Mb",
         "type": "integer",
     }
+
+
+def test_get_assets_info_exposes_resource_schemas(direct):
+    """Each overridable resource with its class schema: an instance's current
+    values as the defaults, no field required, a secret's value left out.
+    An IO handler is not listed."""
+    stub, pb2, _ = direct
+    resources = {
+        r.key: json.loads(r.config_schema)
+        for r in stub.GetAssetsInfo(pb2.GetAssetsInfoRequest()).resources
+    }
+    assert list(resources) == ["db"]
+    schema = resources["db"]
+    assert schema["title"] == "DbResource"
+    assert "required" not in schema
+    assert schema["properties"]["dsn"]["default"] == "memory://"
+    assert schema["properties"]["pool_size"]["default"] == 2
+    assert schema["properties"]["token"]["writeOnly"] is True
+    assert "default" not in schema["properties"]["token"]
 
 
 # ── Materialize ──
@@ -432,6 +462,63 @@ def test_metadata_on_a_task_is_refused(direct):
         "assets.tidy.metadata: metadata overrides apply to assets"
         in exc.value.details()
     )
+    assert repo.storage.get_runs(limit=10) == []
+
+
+# ── Resources ──
+
+
+def test_materialize_rebuilds_a_resource_for_the_run(direct):
+    stub, pb2, repo = direct
+    document = {"resources": {"db": {"dsn": "postgres://replica", "pool_size": 8}}}
+    resp = stub.Materialize(
+        pb2.MaterializeRequest(selection=["uses_db"], config=json.dumps(document))
+    )
+    run = wait_for_run_terminal(repo.storage, resp.run_id)
+    assert run.status == "Success"
+    # The secret kept its value through the rebuild.
+    assert _STORE["uses_db"] == "postgres://replica/8/s3cret"
+    assert run.config == document
+
+    resp = stub.Materialize(pb2.MaterializeRequest(selection=["uses_db"]))
+    assert wait_for_run_terminal(repo.storage, resp.run_id).status == "Success"
+    assert _STORE["uses_db"] == "memory:///2/s3cret"
+
+
+def test_validate_config_checks_resources(direct):
+    stub, pb2, repo = direct
+    assert _validate(stub, pb2, {"resources": {"db": {"pool_size": 3}}}, []) == []
+    errors = _validate(
+        stub,
+        pb2,
+        {"resources": {"db": {"pool_size": 0}, "nope": {"x": 1}, "store": {"x": 1}}},
+        [],
+    )
+    assert errors == [
+        (
+            ("resources", "db"),
+            ("pool_size",),
+            "greater_than_equal",
+            "Input should be greater than or equal to 1",
+        ),
+        (("resources", "nope"), (), "unknown", "no resource 'nope'"),
+        (
+            ("resources", "store"),
+            (),
+            "invalid",
+            "an IO handler cannot be overridden per run",
+        ),
+    ]
+
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.Materialize(
+            pb2.MaterializeRequest(
+                selection=["uses_db"],
+                config=json.dumps({"resources": {"db": {"pool_size": 0}}}),
+            )
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "config: resources.db.pool_size" in exc.value.details()
     assert repo.storage.get_runs(limit=10) == []
 
 

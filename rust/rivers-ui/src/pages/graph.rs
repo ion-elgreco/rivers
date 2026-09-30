@@ -15,7 +15,7 @@ use crate::helpers::{
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::{get_asset, get_assets};
 use crate::server_fns::graph::{get_graph_layout, get_graph_topology, get_node_lineage};
-use crate::server_fns::overview::get_assets_info;
+use crate::server_fns::overview::{get_assets_info, get_resources_info};
 
 fn get_element_size(target: &Option<leptos::web_sys::EventTarget>) -> (f64, f64) {
     #[cfg(target_arch = "wasm32")]
@@ -286,6 +286,17 @@ pub fn GraphPage() -> impl IntoView {
     // Materialize always routes through the dialog so the user previews the
     // asset list (and partition keys) before anything launches.
     let assets_info_value = crate::helpers::resource_value(assets_info);
+    let resources_info = Resource::new(
+        move || loc.get(),
+        |(ns, name)| async move { get_resources_info(ns, name).await },
+    );
+    let resources_info_value = crate::helpers::resource_value(resources_info);
+    let launch_resources = Signal::derive(move || {
+        resources_info_value
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+    });
     let asset_info_by_key = Memo::new(move |_| {
         assets_info_value
             .get()
@@ -980,6 +991,7 @@ pub fn GraphPage() -> impl IntoView {
             records=records_by_key
             records_failed=records_failed
             definitions=asset_info_by_key
+            resources=launch_resources
         />
     }
 }

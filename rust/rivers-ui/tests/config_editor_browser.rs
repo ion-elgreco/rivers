@@ -65,7 +65,7 @@ fn document_schema(classes: &[(&str, &str)]) -> String {
         .iter()
         .map(|(k, v)| (k.to_string(), definition(k, v)))
         .collect();
-    launch_schema(&keys, &definitions, None).expect("a launch with config")
+    launch_schema(&keys, &definitions, &[], None).expect("a launch with config")
 }
 
 fn mount(classes: &[(&str, &str)]) -> Editor {

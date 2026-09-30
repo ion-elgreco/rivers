@@ -23,7 +23,7 @@ use crate::helpers::{
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::automation::get_jobs;
 use crate::server_fns::mutations::execute_job;
-use crate::server_fns::overview::get_assets_info;
+use crate::server_fns::overview::{get_assets_info, get_resources_info};
 use crate::server_fns::runs::get_last_run_per_job;
 use crate::types::{AssetActionInfo, AssetDefinitionInfo, RunRecord};
 
@@ -80,6 +80,17 @@ pub fn JobsListPage() -> impl IntoView {
     // The dialog's config editor reads the job's assets and their schemas.
     let jobs_value = crate::helpers::resource_value(jobs);
     let assets_info_value = crate::helpers::resource_value(assets_info);
+    let resources_info = Resource::new(
+        move || loc.get(),
+        |(ns, name)| async move { get_resources_info(ns, name).await },
+    );
+    let resources_info_value = crate::helpers::resource_value(resources_info);
+    let launch_resources = Signal::derive(move || {
+        resources_info_value
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+    });
     let dialog_assets = Signal::derive(move || {
         let job = dialog_job.get();
         jobs_value
@@ -126,6 +137,7 @@ pub fn JobsListPage() -> impl IntoView {
             verb=dialog_verb_signal
             assets=dialog_assets
             definitions=asset_info_by_key
+            resources=launch_resources
         />
 
         {move || exec_error.get().map(|msg| view! { <div class="error-msg" style="margin-bottom: 1rem">{msg}</div> })}
