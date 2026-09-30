@@ -851,17 +851,9 @@ pub fn span_at(root: &Node, path: &[PathSeg]) -> Option<(Option<Span>, Span)> {
     Some((key_span, node.span()))
 }
 
-fn floor_boundary(text: &str, offset: usize) -> usize {
-    let mut offset = offset.min(text.len());
-    while !text.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    offset
-}
-
 /// 1-based line and column (in characters) of a byte offset.
 pub fn line_col(text: &str, offset: usize) -> (usize, usize) {
-    let before = &text[..floor_boundary(text, offset)];
+    let before = &text[..text.floor_char_boundary(offset)];
     let line_start = before.rfind('\n').map_or(0, |i| i + 1);
     (
         before.matches('\n').count() + 1,
@@ -871,7 +863,7 @@ pub fn line_col(text: &str, offset: usize) -> (usize, usize) {
 
 /// The leading whitespace of the line holding `offset`, up to `offset`.
 pub fn line_indent(text: &str, offset: usize) -> &str {
-    let offset = floor_boundary(text, offset);
+    let offset = text.floor_char_boundary(offset);
     let line_start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
     let line = &text[line_start..offset];
     let width = line
@@ -883,7 +875,7 @@ pub fn line_indent(text: &str, offset: usize) -> &str {
 
 /// The textarea's offset (UTF-16 code units) of a byte offset.
 pub fn byte_to_utf16(text: &str, byte: usize) -> u32 {
-    text[..floor_boundary(text, byte)].encode_utf16().count() as u32
+    text[..text.floor_char_boundary(byte)].encode_utf16().count() as u32
 }
 
 /// The byte offset of a textarea offset (UTF-16 code units).

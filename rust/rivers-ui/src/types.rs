@@ -204,8 +204,8 @@ pub struct RunRecord {
     /// The verb this run executes. `None` means materialize.
     #[serde(default)]
     pub action: Option<String>,
-    /// Per-asset config overrides the run was launched with, as a JSON object
-    /// keyed by asset name. `None` means the definitions' defaults.
+    /// The launch document the run was launched with, as JSON text. `None`
+    /// means the definitions as they are.
     #[serde(default)]
     pub config: Option<String>,
 }

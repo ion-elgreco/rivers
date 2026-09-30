@@ -17,7 +17,7 @@ use crate::loc::{loc_path, use_current_location};
 use crate::now::RelTimeOpt;
 use crate::server_fns::assets::get_assets;
 use crate::server_fns::graph::get_graph_topology;
-use crate::server_fns::overview::{get_assets_info, get_resources_info};
+use crate::server_fns::overview::get_assets_info;
 use crate::types::AssetRecord;
 
 #[component]
@@ -269,26 +269,9 @@ pub fn AssetsListPage() -> impl IntoView {
 
     // The selection controls live outside the table's <Transition>.
     let assets_info_value = crate::helpers::resource_value(assets_info);
-    let resources_info = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_resources_info(ns, name).await },
-    );
-    let resources_info_value = crate::helpers::resource_value(resources_info);
-    let launch_resources = Signal::derive(move || {
-        resources_info_value
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-    });
-    let asset_info_by_key = Memo::new(move |_| {
-        assets_info_value
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|i| (i.asset_key.clone(), i))
-            .collect::<std::collections::HashMap<String, crate::types::AssetDefinitionInfo>>()
-    });
+    let asset_info_by_key = crate::helpers::definitions_by_key(assets_info_value);
+    let launch_resources =
+        crate::components::config_editor::use_launch_resources(loc, show_dialog.into());
     let materialize_picker = Signal::derive(move || {
         let infos = assets_info_value
             .get()

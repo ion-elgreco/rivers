@@ -19,6 +19,7 @@ use crate::components::code_editor::CodeEditor;
 use crate::config_schema::{self, Candidate, Schema};
 use crate::json_text::{self, Issue, PathSeg, Slot, Span};
 use crate::server_fns::mutations::validate_config;
+use crate::server_fns::overview::get_resources_info;
 use crate::types::{AssetDefinitionInfo, ConfigError, ConfigLoc, ResourceInfo};
 
 /// The config class schema a launch of `def` uses: its own for materialize,
@@ -338,7 +339,7 @@ pub fn use_config_check(
         );
         timer.set_value(handle.ok());
     });
-    Signal::derive(move || {
+    let merged = Memo::new(move |_| {
         let mut check = client.get();
         let (answered, issues, missing) = server.get();
         if answered != text.get() {
@@ -354,7 +355,58 @@ pub fn use_config_check(
             check.payload = None;
         }
         check
+    });
+    merged.into()
+}
+
+/// A launch dialog's document: the text, its schema for `keys` (and the
+/// verb's classes), and the check that gates the submit.
+pub struct LaunchConfig {
+    pub text: RwSignal<String>,
+    pub schema: Signal<Option<String>>,
+    pub check: Signal<Check>,
+}
+
+pub fn use_launch_config(
+    keys: Signal<Vec<String>>,
+    definitions: Signal<HashMap<String, AssetDefinitionInfo>>,
+    resources: Signal<Vec<ResourceInfo>>,
+    verb: Signal<Option<String>>,
+    location: Signal<(String, String)>,
+) -> LaunchConfig {
+    let text = RwSignal::new(String::new());
+    let schema: Signal<Option<String>> = Memo::new(move |_| {
+        let verb = verb.get();
+        definitions.with(|defs| {
+            resources.with(|res| Some(launch_schema(&keys.get(), defs, res, verb.as_deref())))
+        })
     })
+    .into();
+    let check = use_config_check(text, keys, schema, location, verb);
+    LaunchConfig {
+        text,
+        schema,
+        check,
+    }
+}
+
+/// The resources a launch document may override, fetched while `open`:
+/// a page whose dialog stays closed makes no call for them.
+pub fn use_launch_resources(
+    location: Signal<(String, String)>,
+    open: Signal<bool>,
+) -> Signal<Vec<ResourceInfo>> {
+    let fetched = Resource::new(
+        move || open.get().then(|| location.get()),
+        |target| async move {
+            match target {
+                Some((ns, name)) => get_resources_info(ns, name).await.unwrap_or_default(),
+                None => Vec::new(),
+            }
+        },
+    );
+    let value = crate::helpers::resource_value(fetched);
+    Signal::derive(move || value.get().unwrap_or_default())
 }
 
 /// The completions at `caret`: the keys the object there lacks, or the

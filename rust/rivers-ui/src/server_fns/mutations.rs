@@ -117,8 +117,8 @@ pub struct MaterializeResult {
 
 /// Trigger a materialization run for `selection` (assets) at the given code
 /// location. `partition_key` is required iff every asset in the selection is
-/// partitioned. `config` is the per-asset override JSON (keyed by asset name)
-/// the backend validates and stores on the run. Fire-and-forget: returns the
+/// partitioned. `config` is the launch document as JSON, which the backend
+/// validates and stores on the run. Fire-and-forget: returns the
 /// `run_id` immediately; the caller polls the run-detail page for completion.
 #[server]
 pub async fn trigger_materialize(

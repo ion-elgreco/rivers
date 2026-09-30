@@ -517,7 +517,7 @@ use crate::assets::io_handler::IOHandler;
 use crate::automation::schedule::{self, PyScheduleDefinition, PyScheduleTickResult};
 use crate::automation::sensor::{self, PySensorDefinition, PySensorTickResult};
 use crate::config::ResourceVariant;
-use crate::config::run_config::{check_run_config, check_run_document, run_config_to_json};
+use crate::config::run_config::{checked_run_config, run_config_to_json};
 use crate::executor::Executor;
 use crate::executor::ops::{
     enumerate_params, get_annotations, is_context_annotation, now_ts, register_assets_from_nodes,
@@ -2745,9 +2745,8 @@ impl PyCodeRepository {
     ) -> PyResult<PyRunResult> {
         let guard = self.ensure_resolved()?;
         let state = guard.as_ref().unwrap();
-        let config = check_run_config(config.as_deref(), |name| state.node_map.contains_key(name))?;
-        Python::attach(|py| {
-            check_run_document(py, config.as_deref(), &state.node_map, &state.resources)
+        let config = Python::attach(|py| {
+            checked_run_config(py, config.as_deref(), &state.node_map, &state.resources)
         })?;
         let graph = state
             .inner_repo
@@ -2915,9 +2914,8 @@ impl PyCodeRepository {
     ) -> PyResult<PyRunResult> {
         let guard = self.ensure_resolved()?;
         let state = guard.as_ref().unwrap();
-        let config = check_run_config(config.as_deref(), |name| state.node_map.contains_key(name))?;
-        Python::attach(|py| {
-            check_run_document(py, config.as_deref(), &state.node_map, &state.resources)
+        let config = Python::attach(|py| {
+            checked_run_config(py, config.as_deref(), &state.node_map, &state.resources)
         })?;
         let graph = state
             .inner_repo
@@ -4180,15 +4178,8 @@ impl PyCodeRepository {
     /// Dispatches one materialize() call per partition key, tracking progress
     /// in storage. Called by `backfill(block=true)` or by the daemon loop
     /// for Requested backfills.
-    #[pyo3(signature = (backfill_id, config=None))]
-    pub(crate) fn execute_backfill(
-        &self,
-        py: Python<'_>,
-        backfill_id: &str,
-        config: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
-        let config = run_config_to_json(py, config.as_ref())?;
-        py.detach(|| self.execute_backfill_inner(backfill_id, config))
+    pub(crate) fn execute_backfill(&self, py: Python<'_>, backfill_id: &str) -> PyResult<()> {
+        py.detach(|| self.execute_backfill_inner(backfill_id))
     }
 
     /// The coordinator dequeues and executes each partition run respecting
@@ -4412,12 +4403,12 @@ impl PyCodeRepository {
         let config = {
             let guard = self.ensure_resolved()?;
             let state = guard.as_ref().unwrap();
-            let config = check_run_config(
+            checked_run_config(
+                py,
                 run_config_to_json(py, config.as_ref())?.as_deref(),
-                |name| state.node_map.contains_key(name),
-            )?;
-            check_run_document(py, config.as_deref(), &state.node_map, &state.resources)?;
-            config
+                &state.node_map,
+                &state.resources,
+            )?
         };
         let selection = match &job_name {
             Some(job) if selection.is_none() => self.handle().job_asset_names(job),
@@ -4573,9 +4564,8 @@ impl PyCodeRepository {
     ) -> PyResult<PyBackfillResult> {
         let guard = self.ensure_resolved()?;
         let state = guard.as_ref().unwrap();
-        let config = check_run_config(config.as_deref(), |name| state.node_map.contains_key(name))?;
-        Python::attach(|py| {
-            check_run_document(py, config.as_deref(), &state.node_map, &state.resources)
+        let config = Python::attach(|py| {
+            checked_run_config(py, config.as_deref(), &state.node_map, &state.resources)
         })?;
 
         // A `Job` target resolves to its own asset selection; everything below
@@ -4798,7 +4788,7 @@ impl PyCodeRepository {
         drop(guard); // release lock before executing
 
         if block {
-            self.execute_backfill_inner(&backfill_id, config)?;
+            self.execute_backfill_inner(&backfill_id)?;
 
             let guard = self.ensure_resolved()?;
             let state = guard.as_ref().unwrap();
@@ -4887,11 +4877,7 @@ impl PyCodeRepository {
         })
     }
 
-    pub(crate) fn execute_backfill_inner(
-        &self,
-        backfill_id: &str,
-        config: Option<String>,
-    ) -> PyResult<()> {
+    pub(crate) fn execute_backfill_inner(&self, backfill_id: &str) -> PyResult<()> {
         let guard = self.ensure_resolved()?;
         let state = guard.as_ref().unwrap();
 
@@ -4909,14 +4895,6 @@ impl PyCodeRepository {
             )));
         }
         fail_backfill_if_job_verb_changed(state, &record)?;
-        // A blocking `backfill(config=...)` passes its config; a daemon runs
-        // the backfill later from the record alone.
-        let config = match config {
-            Some(config) => {
-                check_run_config(Some(&config), |name| state.node_map.contains_key(name))?
-            }
-            None => record.config.clone(),
-        };
 
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
@@ -4997,7 +4975,7 @@ impl PyCodeRepository {
 
             let batch_pk =
                 PyPartitionKey::from(&rivers_core::execution::backfill::bundle_keys(group));
-            let run_config = config.clone();
+            let run_config = record.config.clone();
             let result = match &record.job_name {
                 Some(job_name) => match state.jobs.get(job_name) {
                     Some(job) => self.execute_backfill_job_run(

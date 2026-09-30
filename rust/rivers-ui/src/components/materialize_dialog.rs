@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use leptos::prelude::*;
 
-use crate::components::config_editor::{ConfigEditor, launch_schema, use_config_check};
+use crate::components::config_editor::{ConfigEditor, use_launch_config};
 use crate::components::partition_picker::{PartitionPicker, WholeAssetChoice};
 use crate::helpers::{JobPartitionPicker, close_on_navigation, stale_status_kind};
 use crate::loc::{loc_path, use_current_location};
@@ -134,19 +134,6 @@ pub fn MaterializeDialog(
     let (tag_val, set_tag_val) = signal(String::new());
     let (tags, set_tags) = signal(Vec::<(String, String)>::new());
     let (nav_to, set_nav_to) = signal(Option::<String>::None);
-    let definitions: Signal<HashMap<String, AssetDefinitionInfo>> =
-        definitions.unwrap_or_else(|| Signal::derive(HashMap::new));
-    let config_text = RwSignal::new(String::new());
-    let resources: Signal<Vec<ResourceInfo>> =
-        resources.unwrap_or_else(|| Signal::derive(Vec::new));
-    let config_schema = Signal::derive(move || {
-        Some(launch_schema(
-            &selected.get(),
-            &definitions.get(),
-            &resources.get(),
-            verb.get().as_deref(),
-        ))
-    });
     Effect::new(move || {
         if show.get() {
             set_selected.set(asset_keys.get());
@@ -165,9 +152,16 @@ pub fn MaterializeDialog(
 
     let loc = use_current_location();
     close_on_navigation(show);
-    // Blank text is no overrides; the submit button waits for text without
-    // issues, from the schema at once and from the config classes shortly after.
-    let config_check = use_config_check(config_text, selected.into(), config_schema, loc, verb);
+    // The submit button waits for text without issues, from the schema at
+    // once and from the config classes shortly after.
+    let config = use_launch_config(
+        selected.into(),
+        definitions.unwrap_or_else(|| Signal::derive(HashMap::new)),
+        resources.unwrap_or_else(|| Signal::derive(Vec::new)),
+        verb,
+        loc,
+    );
+    let config_check = config.check;
 
     let materialize_action = Action::new(move |_: &()| {
         let sel = selected.get();
@@ -468,8 +462,8 @@ pub fn MaterializeDialog(
                         </div>
 
                         <ConfigEditor
-                            schema=config_schema
-                            text=config_text
+                            schema=config.schema
+                            text=config.text
                             reset=show
                             check=config_check
                         />

@@ -80,7 +80,7 @@ pub(crate) fn spawn_backfill_pickup_loop(
                                 "backfill queued execution failed"
                             );
                         }
-                    } else if let Err(e) = repo_ref.execute_backfill_inner(&backfill_id, None) {
+                    } else if let Err(e) = repo_ref.execute_backfill_inner(&backfill_id) {
                         tracing::error!(
                             target: "rivers::daemon",
                             backfill_id = %backfill_id,
@@ -517,10 +517,7 @@ pub(crate) fn spawn_schedule_sensor_loop(
 /// records, and mark each as dispatched (transitions cron's next_occurrence /
 /// sensor's last_eval + in_flight). Mutating `automations` here keeps the
 /// per-entry state machine driven by a single side-effect site.
-fn collect_and_mark_due(
-    automations: &mut [AutomationEntry],
-    now: Timestamp,
-) -> Vec<DueEval> {
+fn collect_and_mark_due(automations: &mut [AutomationEntry], now: Timestamp) -> Vec<DueEval> {
     let due_indices: Vec<usize> = automations
         .iter()
         .enumerate()

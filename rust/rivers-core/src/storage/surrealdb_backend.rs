@@ -8105,26 +8105,8 @@ mod tests {
         let storage = make_storage().await;
         let config = r#"{"a":{"mode":"full_refresh"}}"#;
         let bf = BackfillRecord {
-            backfill_id: "bf_cfg".into(),
-            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
-            status: BackfillStatus::Requested,
-            strategy: BackfillStrategy::MultiRun,
-            failure_policy: BackfillFailurePolicy::Continue,
-            asset_selection: vec!["a".into()],
-            job_name: None,
-            partition_keys: vec![],
-            run_ids: vec![],
-            completed_partitions: vec![],
-            failed_partitions: vec![],
-            canceled_partitions: vec![],
-            max_concurrency: 1,
-            tags: vec![],
-            create_time: 1,
-            end_time: None,
-            error: None,
-            launched_by: LaunchedBy::default(),
-            action: None,
             config: Some(config.to_string()),
+            ..make_backfill("bf_cfg", BackfillStatus::Requested, 1)
         };
         storage.create_backfill(&bf).await.unwrap();
         let got = storage.get_backfill("bf_cfg").await.unwrap().unwrap();

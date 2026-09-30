@@ -81,9 +81,7 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
         .transpose()?;
     let overlay = document
         .as_ref()
-        .map(|d| d.overlay_node_map(py, args.node_map))
-        .transpose()?
-        .flatten();
+        .and_then(|d| d.overlay_node_map(py, args.node_map));
     let run_resources = document
         .as_ref()
         .map(|d| RunResources::build(py, d, args.resources))

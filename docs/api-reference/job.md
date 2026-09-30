@@ -36,7 +36,7 @@ def execute(
     self,
     partition_key: PartitionKey | None = None,
     tags: list[tuple[str, str]] | None = None,
-    config: dict[str, dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
     raise_on_error: bool = True,
 ) -> RunResult
 ```
@@ -47,7 +47,7 @@ Run the job synchronously, optionally targeting a single partition. Returns a [`
 |-----------|------|---------|-------------|
 | `partition_key` | `PartitionKey \| None` | `None` | Partition to materialize. Required for partitioned assets. |
 | `tags` | `list[tuple[str, str]] \| None` | `None` | Run tags applied for queue / observability filtering. `rivers/priority` is honored for run-queue priority. |
-| `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config, keyed by asset name. |
+| `config` | `dict[str, Any] \| None` | `None` | The [launch document](../concepts/configuration.md#the-launch-document). |
 | `raise_on_error` | `bool` | `True` | Raise on first failure instead of returning a failed result. |
 
 **Raises:** `ExecutionError` if the job was not obtained from `CodeRepository.get_job()`. The `Job` you construct is only a declaration; each repository runs its own resolved copy.

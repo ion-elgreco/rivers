@@ -41,7 +41,7 @@ pub(crate) fn validate_run_config(
     let value: Value =
         serde_json::from_str(json).map_err(|e| anyhow!("config is not valid JSON: {e}"))?;
     let Value::Object(mut root) = value else {
-        bail!("config must be a JSON object with an 'assets' section");
+        bail!("config must be a JSON object of sections ({})", SECTIONS.join(", "));
     };
     for key in root.keys() {
         if !SECTIONS.contains(&key.as_str()) {
@@ -160,18 +160,30 @@ pub(crate) fn validate_run_config(
     Ok(Some(Value::Object(out).to_string()))
 }
 
-/// [`validate_run_config`] for the Python API: the text a pymethod built
-/// from its `config=` argument, checked before any record is written.
-pub(crate) fn check_run_config(
+/// The document a Python caller passed, canonical and checked before any
+/// record is written: its shape against the nodes of `node_map`, then the
+/// rules of [`document_issues`].
+pub(crate) fn checked_run_config(
+    py: Python<'_>,
     config: Option<&str>,
-    known: impl Fn(&str) -> bool,
+    node_map: &HashMap<String, ResolvedNode>,
+    resources: &HashMap<String, ResourceVariant>,
 ) -> PyResult<Option<String>> {
-    match config {
-        Some(json) => {
-            validate_run_config(json, known).map_err(|e| ConfigurationError::new_err(e.to_string()))
+    let Some(json) = config else {
+        return Ok(None);
+    };
+    let config = validate_run_config(json, |name| node_map.contains_key(name))
+        .map_err(|e| ConfigurationError::new_err(e.to_string()))?;
+    if let Some(json) = &config {
+        let document = parse_run_config(py, json)?;
+        if let Some(issue) = document_issues(py, &document, node_map, resources)?
+            .into_iter()
+            .next()
+        {
+            return Err(ConfigurationError::new_err(format!("config: {issue}")));
         }
-        None => Ok(None),
     }
+    Ok(config)
 }
 
 /// The overrides a document holds for one asset.
@@ -232,40 +244,25 @@ impl RunDocument {
         (!map.is_empty()).then_some(map)
     }
 
-    /// The metadata overrides that apply to a node in `node_map`. Only an
-    /// asset carries metadata: an override for a task is an error.
-    fn metadata_overrides<'a>(
-        &'a self,
-        node_map: &HashMap<String, ResolvedNode>,
-    ) -> PyResult<Vec<(&'a String, &'a HashMap<String, String>)>> {
-        let mut overrides = Vec::new();
-        for (name, o) in &self.assets {
-            if o.metadata.is_empty() {
-                continue;
-            }
-            match node_map.get(name) {
-                Some(ResolvedNode::Asset(_)) => overrides.push((name, &o.metadata)),
-                Some(_) => {
-                    return Err(ConfigurationError::new_err(format!(
-                        "config: metadata overrides apply to assets; '{name}' is a task"
-                    )));
-                }
-                None => {}
-            }
-        }
-        Ok(overrides)
-    }
-
     /// `node_map` with the metadata overrides merged into the assets they
-    /// name, or `None` when the document has none for a node in the map.
+    /// name, or `None` when the document has none for an asset in the map.
+    /// Metadata on a task is refused at launch ([`document_issues`]).
     pub(crate) fn overlay_node_map(
         &self,
         py: Python<'_>,
         node_map: &HashMap<String, ResolvedNode>,
-    ) -> PyResult<Option<HashMap<String, ResolvedNode>>> {
-        let overrides = self.metadata_overrides(node_map)?;
+    ) -> Option<HashMap<String, ResolvedNode>> {
+        let overrides: Vec<_> = self
+            .assets
+            .iter()
+            .filter(|(name, o)| {
+                !o.metadata.is_empty()
+                    && matches!(node_map.get(*name), Some(ResolvedNode::Asset(_)))
+            })
+            .map(|(name, o)| (name, &o.metadata))
+            .collect();
         if overrides.is_empty() {
-            return Ok(None);
+            return None;
         }
         let mut overlay: HashMap<String, ResolvedNode> = node_map
             .iter()
@@ -278,33 +275,57 @@ impl RunDocument {
                     .extend(metadata.iter().map(|(k, v)| (k.clone(), v.clone())));
             }
         }
-        Ok(Some(overlay))
+        Some(overlay)
     }
 }
 
-/// What a run refuses before its first step, checked at the API boundary
-/// so that no run record is written for it: metadata on a task, a resource
-/// key the repository does not have, and resource values its class rejects.
-pub(crate) fn check_run_document(
+/// What a run refuses in `document` apart from the asset config classes,
+/// checked at launch so that no run record is written for it: metadata on
+/// a task, a resource key the repository does not have, and resource values
+/// its class rejects.
+pub(crate) fn document_issues(
     py: Python<'_>,
-    config: Option<&str>,
+    document: &RunDocument,
     node_map: &HashMap<String, ResolvedNode>,
     resources: &HashMap<String, ResourceVariant>,
-) -> PyResult<()> {
-    let Some(json) = config else {
-        return Ok(());
-    };
-    let document = parse_run_config(py, json)?;
-    document.metadata_overrides(node_map)?;
-    for (key, overrides) in &document.resources {
-        let Some(variant) = resources.get(key) else {
-            return Err(ConfigurationError::new_err(format!(
-                "config: no resource '{key}'"
-            )));
-        };
-        variant.for_run(py, key, overrides.bind(py).cast::<PyDict>()?)?;
+) -> PyResult<Vec<ConfigIssue>> {
+    let mut issues = Vec::new();
+    for (name, o) in &document.assets {
+        if !o.metadata.is_empty()
+            && node_map
+                .get(name)
+                .is_some_and(|n| !matches!(n, ResolvedNode::Asset(_)))
+        {
+            issues.push(ConfigIssue {
+                path: vec!["assets".to_string(), name.clone(), "metadata".to_string()],
+                loc: Vec::new(),
+                message: format!("metadata overrides apply to assets; '{name}' is a task"),
+                kind: "invalid".to_string(),
+            });
+        }
     }
-    Ok(())
+    for (key, fields) in &document.resources {
+        let path = vec!["resources".to_string(), key.clone()];
+        let Some(variant) = resources.get(key) else {
+            issues.push(ConfigIssue {
+                path,
+                loc: Vec::new(),
+                message: format!("no resource '{key}'"),
+                kind: "unknown".to_string(),
+            });
+            continue;
+        };
+        match variant.run_kwargs(py, fields.bind(py).cast::<PyDict>()?) {
+            Ok((cls, kwargs)) => issues.extend(config_errors(py, &path, &cls, &kwargs)?),
+            Err(e) => issues.push(ConfigIssue {
+                path,
+                loc: Vec::new(),
+                message: e.value(py).to_string(),
+                kind: "invalid".to_string(),
+            }),
+        }
+    }
+    Ok(issues)
 }
 
 fn object<'py>(value: Bound<'py, PyAny>, what: &str) -> PyResult<Bound<'py, PyDict>> {

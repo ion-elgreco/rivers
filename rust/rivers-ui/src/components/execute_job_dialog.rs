@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use leptos::prelude::*;
 
-use crate::components::config_editor::{ConfigEditor, launch_schema, use_config_check};
+use crate::components::config_editor::{ConfigEditor, use_launch_config};
 use crate::components::partition_picker::{PartitionPicker, WholeAssetChoice};
 use crate::helpers::{JobPartitionPicker, close_on_navigation};
 use crate::loc::{loc_path, use_current_location};
@@ -58,27 +58,18 @@ pub fn ExecuteJobDialog(
     let whole_asset_chosen = Memo::new(move |_| whole_asset.get() && key_optional.get());
     let error = RwSignal::new(None::<String>);
     let nav_to = RwSignal::new(None::<String>);
-    let assets: Signal<Vec<String>> = assets.unwrap_or_else(|| Signal::derive(Vec::new));
-    let definitions: Signal<HashMap<String, AssetDefinitionInfo>> =
-        definitions.unwrap_or_else(|| Signal::derive(HashMap::new));
-    let config_text = RwSignal::new(String::new());
-    let resources: Signal<Vec<ResourceInfo>> =
-        resources.unwrap_or_else(|| Signal::derive(Vec::new));
-    let config_schema = Signal::derive(move || {
-        let verb = verb.get();
-        Some(launch_schema(
-            &assets.get(),
-            &definitions.get(),
-            &resources.get(),
-            verb.as_ref().map(|v| v.name.as_str()),
-        ))
-    });
     let loc = use_current_location();
     close_on_navigation(show);
-    // Blank text is no overrides; the submit button waits for text without
-    // issues, from the schema at once and from the config classes shortly after.
-    let verb_name = Signal::derive(move || verb.get().map(|v| v.name));
-    let config_check = use_config_check(config_text, assets, config_schema, loc, verb_name);
+    // The submit button waits for text without issues, from the schema at
+    // once and from the config classes shortly after.
+    let config = use_launch_config(
+        assets.unwrap_or_else(|| Signal::derive(Vec::new)),
+        definitions.unwrap_or_else(|| Signal::derive(HashMap::new)),
+        resources.unwrap_or_else(|| Signal::derive(Vec::new)),
+        Signal::derive(move || verb.get().map(|v| v.name)),
+        loc,
+    );
+    let config_check = config.check;
 
     let action = Action::new(
         move |input: &(Vec<SubmitPartitionKey>, bool, Option<String>)| {
@@ -210,8 +201,8 @@ pub fn ExecuteJobDialog(
                             <PartitionPicker picker=picker selected=selected reset=show/>
                         </Show>
                         <ConfigEditor
-                            schema=config_schema
-                            text=config_text
+                            schema=config.schema
+                            text=config.text
                             reset=show
                             check=config_check
                         />

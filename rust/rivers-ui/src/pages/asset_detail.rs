@@ -21,7 +21,7 @@ use crate::server_fns::assets::{get_asset, get_asset_events, get_asset_events_pa
 use crate::server_fns::automation::{get_condition_evals, observe_asset};
 use crate::server_fns::graph::get_graph_topology;
 use crate::server_fns::mutations::{materialize_missing_partitions, trigger_materialize};
-use crate::server_fns::overview::{get_assets_info, get_partition_status, get_resources_info};
+use crate::server_fns::overview::{get_assets_info, get_partition_status};
 use crate::server_fns::runs::{get_runs_for_asset, get_step_traceback};
 
 /// Status-class vocabulary for this page's event list and glyph timeline.
@@ -242,17 +242,6 @@ pub fn AssetDetailPage() -> impl IntoView {
     // Picker for this asset: drives dialog-vs-one-click below. Tracks params so
     // it follows navigation between assets.
     let assets_info_value = crate::helpers::resource_value(assets_info);
-    let resources_info = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_resources_info(ns, name).await },
-    );
-    let resources_info_value = crate::helpers::resource_value(resources_info);
-    let launch_resources = Signal::derive(move || {
-        resources_info_value
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-    });
     let materialize_picker = Signal::derive(move || {
         params.track();
         let current = key();
@@ -270,25 +259,17 @@ pub fn AssetDetailPage() -> impl IntoView {
         params.track();
         vec![key()]
     });
-    let asset_info_by_key = Memo::new(move |_| {
-        assets_info_value
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|i| (i.asset_key.clone(), i))
-            .collect::<std::collections::HashMap<String, crate::types::AssetDefinitionInfo>>()
-    });
+    let asset_info_by_key = crate::helpers::definitions_by_key(assets_info_value);
     let show_dialog = RwSignal::new(false);
+    let launch_resources =
+        crate::components::config_editor::use_launch_resources(loc, show_dialog.into());
     // One click materializes an unpartitioned asset — unless it takes config,
     // which only the dialog can edit.
     let materialize_opens_dialog = Signal::derive(move || {
         !matches!(materialize_picker.get(), JobPartitionPicker::None)
-            || crate::components::config_editor::launch_takes_config(
-                &[key()],
-                &asset_info_by_key.get(),
-                None,
-            )
+            || asset_info_by_key.with(|defs| {
+                crate::components::config_editor::launch_takes_config(&[key()], defs, None)
+            })
     });
 
     let materialize_action = Action::new(move |_: &()| {

@@ -156,7 +156,7 @@ print(f"Completed: {result.completed}/{result.num_partitions}")
 | `failure_policy` | `str` | `"continue"` | `"continue"` or `"stop_on_failure"` |
 | `max_concurrency` | `int` | `4` | Max concurrent runs |
 | `tags` | `list[tuple[str, str]]` | None | Tags to attach to the backfill and its runs |
-| `config` | `dict` | None | Per-asset config overrides, applied to every child run |
+| `config` | `dict` | None | The [launch document](configuration.md#the-launch-document), applied to every child run |
 | `block` | `bool` | `True` | Wait for completion. `False` only records the backfill for a daemon to run |
 | `dry_run` | `bool` | `False` | Preview without executing |
 

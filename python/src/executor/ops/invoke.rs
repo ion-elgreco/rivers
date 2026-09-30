@@ -76,12 +76,6 @@ pub(crate) fn resolve_annotation<'py>(
         .call1((annotation, globals))
 }
 
-/// One resource argument: a class is instantiated for the step, an instance
-/// is shared as it is (a per-run override has already rebuilt it).
-fn resource_arg(py: Python<'_>, resource: &ResourceVariant) -> PyResult<Py<PyAny>> {
-    resource.instantiate_config(py, None)
-}
-
 /// Enumerate `(name, optional annotation)` for every *injectable* parameter on
 /// `func` via `inspect.signature` in declaration order. Includes unannotated
 /// params (`def downstream(upstream)`) — `__annotations__` alone would silently
@@ -426,7 +420,7 @@ pub(crate) fn build_step_args(
             )?;
             args.push(loaded);
         } else if let Some(resource) = resources.get(&param_name) {
-            args.push(resource_arg(py, resource)?);
+            args.push(resource.instantiate_config(py, None)?);
         } else {
             return Err(ConfigurationError::new_err(format!(
                 "Asset '{}': parameter '{}' does not match any upstream asset or resource",
@@ -812,7 +806,7 @@ pub(crate) fn execute_action_step(
                         )));
                     }
                     if let Some(resource) = resources.get(param_name) {
-                        args.push(resource_arg(py, resource)?);
+                        args.push(resource.instantiate_config(py, None)?);
                     } else {
                         return Err(ConfigurationError::new_err(format!(
                             "Action '{}' on asset '{}': parameter '{}' does not \

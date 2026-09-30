@@ -794,10 +794,11 @@ pub struct RunRecord {
     /// The verb this run executes. `None` means materialize (rows predate actions).
     #[serde(default)]
     pub action: Option<String>,
-    /// Per-asset config overrides the run was launched with, as a JSON object
-    /// keyed by asset name (`{"asset": {"field": value}}`). `None` means the
-    /// definitions' defaults. Every launcher that starts from a stored run
-    /// (run queue, `rivers execute`, backfill children, reruns) reads it here.
+    /// The launch document the run was launched with, as JSON text:
+    /// `{"assets": {...}, "resources": {...}, "execution": {...}}` (see the
+    /// `run_config` module of the Python crate). `None` means the definitions
+    /// as they are. Every launcher that starts from a stored run (run queue,
+    /// `rivers execute`, backfill children, reruns) reads it here.
     #[serde(default)]
     pub config: Option<String>,
 }
@@ -843,7 +844,7 @@ pub struct CoordinatorRunInfo {
     /// See [`RunRecord::action`] — the backend must execute this verb, not materialize.
     #[serde(default)]
     pub action: Option<String>,
-    /// See [`RunRecord::config`] — the backend applies these overrides.
+    /// See [`RunRecord::config`] — the backend applies this document.
     #[serde(default)]
     pub config: Option<String>,
 }
@@ -1081,8 +1082,8 @@ pub struct BackfillRecord {
     /// The verb child runs execute. `None` means materialize.
     #[serde(default)]
     pub action: Option<String>,
-    /// Per-asset config overrides every child run is launched with; the same
-    /// JSON object as [`RunRecord::config`].
+    /// The launch document every child run is launched with; see
+    /// [`RunRecord::config`].
     #[serde(default)]
     pub config: Option<String>,
 }

@@ -23,7 +23,7 @@ use crate::helpers::{
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::automation::get_jobs;
 use crate::server_fns::mutations::execute_job;
-use crate::server_fns::overview::{get_assets_info, get_resources_info};
+use crate::server_fns::overview::get_assets_info;
 use crate::server_fns::runs::get_last_run_per_job;
 use crate::types::{AssetActionInfo, AssetDefinitionInfo, RunRecord};
 
@@ -70,6 +70,8 @@ pub fn JobsListPage() -> impl IntoView {
     let navigate = leptos_router::hooks::use_navigate();
 
     let show_dialog = RwSignal::new(false);
+    let launch_resources =
+        crate::components::config_editor::use_launch_resources(loc, show_dialog.into());
     let dialog_job = RwSignal::new(String::new());
     let dialog_picker = RwSignal::new(JobPartitionPicker::None);
     let dialog_verb = RwSignal::new(None::<AssetActionInfo>);
@@ -80,17 +82,6 @@ pub fn JobsListPage() -> impl IntoView {
     // The dialog's config editor reads the job's assets and their schemas.
     let jobs_value = crate::helpers::resource_value(jobs);
     let assets_info_value = crate::helpers::resource_value(assets_info);
-    let resources_info = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_resources_info(ns, name).await },
-    );
-    let resources_info_value = crate::helpers::resource_value(resources_info);
-    let launch_resources = Signal::derive(move || {
-        resources_info_value
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-    });
     let dialog_assets = Signal::derive(move || {
         let job = dialog_job.get();
         jobs_value
@@ -102,15 +93,7 @@ pub fn JobsListPage() -> impl IntoView {
             .map(|j| j.asset_selection)
             .unwrap_or_default()
     });
-    let asset_info_by_key = Memo::new(move |_| {
-        assets_info_value
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|i| (i.asset_key.clone(), i))
-            .collect::<std::collections::HashMap<String, crate::types::AssetDefinitionInfo>>()
-    });
+    let asset_info_by_key = crate::helpers::definitions_by_key(assets_info_value);
 
     view! {
         <Topbar
@@ -232,16 +215,13 @@ pub fn JobsListPage() -> impl IntoView {
                                     let on_execute = {
                                         let ns = ns.clone();
                                         let name = name.clone();
-                                        let row_picker = row_picker.clone();
+                                        let open_dialog = open_dialog.clone();
                                         let shown = verb_name.clone();
                                         move |ev: leptos::ev::MouseEvent| {
                                             ev.prevent_default();
                                             ev.stop_propagation();
                                             if opens_dialog {
-                                                dialog_job.set(exec_name.clone());
-                                                dialog_picker.set(row_picker.clone());
-                                                dialog_verb.set(verb.clone());
-                                                show_dialog.set(true);
+                                                open_dialog(ev);
                                                 return;
                                             }
                                             // A destructive verb takes a second click, as on the run page.

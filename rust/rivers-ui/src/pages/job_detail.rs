@@ -23,7 +23,7 @@ use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::get_assets;
 use crate::server_fns::automation::get_jobs;
 use crate::server_fns::mutations::execute_job;
-use crate::server_fns::overview::{get_assets_info, get_resources_info};
+use crate::server_fns::overview::get_assets_info;
 use crate::server_fns::runs::get_runs_page;
 use crate::types::{AssetActionInfo, AssetDefinitionInfo, RunFilter};
 
@@ -93,6 +93,8 @@ pub fn JobDetailPage() -> impl IntoView {
     let (exec_pending, set_exec_pending) = signal(false);
     let (exec_error, set_exec_error) = signal::<Option<String>>(None);
     let show_dialog = RwSignal::new(false);
+    let launch_resources =
+        crate::components::config_editor::use_launch_resources(loc, show_dialog.into());
     let navigate = leptos_router::hooks::use_navigate();
 
     // The job, resolved against its assets' declarations: the verb it runs
@@ -100,17 +102,6 @@ pub fn JobDetailPage() -> impl IntoView {
     // job's definition has loaded: with no verb to show, Execute waits.
     let jobs_value = crate::helpers::resource_value(jobs);
     let assets_info_value = crate::helpers::resource_value(assets_info);
-    let resources_info = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_resources_info(ns, name).await },
-    );
-    let resources_info_value = crate::helpers::resource_value(resources_info);
-    let launch_resources = Signal::derive(move || {
-        resources_info_value
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-    });
     // The dialog's config editor reads the job's assets and their schemas.
     let job_assets = Signal::derive(move || {
         let current = name();
@@ -123,15 +114,7 @@ pub fn JobDetailPage() -> impl IntoView {
             .map(|j| j.asset_selection)
             .unwrap_or_default()
     });
-    let asset_info_by_key = Memo::new(move |_| {
-        assets_info_value
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|i| (i.asset_key.clone(), i))
-            .collect::<std::collections::HashMap<String, AssetDefinitionInfo>>()
-    });
+    let asset_info_by_key = crate::helpers::definitions_by_key(assets_info_value);
     let job_launch = Memo::new(
         move |_| -> Option<(Option<AssetActionInfo>, JobPartitionPicker)> {
             let current = name();
@@ -164,11 +147,13 @@ pub fn JobDetailPage() -> impl IntoView {
     // runs on the click.
     let job_opens_dialog = Signal::derive(move || {
         !matches!(job_picker.get(), JobPartitionPicker::None)
-            || crate::components::config_editor::launch_takes_config(
-                &job_assets.get(),
-                &asset_info_by_key.get(),
-                job_verb_signal.get().as_ref().map(|v| v.name.as_str()),
-            )
+            || asset_info_by_key.with(|defs| {
+                crate::components::config_editor::launch_takes_config(
+                    &job_assets.get(),
+                    defs,
+                    job_verb_signal.get().as_ref().map(|v| v.name.as_str()),
+                )
+            })
     });
     let job_loaded = Signal::derive(move || job_launch.get().is_some());
     let exec_armed = use_confirm_armed(move || params.track());
