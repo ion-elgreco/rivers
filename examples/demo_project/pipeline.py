@@ -14,6 +14,7 @@ import os
 import pickle
 import time
 from datetime import datetime
+from typing import Literal
 
 import obstore.store
 import pyarrow as pa
@@ -70,6 +71,7 @@ class _IngestionSettings(BaseModel):
     source_system: str = "demo"
     batch_size: int = 100
     include_inactive: bool = False
+    mode: Literal["incremental", "full"] = "incremental"
 
 
 class _AnalyticsSettings(BaseModel):
@@ -223,7 +225,7 @@ def raw_users(context: AssetExecutionContext[_IngestionSettings]) -> dict:
     ]
     if not settings.include_inactive:
         users = [u for u in users if u["active"]]
-    return {"users": users, "source": settings.source_system}
+    return {"users": users, "source": settings.source_system, "mode": settings.mode}
 
 
 @Asset(
