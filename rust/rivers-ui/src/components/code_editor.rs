@@ -4,7 +4,10 @@
 
 use leptos::prelude::*;
 
-use crate::json_text::{Issue, Span, TokenKind, line_col, line_indent, tokenize};
+use crate::config_schema::Candidate;
+use crate::json_text::{
+    Issue, Slot, Span, TokenKind, context_at, line_col, line_indent, parse, tokenize,
+};
 
 /// One run of the highlighted text, or the caret's place in it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -183,10 +186,89 @@ pub fn key_edit(text: &str, start: usize, end: usize, key: &str, leave: bool) ->
     }
 }
 
+/// An open completion list: what it replaces and what surrounds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Popup {
+    pub options: Vec<Candidate>,
+    pub index: usize,
+    pub replace: Span,
+    pub key_only: bool,
+    pub comma_before: bool,
+    pub comma_after: bool,
+}
+
+/// The completion list at `caret`, or `None`: no slot there, no option
+/// matches, or the one match is already typed. Unless `explicit`
+/// (Ctrl+Space), it opens only for a typed prefix or right after a colon.
+pub fn completion_at(
+    text: &str,
+    caret: usize,
+    options: Vec<Candidate>,
+    explicit: bool,
+) -> Option<Popup> {
+    let caret = caret.min(text.len());
+    let ctx = context_at(text, &parse(text), caret);
+    let prefix = match &ctx.slot {
+        Slot::Key { prefix } | Slot::Value { prefix } => prefix.as_str(),
+        Slot::None => return None,
+    };
+    let after_colon = matches!(ctx.slot, Slot::Value { .. })
+        && text[..caret].trim_end_matches(' ').ends_with(':');
+    if !explicit && prefix.is_empty() && !after_colon {
+        return None;
+    }
+    let lower = prefix.to_lowercase();
+    let options: Vec<Candidate> = options
+        .into_iter()
+        .filter(|c| c.label.to_lowercase().starts_with(&lower))
+        .collect();
+    if options.is_empty() || (options.len() == 1 && options[0].label == prefix) {
+        return None;
+    }
+    Some(Popup {
+        options,
+        index: 0,
+        replace: ctx.replace,
+        key_only: ctx.key_only,
+        comma_before: ctx.comma_before,
+        comma_after: ctx.comma_after,
+    })
+}
+
+/// The edit that accepts `popup.options[index]`: the key alone when the
+/// key already has its colon, else the whole `"key": value`, with the comma
+/// a neighbouring entry needs.
+pub fn completion_edit(popup: &Popup, index: usize) -> Option<Edit> {
+    let option = popup.options.get(index)?;
+    let (mut text, mut caret) = if popup.key_only {
+        let quoted = format!("\"{}\"", option.label);
+        let len = quoted.len();
+        (quoted, len)
+    } else {
+        (option.insert.clone(), option.caret)
+    };
+    if popup.comma_before {
+        text.insert_str(0, ", ");
+        caret += 2;
+    }
+    if popup.comma_after {
+        text.push(',');
+    }
+    Some(Edit::Insert {
+        replace: popup.replace,
+        text,
+        caret: popup.replace.start + caret,
+    })
+}
+
 #[cfg(target_arch = "wasm32")]
 mod dom {
-    use leptos::prelude::document;
-    use leptos::web_sys::HtmlTextAreaElement;
+    use leptos::prelude::{document, window};
+    use leptos::wasm_bindgen::JsCast;
+    use leptos::web_sys::{HtmlElement, HtmlTextAreaElement};
+
+    /// Room the list needs under the caret before it is rendered.
+    const POPUP_ROOM: f64 = 220.0;
 
     use crate::json_text::{Span, byte_to_utf16, utf16_to_byte};
 
@@ -256,11 +338,59 @@ mod dom {
         let _ = ta.set_selection_range(unit, unit);
         after
     }
+
+    /// Where the list goes in `frame`: under the caret line, or above it
+    /// (`true`) when it would not fit in the scrolling ancestor.
+    pub fn popup_place(frame: &HtmlElement) -> Option<(f64, f64, bool)> {
+        let anchor = frame.query_selector(".code-editor-caret").ok().flatten()?;
+        let at = anchor.get_bounding_client_rect();
+        let origin = frame.get_bounding_client_rect();
+        let limit = frame
+            .closest(".modal-body")
+            .ok()
+            .flatten()
+            .map(|body| body.get_bounding_client_rect().bottom())
+            .or_else(|| window().inner_height().ok()?.as_f64())
+            .unwrap_or(f64::INFINITY);
+        let room = frame
+            .query_selector(".code-editor-popup")
+            .ok()
+            .flatten()
+            .and_then(|list| list.dyn_into::<HtmlElement>().ok())
+            .map_or(POPUP_ROOM, |list| f64::from(list.offset_height()) + 8.0);
+        let above = at.bottom() + room > limit;
+        let y = if above { at.top() } else { at.bottom() };
+        Some((at.left() - origin.left(), y - origin.top(), above))
+    }
+
+    /// Scroll the list in `frame` so its `index`th option is in view.
+    pub fn reveal(frame: &HtmlElement, index: usize) {
+        let Some(list) = frame.query_selector(".code-editor-popup").ok().flatten() else {
+            return;
+        };
+        let selector = format!(".code-editor-option:nth-child({})", index + 1);
+        let Some(item) = list
+            .query_selector(&selector)
+            .ok()
+            .flatten()
+            .and_then(|e| e.dyn_into::<HtmlElement>().ok())
+        else {
+            return;
+        };
+        let top = item.offset_top();
+        let bottom = top + item.offset_height();
+        let view_top = list.scroll_top();
+        if bottom > view_top + list.client_height() {
+            list.set_scroll_top(bottom - list.client_height());
+        } else if top < view_top {
+            list.set_scroll_top(top);
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 mod dom {
-    use leptos::web_sys::HtmlTextAreaElement;
+    use leptos::web_sys::{HtmlElement, HtmlTextAreaElement};
 
     use crate::json_text::Span;
 
@@ -281,23 +411,35 @@ mod dom {
     pub fn insert(_ta: &HtmlTextAreaElement, _replace: Span, _text: &str, _caret: usize) -> String {
         String::new()
     }
+
+    pub fn popup_place(_frame: &HtmlElement) -> Option<(f64, f64, bool)> {
+        None
+    }
+
+    pub fn reveal(_frame: &HtmlElement, _index: usize) {}
 }
 
 /// The editor over `text`. `issues` underline their spans and list under
 /// the text (a click moves the caret there); `on_edit` fires on every
-/// change the user makes.
+/// change the user makes; `complete` gives the completions for a caret
+/// offset, shown while typing and on Ctrl+Space.
 #[component]
 pub fn CodeEditor(
     text: RwSignal<String>,
     #[prop(into)] issues: Signal<Vec<Issue>>,
     #[prop(into)] label: String,
     on_edit: Callback<()>,
+    #[prop(into)] complete: Callback<(String, usize), Vec<Candidate>>,
 ) -> impl IntoView {
     let textarea = NodeRef::<leptos::html::Textarea>::new();
     let caret = RwSignal::new(0usize);
     // Escape arms the next Tab to leave the editor instead of indenting.
     let escaped = RwSignal::new(false);
     let highlighted = Memo::new(move |_| pieces(&text.get(), &issues.get(), caret.get()));
+    let frame = NodeRef::<leptos::html::Div>::new();
+    let popup = RwSignal::new(None::<Popup>);
+    let popup_at = RwSignal::new((0.0f64, 0.0f64, false));
+    let scrolled = RwSignal::new(0u32);
 
     let read_caret = move || {
         if let Some(ta) = textarea.get_untracked() {
@@ -313,6 +455,22 @@ pub fn CodeEditor(
         {
             dom::set_value(&ta, &current);
         }
+    });
+    Effect::new(move || {
+        let Some(open) = popup.get() else {
+            return;
+        };
+        highlighted.track();
+        scrolled.track();
+        let Some(frame) = frame.get_untracked() else {
+            return;
+        };
+        if let Some(place) = dom::popup_place(&frame)
+            && popup_at.get_untracked() != place
+        {
+            popup_at.set(place);
+        }
+        dom::reveal(&frame, open.index);
     });
     let apply = move |edit: Edit| {
         let Some(ta) = textarea.get_untracked() else {
@@ -343,11 +501,66 @@ pub fn CodeEditor(
             caret.set(to);
         }
     };
+    let refresh_popup = move |explicit: bool| {
+        let Some(ta) = textarea.get_untracked() else {
+            return;
+        };
+        let value = dom::value(&ta);
+        let at = dom::selection(&ta).0;
+        let options = complete.run((value.clone(), at));
+        popup.set(completion_at(&value, at, options, explicit));
+    };
+    let accept = move |index: usize| {
+        if let Some(edit) = popup
+            .get_untracked()
+            .and_then(|p| completion_edit(&p, index))
+        {
+            popup.set(None);
+            apply(edit);
+        }
+    };
     let on_keydown = move |ev: leptos::ev::KeyboardEvent| {
         if ev.is_composing() {
             return;
         }
         let key = ev.key();
+        if let Some(open) = popup.get_untracked() {
+            let count = open.options.len();
+            let handled = match key.as_str() {
+                "ArrowDown" => {
+                    popup.set(Some(Popup {
+                        index: (open.index + 1) % count,
+                        ..open
+                    }));
+                    true
+                }
+                "ArrowUp" => {
+                    popup.set(Some(Popup {
+                        index: (open.index + count - 1) % count,
+                        ..open
+                    }));
+                    true
+                }
+                "Enter" | "Tab" => {
+                    accept(open.index);
+                    true
+                }
+                "Escape" => {
+                    popup.set(None);
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                ev.prevent_default();
+                return;
+            }
+        }
+        if ev.ctrl_key() && key == " " {
+            ev.prevent_default();
+            refresh_popup(true);
+            return;
+        }
         if key == "Escape" {
             escaped.set(true);
             return;
@@ -370,7 +583,12 @@ pub fn CodeEditor(
     };
 
     view! {
-        <div class="code-editor" class:code-editor--invalid=move || !issues.get().is_empty()>
+        <div class="code-editor-frame" node_ref=frame>
+        <div
+            class="code-editor"
+            class:code-editor--invalid=move || !issues.get().is_empty()
+            on:scroll=move |_| scrolled.update(|n| *n += 1)
+        >
             <pre class="code-editor-hl" aria-hidden="true">
                 {move || highlighted.get().into_iter().map(|piece| match piece {
                     Piece::Caret => view! { <span class="code-editor-caret"></span> }.into_any(),
@@ -390,15 +608,52 @@ pub fn CodeEditor(
                 on:input=move |ev| {
                     text.set(event_target_value(&ev));
                     read_caret();
+                    refresh_popup(false);
                     on_edit.run(());
                 }
                 on:keydown=on_keydown
                 on:keyup=move |_| read_caret()
-                on:click=move |_| read_caret()
+                on:click=move |_| {
+                    read_caret();
+                    popup.set(None);
+                }
                 on:focus=move |_| read_caret()
+                on:blur=move |_| popup.set(None)
             >
                 {text.get_untracked()}
             </textarea>
+        </div>
+        {move || popup.get().map(|open| {
+            let (x, y, above) = popup_at.get();
+            view! {
+                <div
+                    class="code-editor-popup"
+                    class:code-editor-popup--above=above
+                    role="listbox"
+                    style=format!("left:{x}px;top:{y}px")
+                >
+                    {open.options.iter().enumerate().map(|(i, option)| {
+                        let active = i == open.index;
+                        view! {
+                            <button
+                                type="button"
+                                class="code-editor-option"
+                                class:code-editor-option--active=active
+                                role="option"
+                                aria-selected=active.to_string()
+                                on:mousedown=move |ev| {
+                                    ev.prevent_default();
+                                    accept(i);
+                                }
+                            >
+                                <span class="code-editor-option-label">{option.label.clone()}</span>
+                                <span class="code-editor-option-detail">{option.detail.clone()}</span>
+                            </button>
+                        }
+                    }).collect::<Vec<_>>()}
+                </div>
+            }
+        })}
         </div>
         <Show when=move || !issues.get().is_empty()>
             <ul class="code-editor-issues">
@@ -566,5 +821,105 @@ mod tests {
         assert_eq!(key_edit("{a}", 2, 2, "Backspace", false), Edit::None);
         assert_eq!(key_edit("{}", 0, 0, "Backspace", false), Edit::None);
         assert_eq!(key_edit("x", 1, 1, "a", false), Edit::None);
+    }
+
+    fn option(label: &str, insert: &str) -> Candidate {
+        Candidate {
+            label: label.to_string(),
+            insert: insert.to_string(),
+            detail: String::new(),
+            caret: insert.len() - usize::from(insert.ends_with("\"\"")),
+        }
+    }
+
+    fn fields() -> Vec<Candidate> {
+        vec![
+            option("api_key", "\"api_key\": \"\""),
+            option("batch_size", "\"batch_size\": 100"),
+            option("mode", "\"mode\": \"fast\""),
+        ]
+    }
+
+    #[test]
+    fn completion_opens_for_a_prefix_a_colon_or_ctrl_space() {
+        let labels = |p: Option<Popup>| -> Vec<String> {
+            p.map(|p| p.options.into_iter().map(|c| c.label).collect())
+                .unwrap_or_default()
+        };
+        let text = "{\"ba";
+        assert_eq!(
+            labels(completion_at(text, 4, fields(), false)),
+            vec!["batch_size"]
+        );
+        // Case does not matter; an empty prefix needs Ctrl+Space.
+        assert_eq!(
+            labels(completion_at("{\"BA", 4, fields(), false)),
+            vec!["batch_size"]
+        );
+        assert_eq!(completion_at("{", 1, fields(), false), None);
+        assert_eq!(
+            labels(completion_at("{", 1, fields(), true)),
+            vec!["api_key", "batch_size", "mode"]
+        );
+        // A value opens right after the colon.
+        let values = vec![
+            option("\"fast\"", "\"fast\""),
+            option("\"slow\"", "\"slow\""),
+        ];
+        assert_eq!(
+            labels(completion_at("{\"mode\": ", 9, values.clone(), false)),
+            vec!["\"fast\"", "\"slow\""]
+        );
+        assert_eq!(
+            labels(completion_at("{\"mode\": \"s", 11, values.clone(), false)),
+            vec!["\"slow\""]
+        );
+        // Nothing matches, the match is already typed, or there is no slot.
+        assert_eq!(completion_at("{\"zz", 4, fields(), true), None);
+        assert_eq!(
+            completion_at("{\"mode\": \"slow\"", 15, values, false),
+            None
+        );
+        assert_eq!(completion_at("{}", 2, fields(), true), None);
+        assert_eq!(completion_at("", 0, fields(), true), None);
+    }
+
+    #[test]
+    fn completion_edit_replaces_the_prefix_and_adds_commas() {
+        let insert = |start: usize, end: usize, text: &str, caret: usize| {
+            Some(Edit::Insert {
+                replace: span(start, end),
+                text: text.to_string(),
+                caret,
+            })
+        };
+        let popup = completion_at("{\"ba", 4, fields(), false).unwrap();
+        assert_eq!(
+            completion_edit(&popup, 0),
+            insert(1, 4, "\"batch_size\": 100", 1 + 17)
+        );
+        assert_eq!(completion_edit(&popup, 7), None);
+
+        // The key alone when its colon is there already.
+        let popup = completion_at("{\"ba\": 5}", 3, fields(), false).unwrap();
+        assert!(popup.key_only);
+        assert_eq!(
+            completion_edit(&popup, 0),
+            insert(1, 5, "\"batch_size\"", 1 + 12)
+        );
+
+        // Commas for the neighbours; the caret lands inside `\"\"`.
+        let popup = completion_at("{\"mode\": 1 ", 11, fields(), true).unwrap();
+        assert!(popup.comma_before);
+        assert_eq!(
+            completion_edit(&popup, 0),
+            insert(11, 11, ", \"api_key\": \"\"", 11 + 2 + 12)
+        );
+        let popup = completion_at("{\"mode\": 1}", 1, fields(), true).unwrap();
+        assert!(popup.comma_after);
+        assert_eq!(
+            completion_edit(&popup, 0),
+            insert(1, 1, "\"api_key\": \"\",", 1 + 12)
+        );
     }
 }

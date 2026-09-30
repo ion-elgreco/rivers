@@ -13,8 +13,8 @@ use leptos::prelude::*;
 use serde_json::{Map, Value};
 
 use crate::components::code_editor::CodeEditor;
-use crate::config_schema::{self, Schema};
-use crate::json_text::{self, Issue, Node, Span};
+use crate::config_schema::{self, Candidate, Schema};
+use crate::json_text::{self, Issue, Node, PathSeg, Slot, Span};
 use crate::types::AssetDefinitionInfo;
 
 fn properties(schema_json: &str) -> Option<Map<String, Value>> {
@@ -211,6 +211,40 @@ pub fn check_config(text: &str, selected: &[String], schemas: &HashMap<String, S
     }
 }
 
+/// The completions at `caret`: at the top level the selected assets with a
+/// schema, below it the fields and values of that asset's schema.
+pub fn completions(
+    text: &str,
+    caret: usize,
+    selected: &[String],
+    schemas: &HashMap<String, String>,
+) -> Vec<Candidate> {
+    let ctx = json_text::context_at(text, &json_text::parse(text), caret);
+    let Some(PathSeg::Key(asset)) = ctx.path.first() else {
+        if !matches!(ctx.slot, Slot::Key { .. }) {
+            return Vec::new();
+        }
+        return selected
+            .iter()
+            .filter(|key| schemas.contains_key(*key) && !ctx.siblings.contains(key))
+            .map(|key| Candidate {
+                label: key.clone(),
+                insert: format!("\"{key}\": {{}}"),
+                detail: "asset".to_string(),
+                caret: key.len() + 5,
+            })
+            .collect();
+    };
+    let Some(schema) = schemas.get(asset).and_then(|s| Schema::parse(s)) else {
+        return Vec::new();
+    };
+    match ctx.slot {
+        Slot::Key { .. } => config_schema::key_candidates(&schema, &ctx.path[1..], &ctx.siblings),
+        Slot::Value { .. } => config_schema::value_candidates(&schema, &ctx.path[1..]),
+        Slot::None => Vec::new(),
+    }
+}
+
 /// The dialog section: the code editor over `text`, the required-fields
 /// hint and a reset. Renders nothing when no selected key has a schema.
 /// `reset` turning true (the dialog opening) refills the template; a
@@ -268,6 +302,9 @@ pub fn ConfigEditor(
                     issues=issues
                     label="Config"
                     on_edit=Callback::new(move |()| dirty.set(true))
+                    complete=Callback::new(move |(text, caret): (String, usize)| {
+                        completions(&text, caret, &selected.get_untracked(), &schemas.get_untracked())
+                    })
                 />
                 <Show when=move || !missing.get().is_empty()>
                     <div class="config-editor-hint">
@@ -477,5 +514,34 @@ mod tests {
         let broken = check(r#"{"api": {"batch_size": "x"}}"#);
         assert_eq!(broken.payload, None);
         assert_eq!(broken.missing, keys(&["api.api_key"]));
+    }
+
+    #[test]
+    fn completions_follow_the_caret_from_assets_to_fields_to_values() {
+        let selected = keys(&["api", "cfg", "plain"]);
+        let schemas = schemas(&[("api", PIPELINE), ("cfg", THRESHOLD)]);
+        let labels = |text: &str, caret: usize| -> Vec<String> {
+            completions(text, caret, &selected, &schemas)
+                .into_iter()
+                .map(|c| c.label)
+                .collect()
+        };
+        // Top level: assets with a schema that are not there yet.
+        assert_eq!(labels("{", 1), keys(&["api", "cfg"]));
+        assert_eq!(labels("{\"api\": {}, ", 12), keys(&["cfg"]));
+        let asset = &completions("{", 1, &selected, &schemas)[0];
+        assert_eq!(asset.insert, "\"api\": {}");
+        assert_eq!(asset.caret, 8);
+        // Inside an asset: its fields, then a field's values.
+        assert_eq!(
+            labels("{\"api\": {\"b", 11),
+            keys(&["api_key", "batch_size", "region"])
+        );
+        assert_eq!(labels("{\"api\": {\"region\": ", 19), keys(&["null"]));
+        assert_eq!(labels("{\"cfg\": {\"threshold\": ", 22), keys(&["0.5"]));
+        // No schema, a value at the top level, or outside the document.
+        assert!(labels("{\"plain\": {\"", 12).is_empty());
+        assert!(labels("{\"api\": ", 8).contains(&"{}".to_string()));
+        assert!(labels("{}", 2).is_empty());
     }
 }

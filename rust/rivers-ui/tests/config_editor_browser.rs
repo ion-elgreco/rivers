@@ -16,6 +16,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::{
     Event, EventInit, HtmlElement, HtmlTextAreaElement, KeyboardEvent, KeyboardEventInit,
+    MouseEvent, MouseEventInit,
 };
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -124,6 +125,21 @@ impl Editor {
 
     fn marks(&self) -> Vec<String> {
         self.texts(".code-editor-mark")
+    }
+
+    fn options(&self) -> Vec<String> {
+        self.texts(".code-editor-option-label")
+    }
+
+    fn active_option(&self) -> Option<String> {
+        query_all(&self.host, ".code-editor-option--active")
+            .first()
+            .and_then(|el| {
+                el.query_selector(".code-editor-option-label")
+                    .ok()
+                    .flatten()
+            })
+            .map(|el| el.text_content().unwrap_or_default())
     }
 
     fn hint(&self) -> Option<String> {
@@ -314,4 +330,100 @@ async fn template_returns_after_the_asset_is_selected_again() {
     flush_effects().await;
     assert_eq!(e.text.get_untracked(), template);
     assert_eq!(e.value(), template);
+}
+
+fn mousedown(target: &web_sys::Element) {
+    let init = MouseEventInit::new();
+    init.set_bubbles(true);
+    init.set_cancelable(true);
+    let ev = MouseEvent::new_with_mouse_event_init_dict("mousedown", &init).unwrap();
+    target.dispatch_event(&ev).unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn typing_a_key_prefix_opens_completion_and_enter_inserts() {
+    let e = mount(&[("api_data", PIPELINE)]);
+    flush_effects().await;
+
+    e.type_text("{\"api_data\": {\"ap");
+    flush_effects().await;
+    assert_eq!(e.options(), vec!["api_key"]);
+    assert!(e.press("Enter", false));
+    flush_effects().await;
+    assert_eq!(e.value(), "{\"api_data\": {\"api_key\": \"\"");
+    assert_eq!(e.caret(), 26);
+    assert!(query_all(&e.host, ".code-editor-popup").is_empty());
+}
+
+#[wasm_bindgen_test]
+async fn values_complete_after_the_colon_and_on_ctrl_space() {
+    let e = mount(&[("api_data", PIPELINE)]);
+    flush_effects().await;
+
+    e.type_text("{\"api_data\": {\"mode\": ");
+    flush_effects().await;
+    assert_eq!(e.options(), vec!["\"fast\"", "\"slow\""]);
+    assert_eq!(e.texts(".code-editor-option-detail"), vec!["default", ""]);
+    // Escape closes it; Ctrl+Space brings it back; arrows move; Enter takes.
+    assert!(e.press("Escape", false));
+    flush_effects().await;
+    assert!(query_all(&e.host, ".code-editor-popup").is_empty());
+    assert!(e.press(" ", true));
+    flush_effects().await;
+    assert_eq!(e.options(), vec!["\"fast\"", "\"slow\""]);
+    assert!(e.press("ArrowDown", false));
+    flush_effects().await;
+    assert_eq!(e.active_option().as_deref(), Some("\"slow\""));
+    assert!(e.press("Enter", false));
+    flush_effects().await;
+    assert_eq!(e.value(), "{\"api_data\": {\"mode\": \"slow\"");
+    assert_eq!(e.caret(), 28);
+}
+
+#[wasm_bindgen_test]
+async fn completion_skips_present_keys_and_adds_commas() {
+    let e = mount(&[("api_data", PIPELINE)]);
+    flush_effects().await;
+
+    e.type_text("{\"api_data\": {\"batch_size\": 1}}");
+    e.set_caret(14);
+    assert!(e.press(" ", true));
+    flush_effects().await;
+    assert_eq!(e.options(), vec!["api_key", "mode"]);
+    assert!(e.press("Enter", false));
+    flush_effects().await;
+    assert_eq!(
+        e.value(),
+        "{\"api_data\": {\"api_key\": \"\",\"batch_size\": 1}}"
+    );
+
+    e.type_text("{\"api_data\": {\"batch_size\": 1 ");
+    assert!(e.press(" ", true));
+    flush_effects().await;
+    assert_eq!(e.options(), vec!["api_key", "mode"]);
+    assert!(e.press("ArrowDown", false));
+    assert!(e.press("Enter", false));
+    flush_effects().await;
+    assert_eq!(
+        e.value(),
+        "{\"api_data\": {\"batch_size\": 1 , \"mode\": \"fast\""
+    );
+}
+
+#[wasm_bindgen_test]
+async fn top_level_completion_offers_assets_and_a_click_inserts() {
+    let e = mount(&[("api_data", PIPELINE), ("other", PIPELINE)]);
+    flush_effects().await;
+
+    e.type_text("{");
+    flush_effects().await;
+    assert!(query_all(&e.host, ".code-editor-popup").is_empty());
+    assert!(e.press(" ", true));
+    flush_effects().await;
+    assert_eq!(e.options(), vec!["api_data", "other"]);
+    mousedown(&query_all(&e.host, ".code-editor-option")[1]);
+    flush_effects().await;
+    assert_eq!(e.value(), "{\"other\": {}");
+    assert_eq!(e.caret(), 11);
+    assert!(query_all(&e.host, ".code-editor-popup").is_empty());
 }
