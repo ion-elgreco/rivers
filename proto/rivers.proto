@@ -28,6 +28,8 @@ service CodeLocationService {
   rpc CancelBackfill(CancelBackfillRequest) returns (CancelBackfillResponse);
   rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
   rpc DeleteRun(DeleteRunRequest) returns (DeleteRunResponse);
+  // Check config overrides with each asset's config class, as a run builds it.
+  rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
 }
 
 // --- Health & info ---
@@ -146,6 +148,32 @@ message GetPartitionKeyIndexRequest {
 }
 message GetPartitionKeyIndexResponse {
   int64 index = 1;
+}
+
+message ValidateConfigRequest {
+  // The assets the launch would run; every key in `config` must be one of them.
+  repeated string selection = 1;
+  // As MaterializeRequest.config.
+  string config = 2;
+  // The verb whose config class applies; unset means each asset's own.
+  optional string action = 3;
+}
+// One step of pydantic's `loc`: a field name or a list index.
+message ConfigLoc {
+  oneof part {
+    string key = 1;
+    uint32 index = 2;
+  }
+}
+message ConfigError {
+  string asset = 1;
+  repeated ConfigLoc loc = 2;
+  string message = 3;
+  // pydantic's error type: "missing", "int_parsing", "value_error", ...
+  string kind = 4;
+}
+message ValidateConfigResponse {
+  repeated ConfigError errors = 1;
 }
 
 message GetAssetsInfoRequest {}

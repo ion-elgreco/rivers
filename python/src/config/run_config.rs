@@ -2,6 +2,7 @@
 //! run record stores (`{"asset": {"field": value}}`) and the per-asset
 //! mapping the executor applies.
 use std::collections::HashMap;
+use std::fmt;
 
 use anyhow::{anyhow, bail};
 use pyo3::prelude::*;
@@ -92,10 +93,13 @@ pub(crate) fn run_config_to_json(
     }
 }
 
-/// The JSON schema of the pydantic config class named by `func`'s context
-/// annotation (`AssetExecutionContext[Config]`, `ActionContext[Config]`), or
-/// `None` when it takes no config.
-pub(crate) fn config_schema_json(py: Python<'_>, func: &Py<PyAny>) -> PyResult<Option<String>> {
+/// The pydantic config class named by `func`'s context annotation
+/// (`AssetExecutionContext[Config]`, `ActionContext[Config]`), or `None`
+/// when it takes no config.
+pub(crate) fn config_class<'py>(
+    py: Python<'py>,
+    func: &Py<PyAny>,
+) -> PyResult<Option<Bound<'py, PyType>>> {
     let base_model = py.import("pydantic")?.getattr("BaseModel")?;
     let base_model = base_model.cast::<PyType>()?;
     for (_, annotation) in enumerate_params(py, func)? {
@@ -122,17 +126,99 @@ pub(crate) fn config_schema_json(py: Python<'_>, func: &Py<PyAny>) -> PyResult<O
         } else {
             first.get_type().into_any()
         };
-        if !cls.cast::<PyType>()?.is_subclass(base_model)? {
+        let cls = cls.cast_into::<PyType>()?;
+        if !cls.is_subclass(base_model)? {
             return Ok(None);
         }
-        let schema = cls.call_method0("model_json_schema")?;
-        let text: String = py
-            .import("json")?
-            .call_method1("dumps", (schema,))?
-            .extract()?;
-        return Ok(Some(text));
+        return Ok(Some(cls));
     }
     Ok(None)
+}
+
+/// The JSON schema of `func`'s config class, or `None` when it takes no config.
+pub(crate) fn config_schema_json(py: Python<'_>, func: &Py<PyAny>) -> PyResult<Option<String>> {
+    let Some(cls) = config_class(py, func)? else {
+        return Ok(None);
+    };
+    let schema = cls.call_method0("model_json_schema")?;
+    let text: String = py
+        .import("json")?
+        .call_method1("dumps", (schema,))?
+        .extract()?;
+    Ok(Some(text))
+}
+
+/// One step of pydantic's `loc`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocPart {
+    Key(String),
+    Index(u32),
+}
+
+/// One error from building a config class from overrides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigIssue {
+    pub asset: String,
+    pub loc: Vec<LocPart>,
+    pub message: String,
+    /// pydantic's error type (`missing`, `int_parsing`, `value_error`, ...),
+    /// or `exception` for anything else the constructor raised.
+    pub kind: String,
+}
+
+impl fmt::Display for ConfigIssue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.asset)?;
+        for part in &self.loc {
+            match part {
+                LocPart::Key(key) => write!(f, ".{key}")?,
+                LocPart::Index(index) => write!(f, "[{index}]")?,
+            }
+        }
+        write!(f, ": {}", self.message)
+    }
+}
+
+/// The errors `cls(**overrides)` raises: what a run hits when it builds
+/// the config. Pydantic's own list, or one `exception` entry for anything
+/// else the constructor raised.
+pub(crate) fn config_errors(
+    py: Python<'_>,
+    asset: &str,
+    cls: &Bound<'_, PyType>,
+    overrides: &Bound<'_, PyDict>,
+) -> PyResult<Vec<ConfigIssue>> {
+    let Err(err) = cls.call((), Some(overrides)) else {
+        return Ok(Vec::new());
+    };
+    let validation_error = py.import("pydantic")?.getattr("ValidationError")?;
+    if !err.is_instance(py, &validation_error) {
+        return Ok(vec![ConfigIssue {
+            asset: asset.to_string(),
+            loc: Vec::new(),
+            message: err.value(py).str()?.to_string(),
+            kind: "exception".to_string(),
+        }]);
+    }
+    let mut issues = Vec::new();
+    for item in err.value(py).call_method0("errors")?.try_iter()? {
+        let item = item?;
+        let mut loc = Vec::new();
+        for part in item.get_item("loc")?.try_iter()? {
+            let part = part?;
+            loc.push(match part.extract::<u32>() {
+                Ok(index) => LocPart::Index(index),
+                Err(_) => LocPart::Key(part.str()?.to_string()),
+            });
+        }
+        issues.push(ConfigIssue {
+            asset: asset.to_string(),
+            loc,
+            message: item.get_item("msg")?.extract()?,
+            kind: item.get_item("type")?.extract()?,
+        });
+    }
+    Ok(issues)
 }
 
 /// [`parse_run_config`] for a stored record's field, from a thread that is

@@ -12,7 +12,7 @@ import grpc
 import pytest
 import rivers as rs
 from _polling import wait_for_run_terminal
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from rivers._core import AutomationDaemon
 
 _STORE: dict = {}
@@ -34,6 +34,23 @@ class ThresholdConfig(BaseModel):
 
 class CompactConfig(BaseModel):
     target_size_mb: int = 128
+
+
+class StrictConfig(BaseModel):
+    """What only the class can check: a pattern, a bound, a list, a required
+    field and a validator of its own."""
+
+    code: str = Field("ab", pattern=r"^[a-z]+$")
+    limit: int = Field(1, ge=1)
+    tags: list[int] = []
+    token: str
+
+    @field_validator("code")
+    @classmethod
+    def _not_reserved(cls, value: str) -> str:
+        if value == "nope":
+            raise ValueError("'nope' is reserved")
+        return value
 
 
 def _build_repo(run_queue=None):
@@ -65,9 +82,13 @@ def _build_repo(run_queue=None):
         )
         return context.config.threshold
 
+    @rs.Asset(io_handler=handler)
+    def strict(context: rs.AssetExecutionContext[StrictConfig]):
+        return context.config.token
+
     job = rs.Job(name="cfg_job", assets=[configured])
     return rs.CodeRepository(
-        assets=[plain, configured, part_cfg],
+        assets=[plain, configured, part_cfg, strict],
         jobs=[job],
         default_executor=rs.Executor.in_process(),
         run_queue=run_queue,
@@ -320,3 +341,140 @@ def test_queued_job_applies_config_when_dequeued(queued):
     assert run.status == "Success"
     assert _STORE["configured"] == {"threshold": 0.5, "max_retries": 9}
     assert run.config == {"configured": {"max_retries": 9}}
+
+
+# ── ValidateConfig ──
+
+
+def _validate(stub, pb2, config, selection, action=None):
+    """`(asset, loc, kind, message)` per error the config classes report."""
+    request = pb2.ValidateConfigRequest(
+        selection=list(selection), config=json.dumps(config)
+    )
+    if action is not None:
+        request.action = action
+    return [
+        (
+            e.asset,
+            tuple(p.key if p.HasField("key") else p.index for p in e.loc),
+            e.kind,
+            e.message,
+        )
+        for e in stub.ValidateConfig(request).errors
+    ]
+
+
+def test_validate_config_reports_what_the_class_rejects(direct):
+    stub, pb2, _ = direct
+    valid = {"strict": {"token": "t", "code": "ab", "limit": 2}}
+    assert _validate(stub, pb2, valid, ["strict"]) == []
+
+    errors = _validate(
+        stub,
+        pb2,
+        {"strict": {"token": 1, "code": "AB", "limit": 0, "tags": [1, "x"]}},
+        ["strict"],
+    )
+    assert {(loc, kind) for _, loc, kind, _ in errors} == {
+        (("token",), "string_type"),
+        (("code",), "string_pattern_mismatch"),
+        (("limit",), "greater_than_equal"),
+        (("tags", 1), "int_parsing"),
+    }
+    assert {asset for asset, *_ in errors} == {"strict"}
+
+    # A validator's own message, and a required field as `missing`.
+    errors = _validate(stub, pb2, {"strict": {"code": "nope"}}, ["strict"])
+    assert (
+        "strict",
+        ("code",),
+        "value_error",
+        "Value error, 'nope' is reserved",
+    ) in errors
+    assert ("strict", ("token",), "missing", "Field required") in errors
+
+
+def test_validate_config_uses_the_verbs_class_and_skips_assets_without_one(direct):
+    stub, pb2, _ = direct
+    errors = _validate(
+        stub,
+        pb2,
+        {"configured": {"target_size_mb": "big"}},
+        ["configured"],
+        action="compact",
+    )
+    assert [(loc, kind) for _, loc, kind, _ in errors] == [
+        (("target_size_mb",), "int_parsing")
+    ]
+    # The asset's own class ignores a field it does not know, as pydantic does.
+    assert (
+        _validate(stub, pb2, {"configured": {"target_size_mb": "big"}}, ["configured"])
+        == []
+    )
+    # No config class, or nothing to check.
+    assert _validate(stub, pb2, {"plain": {"x": 1}}, ["plain"]) == []
+    assert _validate(stub, pb2, {}, ["strict"]) == []
+
+
+@pytest.mark.parametrize("config", ["[1]", '{"other": {"x": 1}}', '{"strict": 1}'])
+def test_validate_config_rejects_a_malformed_document(direct, config):
+    stub, pb2, _ = direct
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.ValidateConfig(
+            pb2.ValidateConfigRequest(selection=["strict"], config=config)
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_launch_rejects_values_the_class_rejects(direct):
+    """The same check guards a launch, so no run exists for a config its
+    class rejects at start. A missing field passes: the run's environment
+    may fill a BaseSettings field this process cannot see."""
+    stub, pb2, repo = direct
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.Materialize(
+            pb2.MaterializeRequest(
+                selection=["configured"], config=_cfg(configured={"threshold": "hot"})
+            )
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert (
+        "config: configured.threshold: Input should be a valid number"
+        in exc.value.details()
+    )
+
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.RunAction(
+            pb2.RunActionRequest(
+                action="compact",
+                selection=["configured"],
+                config=_cfg(configured={"target_size_mb": "big"}),
+            )
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "configured.target_size_mb" in exc.value.details()
+
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.ExecuteJob(
+            pb2.ExecuteJobRequest(
+                job_name="cfg_job", config=_cfg(configured={"max_retries": 1.5})
+            )
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.LaunchBackfill(
+            pb2.LaunchBackfillRequest(
+                selection=["part_cfg"],
+                partition_keys=[_single(pb2, "a")],
+                max_concurrency=1,
+                config=_cfg(part_cfg={"threshold": "hot"}),
+            )
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert repo.storage.get_runs(limit=10) == []
+
+    resp = stub.Materialize(
+        pb2.MaterializeRequest(selection=["strict"], config=_cfg(strict={"code": "ab"}))
+    )
+    assert wait_for_run_terminal(repo.storage, resp.run_id).status == "Failure"
