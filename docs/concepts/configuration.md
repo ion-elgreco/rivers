@@ -40,7 +40,7 @@ def api_data(context: rs.AssetExecutionContext[PipelineConfig]):
 
 ## The launch document
 
-A run can depart from the definitions in one document, passed as `config=` to `materialize()`, `run_action()`, `backfill()` and `Job.execute()`, and edited in the UI's launch dialogs. Per asset it holds `config`, values for the asset's config class, and `metadata`, keys added to or replacing the asset's [metadata](assets.md#asset-metadata) for this run; per [resource](resources.md#per-run-overrides), field values the resource is rebuilt with:
+A run can depart from the definitions in one document, passed as `config=` to `materialize()`, `run_action()`, `backfill()` and `Job.execute()`, and edited in the UI's launch dialogs. Per asset it holds `config`, values for the asset's config class, and `metadata`, keys added to or replacing the asset's [metadata](assets.md#asset-metadata) for this run; per [resource](resources.md#per-run-overrides), field values the resource is rebuilt with; and under `execution`, the run's [executor](../api-reference/executors.md#per-run-executor):
 
 ```python
 repo.materialize(
@@ -53,17 +53,18 @@ repo.materialize(
             }
         },
         "resources": {"db": {"pool_size": 2}},
+        "execution": {"executor": "parallel", "max_workers": 4},
     },
 )
 ```
 
-Every part is optional; what is absent stays as defined. `config` values are merged with the class's defaults when the class is instantiated (for `BaseSettings`, env vars are resolved first, then these take precedence). `metadata` values are strings, like the asset's own; the merged metadata is what `context.asset_metadata`, the IO handlers and the engine's `rivers/` keys see for that run, so `rivers/executor` picks the executor for that asset's step. Only assets carry metadata: naming a task under `metadata` is an error. A resource named under `resources` is rebuilt for the run with those values, set up before the first step and torn down after the last; the repository's instance is untouched.
+Every part is optional; what is absent stays as defined. `config` values are merged with the class's defaults when the class is instantiated (for `BaseSettings`, env vars are resolved first, then these take precedence). `metadata` values are strings, like the asset's own; the merged metadata is what `context.asset_metadata`, the IO handlers and the engine's `rivers/` keys see for that run, so `rivers/executor` picks the executor for that asset's step. Only assets carry metadata: naming a task under `metadata` is an error. A resource named under `resources` is rebuilt for the run with those values, set up before the first step and torn down after the last; the repository's instance is untouched. `execution.executor` (`in_process` or `parallel`, with `max_workers` and `max_async_concurrent` for parallel) is the run's executor in place of the repository's or the job's; an asset's own `rivers/executor` metadata still wins for its step.
 
 The document must be JSON-serializable (pydantic's encoder is used, so dates, paths and enums are fine). The run record keeps it (`RunRecord.config`), so a rerun replays it and the run page shows it, and every launch path applies it: the run queue, Kubernetes run and step pods, backfill child runs and reruns. A document that names an unknown asset, an unknown section, or a value its config class rejects is refused before a run exists.
 
 ## The document in the UI
 
-The Materialize and Execute job dialogs show a **Config** editor when a selected asset has a config class or metadata (or the chosen action takes config). It holds the launch document and opens pre-filled with each config field's default and each asset's current metadata, and lists the repository's resources by key:
+The Materialize and Execute job dialogs hold a **Config** editor with the launch document. It opens pre-filled with each config field's default and each asset's current metadata, lists the repository's resources by key, and has an empty `execution` section to fill:
 
 ```json
 {
@@ -77,6 +78,7 @@ The Materialize and Execute job dialogs show a **Config** editor when a selected
       }
     }
   },
+  "execution": {},
   "resources": {
     "db": {}
   }
@@ -91,7 +93,7 @@ A field without a default — a required field, or a `BaseSettings` field the en
 
 Typing a key or a value opens a completion list, and `Ctrl+Space` opens it anywhere. It offers the sections, assets and fields the object does not have yet, with their type, default and description — an asset's current metadata keys and values included — and for a value the choices of a `Literal` or `Enum`, `true`/`false`, `null` where the field allows it, and the default. `Enter` or `Tab` accepts, `Escape` closes. `Tab` indents by two spaces (`Escape` then `Tab` leaves the editor), and `{`, `[` and `"` close themselves.
 
-An asset with neither a config class nor metadata launches on one click; the dialog opens when one has either.
+An asset with neither a config class nor metadata launches on one click, as does a job whose assets have neither and that needs no partition; the dialog opens on its own when one has either. Next to such a one-click button, **Materialize…** or **Execute…** opens the dialog anyway, for the document's other sections.
 
 ## Tasks
 

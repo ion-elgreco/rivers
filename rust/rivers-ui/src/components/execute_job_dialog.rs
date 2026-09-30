@@ -66,12 +66,12 @@ pub fn ExecuteJobDialog(
         resources.unwrap_or_else(|| Signal::derive(Vec::new));
     let config_schema = Signal::derive(move || {
         let verb = verb.get();
-        launch_schema(
+        Some(launch_schema(
             &assets.get(),
             &definitions.get(),
             &resources.get(),
             verb.as_ref().map(|v| v.name.as_str()),
-        )
+        ))
     });
     let loc = use_current_location();
     close_on_navigation(show);

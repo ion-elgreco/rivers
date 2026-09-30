@@ -90,7 +90,7 @@ fn mount_purge_page(jobs: Reply) -> (web_sys::HtmlElement, common::FetchMock, co
     (target, mock, requests)
 }
 
-/// Execute is the only direct button child of the top-bar actions; its class
+/// Execute is the first direct button child of the top-bar actions; its class
 /// switches to `btn-danger` once a destructive verb has loaded.
 fn execute_button(host: &web_sys::HtmlElement) -> web_sys::HtmlButtonElement {
     query_one(host, ".topbar-actions > button")
@@ -191,4 +191,25 @@ async fn execute_sends_the_verb_the_page_showed() {
                 .to_string()
         ]
     );
+}
+
+/// A job that runs on the click still has a way into the dialog: the second
+/// button opens it with the launch document, and sends nothing itself.
+#[wasm_bindgen_test]
+async fn execute_with_a_document_opens_the_dialog() {
+    let (host, _mock, requests) = mount_purge_page(Reply::Json(PURGE_JOB.to_string()));
+    assert!(wait_until(|| query_all(&host, ".topbar-actions > button").len() == 2).await);
+    let buttons = query_all(&host, ".topbar-actions > button");
+    assert_eq!(buttons[1].text_content().unwrap_or_default(), "Execute…");
+
+    click(&buttons[1], false);
+    assert!(wait_until(|| !query_all(&host, ".modal-content").is_empty()).await);
+    assert_eq!(
+        query_one(&host, ".config-editor-text")
+            .dyn_ref::<web_sys::HtmlTextAreaElement>()
+            .unwrap()
+            .value(),
+        "{\n  \"execution\": {}\n}"
+    );
+    assert!(execute_job_bodies(&requests).await.is_empty());
 }

@@ -59,6 +59,10 @@ executor = rs.Executor.kubernetes(
 | `worker_cpu` | `str` | `"500m"` | CPU request/limit for worker pods. |
 | `worker_memory` | `str` | `"512Mi"` | Memory request/limit for worker pods. |
 
+## Per-run executor
+
+A launch can pick the executor for one run through the [launch document](../concepts/configuration.md#the-launch-document): `"execution": {"executor": "in_process"}`, or `"parallel"` with `max_workers` and `max_async_concurrent`. It replaces the repository's default or the job's own executor for that run; a count set without `"executor": "parallel"` is refused. An asset's `rivers/executor` metadata still wins for its step, and a Kubernetes step pod runs its one step in-process whatever the document says. A run launched this way on a Kubernetes default executes its steps in the process that runs the run, not in step pods.
+
 ## Per-asset executor override
 
 Individual assets can override the default executor via the `rivers/executor` metadata key. This works in both `Job.execute()` and `CodeRepository.materialize()`:

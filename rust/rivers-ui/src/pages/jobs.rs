@@ -213,6 +213,21 @@ pub fn JobsListPage() -> impl IntoView {
                                     let armed = RwSignal::new(false);
                                     let navigate = navigate.clone();
                                     let nav_run = navigate.clone();
+                                    // The dialog edits the launch document for a
+                                    // job that would otherwise run on the click.
+                                    let open_dialog = {
+                                        let exec_name = exec_name.clone();
+                                        let row_picker = row_picker.clone();
+                                        let verb = verb.clone();
+                                        move |ev: leptos::ev::MouseEvent| {
+                                            ev.prevent_default();
+                                            ev.stop_propagation();
+                                            dialog_job.set(exec_name.clone());
+                                            dialog_picker.set(row_picker.clone());
+                                            dialog_verb.set(verb.clone());
+                                            show_dialog.set(true);
+                                        }
+                                    };
 
                                     let on_execute = {
                                         let ns = ns.clone();
@@ -327,6 +342,16 @@ pub fn JobsListPage() -> impl IntoView {
                                                     "Execute".to_string()
                                                 }}
                                             </button>
+                                            {(!opens_dialog).then(|| view! {
+                                                <button
+                                                    class="btn"
+                                                    on:click=open_dialog
+                                                    disabled=move || exec_pending.get()
+                                                    title="Execute with a launch document"
+                                                >
+                                                    "Execute…"
+                                                </button>
+                                            })}
                                         </A>
                                     }
                                 }).collect::<Vec<_>>()

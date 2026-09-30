@@ -65,6 +65,7 @@ struct Applied<'a> {
     node_map: &'a HashMap<String, ResolvedNode>,
     resources: &'a HashMap<String, ResourceVariant>,
     config_overrides: Option<HashMap<String, Py<PyAny>>>,
+    executor: Executor,
 }
 
 pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
@@ -88,10 +89,16 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
         .map(|d| RunResources::build(py, d, args.resources))
         .transpose()?
         .flatten();
+    let executor = match document.as_ref().and_then(|d| d.execution.as_ref()) {
+        // A step pod runs its one step here whatever the document says.
+        Some(execution) if !super::in_step_pod() => execution.executor(args.executor),
+        _ => args.executor.clone(),
+    };
     let applied = Applied {
         node_map: overlay.as_ref().unwrap_or(args.node_map),
         resources: run_resources.as_ref().map_or(args.resources, |r| &r.map),
         config_overrides: document.as_ref().and_then(|d| d.config_overrides(py)),
+        executor,
     };
     let result = drive(py, args, &applied);
     if let Some(run_resources) = &run_resources {
@@ -152,7 +159,7 @@ fn drive(py: Python, args: RunPlanArgs, applied: &Applied<'_>) -> PyResult<PyRun
         ));
     }
 
-    let failures = args.executor.execute_plan(
+    let failures = applied.executor.execute_plan(
         py,
         args.plan,
         applied.node_map,

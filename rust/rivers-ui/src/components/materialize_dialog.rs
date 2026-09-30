@@ -140,12 +140,12 @@ pub fn MaterializeDialog(
     let resources: Signal<Vec<ResourceInfo>> =
         resources.unwrap_or_else(|| Signal::derive(Vec::new));
     let config_schema = Signal::derive(move || {
-        launch_schema(
+        Some(launch_schema(
             &selected.get(),
             &definitions.get(),
             &resources.get(),
             verb.get().as_deref(),
-        )
+        ))
     });
     Effect::new(move || {
         if show.get() {

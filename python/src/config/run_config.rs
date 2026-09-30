@@ -4,7 +4,8 @@
 //! ```json
 //! {"assets": {"raw_users": {"config": {"batch_size": 100},
 //!                           "metadata": {"delta/mode": "overwrite"}}},
-//!  "resources": {"db": {"pool_size": 10}}}
+//!  "resources": {"db": {"pool_size": 10}},
+//!  "execution": {"executor": "parallel", "max_workers": 4}}
 //! ```
 //!
 //! Every section is optional; an absent one means "as defined".
@@ -21,10 +22,14 @@ use crate::errors::{ConfigurationError, ExecutionError};
 use crate::executor::ops::{
     enumerate_params, is_action_context_annotation, is_context_annotation, resolve_annotation,
 };
+use crate::executor::{Executor, default_max_workers};
 use crate::repository::resolved_node::ResolvedNode;
 
 /// The sections a document may have.
-const SECTIONS: &[&str] = &["assets", "resources"];
+const SECTIONS: &[&str] = &["assets", "execution", "resources"];
+
+/// The executors a document may name.
+const EXECUTORS: &[&str] = &["in_process", "parallel"];
 
 /// Check the document a launch carries and return it canonical: compact,
 /// with empty parts dropped, or `None` when it sets nothing. `known` says
@@ -113,6 +118,42 @@ pub(crate) fn validate_run_config(
             out.insert("resources".to_string(), Value::Object(kept));
         }
     }
+    if let Some(execution) = root.remove("execution") {
+        let Value::Object(execution) = execution else {
+            bail!("config.execution must be a JSON object");
+        };
+        let parallel = execution.get("executor").and_then(Value::as_str) == Some("parallel");
+        for (key, value) in &execution {
+            match key.as_str() {
+                "executor" => {
+                    if !value.as_str().is_some_and(|e| EXECUTORS.contains(&e)) {
+                        bail!(
+                            "config.execution.executor must be one of {}",
+                            EXECUTORS.join(", ")
+                        );
+                    }
+                }
+                "max_workers" | "max_async_concurrent" => {
+                    if !value.as_u64().is_some_and(|n| n >= 1) {
+                        bail!("config.execution.{key} must be a positive integer");
+                    }
+                    if !parallel {
+                        bail!(
+                            "config.execution.{key} applies to the parallel executor; \
+                             set \"executor\": \"parallel\""
+                        );
+                    }
+                }
+                other => bail!(
+                    "config.execution has an unknown key '{other}'; \
+                     expected executor, max_workers, max_async_concurrent"
+                ),
+            }
+        }
+        if !execution.is_empty() {
+            out.insert("execution".to_string(), Value::Object(execution));
+        }
+    }
     if out.is_empty() {
         return Ok(None);
     }
@@ -141,11 +182,43 @@ pub(crate) struct AssetOverrides {
     pub metadata: HashMap<String, String>,
 }
 
+/// The run's executor as the document sets it.
+pub(crate) struct Execution {
+    pub executor: Option<String>,
+    pub max_workers: Option<usize>,
+    pub max_async_concurrent: Option<usize>,
+}
+
+impl Execution {
+    /// The executor the run uses given the launcher's `default`. A parallel
+    /// count not set here keeps the default's when that is parallel too.
+    pub(crate) fn executor(&self, default: &Executor) -> Executor {
+        match self.executor.as_deref() {
+            Some("in_process") => Executor::InProcess {},
+            Some("parallel") => {
+                let (workers, in_flight) = match default {
+                    Executor::Parallel {
+                        max_workers,
+                        max_async_concurrent,
+                    } => (*max_workers, *max_async_concurrent),
+                    _ => (default_max_workers(), None),
+                };
+                Executor::Parallel {
+                    max_workers: self.max_workers.unwrap_or(workers),
+                    max_async_concurrent: self.max_async_concurrent.or(in_flight),
+                }
+            }
+            _ => default.clone(),
+        }
+    }
+}
+
 /// A stored document, parsed for a run.
 pub(crate) struct RunDocument {
     pub assets: HashMap<String, AssetOverrides>,
     /// Field values per resource key, each a dict.
     pub resources: HashMap<String, Py<PyAny>>,
+    pub execution: Option<Execution>,
 }
 
 impl RunDocument {
@@ -274,7 +347,28 @@ pub(crate) fn parse_run_config(py: Python<'_>, json: &str) -> PyResult<RunDocume
             resources.insert(key, fields.into_any().unbind());
         }
     }
-    Ok(RunDocument { assets, resources })
+    let execution = match root.get_item("execution")? {
+        Some(section) => {
+            let section = object(section, "'execution'")?;
+            let count = |key: &str| -> PyResult<Option<usize>> {
+                section.get_item(key)?.map(|v| v.extract()).transpose()
+            };
+            Some(Execution {
+                executor: section
+                    .get_item("executor")?
+                    .map(|v| v.extract())
+                    .transpose()?,
+                max_workers: count("max_workers")?,
+                max_async_concurrent: count("max_async_concurrent")?,
+            })
+        }
+        None => None,
+    };
+    Ok(RunDocument {
+        assets,
+        resources,
+        execution,
+    })
 }
 
 /// The resources a run uses when its document overrides some: the
@@ -578,6 +672,13 @@ mod tests {
             ))
         );
         assert_eq!(check(r#"{"resources": {"db": {}}}"#), Ok(None));
+        assert_eq!(check(r#"{"execution": {}}"#), Ok(None));
+        assert_eq!(
+            check(r#"{"execution": {"executor": "parallel", "max_workers": 2}}"#),
+            Ok(Some(
+                r#"{"execution":{"executor":"parallel","max_workers":2}}"#.to_string()
+            ))
+        );
         assert_eq!(
             check(r#"{"resources": {"db": {"pool_size": 5}}, "assets": {}}"#),
             Ok(Some(r#"{"resources":{"db":{"pool_size":5}}}"#.to_string()))
@@ -591,7 +692,7 @@ mod tests {
             ("[1]", "config must be a JSON object"),
             (
                 r#"{"other": {}}"#,
-                "unknown section 'other'; expected assets, resources",
+                "unknown section 'other'; expected assets, execution, resources",
             ),
             (r#"{"assets": 1}"#, "config.assets must be a JSON object"),
             (
@@ -621,6 +722,30 @@ mod tests {
             (
                 r#"{"resources": []}"#,
                 "config.resources must be a JSON object",
+            ),
+            (
+                r#"{"execution": 1}"#,
+                "config.execution must be a JSON object",
+            ),
+            (
+                r#"{"execution": {"executor": "k8s"}}"#,
+                "config.execution.executor must be one of in_process, parallel",
+            ),
+            (
+                r#"{"execution": {"executor": "parallel", "max_workers": 0}}"#,
+                "config.execution.max_workers must be a positive integer",
+            ),
+            (
+                r#"{"execution": {"max_workers": 2}}"#,
+                "config.execution.max_workers applies to the parallel executor",
+            ),
+            (
+                r#"{"execution": {"executor": "in_process", "max_async_concurrent": 2}}"#,
+                "config.execution.max_async_concurrent applies to the parallel executor",
+            ),
+            (
+                r#"{"execution": {"workers": 2}}"#,
+                "config.execution has an unknown key 'workers'",
             ),
             (
                 r#"{"resources": {"db": 1}}"#,

@@ -2,10 +2,11 @@
 //! has against it, the required fields it lacks, the completions a caret
 //! takes, the template it opens with and the payload it sends. The schema is
 //! a launch document's, composed from config classes' `model_json_schema()`
-//! text placed in it with [`inline`]. One keyword of our own:
+//! text placed in it with [`inline`]. Two keywords of our own:
 //! `"x-launch-template": "keys"` on a container lists its keys as empty
 //! objects in the template instead of their fields' defaults, for sections
-//! whose values must only be sent when typed.
+//! whose values must only be sent when typed; `"x-requires": {"k": v}` on a
+//! property makes it an error unless the sibling `k` is set to `v`.
 
 use serde_json::{Map, Value};
 
@@ -418,6 +419,21 @@ fn check(schema: &Schema, sch: &Value, node: &Node, path: &str, out: &mut Vec<Is
             for entry in entries {
                 let child = child_path(path, &entry.key);
                 if let Some(prop) = props.and_then(|p| p.get(&entry.key)) {
+                    let requires = prop.get("x-requires").and_then(Value::as_object);
+                    for (sibling, wanted) in requires.into_iter().flatten() {
+                        let set = entries
+                            .iter()
+                            .any(|e| &e.key == sibling && equals(&e.value, wanted));
+                        if !set {
+                            out.push(Issue {
+                                span: entry.key_span,
+                                message: located(
+                                    path,
+                                    format!("{} needs \"{sibling}\": {wanted}", entry.key),
+                                ),
+                            });
+                        }
+                    }
                     check(schema, prop, &entry.value, &child, out);
                 } else if let Some(extra) = additional.filter(|a| a.is_object()) {
                     check(schema, extra, &entry.value, &child, out);
@@ -1236,6 +1252,44 @@ mod tests {
             None
         );
         assert_eq!(compact(&doc, serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn a_property_can_require_a_sibling_value() {
+        let doc = Schema {
+            root: serde_json::json!({"type": "object", "properties": {
+                "executor": {"type": "string", "enum": ["in_process", "parallel"]},
+                "max_workers": {"type": "integer", "minimum": 1, "x-requires": {"executor": "parallel"}}
+            }}),
+        };
+        let at = |text: &str| {
+            let parsed = parse(text);
+            validate(&doc, parsed.root.as_ref().unwrap(), "run")
+                .into_iter()
+                .map(|i| (i.message, i.span))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(at(r#"{"executor": "parallel", "max_workers": 2}"#), vec![]);
+        assert_eq!(
+            at(r#"{"max_workers": 2}"#),
+            vec![(
+                "run: max_workers needs \"executor\": \"parallel\"".to_string(),
+                Span { start: 1, end: 14 }
+            )]
+        );
+        assert_eq!(
+            at(r#"{"executor": "in_process", "max_workers": 0}"#),
+            vec![
+                (
+                    "run: max_workers needs \"executor\": \"parallel\"".to_string(),
+                    Span { start: 27, end: 40 }
+                ),
+                (
+                    "run.max_workers: must be ≥ 1".to_string(),
+                    Span { start: 42, end: 43 }
+                ),
+            ]
+        );
     }
 
     #[test]

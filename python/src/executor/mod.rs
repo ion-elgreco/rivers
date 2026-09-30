@@ -50,7 +50,7 @@ pub(crate) mod metadata_keys {
     pub const NODE_EXECUTOR: &str = "rivers/node/executor";
 }
 
-fn default_max_workers() -> usize {
+pub(crate) fn default_max_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)

@@ -291,7 +291,8 @@ class CodeRepository:
             tags: Run tags applied for queue / observability filtering.
             raise_on_error: Raise on first failure instead of returning a failed result.
             config: The launch document: ``{"assets": {name: {"config":
-                {...}, "metadata": {...}}}, "resources": {key: {...}}}``. Values
+                {...}, "metadata": {...}}}, "resources": {key: {...}},
+                "execution": {"executor": ..., "max_workers": ...}}``. Values
                 must be JSON-serializable; the run record keeps it.
             run_id_override: Use a pre-assigned run ID (for K8s execution pods).
             include_upstream: Also materialize transitive deps (default: only ``selection``).
