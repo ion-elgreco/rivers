@@ -19,7 +19,7 @@ from typing import Literal
 import obstore.store
 import pyarrow as pa
 from deltalake import write_deltalake
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from rivers import (
     ActionContext,
     ActionResult,
@@ -72,6 +72,13 @@ class _IngestionSettings(BaseModel):
     batch_size: int = 100
     include_inactive: bool = False
     mode: Literal["incremental", "full"] = "incremental"
+
+    @field_validator("source_system")
+    @classmethod
+    def _lowercase(cls, value: str) -> str:
+        if value != value.lower():
+            raise ValueError("source_system must be lowercase")
+        return value
 
 
 class _AnalyticsSettings(BaseModel):
@@ -131,9 +138,7 @@ else:
     raw_io = VersionedPickleIOHandler(store=_local_store, prefix="raw")
     processed_io = VersionedPickleIOHandler(store=_local_store, prefix="processed")
     output_io = VersionedPickleIOHandler(store=_local_store, prefix="output")
-    delta_io = DeltaIOHandler(
-        table_uri=os.path.join(_io_root, "delta"), mode="append"
-    )
+    delta_io = DeltaIOHandler(table_uri=os.path.join(_io_root, "delta"), mode="append")
 
 
 # =============================================================================

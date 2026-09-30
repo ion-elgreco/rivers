@@ -65,7 +65,7 @@ The Materialize and Execute job dialogs show a **Config** editor when a selected
 }
 ```
 
-The editor checks the text against each config class's JSON schema as you type. A syntax error, an unknown field, a value of the wrong type or outside its bounds, or a value that is not one of a `Literal`'s choices is underlined and listed under the editor with its line and column; clicking the line moves the caret there. Any of these disables the submit button: pydantic would otherwise ignore an unknown field silently, and a wrong value would fail the step when the run starts. `pattern` and `format` constraints are still checked by the config class at that point.
+The editor checks the text against each config class's JSON schema as you type. A syntax error, an unknown field, a value of the wrong type or outside its bounds, or a value that is not one of a `Literal`'s choices is underlined and listed under the editor with its line and column; clicking the line moves the caret there. Any of these disables the submit button: pydantic would otherwise ignore an unknown field silently, and a wrong value would fail the step when the run starts. Once the schema is satisfied, the config class itself checks the overrides in the code location, the way a run builds it, so its validators and `pattern` or `format` constraints show in the editor a moment after typing. A launch whose values the class rejects is refused before a run exists.
 
 A field without a default — a required field, or a `BaseSettings` field the environment resolves — is never pre-filled, so nothing is sent for it unless you set it. The editor lists such fields as "Required, not set"; **Insert missing fields** adds them with an empty value of the right type. They do not block a submit.
 

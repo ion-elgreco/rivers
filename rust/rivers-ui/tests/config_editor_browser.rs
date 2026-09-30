@@ -8,10 +8,13 @@ mod common;
 
 use std::collections::HashMap;
 
-use common::{click, flush_effects, fresh_mount_target, query_all, query_one};
+use common::{
+    click, flush_effects, fresh_mount_target, install_recording_fetch_mock, query_all, query_one,
+    request_bodies, wait_until,
+};
 use leptos::mount::mount_to;
 use leptos::prelude::*;
-use rivers_ui::components::config_editor::{Check, ConfigEditor, check_config};
+use rivers_ui::components::config_editor::{Check, ConfigEditor, check_config, use_config_check};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::{
@@ -426,4 +429,79 @@ async fn top_level_completion_offers_assets_and_a_click_inserts() {
     assert_eq!(e.value(), "{\"other\": {}");
     assert_eq!(e.caret(), 11);
     assert!(query_all(&e.host, ".code-editor-popup").is_empty());
+}
+
+/// Once the schema is satisfied, the config classes are asked; their
+/// errors land on the value they name, and a schema issue typed later
+/// takes over at once.
+#[wasm_bindgen_test]
+async fn the_config_classes_errors_show_after_the_schema_passes() {
+    let (_mock, requests) = install_recording_fetch_mock(
+        r#"[{"asset":"api_data","loc":[{"Key":"batch_size"}],"message":"Input should be greater than 0","kind":"greater_than"},{"asset":"api_data","loc":[{"Key":"api_key"}],"message":"Field required","kind":"missing"}]"#,
+    );
+    let target = fresh_mount_target();
+    let selected = RwSignal::new(vec!["api_data".to_string()]);
+    let schemas = RwSignal::new(HashMap::from([(
+        "api_data".to_string(),
+        PIPELINE.to_string(),
+    )]));
+    let text = RwSignal::new(String::new());
+    let check = StoredValue::new(None::<Signal<Check>>);
+    mount_to(target.clone(), move || {
+        let checked = use_config_check(
+            text,
+            selected.into(),
+            schemas.into(),
+            Signal::derive(|| ("dev".to_string(), "demo".to_string())),
+            Signal::derive(|| None),
+        );
+        check.set_value(Some(checked));
+        view! {
+            <ConfigEditor
+                selected=selected
+                schemas=schemas
+                text=text
+                reset=Signal::derive(|| true)
+                check=checked
+            />
+        }
+    })
+    .forget();
+    flush_effects().await;
+
+    let issues = || {
+        query_all(&target, ".code-editor-issue")
+            .iter()
+            .map(|el| el.text_content().unwrap_or_default())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        wait_until(|| !issues().is_empty()).await,
+        "no answer arrived"
+    );
+    assert_eq!(
+        issues(),
+        vec!["3:19 api_data.batch_size: Input should be greater than 0"]
+    );
+    assert_eq!(
+        query_all(&target, ".code-editor-mark")
+            .iter()
+            .map(|el| el.text_content().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["100"]
+    );
+    let checked = check.get_value().unwrap().get_untracked();
+    assert_eq!(checked.payload, None);
+    assert_eq!(checked.missing, vec!["api_data.api_key"]);
+    let bodies = request_bodies(&requests.borrow().clone()).await;
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(bodies[0].contains("api_data"), "{}", bodies[0]);
+
+    // A schema issue takes over; the classes' answer was for other text.
+    let ta: HtmlTextAreaElement = query_one(&target, ".code-editor-text").dyn_into().unwrap();
+    ta.set_value("{\"api_data\": {\"batch_sizes\": 1}}");
+    dispatch(&ta, "input");
+    flush_effects().await;
+    assert_eq!(issues().len(), 1);
+    assert!(issues()[0].contains("unknown field 'batch_sizes'"));
 }

@@ -846,14 +846,14 @@ mod tests {
             p.map(|p| p.options.into_iter().map(|c| c.label).collect())
                 .unwrap_or_default()
         };
-        let text = "{\"ba";
+        let text = "{\"bat";
         assert_eq!(
-            labels(completion_at(text, 4, fields(), false)),
+            labels(completion_at(text, 5, fields(), false)),
             vec!["batch_size"]
         );
         // Case does not matter; an empty prefix needs Ctrl+Space.
         assert_eq!(
-            labels(completion_at("{\"BA", 4, fields(), false)),
+            labels(completion_at("{\"BAT", 5, fields(), false)),
             vec!["batch_size"]
         );
         assert_eq!(completion_at("{", 1, fields(), false), None);
@@ -893,19 +893,19 @@ mod tests {
                 caret,
             })
         };
-        let popup = completion_at("{\"ba", 4, fields(), false).unwrap();
+        let popup = completion_at("{\"bat", 5, fields(), false).unwrap();
         assert_eq!(
             completion_edit(&popup, 0),
-            insert(1, 4, "\"batch_size\": 100", 1 + 17)
+            insert(1, 5, "\"batch_size\": 100", 1 + 17)
         );
         assert_eq!(completion_edit(&popup, 7), None);
 
         // The key alone when its colon is there already.
-        let popup = completion_at("{\"ba\": 5}", 3, fields(), false).unwrap();
+        let popup = completion_at("{\"bat\": 5}", 3, fields(), false).unwrap();
         assert!(popup.key_only);
         assert_eq!(
             completion_edit(&popup, 0),
-            insert(1, 5, "\"batch_size\"", 1 + 12)
+            insert(1, 6, "\"batch_size\"", 1 + 12)
         );
 
         // Commas for the neighbours; the caret lands inside `\"\"`.

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use leptos::prelude::*;
 
-use crate::components::config_editor::{ConfigEditor, check_config, launch_config_schemas};
+use crate::components::config_editor::{ConfigEditor, launch_config_schemas, use_config_check};
 use crate::components::partition_picker::{PartitionPicker, WholeAssetChoice};
 use crate::helpers::{JobPartitionPicker, close_on_navigation, stale_status_kind};
 use crate::loc::{loc_path, use_current_location};
@@ -136,11 +136,6 @@ pub fn MaterializeDialog(
     let config_schemas = Signal::derive(move || {
         launch_config_schemas(&selected.get(), &definitions.get(), verb.get().as_deref())
     });
-    // Blank text is no overrides; the submit button waits for text without issues.
-    let config_check = Memo::new(move |_| {
-        check_config(&config_text.get(), &selected.get(), &config_schemas.get())
-    });
-
     Effect::new(move || {
         if show.get() {
             set_selected.set(asset_keys.get());
@@ -159,6 +154,9 @@ pub fn MaterializeDialog(
 
     let loc = use_current_location();
     close_on_navigation(show);
+    // Blank text is no overrides; the submit button waits for text without
+    // issues, from the schema at once and from the config classes shortly after.
+    let config_check = use_config_check(config_text, selected.into(), config_schemas, loc, verb);
 
     let materialize_action = Action::new(move |_: &()| {
         let sel = selected.get();

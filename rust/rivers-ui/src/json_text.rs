@@ -829,6 +829,28 @@ fn locate(text: &str, node: &Node, caret: usize, ctx: &mut Context) {
     }
 }
 
+/// The key span (none for an array item) and value span at `path` under
+/// `root`.
+pub fn span_at(root: &Node, path: &[PathSeg]) -> Option<(Option<Span>, Span)> {
+    let mut node = root;
+    let mut key_span = None;
+    for seg in path {
+        match (seg, node) {
+            (PathSeg::Key(key), Node::Object { entries, .. }) => {
+                let entry = entries.iter().find(|e| &e.key == key)?;
+                key_span = Some(entry.key_span);
+                node = &entry.value;
+            }
+            (PathSeg::Index(index), Node::Array { items, .. }) => {
+                node = items.get(*index)?;
+                key_span = None;
+            }
+            _ => return None,
+        }
+    }
+    Some((key_span, node.span()))
+}
+
 fn floor_boundary(text: &str, offset: usize) -> usize {
     let mut offset = offset.min(text.len());
     while !text.is_char_boundary(offset) {
@@ -1301,6 +1323,27 @@ mod tests {
         assert_eq!(ctx("|{}").slot, Slot::None);
         assert_eq!(ctx("{}|").slot, Slot::None);
         assert_eq!(ctx("|").slot, Slot::None);
+    }
+
+    #[test]
+    fn spans_are_found_by_path() {
+        let text = "{\"a\": {\"b\": [1, {\"c\": true}]}}";
+        let parsed = parse(text);
+        let root = parsed.root.as_ref().unwrap();
+        let at = |path: &[PathSeg]| span_at(root, path);
+        assert_eq!(at(&[]), Some((None, span(0, text.len()))));
+        assert_eq!(at(&[key("a")]), Some((Some(span(1, 4)), span(6, 29))));
+        assert_eq!(
+            at(&[key("a"), key("b"), PathSeg::Index(0)]),
+            Some((None, span(13, 14)))
+        );
+        assert_eq!(
+            at(&[key("a"), key("b"), PathSeg::Index(1), key("c")]),
+            Some((Some(span(17, 20)), span(22, 26)))
+        );
+        assert_eq!(at(&[key("zz")]), None);
+        assert_eq!(at(&[key("a"), PathSeg::Index(0)]), None);
+        assert_eq!(at(&[key("a"), key("b"), PathSeg::Index(5)]), None);
     }
 
     #[test]
