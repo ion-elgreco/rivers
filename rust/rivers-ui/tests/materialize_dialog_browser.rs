@@ -825,15 +825,25 @@ fn submit_disabled(host: &web_sys::HtmlElement) -> bool {
     .unwrap_or(false)
 }
 
-/// An asset without config gets no editor: the dialog reads as before.
+/// An asset without config still gets the editor: the document's
+/// `execution` section applies to any launch, and metadata can be added.
 #[wasm_bindgen_test]
-async fn config_editor_is_absent_without_a_schema() {
+async fn config_editor_offers_execution_for_a_plain_asset() {
     let show = RwSignal::new(true);
     let host = mount_with_definitions(show, vec![definition("plain", None)]);
     flush_effects().await;
 
-    assert!(query_all(&host, ".config-editor").is_empty());
+    assert_eq!(editor_value(&host), "{\n  \"execution\": {}\n}");
     assert!(!submit_disabled(&host));
+    type_config(&host, "{\"execution\": {\"max_workers\": 2}}");
+    flush_effects().await;
+    assert_eq!(
+        query_one(&host, ".code-editor-issue")
+            .text_content()
+            .unwrap_or_default(),
+        "1:16 execution: max_workers needs \"executor\": \"parallel\""
+    );
+    assert!(submit_disabled(&host));
 }
 
 /// The editor opens on the launch document with each configured asset's
@@ -853,7 +863,7 @@ async fn config_editor_prefills_defaults_and_hints_required_fields() {
 
     assert_eq!(
         editor_value(&host),
-        "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100\n      }\n    }\n  }\n}"
+        "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100\n      }\n    }\n  },\n  \"execution\": {}\n}"
     );
     assert_eq!(
         query_one(&host, ".config-editor-hint-fields")
@@ -888,7 +898,7 @@ async fn invalid_config_blocks_submit_until_reset() {
         query_one(&host, ".code-editor-issue")
             .text_content()
             .unwrap_or_default(),
-        "1:2 unknown field 'other'; expected one of assets"
+        "1:2 unknown field 'other'; expected one of assets, execution"
     );
     assert!(submit_disabled(&host));
 
@@ -897,7 +907,7 @@ async fn invalid_config_blocks_submit_until_reset() {
     assert!(query_all(&host, ".code-editor-issue").is_empty());
     assert_eq!(
         editor_value(&host),
-        "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100\n      }\n    }\n  }\n}"
+        "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100\n      }\n    }\n  },\n  \"execution\": {}\n}"
     );
     assert!(!submit_disabled(&host));
 }
@@ -938,7 +948,8 @@ async fn config_editor_lists_resources_by_key() {
     flush_effects().await;
 
     assert!(
-        editor_value(&target).ends_with("  \"resources\": {\n    \"db\": {}\n  }\n}"),
+        editor_value(&target)
+            .ends_with("  \"execution\": {},\n  \"resources\": {\n    \"db\": {}\n  }\n}"),
         "{}",
         editor_value(&target)
     );
@@ -956,8 +967,9 @@ async fn config_editor_lists_resources_by_key() {
     assert!(submit_disabled(&target));
 }
 
-/// Unchecking the only configured asset removes the editor; checking it
-/// again brings the defaults back (the user had not typed).
+/// Unchecking the only configured asset leaves the editor with the
+/// document's `execution` section; checking it again brings the defaults
+/// back (the user had not typed).
 #[wasm_bindgen_test]
 async fn config_editor_follows_the_checked_assets() {
     let show = RwSignal::new(true);
@@ -974,7 +986,7 @@ async fn config_editor_follows_the_checked_assets() {
     let checkboxes = query_all(&host, ".mat-dialog-asset-list .asset-row-check");
     set_checked(&checkboxes[1], false);
     flush_effects().await;
-    assert!(query_all(&host, ".config-editor").is_empty());
+    assert_eq!(editor_value(&host), "{\n  \"execution\": {}\n}");
 
     set_checked(&checkboxes[1], true);
     // The template effect runs after the Show has mounted the textarea, so
@@ -983,6 +995,6 @@ async fn config_editor_follows_the_checked_assets() {
     flush_effects().await;
     assert_eq!(
         editor_value(&host),
-        "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100\n      }\n    }\n  }\n}"
+        "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100\n      }\n    }\n  },\n  \"execution\": {}\n}"
     );
 }

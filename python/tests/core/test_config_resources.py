@@ -1696,6 +1696,107 @@ def test_metadata_override_picks_the_executor(tmp_path, default):
     assert [repo.load_node(n) != me for n in ("m1", "m2")] == [not in_workers] * 2
 
 
+@pytest.mark.parametrize("default", ["in_process", "parallel"])
+def test_execution_picks_the_runs_executor(tmp_path, default):
+    """`execution.executor` replaces the repository's executor for the run;
+    an asset's own `rivers/executor` metadata still wins for its step."""
+    import os
+
+    import obstore.store
+
+    store = rs.PickleIOHandler(
+        store=obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    )
+
+    def pid_asset(name, metadata=None):
+        @rs.Asset(name=name, io_handler=store, metadata=metadata)
+        def where() -> int:
+            return os.getpid()
+
+        return where
+
+    other = "parallel" if default == "in_process" else "in_process"
+    repo = rs.CodeRepository(
+        assets=[
+            pid_asset("a"),
+            pid_asset("b"),
+            pid_asset("own", {"rivers/executor": default}),
+            pid_asset("own2", {"rivers/executor": default}),
+        ],
+        default_executor=(
+            rs.Executor.in_process()
+            if default == "in_process"
+            else rs.Executor.parallel(max_workers=2)
+        ),
+    )
+    me = os.getpid()
+    in_workers = default == "parallel"
+    repo.materialize()
+    assert [repo.load_node(n) != me for n in ("a", "b", "own", "own2")] == [
+        in_workers
+    ] * 4
+
+    execution = {"executor": other}
+    if other == "parallel":
+        execution["max_workers"] = 2
+    result = repo.materialize(config={"execution": execution})
+    assert [repo.load_node(n) != me for n in ("a", "b")] == [not in_workers] * 2
+    assert [repo.load_node(n) != me for n in ("own", "own2")] == [in_workers] * 2
+    assert repo.storage.get_run(result.run_id).config == {"execution": execution}
+
+
+def test_execution_applies_to_a_job_with_its_own_executor(tmp_path):
+    import os
+
+    import obstore.store
+
+    store = rs.PickleIOHandler(
+        store=obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    )
+
+    @rs.Asset(io_handler=store)
+    def one() -> int:
+        return os.getpid()
+
+    @rs.Asset(io_handler=store)
+    def two() -> int:
+        return os.getpid()
+
+    repo = rs.CodeRepository(
+        assets=[one, two],
+        jobs=[rs.Job(name="j", assets=[one, two], executor=rs.Executor.in_process())],
+        default_executor=rs.Executor.parallel(max_workers=2),
+    )
+    repo.resolve()
+    job = repo.get_job("j")
+    job.execute()
+    assert repo.load_node("one") == os.getpid()
+    job.execute(config={"execution": {"executor": "parallel", "max_workers": 2}})
+    assert repo.load_node("one") != os.getpid()
+    assert repo.load_node("two") != os.getpid()
+
+
+@pytest.mark.parametrize(
+    ("execution", "detail"),
+    [
+        ({"executor": "kubernetes"}, "executor must be one of in_process, parallel"),
+        ({"max_workers": 2}, "max_workers applies to the parallel executor"),
+        ({"executor": "parallel", "max_workers": 0}, "must be a positive integer"),
+        ({"workers": 2}, "unknown key 'workers'"),
+    ],
+)
+def test_execution_shape_is_refused_before_a_run_exists(execution, detail):
+    @rs.Asset
+    def plain() -> int:
+        return 1
+
+    repo = rs.CodeRepository(assets=[plain])
+    repo.resolve()
+    with pytest.raises(ConfigurationError, match=detail):
+        repo.materialize(config={"execution": execution})
+    assert repo.storage.get_runs(limit=10) == []
+
+
 def test_metadata_override_on_a_task_is_refused():
     @rs.Task
     def chore(context: rs.TaskExecutionContext) -> int:

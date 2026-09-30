@@ -48,22 +48,18 @@ pub fn launch_takes_config(
         .any(|def| config_schema_of(def, verb).is_some() || !def.metadata.is_empty())
 }
 
-/// The JSON schema of the launch document for `keys`, or `None` when the
-/// launch takes no config. Under `assets`, each selected key gets `config`
-/// (its class schema, when it has one) and, unless it is a task,
-/// `metadata`: its keys as string fields defaulting to the current values,
-/// any other key allowed. Under `resources`, each of `resources` by key;
-/// the template lists the keys alone, so a resource is rebuilt only when
-/// a value is typed.
+/// The JSON schema of the launch document for `keys`. Under `assets`, each
+/// selected key gets `config` (its class schema, when it has one) and,
+/// unless it is a task, `metadata`: its keys as string fields defaulting
+/// to the current values, any other key allowed. Under `resources`, each of
+/// `resources` by key; the template lists the keys alone, so a resource is
+/// rebuilt only when a value is typed. `execution` names the run's executor.
 pub fn launch_schema(
     keys: &[String],
     definitions: &HashMap<String, AssetDefinitionInfo>,
     resources: &[ResourceInfo],
     verb: Option<&str>,
-) -> Option<String> {
-    if !launch_takes_config(keys, definitions, verb) {
-        return None;
-    }
+) -> String {
     let mut assets = Map::new();
     for key in keys {
         let Some(def) = definitions.get(key) else {
@@ -142,12 +138,35 @@ pub fn launch_schema(
             }),
         );
     }
+    sections.insert(
+        "execution".to_string(),
+        json!({
+            "type": "object",
+            "description": "the run's executor; an asset's rivers/executor metadata still wins for its step",
+            "properties": {
+                "executor": {"type": "string", "enum": ["in_process", "parallel"]},
+                "max_workers": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "worker processes",
+                    "x-requires": {"executor": "parallel"}
+                },
+                "max_async_concurrent": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "async steps in flight per worker",
+                    "x-requires": {"executor": "parallel"}
+                }
+            },
+            "additionalProperties": false
+        }),
+    );
     let document = json!({
         "type": "object",
         "properties": sections,
         "additionalProperties": false
     });
-    Some(document.to_string())
+    document.to_string()
 }
 
 /// The editor's opening text: the defaults of every config class and the
@@ -346,9 +365,8 @@ pub fn completions(text: &str, caret: usize, schema_json: Option<&str>) -> Vec<C
 }
 
 /// The dialog section: the code editor over `text`, the required-fields
-/// hint and a reset. Renders nothing without a schema. `reset` turning
-/// true (the dialog opening) refills the template; a schema change does
-/// too until the user has typed.
+/// hint and a reset. `reset` turning true (the dialog opening) refills the
+/// template; a schema change does too until the user has typed.
 #[component]
 pub fn ConfigEditor(
     #[prop(into)] schema: Signal<Option<String>>,
@@ -484,7 +502,6 @@ mod tests {
             &[resource("db", DB)],
             None,
         )
-        .unwrap()
     }
 
     fn messages(check: &Check) -> Vec<(String, Span)> {
@@ -500,7 +517,8 @@ mod tests {
         let text = config_template(&schema()).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
         // `api_key` has no default, so it is never pre-filled; an asset
-        // without metadata gets no `metadata`.
+        // without metadata gets no `metadata`; a resource is listed by key
+        // alone, its values sent only when typed; `execution` has no defaults.
         assert_eq!(
             value,
             json!({
@@ -509,18 +527,18 @@ mod tests {
                     "cfg": {"config": {"threshold": 0.5, "max_retries": 3}},
                     "plain": {"metadata": {"owner": "data"}}
                 },
+                "execution": {},
                 "resources": {"db": {}}
             })
         );
-        // No selected asset takes config: no schema, no editor, resources or not.
+        // No selected asset takes config: a one-click launch, but the dialog
+        // still edits `execution` (and metadata to add) when opened.
         let defs = definitions(vec![
             definition("bare", None, &[]),
             definition("api", Some(PIPELINE), &[]),
         ]);
-        assert_eq!(
-            launch_schema(&keys(&["bare"]), &defs, &[resource("db", DB)], None),
-            None
-        );
+        let bare = launch_schema(&keys(&["bare"]), &defs, &[], None);
+        assert_eq!(config_template(&bare).unwrap(), "{\n  \"execution\": {}\n}");
         assert!(!launch_takes_config(&keys(&["bare"]), &defs, None));
         assert!(launch_takes_config(&keys(&["bare", "api"]), &defs, None));
     }
@@ -529,10 +547,10 @@ mod tests {
     fn template_lists_a_config_class_without_defaults() {
         let class = r#"{"properties":{"api_key":{"type":"string"}},"required":["api_key"],"type":"object"}"#;
         let defs = definitions(vec![definition("api", Some(class), &[])]);
-        let schema = launch_schema(&keys(&["api"]), &defs, &[], None).unwrap();
+        let schema = launch_schema(&keys(&["api"]), &defs, &[], None);
         assert_eq!(
             config_template(&schema).unwrap(),
-            "{\n  \"assets\": {\n    \"api\": {\n      \"config\": {}\n    }\n  }\n}"
+            "{\n  \"assets\": {\n    \"api\": {\n      \"config\": {}\n    }\n  },\n  \"execution\": {}\n}"
         );
     }
 
@@ -551,7 +569,7 @@ mod tests {
         let selected = keys(&["a", "b"]);
         let class_of = |verb: Option<&str>| -> Option<String> {
             let schema: Value =
-                serde_json::from_str(&launch_schema(&selected, &defs, &[], verb)?).unwrap();
+                serde_json::from_str(&launch_schema(&selected, &defs, &[], verb)).unwrap();
             schema
                 .pointer("/properties/assets/properties/a/properties/config/title")
                 .and_then(Value::as_str)
@@ -568,7 +586,7 @@ mod tests {
         task.asset_type = "task".into();
         let defs = definitions(vec![task]);
         let schema: Value =
-            serde_json::from_str(&launch_schema(&keys(&["t"]), &defs, &[], None).unwrap()).unwrap();
+            serde_json::from_str(&launch_schema(&keys(&["t"]), &defs, &[], None)).unwrap();
         let sections = schema
             .pointer("/properties/assets/properties/t/properties")
             .and_then(Value::as_object)
@@ -585,7 +603,7 @@ mod tests {
         assert_eq!(check("{}").payload, None);
         // The template's entries, left untouched.
         assert_eq!(
-            check(r#"{"assets": {"api": {"config": {}}, "plain": {"metadata": {}}}, "resources": {"db": {}}}"#).payload,
+            check(r#"{"assets": {"api": {"config": {}}, "plain": {"metadata": {}}}, "resources": {"db": {}}, "execution": {}}"#).payload,
             None
         );
         // Without a schema there is no document.
@@ -629,7 +647,7 @@ mod tests {
         assert_eq!(
             messages(&check(r#"{"other": {"x": 1}}"#)),
             vec![(
-                "unknown field 'other'; expected one of assets, resources".to_string(),
+                "unknown field 'other'; expected one of assets, execution, resources".to_string(),
                 Span { start: 1, end: 8 }
             )]
         );
@@ -803,7 +821,7 @@ mod tests {
                 .collect()
         };
         // Sections, then the selected assets, then what each asset has.
-        assert_eq!(labels("{", 1), keys(&["assets", "resources"]));
+        assert_eq!(labels("{", 1), keys(&["assets", "execution", "resources"]));
         let section = &completions("{", 1, Some(&schema))[0];
         assert_eq!(section.insert, "\"assets\": {}");
         assert_eq!(section.caret, 11);
@@ -876,6 +894,46 @@ mod tests {
             Some(r#"{"resources":{"db":{"pool_size":8,"token":"t"}}}"#)
         );
         assert_eq!(check(r#"{"resources": {"db": {}}}"#).payload, None);
+    }
+
+    #[test]
+    fn execution_names_the_executor_and_its_counts() {
+        let schema = schema();
+        let check = |text: &str| check_config(text, Some(&schema));
+        let set = check(r#"{"execution": {"executor": "parallel", "max_workers": 4}}"#);
+        assert!(set.issues.is_empty(), "{:?}", set.issues);
+        assert_eq!(
+            set.payload.as_deref(),
+            Some(r#"{"execution":{"executor":"parallel","max_workers":4}}"#)
+        );
+        assert_eq!(
+            messages(&check(r#"{"execution": {"executor": "k8s"}}"#)),
+            vec![(
+                "execution.executor: expected one of \"in_process\", \"parallel\"".to_string(),
+                Span { start: 27, end: 32 }
+            )]
+        );
+        assert_eq!(
+            messages(&check(r#"{"execution": {"max_workers": 2}}"#)),
+            vec![(
+                "execution: max_workers needs \"executor\": \"parallel\"".to_string(),
+                Span { start: 15, end: 28 }
+            )]
+        );
+        let labels = |text: &str, caret: usize| -> Vec<String> {
+            completions(text, caret, Some(&schema))
+                .into_iter()
+                .map(|c| c.label)
+                .collect()
+        };
+        assert_eq!(
+            labels("{\"execution\": {", 15),
+            keys(&["executor", "max_async_concurrent", "max_workers"])
+        );
+        assert_eq!(
+            labels("{\"execution\": {\"executor\": ", 27),
+            keys(&["\"in_process\"", "\"parallel\""])
+        );
     }
 
     #[test]

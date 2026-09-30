@@ -442,6 +442,45 @@ def test_metadata_override_picks_the_executor(direct):
     assert repo.load_node("pid2") != os.getpid()
 
 
+def test_execution_picks_the_runs_executor(direct):
+    stub, pb2, repo = direct
+    document = {"execution": {"executor": "parallel", "max_workers": 2}}
+    resp = stub.Materialize(
+        pb2.MaterializeRequest(selection=["pid", "pid2"], config=json.dumps(document))
+    )
+    run = wait_for_run_terminal(repo.storage, resp.run_id)
+    assert run.status == "Success"
+    assert repo.load_node("pid") != os.getpid()
+    assert repo.load_node("pid2") != os.getpid()
+    assert run.config == document
+
+
+@pytest.mark.parametrize(
+    ("execution", "detail"),
+    [
+        ({"executor": "kubernetes"}, "executor must be one of in_process, parallel"),
+        ({"max_workers": 2}, "max_workers applies to the parallel executor"),
+        ({"executor": "parallel", "max_async_concurrent": 0}, "positive integer"),
+    ],
+)
+def test_execution_shape_is_rejected_at_the_boundary(direct, execution, detail):
+    stub, pb2, repo = direct
+    document = json.dumps({"execution": execution})
+    for call in (
+        lambda: stub.ValidateConfig(
+            pb2.ValidateConfigRequest(selection=["plain"], config=document)
+        ),
+        lambda: stub.Materialize(
+            pb2.MaterializeRequest(selection=["plain"], config=document)
+        ),
+    ):
+        with pytest.raises(grpc.RpcError) as exc:
+            call()
+        assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert detail in exc.value.details()
+    assert repo.storage.get_runs(limit=10) == []
+
+
 def test_metadata_on_a_task_is_refused(direct):
     stub, pb2, repo = direct
     document = {"assets": {"tidy": {"metadata": {"k": "v"}}}}

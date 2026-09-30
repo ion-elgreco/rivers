@@ -431,6 +431,23 @@ pub fn AssetDetailPage() -> impl IntoView {
                                 "Materialize"
                             }}
                         </button>
+                        // The one-click launch runs as defined; the dialog
+                        // edits the launch document (metadata, resources,
+                        // executor) for any asset.
+                        <Show when=move || !materialize_opens_dialog.get()>
+                            <button
+                                class="btn"
+                                title="Materialize with a launch document"
+                                on:click=move |_| {
+                                    dialog_verb.set(None);
+                                    dialog_destructive.set(false);
+                                    show_dialog.set(true);
+                                }
+                                disabled=move || materialize_pending.get()
+                            >
+                                "Materialize…"
+                            </button>
+                        </Show>
                     }.into_any()
                 }
             }}

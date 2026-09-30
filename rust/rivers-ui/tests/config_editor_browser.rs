@@ -65,7 +65,7 @@ fn document_schema(classes: &[(&str, &str)]) -> String {
         .iter()
         .map(|(k, v)| (k.to_string(), definition(k, v)))
         .collect();
-    launch_schema(&keys, &definitions, &[], None).expect("a launch with config")
+    launch_schema(&keys, &definitions, &[], None)
 }
 
 fn mount(classes: &[(&str, &str)]) -> Editor {
@@ -187,7 +187,7 @@ async fn highlights_tokens_by_class() {
 
     assert_eq!(
         e.value(),
-        "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100,\n        \"mode\": \"fast\"\n      }\n    }\n  }\n}"
+        "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100,\n        \"mode\": \"fast\"\n      }\n    }\n  },\n  \"execution\": {}\n}"
     );
     assert_eq!(
         e.texts(".tok-key"),
@@ -196,7 +196,8 @@ async fn highlights_tokens_by_class() {
             "\"api_data\"",
             "\"config\"",
             "\"batch_size\"",
-            "\"mode\""
+            "\"mode\"",
+            "\"execution\""
         ]
     );
     assert_eq!(e.texts(".tok-num"), vec!["100"]);
@@ -250,7 +251,7 @@ async fn wrong_types_and_syntax_errors_are_issues() {
     flush_effects().await;
     assert_eq!(
         e.issues(),
-        vec!["1:2 unknown field 'other'; expected one of assets"]
+        vec!["1:2 unknown field 'other'; expected one of assets, execution"]
     );
 
     e.type_text("{\"assets\": {\"api_data\": {\"config\": {\"batch_size\": 5}}}}");
@@ -332,7 +333,10 @@ async fn insert_missing_fields_adds_required_keys() {
     let value: serde_json::Value = serde_json::from_str(&e.value()).unwrap();
     assert_eq!(
         value,
-        serde_json::json!({"assets": {"api_data": {"config": {"api_key": "", "batch_size": 100, "mode": "fast"}}}})
+        serde_json::json!({
+            "assets": {"api_data": {"config": {"api_key": "", "batch_size": 100, "mode": "fast"}}},
+            "execution": {}
+        })
     );
     assert_eq!(e.hint(), None);
 
@@ -468,7 +472,7 @@ async fn sections_and_assets_complete_and_a_click_inserts() {
     assert!(query_all(&e.host, ".code-editor-popup").is_empty());
     assert!(e.press(" ", true));
     flush_effects().await;
-    assert_eq!(e.options(), vec!["assets"]);
+    assert_eq!(e.options(), vec!["assets", "execution"]);
     assert!(e.press("Escape", false));
 
     e.type_text("{\"assets\": {");

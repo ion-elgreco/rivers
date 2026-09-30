@@ -262,6 +262,21 @@ pub fn JobDetailPage() -> impl IntoView {
                     "Execute".to_string()
                 }}
             </button>
+            // The one-click launch runs the job as defined; the dialog edits
+            // the launch document (metadata, resources, executor) for any job.
+            <Show when=move || job_loaded.get() && !job_opens_dialog.get()>
+                <button
+                    class="btn"
+                    title="Execute with a launch document"
+                    on:click=move |_| {
+                        set_exec_error.set(None);
+                        show_dialog.set(true);
+                    }
+                    disabled=move || exec_pending.get()
+                >
+                    "Execute…"
+                </button>
+            </Show>
         </Topbar>
 
         <ExecuteJobDialog
