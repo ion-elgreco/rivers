@@ -88,7 +88,7 @@ def test_action_config_under_pep563(form):
 
     assert repo.run_action("vacuum").success
     assert repo.run_action(
-        "vacuum", config={"events": {"retention_hours": 720}}
+        "vacuum", config={"assets": {"events": {"config": {"retention_hours": 720}}}}
     ).success
     assert seen == [
         VacuumConfig(retention_hours=168),
@@ -116,7 +116,7 @@ def test_action_config_ignores_unresolved_resource_annotation():
         default_executor=IP,
     )
     assert repo.run_action(
-        "vacuum", config={"events": {"retention_hours": 720}}
+        "vacuum", config={"assets": {"events": {"config": {"retention_hours": 720}}}}
     ).success
     assert seen == [(VacuumConfig(retention_hours=720), "from-repo")]
 
@@ -144,7 +144,7 @@ def test_action_unresolved_config_type_rejects_override():
 
     result = repo.run_action(
         "vacuum",
-        config={"events": {"retention_hours": 720}},
+        config={"assets": {"events": {"config": {"retention_hours": 720}}}},
         raise_on_error=False,
     )
     assert not result.success
@@ -170,6 +170,6 @@ def test_action_without_config_type_ignores_override_under_pep563():
 
     repo = rs.CodeRepository(assets=[events], default_executor=IP)
     assert repo.run_action(
-        "vacuum", config={"events": {"retention_hours": 720}}
+        "vacuum", config={"assets": {"events": {"config": {"retention_hours": 720}}}}
     ).success
     assert seen == [None]

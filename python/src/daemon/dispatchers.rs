@@ -7,13 +7,12 @@ use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{RunRecord, RunStatus};
 
 use super::types::{BackfillRequestData, MaterializationRequestData, RunRequestData};
-use crate::config::run_config::{parse_run_config, parse_run_config_json};
 use crate::gil_threads::GilThreads;
 use crate::partitions::PyPartitionKey;
 use crate::repository::{PyBackfillResult, PyCodeRepository, RepoHandle, priority_from_tags};
 
 /// Launch a `Started` run on a fresh OS thread. `config` is the record's
-/// stored overrides.
+/// stored launch document.
 pub(crate) fn launch_started_run(
     handle: RepoHandle,
     job_name: String,
@@ -37,14 +36,9 @@ pub(crate) fn launch_started_run(
                     return;
                 }
             };
-            let launched = config
-                .as_deref()
-                .map(|s| parse_run_config(py, s))
-                .transpose()
-                .and_then(|config| {
-                    job.borrow(py)
-                        .execute_run(py, &run_id, partition_key, config, false, true)
-                });
+            let launched =
+                job.borrow(py)
+                    .execute_stored_run(py, &run_id, partition_key, config, false, true);
             if let Err(e) = launched {
                 tracing::error!(
                     target: "rivers::executor",
@@ -199,40 +193,39 @@ impl DirectRunDispatcher {
             let py_pk = req.partition_key.as_ref().map(PyPartitionKey::from);
             let launched_by = req.launched_by.clone();
             let action = req.action.clone();
-            let config_json = req.config.clone();
+            let config = req.config.clone();
             self.gil_threads.spawn(move || {
-                let result =
-                    parse_run_config_json(config_json.as_deref()).and_then(|config| match action {
-                        Some(action) => repo
-                            .get()
-                            .run_action_with_launcher(
-                                action,
-                                Some(assets),
-                                py_pk,
-                                None,
-                                false,
-                                config,
-                                Some(run_id.clone()),
-                                false,
-                                launched_by,
-                            )
-                            .map(|_| ()),
-                        None => repo
-                            .get()
-                            .materialize_with_launcher(
-                                Some(assets),
-                                py_pk,
-                                None,
-                                false,
-                                config,
-                                Some(run_id.clone()),
-                                false,
-                                false,
-                                None,
-                                launched_by,
-                            )
-                            .map(|_| ()),
-                    });
+                let result = match action {
+                    Some(action) => repo
+                        .get()
+                        .run_action_with_launcher(
+                            action,
+                            Some(assets),
+                            py_pk,
+                            None,
+                            false,
+                            config,
+                            Some(run_id.clone()),
+                            false,
+                            launched_by,
+                        )
+                        .map(|_| ()),
+                    None => repo
+                        .get()
+                        .materialize_with_launcher(
+                            Some(assets),
+                            py_pk,
+                            None,
+                            false,
+                            config,
+                            Some(run_id.clone()),
+                            false,
+                            false,
+                            None,
+                            launched_by,
+                        )
+                        .map(|_| ()),
+                };
                 if let Err(e) = result {
                     tracing::error!(
                         target: "rivers::daemon",
@@ -465,23 +458,21 @@ impl LocalBackfillDispatcher {
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect::<Vec<(String, String)>>()
                 });
-                let result = match parse_run_config_json(bf.config.as_deref()).and_then(|config| {
-                    repo.get().backfill_inner(
-                        target,
-                        bf.partition_keys.clone(),
-                        bf.partition_range.clone(),
-                        bf.strategy.clone(),
-                        bf.failure_policy.as_deref().unwrap_or("continue"),
-                        bf.max_concurrency,
-                        tags,
-                        config,
-                        false, // block=false
-                        bf.dry_run,
-                        bf.backfill_id.clone(),
-                        bf.launched_by.clone(),
-                        bf.action.clone(),
-                    )
-                }) {
+                let result = match repo.get().backfill_inner(
+                    target,
+                    bf.partition_keys.clone(),
+                    bf.partition_range.clone(),
+                    bf.strategy.clone(),
+                    bf.failure_policy.as_deref().unwrap_or("continue"),
+                    bf.max_concurrency,
+                    tags,
+                    bf.config.clone(),
+                    false, // block=false
+                    bf.dry_run,
+                    bf.backfill_id.clone(),
+                    bf.launched_by.clone(),
+                    bf.action.clone(),
+                ) {
                     Ok(result) => {
                         tracing::info!(
                             target: "rivers::daemon",

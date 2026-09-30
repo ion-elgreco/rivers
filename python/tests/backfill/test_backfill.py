@@ -462,7 +462,7 @@ class TestBackfillConfig:
         result = repo.backfill(
             selection=["asset"],
             partition_keys=[rs.PartitionKey.single("x")],
-            config={"asset": {"mode": "full_refresh"}},
+            config={"assets": {"asset": {"config": {"mode": "full_refresh"}}}},
         )
         assert result.completed == 1
         assert captured.get("mode") == "full_refresh"
@@ -496,7 +496,7 @@ class TestBackfillConfig:
             repo.materialize(partition_key=key)
         calls.clear()
         verb = action or "materialize"
-        config = {"events": {"dry_run": True}}
+        config = {"assets": {"events": {"config": {"dry_run": True}}}}
 
         preview = repo.backfill(
             selection=["events"],

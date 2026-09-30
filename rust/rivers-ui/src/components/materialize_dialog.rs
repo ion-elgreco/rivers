@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use leptos::prelude::*;
 
-use crate::components::config_editor::{ConfigEditor, launch_config_schemas, use_config_check};
+use crate::components::config_editor::{ConfigEditor, launch_schema, use_config_check};
 use crate::components::partition_picker::{PartitionPicker, WholeAssetChoice};
 use crate::helpers::{JobPartitionPicker, close_on_navigation, stale_status_kind};
 use crate::loc::{loc_path, use_current_location};
@@ -133,8 +133,8 @@ pub fn MaterializeDialog(
     let definitions: Signal<HashMap<String, AssetDefinitionInfo>> =
         definitions.unwrap_or_else(|| Signal::derive(HashMap::new));
     let config_text = RwSignal::new(String::new());
-    let config_schemas = Signal::derive(move || {
-        launch_config_schemas(&selected.get(), &definitions.get(), verb.get().as_deref())
+    let config_schema = Signal::derive(move || {
+        launch_schema(&selected.get(), &definitions.get(), verb.get().as_deref())
     });
     Effect::new(move || {
         if show.get() {
@@ -156,7 +156,7 @@ pub fn MaterializeDialog(
     close_on_navigation(show);
     // Blank text is no overrides; the submit button waits for text without
     // issues, from the schema at once and from the config classes shortly after.
-    let config_check = use_config_check(config_text, selected.into(), config_schemas, loc, verb);
+    let config_check = use_config_check(config_text, selected.into(), config_schema, loc, verb);
 
     let materialize_action = Action::new(move |_: &()| {
         let sel = selected.get();
@@ -457,8 +457,7 @@ pub fn MaterializeDialog(
                         </div>
 
                         <ConfigEditor
-                            selected=selected
-                            schemas=config_schemas
+                            schema=config_schema
                             text=config_text
                             reset=show
                             check=config_check

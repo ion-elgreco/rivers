@@ -1,8 +1,10 @@
-//! Per-asset config editor shared by the launch dialogs.
+//! The launch document editor shared by the launch dialogs.
 //!
-//! The text is the JSON the backend stores on the run —
-//! `{"asset": {"field": value}}`. It opens pre-filled with each selected
-//! asset's schema defaults; a field without a default (required, or a
+//! The text is the JSON the backend stores on the run:
+//! `{"assets": {"raw_users": {"config": {...}, "metadata": {...}}}}`.
+//! [`launch_schema`] composes one JSON schema from the selected assets'
+//! definitions; the template, the checks, the completions and the scaffold
+//! all read that schema. A field without a default (required, or a
 //! `BaseSettings` field the environment resolves) is hinted, never sent.
 //! [`check_config`] gives the dialogs the issues that block a submit and
 //! the payload to send.
@@ -11,107 +13,123 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use leptos::prelude::*;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::components::code_editor::CodeEditor;
 use crate::config_schema::{self, Candidate, Schema};
-use crate::json_text::{self, Issue, Node, PathSeg, Slot, Span};
+use crate::json_text::{self, Issue, PathSeg, Slot, Span};
 use crate::server_fns::mutations::validate_config;
 use crate::types::{AssetDefinitionInfo, ConfigError, ConfigLoc};
 
-fn properties(schema_json: &str) -> Option<Map<String, Value>> {
-    let schema: Value = serde_json::from_str(schema_json).ok()?;
-    schema.get("properties")?.as_object().cloned()
+/// The config class schema a launch of `def` uses: its own for materialize,
+/// the verb's declaration for an action run.
+fn config_schema_of<'a>(def: &'a AssetDefinitionInfo, verb: Option<&str>) -> Option<&'a str> {
+    match verb {
+        Some(verb) => def
+            .actions
+            .iter()
+            .find(|a| a.name == verb)?
+            .config_schema
+            .as_deref(),
+        None => def.config_schema.as_deref(),
+    }
 }
 
-/// The config schema per key for a launch: each asset's own for materialize,
-/// or the verb's declaration on each asset for an action run. Keys without
-/// config are absent.
-pub fn launch_config_schemas(
-    keys: &[String],
-    definitions: &HashMap<String, AssetDefinitionInfo>,
-    verb: Option<&str>,
-) -> HashMap<String, String> {
-    keys.iter()
-        .filter_map(|key| {
-            let def = definitions.get(key)?;
-            let schema = match verb {
-                Some(verb) => def
-                    .actions
-                    .iter()
-                    .find(|a| a.name == verb)?
-                    .config_schema
-                    .clone()?,
-                None => def.config_schema.clone()?,
-            };
-            Some((key.clone(), schema))
-        })
-        .collect()
-}
-
-/// Whether a launch of `keys` has anything for the editor — a one-click
-/// launch must open the dialog instead when it does.
+/// Whether a launch of `keys` has anything for the editor: a config class
+/// or metadata on a selected key. A one-click launch must open the dialog
+/// instead when it does.
 pub fn launch_takes_config(
     keys: &[String],
     definitions: &HashMap<String, AssetDefinitionInfo>,
     verb: Option<&str>,
 ) -> bool {
-    !launch_config_schemas(keys, definitions, verb).is_empty()
+    keys.iter()
+        .filter_map(|key| definitions.get(key))
+        .any(|def| config_schema_of(def, verb).is_some() || !def.metadata.is_empty())
 }
 
-/// The editor's opening text: every selected key with a schema, holding its
-/// fields' defaults. `None` when no selected key takes config.
-pub fn config_template(selected: &[String], schemas: &HashMap<String, String>) -> Option<String> {
-    let mut root = Map::new();
-    for key in selected {
-        let Some(schema) = schemas.get(key) else {
-            continue;
-        };
-        let defaults: Map<String, Value> = properties(schema)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(name, prop)| Some((name, prop.get("default")?.clone())))
-            .collect();
-        root.insert(key.clone(), Value::Object(defaults));
-    }
-    if root.is_empty() {
+/// The JSON schema of the launch document for `keys`, or `None` when the
+/// launch takes no config. Under `assets`, each selected key gets `config`
+/// (its class schema, when it has one) and, unless it is a task,
+/// `metadata`: its keys as string fields defaulting to the current values,
+/// any other key allowed.
+pub fn launch_schema(
+    keys: &[String],
+    definitions: &HashMap<String, AssetDefinitionInfo>,
+    verb: Option<&str>,
+) -> Option<String> {
+    if !launch_takes_config(keys, definitions, verb) {
         return None;
     }
-    serde_json::to_string_pretty(&Value::Object(root)).ok()
-}
-
-/// What a submit sends: `None` for blank text or no overrides, else the JSON
-/// compacted, after the checks the backend repeats — an object of objects
-/// whose keys are in the selection. A key with an empty object (how the
-/// template lists an asset without defaults) is dropped.
-pub fn validate_config_text(text: &str, selected: &[String]) -> Result<Option<String>, String> {
-    if text.trim().is_empty() {
-        return Ok(None);
-    }
-    let value: Value =
-        serde_json::from_str(text).map_err(|e| format!("Config is not valid JSON: {e}"))?;
-    let Value::Object(map) = value else {
-        return Err("Config must be a JSON object keyed by asset name.".to_string());
-    };
-    let mut out = Map::new();
-    for (key, overrides) in map {
-        if !selected.contains(&key) {
-            return Err(format!("'{key}' is not in the selection."));
-        }
-        let Value::Object(fields) = overrides else {
-            return Err(format!(
-                "Config for '{key}' must be a JSON object of field values."
-            ));
+    let mut assets = Map::new();
+    for key in keys {
+        let Some(def) = definitions.get(key) else {
+            continue;
         };
-        if fields.is_empty() {
+        let mut sections = Map::new();
+        if let Some(class) = config_schema_of(def, verb) {
+            let at = [
+                "properties",
+                "assets",
+                "properties",
+                key,
+                "properties",
+                "config",
+            ];
+            if let Some(config) = config_schema::inline(class, &at) {
+                sections.insert("config".to_string(), config);
+            }
+        }
+        let is_task = def.asset_type == "task";
+        if !is_task {
+            let current: Map<String, Value> = def
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), json!({"type": "string", "default": v})))
+                .collect();
+            sections.insert(
+                "metadata".to_string(),
+                json!({
+                    "type": "object",
+                    "description": "metadata for this run: keys added to or replacing the asset's own",
+                    "properties": current,
+                    "additionalProperties": {"type": "string"}
+                }),
+            );
+        }
+        if sections.is_empty() {
             continue;
         }
-        out.insert(key, Value::Object(fields));
+        assets.insert(
+            key.clone(),
+            json!({
+                "type": "object",
+                "description": if is_task { "task" } else { "asset" },
+                "properties": sections,
+                "additionalProperties": false
+            }),
+        );
     }
-    if out.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(Value::Object(out).to_string()))
+    let document = json!({
+        "type": "object",
+        "properties": {
+            "assets": {
+                "type": "object",
+                "description": "per-asset overrides for this run",
+                "properties": assets,
+                "additionalProperties": false
+            }
+        },
+        "additionalProperties": false
+    });
+    Some(document.to_string())
+}
+
+/// The editor's opening text: the defaults of every config class and the
+/// current metadata of every selected asset, in the document's shape.
+pub fn config_template(schema_json: &str) -> Option<String> {
+    let schema = Schema::parse(schema_json)?;
+    serde_json::to_string_pretty(&config_schema::template(&schema)).ok()
 }
 
 /// What the dialogs learn from the text: the issues that block a submit,
@@ -123,13 +141,18 @@ pub struct Check {
     pub payload: Option<String>,
 }
 
-/// Syntax first, then the shape the backend checks (an object of objects
-/// keyed by selected assets), then each asset's schema. A syntax error is
-/// the only issue reported, as the tree past it is a guess.
-pub fn check_config(text: &str, selected: &[String], schemas: &HashMap<String, String>) -> Check {
+/// Syntax first, then the document against its schema. A syntax error is
+/// the only issue reported, as the tree past it is a guess. The payload is
+/// the text compacted, the empty parts of the template dropped; `None` for
+/// blank text, an issue, or nothing set. Without a schema there is no
+/// document to check.
+pub fn check_config(text: &str, schema_json: Option<&str>) -> Check {
     if text.trim().is_empty() {
         return Check::default();
     }
+    let Some(schema) = schema_json.and_then(Schema::parse) else {
+        return Check::default();
+    };
     let parsed = json_text::parse(text);
     if let Some(error) = parsed.error {
         return Check {
@@ -140,72 +163,18 @@ pub fn check_config(text: &str, selected: &[String], schemas: &HashMap<String, S
     let Some(root) = parsed.root else {
         return Check::default();
     };
-    let Node::Object { entries, .. } = &root else {
-        return Check {
-            issues: vec![Issue {
+    let mut issues = config_schema::validate(&schema, &root, "");
+    let missing = config_schema::missing_required(&schema, &root, "");
+    let mut payload = None;
+    if issues.is_empty() {
+        match serde_json::from_str::<Value>(text) {
+            Ok(value) => payload = config_schema::compact(&schema, value).map(|v| v.to_string()),
+            Err(e) => issues.push(Issue {
                 span: root.span(),
-                message: "Config must be a JSON object keyed by asset name.".to_string(),
-            }],
-            ..Check::default()
-        };
-    };
-    let mut issues = Vec::new();
-    let mut missing = Vec::new();
-    for entry in entries {
-        if !selected.contains(&entry.key) {
-            issues.push(Issue {
-                span: entry.key_span,
-                message: format!("'{}' is not in the selection.", entry.key),
-            });
-            continue;
-        }
-        if !matches!(entry.value, Node::Object { .. }) {
-            issues.push(Issue {
-                span: entry.value.span(),
-                message: format!(
-                    "Config for '{}' must be a JSON object of field values.",
-                    entry.key
-                ),
-            });
-            continue;
-        }
-        if let Some(schema) = schemas.get(&entry.key).and_then(|s| Schema::parse(s)) {
-            issues.extend(config_schema::validate(&schema, &entry.value, &entry.key));
-            missing.extend(config_schema::missing_required(
-                &schema,
-                &entry.value,
-                &entry.key,
-            ));
+                message: format!("Config is not valid JSON: {e}"),
+            }),
         }
     }
-    // A selected asset without an entry has set none of its fields.
-    let none = Node::Object {
-        span: Span::at(0),
-        entries: Vec::new(),
-        closed: true,
-    };
-    for key in selected {
-        if entries.iter().any(|e| &e.key == key) {
-            continue;
-        }
-        if let Some(schema) = schemas.get(key).and_then(|s| Schema::parse(s)) {
-            missing.extend(config_schema::missing_required(&schema, &none, key));
-        }
-    }
-    let payload = if issues.is_empty() {
-        match validate_config_text(text, selected) {
-            Ok(payload) => payload,
-            Err(message) => {
-                issues.push(Issue {
-                    span: root.span(),
-                    message,
-                });
-                None
-            }
-        }
-    } else {
-        None
-    };
     Check {
         issues,
         missing,
@@ -228,16 +197,16 @@ fn path_label(path: &[PathSeg]) -> String {
     label
 }
 
-/// The editor issues for what the config classes reported: each at its
-/// value in the text (its key for an unknown field, the asset's entry when
+/// The editor issues for what the definitions reported: each at its value
+/// in the text (its key for an unknown field, the nearest object above when
 /// the path is not there). A `missing` field is not an issue; it joins the
-/// required hint as `asset.field`.
+/// required hint under its document path.
 pub fn server_issues(text: &str, errors: &[ConfigError]) -> (Vec<Issue>, Vec<String>) {
     let parsed = json_text::parse(text);
     let mut issues = Vec::new();
     let mut missing = Vec::new();
     for error in errors {
-        let mut path = vec![PathSeg::Key(error.asset.clone())];
+        let mut path: Vec<PathSeg> = error.path.iter().cloned().map(PathSeg::Key).collect();
         path.extend(error.loc.iter().map(|part| match part {
             ConfigLoc::Key(key) => PathSeg::Key(key.clone()),
             ConfigLoc::Index(index) => PathSeg::Index(*index as usize),
@@ -253,7 +222,11 @@ pub fn server_issues(text: &str, errors: &[ConfigError]) -> (Vec<Issue>, Vec<Str
             Some((Some(key), _)) if error.kind == "extra_forbidden" => key,
             Some((_, value)) => value,
             None => root
-                .and_then(|r| json_text::span_at(r, &path[..1]))
+                .and_then(|r| {
+                    (0..path.len())
+                        .rev()
+                        .find_map(|n| json_text::span_at(r, &path[..n]))
+                })
                 .map_or(Span::at(0), |(_, value)| value),
         };
         issues.push(Issue {
@@ -264,19 +237,19 @@ pub fn server_issues(text: &str, errors: &[ConfigError]) -> (Vec<Issue>, Vec<Str
     (issues, missing)
 }
 
-/// The dialogs' check: the schema's, at once, plus what the config classes
+/// The dialogs' check: the schema's, at once, plus what the definitions
 /// report for the text, asked of `location` 300 ms after the last edit
 /// once the schema is satisfied. `action` names the verb whose classes
 /// apply. A reply for text that has changed since is dropped.
 pub fn use_config_check(
     text: RwSignal<String>,
     selected: Signal<Vec<String>>,
-    schemas: Signal<HashMap<String, String>>,
+    schema: Signal<Option<String>>,
     location: Signal<(String, String)>,
     action: Signal<Option<String>>,
 ) -> Signal<Check> {
-    let client = Memo::new(move |_| check_config(&text.get(), &selected.get(), &schemas.get()));
-    // The classes' answer and the text it answers.
+    let client = Memo::new(move |_| check_config(&text.get(), schema.get().as_deref()));
+    // The definitions' answer and the text it answers.
     let server = RwSignal::new((String::new(), Vec::<Issue>::new(), Vec::<String>::new()));
     let timer: StoredValue<Option<TimeoutHandle>> = StoredValue::new(None);
     Effect::new(move || {
@@ -333,54 +306,33 @@ pub fn use_config_check(
     })
 }
 
-/// The completions at `caret`: at the top level the selected assets with a
-/// schema, below it the fields and values of that asset's schema.
-pub fn completions(
-    text: &str,
-    caret: usize,
-    selected: &[String],
-    schemas: &HashMap<String, String>,
-) -> Vec<Candidate> {
-    let ctx = json_text::context_at(text, &json_text::parse(text), caret);
-    let Some(PathSeg::Key(asset)) = ctx.path.first() else {
-        if !matches!(ctx.slot, Slot::Key { .. }) {
-            return Vec::new();
-        }
-        return selected
-            .iter()
-            .filter(|key| schemas.contains_key(*key) && !ctx.siblings.contains(key))
-            .map(|key| Candidate {
-                label: key.clone(),
-                insert: format!("\"{key}\": {{}}"),
-                detail: "asset".to_string(),
-                caret: key.len() + 5,
-            })
-            .collect();
-    };
-    let Some(schema) = schemas.get(asset).and_then(|s| Schema::parse(s)) else {
+/// The completions at `caret`: the keys the object there lacks, or the
+/// values its field takes, from the document's schema.
+pub fn completions(text: &str, caret: usize, schema_json: Option<&str>) -> Vec<Candidate> {
+    let Some(schema) = schema_json.and_then(Schema::parse) else {
         return Vec::new();
     };
+    let ctx = json_text::context_at(text, &json_text::parse(text), caret);
     match ctx.slot {
-        Slot::Key { .. } => config_schema::key_candidates(&schema, &ctx.path[1..], &ctx.siblings),
-        Slot::Value { .. } => config_schema::value_candidates(&schema, &ctx.path[1..]),
+        Slot::Key { .. } => config_schema::key_candidates(&schema, &ctx.path, &ctx.siblings),
+        Slot::Value { .. } => config_schema::value_candidates(&schema, &ctx.path),
         Slot::None => Vec::new(),
     }
 }
 
 /// The dialog section: the code editor over `text`, the required-fields
-/// hint and a reset. Renders nothing when no selected key has a schema.
-/// `reset` turning true (the dialog opening) refills the template; a
-/// selection change does too until the user has typed.
+/// hint and a reset. Renders nothing without a schema. `reset` turning
+/// true (the dialog opening) refills the template; a schema change does
+/// too until the user has typed.
 #[component]
 pub fn ConfigEditor(
-    #[prop(into)] selected: Signal<Vec<String>>,
-    #[prop(into)] schemas: Signal<HashMap<String, String>>,
+    #[prop(into)] schema: Signal<Option<String>>,
     text: RwSignal<String>,
     #[prop(into)] reset: Signal<bool>,
     #[prop(into)] check: Signal<Check>,
 ) -> impl IntoView {
     let dirty = RwSignal::new(false);
-    let template = Memo::new(move |_| config_template(&selected.get(), &schemas.get()));
+    let template = Memo::new(move |_| schema.get().as_deref().and_then(config_template));
     let refill = move || {
         dirty.set(false);
         text.set(template.get_untracked().unwrap_or_default());
@@ -399,11 +351,11 @@ pub fn ConfigEditor(
     let issues = Signal::derive(move || check.get().issues);
     let missing = Signal::derive(move || check.get().missing);
     let scaffold = move || {
-        let filled = config_schema::scaffold_missing(
-            &text.get_untracked(),
-            &selected.get_untracked(),
-            &schemas.get_untracked(),
-        );
+        let filled = schema
+            .get_untracked()
+            .as_deref()
+            .and_then(Schema::parse)
+            .and_then(|schema| config_schema::scaffold_missing(&text.get_untracked(), &schema));
         if let Some(filled) = filled {
             dirty.set(true);
             text.set(filled);
@@ -425,7 +377,7 @@ pub fn ConfigEditor(
                     label="Config"
                     on_edit=Callback::new(move |()| dirty.set(true))
                     complete=Callback::new(move |(text, caret): (String, usize)| {
-                        completions(&text, caret, &selected.get_untracked(), &schemas.get_untracked())
+                        completions(&text, caret, schema.get_untracked().as_deref())
                     })
                 />
                 <Show when=move || !missing.get().is_empty()>
@@ -443,59 +395,18 @@ pub fn ConfigEditor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::AssetActionInfo;
 
     const THRESHOLD: &str = r#"{"properties":{"threshold":{"default":0.5,"title":"Threshold","type":"number"},"max_retries":{"default":3,"title":"Max Retries","type":"integer"}},"title":"ThresholdConfig","type":"object"}"#;
     const PIPELINE: &str = r#"{"properties":{"api_key":{"title":"Api Key","type":"string"},"batch_size":{"default":100,"title":"Batch Size","type":"integer"},"region":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Region"}},"required":["api_key"],"title":"PipelineConfig","type":"object"}"#;
 
-    fn schemas(entries: &[(&str, &str)]) -> HashMap<String, String> {
-        entries
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    fn keys(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
-
-    fn messages(check: &Check) -> Vec<(String, Span)> {
-        check
-            .issues
-            .iter()
-            .map(|i| (i.message.clone(), i.span))
-            .collect()
-    }
-
-    #[test]
-    fn template_holds_only_defaults_of_selected_assets_with_config() {
-        let schemas = schemas(&[("cfg", THRESHOLD), ("api", PIPELINE)]);
-        let text = config_template(&keys(&["plain", "api", "cfg"]), &schemas).unwrap();
-        let value: Value = serde_json::from_str(&text).unwrap();
-        // `api_key` has no default, so it is never pre-filled.
-        assert_eq!(
-            value,
-            serde_json::json!({
-                "api": {"batch_size": 100, "region": null},
-                "cfg": {"threshold": 0.5, "max_retries": 3}
-            })
-        );
-        // No selected asset takes config: no editor.
-        assert_eq!(config_template(&keys(&["plain"]), &schemas), None);
-        assert_eq!(config_template(&keys(&["cfg"]), &HashMap::new()), None);
-    }
-
-    #[test]
-    fn template_lists_an_asset_whose_config_has_no_defaults() {
-        let schema = r#"{"properties":{"api_key":{"type":"string"}},"required":["api_key"],"type":"object"}"#;
-        let text = config_template(&keys(&["api"]), &schemas(&[("api", schema)])).unwrap();
-        assert_eq!(text, "{\n  \"api\": {}\n}");
-    }
-
-    #[test]
-    fn verb_schemas_come_from_each_assets_declaration() {
-        use crate::types::AssetActionInfo;
-        let mut def = AssetDefinitionInfo {
-            asset_key: "a".into(),
+    fn definition(
+        key: &str,
+        config_schema: Option<&str>,
+        metadata: &[(&str, &str)],
+    ) -> AssetDefinitionInfo {
+        AssetDefinitionInfo {
+            asset_key: key.into(),
             description: None,
             partition_def: None,
             hooks: vec![],
@@ -507,142 +418,249 @@ mod tests {
             kinds: vec![],
             group: None,
             code_version: None,
-            asset_type: "asset".into(),
-            actions: vec![AssetActionInfo {
-                name: "compact".into(),
-                outcome: "unchanged".into(),
-                exclusive: false,
-                partitioning: "optional".into(),
-                description: None,
-                config_schema: Some(PIPELINE.into()),
-            }],
-            config_schema: Some(THRESHOLD.into()),
-        };
-        let mut defs = HashMap::new();
-        defs.insert("a".to_string(), def.clone());
-        def.asset_key = "b".into();
-        def.config_schema = None;
-        def.actions.clear();
-        defs.insert("b".to_string(), def);
+            asset_type: "single".into(),
+            actions: vec![],
+            config_schema: config_schema.map(str::to_string),
+            metadata: metadata
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
 
+    fn definitions(defs: Vec<AssetDefinitionInfo>) -> HashMap<String, AssetDefinitionInfo> {
+        defs.into_iter().map(|d| (d.asset_key.clone(), d)).collect()
+    }
+
+    fn keys(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The schema of a launch of `api` (PIPELINE), `cfg` (THRESHOLD) and
+    /// `plain` (no config, one metadata key).
+    fn schema() -> String {
+        let defs = definitions(vec![
+            definition("api", Some(PIPELINE), &[]),
+            definition("cfg", Some(THRESHOLD), &[]),
+            definition("plain", None, &[("owner", "data")]),
+        ]);
+        launch_schema(&keys(&["api", "cfg", "plain"]), &defs, None).unwrap()
+    }
+
+    fn messages(check: &Check) -> Vec<(String, Span)> {
+        check
+            .issues
+            .iter()
+            .map(|i| (i.message.clone(), i.span))
+            .collect()
+    }
+
+    #[test]
+    fn template_holds_defaults_and_current_metadata_of_the_selection() {
+        let text = config_template(&schema()).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        // `api_key` has no default, so it is never pre-filled; an asset
+        // without metadata gets no `metadata`.
+        assert_eq!(
+            value,
+            json!({"assets": {
+                "api": {"config": {"batch_size": 100, "region": null}},
+                "cfg": {"config": {"threshold": 0.5, "max_retries": 3}},
+                "plain": {"metadata": {"owner": "data"}}
+            }})
+        );
+        // No selected asset takes config: no schema, no editor.
+        let defs = definitions(vec![
+            definition("bare", None, &[]),
+            definition("api", Some(PIPELINE), &[]),
+        ]);
+        assert_eq!(launch_schema(&keys(&["bare"]), &defs, None), None);
+        assert!(!launch_takes_config(&keys(&["bare"]), &defs, None));
+        assert!(launch_takes_config(&keys(&["bare", "api"]), &defs, None));
+    }
+
+    #[test]
+    fn template_lists_a_config_class_without_defaults() {
+        let class = r#"{"properties":{"api_key":{"type":"string"}},"required":["api_key"],"type":"object"}"#;
+        let defs = definitions(vec![definition("api", Some(class), &[])]);
+        let schema = launch_schema(&keys(&["api"]), &defs, None).unwrap();
+        assert_eq!(
+            config_template(&schema).unwrap(),
+            "{\n  \"assets\": {\n    \"api\": {\n      \"config\": {}\n    }\n  }\n}"
+        );
+    }
+
+    #[test]
+    fn verb_schemas_come_from_each_assets_declaration() {
+        let mut def = definition("a", Some(THRESHOLD), &[]);
+        def.actions = vec![AssetActionInfo {
+            name: "compact".into(),
+            outcome: "unchanged".into(),
+            exclusive: false,
+            partitioning: "optional".into(),
+            description: None,
+            config_schema: Some(PIPELINE.into()),
+        }];
+        let defs = definitions(vec![def, definition("b", None, &[])]);
         let selected = keys(&["a", "b"]);
-        assert_eq!(
-            launch_config_schemas(&selected, &defs, None),
-            schemas(&[("a", THRESHOLD)])
-        );
-        assert_eq!(
-            launch_config_schemas(&selected, &defs, Some("compact")),
-            schemas(&[("a", PIPELINE)])
-        );
-        assert!(launch_config_schemas(&selected, &defs, Some("vacuum")).is_empty());
+        let class_of = |verb: Option<&str>| -> Option<String> {
+            let schema: Value =
+                serde_json::from_str(&launch_schema(&selected, &defs, verb)?).unwrap();
+            schema
+                .pointer("/properties/assets/properties/a/properties/config/title")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        assert_eq!(class_of(None).as_deref(), Some("ThresholdConfig"));
+        assert_eq!(class_of(Some("compact")).as_deref(), Some("PipelineConfig"));
+        assert_eq!(class_of(Some("vacuum")), None);
+    }
+
+    #[test]
+    fn tasks_get_config_but_no_metadata() {
+        let mut task = definition("t", Some(THRESHOLD), &[]);
+        task.asset_type = "task".into();
+        let defs = definitions(vec![task]);
+        let schema: Value =
+            serde_json::from_str(&launch_schema(&keys(&["t"]), &defs, None).unwrap()).unwrap();
+        let sections = schema
+            .pointer("/properties/assets/properties/t/properties")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(sections.keys().collect::<Vec<_>>(), vec!["config"]);
     }
 
     #[test]
     fn blank_or_empty_text_sends_nothing() {
-        let selected = keys(&["a"]);
-        assert_eq!(validate_config_text("", &selected), Ok(None));
-        assert_eq!(validate_config_text("  \n", &selected), Ok(None));
-        assert_eq!(validate_config_text("{}", &selected), Ok(None));
-        // The template's entry for an asset without defaults, left untouched.
-        assert_eq!(validate_config_text(r#"{"a": {}}"#, &selected), Ok(None));
-    }
-
-    #[test]
-    fn overrides_are_compacted_and_checked_against_the_selection() {
-        let selected = keys(&["a", "b"]);
+        let schema = schema();
+        let check = |text: &str| check_config(text, Some(&schema));
+        assert_eq!(check("").payload, None);
+        assert_eq!(check("  \n").payload, None);
+        assert_eq!(check("{}").payload, None);
+        // The template's entries, left untouched.
         assert_eq!(
-            validate_config_text(
-                "{\n  \"a\": {\"threshold\": 0.9},\n  \"b\": {}\n}",
-                &selected
-            ),
-            Ok(Some(r#"{"a":{"threshold":0.9}}"#.to_string()))
+            check(r#"{"assets": {"api": {"config": {}}, "plain": {"metadata": {}}}}"#).payload,
+            None
         );
-        let err = validate_config_text(r#"{"c": {"x": 1}}"#, &selected).unwrap_err();
-        assert_eq!(err, "'c' is not in the selection.");
-        let err = validate_config_text(r#"{"a": 1}"#, &selected).unwrap_err();
-        assert_eq!(err, "Config for 'a' must be a JSON object of field values.");
-        let err = validate_config_text("[1]", &selected).unwrap_err();
-        assert_eq!(err, "Config must be a JSON object keyed by asset name.");
-        let err = validate_config_text("{\"a\": ", &selected).unwrap_err();
-        assert!(err.starts_with("Config is not valid JSON:"), "{err}");
+        // Without a schema there is no document.
+        assert_eq!(check_config(r#"{"x": 1}"#, None), Check::default());
     }
 
     #[test]
-    fn check_reports_syntax_then_shape_then_schema_issues() {
-        let selected = keys(&["api", "plain"]);
-        let schemas = schemas(&[("api", PIPELINE)]);
-        let check = |text: &str| check_config(text, &selected, &schemas);
+    fn payload_is_compact_and_keeps_what_is_set() {
+        let schema = schema();
+        let check = check_config(
+            "{\n  \"assets\": {\n    \"api\": {\"config\": {\"batch_size\": 5}, \"metadata\": {}},\n    \"plain\": {\"metadata\": {\"owner\": \"me\", \"tier\": \"gold\"}}\n  }\n}",
+            Some(&schema),
+        );
+        assert!(check.issues.is_empty(), "{:?}", check.issues);
+        assert_eq!(
+            check.payload.as_deref(),
+            Some(
+                r#"{"assets":{"api":{"config":{"batch_size":5}},"plain":{"metadata":{"owner":"me","tier":"gold"}}}}"#
+            )
+        );
+    }
 
-        let syntax = check("{\"api\": ");
+    #[test]
+    fn check_reports_syntax_then_schema_issues() {
+        let schema = schema();
+        let check = |text: &str| check_config(text, Some(&schema));
+
+        let syntax = check("{\"assets\": ");
         assert_eq!(
             messages(&syntax),
-            vec![("Expected a value".to_string(), Span::at(8))]
+            vec![("Expected a value".to_string(), Span::at(11))]
         );
         assert_eq!(syntax.payload, None);
         assert_eq!(
             messages(&check("[1]")),
             vec![(
-                "Config must be a JSON object keyed by asset name.".to_string(),
+                "expected object, got array".to_string(),
                 Span { start: 0, end: 3 }
             )]
         );
         assert_eq!(
             messages(&check(r#"{"other": {"x": 1}}"#)),
             vec![(
-                "'other' is not in the selection.".to_string(),
+                "unknown field 'other'; expected one of assets".to_string(),
                 Span { start: 1, end: 8 }
             )]
         );
         assert_eq!(
-            messages(&check(r#"{"api": 1}"#)),
+            messages(&check(r#"{"assets": {"other": {}}}"#)),
             vec![(
-                "Config for 'api' must be a JSON object of field values.".to_string(),
-                Span { start: 8, end: 9 }
+                "assets: unknown field 'other'; expected one of api, cfg, plain".to_string(),
+                Span { start: 12, end: 19 }
             )]
         );
         assert_eq!(
-            messages(&check(r#"{"api": {"batch_sizes": 1, "region": 2}}"#)),
+            messages(&check(r#"{"assets": {"api": 1}}"#)),
+            vec![(
+                "assets.api: expected object, got number".to_string(),
+                Span { start: 19, end: 20 }
+            )]
+        );
+        assert_eq!(
+            messages(&check(r#"{"assets": {"api": {"config": {"batch_sizes": 1, "region": 2}}}}"#)),
             vec![
                 (
-                    "api: unknown field 'batch_sizes'; expected one of api_key, batch_size, region"
+                    "assets.api.config: unknown field 'batch_sizes'; expected one of api_key, batch_size, region"
                         .to_string(),
-                    Span { start: 9, end: 22 }
+                    Span { start: 31, end: 44 }
                 ),
                 (
-                    "api.region: expected string | null, got number".to_string(),
-                    Span { start: 37, end: 38 }
+                    "assets.api.config.region: expected string | null, got number".to_string(),
+                    Span { start: 59, end: 60 }
                 ),
             ]
         );
-        // An asset without a schema takes any object.
-        assert!(check(r#"{"plain": {"anything": 1}}"#).issues.is_empty());
+        // Metadata values are strings, known key or not; a task has none.
+        assert_eq!(
+            messages(&check(
+                r#"{"assets": {"plain": {"metadata": {"owner": 1, "tier": "gold"}}}}"#
+            )),
+            vec![(
+                "assets.plain.metadata.owner: expected string, got number".to_string(),
+                Span { start: 44, end: 45 }
+            )]
+        );
+        assert_eq!(
+            messages(&check(r#"{"assets": {"plain": {"config": {}}}}"#)),
+            vec![(
+                "assets.plain: unknown field 'config'; expected one of metadata".to_string(),
+                Span { start: 22, end: 30 }
+            )]
+        );
     }
 
     #[test]
-    fn check_hints_required_fields_and_gives_the_payload() {
-        let selected = keys(&["api", "plain"]);
-        let schemas = schemas(&[("api", PIPELINE)]);
-        let check = |text: &str| check_config(text, &selected, &schemas);
-
+    fn check_hints_required_fields_through_absent_containers() {
+        let schema = schema();
+        let check = |text: &str| check_config(text, Some(&schema));
         assert_eq!(check("").missing, Vec::<String>::new());
-        assert_eq!(check("{}").missing, keys(&["api.api_key"]));
-        assert_eq!(check(r#"{"api": {}}"#).missing, keys(&["api.api_key"]));
-        let set = check(r#"{"api": {"api_key": "k"}, "plain": {}}"#);
+        assert_eq!(check("{}").missing, keys(&["assets.api.config.api_key"]));
+        assert_eq!(
+            check(r#"{"assets": {"api": {}}}"#).missing,
+            keys(&["assets.api.config.api_key"])
+        );
+        let set = check(r#"{"assets": {"api": {"config": {"api_key": "k"}}, "plain": {}}}"#);
         assert_eq!(set.missing, Vec::<String>::new());
-        assert_eq!(set.payload.as_deref(), Some(r#"{"api":{"api_key":"k"}}"#));
-        assert_eq!(check(r#"{"api": {}}"#).payload, None);
-        assert_eq!(check("").payload, None);
+        assert_eq!(
+            set.payload.as_deref(),
+            Some(r#"{"assets":{"api":{"config":{"api_key":"k"}}}}"#)
+        );
         // Issues leave no payload, and the hint still lists what is missing.
-        let broken = check(r#"{"api": {"batch_size": "x"}}"#);
+        let broken = check(r#"{"assets": {"api": {"config": {"batch_size": "x"}}}}"#);
         assert_eq!(broken.payload, None);
-        assert_eq!(broken.missing, keys(&["api.api_key"]));
+        assert_eq!(broken.missing, keys(&["assets.api.config.api_key"]));
     }
 
     #[test]
     fn server_errors_land_on_their_value_or_key_or_join_the_hint() {
-        let text = "{\n  \"api\": {\n    \"batch_size\": 0,\n    \"tags\": [1, 2],\n    \"extra\": 1\n  }\n}";
+        let text = "{\n  \"assets\": {\n    \"api\": {\n      \"config\": {\n        \"batch_size\": 0,\n        \"tags\": [1, 2],\n        \"extra\": 1\n      }\n    }\n  }\n}";
         let error = |loc: Vec<ConfigLoc>, kind: &str, message: &str| ConfigError {
-            asset: "api".to_string(),
+            path: keys(&["assets", "api", "config"]),
             loc,
             message: message.to_string(),
             kind: kind.to_string(),
@@ -673,6 +691,12 @@ mod tests {
                 "value_error",
                 "Value error, no",
             ),
+            ConfigError {
+                path: keys(&["assets", "api", "metadata"]),
+                loc: vec![],
+                message: "metadata overrides apply to assets; 'api' is a task".into(),
+                kind: "invalid".into(),
+            },
         ];
         let (issues, missing) = server_issues(text, &errors);
         let at = |needle: &str| {
@@ -683,53 +707,102 @@ mod tests {
             }
         };
         let parsed = json_text::parse(text);
-        let api = json_text::span_at(parsed.root.as_ref().unwrap(), &[PathSeg::Key("api".into())])
-            .unwrap()
-            .1;
+        let span_of = |path: &[&str]| {
+            let path: Vec<PathSeg> = path.iter().map(|k| PathSeg::Key(k.to_string())).collect();
+            json_text::span_at(parsed.root.as_ref().unwrap(), &path)
+                .unwrap()
+                .1
+        };
         assert_eq!(
             issues
                 .iter()
                 .map(|i| (i.message.as_str(), i.span))
                 .collect::<Vec<_>>(),
             vec![
-                ("api.batch_size: Input should be greater than 0", at("0")),
-                ("api.tags[1]: Input should be less than 2", at("2")),
-                ("api.extra: Extra inputs are not permitted", at("\"extra\"")),
-                ("api.nope.x: Value error, no", api),
+                (
+                    "assets.api.config.batch_size: Input should be greater than 0",
+                    at("0")
+                ),
+                (
+                    "assets.api.config.tags[1]: Input should be less than 2",
+                    at("2")
+                ),
+                (
+                    "assets.api.config.extra: Extra inputs are not permitted",
+                    at("\"extra\"")
+                ),
+                (
+                    "assets.api.config.nope.x: Value error, no",
+                    span_of(&["assets", "api", "config"])
+                ),
+                (
+                    "assets.api.metadata: metadata overrides apply to assets; 'api' is a task",
+                    span_of(&["assets", "api"])
+                ),
             ]
         );
-        assert_eq!(missing, vec!["api.api_key"]);
+        assert_eq!(missing, vec!["assets.api.config.api_key"]);
         // Text that does not parse still gets the message, at the missing value.
-        let (issues, _) = server_issues("{\"api\": ", &errors[..1]);
-        assert_eq!(issues[0].span, Span::at(8));
+        let (issues, _) = server_issues("{\"assets\": ", &errors[..1]);
+        assert_eq!(issues[0].span, Span::at(11));
     }
 
     #[test]
-    fn completions_follow_the_caret_from_assets_to_fields_to_values() {
-        let selected = keys(&["api", "cfg", "plain"]);
-        let schemas = schemas(&[("api", PIPELINE), ("cfg", THRESHOLD)]);
+    fn completions_follow_the_caret_down_the_document() {
+        let schema = schema();
         let labels = |text: &str, caret: usize| -> Vec<String> {
-            completions(text, caret, &selected, &schemas)
+            completions(text, caret, Some(&schema))
                 .into_iter()
                 .map(|c| c.label)
                 .collect()
         };
-        // Top level: assets with a schema that are not there yet.
-        assert_eq!(labels("{", 1), keys(&["api", "cfg"]));
-        assert_eq!(labels("{\"api\": {}, ", 12), keys(&["cfg"]));
-        let asset = &completions("{", 1, &selected, &schemas)[0];
-        assert_eq!(asset.insert, "\"api\": {}");
-        assert_eq!(asset.caret, 8);
-        // Inside an asset: its fields, then a field's values.
+        // Sections, then the selected assets, then what each asset has.
+        assert_eq!(labels("{", 1), keys(&["assets"]));
+        let section = &completions("{", 1, Some(&schema))[0];
+        assert_eq!(section.insert, "\"assets\": {}");
+        assert_eq!(section.caret, 11);
+        assert_eq!(section.detail, "object — per-asset overrides for this run");
+        assert_eq!(labels("{\"assets\": {", 12), keys(&["api", "cfg", "plain"]));
         assert_eq!(
-            labels("{\"api\": {\"b", 11),
+            labels("{\"assets\": {\"api\": {}, ", 23),
+            keys(&["cfg", "plain"])
+        );
+        assert_eq!(
+            labels("{\"assets\": {\"api\": {", 20),
+            keys(&["config", "metadata"])
+        );
+        assert_eq!(
+            completions("{\"assets\": {\"api\": {", 20, Some(&schema))[0].detail,
+            "PipelineConfig"
+        );
+        assert_eq!(
+            labels("{\"assets\": {\"plain\": {", 22),
+            keys(&["metadata"])
+        );
+        // Inside a config: its fields, then a field's values; inside
+        // metadata: the current keys with their values.
+        assert_eq!(
+            labels("{\"assets\": {\"api\": {\"config\": {\"b", 33),
             keys(&["api_key", "batch_size", "region"])
         );
-        assert_eq!(labels("{\"api\": {\"region\": ", 19), keys(&["null"]));
-        assert_eq!(labels("{\"cfg\": {\"threshold\": ", 22), keys(&["0.5"]));
-        // No schema, a value at the top level, or outside the document.
-        assert!(labels("{\"plain\": {\"", 12).is_empty());
-        assert!(labels("{\"api\": ", 8).contains(&"{}".to_string()));
+        assert_eq!(
+            labels("{\"assets\": {\"api\": {\"config\": {\"region\": ", 41),
+            keys(&["null"])
+        );
+        assert_eq!(
+            labels("{\"assets\": {\"cfg\": {\"config\": {\"threshold\": ", 44),
+            keys(&["0.5"])
+        );
+        assert_eq!(
+            labels("{\"assets\": {\"plain\": {\"metadata\": {", 36),
+            keys(&["owner"])
+        );
+        assert_eq!(
+            labels("{\"assets\": {\"plain\": {\"metadata\": {\"owner\": ", 45),
+            keys(&["\"data\""])
+        );
+        // No schema, or outside the document.
+        assert!(completions("{", 1, None).is_empty());
         assert!(labels("{}", 2).is_empty());
     }
 }

@@ -6,7 +6,6 @@
 //! argument from Python. Each query is exposed twice: a sync method that
 //! releases the GIL while awaiting the async storage call, and an
 //! `async_*` variant for `await`-friendly use from `asyncio`.
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
@@ -414,8 +413,8 @@ pub struct PyRunRecord {
 
 #[pymethods]
 impl PyRunRecord {
-    /// Per-asset config overrides the run was launched with, keyed by asset
-    /// name. `None` means the definitions' defaults.
+    /// The launch document the run was launched with (see
+    /// `CodeRepository.materialize`). `None` means the definitions' defaults.
     #[getter]
     fn config(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         self.config_json
@@ -1457,10 +1456,10 @@ impl PyStorage {
         block_reason: Option<String>,
         node_names: Vec<String>,
         action: Option<String>,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<Py<PyAny>>,
     ) -> PyResult<()> {
         use rivers_core::storage::RunRecord;
-        let config = crate::config::run_config::run_config_to_json(py, config.as_ref());
+        let config = crate::config::run_config::run_config_to_json(py, config.as_ref())?;
         let record = RunRecord {
             run_id: run_id.to_string(),
             code_location_id: self.cl().to_string(),

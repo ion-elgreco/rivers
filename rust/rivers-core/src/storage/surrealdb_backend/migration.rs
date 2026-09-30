@@ -102,7 +102,7 @@ impl AsyncMigrate for SurrealMigrate {
 
 /// Highest embedded migration version. Bump by adding a `Vn__*.surql` + an
 /// [`embedded_migrations`] entry; a test pins this to that max.
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 /// One compat row per migration (the floors it set), folded by the open guard.
 const MIGRATION_META_TABLE: &str = "migration_meta";
@@ -152,6 +152,11 @@ fn embedded_migrations() -> Vec<Migration> {
             include_str!("migrations/V9__run_config.surql"),
         )
         .expect("V9__run_config migration name is well-formed"),
+        Migration::unapplied(
+            "V10__launch_document",
+            include_str!("migrations/V10__launch_document.surql"),
+        )
+        .expect("V10__launch_document migration name is well-formed"),
     ]
 }
 
@@ -159,19 +164,81 @@ fn embedded_migrations() -> Vec<Migration> {
 /// skipped; an edited applied one aborts on a checksum mismatch).
 async fn apply_migrations(db: &Surreal<Any>) -> anyhow::Result<()> {
     let migrations = embedded_migrations();
+    let before = read_schema_stamps(db).await?.map_or(0, |s| s.version);
     let mut backend = SurrealMigrate { db: db.clone() };
-    backend
-        .migrate(
-            &migrations,
-            true,  // abort_divergent: an edited applied migration is an error
-            false, // abort_missing: tolerate a DB carrying migrations we don't embed
-            false, // grouped: one transaction per migration
-            Target::Latest,
-            REFINERY_HISTORY_TABLE,
-        )
-        .await
-        .context("applying storage migrations")?;
+    let apply = async |backend: &mut SurrealMigrate, target: Target| {
+        backend
+            .migrate(
+                &migrations,
+                true,  // abort_divergent: an edited applied migration is an error
+                false, // abort_missing: tolerate a DB carrying migrations we don't embed
+                false, // grouped: one transaction per migration
+                target,
+                REFINERY_HISTORY_TABLE,
+            )
+            .await
+            .context("applying storage migrations")
+    };
+    // V10 changes the shape of stored rows. They are rewritten between the
+    // DDL before it and its own stamp, so a store never reads as V10 while
+    // holding V9 rows.
+    if before < 10 {
+        apply(&mut backend, Target::Version(9)).await?;
+        rewrite_v10_launch_documents(db).await?;
+    }
+    apply(&mut backend, Target::Latest).await?;
     Ok(())
+}
+
+/// The V9 `config` (`{"<asset>": {fields}}`) on runs and backfills as the
+/// launch document. A row already in the new shape is left alone.
+async fn rewrite_v10_launch_documents(db: &Surreal<Any>) -> anyhow::Result<()> {
+    #[derive(SurrealValue)]
+    struct Row {
+        ident: String,
+        config: String,
+    }
+    for (table, key) in [("runs", "run_id"), ("backfills", "backfill_id")] {
+        let rows: Vec<Row> = db
+            .query(format!(
+                "SELECT {key} AS ident, config FROM {table} WHERE config != NONE"
+            ))
+            .await?
+            .check()?
+            .take(0)?;
+        for row in rows {
+            let Some(document) = launch_document_from_v9(&row.config) else {
+                continue;
+            };
+            db.query(format!(
+                "UPDATE {table} SET config = $config WHERE {key} = $ident"
+            ))
+            .bind(("config", document))
+            .bind(("ident", row.ident))
+            .await?
+            .check()?;
+        }
+    }
+    Ok(())
+}
+
+/// `{"<asset>": {fields}}` as `{"assets": {"<asset>": {"config": {fields}}}}`;
+/// `None` for text that is not the V9 shape, the new shape included.
+fn launch_document_from_v9(text: &str) -> Option<String> {
+    let serde_json::Value::Object(old) = serde_json::from_str(text).ok()? else {
+        return None;
+    };
+    if old
+        .keys()
+        .all(|k| ["assets", "resources", "execution"].contains(&k.as_str()))
+    {
+        return None;
+    }
+    let assets: serde_json::Map<String, serde_json::Value> = old
+        .into_iter()
+        .map(|(asset, fields)| (asset, serde_json::json!({ "config": fields })))
+        .collect();
+    Some(serde_json::json!({ "assets": assets }).to_string())
 }
 
 /// What a caller intends to do — selects which floor [`check_compatibility`] enforces.
@@ -660,8 +727,8 @@ mod tests {
         let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
         assert_eq!(
             (stamps.version, stamps.min_reader, stamps.min_writer),
-            (SCHEMA_VERSION, 2, 7),
-            "v2 raised the read floor to 2; v7 raised the write floor to 7, because a \
+            (SCHEMA_VERSION, 2, 10),
+            "v2 raised the read floor to 2; v7 raised the write floor to 7 (v10 to 10), because a \
              pre-v7 writer records provenance without the time a v7 writer compares"
         );
     }
@@ -877,7 +944,7 @@ mod tests {
         let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
         assert_eq!(
             (stamps.version, stamps.min_reader, stamps.min_writer),
-            (SCHEMA_VERSION, 2, 7),
+            (SCHEMA_VERSION, 2, 10),
             "a pre-v7 writer records a code version without its time, which a \
              v7 writer then lets an older materialization overwrite"
         );
@@ -1035,6 +1102,93 @@ mod tests {
         );
         assert!(check_compatibility(stamps, Capability::Read, 8).is_ok());
         assert!(check_compatibility(stamps, Capability::ReadWrite, 8).is_ok());
+    }
+
+    /// V10 turns `config` into the launch document. Rows from before it are
+    /// rewritten as part of the upgrade, on runs and backfills; a row already
+    /// in the new shape is left alone. A V9 writer is refused (it would read
+    /// `assets` as an asset name); a V9 reader still shows the text.
+    #[tokio::test]
+    async fn test_v10_rewrites_run_config_into_the_launch_document() {
+        let db = any::connect("mem://").await.unwrap();
+        db.use_ns(DEFAULT_NAMESPACE)
+            .use_db(DEFAULT_DATABASE)
+            .await
+            .unwrap();
+        let mut backend = SurrealMigrate { db: db.clone() };
+        let migrations: Vec<Migration> = embedded_migrations().into_iter().take(9).collect();
+        backend
+            .migrate(
+                &migrations,
+                true,
+                false,
+                false,
+                Target::Latest,
+                REFINERY_HISTORY_TABLE,
+            )
+            .await
+            .expect("apply migrations");
+        db.query(
+            "INSERT INTO runs [\
+                { run_id: 'r1', status: 'Queued', start_time: 1, tags: [], node_names: ['a'], \
+                  config: '{\"a\":{\"x\":1},\"b\":{}}' }, \
+                { run_id: 'r2', status: 'Queued', start_time: 2, tags: [], node_names: ['a'] }, \
+                { run_id: 'r3', status: 'Queued', start_time: 3, tags: [], node_names: ['a'], \
+                  config: '{\"assets\":{\"a\":{\"config\":{\"x\":2}}}}' } \
+             ] RETURN NONE; \
+             INSERT INTO backfills { backfill_id: 'b1', code_location_id: 'default', \
+             status: 'Requested', strategy: { kind: 'MultiRun' }, failure_policy: 'Continue', \
+             asset_selection: [], partition_keys: [], run_ids: [], completed_partitions: [], \
+             failed_partitions: [], canceled_partitions: [], max_concurrency: 1, tags: [], \
+             create_time: 1, end_time: NONE, error: NONE, config: '{\"a\":{\"y\":true}}' } RETURN NONE",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        apply_migrations(&db).await.unwrap();
+
+        let rows: Vec<(i64, Option<String>)> = db
+            .query("SELECT VALUE [start_time, config] FROM runs ORDER BY start_time")
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    1,
+                    Some(r#"{"assets":{"a":{"config":{"x":1}},"b":{"config":{}}}}"#.to_string())
+                ),
+                (2, None),
+                (
+                    3,
+                    Some(r#"{"assets":{"a":{"config":{"x":2}}}}"#.to_string())
+                ),
+            ]
+        );
+        let backfill: Option<String> = db
+            .query("SELECT VALUE config FROM backfills WHERE backfill_id = 'b1'")
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert_eq!(
+            backfill.as_deref(),
+            Some(r#"{"assets":{"a":{"config":{"y":true}}}}"#)
+        );
+        let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
+        assert_eq!(
+            (stamps.version, stamps.min_reader, stamps.min_writer),
+            (10, 2, 10)
+        );
+        assert!(check_compatibility(stamps, Capability::Read, 9).is_ok());
+        assert!(check_compatibility(stamps, Capability::ReadWrite, 9).is_err());
+        // Nothing to rewrite the second time.
+        assert_eq!(launch_document_from_v9(r#"{"assets":{"a":{}}}"#), None);
+        assert_eq!(launch_document_from_v9("[1]"), None);
     }
 
     /// V5 adds `exclusive`/`partitions` to a SCHEMAFULL table. `DEFAULT` only

@@ -468,8 +468,8 @@ async fn execute_job_with_multi_picker_fires_one_request_per_combination() {
     );
 }
 
-/// The edited config rides the materialize request as the JSON the backend
-/// stores on the run; an asset left at `{}` is not sent.
+/// The edited document rides the materialize request as the JSON the
+/// backend stores on the run; a section left empty is not sent.
 #[wasm_bindgen_test]
 async fn materialize_sends_the_edited_config() {
     nav_to("/locations/default/demo/assets/api_data");
@@ -499,6 +499,7 @@ async fn materialize_sends_the_edited_config() {
                 asset_type: "asset".to_string(),
                 actions: vec![],
                 config_schema: config_schema.map(str::to_string),
+                metadata: Default::default(),
             },
         );
     }
@@ -524,7 +525,7 @@ async fn materialize_sends_the_edited_config() {
     js_sys::Reflect::set(
         &textarea,
         &"value".into(),
-        &"{\"api_data\": {\"batch_size\": 5}, \"plain\": {}}".into(),
+        &"{\"assets\": {\"api_data\": {\"config\": {\"batch_size\": 5}}, \"plain\": {\"metadata\": {}}}}".into(),
     )
     .unwrap();
     let init = web_sys::EventInit::new();
@@ -546,7 +547,9 @@ async fn materialize_sends_the_edited_config() {
     let bodies = request_bodies(&recorded).await;
     assert_eq!(bodies.len(), 1, "{bodies:?}");
     assert!(
-        bodies[0].ends_with("&config=%7B%22api_data%22%3A%7B%22batch_size%22%3A5%7D%7D"),
+        bodies[0].ends_with(
+            "&config=%7B%22assets%22%3A%7B%22api_data%22%3A%7B%22config%22%3A%7B%22batch_size%22%3A5%7D%7D%7D%7D"
+        ),
         "{}",
         bodies[0]
     );

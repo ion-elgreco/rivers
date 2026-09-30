@@ -20,6 +20,7 @@ use super::Executor;
 use super::ops::now_ts;
 use crate::assets::io_handler_registry::IOHandlerRegistry;
 use crate::config::ResourceVariant;
+use crate::config::run_config::parse_run_config;
 use crate::errors::ExecutionError;
 use crate::partitions::PyPartitionKey;
 use crate::repository::resolved_node::ResolvedNode;
@@ -52,7 +53,8 @@ pub(crate) struct RunPlanArgs<'a> {
     pub init: RunInit,
     pub partition_key: Option<PyPartitionKey>,
     pub tags: Vec<(String, String)>,
-    pub config: Option<HashMap<String, Py<PyAny>>>,
+    /// The launch document, canonical (see [`crate::config::run_config`]).
+    pub config: Option<String>,
 
     pub resume: bool,
     pub raise_on_error: bool,
@@ -64,7 +66,20 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
 
     let node_names = args.plan.all_asset_names();
 
-    let config_json = crate::config::run_config::run_config_to_json(py, args.config.as_ref());
+    // Read before any record write, so a document the definitions refuse
+    // leaves no run behind.
+    let document = args
+        .config
+        .as_deref()
+        .map(|json| parse_run_config(py, json))
+        .transpose()?;
+    let config_overrides = document.as_ref().and_then(|d| d.config_overrides(py));
+    let overlay = document
+        .as_ref()
+        .map(|d| d.overlay_node_map(py, args.node_map))
+        .transpose()?
+        .flatten();
+    let node_map = overlay.as_ref().unwrap_or(args.node_map);
     let started = py.detach(|| -> PyResult<bool> {
         match args.init {
             RunInit::Create { launched_by } => {
@@ -83,7 +98,7 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
                     block_reason: None,
                     launched_by,
                     action: args.plan.action.clone(),
-                    config: config_json,
+                    config: args.config,
                 };
                 io_rt()
                     .block_on(args.storage.backend().create_run(&record))
@@ -117,13 +132,13 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
     let failures = args.executor.execute_plan(
         py,
         args.plan,
-        args.node_map,
+        node_map,
         &args.partition_key,
         args.storage,
         &args.run_id,
         args.resources,
         args.retries,
-        &args.config,
+        &config_overrides,
         args.io_handler_registry,
         args.resume,
     );

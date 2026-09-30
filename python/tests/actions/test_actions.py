@@ -3150,7 +3150,10 @@ def test_action_config_defaults_and_overrides(executor, style):
     assert seen == {"orders": (128, False)}
 
     assert repo.run_action(
-        "tune", config={"orders": {"target_size_mb": 512, "force": True}}
+        "tune",
+        config={
+            "assets": {"orders": {"config": {"target_size_mb": 512, "force": True}}}
+        },
     ).success
     assert seen == {"orders": (512, True)}
 
@@ -3169,7 +3172,9 @@ def test_action_config_class_form():
             seen["cfg"] = (ctx.config.target_size_mb, ctx.config.force)
 
     repo = rs.CodeRepository(assets=[EventLog], default_executor=IP)
-    assert repo.run_action("tune", config={"event_log": {"target_size_mb": 64}}).success
+    assert repo.run_action(
+        "tune", config={"assets": {"event_log": {"config": {"target_size_mb": 64}}}}
+    ).success
     assert seen["cfg"] == (64, False)
 
 
@@ -3190,8 +3195,12 @@ def test_action_config_absent_without_annotation():
         return 1
 
     repo = rs.CodeRepository(assets=[orders], default_executor=IP)
-    assert repo.run_action("plain", config={"orders": {"target_size_mb": 1}}).success
-    assert repo.run_action("bare", config={"orders": {"target_size_mb": 1}}).success
+    assert repo.run_action(
+        "plain", config={"assets": {"orders": {"config": {"target_size_mb": 1}}}}
+    ).success
+    assert repo.run_action(
+        "bare", config={"assets": {"orders": {"config": {"target_size_mb": 1}}}}
+    ).success
     assert seen == {"plain": None, "bare": None}
 
 
@@ -3208,7 +3217,7 @@ def test_action_config_validation_error_fails_run():
     repo = rs.CodeRepository(assets=[orders], default_executor=IP)
     result = repo.run_action(
         "tune",
-        config={"orders": {"target_size_mb": "not-an-int"}},
+        config={"assets": {"orders": {"config": {"target_size_mb": "not-an-int"}}}},
         raise_on_error=False,
     )
     assert not result.success
@@ -3235,7 +3244,9 @@ def test_observe_config_override():
             )
 
     repo = rs.CodeRepository(assets=[Feed], default_executor=IP)
-    assert repo.run_action("observe", config={"feed": {"target_size_mb": 42}}).success
+    assert repo.run_action(
+        "observe", config={"assets": {"feed": {"config": {"target_size_mb": 42}}}}
+    ).success
     assert seen["cfg"] == 42
 
 
@@ -3351,7 +3362,9 @@ def test_action_resource_param_with_config_overrides():
         resources={"probe": ProbeResource(prefix="base")},
         default_executor=IP,
     )
-    assert repo.run_action("tag", config={"orders": {"target_size_mb": 9}}).success
+    assert repo.run_action(
+        "tag", config={"assets": {"orders": {"config": {"target_size_mb": 9}}}}
+    ).success
     assert seen["vals"] == (9, "base")
 
 

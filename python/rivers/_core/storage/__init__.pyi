@@ -187,9 +187,10 @@ class RunRecord:
     """Origin of this run (manual / schedule / sensor / backfill / condition)."""
     action: str | None
     """The verb this run executes. ``None`` means materialize."""
-    config: dict[str, dict[str, Any]] | None
-    """Per-asset config overrides the run was launched with, keyed by asset
-    name. ``None`` means the definitions' defaults."""
+    config: dict[str, Any] | None
+    """The launch document the run was launched with:
+    ``{"assets": {name: {"config": {...}, "metadata": {...}}}}``. ``None``
+    means the definitions as they are."""
 
 class PoolLimit:
     """Configuration of a concurrency pool."""
@@ -481,7 +482,7 @@ class Storage:
         block_reason: str | None = None,
         node_names: list[str] = ...,
         action: str | None = None,
-        config: dict[str, dict[str, Any]] | None = None,
+        config: dict[str, Any] | None = None,
     ) -> None:
         """(Internal) create a run record directly — test helper."""
         ...

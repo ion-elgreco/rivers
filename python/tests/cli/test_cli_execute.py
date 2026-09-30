@@ -260,9 +260,10 @@ class Cfg(BaseModel):
     threshold: float = 0.5
 
 
-@rs.Asset(name="cfg")
+@rs.Asset(name="cfg", metadata={"tier": "bronze"})
 def cfg(context: rs.AssetExecutionContext[Cfg]) -> float:
-    Path("cfg_seen.txt").write_text(str(context.config.threshold))
+    seen = f"{context.config.threshold} {context.asset_metadata['tier']}"
+    Path("cfg_seen.txt").write_text(seen)
     return context.config.threshold
 
 
@@ -271,8 +272,8 @@ repo = rs.CodeRepository(assets=[cfg])
 
 
 def test_execute_applies_the_records_config(resolved_tmp_path, monkeypatch):
-    """The config overrides ride the run record, not the pod args: a run
-    launched from the UI or the queue applies them in its pod."""
+    """The launch document rides the run record, not the pod args: a run
+    launched from the UI or the queue applies it in its pod."""
     (resolved_tmp_path / "defs_cfg.py").write_text(CONFIG_REPO_MODULE)
     store = _cloud_env(monkeypatch, resolved_tmp_path / "storage_cfg")
     store._create_run(
@@ -281,7 +282,11 @@ def test_execute_applies_the_records_config(resolved_tmp_path, monkeypatch):
         "Queued",
         1,
         node_names=["cfg"],
-        config={"cfg": {"threshold": 0.9}},
+        config={
+            "assets": {
+                "cfg": {"config": {"threshold": 0.9}, "metadata": {"tier": "gold"}}
+            }
+        },
     )
 
     result = runner.invoke(
@@ -296,7 +301,7 @@ def test_execute_applies_the_records_config(resolved_tmp_path, monkeypatch):
         ],
     )
     assert result.exit_code == 0, result.output
-    assert (resolved_tmp_path / "cfg_seen.txt").read_text() == "0.9"
+    assert (resolved_tmp_path / "cfg_seen.txt").read_text() == "0.9 gold"
     outcome = store.kv_get("run_outcome:pod-cfg")
     assert outcome is not None and b"Success" in outcome
 
@@ -313,7 +318,7 @@ def test_execute_step_applies_the_records_config(resolved_tmp_path, monkeypatch)
         "Started",
         1,
         node_names=["cfg"],
-        config={"cfg": {"threshold": 0.75}},
+        config={"assets": {"cfg": {"config": {"threshold": 0.75}}}},
     )
 
     result = runner.invoke(
@@ -328,7 +333,7 @@ def test_execute_step_applies_the_records_config(resolved_tmp_path, monkeypatch)
         ],
     )
     assert result.exit_code == 0, result.output
-    assert (resolved_tmp_path / "cfg_seen.txt").read_text() == "0.75"
+    assert (resolved_tmp_path / "cfg_seen.txt").read_text() == "0.75 bronze"
 
 
 def test_execute_step_without_a_run_record_fails_loudly(resolved_tmp_path, monkeypatch):

@@ -1279,6 +1279,7 @@ mod tests {
             asset_type: "asset".to_string(),
             actions: vec![],
             config_schema: None,
+            metadata: Default::default(),
         }
     }
 

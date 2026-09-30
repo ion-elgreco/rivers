@@ -517,7 +517,7 @@ use crate::assets::io_handler::IOHandler;
 use crate::automation::schedule::{self, PyScheduleDefinition, PyScheduleTickResult};
 use crate::automation::sensor::{self, PySensorDefinition, PySensorTickResult};
 use crate::config::ResourceVariant;
-use crate::config::run_config::{parse_run_config_json, run_config_to_json};
+use crate::config::run_config::{check_run_config, run_config_to_json};
 use crate::executor::Executor;
 use crate::executor::ops::{
     enumerate_params, get_annotations, is_context_annotation, now_ts, register_assets_from_nodes,
@@ -2682,7 +2682,7 @@ impl PyCodeRepository {
         run_id_override: Option<String>,
         partition_key: Option<PyPartitionKey>,
         tags: Option<Vec<(String, String)>>,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<String>,
         launched_by: LaunchedBy,
         resume: bool,
         raise_on_error: bool,
@@ -2707,7 +2707,7 @@ impl PyCodeRepository {
                 launched_by,
                 run_id.clone(),
                 synthetic_job.action.clone(),
-                Python::attach(|py| run_config_to_json(py, config.as_ref())),
+                config.clone(),
             ))?;
         }
 
@@ -2736,7 +2736,7 @@ impl PyCodeRepository {
         partition_key: Option<PyPartitionKey>,
         tags: Option<Vec<(String, String)>>,
         raise_on_error: bool,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<String>,
         run_id_override: Option<String>,
         include_upstream: bool,
         resume: bool,
@@ -2745,6 +2745,7 @@ impl PyCodeRepository {
     ) -> PyResult<PyRunResult> {
         let guard = self.ensure_resolved()?;
         let state = guard.as_ref().unwrap();
+        let config = check_run_config(config.as_deref(), |name| state.node_map.contains_key(name))?;
         let graph = state
             .inner_repo
             .graph
@@ -2850,7 +2851,7 @@ impl PyCodeRepository {
         run_id_override: Option<String>,
         partition_key: Option<PyPartitionKey>,
         tags: Option<Vec<(String, String)>>,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<String>,
         launched_by: LaunchedBy,
         resume: bool,
         raise_on_error: bool,
@@ -2904,13 +2905,14 @@ impl PyCodeRepository {
         partition_key: Option<PyPartitionKey>,
         tags: Option<Vec<(String, String)>>,
         raise_on_error: bool,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<String>,
         run_id_override: Option<String>,
         resume: bool,
         launched_by: LaunchedBy,
     ) -> PyResult<PyRunResult> {
         let guard = self.ensure_resolved()?;
         let state = guard.as_ref().unwrap();
+        let config = check_run_config(config.as_deref(), |name| state.node_map.contains_key(name))?;
         let graph = state
             .inner_repo
             .graph
@@ -3942,13 +3944,14 @@ impl PyCodeRepository {
         partition_key: Option<PyPartitionKey>,
         tags: Option<Vec<(String, String)>>,
         raise_on_error: bool,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<Py<PyAny>>,
         run_id_override: Option<String>,
         include_upstream: bool,
         resume: bool,
         retry: Option<Bound<'_, PyAny>>,
     ) -> PyResult<PyRunResult> {
         let retry = crate::retry::extract_retry_ref(retry)?;
+        let config = run_config_to_json(py, config.as_ref())?;
         py.detach(|| {
             self.materialize_with_launcher(
                 selection,
@@ -3979,10 +3982,11 @@ impl PyCodeRepository {
         partition_key: Option<PyPartitionKey>,
         tags: Option<Vec<(String, String)>>,
         raise_on_error: bool,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<Py<PyAny>>,
         run_id_override: Option<String>,
         resume: bool,
     ) -> PyResult<PyRunResult> {
+        let config = run_config_to_json(py, config.as_ref())?;
         py.detach(|| {
             self.run_action_with_launcher(
                 action,
@@ -4132,7 +4136,7 @@ impl PyCodeRepository {
         failure_policy: &str,
         max_concurrency: u32,
         tags: Option<Vec<(String, String)>>,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<Py<PyAny>>,
         block: bool,
         dry_run: bool,
         action: Option<String>,
@@ -4147,6 +4151,7 @@ impl PyCodeRepository {
                  to target every asset that defines it"
             )));
         }
+        let config = run_config_to_json(py, config.as_ref())?;
         py.detach(|| {
             self.backfill_inner(
                 crate::daemon::RunType::Materialization(selection.unwrap_or_default()),
@@ -4174,8 +4179,9 @@ impl PyCodeRepository {
         &self,
         py: Python<'_>,
         backfill_id: &str,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<Py<PyAny>>,
     ) -> PyResult<()> {
+        let config = run_config_to_json(py, config.as_ref())?;
         py.detach(|| self.execute_backfill_inner(backfill_id, config))
     }
 
@@ -4387,7 +4393,7 @@ impl PyCodeRepository {
         selection: Option<Vec<String>>,
         partition_key: Option<PyPartitionKey>,
         job_name: Option<String>,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<Py<PyAny>>,
     ) -> PyResult<PyRunHandle> {
         if !self.has_run_queue() {
             return Err(ExecutionError::new_err(
@@ -4397,13 +4403,18 @@ impl PyCodeRepository {
         // Test helper — auto-resolve so Python tests don't have to call resolve()
         // explicitly first. Production callers (gRPC, daemon) always run after
         // resolve and bypass this helper.
-        let _guard = self.ensure_resolved()?;
-        drop(_guard);
+        let config = {
+            let guard = self.ensure_resolved()?;
+            let state = guard.as_ref().unwrap();
+            check_run_config(
+                run_config_to_json(py, config.as_ref())?.as_deref(),
+                |name| state.node_map.contains_key(name),
+            )?
+        };
         let selection = match &job_name {
             Some(job) if selection.is_none() => self.handle().job_asset_names(job),
             _ => selection,
         };
-        let config = run_config_to_json(py, config.as_ref());
         py.detach(|| {
             io_rt().block_on(self.submit_run(
                 selection,
@@ -4545,7 +4556,7 @@ impl PyCodeRepository {
         failure_policy: &str,
         max_concurrency: u32,
         tags: Option<Vec<(String, String)>>,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<String>,
         block: bool,
         dry_run: bool,
         preminted_id: Option<String>,
@@ -4554,6 +4565,7 @@ impl PyCodeRepository {
     ) -> PyResult<PyBackfillResult> {
         let guard = self.ensure_resolved()?;
         let state = guard.as_ref().unwrap();
+        let config = check_run_config(config.as_deref(), |name| state.node_map.contains_key(name))?;
 
         // A `Job` target resolves to its own asset selection; everything below
         // (partition resolution, strategy, the record) is identical for both kinds.
@@ -4765,7 +4777,7 @@ impl PyCodeRepository {
             launched_by,
             // The verb the children run — a Job target's own, not `None`.
             action: child_verb,
-            config: Python::attach(|py| run_config_to_json(py, config.as_ref())),
+            config: config.clone(),
         };
 
         io_rt()
@@ -4844,7 +4856,7 @@ impl PyCodeRepository {
         job: &Py<PyJob>,
         job_name: &str,
         py_pk: PyPartitionKey,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<String>,
         backfill_id: &str,
         run_id: String,
     ) -> PyResult<PyRunResult> {
@@ -4855,19 +4867,19 @@ impl PyCodeRepository {
                 backfill_id: backfill_id.to_string(),
             },
             Some(run_id),
-            Python::attach(|py| run_config_to_json(py, config.as_ref())),
+            config.clone(),
         ))?;
         Python::attach(|py| {
             job.bind(py)
                 .borrow()
-                .execute_run(py, &run_id, Some(py_pk), config, false, false)
+                .execute_stored_run(py, &run_id, Some(py_pk), config, false, false)
         })
     }
 
     pub(crate) fn execute_backfill_inner(
         &self,
         backfill_id: &str,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<String>,
     ) -> PyResult<()> {
         let guard = self.ensure_resolved()?;
         let state = guard.as_ref().unwrap();
@@ -4889,8 +4901,10 @@ impl PyCodeRepository {
         // A blocking `backfill(config=...)` passes its config; a daemon runs
         // the backfill later from the record alone.
         let config = match config {
-            Some(config) => Some(config),
-            None => parse_run_config_json(record.config.as_deref())?,
+            Some(config) => {
+                check_run_config(Some(&config), |name| state.node_map.contains_key(name))?
+            }
+            None => record.config.clone(),
         };
 
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4972,13 +4986,7 @@ impl PyCodeRepository {
 
             let batch_pk =
                 PyPartitionKey::from(&rivers_core::execution::backfill::bundle_keys(group));
-            let run_config = config.as_ref().map(|c| {
-                Python::attach(|py| {
-                    c.iter()
-                        .map(|(k, v)| (k.clone(), v.clone_ref(py)))
-                        .collect::<HashMap<String, Py<PyAny>>>()
-                })
-            });
+            let run_config = config.clone();
             let result = match &record.job_name {
                 Some(job_name) => match state.jobs.get(job_name) {
                     Some(job) => self.execute_backfill_job_run(

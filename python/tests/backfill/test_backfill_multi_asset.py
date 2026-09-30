@@ -649,7 +649,7 @@ class TestMultiAssetBackfillConfig:
         result = repo.backfill(
             selection=["x"],
             partition_keys=[rs.PartitionKey.single("a")],
-            config={"x": {"mode": "full_refresh"}},
+            config={"assets": {"x": {"config": {"mode": "full_refresh"}}}},
         )
         assert result.completed == 1
         assert captured.get("mode") == "full_refresh"

@@ -17,6 +17,7 @@ use rivers_core::execution::retry::{RetryPolicy, RetryRef};
 
 use crate::assets::io_handler_registry::IOHandlerRegistry;
 use crate::config::ResourceVariant;
+use crate::config::run_config::{check_run_config, run_config_to_json};
 use crate::errors::{ConfigurationError, ExecutionError, GraphValidationError, NodeNotFoundError};
 use crate::executor::run_lifecycle::{RunInit, RunPlanArgs, run_plan};
 
@@ -528,9 +529,10 @@ impl PyJob {
         py: Python,
         partition_key: Option<PyPartitionKey>,
         tags: Option<Vec<(String, String)>>,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<Py<PyAny>>,
         raise_on_error: bool,
     ) -> PyResult<PyRunResult> {
+        let config = self.checked_config(py, config.as_ref())?;
         self.run_inner(
             py,
             uuid::Uuid::new_v4().to_string(),
@@ -562,7 +564,24 @@ impl PyJob {
         py: Python,
         run_id: &str,
         partition_key: Option<PyPartitionKey>,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<Py<PyAny>>,
+        resume: bool,
+        raise_on_error: bool,
+    ) -> PyResult<PyRunResult> {
+        let config = self.checked_config(py, config.as_ref())?;
+        self.execute_stored_run(py, run_id, partition_key, config, resume, raise_on_error)
+    }
+}
+
+impl PyJob {
+    /// [`Self::execute_run`] with the document text a record holds: how
+    /// daemon dispatch and backfill children enter.
+    pub(crate) fn execute_stored_run(
+        &self,
+        py: Python,
+        run_id: &str,
+        partition_key: Option<PyPartitionKey>,
+        config: Option<String>,
         resume: bool,
         raise_on_error: bool,
     ) -> PyResult<PyRunResult> {
@@ -577,9 +596,16 @@ impl PyJob {
             raise_on_error,
         )
     }
-}
 
-impl PyJob {
+    /// The `config=` a pymethod took, as the document text, checked
+    /// against this job's nodes.
+    fn checked_config(&self, py: Python, config: Option<&Py<PyAny>>) -> PyResult<Option<String>> {
+        let (_, node_map, _) = self.validated_parts()?;
+        check_run_config(run_config_to_json(py, config)?.as_deref(), |name| {
+            node_map.contains_key(name)
+        })
+    }
+
     /// Single entry point used by `execute`, `execute_run`, and
     /// `materialize_with_launcher` (via a synthetic job).
     #[allow(clippy::too_many_arguments)]
@@ -590,7 +616,7 @@ impl PyJob {
         init: RunInit,
         partition_key: Option<PyPartitionKey>,
         tags: Vec<(String, String)>,
-        config: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<String>,
         resume: bool,
         raise_on_error: bool,
     ) -> PyResult<PyRunResult> {

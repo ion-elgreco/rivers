@@ -143,7 +143,7 @@ physical table is already gone. A subclass redefining a verb replaces the built-
 
 ### `OptimizeConfig`
 
-Per-asset overrides via `run_action("optimize", config={"<asset>": {...}})`:
+Per-asset overrides via `run_action("optimize", config={"assets": {"<asset>": {"config": {...}}}})`:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

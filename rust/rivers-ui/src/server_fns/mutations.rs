@@ -568,7 +568,7 @@ pub async fn validate_config(
         .errors
         .into_iter()
         .map(|e| ConfigError {
-            asset: e.asset,
+            path: e.path,
             loc: e
                 .loc
                 .into_iter()
