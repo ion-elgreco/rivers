@@ -695,10 +695,11 @@ class TestRunQueueConfig:
         )
         repo.resolve(storage=storage)
         handle = repo._submit_run(
-            selection=["queued_cfg"], config={"queued_cfg": {"threshold": 0.9}}
+            selection=["queued_cfg"],
+            config={"assets": {"queued_cfg": {"config": {"threshold": 0.9}}}},
         )
         assert storage.get_run(handle.run_id).config == {
-            "queued_cfg": {"threshold": 0.9}
+            "assets": {"queued_cfg": {"config": {"threshold": 0.9}}}
         }
 
         daemon = AutomationDaemon(repo=repo, storage=storage)

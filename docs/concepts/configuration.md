@@ -38,38 +38,54 @@ def api_data(context: rs.AssetExecutionContext[PipelineConfig]):
     return fetch_data(config.api_key, batch_size=config.batch_size)
 ```
 
-## Materialize-time overrides
+## The launch document
 
-Override config values when calling `materialize()`:
+A run can depart from the definitions in one document, passed as `config=` to `materialize()`, `run_action()`, `backfill()` and `Job.execute()`, and edited in the UI's launch dialogs. Per asset it holds `config`, values for the asset's config class, and `metadata`, keys added to or replacing the asset's [metadata](assets.md#asset-metadata) for this run:
 
 ```python
 repo.materialize(
     selection=["filtered_data"],
-    config={"filtered_data": {"min_value": 10, "max_value": 50}},
+    config={
+        "assets": {
+            "filtered_data": {
+                "config": {"min_value": 10, "max_value": 50},
+                "metadata": {"delta/mode": "overwrite", "rivers/executor": "in_process"},
+            }
+        }
+    },
 )
 ```
 
-Overrides are merged with defaults at instantiation time. For `BaseSettings`, env vars are resolved first, then overrides take precedence.
+Every part is optional; what is absent stays as defined. `config` values are merged with the class's defaults when the class is instantiated (for `BaseSettings`, env vars are resolved first, then these take precedence). `metadata` values are strings, like the asset's own; the merged metadata is what `context.asset_metadata`, the IO handlers and the engine's `rivers/` keys see for that run, so `rivers/executor` picks the executor for that asset's step. Only assets carry metadata: naming a task under `metadata` is an error.
 
-The run record keeps the overrides (`RunRecord.config`, as long as the values are JSON-serializable), so a rerun replays them and the run page shows them. Every launch path applies them: the run queue, Kubernetes run pods, backfill child runs and reruns.
+The document must be JSON-serializable (pydantic's encoder is used, so dates, paths and enums are fine). The run record keeps it (`RunRecord.config`), so a rerun replays it and the run page shows it, and every launch path applies it: the run queue, Kubernetes run and step pods, backfill child runs and reruns. A document that names an unknown asset, an unknown section, or a value its config class rejects is refused before a run exists.
 
-## Overrides from the UI
+## The document in the UI
 
-The Materialize and Execute job dialogs show a **Config** editor when a selected asset (or the chosen action) takes config. It holds the same JSON object `materialize()` takes, keyed by asset name, and opens pre-filled with each field's default:
+The Materialize and Execute job dialogs show a **Config** editor when a selected asset has a config class or metadata (or the chosen action takes config). It holds the launch document and opens pre-filled with each config field's default and each asset's current metadata:
 
 ```json
 {
-  "api_data": {
-    "batch_size": 100
+  "assets": {
+    "api_data": {
+      "config": {
+        "batch_size": 100
+      },
+      "metadata": {
+        "delta/mode": "append"
+      }
+    }
   }
 }
 ```
 
-The editor checks the text against each config class's JSON schema as you type. A syntax error, an unknown field, a value of the wrong type or outside its bounds, or a value that is not one of a `Literal`'s choices is underlined and listed under the editor with its line and column; clicking the line moves the caret there. Any of these disables the submit button: pydantic would otherwise ignore an unknown field silently, and a wrong value would fail the step when the run starts. Once the schema is satisfied, the config class itself checks the overrides in the code location, the way a run builds it, so its validators and `pattern` or `format` constraints show in the editor a moment after typing. A launch whose values the class rejects is refused before a run exists.
+The editor checks the text against the document's JSON schema as you type. A syntax error, an unknown section, asset or field, a value of the wrong type or outside its bounds, a metadata value that is not a string, or a value that is not one of a `Literal`'s choices is underlined and listed under the editor with its line and column; clicking the line moves the caret there. Any of these disables the submit button: pydantic would otherwise ignore an unknown field silently, and a wrong value would fail the step when the run starts. Once the schema is satisfied, the code location checks the document as a run would, building each config class, so validators and `pattern` or `format` constraints show in the editor a moment after typing. A launch the code location refuses never becomes a run.
 
-A field without a default — a required field, or a `BaseSettings` field the environment resolves — is never pre-filled, so nothing is sent for it unless you set it. The editor lists such fields as "Required, not set"; **Insert missing fields** adds them with an empty value of the right type. They do not block a submit.
+A field without a default — a required field, or a `BaseSettings` field the environment resolves — is never pre-filled, so nothing is sent for it unless you set it. The editor lists such fields as "Required, not set" under their document path; **Insert missing fields** adds them with an empty value of the right type. They do not block a submit.
 
-Typing a field name or a value opens a completion list, and `Ctrl+Space` opens it anywhere. It offers the fields the object does not have yet, with their type, default and description, and for a value the choices of a `Literal` or `Enum`, `true`/`false`, `null` where the field allows it, and the default. `Enter` or `Tab` accepts, `Escape` closes. `Tab` indents by two spaces (`Escape` then `Tab` leaves the editor), and `{`, `[` and `"` close themselves.
+Typing a key or a value opens a completion list, and `Ctrl+Space` opens it anywhere. It offers the sections, assets and fields the object does not have yet, with their type, default and description — an asset's current metadata keys and values included — and for a value the choices of a `Literal` or `Enum`, `true`/`false`, `null` where the field allows it, and the default. `Enter` or `Tab` accepts, `Escape` closes. `Tab` indents by two spaces (`Escape` then `Tab` leaves the editor), and `{`, `[` and `"` close themselves.
+
+An asset with neither a config class nor metadata launches on one click; the dialog opens when one has either.
 
 ## Tasks
 

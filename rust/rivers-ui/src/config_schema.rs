@@ -1,13 +1,13 @@
-//! What the editor knows about a config class's JSON schema (pydantic's
-//! `model_json_schema()` text): the issues a parsed document has against
-//! it, the required fields it lacks, and the completions a caret takes.
-
-use std::collections::HashMap;
+//! What the editor knows about a JSON schema: the issues a parsed document
+//! has against it, the required fields it lacks, the completions a caret
+//! takes, the template it opens with and the payload it sends. The schema is
+//! a launch document's, composed from config classes' `model_json_schema()`
+//! text placed in it with [`inline`].
 
 use serde_json::{Map, Value};
 
 use crate::helpers::plural;
-use crate::json_text::{Issue, Node, PathSeg};
+use crate::json_text::{Issue, Node, PathSeg, Span};
 
 pub struct Schema {
     root: Value,
@@ -124,6 +124,11 @@ pub fn type_label(schema: &Schema, node: &Value) -> String {
             .unwrap_or(reference)
             .to_string();
     }
+    if is_container(node)
+        && let Some(title) = resolved.get("title").and_then(Value::as_str)
+    {
+        return title.to_string();
+    }
     match resolved.get("type") {
         Some(Value::String(t)) => return t.clone(),
         Some(Value::Array(ts)) => {
@@ -145,6 +150,106 @@ pub fn type_label(schema: &Schema, node: &Value) -> String {
         }
     }
     "any".to_string()
+}
+
+/// An object declared in place with named fields: a document section, or
+/// a class schema inlined as one. A model is a `$ref`; a `dict` field has
+/// no `properties`.
+fn is_container(node: &Value) -> bool {
+    node.get("$ref").is_none() && node.get("properties").is_some_and(Value::is_object)
+}
+
+/// `schema_json` placed at `path` (property names, unescaped) in a larger
+/// schema: its `$defs` stay with it and its `#/$defs/...` references point
+/// there.
+pub fn inline(schema_json: &str, path: &[&str]) -> Option<Value> {
+    let mut value: Value = serde_json::from_str(schema_json).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    let base: String = path
+        .iter()
+        .map(|seg| format!("/{}", seg.replace('~', "~0").replace('/', "~1")))
+        .collect();
+    rebase_refs(&mut value, &base);
+    Some(value)
+}
+
+fn rebase_refs(value: &mut Value, base: &str) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(reference)) = map.get_mut("$ref") {
+                let rebased = reference
+                    .strip_prefix("#/$defs/")
+                    .map(|rest| format!("#{base}/$defs/{rest}"));
+                if let Some(rebased) = rebased {
+                    *reference = rebased;
+                }
+            }
+            for child in map.values_mut() {
+                rebase_refs(child, base);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                rebase_refs(item, base);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The text an editor opens with: the defaults the schema holds, in the
+/// objects that hold them. A container with named fields is listed even
+/// without defaults, as its fields complete; one with neither is not, nor
+/// is a model without a default.
+pub fn template(schema: &Schema) -> Value {
+    template_of(schema, &schema.root).unwrap_or_else(|| Value::Object(Map::new()))
+}
+
+fn template_of(schema: &Schema, node: &Value) -> Option<Value> {
+    if let Some(default) = schema.default_of(node) {
+        return Some(default.clone());
+    }
+    if !is_container(node) {
+        return None;
+    }
+    let props = node.get("properties")?.as_object()?;
+    let children: Map<String, Value> = props
+        .iter()
+        .filter_map(|(name, prop)| Some((name.clone(), template_of(schema, prop)?)))
+        .collect();
+    let has_fields = !props.is_empty() && !props.values().any(is_container);
+    (has_fields || !children.is_empty()).then_some(Value::Object(children))
+}
+
+/// `value` without the empty containers the template lists; `None` when
+/// nothing is left. A field set to `{}` stays: that is a value.
+pub fn compact(schema: &Schema, value: Value) -> Option<Value> {
+    compact_at(&schema.root, value)
+}
+
+fn compact_at(node: &Value, value: Value) -> Option<Value> {
+    let map = match value {
+        Value::Object(map) => map,
+        other => return Some(other),
+    };
+    let props = node.get("properties").and_then(Value::as_object);
+    let out: Map<String, Value> = map
+        .into_iter()
+        .filter_map(|(key, child)| {
+            let kept = match props.and_then(|p| p.get(&key)) {
+                Some(prop) => compact_at(prop, child)?,
+                None => child,
+            };
+            Some((key, kept))
+        })
+        .collect();
+    if out.is_empty() && is_container(node) {
+        None
+    } else {
+        Some(Value::Object(out))
+    }
 }
 
 fn type_set(node: &Value) -> Vec<&str> {
@@ -411,11 +516,14 @@ fn collect_missing(schema: &Schema, sch: &Value, node: &Node, path: &str, out: &
     let Some(obj) = schema.object_branch(sch) else {
         return;
     };
-    if let Some(required) = obj.get("required").and_then(Value::as_array) {
-        for key in required.iter().filter_map(Value::as_str) {
-            if !entries.iter().any(|e| e.key == key) {
-                out.push(child_path(path, key));
-            }
+    let required: Vec<&str> = obj
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for key in &required {
+        if !entries.iter().any(|e| e.key == *key) {
+            out.push(child_path(path, key));
         }
     }
     let props = obj.get("properties").and_then(Value::as_object);
@@ -428,6 +536,20 @@ fn collect_missing(schema: &Schema, sch: &Value, node: &Node, path: &str, out: &
                 &child_path(path, &entry.key),
                 out,
             );
+        }
+    }
+    // An absent container counts as empty: what it requires is still missing.
+    let none = Node::Object {
+        span: Span::at(0),
+        entries: Vec::new(),
+        closed: true,
+    };
+    for (name, prop) in props.into_iter().flatten() {
+        if is_container(prop)
+            && !required.iter().any(|r| r == name)
+            && !entries.iter().any(|e| &e.key == name)
+        {
+            collect_missing(schema, prop, &none, &child_path(path, name), out);
         }
     }
 }
@@ -579,36 +701,18 @@ pub fn placeholder_value(schema: &Schema, node: &Value) -> Value {
 }
 
 /// `text` with the required fields its objects lack added, each with its
-/// default or a placeholder, pretty-printed. `None` when `text` is not a
-/// JSON object of objects.
-pub fn scaffold_missing(
-    text: &str,
-    selected: &[String],
-    schemas: &HashMap<String, String>,
-) -> Option<String> {
+/// default or a placeholder, pretty-printed; an absent container is added
+/// when it requires something. `None` when `text` is not a JSON object.
+pub fn scaffold_missing(text: &str, schema: &Schema) -> Option<String> {
     let mut root = if text.trim().is_empty() {
         Map::new()
     } else {
-        let Value::Object(root) = serde_json::from_str(text).ok()? else {
-            return None;
-        };
-        root
-    };
-    for key in selected {
-        let Some(schema) = schemas.get(key).and_then(|s| Schema::parse(s)) else {
-            continue;
-        };
-        let mut fields = match root.get(key) {
-            Some(Value::Object(fields)) => fields.clone(),
-            Some(_) => return None,
-            None => Map::new(),
-        };
-        let before = fields.len();
-        fill_required(&schema, &schema.root, &mut fields);
-        if root.contains_key(key) || fields.len() > before {
-            root.insert(key.clone(), Value::Object(fields));
+        match serde_json::from_str(text).ok()? {
+            Value::Object(root) => root,
+            _ => return None,
         }
-    }
+    };
+    fill_required(schema, &schema.root, &mut root);
     serde_json::to_string_pretty(&Value::Object(root)).ok()
 }
 
@@ -631,6 +735,15 @@ fn fill_required(schema: &Schema, sch: &Value, fields: &mut Map<String, Value>) 
             && let Value::Object(inner) = value
         {
             fill_required(schema, prop, inner);
+        }
+    }
+    for (name, prop) in props.into_iter().flatten() {
+        if is_container(prop) && !fields.contains_key(name) {
+            let mut inner = Map::new();
+            fill_required(schema, prop, &mut inner);
+            if !inner.is_empty() {
+                fields.insert(name.clone(), Value::Object(inner));
+            }
         }
     }
 }
@@ -978,47 +1091,160 @@ mod tests {
         assert_eq!(at("m"), "{}");
     }
 
-    #[test]
-    fn scaffold_adds_the_required_fields_only() {
-        let schemas: HashMap<String, String> = [
+    /// A launch document schema over the class fixtures, as the editor
+    /// composes it.
+    fn document() -> Schema {
+        let mut assets = Map::new();
+        for (key, class) in [
             ("cfg", CFG),
             ("api", SETTINGS),
             ("outer", NESTED),
             ("ingest", INGESTION),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-        let selected = strings(&["cfg", "api", "outer", "ingest", "plain"]);
+        ] {
+            let at = [
+                "properties",
+                "assets",
+                "properties",
+                key,
+                "properties",
+                "config",
+            ];
+            assets.insert(
+                key.to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "config": inline(class, &at).unwrap(),
+                        "metadata": {"type": "object", "properties": {}, "additionalProperties": {"type": "string"}}
+                    },
+                    "additionalProperties": false
+                }),
+            );
+        }
+        Schema {
+            root: serde_json::json!({
+                "type": "object",
+                "properties": {"assets": {"type": "object", "properties": assets, "additionalProperties": false}},
+                "additionalProperties": false
+            }),
+        }
+    }
 
-        let text = "{\n  \"cfg\": {\n    \"threshold\": 0.9\n  },\n  \"outer\": {\"creds\": {}}\n}";
-        let out = scaffold_missing(text, &selected, &schemas).unwrap();
-        let value: Value = serde_json::from_str(&out).unwrap();
+    #[test]
+    fn inline_keeps_a_class_schemas_models_reachable() {
+        let placed = inline(CFG, &["properties", "a/b"]).unwrap();
         assert_eq!(
-            value,
-            serde_json::json!({
-                "cfg": {"threshold": 0.9, "required_key": ""},
-                "api": {"api_key": ""},
-                "outer": {"creds": {"user": ""}}
-            })
+            placed.pointer("/properties/inner/$ref").unwrap(),
+            "#/properties/a~1b/$defs/Inner"
         );
-        // Blank text scaffolds from nothing; an asset with nothing required
-        // stays absent; a present one keeps its fields.
-        let out = scaffold_missing("", &strings(&["ingest", "outer"]), &schemas).unwrap();
+        let doc = Schema {
+            root: serde_json::json!({"properties": {"a/b": placed}}),
+        };
+        assert_eq!(
+            doc.at(&[key("a/b"), key("inner"), key("port")])
+                .and_then(|n| n.get("maximum")),
+            Some(&serde_json::json!(65535))
+        );
+        assert_eq!(
+            type_label(&doc, doc.at(&[key("a/b"), key("inner")]).unwrap()),
+            "Inner"
+        );
+        assert_eq!(type_label(&doc, doc.at(&[key("a/b")]).unwrap()), "Cfg");
+        assert_eq!(inline("[1]", &["x"]), None);
+    }
+
+    #[test]
+    fn template_holds_defaults_and_the_containers_with_fields() {
+        let doc = document();
+        assert_eq!(
+            template(&doc),
+            serde_json::json!({"assets": {
+                "api": {"config": {"batch": 10}},
+                "cfg": {"config": {
+                    "threshold": 0.5, "name": "x", "region": null, "mode": "fast", "reg": "eu",
+                    "inner": {"host": "localhost", "port": 5432}, "extra": {}, "when": null, "ratio": 1
+                }},
+                "ingest": {"config": {"source_system": "demo", "batch_size": 100, "include_inactive": false}},
+                "outer": {"config": {}}
+            }})
+        );
+        // Nothing known anywhere: an empty document.
+        let bare = Schema {
+            root: serde_json::json!({"type": "object", "properties": {"assets": {"type": "object", "properties": {
+                "plain": {"type": "object", "properties": {"metadata": {"type": "object", "properties": {}}}}
+            }}}}),
+        };
+        assert_eq!(template(&bare), serde_json::json!({}));
+    }
+
+    #[test]
+    fn compact_drops_empty_containers_but_keeps_empty_values() {
+        let doc = document();
+        let text = serde_json::json!({"assets": {
+            "cfg": {"config": {"extra": {}, "inner": {}}, "metadata": {}},
+            "api": {"config": {}},
+            "outer": {}
+        }});
+        assert_eq!(
+            compact(&doc, text),
+            Some(serde_json::json!({"assets": {"cfg": {"config": {"extra": {}, "inner": {}}}}}))
+        );
+        assert_eq!(
+            compact(&doc, serde_json::json!({"assets": {"api": {"config": {}}}})),
+            None
+        );
+        assert_eq!(compact(&doc, serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn missing_fields_are_found_through_absent_containers() {
+        let doc = document();
+        let at = |text: &str| {
+            let parsed = parse(text);
+            missing_required(&doc, parsed.root.as_ref().unwrap(), "")
+        };
+        assert_eq!(
+            at("{}"),
+            strings(&[
+                "assets.api.config.api_key",
+                "assets.cfg.config.required_key",
+                "assets.outer.config.creds",
+            ])
+        );
+        assert_eq!(
+            at(
+                r#"{"assets": {"api": {"config": {"api_key": "k"}}, "cfg": {"config": {"required_key": "r"}}, "outer": {"config": {"creds": {}}}}}"#
+            ),
+            strings(&["assets.outer.config.creds.user"])
+        );
+    }
+
+    #[test]
+    fn scaffold_adds_required_fields_and_the_containers_they_need() {
+        let doc = document();
+        let text = "{\n  \"assets\": {\n    \"cfg\": {\"config\": {\"threshold\": 0.9}},\n    \"outer\": {\"config\": {\"creds\": {}}}\n  }\n}";
+        let out = scaffold_missing(text, &doc).unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&out).unwrap(),
-            serde_json::json!({"outer": {"creds": {"user": ""}}})
+            serde_json::json!({"assets": {
+                "cfg": {"config": {"threshold": 0.9, "required_key": ""}},
+                "api": {"config": {"api_key": ""}},
+                "outer": {"config": {"creds": {"user": ""}}}
+            }})
         );
-        let out = scaffold_missing(
-            r#"{"ingest": {"batch_size": 5}}"#,
-            &strings(&["ingest"]),
-            &schemas,
-        )
-        .unwrap();
-        assert_eq!(out, "{\n  \"ingest\": {\n    \"batch_size\": 5\n  }\n}");
-        assert_eq!(scaffold_missing("{\"cfg\": ", &selected, &schemas), None);
-        assert_eq!(scaffold_missing("[1]", &selected, &schemas), None);
-        assert_eq!(scaffold_missing(r#"{"cfg": 1}"#, &selected, &schemas), None);
+        // Blank text scaffolds from nothing; a container with nothing
+        // required stays absent.
+        let out = scaffold_missing("", &doc).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap(),
+            serde_json::json!({"assets": {
+                "api": {"config": {"api_key": ""}},
+                "cfg": {"config": {"required_key": ""}},
+                "outer": {"config": {"creds": {"user": ""}}}
+            }})
+        );
+        assert_eq!(scaffold_missing("{\"assets\": ", &doc), None);
+        assert_eq!(scaffold_missing("[1]", &doc), None);
     }
 
     #[test]

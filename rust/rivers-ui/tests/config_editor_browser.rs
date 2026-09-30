@@ -1,6 +1,7 @@
-//! Browser tests for the config editor: highlighting, schema issues, the
-//! keys a code editor has, and the required-fields hint. `ConfigEditor` is
-//! mounted on its own with the `check_config` memo a dialog would own.
+//! Browser tests for the launch document editor: highlighting, schema
+//! issues, the keys a code editor has, and the required-fields hint.
+//! `ConfigEditor` is mounted on its own with the `check_config` memo a
+//! dialog would own.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -14,7 +15,10 @@ use common::{
 };
 use leptos::mount::mount_to;
 use leptos::prelude::*;
-use rivers_ui::components::config_editor::{Check, ConfigEditor, check_config, use_config_check};
+use rivers_ui::components::config_editor::{
+    Check, ConfigEditor, check_config, launch_schema, use_config_check,
+};
+use rivers_ui::types::AssetDefinitionInfo;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::{
@@ -28,27 +32,51 @@ const PIPELINE: &str = r#"{"properties":{"api_key":{"title":"Api Key","type":"st
 
 struct Editor {
     host: HtmlElement,
-    selected: RwSignal<Vec<String>>,
+    schema: RwSignal<Option<String>>,
     text: RwSignal<String>,
     check: Memo<Check>,
 }
 
-fn mount(schemas: &[(&str, &str)]) -> Editor {
-    let target = fresh_mount_target();
-    let keys: Vec<String> = schemas.iter().map(|(k, _)| k.to_string()).collect();
-    let by_key: HashMap<String, String> = schemas
+fn definition(key: &str, config_schema: &str) -> AssetDefinitionInfo {
+    AssetDefinitionInfo {
+        asset_key: key.to_string(),
+        description: None,
+        partition_def: None,
+        hooks: vec![],
+        io_handler: None,
+        has_self_dependency: false,
+        is_external: false,
+        automation_condition: None,
+        tags: vec![],
+        kinds: vec![],
+        group: None,
+        code_version: None,
+        asset_type: "single".to_string(),
+        actions: vec![],
+        config_schema: Some(config_schema.to_string()),
+        metadata: Default::default(),
+    }
+}
+
+/// The launch document schema of a materialize of `classes` (key, class schema).
+fn document_schema(classes: &[(&str, &str)]) -> String {
+    let keys: Vec<String> = classes.iter().map(|(k, _)| k.to_string()).collect();
+    let definitions: HashMap<String, AssetDefinitionInfo> = classes
         .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .map(|(k, v)| (k.to_string(), definition(k, v)))
         .collect();
-    let selected = RwSignal::new(keys);
-    let schemas = RwSignal::new(by_key);
+    launch_schema(&keys, &definitions, None).expect("a launch with config")
+}
+
+fn mount(classes: &[(&str, &str)]) -> Editor {
+    let target = fresh_mount_target();
+    let schema = RwSignal::new(Some(document_schema(classes)));
     let text = RwSignal::new(String::new());
-    let check = Memo::new(move |_| check_config(&text.get(), &selected.get(), &schemas.get()));
+    let check = Memo::new(move |_| check_config(&text.get(), schema.get().as_deref()));
     mount_to(target.clone(), move || {
         view! {
             <ConfigEditor
-                selected=selected
-                schemas=schemas
+                schema=schema
                 text=text
                 reset=Signal::derive(|| true)
                 check=check
@@ -58,7 +86,7 @@ fn mount(schemas: &[(&str, &str)]) -> Editor {
     .forget();
     Editor {
         host: target,
-        selected,
+        schema,
         text,
         check,
     }
@@ -159,11 +187,17 @@ async fn highlights_tokens_by_class() {
 
     assert_eq!(
         e.value(),
-        "{\n  \"api_data\": {\n    \"batch_size\": 100,\n    \"mode\": \"fast\"\n  }\n}"
+        "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100,\n        \"mode\": \"fast\"\n      }\n    }\n  }\n}"
     );
     assert_eq!(
         e.texts(".tok-key"),
-        vec!["\"api_data\"", "\"batch_size\"", "\"mode\""]
+        vec![
+            "\"assets\"",
+            "\"api_data\"",
+            "\"config\"",
+            "\"batch_size\"",
+            "\"mode\""
+        ]
     );
     assert_eq!(e.texts(".tok-num"), vec!["100"]);
     assert_eq!(e.texts(".tok-str"), vec!["\"fast\""]);
@@ -177,13 +211,13 @@ async fn unknown_key_is_underlined_and_listed() {
     let e = mount(&[("api_data", PIPELINE)]);
     flush_effects().await;
 
-    e.type_text("{\"api_data\": {\"batch_sizes\": 1}}");
+    e.type_text("{\"assets\": {\"api_data\": {\"config\": {\"batch_sizes\": 1}}}}");
     flush_effects().await;
     assert_eq!(e.marks(), vec!["\"batch_sizes\""]);
     assert_eq!(
         e.issues(),
         vec![
-            "1:15 api_data: unknown field 'batch_sizes'; expected one of api_key, batch_size, mode"
+            "1:37 assets.api_data.config: unknown field 'batch_sizes'; expected one of api_key, batch_size, mode"
         ]
     );
     assert_eq!(query_all(&e.host, ".code-editor--invalid").len(), 1);
@@ -191,7 +225,7 @@ async fn unknown_key_is_underlined_and_listed() {
 
     // Clicking the issue puts the caret on it.
     click(&query_one(&e.host, ".code-editor-issue .link-btn"), false);
-    assert_eq!(e.caret(), 14);
+    assert_eq!(e.caret(), 36);
 }
 
 #[wasm_bindgen_test]
@@ -199,29 +233,32 @@ async fn wrong_types_and_syntax_errors_are_issues() {
     let e = mount(&[("api_data", PIPELINE)]);
     flush_effects().await;
 
-    e.type_text("{\"api_data\": {\"batch_size\": \"5\"}}");
+    e.type_text("{\"assets\": {\"api_data\": {\"config\": {\"batch_size\": \"5\"}}}}");
     flush_effects().await;
     assert_eq!(
         e.issues(),
-        vec!["1:29 api_data.batch_size: expected integer, got string"]
+        vec!["1:51 assets.api_data.config.batch_size: expected integer, got string"]
     );
     assert_eq!(e.marks(), vec!["\"5\""]);
 
-    e.type_text("{\"api_data\": ");
+    e.type_text("{\"assets\": ");
     flush_effects().await;
-    assert_eq!(e.issues(), vec!["1:14 Expected a value"]);
+    assert_eq!(e.issues(), vec!["1:12 Expected a value"]);
     assert_eq!(e.marks(), vec![" "]);
 
     e.type_text("{\"other\": {}}");
     flush_effects().await;
-    assert_eq!(e.issues(), vec!["1:2 'other' is not in the selection."]);
+    assert_eq!(
+        e.issues(),
+        vec!["1:2 unknown field 'other'; expected one of assets"]
+    );
 
-    e.type_text("{\"api_data\": {\"batch_size\": 5}}");
+    e.type_text("{\"assets\": {\"api_data\": {\"config\": {\"batch_size\": 5}}}}");
     flush_effects().await;
     assert!(e.issues().is_empty());
     assert_eq!(
         e.check.get_untracked().payload.as_deref(),
-        Some("{\"api_data\":{\"batch_size\":5}}")
+        Some("{\"assets\":{\"api_data\":{\"config\":{\"batch_size\":5}}}}")
     );
 }
 
@@ -289,44 +326,46 @@ async fn insert_missing_fields_adds_required_keys() {
     let e = mount(&[("api_data", PIPELINE)]);
     flush_effects().await;
 
-    assert_eq!(e.hint().as_deref(), Some("api_data.api_key"));
+    assert_eq!(e.hint().as_deref(), Some("assets.api_data.config.api_key"));
     click(&query_one(&e.host, ".config-editor-hint .link-btn"), false);
     flush_effects().await;
     let value: serde_json::Value = serde_json::from_str(&e.value()).unwrap();
     assert_eq!(
         value,
-        serde_json::json!({"api_data": {"api_key": "", "batch_size": 100, "mode": "fast"}})
+        serde_json::json!({"assets": {"api_data": {"config": {"api_key": "", "batch_size": 100, "mode": "fast"}}}})
     );
     assert_eq!(e.hint(), None);
 
     // Hinted too when the asset's entry is gone; the payload holds what is set.
     e.type_text("{}");
     flush_effects().await;
-    assert_eq!(e.hint().as_deref(), Some("api_data.api_key"));
-    e.type_text("{\"api_data\": {\"api_key\": \"k\"}}");
+    assert_eq!(e.hint().as_deref(), Some("assets.api_data.config.api_key"));
+    e.type_text("{\"assets\": {\"api_data\": {\"config\": {\"api_key\": \"k\"}}}}");
     flush_effects().await;
     assert_eq!(e.hint(), None);
     assert_eq!(
         e.check.get_untracked().payload.as_deref(),
-        Some("{\"api_data\":{\"api_key\":\"k\"}}")
+        Some("{\"assets\":{\"api_data\":{\"config\":{\"api_key\":\"k\"}}}}")
     );
 }
 
-/// Deselecting the only configured asset removes the editor; selecting it
-/// again brings the template back, in the signal and in the textarea.
+/// Deselecting the only configured asset (no schema) removes the editor;
+/// selecting it again brings the template back, in the signal and in the
+/// textarea.
 #[wasm_bindgen_test]
 async fn template_returns_after_the_asset_is_selected_again() {
     let e = mount(&[("api_data", PIPELINE)]);
     flush_effects().await;
     let template = e.value();
-    assert!(template.starts_with("{\n  \"api_data\""), "{template}");
+    assert!(template.starts_with("{\n  \"assets\""), "{template}");
 
-    e.selected.set(Vec::new());
+    e.schema.set(None);
     flush_effects().await;
     assert!(query_all(&e.host, ".config-editor").is_empty());
     assert_eq!(e.text.get_untracked(), "");
 
-    e.selected.set(vec!["api_data".to_string()]);
+    e.schema
+        .set(Some(document_schema(&[("api_data", PIPELINE)])));
     // The template effect runs after the Show has mounted the textarea, so
     // the value binding follows one microtask later.
     flush_effects().await;
@@ -348,13 +387,16 @@ async fn typing_a_key_prefix_opens_completion_and_enter_inserts() {
     let e = mount(&[("api_data", PIPELINE)]);
     flush_effects().await;
 
-    e.type_text("{\"api_data\": {\"ap");
+    e.type_text("{\"assets\": {\"api_data\": {\"config\": {\"ap");
     flush_effects().await;
     assert_eq!(e.options(), vec!["api_key"]);
     assert!(e.press("Enter", false));
     flush_effects().await;
-    assert_eq!(e.value(), "{\"api_data\": {\"api_key\": \"\"");
-    assert_eq!(e.caret(), 26);
+    assert_eq!(
+        e.value(),
+        "{\"assets\": {\"api_data\": {\"config\": {\"api_key\": \"\""
+    );
+    assert_eq!(e.caret(), 48);
     assert!(query_all(&e.host, ".code-editor-popup").is_empty());
 }
 
@@ -363,7 +405,7 @@ async fn values_complete_after_the_colon_and_on_ctrl_space() {
     let e = mount(&[("api_data", PIPELINE)]);
     flush_effects().await;
 
-    e.type_text("{\"api_data\": {\"mode\": ");
+    e.type_text("{\"assets\": {\"api_data\": {\"config\": {\"mode\": ");
     flush_effects().await;
     assert_eq!(e.options(), vec!["\"fast\"", "\"slow\""]);
     assert_eq!(e.texts(".code-editor-option-detail"), vec!["default", ""]);
@@ -379,8 +421,11 @@ async fn values_complete_after_the_colon_and_on_ctrl_space() {
     assert_eq!(e.active_option().as_deref(), Some("\"slow\""));
     assert!(e.press("Enter", false));
     flush_effects().await;
-    assert_eq!(e.value(), "{\"api_data\": {\"mode\": \"slow\"");
-    assert_eq!(e.caret(), 28);
+    assert_eq!(
+        e.value(),
+        "{\"assets\": {\"api_data\": {\"config\": {\"mode\": \"slow\""
+    );
+    assert_eq!(e.caret(), 50);
 }
 
 #[wasm_bindgen_test]
@@ -388,8 +433,8 @@ async fn completion_skips_present_keys_and_adds_commas() {
     let e = mount(&[("api_data", PIPELINE)]);
     flush_effects().await;
 
-    e.type_text("{\"api_data\": {\"batch_size\": 1}}");
-    e.set_caret(14);
+    e.type_text("{\"assets\": {\"api_data\": {\"config\": {\"batch_size\": 1}}}}");
+    e.set_caret(36);
     assert!(e.press(" ", true));
     flush_effects().await;
     assert_eq!(e.options(), vec!["api_key", "mode"]);
@@ -397,10 +442,10 @@ async fn completion_skips_present_keys_and_adds_commas() {
     flush_effects().await;
     assert_eq!(
         e.value(),
-        "{\"api_data\": {\"api_key\": \"\",\"batch_size\": 1}}"
+        "{\"assets\": {\"api_data\": {\"config\": {\"api_key\": \"\",\"batch_size\": 1}}}}"
     );
 
-    e.type_text("{\"api_data\": {\"batch_size\": 1 ");
+    e.type_text("{\"assets\": {\"api_data\": {\"config\": {\"batch_size\": 1 ");
     assert!(e.press(" ", true));
     flush_effects().await;
     assert_eq!(e.options(), vec!["api_key", "mode"]);
@@ -409,12 +454,12 @@ async fn completion_skips_present_keys_and_adds_commas() {
     flush_effects().await;
     assert_eq!(
         e.value(),
-        "{\"api_data\": {\"batch_size\": 1 , \"mode\": \"fast\""
+        "{\"assets\": {\"api_data\": {\"config\": {\"batch_size\": 1 , \"mode\": \"fast\""
     );
 }
 
 #[wasm_bindgen_test]
-async fn top_level_completion_offers_assets_and_a_click_inserts() {
+async fn sections_and_assets_complete_and_a_click_inserts() {
     let e = mount(&[("api_data", PIPELINE), ("other", PIPELINE)]);
     flush_effects().await;
 
@@ -423,11 +468,17 @@ async fn top_level_completion_offers_assets_and_a_click_inserts() {
     assert!(query_all(&e.host, ".code-editor-popup").is_empty());
     assert!(e.press(" ", true));
     flush_effects().await;
+    assert_eq!(e.options(), vec!["assets"]);
+    assert!(e.press("Escape", false));
+
+    e.type_text("{\"assets\": {");
+    assert!(e.press(" ", true));
+    flush_effects().await;
     assert_eq!(e.options(), vec!["api_data", "other"]);
     mousedown(&query_all(&e.host, ".code-editor-option")[1]);
     flush_effects().await;
-    assert_eq!(e.value(), "{\"other\": {}");
-    assert_eq!(e.caret(), 11);
+    assert_eq!(e.value(), "{\"assets\": {\"other\": {}");
+    assert_eq!(e.caret(), 22);
     assert!(query_all(&e.host, ".code-editor-popup").is_empty());
 }
 
@@ -437,29 +488,25 @@ async fn top_level_completion_offers_assets_and_a_click_inserts() {
 #[wasm_bindgen_test]
 async fn the_config_classes_errors_show_after_the_schema_passes() {
     let (_mock, requests) = install_recording_fetch_mock(
-        r#"[{"asset":"api_data","loc":[{"Key":"batch_size"}],"message":"Input should be greater than 0","kind":"greater_than"},{"asset":"api_data","loc":[{"Key":"api_key"}],"message":"Field required","kind":"missing"}]"#,
+        r#"[{"path":["assets","api_data","config"],"loc":[{"Key":"batch_size"}],"message":"Input should be greater than 0","kind":"greater_than"},{"path":["assets","api_data","config"],"loc":[{"Key":"api_key"}],"message":"Field required","kind":"missing"}]"#,
     );
     let target = fresh_mount_target();
     let selected = RwSignal::new(vec!["api_data".to_string()]);
-    let schemas = RwSignal::new(HashMap::from([(
-        "api_data".to_string(),
-        PIPELINE.to_string(),
-    )]));
+    let schema = RwSignal::new(Some(document_schema(&[("api_data", PIPELINE)])));
     let text = RwSignal::new(String::new());
     let check = StoredValue::new(None::<Signal<Check>>);
     mount_to(target.clone(), move || {
         let checked = use_config_check(
             text,
             selected.into(),
-            schemas.into(),
+            schema.into(),
             Signal::derive(|| ("dev".to_string(), "demo".to_string())),
             Signal::derive(|| None),
         );
         check.set_value(Some(checked));
         view! {
             <ConfigEditor
-                selected=selected
-                schemas=schemas
+                schema=schema
                 text=text
                 reset=Signal::derive(|| true)
                 check=checked
@@ -481,7 +528,7 @@ async fn the_config_classes_errors_show_after_the_schema_passes() {
     );
     assert_eq!(
         issues(),
-        vec!["3:19 api_data.batch_size: Input should be greater than 0"]
+        vec!["5:23 assets.api_data.config.batch_size: Input should be greater than 0"]
     );
     assert_eq!(
         query_all(&target, ".code-editor-mark")
@@ -492,14 +539,14 @@ async fn the_config_classes_errors_show_after_the_schema_passes() {
     );
     let checked = check.get_value().unwrap().get_untracked();
     assert_eq!(checked.payload, None);
-    assert_eq!(checked.missing, vec!["api_data.api_key"]);
+    assert_eq!(checked.missing, vec!["assets.api_data.config.api_key"]);
     let bodies = request_bodies(&requests.borrow().clone()).await;
     assert_eq!(bodies.len(), 1, "{bodies:?}");
     assert!(bodies[0].contains("api_data"), "{}", bodies[0]);
 
     // A schema issue takes over; the classes' answer was for other text.
     let ta: HtmlTextAreaElement = query_one(&target, ".code-editor-text").dyn_into().unwrap();
-    ta.set_value("{\"api_data\": {\"batch_sizes\": 1}}");
+    ta.set_value("{\"assets\": {\"api_data\": {\"config\": {\"batch_sizes\": 1}}}}");
     dispatch(&ta, "input");
     flush_effects().await;
     assert_eq!(issues().len(), 1);

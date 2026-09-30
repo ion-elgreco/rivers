@@ -274,6 +274,19 @@ Custom IO handlers can define their own prefixed keys following the same convent
 
 Metadata is a `dict[str, str]` — all values are strings. IO handlers parse them as needed (e.g. `delta/partition_expr` can be a JSON dict for multi-dimensional partitions).
 
+### Per-run overrides
+
+A launch can add or replace metadata keys for one run through the [launch document](configuration.md#the-launch-document), from Python or the UI's launch dialogs:
+
+```python
+repo.materialize(
+    selection=["events"],
+    config={"assets": {"events": {"metadata": {"delta/mode": "overwrite"}}}},
+)
+```
+
+The merged metadata reaches `context.asset_metadata`, the IO handlers and the engine for that run only; the definition is unchanged. `rivers/executor` set this way picks the executor for that asset's step.
+
 ## Output metadata
 
 IO handlers and asset functions can attach runtime metadata via `context.add_output_metadata()`. This metadata is available in the job result and can include `MetadataValue` instances for typed values:

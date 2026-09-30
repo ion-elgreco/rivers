@@ -1682,7 +1682,16 @@ def test_delta_asset_vacuum_config_reaches_deltalake(tmp_path, storage):
 
     assert repo.run_action(
         "vacuum",
-        config={"events": {"retention_hours": 0, "enforce_retention_duration": False}},
+        config={
+            "assets": {
+                "events": {
+                    "config": {
+                        "retention_hours": 0,
+                        "enforce_retention_duration": False,
+                    }
+                }
+            }
+        },
     ).success
 
     assert len(list(table_dir.rglob("*.parquet"))) == active
@@ -1760,7 +1769,9 @@ def test_partitioned_delta_asset_optimize_scope(
     assert repo.run_action(
         "optimize",
         partition_key=rs.PartitionKey.single(key) if key else None,
-        config={"events": {"z_order_by": z_order_by}} if z_order_by else None,
+        config={"assets": {"events": {"config": {"z_order_by": z_order_by}}}}
+        if z_order_by
+        else None,
     ).success
 
     assert _files_per_partition(table_uri, "day") == files_per_day
@@ -1955,7 +1966,9 @@ def test_verb_config_rejects_unknown_keys(tmp_path, storage):
     repo.materialize()
 
     result = repo.run_action(
-        "vacuum", config={"events": {"retention_hrs": 1}}, raise_on_error=False
+        "vacuum",
+        config={"assets": {"events": {"config": {"retention_hrs": 1}}}},
+        raise_on_error=False,
     )
     assert not result.success
     assert "retention_hrs" in result.failed_assets[0][1]

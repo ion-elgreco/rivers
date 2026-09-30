@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use leptos::prelude::*;
 
-use crate::components::config_editor::{ConfigEditor, launch_config_schemas, use_config_check};
+use crate::components::config_editor::{ConfigEditor, launch_schema, use_config_check};
 use crate::components::partition_picker::{PartitionPicker, WholeAssetChoice};
 use crate::helpers::{JobPartitionPicker, close_on_navigation};
 use crate::loc::{loc_path, use_current_location};
@@ -59,9 +59,9 @@ pub fn ExecuteJobDialog(
     let definitions: Signal<HashMap<String, AssetDefinitionInfo>> =
         definitions.unwrap_or_else(|| Signal::derive(HashMap::new));
     let config_text = RwSignal::new(String::new());
-    let config_schemas = Signal::derive(move || {
+    let config_schema = Signal::derive(move || {
         let verb = verb.get();
-        launch_config_schemas(
+        launch_schema(
             &assets.get(),
             &definitions.get(),
             verb.as_ref().map(|v| v.name.as_str()),
@@ -72,7 +72,7 @@ pub fn ExecuteJobDialog(
     // Blank text is no overrides; the submit button waits for text without
     // issues, from the schema at once and from the config classes shortly after.
     let verb_name = Signal::derive(move || verb.get().map(|v| v.name));
-    let config_check = use_config_check(config_text, assets, config_schemas, loc, verb_name);
+    let config_check = use_config_check(config_text, assets, config_schema, loc, verb_name);
 
     let action = Action::new(
         move |input: &(Vec<SubmitPartitionKey>, bool, Option<String>)| {
@@ -204,8 +204,7 @@ pub fn ExecuteJobDialog(
                             <PartitionPicker picker=picker selected=selected reset=show/>
                         </Show>
                         <ConfigEditor
-                            selected=assets
-                            schemas=config_schemas
+                            schema=config_schema
                             text=config_text
                             reset=show
                             check=config_check

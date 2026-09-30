@@ -62,9 +62,9 @@ message MaterializeRequest {
   optional ProtoPartitionKey partition_key = 2;
   repeated Tag tags = 3;
   optional UserRef user = 4;
-  // Per-asset config overrides as a JSON object keyed by asset name:
-  // `{"asset": {"field": value}}`. Every key must be in the selection. Unset
-  // or empty means the definitions' defaults. Stored on the run.
+  // The launch document as JSON: `{"assets": {"<asset>": {"config": {...},
+  // "metadata": {...}}}}`. Every asset named must be in the selection. Unset
+  // or empty means the definitions as they are. Stored on the run.
   optional string config = 5;
 }
 
@@ -92,7 +92,7 @@ message ExecuteJobRequest {
   // The job runs its own verb, so a request naming another one (a page that
   // has not loaded the job, or loaded it before a redeploy) is rejected.
   optional string action = 5;
-  // As MaterializeRequest.config, keyed by the job's assets.
+  // As MaterializeRequest.config, naming the job's assets.
   optional string config = 6;
 }
 
@@ -151,7 +151,7 @@ message GetPartitionKeyIndexResponse {
 }
 
 message ValidateConfigRequest {
-  // The assets the launch would run; every key in `config` must be one of them.
+  // The assets the launch would run; every asset `config` names must be one of them.
   repeated string selection = 1;
   // As MaterializeRequest.config.
   string config = 2;
@@ -166,10 +166,15 @@ message ConfigLoc {
   }
 }
 message ConfigError {
-  string asset = 1;
+  // Where in the document the checked object sits, e.g. `assets`, the asset
+  // name, `config`.
+  repeated string path = 1;
+  // pydantic's `loc` inside that object; empty for the object itself.
   repeated ConfigLoc loc = 2;
   string message = 3;
-  // pydantic's error type: "missing", "int_parsing", "value_error", ...
+  // pydantic's error type ("missing", "int_parsing", "value_error", ...),
+  // "exception" for anything else a constructor raised, or "invalid" for a
+  // part of the document the definitions refuse.
   string kind = 4;
 }
 message ValidateConfigResponse {
@@ -199,6 +204,8 @@ message AssetDefinitionInfo {
   // JSON schema (pydantic `model_json_schema()`) of the config class the
   // asset's context annotation names. Unset when the asset takes no config.
   optional string config_schema = 15;
+  // The asset's metadata as defined; a launch document may add or replace keys.
+  map<string, string> metadata = 16;
 }
 
 message ActionInfo {

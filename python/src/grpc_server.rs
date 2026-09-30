@@ -76,8 +76,9 @@ impl CodeLocationImpl {
             .map_err(Status::internal)
     }
 
-    /// The errors each asset's config class raises for `config`, built as a
-    /// run builds it. Assets without a config class are skipped.
+    /// The errors the definitions find in `config`: each asset's config
+    /// class built as a run builds it, and metadata overrides on a node
+    /// that is not an asset. Assets without a config class are skipped.
     #[allow(clippy::result_large_err)]
     async fn config_issues(
         &self,
@@ -89,10 +90,28 @@ impl CodeLocationImpl {
             let repo_ref = repo.get();
             let guard = repo_ref.state.read().unwrap();
             let state = guard.as_ref().ok_or("repository not resolved")?;
-            let overrides = parse_run_config(py, &config).map_err(|e| e.to_string())?;
+            let document = parse_run_config(py, &config).map_err(|e| e.to_string())?;
             let mut issues = Vec::new();
-            for (asset, fields) in &overrides {
+            for (asset, overrides) in &document.assets {
                 let Some(node) = state.node_map.get(asset) else {
+                    continue;
+                };
+                let at =
+                    |section: &str| vec!["assets".to_string(), asset.clone(), section.to_string()];
+                if !overrides.metadata.is_empty()
+                    && !matches!(
+                        node,
+                        crate::repository::resolved_node::ResolvedNode::Asset(_)
+                    )
+                {
+                    issues.push(ConfigIssue {
+                        path: at("metadata"),
+                        loc: Vec::new(),
+                        message: format!("metadata overrides apply to assets; '{asset}' is a task"),
+                        kind: "invalid".to_string(),
+                    });
+                }
+                let Some(fields) = &overrides.config else {
                     continue;
                 };
                 let func = match &action {
@@ -112,9 +131,11 @@ impl CodeLocationImpl {
                     .bind(py)
                     .cast::<PyDict>()
                     .map_err(|e| e.to_string())?;
-                issues.extend(config_errors(py, asset, &cls, fields).map_err(|e| e.to_string())?);
+                issues.extend(
+                    config_errors(py, &at("config"), &cls, fields).map_err(|e| e.to_string())?,
+                );
             }
-            issues.sort_by(|a, b| a.asset.cmp(&b.asset));
+            issues.sort_by(|a, b| a.path.cmp(&b.path));
             Ok(issues)
         })
         .await
@@ -151,7 +172,7 @@ impl CodeLocationImpl {
 
 fn proto_config_error(issue: ConfigIssue) -> ConfigError {
     ConfigError {
-        asset: issue.asset,
+        path: issue.path,
         loc: issue
             .loc
             .into_iter()
@@ -172,7 +193,7 @@ fn proto_config_error(issue: ConfigIssue) -> ConfigError {
 #[allow(clippy::result_large_err)]
 fn request_config(config: Option<String>, selection: &[String]) -> Result<Option<String>, Status> {
     match config.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(json) => validate_run_config(json, selection)
+        Some(json) => validate_run_config(json, |name| selection.iter().any(|s| s == name))
             .map_err(|e| Status::invalid_argument(e.to_string())),
         None => Ok(None),
     }
@@ -571,6 +592,7 @@ impl CodeLocationService for CodeLocationImpl {
                         asset_type: node.asset_type().to_string(),
                         actions,
                         config_schema,
+                        metadata: node.metadata().unwrap_or_default(),
                     });
                 }
 

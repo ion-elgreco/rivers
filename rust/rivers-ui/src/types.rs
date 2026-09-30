@@ -1,6 +1,8 @@
 //! DTO types for the UI — mirrors rivers-core types without surrealdb dependencies.
 //! Used in server function signatures so they work on both SSR and WASM hydration targets.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Format a partition key to match gRPC's `py_partition_key_display` (`Multi` →
@@ -628,6 +630,9 @@ pub struct AssetDefinitionInfo {
     /// JSON schema of the asset's config class; `None` when it takes no config.
     #[serde(default)]
     pub config_schema: Option<String>,
+    /// The asset's metadata as defined; a launch may add or replace keys.
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 /// One step of pydantic's `loc`: a field name or a list index.
@@ -637,13 +642,17 @@ pub enum ConfigLoc {
     Index(u32),
 }
 
-/// One error a config class reported for a launch's overrides.
+/// One error the definitions found in a launch document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigError {
-    pub asset: String,
+    /// Where in the document the checked object sits, e.g.
+    /// `["assets", "raw_users", "config"]`.
+    pub path: Vec<String>,
+    /// pydantic's `loc` inside that object; empty for the object itself.
     pub loc: Vec<ConfigLoc>,
     pub message: String,
-    /// pydantic's error type: `missing`, `int_parsing`, `value_error`, ...
+    /// pydantic's error type (`missing`, `int_parsing`, `value_error`, ...),
+    /// `exception`, or `invalid` for a part the definitions refuse.
     pub kind: String,
 }
 

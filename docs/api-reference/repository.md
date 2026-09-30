@@ -86,7 +86,7 @@ def materialize(
     partition_key: PartitionKey | None = None,
     tags: list[tuple[str, str]] | None = None,
     raise_on_error: bool = True,
-    config: dict[str, dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
     run_id_override: str | None = None,
     include_upstream: bool = False,
     resume: bool = False,
@@ -104,7 +104,7 @@ When a `RunQueueConfig` is configured, the run queue applies to daemon-submitted
 | `partition_key` | `PartitionKey \| None` | `None` | Partition to materialize. Required for partitioned assets. |
 | `tags` | `list[tuple[str, str]] \| None` | `None` | Tags applied to the run for queue / observability filtering. |
 | `raise_on_error` | `bool` | `True` | Raise on first failure rather than returning a failed result. |
-| `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config overrides keyed by asset name. Kept on the run record when JSON-serializable. |
+| `config` | `dict[str, Any] \| None` | `None` | The [launch document](../concepts/configuration.md#the-launch-document): per-asset `config` and `metadata` overrides. Values must be JSON-serializable; the run record keeps it. |
 | `run_id_override` | `str \| None` | `None` | Use a pre-assigned run ID (used by K8s execution pods). |
 | `include_upstream` | `bool` | `False` | Also materialize transitive deps of `selection`. |
 | `resume` | `bool` | `False` | Skip already-completed steps from a crashed prior run with the same `run_id_override`. |
@@ -124,7 +124,7 @@ def backfill(
     failure_policy: str = "continue",
     max_concurrency: int = 4,
     tags: list[tuple[str, str]] | None = None,
-    config: dict[str, dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
     block: bool = True,
     dry_run: bool = False,
     action: str | None = None,
@@ -195,7 +195,7 @@ def run_action(
     partition_key: PartitionKey | None = None,
     tags: list[tuple[str, str]] | None = None,
     raise_on_error: bool = True,
-    config: dict[str, dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
     run_id_override: str | None = None,
     resume: bool = False,
 ) -> RunResult
@@ -210,7 +210,7 @@ Run a named [asset action](../concepts/actions.md) over a selection. The plan ha
 | `partition_key` | `PartitionKey \| None` | `None` | Partition to act on. The verb's [`partitioning`](assets.md#actionpartitioning) decides: required on partitioned targets for `Required`, rejected for `Keyless`, optional for `Optional` (none = the whole asset). |
 | `tags` | `list[tuple[str, str]] \| None` | `None` | Run tags. |
 | `raise_on_error` | `bool` | `True` | Raise the first failure instead of reporting it on the result. |
-| `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config overrides, keyed by asset name, for the action's own config class. Kept on the run record when JSON-serializable. |
+| `config` | `dict[str, Any] \| None` | `None` | The [launch document](../concepts/configuration.md#the-launch-document); `config` overrides go to the action's own config class. |
 | `run_id_override` | `str \| None` | `None` | Re-execute an existing run record under its own id (used by K8s run pods). |
 | `resume` | `bool` | `False` | Skip already-completed steps from a crashed prior run with the same `run_id_override`. |
 

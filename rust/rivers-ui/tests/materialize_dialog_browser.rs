@@ -764,6 +764,7 @@ fn definition(key: &str, config_schema: Option<&str>) -> rivers_ui::types::Asset
         asset_type: "asset".to_string(),
         actions: vec![],
         config_schema: config_schema.map(str::to_string),
+        metadata: Default::default(),
     }
 }
 
@@ -835,9 +836,9 @@ async fn config_editor_is_absent_without_a_schema() {
     assert!(!submit_disabled(&host));
 }
 
-/// The editor opens on each configured asset's defaults, keyed by asset. A
-/// field without a default is hinted as required but never pre-filled, so
-/// nothing is sent for it unless typed.
+/// The editor opens on the launch document with each configured asset's
+/// defaults. A field without a default is hinted as required but never
+/// pre-filled, so nothing is sent for it unless typed.
 #[wasm_bindgen_test]
 async fn config_editor_prefills_defaults_and_hints_required_fields() {
     let show = RwSignal::new(true);
@@ -852,13 +853,13 @@ async fn config_editor_prefills_defaults_and_hints_required_fields() {
 
     assert_eq!(
         editor_value(&host),
-        "{\n  \"api_data\": {\n    \"batch_size\": 100\n  }\n}"
+        "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100\n      }\n    }\n  }\n}"
     );
     assert_eq!(
         query_one(&host, ".config-editor-hint-fields")
             .text_content()
             .unwrap_or_default(),
-        "api_data.api_key"
+        "assets.api_data.config.api_key"
     );
     assert!(query_all(&host, ".config-field").is_empty());
     assert!(!submit_disabled(&host));
@@ -872,12 +873,12 @@ async fn invalid_config_blocks_submit_until_reset() {
     let host = mount_with_definitions(show, vec![definition("api_data", Some(PIPELINE_SCHEMA))]);
     flush_effects().await;
 
-    type_config(&host, "{\"api_data\": ");
+    type_config(&host, "{\"assets\": ");
     flush_effects().await;
     let error = query_one(&host, ".code-editor-issue")
         .text_content()
         .unwrap_or_default();
-    assert_eq!(error, "1:14 Expected a value");
+    assert_eq!(error, "1:12 Expected a value");
     assert!(!query_all(&host, ".code-editor-mark").is_empty());
     assert!(submit_disabled(&host));
 
@@ -887,7 +888,7 @@ async fn invalid_config_blocks_submit_until_reset() {
         query_one(&host, ".code-editor-issue")
             .text_content()
             .unwrap_or_default(),
-        "1:2 'other' is not in the selection."
+        "1:2 unknown field 'other'; expected one of assets"
     );
     assert!(submit_disabled(&host));
 
@@ -896,7 +897,7 @@ async fn invalid_config_blocks_submit_until_reset() {
     assert!(query_all(&host, ".code-editor-issue").is_empty());
     assert_eq!(
         editor_value(&host),
-        "{\n  \"api_data\": {\n    \"batch_size\": 100\n  }\n}"
+        "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100\n      }\n    }\n  }\n}"
     );
     assert!(!submit_disabled(&host));
 }
@@ -928,6 +929,6 @@ async fn config_editor_follows_the_checked_assets() {
     flush_effects().await;
     assert_eq!(
         editor_value(&host),
-        "{\n  \"api_data\": {\n    \"batch_size\": 100\n  }\n}"
+        "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100\n      }\n    }\n  }\n}"
     );
 }

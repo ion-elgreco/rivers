@@ -104,6 +104,7 @@ pub async fn get_assets_info(
                 asset_type: a.asset_type,
                 actions,
                 config_schema: a.config_schema,
+                metadata: a.metadata,
             }
         })
         .collect();

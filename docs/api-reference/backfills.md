@@ -136,7 +136,7 @@ CodeRepository.backfill(
     failure_policy: str = "continue",
     max_concurrency: int = 4,
     tags: list[tuple[str, str]] | None = None,
-    config: dict[str, dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
     block: bool = True,
     dry_run: bool = False,
     action: str | None = None,
@@ -154,7 +154,7 @@ Launch a backfill to reprocess partitions.
 | `failure_policy` | `str` | `"continue"` | `"continue"` to keep processing on failure, `"stop_on_failure"` to halt. |
 | `max_concurrency` | `int` | `4` | Maximum number of concurrent runs. |
 | `tags` | `list[tuple[str, str]] \| None` | `None` | Tags attached to the backfill and its runs. Use `("rivers/priority", "N")` to override default priority (-10). |
-| `config` | `dict[str, dict[str, Any]] \| None` | `None` | Per-asset config overrides (keyed by asset name). Kept on the backfill record and applied to every child run. |
+| `config` | `dict[str, Any] \| None` | `None` | The [launch document](../concepts/configuration.md#the-launch-document). Kept on the backfill record and applied to every child run. |
 | `block` | `bool` | `True` | If `True`, wait for the backfill to complete before returning. If `False`, only record the backfill; a daemon runs it later. |
 | `dry_run` | `bool` | `False` | If `True`, compute the plan without executing. |
 | `action` | `str \| None` | `None` | Run this [action](../concepts/actions.md) on every partition instead of materializing. Every selected asset must define the verb; child runs and `rerun_backfill` inherit it. |

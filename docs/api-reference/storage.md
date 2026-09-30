@@ -61,6 +61,8 @@ The reader/writer split lets a write-breaking migration for newer writers run **
 | 6 | Deletions leave tombstones on asset and partition rows | 2, 6 |
 | 7 | An asset's code version and inputs keep the time of the materialization that recorded them | 2, 7 |
 | 8 | Run logs keep each failed attempt's traceback | 2, 7 |
+| 9 | Runs keep the config they were launched with | 2, 7 |
+| 10 | The run config is the launch document; stored rows are rewritten to it | 2, 10 |
 
 An **uninitialized** store (no stamp) is bootstrapped by whichever process opens it first — the UI included — so a fresh deployment shows an empty UI without waiting for a code location.
 
@@ -248,9 +250,9 @@ machine. The run page in the UI shows it.
 | `block_reason` | `str \| None` |
 | `launched_by` | `LaunchedBy` |
 | `action` | `str \| None` |
-| `config` | `dict[str, dict[str, Any]] \| None` |
+| `config` | `dict[str, Any] \| None` |
 
-`config` holds the per-asset overrides the run was launched with, keyed by asset name; `None` means the definitions' defaults.
+`config` holds the [launch document](../concepts/configuration.md#the-launch-document) the run was launched with; `None` means the definitions as they are.
 
 ### `LaunchedBy`
 
