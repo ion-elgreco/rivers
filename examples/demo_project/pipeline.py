@@ -144,7 +144,7 @@ class _ConfigShowcase(BaseModel):
     day: date = date(2025, 1, 1)
     output_dir: Path = Path("/tmp/showcase")
     version: str = Field("1.0.0", pattern=r"^\d+\.\d+\.\d+$")
-    # No default: the editor lists it under "Required, not set"
+    # No default: the launch is refused until it is set
     run_label: str
 
     @field_validator("tags")

@@ -28,7 +28,7 @@ use web_sys::{
 
 wasm_bindgen_test_configure!(run_in_browser);
 
-const PIPELINE: &str = r#"{"properties":{"api_key":{"title":"Api Key","type":"string"},"batch_size":{"default":100,"title":"Batch Size","type":"integer"},"mode":{"default":"fast","enum":["fast","slow"],"title":"Mode","type":"string"}},"required":["api_key"],"title":"PipelineConfig","type":"object"}"#;
+const PIPELINE: &str = r#"{"properties":{"api_key":{"title":"Api Key","type":"string"},"batch_size":{"default":100,"title":"Batch Size","type":"integer"},"mode":{"default":"fast","enum":["fast","slow"],"title":"Mode","type":"string"}},"required":["api_key"],"title":"PipelineConfig","type":"object","x-settings":true}"#;
 
 struct Editor {
     host: HtmlElement,

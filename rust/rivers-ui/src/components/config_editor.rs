@@ -185,10 +185,13 @@ pub struct Check {
 }
 
 /// Syntax first, then the document against its schema. A syntax error is
-/// the only issue reported, as the tree past it is a guess. The payload is
-/// what differs from the definitions: the text compacted, a value equal to
-/// its default and the parts left empty dropped; `None` for blank text, an
-/// issue, or nothing that differs. Without a schema there is no document.
+/// the only issue reported, as the tree past it is a guess. A required
+/// field the text lacks is listed as missing; it is an issue too unless
+/// its class reads the environment, which may set it when the run starts.
+/// The payload is what differs from the definitions: the text compacted, a
+/// value equal to its default and the parts left empty dropped; `None` for
+/// blank text, an issue, or nothing that differs. Without a schema there is
+/// no document.
 pub fn check_config(text: &str, schema_json: Option<&str>) -> Check {
     if text.trim().is_empty() {
         return Check::default();
@@ -207,7 +210,12 @@ pub fn check_config(text: &str, schema_json: Option<&str>) -> Check {
         return Check::default();
     };
     let mut issues = config_schema::validate(&schema, &root, "");
-    let missing = config_schema::missing_required(&schema, &root, "");
+    let found = config_schema::missing_required(&schema, &root, "");
+    issues.extend(found.iter().filter(|m| !m.env).map(|m| Issue {
+        span: m.span,
+        message: format!("{}: required", m.path),
+    }));
+    let missing = found.into_iter().map(|m| m.path).collect();
     let mut payload = None;
     if issues.is_empty() {
         match serde_json::from_str::<Value>(text) {
@@ -440,7 +448,7 @@ mod tests {
     use crate::types::AssetActionInfo;
 
     const THRESHOLD: &str = r#"{"properties":{"threshold":{"default":0.5,"title":"Threshold","type":"number"},"max_retries":{"default":3,"title":"Max Retries","type":"integer"}},"title":"ThresholdConfig","type":"object"}"#;
-    const PIPELINE: &str = r#"{"properties":{"api_key":{"title":"Api Key","type":"string"},"batch_size":{"default":100,"title":"Batch Size","type":"integer"},"region":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Region"}},"required":["api_key"],"title":"PipelineConfig","type":"object"}"#;
+    const PIPELINE: &str = r#"{"properties":{"api_key":{"title":"Api Key","type":"string"},"batch_size":{"default":100,"title":"Batch Size","type":"integer"},"region":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Region"}},"required":["api_key"],"title":"PipelineConfig","type":"object","x-settings":true}"#;
 
     fn definition(
         key: &str,
@@ -479,6 +487,7 @@ mod tests {
     }
 
     const DB: &str = r#"{"properties":{"dsn":{"default":"memory://","title":"Dsn","type":"string"},"pool_size":{"default":2,"title":"Pool Size","type":"integer"},"token":{"format":"password","title":"Token","type":"string","writeOnly":true}},"title":"DbResource","type":"object"}"#;
+    const STRICT: &str = r#"{"properties":{"token":{"title":"Token","type":"string"},"limit":{"default":1,"title":"Limit","type":"integer"}},"required":["token"],"title":"StrictConfig","type":"object"}"#;
 
     fn resource(key: &str, config_schema: &str) -> ResourceInfo {
         ResourceInfo {
@@ -719,6 +728,44 @@ mod tests {
         let broken = check(r#"{"assets": {"api": {"config": {"batch_size": "x"}}}}"#);
         assert_eq!(broken.payload, None);
         assert_eq!(broken.missing, keys(&["assets.api.config.api_key"]));
+    }
+
+    #[test]
+    fn a_plain_models_required_field_is_an_issue_until_set() {
+        let defs = definitions(vec![
+            definition("api", Some(PIPELINE), &[]),
+            definition("strict", Some(STRICT), &[]),
+        ]);
+        let schema = launch_schema(&keys(&["api", "strict"]), &defs, &[], None);
+        let check = |text: &str| check_config(text, Some(&schema));
+        // The settings class may get `api_key` from the environment: a hint
+        // only. The plain class cannot: an issue at the object lacking it.
+        let text = r#"{"assets": {"strict": {"config": {"limit": 2}}}}"#;
+        let unset = check(text);
+        let config = text.find("{\"limit\"").unwrap();
+        assert_eq!(
+            messages(&unset),
+            vec![(
+                "assets.strict.config.token: required".to_string(),
+                Span {
+                    start: config,
+                    end: text.len() - 3
+                }
+            )]
+        );
+        // The text's objects are walked before the absent containers.
+        assert_eq!(
+            unset.missing,
+            keys(&["assets.strict.config.token", "assets.api.config.api_key"])
+        );
+        assert_eq!(unset.payload, None);
+        let set = check(r#"{"assets": {"strict": {"config": {"token": "t"}}}}"#);
+        assert_eq!(set.issues, Vec::<Issue>::new());
+        assert_eq!(set.missing, keys(&["assets.api.config.api_key"]));
+        assert_eq!(
+            set.payload.as_deref(),
+            Some(r#"{"assets":{"strict":{"config":{"token":"t"}}}}"#)
+        );
     }
 
     #[test]
