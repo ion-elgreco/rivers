@@ -15,6 +15,7 @@ rivers-ui = { path = "../rust/rivers-ui", features = ["ssr"] }
 rivers-api = { path = "../rust/rivers-api" }
 petgraph.workspace = true
 tonic.workspace = true
+http = "1"
 tonic-prost.workspace = true
 tonic-health.workspace = true
 prost.workspace = true
@@ -34,7 +35,8 @@ tracing-subscriber.workspace = true
 pyo3-pylogger = "0.5"
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "tls-webpki-roots"] }
+rustls-native-certs = "0.8"
 tracing-opentelemetry = "0.32"
 serde.workspace = true
 serde_json.workspace = true

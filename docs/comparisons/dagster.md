@@ -399,5 +399,5 @@ The Python pymethods intentionally skip the queue — they are the "I want to ru
 
 ## Observability
 
-- **OTLP tracing built-in** — set `OTEL_EXPORTER_OTLP_ENDPOINT` and rivers wires an OpenTelemetry span exporter to the Rust `tracing` subscriber. No `dagster-opentelemetry` extension.
+- **OTLP tracing built-in** — set `OTEL_EXPORTER_OTLP_ENDPOINT` (plus `OTEL_EXPORTER_OTLP_HEADERS` for an API key) and rivers wires an OpenTelemetry span exporter to the Rust `tracing` subscriber, TLS included. No `dagster-opentelemetry` extension.
 - **Python `logging` bridge** — `logging.getLogger("rivers")` and `context.log` flow through the same `tracing` subscriber via `pyo3-pylogger`, so per-step log capture works without user setup.

@@ -220,7 +220,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/rivers-ext-images.tar
-          key: rivers-ext-images-arm64-v2
+          key: rivers-ext-images-arm64-v3
 
       - name: Load cached external images
         if: steps.image-cache.outputs.cache-hit == 'true'
@@ -240,7 +240,8 @@ jobs:
         if: steps.image-cache.outputs.cache-hit != 'true'
         run: |
           docker save -o /tmp/rivers-ext-images.tar \
-            rustfs/rustfs:latest amazon/aws-cli:latest surrealdb/surrealdb:v3
+            rustfs/rustfs:latest amazon/aws-cli:latest surrealdb/surrealdb:v3 \
+            otel/opentelemetry-collector-contrib:0.140.0
 
       - name: Wait for the stack to be ready
         run: just k8s-wait

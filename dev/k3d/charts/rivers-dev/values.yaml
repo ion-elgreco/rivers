@@ -25,6 +25,12 @@ s3:
   secretKey: riverstest
   region: us-east-1
 
+# OTLP collector for the OTel integration test; the rivers release points
+# `otel.endpoint` / `otel.headers.existingSecret` at it (see helmfile).
+otel:
+  image: otel/opentelemetry-collector-contrib:0.140.0
+  token: rivers-k3d-token
+
 # CodeLocations to apply. The rivers operator is deployed with
 # `operator.allowInsecureRegistry: true` so it can resolve digests directly
 # from the HTTP-only k3d registry — `digest` here is optional.

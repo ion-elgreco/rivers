@@ -65,6 +65,7 @@ pub struct Context {
     /// is set, `RIVERS_SURREAL_USERNAME` / `_PASSWORD` are emitted via
     /// `valueFrom.secretKeyRef`; otherwise pods connect unauthenticated.
     pub surreal_pod_cfg: rivers_k8s::env::SurrealPodConfig,
+    pub otel_pod_cfg: rivers_k8s::env::OtelPodConfig,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,6 +119,7 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         &resolved_image,
         &ctx.code_location_service_account,
         &ctx.surreal_pod_cfg,
+        &ctx.otel_pod_cfg,
     );
     let service = build_service(&cl);
 
