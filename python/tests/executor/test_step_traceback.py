@@ -127,7 +127,7 @@ def test_failed_step_stores_its_traceback(storage, setup, tmp_path, is_async):
     assert frame["function"] == "boom"
     assert os.path.samefile(frame["abs_path"], __file__)
     assert frame["filename"].endswith("tests/executor/test_step_traceback.py")
-    assert frame["abs_path"].endswith(frame["filename"])
+    assert frame["abs_path"].replace("\\", "/").endswith(frame["filename"])
     assert frame["in_app"] is True
     assert frame["lineno"] == lineno
     assert frame["context_line"] == SOURCE[lineno - 1]
