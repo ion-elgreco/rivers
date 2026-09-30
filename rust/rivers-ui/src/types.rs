@@ -630,6 +630,23 @@ pub struct AssetDefinitionInfo {
     pub config_schema: Option<String>,
 }
 
+/// One step of pydantic's `loc`: a field name or a list index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConfigLoc {
+    Key(String),
+    Index(u32),
+}
+
+/// One error a config class reported for a launch's overrides.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigError {
+    pub asset: String,
+    pub loc: Vec<ConfigLoc>,
+    pub message: String,
+    /// pydantic's error type: `missing`, `int_parsing`, `value_error`, ...
+    pub kind: String,
+}
+
 /// Mirror of the gRPC `ActionInfo`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetActionInfo {

@@ -8,6 +8,7 @@
 //! the payload to send.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use leptos::prelude::*;
 use serde_json::{Map, Value};
@@ -15,7 +16,8 @@ use serde_json::{Map, Value};
 use crate::components::code_editor::CodeEditor;
 use crate::config_schema::{self, Candidate, Schema};
 use crate::json_text::{self, Issue, Node, PathSeg, Slot, Span};
-use crate::types::AssetDefinitionInfo;
+use crate::server_fns::mutations::validate_config;
+use crate::types::{AssetDefinitionInfo, ConfigError, ConfigLoc};
 
 fn properties(schema_json: &str) -> Option<Map<String, Value>> {
     let schema: Value = serde_json::from_str(schema_json).ok()?;
@@ -209,6 +211,126 @@ pub fn check_config(text: &str, selected: &[String], schemas: &HashMap<String, S
         missing,
         payload,
     }
+}
+
+fn path_label(path: &[PathSeg]) -> String {
+    let mut label = String::new();
+    for seg in path {
+        match seg {
+            PathSeg::Key(key) if label.is_empty() => label.push_str(key),
+            PathSeg::Key(key) => {
+                label.push('.');
+                label.push_str(key);
+            }
+            PathSeg::Index(index) => label.push_str(&format!("[{index}]")),
+        }
+    }
+    label
+}
+
+/// The editor issues for what the config classes reported: each at its
+/// value in the text (its key for an unknown field, the asset's entry when
+/// the path is not there). A `missing` field is not an issue; it joins the
+/// required hint as `asset.field`.
+pub fn server_issues(text: &str, errors: &[ConfigError]) -> (Vec<Issue>, Vec<String>) {
+    let parsed = json_text::parse(text);
+    let mut issues = Vec::new();
+    let mut missing = Vec::new();
+    for error in errors {
+        let mut path = vec![PathSeg::Key(error.asset.clone())];
+        path.extend(error.loc.iter().map(|part| match part {
+            ConfigLoc::Key(key) => PathSeg::Key(key.clone()),
+            ConfigLoc::Index(index) => PathSeg::Index(*index as usize),
+        }));
+        let label = path_label(&path);
+        if error.kind == "missing" {
+            missing.push(label);
+            continue;
+        }
+        let root = parsed.root.as_ref();
+        let spans = root.and_then(|r| json_text::span_at(r, &path));
+        let span = match spans {
+            Some((Some(key), _)) if error.kind == "extra_forbidden" => key,
+            Some((_, value)) => value,
+            None => root
+                .and_then(|r| json_text::span_at(r, &path[..1]))
+                .map_or(Span::at(0), |(_, value)| value),
+        };
+        issues.push(Issue {
+            span,
+            message: format!("{label}: {}", error.message),
+        });
+    }
+    (issues, missing)
+}
+
+/// The dialogs' check: the schema's, at once, plus what the config classes
+/// report for the text, asked of `location` 300 ms after the last edit
+/// once the schema is satisfied. `action` names the verb whose classes
+/// apply. A reply for text that has changed since is dropped.
+pub fn use_config_check(
+    text: RwSignal<String>,
+    selected: Signal<Vec<String>>,
+    schemas: Signal<HashMap<String, String>>,
+    location: Signal<(String, String)>,
+    action: Signal<Option<String>>,
+) -> Signal<Check> {
+    let client = Memo::new(move |_| check_config(&text.get(), &selected.get(), &schemas.get()));
+    // The classes' answer and the text it answers.
+    let server = RwSignal::new((String::new(), Vec::<Issue>::new(), Vec::<String>::new()));
+    let timer: StoredValue<Option<TimeoutHandle>> = StoredValue::new(None);
+    Effect::new(move || {
+        let check = client.get();
+        if let Some(handle) = timer.get_value() {
+            handle.clear();
+            timer.set_value(None);
+        }
+        let Some(payload) = check.payload.filter(|_| check.issues.is_empty()) else {
+            return;
+        };
+        let asked = text.get_untracked();
+        let handle = set_timeout_with_handle(
+            move || {
+                timer.set_value(None);
+                let (ns, name) = location.get_untracked();
+                let selection = selected.get_untracked();
+                let action = action.get_untracked();
+                leptos::task::spawn_local(async move {
+                    let errors = match validate_config(ns, name, selection, action, payload).await {
+                        Ok(errors) => errors,
+                        Err(e) => {
+                            leptos::logging::warn!("config check failed: {e}");
+                            return;
+                        }
+                    };
+                    if text.get_untracked() != asked {
+                        return;
+                    }
+                    let (issues, missing) = server_issues(&asked, &errors);
+                    server.set((asked, issues, missing));
+                });
+            },
+            Duration::from_millis(300),
+        );
+        timer.set_value(handle.ok());
+    });
+    Signal::derive(move || {
+        let mut check = client.get();
+        let (answered, issues, missing) = server.get();
+        if answered != text.get() {
+            return check;
+        }
+        check.issues.extend(issues);
+        for field in missing {
+            if !check.missing.contains(&field) {
+                check.missing.push(field);
+            }
+        }
+        if !check.issues.is_empty() {
+            check.payload = None;
+        }
+        check
+    })
 }
 
 /// The completions at `caret`: at the top level the selected assets with a
@@ -514,6 +636,72 @@ mod tests {
         let broken = check(r#"{"api": {"batch_size": "x"}}"#);
         assert_eq!(broken.payload, None);
         assert_eq!(broken.missing, keys(&["api.api_key"]));
+    }
+
+    #[test]
+    fn server_errors_land_on_their_value_or_key_or_join_the_hint() {
+        let text = "{\n  \"api\": {\n    \"batch_size\": 0,\n    \"tags\": [1, 2],\n    \"extra\": 1\n  }\n}";
+        let error = |loc: Vec<ConfigLoc>, kind: &str, message: &str| ConfigError {
+            asset: "api".to_string(),
+            loc,
+            message: message.to_string(),
+            kind: kind.to_string(),
+        };
+        let errors = vec![
+            error(
+                vec![ConfigLoc::Key("batch_size".into())],
+                "greater_than",
+                "Input should be greater than 0",
+            ),
+            error(
+                vec![ConfigLoc::Key("tags".into()), ConfigLoc::Index(1)],
+                "less_than",
+                "Input should be less than 2",
+            ),
+            error(
+                vec![ConfigLoc::Key("extra".into())],
+                "extra_forbidden",
+                "Extra inputs are not permitted",
+            ),
+            error(
+                vec![ConfigLoc::Key("api_key".into())],
+                "missing",
+                "Field required",
+            ),
+            error(
+                vec![ConfigLoc::Key("nope".into()), ConfigLoc::Key("x".into())],
+                "value_error",
+                "Value error, no",
+            ),
+        ];
+        let (issues, missing) = server_issues(text, &errors);
+        let at = |needle: &str| {
+            let start = text.find(needle).unwrap();
+            Span {
+                start,
+                end: start + needle.len(),
+            }
+        };
+        let parsed = json_text::parse(text);
+        let api = json_text::span_at(parsed.root.as_ref().unwrap(), &[PathSeg::Key("api".into())])
+            .unwrap()
+            .1;
+        assert_eq!(
+            issues
+                .iter()
+                .map(|i| (i.message.as_str(), i.span))
+                .collect::<Vec<_>>(),
+            vec![
+                ("api.batch_size: Input should be greater than 0", at("0")),
+                ("api.tags[1]: Input should be less than 2", at("2")),
+                ("api.extra: Extra inputs are not permitted", at("\"extra\"")),
+                ("api.nope.x: Value error, no", api),
+            ]
+        );
+        assert_eq!(missing, vec!["api.api_key"]);
+        // Text that does not parse still gets the message, at the missing value.
+        let (issues, _) = server_issues("{\"api\": ", &errors[..1]);
+        assert_eq!(issues[0].span, Span::at(8));
     }
 
     #[test]

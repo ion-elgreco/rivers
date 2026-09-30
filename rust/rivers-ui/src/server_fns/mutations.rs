@@ -4,7 +4,7 @@
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::types::SubmitPartitionKey;
+use crate::types::{ConfigError, SubmitPartitionKey};
 
 /// Session identity as a proto `UserRef`; `None` in auth mode `none`.
 #[cfg(feature = "ssr")]
@@ -533,4 +533,53 @@ pub async fn delete_runs(run_ids: Vec<String>) -> Result<BulkRunActionResult, Se
         }
     }
     Ok(BulkRunActionResult { requested, failed })
+}
+
+/// The errors each asset's config class reports for `config`, built as a
+/// run builds it: what a launch would be refused for, and what a run
+/// would hit at start.
+#[server]
+pub async fn validate_config(
+    loc_ns: String,
+    loc_name: String,
+    selection: Vec<String>,
+    action: Option<String>,
+    config: String,
+) -> Result<Vec<ConfigError>, ServerFnError> {
+    use rivers_api::rivers::{ValidateConfigRequest, config_loc};
+
+    use crate::types::ConfigLoc;
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let resp = client
+        .validate_config(ValidateConfigRequest {
+            selection,
+            config,
+            action,
+        })
+        .await
+        .map_err(super::grpc_err)?;
+    Ok(resp
+        .into_inner()
+        .errors
+        .into_iter()
+        .map(|e| ConfigError {
+            asset: e.asset,
+            loc: e
+                .loc
+                .into_iter()
+                .filter_map(|l| l.part)
+                .map(|part| match part {
+                    config_loc::Part::Key(key) => ConfigLoc::Key(key),
+                    config_loc::Part::Index(index) => ConfigLoc::Index(index),
+                })
+                .collect(),
+            message: e.message,
+            kind: e.kind,
+        })
+        .collect())
 }

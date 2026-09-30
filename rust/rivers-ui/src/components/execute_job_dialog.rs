@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use leptos::prelude::*;
 
-use crate::components::config_editor::{ConfigEditor, check_config, launch_config_schemas};
+use crate::components::config_editor::{ConfigEditor, launch_config_schemas, use_config_check};
 use crate::components::partition_picker::{PartitionPicker, WholeAssetChoice};
 use crate::helpers::{JobPartitionPicker, close_on_navigation};
 use crate::loc::{loc_path, use_current_location};
@@ -67,12 +67,12 @@ pub fn ExecuteJobDialog(
             verb.as_ref().map(|v| v.name.as_str()),
         )
     });
-    // Blank text is no overrides; the submit button waits for text without issues.
-    let config_check =
-        Memo::new(move |_| check_config(&config_text.get(), &assets.get(), &config_schemas.get()));
-
     let loc = use_current_location();
     close_on_navigation(show);
+    // Blank text is no overrides; the submit button waits for text without
+    // issues, from the schema at once and from the config classes shortly after.
+    let verb_name = Signal::derive(move || verb.get().map(|v| v.name));
+    let config_check = use_config_check(config_text, assets, config_schemas, loc, verb_name);
 
     let action = Action::new(
         move |input: &(Vec<SubmitPartitionKey>, bool, Option<String>)| {
