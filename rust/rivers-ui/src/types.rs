@@ -660,7 +660,8 @@ pub struct ConfigError {
     pub loc: Vec<ConfigLoc>,
     pub message: String,
     /// pydantic's error type (`missing`, `int_parsing`, `value_error`, ...),
-    /// `exception`, or `invalid` for a part the definitions refuse.
+    /// `required` for a plain model's field left unset, `exception`, or
+    /// `invalid` for a part the definitions refuse.
     pub kind: String,
 }
 

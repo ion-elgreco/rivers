@@ -76,30 +76,36 @@ impl CodeLocationImpl {
             .map_err(Status::internal)
     }
 
-    /// The errors the definitions find in `config`: each asset's config
-    /// class and each named resource built as a run builds them, metadata
-    /// overrides on a node that is not an asset, and resource keys the
-    /// repository does not have. Assets without a config class are skipped.
+    /// The errors the definitions find in a launch of `selection` with
+    /// `config`: each selected asset's config class built with the values
+    /// the document gives it, or none, and each named resource built as a
+    /// run builds it; metadata overrides on a node that is not an asset,
+    /// and resource keys the repository does not have. Assets without a
+    /// config class are skipped.
     #[allow(clippy::result_large_err)]
     async fn config_issues(
         &self,
-        config: &str,
+        config: Option<&str>,
+        selection: &[String],
         action: Option<String>,
     ) -> Result<Vec<ConfigIssue>, Status> {
-        let config = config.to_string();
+        let config = config.unwrap_or("{}").to_string();
+        let selection = selection.to_vec();
         self.run_on_python(move |py, repo| {
             let repo_ref = repo.get();
             let guard = repo_ref.state.read().unwrap();
             let state = guard.as_ref().ok_or("repository not resolved")?;
             let document = parse_run_config(py, &config).map_err(|e| e.to_string())?;
+            let empty = PyDict::new(py);
             let mut issues = Vec::new();
-            for (asset, overrides) in &document.assets {
+            for asset in &selection {
                 let Some(node) = state.node_map.get(asset) else {
                     continue;
                 };
+                let overrides = document.assets.get(asset);
                 let at =
                     |section: &str| vec!["assets".to_string(), asset.clone(), section.to_string()];
-                if !overrides.metadata.is_empty()
+                if overrides.is_some_and(|o| !o.metadata.is_empty())
                     && !matches!(
                         node,
                         crate::repository::resolved_node::ResolvedNode::Asset(_)
@@ -112,9 +118,6 @@ impl CodeLocationImpl {
                         kind: "invalid".to_string(),
                     });
                 }
-                let Some(fields) = &overrides.config else {
-                    continue;
-                };
                 let func = match &action {
                     Some(verb) => match node.find_action(verb).and_then(|a| a.func.as_ref()) {
                         Some(func) => func.clone_ref(py),
@@ -128,12 +131,16 @@ impl CodeLocationImpl {
                 let Some(cls) = config_class(py, &func).map_err(|e| e.to_string())? else {
                     continue;
                 };
-                let fields = fields
-                    .bind(py)
-                    .cast::<PyDict>()
-                    .map_err(|e| e.to_string())?;
+                let fields = match overrides.and_then(|o| o.config.as_ref()) {
+                    Some(fields) => fields
+                        .bind(py)
+                        .cast::<PyDict>()
+                        .map_err(|e| e.to_string())?
+                        .clone(),
+                    None => empty.clone(),
+                };
                 issues.extend(
-                    config_errors(py, &at("config"), &cls, fields).map_err(|e| e.to_string())?,
+                    config_errors(py, &at("config"), &cls, &fields).map_err(|e| e.to_string())?,
                 );
             }
             for (key, fields) in &document.resources {
@@ -169,20 +176,19 @@ impl CodeLocationImpl {
         .await
     }
 
-    /// INVALID_ARGUMENT when the config classes reject `config`'s values.
-    /// A missing field passes: a `BaseSettings` field may come from the
-    /// run's environment, which this process does not see.
+    /// INVALID_ARGUMENT when a config class of `selection` rejects the
+    /// launch: a value it refuses, or a field a plain model needs that
+    /// `config` leaves unset. A `BaseSettings` field left unset passes: the
+    /// run's environment, which this process does not see, may set it.
     #[allow(clippy::result_large_err)]
     async fn reject_config_errors(
         &self,
         config: Option<&str>,
+        selection: &[String],
         action: Option<&str>,
     ) -> Result<(), Status> {
-        let Some(config) = config else {
-            return Ok(());
-        };
         let issues: Vec<String> = self
-            .config_issues(config, action.map(str::to_string))
+            .config_issues(config, selection, action.map(str::to_string))
             .await?
             .into_iter()
             .filter(|issue| issue.kind != "missing")
@@ -311,7 +317,8 @@ impl CodeLocationService for CodeLocationImpl {
             .await
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let config = request_config(req.config, &asset_selection)?;
-        self.reject_config_errors(config.as_deref(), None).await?;
+        self.reject_config_errors(config.as_deref(), &asset_selection, None)
+            .await?;
 
         let mat_request = crate::daemon::MaterializationRequestData {
             run_id: uuid::Uuid::new_v4().to_string(),
@@ -370,7 +377,7 @@ impl CodeLocationService for CodeLocationImpl {
             .job_asset_names(&req.job_name)
             .unwrap_or_default();
         let config = request_config(req.config, &job_assets)?;
-        self.reject_config_errors(config.as_deref(), shown.as_deref())
+        self.reject_config_errors(config.as_deref(), &job_assets, shown.as_deref())
             .await?;
         let run_request = crate::daemon::RunRequestData {
             run_key: None,
@@ -521,12 +528,10 @@ impl CodeLocationService for CodeLocationImpl {
         request: Request<ValidateConfigRequest>,
     ) -> Result<Response<ValidateConfigResponse>, Status> {
         let req = request.into_inner();
-        let Some(config) = request_config(Some(req.config), &req.selection)? else {
-            return Ok(Response::new(ValidateConfigResponse { errors: Vec::new() }));
-        };
+        let config = request_config(Some(req.config), &req.selection)?;
         let action = req.action.filter(|a| !a.is_empty());
         let errors = self
-            .config_issues(&config, action)
+            .config_issues(config.as_deref(), &req.selection, action)
             .await?
             .into_iter()
             .map(proto_config_error)
@@ -847,7 +852,7 @@ impl CodeLocationService for CodeLocationImpl {
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         }
         let config = request_config(req.config, &asset_selection)?;
-        self.reject_config_errors(config.as_deref(), Some(&req.action))
+        self.reject_config_errors(config.as_deref(), &asset_selection, Some(&req.action))
             .await?;
 
         let action_request = crate::daemon::MaterializationRequestData {
@@ -941,7 +946,7 @@ impl CodeLocationService for CodeLocationImpl {
             None => req.selection.clone(),
         };
         let config = request_config(req.config, &child_assets)?;
-        self.reject_config_errors(config.as_deref(), action.as_deref())
+        self.reject_config_errors(config.as_deref(), &child_assets, action.as_deref())
             .await?;
         let target = match req.job_name {
             Some(name) => crate::daemon::RunType::Job(name),

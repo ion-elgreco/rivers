@@ -15,6 +15,7 @@ import pytest
 import rivers as rs
 from _polling import wait_for_run_terminal
 from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic_settings import BaseSettings
 from rivers._core import AutomationDaemon
 
 _STORE: dict = {}
@@ -56,6 +57,14 @@ class StrictConfig(BaseModel):
         if value == "nope":
             raise ValueError("'nope' is reserved")
         return value
+
+
+class EnvConfig(BaseSettings):
+    """A field the run's environment may set: left unset, it is reported as
+    `missing` and does not stop a launch."""
+
+    token_from_env: str
+    batch: int = 10
 
 
 class DbResource(rs.Resource):
@@ -103,6 +112,10 @@ def _build_repo(tmp_path, run_queue=None):
     def strict(context: rs.AssetExecutionContext[StrictConfig]):
         return context.config.token
 
+    @rs.Asset(io_handler=handler)
+    def from_env(context: rs.AssetExecutionContext[EnvConfig]):
+        return context.config.token_from_env
+
     @rs.Asset(io_handler=handler, metadata={"tier": "bronze"})
     def tagged(context: rs.AssetExecutionContext):
         return dict(context.asset_metadata or {})
@@ -132,7 +145,17 @@ def _build_repo(tmp_path, run_queue=None):
     job = rs.Job(name="cfg_job", assets=[configured])
     tidy_job = rs.Job(name="tidy_job", assets=[tidy])
     return rs.CodeRepository(
-        assets=[plain, configured, part_cfg, strict, tagged, pid, pid2, uses_db],
+        assets=[
+            plain,
+            configured,
+            part_cfg,
+            strict,
+            from_env,
+            tagged,
+            pid,
+            pid2,
+            uses_db,
+        ],
         tasks=[tidy],
         jobs=[job, tidy_job],
         resources={"db": DbResource(), "store": handler},
@@ -643,7 +666,7 @@ def test_validate_config_reports_what_the_class_rejects(direct):
     }
     assert {path for path, *_ in errors} == {_at("strict")}
 
-    # A validator's own message, and a required field as `missing`.
+    # A validator's own message; a field a plain model needs is `required`.
     errors = _validate(stub, pb2, _stored(strict={"code": "nope"}), ["strict"])
     assert (
         _at("strict"),
@@ -651,7 +674,13 @@ def test_validate_config_reports_what_the_class_rejects(direct):
         "value_error",
         "Value error, 'nope' is reserved",
     ) in errors
-    assert (_at("strict"), ("token",), "missing", "Field required") in errors
+    assert (_at("strict"), ("token",), "required", "Field required") in errors
+
+    # A BaseSettings field the environment may set is `missing`, reported
+    # even when the document says nothing about the asset.
+    assert _validate(stub, pb2, {}, ["from_env"]) == [
+        (_at("from_env"), ("token_from_env",), "missing", "Field required")
+    ]
 
 
 def test_validate_config_uses_the_verbs_class_and_skips_assets_without_one(direct):
@@ -673,9 +702,12 @@ def test_validate_config_uses_the_verbs_class_and_skips_assets_without_one(direc
         )
         == []
     )
-    # No config class, or nothing to check.
+    # No config class: nothing to check. An empty document is still checked
+    # against the selection's classes.
     assert _validate(stub, pb2, _stored(plain={"x": 1}), ["plain"]) == []
-    assert _validate(stub, pb2, {}, ["strict"]) == []
+    assert _validate(stub, pb2, {}, ["strict"]) == [
+        (_at("strict"), ("token",), "required", "Field required")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -693,8 +725,9 @@ def test_validate_config_rejects_a_malformed_document(direct, config):
 
 def test_launch_rejects_values_the_class_rejects(direct):
     """The same check guards a launch, so no run exists for a config its
-    class rejects at start. A missing field passes: the run's environment
-    may fill a BaseSettings field this process cannot see."""
+    class rejects at start, nor for a plain model's field left unset. A
+    BaseSettings field left unset passes: the run's environment may fill
+    it, which this process cannot see."""
     stub, pb2, repo = direct
     with pytest.raises(grpc.RpcError) as exc:
         stub.Materialize(
@@ -737,9 +770,20 @@ def test_launch_rejects_values_the_class_rejects(direct):
             )
         )
     assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+    for request in (
+        pb2.MaterializeRequest(
+            selection=["strict"], config=_cfg(strict={"code": "ab"})
+        ),
+        pb2.MaterializeRequest(selection=["strict"]),
+    ):
+        with pytest.raises(grpc.RpcError) as exc:
+            stub.Materialize(request)
+        assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert (
+            "config: assets.strict.config.token: Field required" in exc.value.details()
+        )
     assert repo.storage.get_runs(limit=10) == []
 
-    resp = stub.Materialize(
-        pb2.MaterializeRequest(selection=["strict"], config=_cfg(strict={"code": "ab"}))
-    )
+    resp = stub.Materialize(pb2.MaterializeRequest(selection=["from_env"]))
     assert wait_for_run_terminal(repo.storage, resp.run_id).status == "Failure"

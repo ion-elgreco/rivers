@@ -3,9 +3,11 @@
 //! takes, the template it opens with and the payload it sends. The schema is
 //! a launch document's, composed from config classes' `model_json_schema()`
 //! text placed in it with [`inline`]. The payload keeps only what differs
-//! from the schema's defaults, so an untouched template sends nothing. One
-//! keyword of our own: `"x-requires": {"k": v}` on a property makes it an
-//! error unless the sibling `k` is set to `v`.
+//! from the schema's defaults, so an untouched template sends nothing. Two
+//! keywords of our own: `"x-requires": {"k": v}` on a property makes it an
+//! error unless the sibling `k` is set to `v`; `"x-settings": true` on a
+//! class marks one that reads the environment, so a required field it
+//! lacks may still be set when the run starts.
 
 use serde_json::{Map, Value};
 
@@ -529,17 +531,38 @@ fn check(schema: &Schema, sch: &Value, node: &Node, path: &str, out: &mut Vec<Is
     }
 }
 
-/// Dotted paths of the required fields that objects in `node` lack.
-pub fn missing_required(schema: &Schema, node: &Node, path: &str) -> Vec<String> {
+/// A required field the text lacks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Missing {
+    /// Dotted path of the field.
+    pub path: String,
+    /// The object that lacks it, or the nearest one the text has.
+    pub span: Span,
+    /// The field's class reads the environment (`x-settings`), which may
+    /// set the field when the run starts.
+    pub env: bool,
+}
+
+/// The required fields that objects in `node` lack.
+pub fn missing_required(schema: &Schema, node: &Node, path: &str) -> Vec<Missing> {
     let mut out = Vec::new();
-    collect_missing(schema, &schema.root, node, path, &mut out);
+    collect_missing(schema, &schema.root, node, path, false, &mut out);
     out
 }
 
-fn collect_missing(schema: &Schema, sch: &Value, node: &Node, path: &str, out: &mut Vec<String>) {
-    let Node::Object { entries, .. } = node else {
+fn collect_missing(
+    schema: &Schema,
+    sch: &Value,
+    node: &Node,
+    path: &str,
+    env: bool,
+    out: &mut Vec<Missing>,
+) {
+    let Node::Object { entries, span, .. } = node else {
         return;
     };
+    let span = *span;
+    let env = env || sch.get("x-settings") == Some(&Value::Bool(true));
     let Some(obj) = schema.object_branch(sch) else {
         return;
     };
@@ -550,7 +573,11 @@ fn collect_missing(schema: &Schema, sch: &Value, node: &Node, path: &str, out: &
         .unwrap_or_default();
     for key in &required {
         if !entries.iter().any(|e| e.key == *key) {
-            out.push(child_path(path, key));
+            out.push(Missing {
+                path: child_path(path, key),
+                span,
+                env,
+            });
         }
     }
     let props = obj.get("properties").and_then(Value::as_object);
@@ -561,13 +588,15 @@ fn collect_missing(schema: &Schema, sch: &Value, node: &Node, path: &str, out: &
                 prop,
                 &entry.value,
                 &child_path(path, &entry.key),
+                env,
                 out,
             );
         }
     }
-    // An absent container counts as empty: what it requires is still missing.
+    // An absent container counts as empty: what it requires is still
+    // missing, at the object that would hold it.
     let none = Node::Object {
-        span: Span::at(0),
+        span,
         entries: Vec::new(),
         closed: true,
     };
@@ -576,7 +605,7 @@ fn collect_missing(schema: &Schema, sch: &Value, node: &Node, path: &str, out: &
             && !required.iter().any(|r| r == name)
             && !entries.iter().any(|e| &e.key == name)
         {
-            collect_missing(schema, prop, &none, &child_path(path, name), out);
+            collect_missing(schema, prop, &none, &child_path(path, name), env, out);
         }
     }
 }
@@ -782,7 +811,7 @@ mod tests {
 
     // Captured from pydantic 2 `model_json_schema()` (see the plan for the classes).
     const CFG: &str = r##"{"$defs":{"Inner":{"properties":{"host":{"default":"localhost","title":"Host","type":"string"},"port":{"default":5432,"maximum":65535,"minimum":1,"title":"Port","type":"integer"}},"title":"Inner","type":"object"},"Region":{"enum":["eu","us"],"title":"Region","type":"string"}},"description":"Doc of Cfg.","properties":{"threshold":{"default":0.5,"description":"Cut-off","maximum":1,"minimum":0,"title":"Threshold","type":"number"},"name":{"default":"x","maxLength":8,"minLength":1,"title":"Name","type":"string"},"region":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Region"},"mode":{"default":"fast","enum":["fast","slow"],"title":"Mode","type":"string"},"reg":{"$ref":"#/$defs/Region","default":"eu"},"inner":{"$ref":"#/$defs/Inner","default":{"host":"localhost","port":5432}},"tags":{"items":{"type":"string"},"maxItems":3,"title":"Tags","type":"array"},"extra":{"additionalProperties":{"type":"integer"},"default":{},"title":"Extra","type":"object"},"when":{"anyOf":[{"format":"date-time","type":"string"},{"type":"null"}],"default":null,"title":"When"},"required_key":{"title":"Required Key","type":"string"},"ratio":{"anyOf":[{"type":"integer"},{"type":"number"}],"default":1,"title":"Ratio"}},"required":["required_key"],"title":"Cfg","type":"object"}"##;
-    const SETTINGS: &str = r#"{"additionalProperties":false,"properties":{"api_key":{"title":"Api Key","type":"string"},"batch":{"default":10,"title":"Batch","type":"integer"}},"required":["api_key"],"title":"S","type":"object"}"#;
+    const SETTINGS: &str = r#"{"additionalProperties":false,"properties":{"api_key":{"title":"Api Key","type":"string"},"batch":{"default":10,"title":"Batch","type":"integer"}},"required":["api_key"],"title":"S","type":"object","x-settings":true}"#;
     const INGESTION: &str = r#"{"properties":{"source_system":{"default":"demo","title":"Source System","type":"string"},"batch_size":{"default":100,"title":"Batch Size","type":"integer"},"include_inactive":{"default":false,"title":"Include Inactive","type":"boolean"}},"title":"_IngestionSettings","type":"object"}"#;
     const PAIR: &str = r##"{"$defs":{"Inner":{"properties":{"host":{"default":"localhost","title":"Host","type":"string"},"port":{"default":5432,"maximum":65535,"minimum":1,"title":"Port","type":"integer"}},"title":"Inner","type":"object"}},"properties":{"pair":{"default":[1,"a"],"maxItems":2,"minItems":2,"prefixItems":[{"type":"integer"},{"type":"string"}],"title":"Pair","type":"array"},"maybe_inner":{"anyOf":[{"$ref":"#/$defs/Inner"},{"type":"null"}],"default":null},"anything":{"additionalProperties":true,"default":{},"title":"Anything","type":"object"}},"title":"Pair","type":"object"}"##;
     const NESTED: &str = r##"{"$defs":{"Creds":{"properties":{"user":{"title":"User","type":"string"},"pw":{"default":"","title":"Pw","type":"string"}},"required":["user"],"title":"Creds","type":"object"}},"properties":{"creds":{"$ref":"#/$defs/Creds"}},"required":["creds"],"title":"Outer","type":"object"}"##;
@@ -811,6 +840,9 @@ mod tests {
     fn missing(schema_json: &str, doc: &str) -> Vec<String> {
         let parsed = parse(doc);
         missing_required(&schema(schema_json), parsed.root.as_ref().unwrap(), "")
+            .into_iter()
+            .map(|m| m.path)
+            .collect()
     }
 
     fn key(name: &str) -> PathSeg {
@@ -1301,19 +1333,34 @@ mod tests {
             let parsed = parse(text);
             missing_required(&doc, parsed.root.as_ref().unwrap(), "")
         };
+        let found = at("{}");
         assert_eq!(
-            at("{}"),
-            strings(&[
+            found.iter().map(|m| m.path.as_str()).collect::<Vec<_>>(),
+            [
                 "assets.api.config.api_key",
                 "assets.cfg.config.required_key",
                 "assets.outer.config.creds",
-            ])
+            ]
         );
+        // Only the settings class may get its field from the environment.
+        // Each sits at the root, the nearest object the text has.
+        let root = Span { start: 0, end: 2 };
         assert_eq!(
-            at(
-                r#"{"assets": {"api": {"config": {"api_key": "k"}}, "cfg": {"config": {"required_key": "r"}}, "outer": {"config": {"creds": {}}}}}"#
-            ),
-            strings(&["assets.outer.config.creds.user"])
+            found.iter().map(|m| (m.env, m.span)).collect::<Vec<_>>(),
+            [(true, root), (false, root), (false, root)]
+        );
+        let text = r#"{"assets": {"api": {"config": {"api_key": "k"}}, "cfg": {"config": {"required_key": "r"}}, "outer": {"config": {"creds": {}}}}}"#;
+        let creds = text.rfind("{}").unwrap();
+        assert_eq!(
+            at(text),
+            vec![Missing {
+                path: "assets.outer.config.creds.user".to_string(),
+                span: Span {
+                    start: creds,
+                    end: creds + 2
+                },
+                env: false,
+            }]
         );
     }
 

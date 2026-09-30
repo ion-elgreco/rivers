@@ -28,7 +28,8 @@ service CodeLocationService {
   rpc CancelBackfill(CancelBackfillRequest) returns (CancelBackfillResponse);
   rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
   rpc DeleteRun(DeleteRunRequest) returns (DeleteRunResponse);
-  // Check config overrides with each asset's config class, as a run builds it.
+  // Check a launch document with each selected asset's config class, as a run
+  // builds it, with the document's values or none.
   rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
 }
 
@@ -173,6 +174,8 @@ message ConfigError {
   repeated ConfigLoc loc = 2;
   string message = 3;
   // pydantic's error type ("missing", "int_parsing", "value_error", ...),
+  // "required" for a field a plain model needs and the document leaves unset
+  // ("missing" is a BaseSettings field the run's environment may set),
   // "exception" for anything else a constructor raised, or "invalid" for a
   // part of the document the definitions refuse.
   string kind = 4;

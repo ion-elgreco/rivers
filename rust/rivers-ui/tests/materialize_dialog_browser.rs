@@ -745,7 +745,7 @@ async fn back_to_another_code_location_closes_the_dialog() {
 
 // ── Config editor ──
 
-const PIPELINE_SCHEMA: &str = r#"{"properties":{"api_key":{"title":"Api Key","type":"string"},"batch_size":{"default":100,"title":"Batch Size","type":"integer"}},"required":["api_key"],"title":"PipelineConfig","type":"object"}"#;
+const PIPELINE_SCHEMA: &str = r#"{"properties":{"api_key":{"title":"Api Key","type":"string"},"batch_size":{"default":100,"title":"Batch Size","type":"integer"}},"required":["api_key"],"title":"PipelineConfig","type":"object","x-settings":true}"#;
 
 fn definition(key: &str, config_schema: Option<&str>) -> rivers_ui::types::AssetDefinitionInfo {
     rivers_ui::types::AssetDefinitionInfo {
@@ -910,6 +910,39 @@ async fn invalid_config_blocks_submit_until_reset() {
         "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100\n      }\n    }\n  },\n  \"execution\": {}\n}"
     );
     assert!(!submit_disabled(&host));
+}
+
+const STRICT_SCHEMA: &str = r#"{"properties":{"token":{"title":"Token","type":"string"},"limit":{"default":1,"title":"Limit","type":"integer"}},"required":["token"],"title":"StrictConfig","type":"object"}"#;
+
+/// A field a plain model needs and the document leaves unset blocks the
+/// submit; the hint's button sets it. (`api_key` above is a settings
+/// field the environment may set, so it only hints.)
+#[wasm_bindgen_test]
+async fn a_plain_models_required_field_blocks_submit_until_set() {
+    let show = RwSignal::new(true);
+    let host = mount_with_definitions(show, vec![definition("strict", Some(STRICT_SCHEMA))]);
+    flush_effects().await;
+
+    assert_eq!(
+        query_one(&host, ".code-editor-issue")
+            .text_content()
+            .unwrap_or_default(),
+        "4:17 assets.strict.config.token: required"
+    );
+    assert!(submit_disabled(&host));
+
+    click(&query_one(&host, ".config-editor-hint .link-btn"), false);
+    flush_effects().await;
+    assert!(query_all(&host, ".code-editor-issue").is_empty());
+    assert!(!submit_disabled(&host));
+    let value: serde_json::Value = serde_json::from_str(&editor_value(&host)).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "assets": {"strict": {"config": {"limit": 1, "token": ""}}},
+            "execution": {}
+        })
+    );
 }
 
 /// The repository's resources come pre-filled with their current values;

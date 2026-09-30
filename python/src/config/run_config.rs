@@ -501,12 +501,25 @@ pub(crate) fn config_class<'py>(
     Ok(None)
 }
 
-/// The JSON schema of `func`'s config class, or `None` when it takes no config.
+/// Whether `cls` reads the environment: a `BaseSettings`, whose fields the
+/// run's environment may set. `false` without pydantic-settings.
+fn is_settings(py: Python<'_>, cls: &Bound<'_, PyType>) -> PyResult<bool> {
+    let Ok(module) = py.import("pydantic_settings") else {
+        return Ok(false);
+    };
+    cls.is_subclass(&module.getattr("BaseSettings")?)
+}
+
+/// The JSON schema of `func`'s config class, or `None` when it takes no
+/// config. A `BaseSettings` schema is marked `"x-settings": true`.
 pub(crate) fn config_schema_json(py: Python<'_>, func: &Py<PyAny>) -> PyResult<Option<String>> {
     let Some(cls) = config_class(py, func)? else {
         return Ok(None);
     };
     let schema = cls.call_method0("model_json_schema")?;
+    if is_settings(py, &cls)? {
+        schema.set_item("x-settings", true)?;
+    }
     let text: String = py
         .import("json")?
         .call_method1("dumps", (schema,))?
@@ -586,8 +599,9 @@ pub(crate) struct ConfigIssue {
     pub loc: Vec<LocPart>,
     pub message: String,
     /// pydantic's error type (`missing`, `int_parsing`, `value_error`, ...),
-    /// `exception` for anything else a constructor raised, or `invalid`
-    /// for a document part the definitions refuse.
+    /// `required` for a field a plain model needs and the document leaves
+    /// unset, `exception` for anything else a constructor raised, or
+    /// `invalid` for a document part the definitions refuse.
     pub kind: String,
 }
 
@@ -606,7 +620,9 @@ impl fmt::Display for ConfigIssue {
 
 /// The errors `cls(**overrides)` raises: what a run hits when it builds
 /// the config. Pydantic's own list, or one `exception` entry for anything
-/// else the constructor raised. `path` locates `overrides` in the document.
+/// else the constructor raised. A field left unset is `missing` only for a
+/// `BaseSettings`, whose environment may set it at run time; for any other
+/// class it is `required`. `path` locates `overrides` in the document.
 pub(crate) fn config_errors(
     py: Python<'_>,
     path: &[String],
@@ -616,6 +632,7 @@ pub(crate) fn config_errors(
     let Err(err) = cls.call((), Some(overrides)) else {
         return Ok(Vec::new());
     };
+    let env = is_settings(py, cls)?;
     let validation_error = py.import("pydantic")?.getattr("ValidationError")?;
     if !err.is_instance(py, &validation_error) {
         return Ok(vec![ConfigIssue {
@@ -636,11 +653,16 @@ pub(crate) fn config_errors(
                 Err(_) => LocPart::Key(part.str()?.to_string()),
             });
         }
+        let kind: String = item.get_item("type")?.extract()?;
         issues.push(ConfigIssue {
             path: path.to_vec(),
             loc,
             message: item.get_item("msg")?.extract()?,
-            kind: item.get_item("type")?.extract()?,
+            kind: if kind == "missing" && !env {
+                "required".to_string()
+            } else {
+                kind
+            },
         });
     }
     Ok(issues)
