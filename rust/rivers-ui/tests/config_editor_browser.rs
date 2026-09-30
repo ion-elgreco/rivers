@@ -520,6 +520,13 @@ async fn the_config_classes_errors_show_after_the_schema_passes() {
     .forget();
     flush_effects().await;
 
+    // The untouched template differs in nothing, so nothing is asked; a
+    // changed value is.
+    let ta: HtmlTextAreaElement = query_one(&target, ".code-editor-text").dyn_into().unwrap();
+    ta.set_value("{\"assets\": {\"api_data\": {\"config\": {\"batch_size\": 0}}}}");
+    dispatch(&ta, "input");
+    flush_effects().await;
+
     let issues = || {
         query_all(&target, ".code-editor-issue")
             .iter()
@@ -532,14 +539,14 @@ async fn the_config_classes_errors_show_after_the_schema_passes() {
     );
     assert_eq!(
         issues(),
-        vec!["5:23 assets.api_data.config.batch_size: Input should be greater than 0"]
+        vec!["1:51 assets.api_data.config.batch_size: Input should be greater than 0"]
     );
     assert_eq!(
         query_all(&target, ".code-editor-mark")
             .iter()
             .map(|el| el.text_content().unwrap_or_default())
             .collect::<Vec<_>>(),
-        vec!["100"]
+        vec!["0"]
     );
     let checked = check.get_value().unwrap().get_untracked();
     assert_eq!(checked.payload, None);
@@ -549,7 +556,6 @@ async fn the_config_classes_errors_show_after_the_schema_passes() {
     assert!(bodies[0].contains("api_data"), "{}", bodies[0]);
 
     // A schema issue takes over; the classes' answer was for other text.
-    let ta: HtmlTextAreaElement = query_one(&target, ".code-editor-text").dyn_into().unwrap();
     ta.set_value("{\"assets\": {\"api_data\": {\"config\": {\"batch_sizes\": 1}}}}");
     dispatch(&ta, "input");
     flush_effects().await;

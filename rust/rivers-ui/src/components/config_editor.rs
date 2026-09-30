@@ -52,8 +52,8 @@ pub fn launch_takes_config(
 /// selected key gets `config` (its class schema, when it has one) and,
 /// unless it is a task, `metadata`: its keys as string fields defaulting
 /// to the current values, any other key allowed. Under `resources`, each of
-/// `resources` by key; the template lists the keys alone, so a resource is
-/// rebuilt only when a value is typed. `execution` names the run's executor.
+/// `resources` by key, its current values as the defaults. `execution` names
+/// the run's executor.
 pub fn launch_schema(
     keys: &[String],
     definitions: &HashMap<String, AssetDefinitionInfo>,
@@ -132,7 +132,6 @@ pub fn launch_schema(
             json!({
                 "type": "object",
                 "description": "resources rebuilt for this run with these values",
-                "x-launch-template": "keys",
                 "properties": by_key,
                 "additionalProperties": false
             }),
@@ -187,9 +186,9 @@ pub struct Check {
 
 /// Syntax first, then the document against its schema. A syntax error is
 /// the only issue reported, as the tree past it is a guess. The payload is
-/// the text compacted, the empty parts of the template dropped; `None` for
-/// blank text, an issue, or nothing set. Without a schema there is no
-/// document to check.
+/// what differs from the definitions: the text compacted, a value equal to
+/// its default and the parts left empty dropped; `None` for blank text, an
+/// issue, or nothing that differs. Without a schema there is no document.
 pub fn check_config(text: &str, schema_json: Option<&str>) -> Check {
     if text.trim().is_empty() {
         return Check::default();
@@ -528,7 +527,7 @@ mod tests {
                     "plain": {"metadata": {"owner": "data"}}
                 },
                 "execution": {},
-                "resources": {"db": {}}
+                "resources": {"db": {"dsn": "memory://", "pool_size": 2}}
             })
         );
         // No selected asset takes config: a one-click launch, but the dialog
@@ -601,9 +600,11 @@ mod tests {
         assert_eq!(check("").payload, None);
         assert_eq!(check("  \n").payload, None);
         assert_eq!(check("{}").payload, None);
-        // The template's entries, left untouched.
+        // The template, left untouched, and a value equal to its default.
+        assert_eq!(check(&config_template(&schema).unwrap()).payload, None);
         assert_eq!(
-            check(r#"{"assets": {"api": {"config": {}}, "plain": {"metadata": {}}}, "resources": {"db": {}}, "execution": {}}"#).payload,
+            check(r#"{"assets": {"api": {"config": {"batch_size": 100}}}, "resources": {"db": {"pool_size": 2}}}"#)
+                .payload,
             None
         );
         // Without a schema there is no document.

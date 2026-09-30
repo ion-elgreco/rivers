@@ -912,10 +912,10 @@ async fn invalid_config_blocks_submit_until_reset() {
     assert!(!submit_disabled(&host));
 }
 
-/// The repository's resources are listed by key, values left for the user
-/// to type; the schema underlines a wrong value under a key.
+/// The repository's resources come pre-filled with their current values;
+/// the schema underlines a wrong value under a key.
 #[wasm_bindgen_test]
-async fn config_editor_lists_resources_by_key() {
+async fn config_editor_prefills_resource_values() {
     nav_to("/locations/default/demo");
     let target = fresh_mount_target();
     let show = RwSignal::new(true);
@@ -949,7 +949,9 @@ async fn config_editor_lists_resources_by_key() {
 
     assert!(
         editor_value(&target)
-            .ends_with("  \"execution\": {},\n  \"resources\": {\n    \"db\": {}\n  }\n}"),
+            .ends_with(
+                "  \"execution\": {},\n  \"resources\": {\n    \"db\": {\n      \"pool_size\": 2\n    }\n  }\n}"
+            ),
         "{}",
         editor_value(&target)
     );

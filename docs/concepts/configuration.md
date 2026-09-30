@@ -64,7 +64,7 @@ The document must be JSON-serializable (pydantic's encoder is used, so dates, pa
 
 ## The document in the UI
 
-The Materialize and Execute job dialogs hold a **Config** editor with the launch document. It opens pre-filled with each config field's default and each asset's current metadata, lists the repository's resources by key, and has an empty `execution` section to fill:
+The Materialize and Execute job dialogs hold a **Config** editor with the launch document. It opens pre-filled with each config field's default, each asset's current metadata and each resource's current values, plus an empty `execution` section to fill:
 
 ```json
 {
@@ -80,12 +80,14 @@ The Materialize and Execute job dialogs hold a **Config** editor with the launch
   },
   "execution": {},
   "resources": {
-    "db": {}
+    "db": {
+      "pool_size": 10
+    }
   }
 }
 ```
 
-A resource's fields are not pre-filled: a value typed under its key rebuilds it for the run, an empty `{}` sends nothing. Completion inside a resource offers its fields with their current values (a secret's is not shown).
+Only what differs from these values is sent. An untouched dialog launches the run as defined, a resource is rebuilt only when one of its values changed, and a `BaseSettings` field left at its class default keeps the value the run's environment gives it. A value typed equal to its default is not sent either. A secret is never pre-filled; completion shows every other field's current value.
 
 The editor checks the text against the document's JSON schema as you type. A syntax error, an unknown section, asset or field, a value of the wrong type or outside its bounds, a metadata value that is not a string, or a value that is not one of a `Literal`'s choices is underlined and listed under the editor with its line and column; clicking the line moves the caret there. Any of these disables the submit button: pydantic would otherwise ignore an unknown field silently, and a wrong value would fail the step when the run starts. Once the schema is satisfied, the code location checks the document as a run would, building each config class, so validators and `pattern` or `format` constraints show in the editor a moment after typing. A launch the code location refuses never becomes a run.
 
