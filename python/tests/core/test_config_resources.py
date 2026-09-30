@@ -1564,8 +1564,9 @@ def test_basemodel_instance_config_with_materialize_overrides():
     assert repo.load_node("overridden") == {"rate": 9.9, "label": "default"}
 
 
-def test_basemodel_instance_in_asset_fn_config_with_materialize_overrides():
-    """BaseModel instance config is overridden via model_copy at materialize time."""
+def test_resource_instance_overridden_through_the_document():
+    """A BaseModel instance given as a resource is rebuilt for the run with
+    the document's values; only the named fields change."""
 
     class OverridableConfig(BaseModel):
         rate: float = 1.0
@@ -1576,44 +1577,40 @@ def test_basemodel_instance_in_asset_fn_config_with_materialize_overrides():
         return {"rate": resource.rate, "label": resource.label}
 
     repo = rs.CodeRepository(
-        assets=[overridden], resources={"resource": OverridableConfig()}
+        assets=[overridden], resources={"resource": OverridableConfig(label="mine")}
     )
 
-    # Without overrides — defaults used
     repo.materialize()
-    assert repo.load_node("overridden") == {"rate": 1.0, "label": "default"}
+    assert repo.load_node("overridden") == {"rate": 1.0, "label": "mine"}
 
-    # With overrides — only specified fields change
-    repo.materialize(
-        config={"assets": {"overridden": {"config": {"rate": 9.9}}}},
-    )
-    assert repo.load_node("overridden") == {"rate": 9.9, "label": "default"}
+    repo.materialize(config={"resources": {"resource": {"rate": 9.9}}})
+    assert repo.load_node("overridden") == {"rate": 9.9, "label": "mine"}
+
+    # The repository's instance is untouched.
+    repo.materialize()
+    assert repo.load_node("overridden") == {"rate": 1.0, "label": "mine"}
 
 
-def test_basemodel_uninitialized_instance_in_asset_fn_config_with_materialize_overrides():
-    """BaseModel instance config is overridden via model_copy at materialize time."""
+def test_asset_config_does_not_reach_resources():
+    """An asset's `config` overrides go to its config class only; a resource
+    with a field of the same name keeps its value."""
 
     class OverridableConfig(BaseModel):
         rate: float = 1.0
         label: str = "default"
 
     @rs.Asset
-    def overridden(resource: OverridableConfig):
-        return {"rate": resource.rate, "label": resource.label}
+    def overridden(
+        context: rs.AssetExecutionContext[OverridableConfig],
+        resource: OverridableConfig,
+    ):
+        return {"config": context.config.rate, "resource": resource.rate}
 
     repo = rs.CodeRepository(
         assets=[overridden], resources={"resource": OverridableConfig()}
     )
-
-    # Without overrides — defaults used
-    repo.materialize()
-    assert repo.load_node("overridden") == {"rate": 1.0, "label": "default"}
-
-    # With overrides — only specified fields change
-    repo.materialize(
-        config={"assets": {"overridden": {"config": {"rate": 9.9}}}},
-    )
-    assert repo.load_node("overridden") == {"rate": 9.9, "label": "default"}
+    repo.materialize(config={"assets": {"overridden": {"config": {"rate": 9.9}}}})
+    assert repo.load_node("overridden") == {"config": 9.9, "resource": 1.0}
 
 
 # ---------------------------------------------------------------------------
@@ -1740,6 +1737,115 @@ def test_malformed_document_is_refused_before_a_run_exists(config, detail):
     repo.resolve()
     with pytest.raises(ConfigurationError, match=detail):
         repo.materialize(config=config)
+    assert repo.storage.get_runs(limit=10) == []
+
+
+# ---------------------------------------------------------------------------
+# Tests: the launch document's resource overrides
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("default", ["in_process", "parallel"])
+def test_resource_override_is_a_per_run_instance_with_lifecycle(tmp_path, default):
+    """A `Resource` named in the document is rebuilt for the run, set up
+    before its first step and torn down after its last (in this process; a
+    worker runs its own lifecycle on the copy it gets). The repository's
+    instance keeps serving the runs that do not name it."""
+    import obstore.store
+
+    events: list = []
+    store = rs.PickleIOHandler(
+        store=obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    )
+
+    class LifecycleLog(rs.Resource):
+        label: str = "base"
+
+        def setup(self):
+            events.append(f"setup:{self.label}")
+
+        def teardown(self):
+            events.append(f"teardown:{self.label}")
+
+    @rs.Asset(io_handler=store)
+    def first(res: LifecycleLog) -> str:
+        return res.label
+
+    @rs.Asset(io_handler=store)
+    def second(first: str, res: LifecycleLog) -> str:
+        return f"{first}/{res.label}"
+
+    executor = (
+        rs.Executor.in_process()
+        if default == "in_process"
+        else rs.Executor.parallel(max_workers=2)
+    )
+    repo = rs.CodeRepository(
+        assets=[first, second],
+        resources={"res": LifecycleLog()},
+        default_executor=executor,
+    )
+    repo.resolve()
+    assert events == ["setup:base"]
+
+    result = repo.materialize(config={"resources": {"res": {"label": "run"}}})
+    assert result.success
+    assert repo.load_node("second") == "run/run"
+    assert events == ["setup:base", "setup:run", "teardown:run"]
+    assert repo.storage.get_run(result.run_id).config == {
+        "resources": {"res": {"label": "run"}}
+    }
+
+    repo.materialize()
+    assert repo.load_node("second") == "base/base"
+    assert events == ["setup:base", "setup:run", "teardown:run"]
+
+
+def test_resource_class_overridden_through_the_document():
+    """A class given as a resource is built once for the run with the values."""
+
+    class Settings(BaseModel):
+        region: str = "eu"
+
+    @rs.Asset
+    def where(settings: Settings) -> str:
+        return settings.region
+
+    repo = rs.CodeRepository(assets=[where], resources={"settings": Settings})
+    repo.materialize(config={"resources": {"settings": {"region": "us"}}})
+    assert repo.load_node("where") == "us"
+    repo.materialize()
+    assert repo.load_node("where") == "eu"
+
+
+def test_resource_override_is_checked_by_the_class():
+    class Pool(rs.Resource):
+        size: int = 2
+
+    @rs.Asset
+    def sized(pool: Pool) -> int:
+        return pool.size
+
+    repo = rs.CodeRepository(assets=[sized], resources={"pool": Pool()})
+    repo.resolve()
+    with pytest.raises(ConfigurationError, match="config: resources.pool"):
+        repo.materialize(config={"resources": {"pool": {"size": "many"}}})
+    with pytest.raises(ConfigurationError, match="no resource 'nope'"):
+        repo.materialize(config={"resources": {"nope": {"size": 1}}})
+    assert repo.storage.get_runs(limit=10) == []
+
+
+def test_io_handler_resource_cannot_be_overridden():
+    handler = rs.InMemoryIOHandler()
+
+    @rs.Asset(io_handler="store")
+    def kept() -> int:
+        return 1
+
+    repo = rs.CodeRepository(assets=[kept], resources={"store": handler})
+    repo.resolve()
+    with pytest.raises(ConfigurationError, match="IO handler cannot be overridden"):
+        repo.materialize(config={"resources": {"store": {"x": 1}}})
     assert repo.storage.get_runs(limit=10) == []
 
 

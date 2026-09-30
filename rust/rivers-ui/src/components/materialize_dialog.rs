@@ -14,7 +14,8 @@ use crate::helpers::{JobPartitionPicker, close_on_navigation, stale_status_kind}
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::mutations::{launch_backfill, trigger_action, trigger_materialize};
 use crate::types::{
-    AssetActionInfo, AssetDefinitionInfo, AssetRecord, StaleStatus, SubmitPartitionKey,
+    AssetActionInfo, AssetDefinitionInfo, AssetRecord, ResourceInfo, StaleStatus,
+    SubmitPartitionKey,
 };
 
 /// Above this many selected partitions, submit one backfill instead of a run each.
@@ -114,6 +115,9 @@ pub fn MaterializeDialog(
     /// config schema (the verb's own declaration for an action run).
     #[prop(optional, into)]
     definitions: Option<Signal<HashMap<String, AssetDefinitionInfo>>>,
+    /// The resources a launch document may override, for the config editor.
+    #[prop(optional, into)]
+    resources: Option<Signal<Vec<ResourceInfo>>>,
 ) -> impl IntoView {
     let records_failed: Signal<bool> = records_failed.unwrap_or_else(|| Signal::derive(|| false));
     let verb_info: Signal<Option<AssetActionInfo>> =
@@ -133,8 +137,15 @@ pub fn MaterializeDialog(
     let definitions: Signal<HashMap<String, AssetDefinitionInfo>> =
         definitions.unwrap_or_else(|| Signal::derive(HashMap::new));
     let config_text = RwSignal::new(String::new());
+    let resources: Signal<Vec<ResourceInfo>> =
+        resources.unwrap_or_else(|| Signal::derive(Vec::new));
     let config_schema = Signal::derive(move || {
-        launch_schema(&selected.get(), &definitions.get(), verb.get().as_deref())
+        launch_schema(
+            &selected.get(),
+            &definitions.get(),
+            &resources.get(),
+            verb.get().as_deref(),
+        )
     });
     Effect::new(move || {
         if show.get() {

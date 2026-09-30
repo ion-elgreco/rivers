@@ -189,8 +189,8 @@ class RunRecord:
     """The verb this run executes. ``None`` means materialize."""
     config: dict[str, Any] | None
     """The launch document the run was launched with:
-    ``{"assets": {name: {"config": {...}, "metadata": {...}}}}``. ``None``
-    means the definitions as they are."""
+    ``{"assets": {name: {"config": {...}, "metadata": {...}}}, "resources":
+    {key: {...}}}``. ``None`` means the definitions as they are."""
 
 class PoolLimit:
     """Configuration of a concurrency pool."""

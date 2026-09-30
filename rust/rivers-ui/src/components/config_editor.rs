@@ -19,7 +19,7 @@ use crate::components::code_editor::CodeEditor;
 use crate::config_schema::{self, Candidate, Schema};
 use crate::json_text::{self, Issue, PathSeg, Slot, Span};
 use crate::server_fns::mutations::validate_config;
-use crate::types::{AssetDefinitionInfo, ConfigError, ConfigLoc};
+use crate::types::{AssetDefinitionInfo, ConfigError, ConfigLoc, ResourceInfo};
 
 /// The config class schema a launch of `def` uses: its own for materialize,
 /// the verb's declaration for an action run.
@@ -52,10 +52,13 @@ pub fn launch_takes_config(
 /// launch takes no config. Under `assets`, each selected key gets `config`
 /// (its class schema, when it has one) and, unless it is a task,
 /// `metadata`: its keys as string fields defaulting to the current values,
-/// any other key allowed.
+/// any other key allowed. Under `resources`, each of `resources` by key;
+/// the template lists the keys alone, so a resource is rebuilt only when
+/// a value is typed.
 pub fn launch_schema(
     keys: &[String],
     definitions: &HashMap<String, AssetDefinitionInfo>,
+    resources: &[ResourceInfo],
     verb: Option<&str>,
 ) -> Option<String> {
     if !launch_takes_config(keys, definitions, verb) {
@@ -110,16 +113,38 @@ pub fn launch_schema(
             }),
         );
     }
+    let mut sections = Map::new();
+    sections.insert(
+        "assets".to_string(),
+        json!({
+            "type": "object",
+            "description": "per-asset overrides for this run",
+            "properties": assets,
+            "additionalProperties": false
+        }),
+    );
+    if !resources.is_empty() {
+        let mut by_key = Map::new();
+        for resource in resources {
+            let at = ["properties", "resources", "properties", &resource.key];
+            if let Some(schema) = config_schema::inline(&resource.config_schema, &at) {
+                by_key.insert(resource.key.clone(), schema);
+            }
+        }
+        sections.insert(
+            "resources".to_string(),
+            json!({
+                "type": "object",
+                "description": "resources rebuilt for this run with these values",
+                "x-launch-template": "keys",
+                "properties": by_key,
+                "additionalProperties": false
+            }),
+        );
+    }
     let document = json!({
         "type": "object",
-        "properties": {
-            "assets": {
-                "type": "object",
-                "description": "per-asset overrides for this run",
-                "properties": assets,
-                "additionalProperties": false
-            }
-        },
+        "properties": sections,
         "additionalProperties": false
     });
     Some(document.to_string())
@@ -436,15 +461,30 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
+    const DB: &str = r#"{"properties":{"dsn":{"default":"memory://","title":"Dsn","type":"string"},"pool_size":{"default":2,"title":"Pool Size","type":"integer"},"token":{"format":"password","title":"Token","type":"string","writeOnly":true}},"title":"DbResource","type":"object"}"#;
+
+    fn resource(key: &str, config_schema: &str) -> ResourceInfo {
+        ResourceInfo {
+            key: key.into(),
+            config_schema: config_schema.into(),
+        }
+    }
+
     /// The schema of a launch of `api` (PIPELINE), `cfg` (THRESHOLD) and
-    /// `plain` (no config, one metadata key).
+    /// `plain` (no config, one metadata key), with the resource `db`.
     fn schema() -> String {
         let defs = definitions(vec![
             definition("api", Some(PIPELINE), &[]),
             definition("cfg", Some(THRESHOLD), &[]),
             definition("plain", None, &[("owner", "data")]),
         ]);
-        launch_schema(&keys(&["api", "cfg", "plain"]), &defs, None).unwrap()
+        launch_schema(
+            &keys(&["api", "cfg", "plain"]),
+            &defs,
+            &[resource("db", DB)],
+            None,
+        )
+        .unwrap()
     }
 
     fn messages(check: &Check) -> Vec<(String, Span)> {
@@ -463,18 +503,24 @@ mod tests {
         // without metadata gets no `metadata`.
         assert_eq!(
             value,
-            json!({"assets": {
-                "api": {"config": {"batch_size": 100, "region": null}},
-                "cfg": {"config": {"threshold": 0.5, "max_retries": 3}},
-                "plain": {"metadata": {"owner": "data"}}
-            }})
+            json!({
+                "assets": {
+                    "api": {"config": {"batch_size": 100, "region": null}},
+                    "cfg": {"config": {"threshold": 0.5, "max_retries": 3}},
+                    "plain": {"metadata": {"owner": "data"}}
+                },
+                "resources": {"db": {}}
+            })
         );
-        // No selected asset takes config: no schema, no editor.
+        // No selected asset takes config: no schema, no editor, resources or not.
         let defs = definitions(vec![
             definition("bare", None, &[]),
             definition("api", Some(PIPELINE), &[]),
         ]);
-        assert_eq!(launch_schema(&keys(&["bare"]), &defs, None), None);
+        assert_eq!(
+            launch_schema(&keys(&["bare"]), &defs, &[resource("db", DB)], None),
+            None
+        );
         assert!(!launch_takes_config(&keys(&["bare"]), &defs, None));
         assert!(launch_takes_config(&keys(&["bare", "api"]), &defs, None));
     }
@@ -483,7 +529,7 @@ mod tests {
     fn template_lists_a_config_class_without_defaults() {
         let class = r#"{"properties":{"api_key":{"type":"string"}},"required":["api_key"],"type":"object"}"#;
         let defs = definitions(vec![definition("api", Some(class), &[])]);
-        let schema = launch_schema(&keys(&["api"]), &defs, None).unwrap();
+        let schema = launch_schema(&keys(&["api"]), &defs, &[], None).unwrap();
         assert_eq!(
             config_template(&schema).unwrap(),
             "{\n  \"assets\": {\n    \"api\": {\n      \"config\": {}\n    }\n  }\n}"
@@ -505,7 +551,7 @@ mod tests {
         let selected = keys(&["a", "b"]);
         let class_of = |verb: Option<&str>| -> Option<String> {
             let schema: Value =
-                serde_json::from_str(&launch_schema(&selected, &defs, verb)?).unwrap();
+                serde_json::from_str(&launch_schema(&selected, &defs, &[], verb)?).unwrap();
             schema
                 .pointer("/properties/assets/properties/a/properties/config/title")
                 .and_then(Value::as_str)
@@ -522,7 +568,7 @@ mod tests {
         task.asset_type = "task".into();
         let defs = definitions(vec![task]);
         let schema: Value =
-            serde_json::from_str(&launch_schema(&keys(&["t"]), &defs, None).unwrap()).unwrap();
+            serde_json::from_str(&launch_schema(&keys(&["t"]), &defs, &[], None).unwrap()).unwrap();
         let sections = schema
             .pointer("/properties/assets/properties/t/properties")
             .and_then(Value::as_object)
@@ -539,7 +585,7 @@ mod tests {
         assert_eq!(check("{}").payload, None);
         // The template's entries, left untouched.
         assert_eq!(
-            check(r#"{"assets": {"api": {"config": {}}, "plain": {"metadata": {}}}}"#).payload,
+            check(r#"{"assets": {"api": {"config": {}}, "plain": {"metadata": {}}}, "resources": {"db": {}}}"#).payload,
             None
         );
         // Without a schema there is no document.
@@ -583,7 +629,7 @@ mod tests {
         assert_eq!(
             messages(&check(r#"{"other": {"x": 1}}"#)),
             vec![(
-                "unknown field 'other'; expected one of assets".to_string(),
+                "unknown field 'other'; expected one of assets, resources".to_string(),
                 Span { start: 1, end: 8 }
             )]
         );
@@ -757,7 +803,7 @@ mod tests {
                 .collect()
         };
         // Sections, then the selected assets, then what each asset has.
-        assert_eq!(labels("{", 1), keys(&["assets"]));
+        assert_eq!(labels("{", 1), keys(&["assets", "resources"]));
         let section = &completions("{", 1, Some(&schema))[0];
         assert_eq!(section.insert, "\"assets\": {}");
         assert_eq!(section.caret, 11);
@@ -804,5 +850,57 @@ mod tests {
         // No schema, or outside the document.
         assert!(completions("{", 1, None).is_empty());
         assert!(labels("{}", 2).is_empty());
+    }
+    #[test]
+    fn resources_are_checked_by_key_and_class_and_sent_when_typed() {
+        let schema = schema();
+        let check = |text: &str| check_config(text, Some(&schema));
+        assert_eq!(
+            messages(&check(r#"{"resources": {"nope": {}}}"#)),
+            vec![(
+                "resources: unknown field 'nope'; expected one of db".to_string(),
+                Span { start: 15, end: 21 }
+            )]
+        );
+        assert_eq!(
+            messages(&check(r#"{"resources": {"db": {"pool_size": "x"}}}"#)),
+            vec![(
+                "resources.db.pool_size: expected integer, got string".to_string(),
+                Span { start: 35, end: 38 }
+            )]
+        );
+        let set = check(r#"{"resources": {"db": {"pool_size": 8, "token": "t"}}}"#);
+        assert!(set.issues.is_empty(), "{:?}", set.issues);
+        assert_eq!(
+            set.payload.as_deref(),
+            Some(r#"{"resources":{"db":{"pool_size":8,"token":"t"}}}"#)
+        );
+        assert_eq!(check(r#"{"resources": {"db": {}}}"#).payload, None);
+    }
+
+    #[test]
+    fn resource_completion_lists_keys_then_fields_with_current_values() {
+        let schema = schema();
+        let labels = |text: &str, caret: usize| -> Vec<String> {
+            completions(text, caret, Some(&schema))
+                .into_iter()
+                .map(|c| c.label)
+                .collect()
+        };
+        assert_eq!(labels("{\"resources\": {", 15), keys(&["db"]));
+        let fields = completions("{\"resources\": {\"db\": {", 22, Some(&schema));
+        assert_eq!(
+            fields
+                .iter()
+                .map(|c| (c.label.as_str(), c.detail.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("dsn", "string = \"memory://\""),
+                ("pool_size", "integer = 2"),
+                ("token", "string"),
+            ]
+        );
+        // A secret's value is never offered.
+        assert!(labels("{\"resources\": {\"db\": {\"token\": ", 32).is_empty());
     }
 }

@@ -902,6 +902,60 @@ async fn invalid_config_blocks_submit_until_reset() {
     assert!(!submit_disabled(&host));
 }
 
+/// The repository's resources are listed by key, values left for the user
+/// to type; the schema underlines a wrong value under a key.
+#[wasm_bindgen_test]
+async fn config_editor_lists_resources_by_key() {
+    nav_to("/locations/default/demo");
+    let target = fresh_mount_target();
+    let show = RwSignal::new(true);
+    let definitions: HashMap<String, rivers_ui::types::AssetDefinitionInfo> = [(
+        "api_data".to_string(),
+        definition("api_data", Some(PIPELINE_SCHEMA)),
+    )]
+    .into_iter()
+    .collect();
+    let resources = vec![rivers_ui::types::ResourceInfo {
+        key: "db".to_string(),
+        config_schema: r#"{"properties":{"pool_size":{"default":2,"type":"integer"}},"title":"Db","type":"object"}"#.to_string(),
+    }];
+    mount_to(target.clone(), move || {
+        let definitions = definitions.clone();
+        let resources = resources.clone();
+        view! {
+            <Router>
+                <MaterializeDialog
+                    show=show
+                    asset_keys=Signal::derive(|| vec!["api_data".to_string()])
+                    records=Signal::derive(HashMap::new)
+                    definitions=Signal::derive(move || definitions.clone())
+                    resources=Signal::derive(move || resources.clone())
+                />
+            </Router>
+        }
+    })
+    .forget();
+    flush_effects().await;
+
+    assert!(
+        editor_value(&target).ends_with("  \"resources\": {\n    \"db\": {}\n  }\n}"),
+        "{}",
+        editor_value(&target)
+    );
+    type_config(
+        &target,
+        "{\"resources\": {\"db\": {\"pool_size\": \"many\"}}}",
+    );
+    flush_effects().await;
+    assert_eq!(
+        query_one(&target, ".code-editor-issue")
+            .text_content()
+            .unwrap_or_default(),
+        "1:36 resources.db.pool_size: expected integer, got string"
+    );
+    assert!(submit_disabled(&target));
+}
+
 /// Unchecking the only configured asset removes the editor; checking it
 /// again brings the defaults back (the user had not typed).
 #[wasm_bindgen_test]

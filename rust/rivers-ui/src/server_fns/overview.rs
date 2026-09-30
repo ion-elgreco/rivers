@@ -4,7 +4,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[allow(unused_imports)]
-use crate::types::{AssetDefinitionInfo, PartitionDetail, PartitionStatus};
+use crate::types::{AssetDefinitionInfo, PartitionDetail, PartitionStatus, ResourceInfo};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentInfo {
@@ -23,6 +23,34 @@ pub struct DeploymentInfo {
     pub daemon_active: bool,
     pub daemon_schedules: usize,
     pub daemon_sensors: usize,
+}
+
+/// The resources a launch document may override, for the launch dialogs.
+#[server]
+pub async fn get_resources_info(
+    loc_ns: String,
+    loc_name: String,
+) -> Result<Vec<ResourceInfo>, ServerFnError> {
+    use rivers_api::rivers::GetAssetsInfoRequest;
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let resp = client
+        .get_assets_info(GetAssetsInfoRequest {})
+        .await
+        .map_err(super::grpc_err)?;
+    Ok(resp
+        .into_inner()
+        .resources
+        .into_iter()
+        .map(|r| ResourceInfo {
+            key: r.key,
+            config_schema: r.config_schema,
+        })
+        .collect())
 }
 
 #[server]

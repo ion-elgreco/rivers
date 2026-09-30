@@ -18,7 +18,7 @@ use crate::automation::schedule::TickRequest;
 use crate::automation::{PyScheduleStatus, PySensorStatus};
 use crate::config::run_config::{
     ConfigIssue, LocPart, config_class, config_errors, config_schema_json, parse_run_config,
-    validate_run_config,
+    resource_schema_json, validate_run_config,
 };
 use crate::daemon::{BackfillDispatcherKind, RunDispatcherKind};
 use crate::executor::Executor;
@@ -77,8 +77,9 @@ impl CodeLocationImpl {
     }
 
     /// The errors the definitions find in `config`: each asset's config
-    /// class built as a run builds it, and metadata overrides on a node
-    /// that is not an asset. Assets without a config class are skipped.
+    /// class and each named resource built as a run builds them, metadata
+    /// overrides on a node that is not an asset, and resource keys the
+    /// repository does not have. Assets without a config class are skipped.
     #[allow(clippy::result_large_err)]
     async fn config_issues(
         &self,
@@ -134,6 +135,33 @@ impl CodeLocationImpl {
                 issues.extend(
                     config_errors(py, &at("config"), &cls, fields).map_err(|e| e.to_string())?,
                 );
+            }
+            for (key, fields) in &document.resources {
+                let path = vec!["resources".to_string(), key.clone()];
+                let Some(variant) = state.resources.get(key) else {
+                    issues.push(ConfigIssue {
+                        path,
+                        loc: Vec::new(),
+                        message: format!("no resource '{key}'"),
+                        kind: "unknown".to_string(),
+                    });
+                    continue;
+                };
+                let fields = fields
+                    .bind(py)
+                    .cast::<PyDict>()
+                    .map_err(|e| e.to_string())?;
+                match variant.run_kwargs(py, fields) {
+                    Ok((cls, kwargs)) => issues.extend(
+                        config_errors(py, &path, &cls, &kwargs).map_err(|e| e.to_string())?,
+                    ),
+                    Err(e) => issues.push(ConfigIssue {
+                        path,
+                        loc: Vec::new(),
+                        message: e.value(py).to_string(),
+                        kind: "invalid".to_string(),
+                    }),
+                }
             }
             issues.sort_by(|a, b| a.path.cmp(&b.path));
             Ok(issues)
@@ -596,7 +624,25 @@ impl CodeLocationService for CodeLocationImpl {
                     });
                 }
 
-                Ok(GetAssetsInfoResponse { assets })
+                let mut resources = Vec::new();
+                for (key, variant) in &state.resources {
+                    match resource_schema_json(py, variant) {
+                        Ok(Some(config_schema)) => resources.push(ResourceInfo {
+                            key: key.clone(),
+                            config_schema,
+                        }),
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(
+                            target: "rivers::grpc",
+                            resource = %key,
+                            error = %e,
+                            "resource schema unavailable"
+                        ),
+                    }
+                }
+                resources.sort_by(|a, b| a.key.cmp(&b.key));
+
+                Ok(GetAssetsInfoResponse { assets, resources })
             })
             .await?;
         Ok(Response::new(resp))

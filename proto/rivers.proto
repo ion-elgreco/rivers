@@ -184,6 +184,18 @@ message ValidateConfigResponse {
 message GetAssetsInfoRequest {}
 message GetAssetsInfoResponse {
   repeated AssetDefinitionInfo assets = 1;
+  // The resources a launch document may override.
+  repeated ResourceInfo resources = 2;
+}
+
+// A resource of the repository a launch document may override with field
+// values. An IO handler is not listed: nodes hold it through the registry.
+message ResourceInfo {
+  string key = 1;
+  // JSON schema of the resource's class. For an instance, each field's
+  // `default` is its current value (a secret's is left out) and nothing is
+  // `required`.
+  string config_schema = 2;
 }
 
 message AssetDefinitionInfo {

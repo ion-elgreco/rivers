@@ -19,7 +19,7 @@ from typing import Literal
 import obstore.store
 import pyarrow as pa
 from deltalake import write_deltalake
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, SecretStr, field_validator
 from rivers import (
     ActionContext,
     ActionResult,
@@ -46,6 +46,7 @@ from rivers import (
     PartitionMapping,
     PartitionsDefinition,
     PickleIOHandler,
+    Resource,
     RunQueueConfig,
     RunRequest,
     Schedule,
@@ -65,6 +66,14 @@ from rivers import (
 # =============================================================================
 # Configuration (Config + Pydantic)
 # =============================================================================
+
+
+class CrmApi(Resource):
+    """The CRM the ingestion reads from; a launch can point it elsewhere."""
+
+    base_url: str = "https://crm.example.com"
+    timeout_s: int = 10
+    api_key: SecretStr = SecretStr("demo-key")
 
 
 class _IngestionSettings(BaseModel):
@@ -205,9 +214,10 @@ external_weather_data = Asset.external(
     hooks=[log_success, alert_failure],
     pool="database",
 )
-def raw_users(context: AssetExecutionContext[_IngestionSettings]) -> dict:
-    """Simulate raw user data ingestion using pipeline config."""
+def raw_users(context: AssetExecutionContext[_IngestionSettings], crm: CrmApi) -> dict:
+    """Simulate raw user data ingestion using pipeline config and the CRM resource."""
     settings = context.config
+    context.add_output_metadata({"crm": f"{crm.base_url} ({crm.timeout_s}s)"})
     users = [
         {"id": 1, "name": "Alice", "region": "us-east", "active": True, "tier": "pro"},
         {"id": 2, "name": "Bob", "region": "us-west", "active": True, "tier": "free"},
@@ -1824,6 +1834,7 @@ repo = CodeRepository(
         failure_showcase_schedule,
     ],
     sensors=[new_data_sensor, file_watcher_sensor, data_quality_sensor],
+    resources={"crm": CrmApi()},
     run_queue=RunQueueConfig(
         max_concurrent_runs=3,
         tag_concurrency_limits=[

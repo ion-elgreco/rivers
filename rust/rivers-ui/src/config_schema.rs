@@ -2,7 +2,10 @@
 //! has against it, the required fields it lacks, the completions a caret
 //! takes, the template it opens with and the payload it sends. The schema is
 //! a launch document's, composed from config classes' `model_json_schema()`
-//! text placed in it with [`inline`].
+//! text placed in it with [`inline`]. One keyword of our own:
+//! `"x-launch-template": "keys"` on a container lists its keys as empty
+//! objects in the template instead of their fields' defaults, for sections
+//! whose values must only be sent when typed.
 
 use serde_json::{Map, Value};
 
@@ -161,7 +164,8 @@ fn is_container(node: &Value) -> bool {
 
 /// `schema_json` placed at `path` (property names, unescaped) in a larger
 /// schema: its `$defs` stay with it and its `#/$defs/...` references point
-/// there.
+/// there. A secret (`writeOnly`) loses its `default`, which pydantic masks:
+/// the mask must never be offered as a value.
 pub fn inline(schema_json: &str, path: &[&str]) -> Option<Value> {
     let mut value: Value = serde_json::from_str(schema_json).ok()?;
     if !value.is_object() {
@@ -186,6 +190,9 @@ fn rebase_refs(value: &mut Value, base: &str) {
                     *reference = rebased;
                 }
             }
+            if map.get("writeOnly") == Some(&Value::Bool(true)) {
+                map.remove("default");
+            }
             for child in map.values_mut() {
                 rebase_refs(child, base);
             }
@@ -208,6 +215,9 @@ pub fn template(schema: &Schema) -> Value {
 }
 
 fn template_of(schema: &Schema, node: &Value) -> Option<Value> {
+    if node.get("writeOnly") == Some(&Value::Bool(true)) {
+        return None;
+    }
     if let Some(default) = schema.default_of(node) {
         return Some(default.clone());
     }
@@ -215,6 +225,16 @@ fn template_of(schema: &Schema, node: &Value) -> Option<Value> {
         return None;
     }
     let props = node.get("properties")?.as_object()?;
+    if node.get("x-launch-template").and_then(Value::as_str) == Some("keys") {
+        if props.is_empty() {
+            return None;
+        }
+        let keys = props
+            .keys()
+            .map(|key| (key.clone(), Value::Object(Map::new())))
+            .collect();
+        return Some(Value::Object(keys));
+    }
     let children: Map<String, Value> = props
         .iter()
         .filter_map(|(name, prop)| Some((name.clone(), template_of(schema, prop)?)))
@@ -1151,6 +1171,14 @@ mod tests {
         );
         assert_eq!(type_label(&doc, doc.at(&[key("a/b")]).unwrap()), "Cfg");
         assert_eq!(inline("[1]", &["x"]), None);
+        // A secret's masked default is dropped.
+        let secret = r#"{"properties":{"token":{"default":"**********","format":"password","type":"string","writeOnly":true}},"type":"object"}"#;
+        assert_eq!(
+            inline(secret, &["s"])
+                .unwrap()
+                .pointer("/properties/token/default"),
+            None
+        );
     }
 
     #[test]
@@ -1167,6 +1195,20 @@ mod tests {
                 "ingest": {"config": {"source_system": "demo", "batch_size": 100, "include_inactive": false}},
                 "outer": {"config": {}}
             }})
+        );
+        // A `keys` container lists its keys without their values; a secret is
+        // never pre-filled.
+        let keyed = Schema {
+            root: serde_json::json!({"type": "object", "properties": {"resources": {
+                "type": "object", "x-launch-template": "keys", "properties": {
+                    "db": {"type": "object", "properties": {"dsn": {"type": "string", "default": "x"}}},
+                    "cache": {"type": "object", "properties": {"ttl": {"type": "integer", "default": 5}}}
+                }
+            }, "secret": {"type": "string", "writeOnly": true, "default": "***"}}}),
+        };
+        assert_eq!(
+            template(&keyed),
+            serde_json::json!({"resources": {"cache": {}, "db": {}}})
         );
         // Nothing known anywhere: an empty document.
         let bare = Schema {
