@@ -13,7 +13,7 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 
 use crate::components::execute_job_dialog::ExecuteJobDialog;
-use crate::components::icons::IconPlay;
+use crate::components::icons::{IconPlay, IconTrash};
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::ui_kit::{
     AssetStack, EmptyState, KindBadge, SplitButton, StatusChip, Topbar,
@@ -306,7 +306,7 @@ pub fn JobsListPage() -> impl IntoView {
                                             {status_cell}
                                             {last_run_cell}
                                             {
-                                                let variant = if destructive { "btn-danger" } else { "" };
+                                                let variant = if destructive { "btn-danger" } else { "btn-accent" };
                                                 let execute = view! {
                                                     <button
                                                         class=format!("btn {variant}")
@@ -314,7 +314,7 @@ pub fn JobsListPage() -> impl IntoView {
                                                         disabled=move || exec_pending.get()
                                                         title="Execute job"
                                                     >
-                                                        <IconPlay/>
+                                                        {if destructive { view! { <IconTrash/> }.into_any() } else { view! { <IconPlay/> }.into_any() }}
                                                         {move || if exec_pending.get() {
                                                             "Executing…".to_string()
                                                         } else if armed.get() {

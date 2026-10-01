@@ -344,7 +344,7 @@ a:hover { color: var(--accent-hover); }
     border-radius: var(--round-md);
 }
 
-/* Buttons. Variants: .btn (secondary), .btn-primary, .btn-danger. Sizes: default
+/* Buttons. Variants: .btn (secondary), .btn-primary, .btn-accent, .btn-danger. Sizes: default
  * 28px, .btn-small 22px; .btn-square makes an icon-only button. One size per row. */
 .btn {
     display: inline-flex;
@@ -409,6 +409,7 @@ a:hover { color: var(--accent-hover); }
 .btn-primary.btn-split-toggle {
     border-left-color: color-mix(in srgb, var(--on-accent) 25%, transparent);
 }
+.btn-accent.btn-split-toggle { border-left-color: var(--accent-border); }
 .btn-danger.btn-split-toggle {
     border-left-color: color-mix(in srgb, var(--error) 40%, transparent);
 }
@@ -450,6 +451,18 @@ a:hover { color: var(--accent-hover); }
     background: color-mix(in srgb, var(--error) 10%, transparent);
     color: var(--error);
     border-color: var(--error);
+}
+
+/* A row's launch button: tinted like .btn-danger, quieter than .btn-primary. */
+.btn-accent {
+    background: var(--accent-bg-soft);
+    color: var(--accent);
+    border-color: var(--accent-border);
+}
+.btn-accent:hover:not(:disabled) {
+    background: var(--accent-bg);
+    color: var(--accent);
+    border-color: var(--accent);
 }
 
 /* Bare inline icon button: close (×), remove (×), copy. Needs an aria-label. */

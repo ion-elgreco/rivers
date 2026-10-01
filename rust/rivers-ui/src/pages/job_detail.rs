@@ -8,7 +8,7 @@ use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
 
 use crate::components::execute_job_dialog::ExecuteJobDialog;
-use crate::components::icons::IconPlay;
+use crate::components::icons::{IconPlay, IconTrash};
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::pagination::Pagination;
 use crate::components::ui_kit::{
@@ -241,7 +241,11 @@ pub fn JobDetailPage() -> impl IntoView {
                         on:click=on_execute
                         disabled=move || exec_pending.get() || !job_loaded.get()
                     >
-                        <IconPlay/>
+                        {move || if job_verb_signal.get().is_some_and(|v| v.is_destructive()) {
+                            view! { <IconTrash/> }.into_any()
+                        } else {
+                            view! { <IconPlay/> }.into_any()
+                        }}
                         {move || if exec_pending.get() {
                             "Executing…".to_string()
                         } else if exec_armed.get() {
