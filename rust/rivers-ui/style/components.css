@@ -393,13 +393,24 @@ a:hover { color: var(--accent-hover); }
 
 /* A button with a menu of variants on an attached chevron. */
 .btn-split { position: relative; display: inline-flex; }
-.btn-split > .btn:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+/* The split's halves share one outline; the chevron's left edge divides them. */
+.btn-split > .btn:first-child {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+    border-right-width: 0;
+}
 .btn-split-toggle {
     width: 24px;
     padding: 0;
     border-top-left-radius: 0;
     border-bottom-left-radius: 0;
-    border-left: 1px solid color-mix(in srgb, var(--on-accent) 25%, transparent);
+    border-left: 1px solid var(--border);
+}
+.btn-primary.btn-split-toggle {
+    border-left-color: color-mix(in srgb, var(--on-accent) 25%, transparent);
+}
+.btn-danger.btn-split-toggle {
+    border-left-color: color-mix(in srgb, var(--error) 40%, transparent);
 }
 .btn-split-toggle svg { transform: rotate(90deg); }
 .btn-split-backdrop { position: fixed; inset: 0; z-index: 99; }

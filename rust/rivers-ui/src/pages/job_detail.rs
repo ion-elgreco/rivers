@@ -13,7 +13,7 @@ use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::pagination::Pagination;
 use crate::components::ui_kit::{
     AssetSummaryRow, Crumb, EmptyState, KindBadge, RecentRunsStrip, RunsGrid, SectionHeader,
-    StatusChip, StripRun, Topbar,
+    SplitButton, StatusChip, StripRun, Topbar,
 };
 use crate::helpers::{
     JobPartitionPicker, job_partition_picker, job_verb, replay_click, run_status_kind,
@@ -159,6 +159,13 @@ pub fn JobDetailPage() -> impl IntoView {
     let exec_armed = use_confirm_armed(move || params.track());
 
     let dialog_job_name: Signal<String> = Signal::derive(name);
+    let execute_variant = Signal::derive(move || {
+        if job_verb_signal.get().is_some_and(|v| v.is_destructive()) {
+            "btn-danger"
+        } else {
+            "btn-primary"
+        }
+    });
 
     let on_execute = move |_| {
         let Some((verb, _)) = job_launch.get() else {
@@ -224,44 +231,51 @@ pub fn JobDetailPage() -> impl IntoView {
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
             {move || exec_error.get().map(|msg| view! { <span class="text-error">{msg}</span> })}
-            <button
-                class=move || if job_verb_signal.get().is_some_and(|v| v.is_destructive()) {
-                    "btn btn-danger"
-                } else {
-                    "btn btn-primary"
-                }
-                on:click=on_execute
-                disabled=move || exec_pending.get() || !job_loaded.get()
-            >
-                <IconPlay/>
-                {move || if exec_pending.get() {
-                    "Executing…".to_string()
-                } else if exec_armed.get() {
-                    format!(
-                        "Confirm {}?",
-                        job_verb_signal.get().map(|v| v.name).unwrap_or_default()
-                    )
-                } else if job_opens_dialog.get() {
-                    "Execute…".to_string()
-                } else {
-                    "Execute".to_string()
-                }}
-            </button>
-            // The one-click launch runs the job as defined; the dialog edits
-            // the launch document (metadata, resources, executor) for any job.
-            <Show when=move || job_loaded.get() && !job_opens_dialog.get()>
-                <button
-                    class="btn"
-                    title="Execute with a launch document"
-                    on:click=move |_| {
-                        set_exec_error.set(None);
-                        show_dialog.set(true);
+            // A job that runs on the click offers the dialog from its menu,
+            // for the launch document (metadata, resources, executor).
+            {move || {
+                let on_execute = on_execute.clone();
+                let execute = view! {
+                    <button
+                        class=move || format!("btn {}", execute_variant.get())
+                        on:click=on_execute
+                        disabled=move || exec_pending.get() || !job_loaded.get()
+                    >
+                        <IconPlay/>
+                        {move || if exec_pending.get() {
+                            "Executing…".to_string()
+                        } else if exec_armed.get() {
+                            format!(
+                                "Confirm {}?",
+                                job_verb_signal.get().map(|v| v.name).unwrap_or_default()
+                            )
+                        } else if job_opens_dialog.get() {
+                            "Execute…".to_string()
+                        } else {
+                            "Execute".to_string()
+                        }}
+                    </button>
+                };
+                if job_loaded.get() && !job_opens_dialog.get() {
+                    view! {
+                        <SplitButton
+                            variant=execute_variant
+                            disabled=Signal::derive(move || exec_pending.get())
+                            menu_label="Execute with config…"
+                            on_menu=Callback::new(move |()| {
+                                exec_armed.set(false);
+                                set_exec_error.set(None);
+                                show_dialog.set(true);
+                            })
+                        >
+                            {execute}
+                        </SplitButton>
                     }
-                    disabled=move || exec_pending.get()
-                >
-                    "Execute…"
-                </button>
-            </Show>
+                    .into_any()
+                } else {
+                    execute.into_any()
+                }
+            }}
         </Topbar>
 
         <ExecuteJobDialog

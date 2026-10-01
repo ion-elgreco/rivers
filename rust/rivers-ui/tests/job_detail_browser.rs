@@ -92,15 +92,16 @@ fn mount_purge_page(jobs: Reply) -> (web_sys::HtmlElement, common::FetchMock, co
 
 /// Execute is the first direct button child of the top-bar actions; its class
 /// switches to `btn-danger` once a destructive verb has loaded.
+/// Execute stands alone, or leads a split button whose menu opens the dialog.
+const EXECUTE: &str = ".topbar-actions > button, .topbar-actions > .btn-split > button:first-child";
+
 fn execute_button(host: &web_sys::HtmlElement) -> web_sys::HtmlButtonElement {
-    query_one(host, ".topbar-actions > button")
-        .dyn_into()
-        .unwrap()
+    query_one(host, EXECUTE).dyn_into().unwrap()
 }
 
 /// The routes render asynchronously: `false` until the page is there.
 fn page_rendered(host: &web_sys::HtmlElement) -> bool {
-    !query_all(host, ".topbar-actions > button").is_empty()
+    !query_all(host, EXECUTE).is_empty()
 }
 
 async fn execute_job_bodies(requests: &common::Requests) -> Vec<String> {
@@ -193,16 +194,25 @@ async fn execute_sends_the_verb_the_page_showed() {
     );
 }
 
-/// A job that runs on the click still has a way into the dialog: the second
-/// button opens it with the launch document, and sends nothing itself.
+/// A job that runs on the click still has a way into the dialog: its menu
+/// opens it with the launch document, and sends nothing itself.
 #[wasm_bindgen_test]
 async fn execute_with_a_document_opens_the_dialog() {
     let (host, _mock, requests) = mount_purge_page(Reply::Json(PURGE_JOB.to_string()));
-    assert!(wait_until(|| query_all(&host, ".topbar-actions > button").len() == 2).await);
-    let buttons = query_all(&host, ".topbar-actions > button");
-    assert_eq!(buttons[1].text_content().unwrap_or_default(), "Execute…");
+    assert!(wait_until(|| !query_all(&host, ".topbar-actions .btn-split-toggle").is_empty()).await);
+    click(
+        &query_one(&host, ".topbar-actions .btn-split-toggle"),
+        false,
+    );
+    assert!(wait_until(|| !query_all(&host, ".btn-split-menu-item").is_empty()).await);
+    let item = query_one(&host, ".btn-split-menu-item");
+    assert_eq!(
+        item.text_content().unwrap_or_default(),
+        "Execute with config…"
+    );
+    assert!(execute_job_bodies(&requests).await.is_empty());
 
-    click(&buttons[1], false);
+    click(&item, false);
     assert!(wait_until(|| !query_all(&host, ".modal-content").is_empty()).await);
     assert_eq!(
         query_one(&host, ".config-editor-text")

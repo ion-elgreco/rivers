@@ -9,7 +9,7 @@ use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::pagination::{InfiniteEventList, PaginatedView};
 use crate::components::rerun_dialog::RerunConfigDialog;
 use crate::components::traceback::RunFailures;
-use crate::components::ui_kit::{Crumb, EmptyState, StatusChip, Topbar};
+use crate::components::ui_kit::{Crumb, EmptyState, SplitButton, StatusChip, Topbar};
 use crate::helpers::{
     code_location_label, format_elapsed, format_relative_time, format_timestamp,
     launched_by_display, nanos_to_datetime, run_status_kind, short_id,
@@ -356,55 +356,39 @@ pub fn RunDetailPage() -> impl IntoView {
                                     }
                                 })}
                                 {(!is_active_status).then(move || view! {
-                                    <div class="btn-split">
-                                    <button
-                                        class="btn btn-primary"
-                                        on:click=move |_| {
-                                            let (dispatch, armed) = crate::helpers::replay_click(
-                                                rerun_verb.is_some(),
-                                                reexecute_armed.get(),
-                                            );
-                                            reexecute_armed.set(armed);
-                                            if dispatch {
-                                                action_error.set(None);
-                                                reexecute.dispatch(rerun_run_id.clone());
-                                            }
-                                        }
-                                        disabled=move || reexecute_pending.get()
+                                    <SplitButton
+                                        variant="btn-primary"
+                                        disabled=Signal::derive(move || reexecute_pending.get())
+                                        menu_label="Re-execute with config…"
+                                        on_menu=Callback::new(move |()| {
+                                            reexecute_armed.set(false);
+                                            rerun_dialog.set(true);
+                                        })
+                                        open=rerun_menu
                                     >
-                                        <IconRetry/>
-                                        {move || crate::helpers::replay_button_text(
-                                            rerun_verb_text.as_deref(),
-                                            reexecute_armed.get(),
-                                            reexecute_pending.get(),
-                                        )}
-                                    </button>
-                                    <button
-                                        class="btn btn-primary btn-split-toggle"
-                                        on:click=move |_| rerun_menu.update(|o| *o = !*o)
-                                        disabled=move || reexecute_pending.get()
-                                        title="More re-execute options"
-                                        aria-label="More re-execute options"
-                                        aria-haspopup="menu"
-                                        aria-expanded=move || rerun_menu.get().to_string()
-                                    >
-                                        <IconChevronRight/>
-                                    </button>
-                                    <Show when=move || rerun_menu.get()>
-                                        <div class="btn-split-backdrop" on:click=move |_| rerun_menu.set(false)></div>
-                                        <div class="btn-split-menu" role="menu">
-                                            <button
-                                                class="btn-split-menu-item"
-                                                role="menuitem"
-                                                on:click=move |_| {
-                                                    rerun_menu.set(false);
-                                                    reexecute_armed.set(false);
-                                                    rerun_dialog.set(true);
+                                        <button
+                                            class="btn btn-primary"
+                                            on:click=move |_| {
+                                                let (dispatch, armed) = crate::helpers::replay_click(
+                                                    rerun_verb.is_some(),
+                                                    reexecute_armed.get(),
+                                                );
+                                                reexecute_armed.set(armed);
+                                                if dispatch {
+                                                    action_error.set(None);
+                                                    reexecute.dispatch(rerun_run_id.clone());
                                                 }
-                                            >"Re-execute with config…"</button>
-                                        </div>
-                                    </Show>
-                                    </div>
+                                            }
+                                            disabled=move || reexecute_pending.get()
+                                        >
+                                            <IconRetry/>
+                                            {move || crate::helpers::replay_button_text(
+                                                rerun_verb_text.as_deref(),
+                                                reexecute_armed.get(),
+                                                reexecute_pending.get(),
+                                            )}
+                                        </button>
+                                    </SplitButton>
                                 })}
                             }
                         })}

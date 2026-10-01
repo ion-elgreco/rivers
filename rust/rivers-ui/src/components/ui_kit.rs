@@ -161,6 +161,67 @@ impl Crumb {
     }
 }
 
+/// A button with a chevron menu holding one variant. `children` is the main
+/// button; the chevron takes its `variant` class (`btn-primary`,
+/// `btn-danger` or none). Clicks stop at the split, so it can sit in a row
+/// link. Pass `open` to keep the menu open across a re-render.
+#[component]
+pub fn SplitButton(
+    #[prop(into)] variant: Signal<&'static str>,
+    #[prop(into)] disabled: Signal<bool>,
+    #[prop(into)] menu_label: String,
+    on_menu: Callback<()>,
+    #[prop(optional)] open: Option<RwSignal<bool>>,
+    children: Children,
+) -> impl IntoView {
+    let open = open.unwrap_or_else(|| RwSignal::new(false));
+    let stop = |ev: &web_sys::MouseEvent| {
+        ev.prevent_default();
+        ev.stop_propagation();
+    };
+    view! {
+        <div class="btn-split">
+            {children()}
+            <button
+                class=move || format!("btn {} btn-split-toggle", variant.get())
+                on:click=move |ev| {
+                    stop(&ev);
+                    open.update(|o| *o = !*o);
+                }
+                disabled=disabled
+                title="More options"
+                aria-label="More options"
+                aria-haspopup="menu"
+                aria-expanded=move || open.get().to_string()
+            >
+                <crate::components::icons::IconChevronRight/>
+            </button>
+            <Show when=move || open.get()>
+                <div
+                    class="btn-split-backdrop"
+                    on:click=move |ev| {
+                        stop(&ev);
+                        open.set(false);
+                    }
+                ></div>
+                <div class="btn-split-menu" role="menu">
+                    <button
+                        class="btn-split-menu-item"
+                        role="menuitem"
+                        on:click=move |ev| {
+                            stop(&ev);
+                            open.set(false);
+                            on_menu.run(());
+                        }
+                    >
+                        {menu_label.clone()}
+                    </button>
+                </div>
+            </Show>
+        </div>
+    }
+}
+
 /// Page header. List pages pass `title` (+ an optional `subtitle` line);
 /// detail pages pass `crumbs`. Children are the page actions.
 #[component]

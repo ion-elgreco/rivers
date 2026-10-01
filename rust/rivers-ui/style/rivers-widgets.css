@@ -1281,6 +1281,8 @@ code[title],
    column in that row only and push the row out of line with the header. */
 .grid-row > *,
 .grid-table-head > * { min-width: 0; }
+/* A row's action button, at the end of its column. */
+.grid-cell-action { display: flex; justify-content: flex-end; }
 .grid-row > .chip,
 .grid-row > .kind-badge,
 .grid-row > .rv-tag { justify-self: start; }
