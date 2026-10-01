@@ -428,11 +428,27 @@
     background: var(--bg-inset);
     border-left: 2px solid var(--border);
     border-radius: var(--round-sm);
-    padding: 12px 16px;
+    padding: 8px 16px;
     margin: 0 0 16px;
 }
+.run-config-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+.run-config-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0;
+    border: 0;
+    background: none;
+    cursor: pointer;
+}
+.run-config-toggle:hover .section-header-label { color: var(--text); }
 .run-config-text {
-    margin: 0;
+    margin: 8px 0 4px;
     font-family: var(--font-mono);
     font-size: var(--fs-sm);
     color: var(--text);

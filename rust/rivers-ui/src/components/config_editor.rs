@@ -172,8 +172,34 @@ pub fn launch_schema(
 /// The editor's opening text: the defaults of every config class and the
 /// current metadata of every selected asset, in the document's shape.
 pub fn config_template(schema_json: &str) -> Option<String> {
+    config_template_over(schema_json, None)
+}
+
+/// [`config_template`] with `document` laid over it: a rerun opens on its
+/// run's values, the defaults around them.
+pub fn config_template_over(schema_json: &str, document: Option<&str>) -> Option<String> {
     let schema = Schema::parse(schema_json)?;
-    serde_json::to_string_pretty(&config_schema::template(&schema)).ok()
+    let mut template = config_schema::template(&schema);
+    if let Some(document) = document.and_then(|d| serde_json::from_str(d).ok()) {
+        overlay(&mut template, document);
+    }
+    serde_json::to_string_pretty(&template).ok()
+}
+
+fn overlay(base: &mut Value, top: Value) {
+    match (base, top) {
+        (Value::Object(base), Value::Object(top)) => {
+            for (key, value) in top {
+                match base.get_mut(&key) {
+                    Some(slot) => overlay(slot, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, top) => *base = top,
+    }
 }
 
 /// What the dialogs learn from the text: the issues that block a submit,
@@ -425,29 +451,40 @@ pub fn completions(text: &str, caret: usize, schema_json: Option<&str>) -> Vec<C
 
 /// The dialog section: the code editor over `text`, the required-fields
 /// hint and a reset. `reset` turning true (the dialog opening) refills the
-/// template; a schema change does too until the user has typed.
+/// template, with `base` laid over it when given; a schema change does too
+/// until the user has typed.
 #[component]
 pub fn ConfigEditor(
     #[prop(into)] schema: Signal<Option<String>>,
     text: RwSignal<String>,
     #[prop(into)] reset: Signal<bool>,
     #[prop(into)] check: Signal<Check>,
+    /// The document to open on: a rerun's stored one.
+    #[prop(optional, into)]
+    base: Option<Signal<Option<String>>>,
 ) -> impl IntoView {
     let dirty = RwSignal::new(false);
     let template = Memo::new(move |_| schema.get().as_deref().and_then(config_template));
-    let refill = move || {
+    let opening = Memo::new(move |_| {
+        let base = base.and_then(|b| b.get());
+        schema
+            .get()
+            .as_deref()
+            .and_then(|s| config_template_over(s, base.as_deref()))
+    });
+    let refill = move |to: Option<String>| {
         dirty.set(false);
-        text.set(template.get_untracked().unwrap_or_default());
+        text.set(to.unwrap_or_default());
     };
     Effect::new(move || {
         if reset.get() {
-            refill();
+            refill(opening.get_untracked());
         }
     });
     Effect::new(move || {
-        let template = template.get();
+        let opening = opening.get();
         if !dirty.get_untracked() {
-            text.set(template.unwrap_or_default());
+            text.set(opening.unwrap_or_default());
         }
     });
     let issues = Signal::derive(move || check.get().issues);
@@ -470,7 +507,7 @@ pub fn ConfigEditor(
                 <div class="mat-dialog-col-head">
                     <label>"Config"</label>
                     <span class="mat-dialog-col-actions">
-                        <button class="link-btn" on:click=move |_| refill()>"Reset to defaults"</button>
+                        <button class="link-btn" on:click=move |_| refill(template.get_untracked())>"Reset to defaults"</button>
                     </span>
                 </div>
                 <CodeEditor
@@ -601,6 +638,40 @@ mod tests {
         assert_eq!(config_template(&bare).unwrap(), "{\n  \"execution\": {}\n}");
         assert!(!launch_takes_config(&keys(&["bare"]), &defs, None));
         assert!(launch_takes_config(&keys(&["bare", "api"]), &defs, None));
+    }
+
+    #[test]
+    fn a_stored_document_opens_over_the_defaults() {
+        let schema = schema();
+        let stored = r#"{"assets":{"api":{"config":{"api_key":"k","batch_size":5}},"plain":{"metadata":{"tier":"gold"}}},"execution":{"executor":"parallel"}}"#;
+        let text = config_template_over(&schema, Some(stored)).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "assets": {
+                    "api": {"config": {"api_key": "k", "batch_size": 5, "region": null}},
+                    "cfg": {"config": {"threshold": 0.5, "max_retries": 3}},
+                    "plain": {"metadata": {"owner": "data", "tier": "gold"}}
+                },
+                "execution": {"executor": "parallel"},
+                "resources": {"db": {"dsn": "memory://", "pool_size": 2}}
+            })
+        );
+        // Left as opened, the rerun sends what the run had.
+        let check = check_config(&text, Some(&schema));
+        assert!(check.issues.is_empty(), "{:?}", check.issues);
+        let sent: Value = serde_json::from_str(&check.payload.unwrap()).unwrap();
+        assert_eq!(sent, serde_json::from_str::<Value>(stored).unwrap());
+        // No stored document, or one that does not parse: the defaults.
+        assert_eq!(
+            config_template_over(&schema, None),
+            config_template(&schema)
+        );
+        assert_eq!(
+            config_template_over(&schema, Some("not json")),
+            config_template(&schema)
+        );
     }
 
     #[test]

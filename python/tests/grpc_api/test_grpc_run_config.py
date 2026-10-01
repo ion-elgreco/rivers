@@ -395,6 +395,95 @@ def test_rerun_replays_the_original_config(direct):
     assert run.config == _stored(configured={"threshold": 0.9})
 
 
+def _launch_configured(stub, pb2, kind, fields):
+    """Launch `configured` as `kind` with `fields` for the class that run uses."""
+    config = _cfg(configured=fields)
+    if kind == "materialize":
+        return stub.Materialize(
+            pb2.MaterializeRequest(selection=["configured"], config=config)
+        ).run_id
+    if kind == "job":
+        return stub.ExecuteJob(
+            pb2.ExecuteJobRequest(job_name="cfg_job", config=config)
+        ).run_id
+    return stub.RunAction(
+        pb2.RunActionRequest(action="compact", selection=["configured"], config=config)
+    ).run_id
+
+
+@pytest.mark.parametrize(
+    ("kind", "first", "updated", "seen"),
+    [
+        (
+            "materialize",
+            {"threshold": 0.9},
+            {"threshold": 0.1},
+            lambda: _STORE["configured"]["threshold"],
+        ),
+        (
+            "job",
+            {"max_retries": 7},
+            {"max_retries": 2},
+            lambda: _STORE["configured"]["max_retries"],
+        ),
+        (
+            "action",
+            {"target_size_mb": 512},
+            {"target_size_mb": 64},
+            lambda: _SEEN["compact"],
+        ),
+    ],
+)
+def test_rerun_with_config_replaces_the_stored_document(
+    direct, kind, first, updated, seen
+):
+    stub, pb2, repo = direct
+    first_id = _launch_configured(stub, pb2, kind, first)
+    assert wait_for_run_terminal(repo.storage, first_id).status == "Success"
+
+    rerun = stub.RerunRun(
+        pb2.RerunRunRequest(run_id=first_id, config=_cfg(configured=updated))
+    )
+    run = wait_for_run_terminal(repo.storage, rerun.run_id)
+    assert run.status == "Success"
+    assert seen() == next(iter(updated.values()))
+    assert run.config == _stored(configured=updated)
+    assert repo.storage.get_run(first_id).config == _stored(configured=first)
+
+
+def test_rerun_with_empty_config_runs_the_definitions(direct):
+    stub, pb2, repo = direct
+    first_id = _launch_configured(stub, pb2, "materialize", {"threshold": 0.9})
+    assert wait_for_run_terminal(repo.storage, first_id).status == "Success"
+
+    rerun = stub.RerunRun(pb2.RerunRunRequest(run_id=first_id, config=""))
+    run = wait_for_run_terminal(repo.storage, rerun.run_id)
+    assert run.status == "Success"
+    assert _STORE["configured"] == {"threshold": 0.5, "max_retries": 3}
+    assert run.config is None
+
+
+@pytest.mark.parametrize(
+    ("config", "detail"),
+    [
+        (_cfg(configured={"threshold": "hot"}), "assets.configured.config.threshold"),
+        (_cfg(plain={"x": 1}), "plain"),
+    ],
+    ids=["value-the-class-refuses", "asset-outside-the-run"],
+)
+def test_rerun_rejects_a_bad_config(direct, config, detail):
+    stub, pb2, repo = direct
+    first_id = _launch_configured(stub, pb2, "job", {"max_retries": 7})
+    assert wait_for_run_terminal(repo.storage, first_id).status == "Success"
+    runs_before = len(repo.storage.get_runs(limit=100))
+
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.RerunRun(pb2.RerunRunRequest(run_id=first_id, config=config))
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert detail in exc.value.details()
+    assert len(repo.storage.get_runs(limit=100)) == runs_before
+
+
 # ── Backfills ──
 
 

@@ -212,9 +212,13 @@ pub async fn trigger_action(
 
 /// Re-execute a run by id, server-side: replays it on its original partition,
 /// reusing tags + job/materialization shape, routed to the run's owning code
-/// location. Returns the new `run_id`.
+/// location. Returns the new `run_id`. `config` replaces the run's launch
+/// document; `None` reuses it, an empty one runs the definitions as they are.
 #[server]
-pub async fn rerun_run(run_id: String) -> Result<MaterializeResult, ServerFnError> {
+pub async fn rerun_run(
+    run_id: String,
+    config: Option<String>,
+) -> Result<MaterializeResult, ServerFnError> {
     use rivers_api::rivers::RerunRunRequest;
 
     let mut client = connect_to_run_owner(&run_id).await?;
@@ -223,6 +227,7 @@ pub async fn rerun_run(run_id: String) -> Result<MaterializeResult, ServerFnErro
         .rerun_run(RerunRunRequest {
             run_id,
             user: current_user_ref().await,
+            config,
         })
         .await
         .map_err(super::grpc_err)?;

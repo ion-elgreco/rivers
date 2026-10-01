@@ -376,11 +376,28 @@ impl CodeLocationService for CodeLocationImpl {
         let req = request.into_inner();
         // Rebuilds the request from the stored run (partition + tags) for replay,
         // stamped with the rerunning user (not the original launcher).
-        let rerun = self
+        let mut rerun = self
             .handle
             .build_run_rerun_request(&req.run_id, manual_launch(req.user))
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(config) = req.config {
+            let (selection, action) = match &rerun {
+                crate::daemon::RunRerunRequest::Job(r) => {
+                    let job = r.job_name.as_deref().unwrap_or_default();
+                    (
+                        self.handle.job_asset_names(job).unwrap_or_default(),
+                        self.handle.job_verb(job),
+                    )
+                }
+                crate::daemon::RunRerunRequest::Materialization(m) => {
+                    (m.asset_selection.clone(), m.action.clone())
+                }
+            };
+            *rerun.config_mut() = self
+                .launch_config(Some(config), &selection, action.as_deref())
+                .await?;
+        }
 
         let status = self.run_dispatcher.mode_label().to_string();
         let run_id = match rerun {

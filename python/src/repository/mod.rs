@@ -1618,6 +1618,15 @@ impl RepoHandle {
             .and_then(|s| s.jobs_info.get(name).map(|j| j.asset_names.clone()))
     }
 
+    /// The verb a user-defined job runs; `None` means materialize.
+    pub(crate) fn job_verb(&self, name: &str) -> Option<String> {
+        self.state
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|s| job_action(&s.jobs_info, Some(name)))
+    }
+
     /// Assets defining `action`, sorted.
     pub(crate) fn assets_supporting_action(&self, action: &str) -> PyResult<Vec<String>> {
         let guard = self.state.read().unwrap();

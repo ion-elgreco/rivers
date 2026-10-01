@@ -97,6 +97,8 @@ Typing a key or a value opens a completion list, and `Ctrl+Space` opens it anywh
 
 An asset with neither a config class nor metadata launches on one click, as does a job whose assets have neither and that needs no partition; the dialog opens on its own when one has either. Next to such a one-click button, **Materialize…** or **Execute…** opens the dialog anyway, for the document's other sections.
 
+The run page shows the run's document under **Config**, collapsed, with a **Copy** button. **Re-execute** replays the run with the same document. Its menu holds **Re-execute with config…**, which opens the editor on the run's document over the current defaults; the new run gets the edited document, checked as a launch is, and the original run keeps its own. Over gRPC, `RerunRunRequest.config` does the same: unset reuses the stored document, an empty string runs the definitions as they are.
+
 ## Tasks
 
 Tasks support config the same way as assets:

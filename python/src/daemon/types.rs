@@ -84,6 +84,15 @@ pub(crate) enum RunRerunRequest {
     Materialization(MaterializationRequestData),
 }
 
+impl RunRerunRequest {
+    pub(crate) fn config_mut(&mut self) -> &mut Option<String> {
+        match self {
+            Self::Job(r) => &mut r.config,
+            Self::Materialization(m) => &mut m.config,
+        }
+    }
+}
+
 /// What a backfill runs each partition as: an ad-hoc materialization of an asset
 /// selection, or a named `Job` (whose own plan + executor are used). Reconstructed
 /// from `BackfillRecord` (`job_name` → `Job`, else `Materialization`) at execution.

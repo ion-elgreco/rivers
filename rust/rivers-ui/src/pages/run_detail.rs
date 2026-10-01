@@ -4,9 +4,10 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 
-use crate::components::icons::{IconRetry, IconStop, IconTrash};
+use crate::components::icons::{IconChevronRight, IconCopy, IconRetry, IconStop, IconTrash};
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::pagination::{InfiniteEventList, PaginatedView};
+use crate::components::rerun_dialog::RerunConfigDialog;
 use crate::components::traceback::RunFailures;
 use crate::components::ui_kit::{Crumb, EmptyState, StatusChip, Topbar};
 use crate::helpers::{
@@ -183,10 +184,23 @@ pub fn RunDetailPage() -> impl IntoView {
     // actions route by the run's owning location, not the page's.
     let reexecute = Action::new(move |run_id: &String| {
         let run_id = run_id.clone();
-        async move { rerun_run(run_id).await }
+        async move { rerun_run(run_id, None).await }
     });
     let reexecute_pending = reexecute.pending();
     let reexecute_armed = RwSignal::new(false);
+    let rerun_menu = RwSignal::new(false);
+    let rerun_dialog = RwSignal::new(false);
+    let config_open = RwSignal::new(false);
+    let run_value = crate::helpers::resource_value(run);
+    let run_record = Signal::derive(move || run_value.get().and_then(|r| r.ok()).flatten());
+    // The dialog checks the document against the location that owns the run.
+    let run_owner = Signal::derive(move || {
+        let cl = run_record.with(|r| r.as_ref().map(|r| r.code_location_id.clone()));
+        let entries = locations.get().and_then(|r| r.ok()).unwrap_or_default();
+        cl.and_then(|cl| entries.into_iter().find(|e| e.identity == cl))
+            .map(|e| (e.namespace, e.name))
+            .unwrap_or_else(|| loc.get())
+    });
 
     let cancel = Action::new(move |id: &String| {
         let id = id.clone();
@@ -207,6 +221,8 @@ pub fn RunDetailPage() -> impl IntoView {
         delete_armed.set(false);
         cancel_armed.set(false);
         reexecute_armed.set(false);
+        rerun_menu.set(false);
+        config_open.set(false);
     });
     // A deleted run has no page to stay on — back to the list. Ok(false)
     // means the run was already gone, which lands in the same place.
@@ -340,6 +356,7 @@ pub fn RunDetailPage() -> impl IntoView {
                                     }
                                 })}
                                 {(!is_active_status).then(move || view! {
+                                    <div class="btn-split">
                                     <button
                                         class="btn btn-primary"
                                         on:click=move |_| {
@@ -362,6 +379,32 @@ pub fn RunDetailPage() -> impl IntoView {
                                             reexecute_pending.get(),
                                         )}
                                     </button>
+                                    <button
+                                        class="btn btn-primary btn-split-toggle"
+                                        on:click=move |_| rerun_menu.update(|o| *o = !*o)
+                                        disabled=move || reexecute_pending.get()
+                                        title="More re-execute options"
+                                        aria-label="More re-execute options"
+                                        aria-haspopup="menu"
+                                        aria-expanded=move || rerun_menu.get().to_string()
+                                    >
+                                        <IconChevronRight/>
+                                    </button>
+                                    <Show when=move || rerun_menu.get()>
+                                        <div class="btn-split-backdrop" on:click=move |_| rerun_menu.set(false)></div>
+                                        <div class="btn-split-menu" role="menu">
+                                            <button
+                                                class="btn-split-menu-item"
+                                                role="menuitem"
+                                                on:click=move |_| {
+                                                    rerun_menu.set(false);
+                                                    reexecute_armed.set(false);
+                                                    rerun_dialog.set(true);
+                                                }
+                                            >"Re-execute with config…"</button>
+                                        </div>
+                                    </Show>
+                                    </div>
                                 })}
                             }
                         })}
@@ -453,10 +496,31 @@ pub fn RunDetailPage() -> impl IntoView {
                                 let pretty = serde_json::from_str::<serde_json::Value>(config)
                                     .and_then(|v| serde_json::to_string_pretty(&v))
                                     .unwrap_or_else(|_| config.clone());
+                                let copy_text = pretty.clone();
                                 view! {
                                     <div class="run-config">
-                                        <div class="section-header-label" style="margin-bottom:4px">"CONFIG"</div>
-                                        <pre class="run-config-text">{pretty}</pre>
+                                        <div class="run-config-head">
+                                            <button
+                                                class="run-config-toggle"
+                                                on:click=move |_| config_open.update(|o| *o = !*o)
+                                                aria-expanded=move || config_open.get().to_string()
+                                            >
+                                                <span class="chev-btn" class:chev-btn--open=move || config_open.get()>
+                                                    <IconChevronRight/>
+                                                </span>
+                                                <span class="section-header-label">"CONFIG"</span>
+                                            </button>
+                                            <button
+                                                class="btn btn-small copyable"
+                                                data-copy=copy_text
+                                                title="Copy the launch config as JSON"
+                                            >
+                                                <IconCopy/>"Copy"
+                                            </button>
+                                        </div>
+                                        <Show when=move || config_open.get()>
+                                            <pre class="run-config-text">{pretty.clone()}</pre>
+                                        </Show>
                                     </div>
                                 }
                             })}
@@ -546,6 +610,7 @@ pub fn RunDetailPage() -> impl IntoView {
                 }}
             </Transition>
         </Show>
+        <RerunConfigDialog show=rerun_dialog run=run_record location=run_owner/>
         </div>
     }
 }

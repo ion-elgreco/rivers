@@ -391,6 +391,45 @@ a:hover { color: var(--accent-hover); }
     filter: brightness(1.1);
 }
 
+/* A button with a menu of variants on an attached chevron. */
+.btn-split { position: relative; display: inline-flex; }
+.btn-split > .btn:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.btn-split-toggle {
+    width: 24px;
+    padding: 0;
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    border-left: 1px solid color-mix(in srgb, var(--on-accent) 25%, transparent);
+}
+.btn-split-toggle svg { transform: rotate(90deg); }
+.btn-split-backdrop { position: fixed; inset: 0; z-index: 99; }
+.btn-split-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 100;
+    min-width: 200px;
+    padding: 4px;
+    background: var(--bg-hover);
+    border-radius: var(--round-md);
+    box-shadow: var(--shadow-pop);
+}
+.btn-split-menu-item {
+    display: block;
+    width: 100%;
+    padding: 7px 10px;
+    border: 0;
+    border-radius: var(--round-sm);
+    background: none;
+    color: var(--text);
+    font-family: var(--font-sans);
+    font-size: var(--fs-xs);
+    text-align: left;
+    white-space: nowrap;
+    cursor: pointer;
+}
+.btn-split-menu-item:hover { background: var(--bg-surface-low); color: var(--accent); }
+
 .btn-danger {
     background: transparent;
     color: var(--error);

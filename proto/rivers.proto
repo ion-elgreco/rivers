@@ -107,6 +107,10 @@ message ExecuteJobResponse {
 message RerunRunRequest {
   string run_id = 1;
   optional UserRef user = 2;
+  // A launch document (as MaterializeRequest.config) that replaces the one
+  // stored on the run. Unset reuses the stored one; empty runs with the
+  // definitions as they are.
+  optional string config = 3;
 }
 
 message RerunRunResponse {
